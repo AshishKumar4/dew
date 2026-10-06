@@ -9,7 +9,10 @@ the text and every parameter: in float32 and in float64, the truth both
 float32 runs are measured from (tests/fixtures/flaxdiff_family/family.npz). Dew's
 models on the same weights and Fourier table are held to
 tests/reference_error.py's rule: no further from float64 than twice the
-float32 reference.
+float32 reference. The UNet variant uses the same rule over 52 spatial
+channel orders, since a single output or gradient draw has too few
+independent rounding directions. Each order's float64 reference computes
+the original output and gradient within 1e-12 relative error.
 
 The DiTs average the text over every position, as FlaxDiff's do: Dew builds
 them with `text_pooling="all"`, and is handed a padded mask the pooling
@@ -25,7 +28,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
 
 from dew.nn.attention import Stage
 from dew.nn.backbones.dit import SimpleDiT
@@ -37,12 +40,6 @@ from dew.nn.backbones.video_dit import VideoDiT
 from dew.nn.dit import TextContext
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "flaxdiff_family" / "family.npz"
-# On a CPU with performance and efficiency cores, XLA's float32 convolution
-# rounds one of two ways in a process, by the core type that ran its first
-# convolution (openxla/xla#50022); the fixture's tool pins its own to the
-# lowest CPU. So Dew's Unet lands on one of two roundings per process: over
-# 26 processes on an i9-12900K the unet ratios (output/gradients, published
-# then variant) were only 0.95/1.00, 0.53/0.34 or 1.03/1.03, 0.63/0.67.
 CASES = ("simple_dit/published", "simple_dit/variant", "simple_udit/published", "simple_udit/variant",
          "simple_mmdit/published", "simple_mmdit/variant", "hierarchical_mmdit/published",
          "hierarchical_mmdit/variant", "unet/published", "unet/variant", "video_dit/published",
@@ -121,6 +118,26 @@ def nest(flat: dict[tuple[str, ...], np.ndarray]) -> dict:
     return tree
 
 
+def unet_channels(name: str, value: np.ndarray, order: np.ndarray) -> np.ndarray:
+    """Reorder the variant UNet's eight spatial channels, keeping each
+    concatenated skip stream whole. Its norms are RMS norms. Every attention
+    stage projects in and out, so only the projections' spatial sides move;
+    the attention heads, time embedding and text keep their own order."""
+    parts = name.split("/")
+    if "Attention" in parts or parts[0] == "TimeProjection_0":
+        return value
+    if any(part.startswith("project_in") for part in parts):
+        return np.take(value, order, axis=-2)
+    if any(part.startswith("project_out") for part in parts):
+        return np.take(value, order, axis=-1)
+    for axis in range(value.ndim):
+        size = value.shape[axis]
+        if size in (len(order), 2 * len(order)):
+            channels = np.concatenate([order + start for start in range(0, size, len(order))])
+            value = np.take(value, channels, axis=axis)
+    return value
+
+
 @pytest.mark.parametrize("case", CASES)
 def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case):
     arrays, meta = reference
@@ -145,10 +162,9 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         return model.apply({"params": params, "constants": constants}, image, times,
                            TextContext(text, jnp.asarray(mask)))
 
-    output, pullback = jax.vjp(forward, params, image, text)
-    grad_params, grad_image, grad_text = pullback(jnp.asarray(part("probe")))
-    assert_as_exact_as_the_reference(np.asarray(output), part("fp32.output"), part("fp64.output"),
-                                     f"{case} output")
+    def evaluated(params):
+        output, pullback = jax.vjp(forward, params, image, text)
+        return output, pullback(jnp.asarray(part("probe")))
 
     def leaf(tree, path):
         for key in path:
@@ -160,8 +176,35 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         leaves += [part(f"{precision}.grad_param.{name}") for name in names]
         return np.concatenate([np.ravel(value) for value in leaves])
 
-    native = [np.asarray(grad_image), np.asarray(grad_text)]
-    native += [from_dew(name, leaf(grad_params, dew_path(cls, name))) for name in names]
-    native_order = np.concatenate([np.ravel(value) for value in native])
-    assert_as_exact_as_the_reference(native_order, source_order("fp32"), source_order("fp64"),
-                                     f"{case} gradients")
+    def gradient_order(gradients, back=None):
+        grad_params, grad_image, grad_text = gradients
+        native = [np.asarray(grad_image), np.asarray(grad_text)]
+        for name in names:
+            value = from_dew(name, leaf(grad_params, dew_path(cls, name)))
+            native.append(value if back is None else unet_channels(name, value, back))
+        return np.concatenate([np.ravel(value) for value in native])
+
+    if case == "unet/variant":
+        # The variant concentrates its rounding in a few directions. Spatial
+        # channel orders move those roundings without moving the function;
+        # the reference tool checks every order's output and gradient in float64.
+        with np.load(FIXTURE.with_name("orders.npz")) as drawn:
+            orders, reference_output, reference_gradients = (drawn[key] for key in
+                                                            ("orders", "output", "gradients"))
+        run = jax.jit(evaluated)
+        output_distances, gradient_distances = [], []
+        truth_gradients = source_order("fp64")
+        for order in orders:
+            moved = nest({dew_path(cls, name): to_dew(name, unet_channels(
+                name, part(f"param.{name}").view(ml_dtypes.bfloat16).astype(np.float32), order))
+                          for name in names})
+            output, gradients = run(moved)
+            output_distances.append(distance(output, part("fp64.output")))
+            gradient_distances.append(distance(gradient_order(gradients, np.argsort(order)), truth_gradients))
+        assert_as_exact_over_orders(output_distances, reference_output, f"{case} output")
+        assert_as_exact_over_orders(gradient_distances, reference_gradients, f"{case} gradients")
+    else:
+        output, gradients = evaluated(params)
+        assert_as_exact_as_the_reference(output, part("fp32.output"), part("fp64.output"), f"{case} output")
+        assert_as_exact_as_the_reference(
+            gradient_order(gradients), source_order("fp32"), source_order("fp64"), f"{case} gradients")

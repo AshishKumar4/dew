@@ -229,6 +229,38 @@ def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
 
 
+class DrafterRefused(ValueError):
+    """Raised, by design, for a config.json that describes a speculative drafter.
+
+    A drafter reads a target model's hidden states and drafts through the
+    target's embedding and head, which its checkpoint does not carry, so it is
+    no language model on its own. The message names its architecture, the
+    target layers it reads and where its draft arithmetic lives. It is a
+    ValueError, so a caller that catches ValueError catches it too.
+    """
+
+
+def _refuse_drafter(hf_config: Mapping[str, object]) -> None:
+    """Refuse a SpecForge DFlash drafter, DSpark's among them, by the
+    `num_target_layers` it places its target layers by (dflash.py:256-298 in
+    RadixArk/Kimi-K3-DSpark at 3c5bac3). DFlashDraftModel, DFlash2DraftModel,
+    DSparkDraftModel and Qwen3DSparkModel all carry it under model_type qwen3,
+    beside the layers they read in dflash_config or at the top level."""
+    if 'num_target_layers' not in hf_config:
+        return
+    nested = hf_config.get('dflash_config')
+    taps = (nested.get('target_layer_ids') if isinstance(nested, Mapping) else None) or hf_config.get(
+        'target_layer_ids')
+    read = f"after its layers {taps}" if taps else "after the layers dflash.py spaces over them"
+    raise DrafterRefused(
+        f"architectures {hf_config.get('architectures')} is not expressible: it is a speculative "
+        f"drafter that reads a {hf_config['num_target_layers']}-layer target's hidden states {read} "
+        "and drafts through that target's embedding and head, which its checkpoint does not "
+        "carry. The draft arithmetic it is served with lives in SGLang's speculative decoding "
+        "(DSPARK, DFLASH), not in a model Dew builds; Dew drafts with a drafter its target's "
+        "own checkpoint carries (CausalTransformer.draft)")
+
+
 def _refuse_encoder_fields(text: Mapping[str, object]) -> None:
     """Refuse a serialized text_config whose `_SERIALIZED_ENCODER_FIELDS` are set."""
     for key in _SERIALIZED_ENCODER_FIELDS:
@@ -737,6 +769,7 @@ def _softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     """Translate one registered family's config, refusing any setting Dew does not compute."""
 
+    _refuse_drafter(hf_config)
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
     # whole model and whose text_config holds the decoder;
@@ -1508,10 +1541,9 @@ def _stack_experts(params: LazyTree) -> None:
         nested = block.get('block') if isinstance(block, dict) else None
         if depth.startswith(('mtp_', 'dspark_')) and isinstance(nested, dict):
             blocks.append((depth, nested))
-    for layer, block in blocks:
-        mlp = block.get('mlp')
-        if not isinstance(mlp, dict):
-            continue
+    slots = [(f'{layer}.{name}', slot) for layer, block in blocks for name, slot in block.items()
+             if name in ('mlp', 'self_attn') and isinstance(slot, dict)]
+    for layer, mlp in slots:
         experts = mlp.get('experts')
         if not isinstance(experts, dict):
             continue
