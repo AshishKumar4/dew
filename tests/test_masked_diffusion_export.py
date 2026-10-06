@@ -163,3 +163,44 @@ def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name
+
+
+@pytest.mark.parametrize("fixture", ["llada-tiny", "dream-tiny"])
+def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture, tmp_path):
+    """A run of `MaskedDiffusionObjective` from a loaded checkpoint, read back
+    by `Pretrained.from_run`, is a masked decoder by the run's objective; its
+    export in the family its model derives is one by the export's own config,
+    which `Pretrained.load` reads to the run's trained logits."""
+    import math
+
+    import grain.python as grain
+    import jax
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.data import Dataset, Loading
+    from dew.diffusion.discrete import MDLM
+    from dew.interop import PretrainedMaskedDecoder
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.training import Trainer
+
+    source = Pretrained.load(str(FIXTURES / fixture), dtype="float32", attention_impl="reference")
+    ids = np.load(FIXTURES / fixture / "input_ids.npy")
+    objective = MaskedDiffusionObjective(source.model, MDLM(mask_id=source.model.mask_token_id)(),
+                                         int(ids.shape[1]), ema_decay=None, variables=source.variables)
+    count = math.lcm(int(ids.shape[0]), jax.device_count())
+    rows = [{"text": row} for row in np.concatenate([ids] * (count // int(ids.shape[0])))]
+    data = Dataset.from_grain(grain.MapDataset.source(rows), batch=count, loading=Loading(workers=0))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    state = Trainer(objective, optax.sgd(1.0), key=jax.random.key(0), checkpoints=checkpoints).fit(
+        data, steps=1, checkpoint_every=1)
+    checkpoints.wait()
+
+    exported = Pretrained.from_run(tmp_path / "run")
+    exported.save(tmp_path / "export")
+    reloaded = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="reference")
+
+    assert isinstance(exported, PretrainedMaskedDecoder) and isinstance(reloaded, PretrainedMaskedDecoder)
+    assert reloaded.model.mask_token_id == source.model.mask_token_id
+    np.testing.assert_array_equal(tool.logits(reloaded, reloaded.variables, ids),
+                                  tool.logits(source, state.variables, ids))

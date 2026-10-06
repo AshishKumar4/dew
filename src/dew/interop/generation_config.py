@@ -23,12 +23,10 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew import records
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.multimodal import MultimodalTransformer
 from dew.records import JSON
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
-from dew.sampling.text import Sampling, ordered_transforms, with_ids_of
+from dew.sampling.text import Bounded, Predicting, Sampling, ordered_transforms, with_ids_of
 
 
 def _generation_value(config: Mapping[str, object], generation_config: Mapping[str, object],
@@ -309,25 +307,13 @@ def _audit(config: Mapping[str, object], generation_config: Mapping[str, object]
             "stopping=..., strategy=...) builds the task from components outright")
 
 
-
-def _decoder(model: nn.Module) -> CausalTransformer | MultimodalTransformer | None:
-    """Return the decoder a source built, or None for a model that is not one.
-
-    `CausalTransformer` declares what native decoding reads off a model, and
-    `MultimodalTransformer` forwards those four fields to the decoder it
-    holds, so the two answer together for everything but the decoder's own.
-    """
-    return model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
-
-
 def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str, object],
                     model: nn.Module) -> None:
     """Return the declared cache length, checked against the model's own."""
     value = _generation_value(config, generation_config, "max_cache_len")
     if value is None:
         return
-    decoder = _decoder(model)
-    capacity = None if decoder is None else decoder.max_seq_len
+    capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if type(value) is not int or value < 1:
         raise ValueError("max_cache_len must be a positive integer")
     if capacity is not None and value > capacity:
@@ -503,8 +489,7 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
         )
     if not speculating:
         return None
-    decoder = _decoder(model)
-    if decoder is None or not decoder.num_nextn_predict_layers:
+    if not isinstance(model, Predicting) or not model.num_nextn_predict_layers:
         raise ValueError("the source asks for multi-token-prediction speculation, but this "
                          "checkpoint carries no prediction-depth weights")
     length = read("num_assistant_tokens")
