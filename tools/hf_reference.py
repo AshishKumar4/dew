@@ -78,7 +78,7 @@ import torch
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
-    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
+    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM, PhiConfig, PhiForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -128,6 +128,102 @@ NEMOTRON_H_CONFIGS = (
     ("nemotron-h-4b", "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"),
     ("nemotron-h-30b-a3b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"),
 )
+PHI_CONFIG = ('phi-2', 'microsoft/phi-2', '810d367871c1d460086d9f82db8696f2e0a0fcd0')
+
+
+def tiny_phi() -> PhiForCausalLM:
+    """Biased one-norm parallel branches, partial rotary, GQA and an affine head."""
+    torch.manual_seed(0)
+    return PhiForCausalLM(PhiConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=48,
+        layer_norm_eps=3e-5, resid_pdrop=0., embd_pdrop=0., attention_dropout=0.,
+        rope_parameters={'rope_type': 'default', 'rope_theta': 10000., 'partial_rotary_factor': .5},
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
+    """Same-weight fp32/float64 logits, left-padding and greedy continuation.
+
+    Phi-3's crossing oracle is its uncached full-prefix forward. Its pinned
+    generate drops the prefix at that crossing (transformers issue #49334),
+    so that output is recorded separately from the intended continuation.
+    """
+    from unittest.mock import patch
+
+    from diffusers_wan_reference import float64
+
+    model.config._attn_implementation = 'eager'
+    write_tiny(name, model)
+    directory = FIXTURES / name
+    ids = np.load(directory / 'input_ids.npy')
+    mask = np.ones_like(ids, bool)
+    mask[1, :3] = False
+    padded = np.where(mask, ids, 0)
+    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
+    positioned = ({} if model.config.model_type == 'bloom' else
+                  {'position_ids': torch.from_numpy(positions).long()})
+    np.save(directory / 'padded_ids.npy', padded)
+    np.save(directory / 'attention_mask.npy', mask)
+    phi3 = model.config.model_type == 'phi3'
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
+                                   max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
+        logits = model(torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+                       use_cache=False, **positioned).logits.numpy()
+        if phi3:
+            np.save(directory / 'transformers_generated.npy', generated)
+            generated = ids[:, :4].copy()
+            scores = []
+            for _ in range(6):
+                score = model(torch.from_numpy(generated).long(), use_cache=False).logits[:, -1].numpy()
+                scores.append(score)
+                generated = np.concatenate((generated, score.argmax(-1)[:, None]), axis=1)
+            np.save(directory / 'generation_logits.npy', np.stack(scores, axis=1))
+            np.save(directory / 'short_logits.npy',
+                    model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.numpy())
+    np.save(directory / 'generated.npy', generated)
+    np.save(directory / 'padded_logits.npy', logits)
+    affine = model.config.model_type in ('phi', 'gptj')
+    if affine:
+        full = torch.from_numpy(np.load(directory / 'logits.npy'))
+        losses = torch.nn.functional.cross_entropy(
+            full[:, :-1].transpose(1, 2), torch.from_numpy(ids[:, 1:]).long(), reduction='none')
+        np.save(directory / 'losses.npy', losses.numpy())
+    tensor, full = torch.tensor, torch.full
+
+    def wide_tensor(*args, dtype=None, **kwargs):
+        return tensor(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    def wide_full(*args, dtype=None, **kwargs):
+        return full(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    with (float64(), patch.object(torch, 'tensor', wide_tensor),
+          patch.object(torch, 'full', wide_full), torch.no_grad()):
+        # Rebuild frequency/sinusoidal buffers in float64 rather than
+        # widening an already-rounded fp32 table. Parameters remain the
+        # same checkpoint values, loaded into the wider reference model.
+        truth_model = AutoModelForCausalLM.from_config(
+            model.config, dtype=torch.float64, attn_implementation='eager').eval()
+        truth_model.load_state_dict(model.state_dict())
+        truth = truth_model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
+        if affine:
+            losses = torch.nn.functional.cross_entropy(
+                torch.from_numpy(truth[:, :-1]).transpose(1, 2),
+                torch.from_numpy(ids[:, 1:]).long(), reduction='none')
+            np.save(directory / 'losses_f64.npy', losses.numpy())
+        padded_truth = truth_model(
+            torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+            use_cache=False, **positioned).logits.double().numpy()
+        if phi3:
+            np.save(directory / 'short_logits_f64.npy',
+                    truth_model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.double().numpy())
+            scores = [truth_model(torch.from_numpy(generated[:, :4 + step]).long(),
+                                  use_cache=False).logits[:, -1].double().numpy() for step in range(6)]
+            np.save(directory / 'generation_logits_f64.npy', np.stack(scores, axis=1))
+    np.save(directory / 'logits_f64.npy', truth)
+    np.save(directory / 'padded_logits_f64.npy', padded_truth)
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -1131,9 +1227,15 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
+    parser.add_argument('--classic-family', choices=('phi',),
+                        help='only this classic decoder fixture and its pinned released config')
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.classic_family == 'phi':
+        write_classic_tiny('phi-tiny', tiny_phi())
+        write_released_config(*PHI_CONFIG)
+        return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:
         write_released_config(name, repo, revision)
