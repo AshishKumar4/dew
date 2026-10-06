@@ -455,21 +455,25 @@ class DiffusionObjective(Objective[Ratio]):
         return self._fixed_blank(like)
 
     def held_variables(self) -> Variables:
-        """Return every array `init` starts from instead of drawing: the starting tree, or the frozen towers.
+        """Return every array `init` starts from instead of drawing: the starting tree, or the frozen towers,
+        with the frozen networks the loss reads that the starting tree does not hold.
 
         A text tower and a VAE are released weights of hundreds of megabytes, which a
         trace without arguments would compile into the state executable as
-        constants. This is one mapping, so an objective that starts from more than
-        the towers extends both this and `init`.
+        constants. A saved run's tree holds its representation encoder and
+        perceptual network; a pipeline's holds neither, and they ride beside it.
+        This is one mapping, so an objective that starts from more than the towers
+        extends both this and `init`.
         """
         if self.variables is not None:
-            return self.variables
-        held: dict[str, Any] = {"encoders": self.encoder_params()}
-        if self.autoencoder is not None:
-            held["autoencoder"] = self.autoencoder.params
-        if self.alignment is not None:
+            held: dict[str, Any] = dict(self.variables)
+        else:
+            held = {"encoders": self.encoder_params()}
+            if self.autoencoder is not None:
+                held["autoencoder"] = self.autoencoder.params
+        if self.alignment is not None and REPRESENTATION not in held:
             held[REPRESENTATION] = self.alignment.variables
-        if self.end_to_end is not None and self.end_to_end.perceptual_weight:
+        if self.end_to_end is not None and self.end_to_end.perceptual_weight and PERCEPTUAL not in held:
             from dew.eval.lpips import LPIPSNetwork
 
             held[PERCEPTUAL] = LPIPSNetwork.published()[1]
@@ -875,11 +879,9 @@ class Denoising(Training):
 
     def check(self, run: DiffusionRunConfig) -> None:
         super().check(run)
-        if self.alignment is not None and run.pretrained is not None:
-            raise ValueError("representation alignment trains a scratch model on the denoising loss; "
-                             "it takes no `pretrained`")
         if self.alignment is not None and self.alignment.end_to_end is not None and run.autoencoder is None:
-            raise ValueError("end-to-end tuning trains the run's autoencoder; set `autoencoder`")
+            raise ValueError("end-to-end tuning trains the run's own `autoencoder`, which a run from scratch "
+                             "sets and a pretrained pipeline does not")
 
 
 def teacher_variables(directory: str, variables: Variables | None) -> Variables:
