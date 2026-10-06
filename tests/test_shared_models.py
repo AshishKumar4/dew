@@ -132,6 +132,33 @@ def test_a_timed_out_handler_does_not_release_ongoing_compute(service, tmp_path,
             finished.set()
 
 
+def test_an_early_rejection_remains_readable_when_the_client_sends_after_close(service, tmp_path, monkeypatch):
+    import threading
+    from types import SimpleNamespace
+
+    closed = threading.Event()
+    client = module("model_client")
+
+    class DelayedSocket(socket.socket):
+        def sendall(self, data, *args):
+            assert closed.wait(2), "the rejection did not close its connection"
+            return super().sendall(data, *args)
+
+    with service.ModelService(tmp_path / "model.sock", object(), uids=[]) as server:
+        shutdown = server.shutdown_request
+
+        def rejected(request):
+            shutdown(request)
+            closed.set()
+
+        monkeypatch.setattr(server, "shutdown_request", rejected)
+        monkeypatch.setattr(client, "SOCKET", str(server.path))
+        monkeypatch.setattr(client, "socket", SimpleNamespace(
+            socket=DelayedSocket, AF_UNIX=socket.AF_UNIX, SOCK_STREAM=socket.SOCK_STREAM))
+        with pytest.raises(ValueError, match="isolated kernel uid"):
+            client.request({"op": "describe", "repo": "model", "revision": "pinned"})
+
+
 def test_shared_text_delegates_prompt_preparation_to_dew_server(service):
     from types import SimpleNamespace
 
