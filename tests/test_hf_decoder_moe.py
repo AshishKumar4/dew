@@ -80,6 +80,19 @@ def test_granitemoe_prefill_and_steps_match_the_reference():
         np.load(GRANITEMOE / 'logits.npy'), np.load(GRANITEMOE / 'logits_f64.npy'), 'Granite MoE cache')
 
 
+def test_granitemoe_padded_routing_matches_the_reference():
+    model, variables = fp32_decoder(GRANITEMOE)
+    arrays = np.load(GRANITEMOE / 'padded.npz')
+    logits = np.asarray(model.apply(
+        variables, arrays['input_ids'], positions=arrays['position_ids'],
+        attention_mask=arrays['attention_mask']))
+    valid = arrays['attention_mask']
+    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
+                                     arrays['logits_f64'][valid], 'Granite MoE padded')
+    print('Granite MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
+          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
+
+
 def test_granitemoe_export_keeps_packed_experts_and_tied_head(tmp_path):
     from safetensors.numpy import load_file
 
