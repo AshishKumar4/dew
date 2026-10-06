@@ -115,11 +115,14 @@ def terminate(process) -> None:
     process.wait(timeout=60)
 
 
-def report_of(process, out: Path, timeout=600) -> dict:
-    """What the worker recorded, once it has exited cleanly."""
+def report_of(process, out: Path, timeout=600, pool=None) -> dict:
+    """What the worker recorded, once it has exited cleanly. A worker of a
+    `pool` that does not finish fails with every worker's stacks (`stuck`)."""
     try:
         log = process.communicate(timeout=timeout)[0]
     except subprocess.TimeoutExpired:
+        if pool is not None:
+            pytest.fail(stuck(pool, f"let {out.name} finish within {timeout}s"))
         terminate(process)
         pytest.fail(f"{out.name} did not finish within {timeout}s")
     assert process.returncode == 0, f"{out.name} exited {process.returncode}\n{log}"
@@ -141,7 +144,8 @@ def run_pool(mode, directory: Path, processes: int, *, timeout=600, **flags) -> 
               **flags)
         for index, out in enumerate(outs)]
     try:
-        return [report_of(process, out, timeout=timeout) for process, out in zip(running, outs, strict=True)]
+        return [report_of(process, out, timeout=timeout, pool=running)
+                for process, out in zip(running, outs, strict=True)]
     finally:
         for process in running:
             if process.poll() is None:
@@ -923,6 +927,30 @@ def test_every_process_writes_its_own_local_checkpoint_every_n_steps(tmp_path):
         assert report["written_steps"] == [SAVE_EVERY, 2 * SAVE_EVERY, STEPS]
     assert committed_steps(worker.checkpoint_dir(directory / "run", "local")) == [
         SAVE_EVERY, 2 * SAVE_EVERY, STEPS]
+
+
+@pytest.mark.distributed
+def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
+    """A process whose local checkpoint fails in orbax's background thread
+    (FileExistsError creating its tmp directory, as on a CI shard on
+    2026-10-05) raises at its next save, and the pool ends with it, rather
+    than the two processes waiting for ever in barriers the other will not
+    reach: that shard's pool hung until its 600 s timeout."""
+    directory = tmp_path
+    coordinator = f"127.0.0.1:{free_port()}"
+    (directory / "out").mkdir()
+    pool = [spawn("fit", directory / "out" / f"process{index}.json", processes=2, process_id=index,
+                  coordinator=coordinator, **local_flags(directory),
+                  fail_local_save=LOCAL_EVERY * 2 if index == 1 else None)
+            for index in range(2)]
+    outputs = []
+    for process in pool:
+        try:
+            outputs.append(process.communicate(timeout=120)[0])
+        except subprocess.TimeoutExpired:
+            pytest.fail(stuck(pool, "end after a failed local save"))
+    assert pool[1].returncode != 0 and "FileExistsError" in outputs[1], outputs[1][-4000:]
+    assert pool[0].returncode != 0, outputs[0][-4000:]
 
 
 @pytest.mark.distributed

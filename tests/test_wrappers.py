@@ -103,6 +103,36 @@ def test_qwen35_wrapper_translates_to_three_records():
     assert record["tokens_per_image"] is None
 
 
+@pytest.mark.parametrize("name", ["qwen35-tiny-mm", "qwen35-moe-native-tiny"])
+def test_a_qwen35_wrapper_repeating_its_text_width_translates_the_same(name):
+    """Ornith's Qwen3.5 wrappers state hidden_size at the top level too. The
+    wrapper config declares no such field and its model reads the text
+    config's, so a repeated value translates as if absent; another value
+    is refused by name, since it describes no model the reference builds."""
+    config = json.loads((FIXTURES / name / "config.json").read_text())
+    width = config["text_config"]["hidden_size"]
+
+    assert translate_wrapper_config({**config, "hidden_size": width}) == translate_wrapper_config(config)
+    with pytest.raises(ValueError, match=f"^hidden_size={2 * width} is not expressible"):
+        translate_wrapper_config({**config, "hidden_size": 2 * width})
+
+
+@pytest.mark.network
+@pytest.mark.parametrize("repo, revision", [
+    ("ornith-ai/Ornith-1.0-9B", "83dc1f5e24ef8527af019a6b3bf66ac0f1c2c999"),
+    ("ornith-ai/Ornith-1.0-35B", "5df2ed3f675c7beaa490328cc70bb573b65fb660"),
+])
+def test_ornith_wrappers_translate_from_their_released_configs(repo, revision):
+    """The two most downloaded Ornith wrappers (qwen3_5 and qwen3_5_moe),
+    config only: each repeats its text width at the top level."""
+    from huggingface_hub import hf_hub_download
+
+    config = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
+    assert config["hidden_size"] == config["text_config"]["hidden_size"]
+    record = translate_wrapper_config(config)
+    assert record["text_model_type"] == config["text_config"]["model_type"]
+
+
 def test_the_released_gemma4_wrapper_translates():
     """google/gemma-4-26B-A4B's wrapper, config only: the tower reads 1152
     wide with a pooling kernel of 3 and standardization on, the text half

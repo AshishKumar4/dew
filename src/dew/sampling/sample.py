@@ -53,23 +53,28 @@ def sample[StateT](
     times: ArrayLike | Sequence[float] | None = None,
     final_denoise: bool = True,
 ) -> jax.Array:
-    """`steps` points from T to 0: a solver step across each interval, then the
-    model's clean prediction at the last point.
+    """Run the reverse process from `x_T` with `solver` and return the final sample.
 
-    `denoise` is `process.denoiser(...)`, which carries the process the solver
-    reads; `guidance` wraps it. Every step's noise comes from `key` folded
-    with the step index, so a trajectory is reproducible from one key.
-    An explicit `times` grid is the trajectory when given, descending and
-    concrete, for a source whose solver pairs its own sigma and model-time
-    tables; it decides the length, so a grid of `steps + 1` points ending
-    on the terminal is legal and a single point walks nothing. Exactly one
-    of `steps` and `times` is passed. `final_denoise=False` returns the last
-    point's state without the closing clean prediction, the way those
-    solvers end.
+    The time grid runs from T to 0. The solver takes one step across each
+    interval, and the result is the model's clean prediction at the last
+    point. Pass exactly one of `steps` and `times`. With `steps`, the
+    process supplies a grid of that many points. An explicit `times` grid is
+    used as the trajectory, descending and concrete, for a source whose
+    solver pairs its own sigma and model-time tables. Its length sets the
+    number of steps, so a grid of `steps + 1` points ending on the terminal
+    is allowed, and a single point takes no solver step.
+    `final_denoise=False` returns the last point's state without the closing
+    clean prediction, which is how those solvers end.
 
-    The trajectory is one `lax.scan`, traced at each call: under a caller's
-    `jax.jit` it compiles once, as the pipelines and objectives call it,
-    and called eagerly it traces and compiles the scan again every time.
+    `denoise` is `process.denoiser(...)`, which holds the process the solver
+    reads, and `guidance` wraps it. Every step's noise comes from `key`
+    folded with the step index, so a trajectory is reproducible from one
+    key.
+
+    The trajectory is one `lax.scan`, traced at each call. Under a caller's
+    `jax.jit` it compiles once, which is how the pipelines and objectives
+    call it. Called eagerly, it traces and compiles the scan again every
+    time.
     """
     if (steps is None) == (times is None):
         raise ValueError("pass exactly one of steps and times")

@@ -1,7 +1,8 @@
-"""The trainer and what it is built from.
+"""The trainer and the pieces it is built from.
 
-`dew.training` knows no modality. It imports nothing from `dew.diffusion`,
-`dew.inputs` or `dew.sampling`, and wandb only when a `WandbTracker` logs.
+`dew.training` contains nothing specific to a modality. It imports nothing from
+`dew.diffusion`, `dew.inputs` or `dew.sampling` at runtime, and imports wandb
+only when a `WandbTracker` logs.
 """
 
 from dew.checkpoints import Checkpoints, Keep

@@ -91,6 +91,15 @@ Tolerances and the differences actually observed, fp32 on CPU:
   output projection and per-head sinks, three hash-routed layers over
   three top-k ones and the gate clamp at 2.0; rolling the hash table moves
   the logits by more than 1e-2 and dropping the clamp by more than 1.
+- nemotron-h-tiny uses the float64 rule. Native CPU RMS distances are
+  2.64e-7 for Dew and 2.19e-7 for transformers (ratio 1.20), with max
+  fp32 logit difference 1.25e-6 and equal argmax. Grouped gated SSD norms,
+  a dt floor, biased SSD projections, positionless GQA and ReLU² MLPs
+  live in independent pre-norm residual blocks.
+- nemotron-h-moe-tiny and its latent variant use the same float64 rule.
+  Native CPU ratios are 0.967 and 1.215, max fp32 logit difference 1.43e-6
+  for each, with equal argmax. They carry ungated routed and shared experts,
+  nonzero selection bias, grouped sigmoid routing and optional latent projections.
 """
 
 import dataclasses
@@ -107,13 +116,16 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.hf_decoders import translate_config, translate_weights
+from dew.interop.hf_decoders import DrafterRefused, translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.mixers import AttentionMixer
+from dew.nn.mixers.mamba2 import Mamba2Mixer
+from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.moe import Situ
 from dew.registry import models, with_precision
 
@@ -125,6 +137,7 @@ TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "llama31-tiny", "gpt2-tiny", "opt-tiny", "gpt-neox-tiny")
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = (*DEEPSEEK, "kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
+HYBRID = ("nemotron-h-tiny", "nemotron-h-moe-tiny", "nemotron-h-moe-latent-tiny")
 GEMMA4_MOE = FIXTURES / "gemma4-moe-tiny"
 REAL = FIXTURES / "qwen3-0.6b"
 
@@ -257,6 +270,24 @@ def test_a_multimodal_gemma3_config_is_refused():
 
     with pytest.raises(ValueError, match="model_type 'gemma3'"):
         translate_config(wrapped)
+
+
+def test_a_speculative_drafter_is_refused_by_design_naming_what_it_reads():
+    """RadixArk/Kimi-K3-DSpark ships a SpecForge drafter under model_type
+    qwen3. It reads Kimi K3's states after five of its 93 layers and has no
+    embedding or head of its own, so the refusal names the drafter, its
+    target layers and SGLang, where its draft arithmetic lives. Without
+    `num_target_layers` the same fields are an ordinary qwen3 config that
+    fails on what it cannot express."""
+    config = fixture_config("kimi-k3-dspark")
+
+    with pytest.raises(DrafterRefused, match=r"\['DSparkDraftModel'\].* 93-layer target's hidden "
+                       r"states after its layers \[7, 23, 51, 67, 83\].*SGLang"):
+        translate_config(config)
+    del config["num_target_layers"]
+    with pytest.raises(ValueError, match="config fields") as refused:
+        translate_config(config)
+    assert not isinstance(refused.value, DrafterRefused)
 
 
 def test_released_mistral_v03_config_translates_every_computational_field():
@@ -744,7 +775,7 @@ def test_a_ramp_the_reference_puts_on_one_kind_lands_on_that_kind():
             k: v for k, v in ramp.items() if k != 'high_freq_factor'}})
 
 
-@pytest.mark.parametrize("name", TINY + ROUTED)
+@pytest.mark.parametrize("name", TINY + ROUTED + HYBRID)
 def test_translated_weights_are_exactly_the_models_variables(name, rng):
     """Same collections, same paths, same shapes, same dtypes as a freshly
     initialised model: `params` for every family, and the `moe` collection
@@ -764,7 +795,7 @@ def test_translated_weights_are_exactly_the_models_variables(name, rng):
         assert leaf.dtype == jnp.float32, path
 
 
-@pytest.mark.parametrize("name", TINY + ROUTED)
+@pytest.mark.parametrize("name", TINY + ROUTED + HYBRID)
 def test_fp32_logits_match_the_reference_implementation(name):
     """The parity claim: transformers' logits, our logits, same weights."""
     directory = FIXTURES / name
@@ -773,10 +804,217 @@ def test_fp32_logits_match_the_reference_implementation(name):
     reference = np.load(directory / "logits.npy")
 
     logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
+    if name in HYBRID:
+        assert_as_exact_as_the_reference(logits, reference, np.load(directory / "logits_f64.npy"),
+                                         f"{name} logits")
+    else:
+        difference = float(np.max(np.abs(logits - reference)))
+        assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
     assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
+
+
+def test_nemotron_h_reads_independent_blocks_and_grouped_ssd():
+    """The SSD width and dt floor are the reference's, independently of expand and time_step_limit."""
+    config = translate_config(fixture_config("nemotron-h-tiny"))
+    model = config.value
+    assert model.per_layer_types == ("linear_attention", "mlp", "full_attention", "linear_attention", "mlp")
+    assert model.mlp_features == 0 and model.qk_norm is False
+    assert model.kind_of("linear_attention").mixer == Mamba2Mixer(
+        num_heads=4, head_dim=8, state_size=4, n_groups=2, norm_groups=2,
+        conv_kernel=4, chunk_size=4, use_bias=True, time_step_limit=(0.7, float("inf")))
+    assert model.kind_of("full_attention").mixer == AttentionMixer(nope=True)
+    assert model.kind_of("mlp").mixer == MLPMixer(intermediate_size=32)
+
+
+def test_nemotron_h_weight_names_invert():
+    from dew.interop.families.nemotron_h import export_path, weight_path
+    from dew.interop.sources import load_shards
+
+    config = translate_config(fixture_config("nemotron-h-tiny"))
+    for name in load_shards(FIXTURES / "nemotron-h-tiny"):
+        path = weight_path(name, config)
+        assert export_path(".".join(path[1:]), config) == name
+    assert weight_path("lm_head.weight", {"tie_embeddings": True}) is None
+    assert export_path("lm_head.kernel", {"tie_embeddings": True}) is None
+    with pytest.raises(ValueError, match="no place"):
+        weight_path("backbone.layers.0.mixer.rotary_emb.inv_freq", config)
+    with pytest.raises(ValueError, match="not a Nemotron-H"):
+        export_path("layers_0.mlp.gate_proj.kernel", config)
+
+
+def test_nemotron_h_does_not_claim_another_mamba2_hybrid():
+    from dew.interop.hf_decoders import family_entries
+
+    config = translate_config(fixture_config("nemotron-h-tiny"))
+    family = next(entry for entry in family_entries() if entry.model_types == ("nemotron_h",))
+    assert family.matches(config.value)
+    assert not family.matches(CausalTransformer(vocab_size=64, emb_features=16, num_heads=2,
+                                               mlp_features=0, qk_norm=False,
+                                               layer_types=("mamba", "full_attention"),
+                                               kinds={"mamba": LayerKind(mixer=Mamba2Mixer(n_groups=1))}))
+
+
+def test_nemotron_h_legacy_patterns_and_mamba_aliases_read_as_the_modern_config():
+    modern = fixture_config("nemotron-h-tiny")
+    legacy = {**modern, "hybrid_override_pattern": "M-*M-", "num_hidden_layers": 999}
+    del legacy["layers_block_type"]
+    for key, alias in (("n_groups", "mamba_n_groups"), ("conv_kernel", "mamba_d_conv"),
+                       ("chunk_size", "mamba_chunk_size"), ("use_conv_bias", "mamba_conv_bias"),
+                       ("time_step_min", "mamba_dt_min")):
+        legacy[alias] = legacy.pop(key)
+    assert translate_config(legacy) == translate_config(modern)
+    assert translate_config({**modern, "hybrid_override_pattern": "E"}) == translate_config(modern)
+    legacy["layer_types"] = ["mamba", "mlp", "attention", "mamba", "mlp"]
+    assert translate_config(legacy) == translate_config(modern)
+
+
+@pytest.mark.parametrize("legacy, read", [
+    ("mamba_num_groups", "n_groups"),
+    ("mamba_state_dim", "ssm_state_size"),
+    ("num_query_groups", "num_key_value_heads"),
+    ("rms_norm_eps", "layer_norm_epsilon"),
+    ("norm_eps", "layer_norm_epsilon"),
+])
+def test_nemotron_h_legacy_geometry_must_repeat_the_field_the_reference_reads(legacy, read):
+    """Released duplicates agree; a contradiction cannot silently name two geometries."""
+    modern = fixture_config("nemotron-h-tiny")
+    repeated = {**modern, legacy: modern[read]}
+    assert translate_config(repeated) == translate_config(modern)
+    with pytest.raises(ValueError, match=legacy):
+        translate_config({**repeated, legacy: modern[read] + 1})
+
+
+@pytest.mark.parametrize("changes, message", [
+    ({"num_nextn_predict_layers": 1}, "multi-token prediction"),
+    ({"mlp_hidden_act": "silu"}, "mlp_hidden_act"),
+    ({"mamba_hidden_act": "relu"}, "mamba_hidden_act"),
+    ({"layers_block_type": ["unknown"]}, "layers_block_type"),
+    ({"layers_block_type": None, "hybrid_override_pattern": "MX"}, "unknown block kinds"),
+    ({"layers_block_type": []}, "layers_block_type"),
+])
+def test_nemotron_h_refuses_a_block_it_cannot_compute(changes, message):
+    with pytest.raises(ValueError, match=message):
+        translate_config({**fixture_config("nemotron-h-tiny"), **changes})
+
+
+def _assert_nemotron_h_released_config(config, name):
+    if name == "nemotron-h-30b-a3b":
+        model = translate_config(config).value
+        assert model.num_layers == 52 and model.emb_features == 2688
+        assert model.per_layer_types.count("moe") == 23
+        mixer = model.kind_of("moe").mixer
+        assert isinstance(mixer, MLPMixer) and mixer.activation == "relu2"
+        assert mixer.mixture == Mixture(
+            experts=128, top_k=6, score_function="sigmoid", scaling=2.5, bias=True,
+            expert_features=1856, shared_features=3712)
+        return
+    model = translate_config(config).value
+    assert model.num_layers == 42 and model.emb_features == 3136 and model.max_seq_len == 262144
+    assert model.num_heads == 40 and model.kv_heads == 8 and model.features_per_head == 128
+    assert model.per_layer_types.count("linear_attention") == 21
+    assert model.per_layer_types.count("full_attention") == 4
+    assert model.per_layer_types.count("mlp") == 17
+    assert model.kind_of("linear_attention").mixer == Mamba2Mixer(
+        num_heads=96, head_dim=80, state_size=128, n_groups=8, norm_groups=8,
+        conv_kernel=4, chunk_size=256, time_step_limit=(0.001, float("inf")))
+    assert model.kind_of("mlp").mixer == MLPMixer(intermediate_size=12544)
+
+
+@pytest.mark.parametrize("name", ("nemotron-h-4b", "nemotron-h-30b-a3b"))
+def test_nemotron_h_released_configs_translate(name):
+    _assert_nemotron_h_released_config(fixture_config(name), name)
+
+
+@pytest.mark.parametrize("name", HYBRID[1:])
+def test_nemotron_h_routed_mixer_rebuilds_from_its_run_record(name):
+    from dew.registry import mixers
+
+    mixer = translate_config(fixture_config(name)).value.kind_of("moe").mixer
+    assert isinstance(mixer, MLPMixer) and mixer.mixture is not None
+    fields = dataclasses.asdict(mixer)
+    assert mixers.from_record({"name": "mlp", "fields": fields}) == mixer
+
+
+@pytest.mark.parametrize("fields", [{"layers": (1,)}, {"hash_layers": (1,)}, {"media_bias": True}])
+def test_nemotron_h_mixer_refuses_controls_owned_by_the_decoder_feedforward(fields):
+    with pytest.raises(ValueError, match="decoder feed-forward slot"):
+        MLPMixer(intermediate_size=16, mixture=Mixture(experts=8, **fields))
+
+
+def test_nemotron_h_zero_shared_width_uses_the_references_dense_width():
+    config = {**fixture_config("nemotron-h-moe-tiny"), "moe_shared_expert_intermediate_size": 0}
+    mixer = translate_config(config).value.kind_of("moe").mixer
+    assert isinstance(mixer, MLPMixer) and mixer.mixture is not None
+    assert mixer.mixture.shared_features == config["intermediate_size"]
+
+
+@pytest.mark.parametrize("name", HYBRID[1:])
+def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
+    """The native 3-D layout and transformers' per-expert save layout compute the same model."""
+    from safetensors.numpy import save_file
+
+    from dew.interop.sources import load_shards
+
+    tensors = load_shards(FIXTURES / name)
+    packed = {key: value for key, value in tensors.items() if ".experts." not in key}
+    for layer in (1, 3):
+        for projection in ("up_proj", "down_proj"):
+            stem = f"backbone.layers.{layer}.mixer.experts"
+            packed[f"{stem}.{projection}"] = np.stack(
+                [tensors[f"{stem}.{index}.{projection}.weight"] for index in range(8)])
+    source = tmp_path / "packed"
+    source.mkdir()
+    (source / "config.json").write_text(json.dumps(fixture_config(name)))
+    save_file(packed, source / "model.safetensors")
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    expected = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    for path, tensor in flat_tree(expected.variables).items():
+        np.testing.assert_array_equal(tensor, flat_tree(loaded.variables)[path])
+    destination = tmp_path / "export"
+    loaded.save(destination)
+    exported = load_shards(destination)
+    assert exported.keys() == packed.keys()
+    for key, tensor in packed.items():
+        np.testing.assert_array_equal(tensor, exported[key])
+    ids = np.load(FIXTURES / name / "input_ids.npy")
+    assert_as_exact_as_the_reference(loaded.model.apply(loaded.variables, ids),
+                                     np.load(FIXTURES / name / "logits.npy"),
+                                     np.load(FIXTURES / name / "logits_f64.npy"), f"{name} packed logits")
+
+
+@pytest.mark.network
+@pytest.mark.parametrize("name", ("nemotron-h-4b", "nemotron-h-30b-a3b"))
+def test_nemotron_h_pinned_hub_configs_read_as_the_committed_releases(name):
+    from huggingface_hub import hf_hub_download
+
+    source = json.loads((FIXTURES / name / "source.json").read_text())
+    config = json.loads(Path(hf_hub_download(source["repo"], "config.json",
+                                            revision=source["revision"])).read_text())
+    assert config == fixture_config(name)
+    _assert_nemotron_h_released_config(config, name)
+
+
+@pytest.mark.parametrize("name", HYBRID)
+def test_nemotron_h_export_preserves_the_source_config_weights_and_logits(name, tmp_path):
+    """The loaded hybrid exports in its source layout, as Mamba-2 and Qwen3-Next do."""
+    from dew.interop.sources import load_shards
+
+    directory = FIXTURES / name
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    destination = tmp_path / "nemotron-h"
+    loaded.save(destination)
+    assert json.loads((destination / "config.json").read_text()) == fixture_config(name)
+    source, exported = load_shards(directory), load_shards(destination)
+    assert source.keys() == exported.keys()
+    for name, tensor in source.items():
+        np.testing.assert_array_equal(tensor, exported[name])
+    restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
+    ids = np.load(directory / "input_ids.npy")
+    np.testing.assert_array_equal(loaded.model.apply(loaded.variables, ids),
+                                  restored.model.apply(restored.variables, ids))
+    assert_as_exact_as_the_reference(transformers_logits(destination, ids, tmp_path),
+                                     np.load(directory / "logits.npy"),
+                                     np.load(directory / "logits_f64.npy"), "Nemotron-H export logits")
 
 
 def test_the_bf16_gemma_forward_still_tracks_the_reference():

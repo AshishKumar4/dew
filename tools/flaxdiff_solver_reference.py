@@ -19,11 +19,13 @@ vector-Jacobian product of the last one through the whole walk, in float32
 and in float64.
 
     python tools/flaxdiff_solver_reference.py
+    python tools/flaxdiff_solver_reference.py rounding tests/fixtures/flaxdiff_solvers/rounding.npz 4
 """
 
 from __future__ import annotations
 
 import ast
+import sys
 import types
 import urllib.request
 from pathlib import Path
@@ -46,15 +48,18 @@ def source(path: str) -> str:
     return urllib.request.urlopen(url).read().decode()
 
 
-def definitions(path: str, names: set[str]) -> list[ast.stmt]:
-    tree = ast.parse(source(path))
+def definitions(path: str, names: set[str], *, wide: bool = False) -> list[ast.stmt]:
+    published_source = source(path)
+    if wide:
+        published_source = published_source.replace("jnp.float32", "jnp.float64")
+    tree = ast.parse(published_source)
     found = [node for node in tree.body
              if isinstance(node, ast.FunctionDef | ast.ClassDef) and node.name in names]
     assert {node.name for node in found} == names, names - {node.name for node in found}
     return found
 
 
-def published() -> dict:
+def published(*, wide: bool = False) -> dict:
     """The schedule classes, a `DiffusionSampler` holding its published
     `sample_step`, `get_steps` and `generate_samples`, and the two samplers,
     in one namespace."""
@@ -63,10 +68,11 @@ def published() -> dict:
     exec(compile(ast.Module(body=definitions("utils.py", {"MarkovState", "RandomMarkovState", "clip_images"}),
                             type_ignores=[]), "flaxdiff/utils.py", "exec"), scope)
     schedules = definitions("schedulers/common.py", {"get_coeff_shapes_tuple", "reshape_rates",
-                                                     "NoiseScheduler", "GeneralizedNoiseScheduler"})
-    schedules += definitions("schedulers/karras.py", {"KarrasVENoiseScheduler"})
+                                                     "NoiseScheduler", "GeneralizedNoiseScheduler"},
+                            wide=wide)
+    schedules += definitions("schedulers/karras.py", {"KarrasVENoiseScheduler"}, wide=wide)
     exec(compile(ast.Module(body=schedules, type_ignores=[]), "flaxdiff/schedulers", "exec"), scope)
-    methods = [node for node in definitions("samplers/common.py", {"DiffusionSampler"})[0].body
+    methods = [node for node in definitions("samplers/common.py", {"DiffusionSampler"}, wide=wide)[0].body
                if isinstance(node, ast.FunctionDef)
                and node.name in {"sample_step", "get_steps", "generate_samples"}]
     assert len(methods) == 3, [node.name for node in methods]
@@ -132,6 +138,28 @@ def closed(scope: dict, name: str, x_T, steps: int, clipped: bool):
     return sampler.generate_samples(None, x_T.shape[0], x_T.shape[1], diffusion_steps=steps, priors=x_T)
 
 
+def rounding(destination: Path, copies: int) -> None:
+    """RK4's clipped output over independent initial states.
+
+    Its denoiser and stages are pointwise, so permutations repeat the same
+    rounding draw. More independent states average their per-input variance
+    without changing the reference rule. The float64 namespace widens the
+    source's explicit float32 timestep casts as well as the input; otherwise
+    its sigma calculations retain float32 roundings in the oracle. Every
+    `jnp.float32` the widening replaces is a dtype argument or cast:
+    schedulers/common.py:18 (a dtype default), karras.py:49 (astype) and :71
+    (a random draw's dtype, unused by the walk), samplers/common.py:144 and
+    :206 (the step array's dtype), at the pinned commit.
+    """
+    generator = np.random.default_rng(4)
+    initial = (generator.standard_normal((32 * copies, 64)) * SIGMA_MAX).astype(np.float32)
+    single = closed(published(), "rk4", jnp.asarray(initial), STEPS, clipped=True)
+    truth = closed(published(wide=True), "rk4", jnp.asarray(initial, jnp.float64), STEPS, clipped=True)
+    np.savez_compressed(destination, copies=np.asarray(copies), x_T=initial,
+                        clipped=np.asarray(single), clipped_f64=np.asarray(truth))
+    print(f"{destination}: {copies} independent initial states per original entry")
+
+
 def main() -> None:
     scope = published()
     grid = scope["KarrasVENoiseScheduler"](timesteps=1.0)
@@ -165,4 +193,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["rounding"]:
+        rounding(Path(sys.argv[2]), int(sys.argv[3]))
+    else:
+        main()

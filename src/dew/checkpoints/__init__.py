@@ -47,7 +47,7 @@ import numpy as np
 import orbax.checkpoint as ocp
 from etils import epath
 from jax.experimental import multihost_utils
-from orbax.checkpoint.checkpoint_manager import MultiprocessingOptions
+from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position
@@ -115,6 +115,26 @@ def _with_averages(opt_state, averages):
 def is_uri(path: str) -> bool:
     """Return whether a path names a `<scheme>://` location, such as a gs:// bucket."""
     return '://' in path
+
+
+ORDERED_DIRECTORIES = AsyncOptions(create_directories_asynchronously=False)
+"""A local save creates its step's tmp directory, then its items', before it returns.
+
+orbax 0.12.4 creates them by default in background threads that wait on
+signals keyed by the save's operation id alone (google/orbax#3621), so in a
+pool another process's "directories created" can release this process's
+item writer early. Its `parents=True` mkdir then creates the step's
+directory, and the step's own `exist_ok=False` mkdir raises FileExistsError
+(a CI shard's pool hung on it). Two-process local runs on two cores raised
+it in 13 of 53 with the threads unordered and in 0 of 70 with them in
+order. In order, a save call on local disk took 14.0 ms against 6.9.
+
+Only the local manager, whose processes each write a directory of their
+own, takes it. The persistent manager's primary creates one shared
+directory, and its signal is meant to release every process's writer, so
+a key shared across processes is the design there; its saves keep
+creating directories in the background, which matters on GCS, where a
+synchronous mkdir chain costs far more than on local disk."""
 
 
 def location(directory: str) -> epath.Path:
@@ -801,22 +821,33 @@ class Checkpoints:
 
     def _open_local(self) -> ocp.CheckpointManager:
         if self._local_manager is None:
-            # No primary host: every process writes its own metadata, and
-            # every shard it holds, one copy per process, so each process's
-            # directory is complete for its devices.
+            # Each process is a pool of one for its local manager: it writes
+            # its own metadata, and every shard it holds, one copy per
+            # process, so each process's directory is complete for its
+            # devices, and orbax's barriers wait for this process alone. Over
+            # the whole pool, a save that failed in one process's background
+            # thread (FileExistsError creating its tmp directory, a CI shard
+            # on 2026-10-05) left that process's finalize waiting at a
+            # barrier the others had passed, and the pool hung until orbax's
+            # 600 s timeout; alone, the failure reaches the process's next
+            # save, which raises and ends the pool.
             # Only device arrays are registered, because orbax writes a host
             # array from process 0 alone whatever the options say; the
             # position table rides as a replicated device array instead. The
             # prefix keeps this manager's barriers apart from the persistent
-            # one's, whose keys are otherwise the same at a step both write.
-            multiprocessing = MultiprocessingOptions(primary_host=None,
-                                                     barrier_sync_key_prefix='local')
+            # one's and from the other processes' own.
+            me = jax.process_index()
+            multiprocessing = MultiprocessingOptions(primary_host=me, active_processes={me},
+                                                     barrier_sync_key_prefix=f'local{me}')
             registry = ocp.type_handlers.create_type_handler_registry(
                 (jax.Array, ocp.type_handlers.ArrayHandler(
                     primary_host=None, replica_id=None, use_replica_parallel=False)))
+            # orbax creates no directory for a manager over a subset of the pool.
+            epath.Path(self.local_path).mkdir(parents=True, exist_ok=True)
             options = ocp.CheckpointManagerOptions(
-                max_to_keep=1, create=True, cleanup_tmp_directories=True,
-                enable_async_checkpointing=True, multiprocessing_options=multiprocessing)
+                max_to_keep=1, create=False, cleanup_tmp_directories=True,
+                enable_async_checkpointing=True, multiprocessing_options=multiprocessing,
+                async_options=ORDERED_DIRECTORIES)
             self._local_manager = ocp.CheckpointManager(
                 self.local_path, options=options,
                 item_handlers=ocp.PyTreeCheckpointHandler(

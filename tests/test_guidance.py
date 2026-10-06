@@ -42,9 +42,20 @@ def test_apg_walks_diffusers_adaptive_projected_guidance(name):
     velocity, over a whole Euler walk; `plain` (eta 1, nothing clipped, no
     momentum) is classifier-free guidance. `interval` guides only the
     guider's steps [int(start N), int(stop N)) of ten, 2 through 6, which is
-    `interval=(2/10, 6/10)`, the momentum resting on the steps either side."""
-    arrays = np.load(FIXTURES / "apg.npz")
-    case = json.loads(str(arrays["cases"]))[name]
+    `interval=(2/10, 6/10)`, the momentum resting on the steps either side.
+
+    Plain guidance has no order-dependent reduction. Its 1024 independent
+    states resolve the RMS error instead: default/AVX/SDE-ICX ratios are
+    1.03/1.11/1.03; disjoint subsets of 128 states range from 0.98 to 1.17.
+    Two states put an AVX subset at 2.18 despite the same computation.
+
+    After the compensated projection, projected ratios over 52 spatial
+    orders range from 1.47 to 1.80 on default/SDE-ICX and 1.33 to 1.67 on
+    AVX, so its single-draw rule keeps a margin at the factor of two.
+    """
+    ensemble = name == "plain"
+    arrays = np.load(FIXTURES / ("apg_ensemble.npz" if ensemble else "apg.npz"))
+    case = json.loads(str(arrays["case"])) if ensemble else json.loads(str(arrays["cases"]))[name]
     steps = case["steps"]
     first, after = int(case["start"] * steps), int(case["stop"] * steps)
     rows = arrays["x_T"].shape[0]
@@ -55,7 +66,8 @@ def test_apg_walks_diffusers_adaptive_projected_guidance(name):
                    momentum=case["momentum"], interval=(first / steps, (after - 1) / steps))
     walked = sample(denoise, jnp.asarray(arrays["x_T"]), steps + 1, solver=Euler(),
                     guidance=guidance, key=jax.random.PRNGKey(0), final_denoise=False)
-    assert_as_exact_as_the_reference(walked, arrays[f"{name}.result32"], arrays[f"{name}.result"], name)
+    prefix = "" if ensemble else f"{name}."
+    assert_as_exact_as_the_reference(walked, arrays[f"{prefix}result32"], arrays[f"{prefix}result"], name)
 
 
 def test_a_flow_trajectory_refuses_apg_momentum():
@@ -68,6 +80,38 @@ def test_a_flow_trajectory_refuses_apg_momentum():
     with pytest.raises(ValueError, match="momentum"):
         FlowSDE(0.5).trajectory(denoise, jnp.zeros((1, 3, 4)), 4, guidance=APG(4.0, momentum=-0.5),
                                 key=jax.random.key(0))
+
+
+class RawPrediction(nn.Module):
+    """Given predictions isolate the guidance from a model's rounding."""
+
+    def __call__(self, x, time, *, prediction):
+        return prediction
+
+
+@pytest.mark.parametrize("name", ["ordinary", "large", "tiny", "different_scales"])
+def test_apg_keeps_diffusers_projection_precision_on_raw_predictions(name):
+    """Diffusers projects in float64 and rounds each component to fp32.
+    Nearly parallel raw predictions expose the rounding of the orthogonal
+    component without an Euler walk's conversion through a clean prediction."""
+    arrays = np.load(FIXTURES / "apg_projection.npz")
+    conditional, unconditional = (jnp.asarray(arrays[f"{name}.{key}"])
+                                   for key in ("conditional", "unconditional"))
+    process = Process(FlowMatchingScheduler(), DirectPredictionTransform())
+
+    @jax.jit
+    def projected(conditional, unconditional):
+        denoise = process.denoiser(RawPrediction(), {}, {"prediction": conditional},
+                                   {"prediction": unconditional})
+        walk = APG(6.0, eta=0.0, norm_threshold=0.0).walk(denoise, 1)
+        x = jnp.zeros_like(conditional)
+        # At alpha=0 and sigma=1, DirectPredictionTransform returns the raw
+        # prediction as x0, so the denoiser's conversion introduces no rounding.
+        return walk.step(x, jnp.ones(x.shape[0]), 0, walk.init(x))[0][0]
+
+    prediction = projected(conditional, unconditional)
+    assert_as_exact_as_the_reference(prediction, arrays[f"{name}.result32"], arrays[f"{name}.result"],
+                                     f"APG projection {name}")
 
 
 class Strength(nn.Module):

@@ -616,3 +616,34 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
     assert_as_exact_as_the_reference(np.asarray(folded, np.float32), np.asarray(plain, np.float32), truth,
                                      "folded")
 
+
+@pytest.mark.skipif(jax.default_backend() != 'gpu', reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
+def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
+    """`dew.nn.kernels.decode_attention` reads each row's keys up to its
+    length, block by block, and is within tests/reference_error.py's rule of
+    jax.nn's xla attention against float64: rows reading 1 key (an idle
+    slot), a block's worth, one past it, and the whole capacity, at
+    Qwen3.5-0.8B's widths (4 query positions over 2 key heads of 256)."""
+    from dew.nn.kernels import decode_attention
+
+    rng = np.random.default_rng(0)
+    capacity = 4 * decode_attention.BLOCK
+    lengths = jnp.asarray([1, decode_attention.BLOCK, decode_attention.BLOCK + 1, 77, capacity], jnp.int32)
+    rows = lengths.shape[0]
+    query = jnp.asarray(rng.normal(size=(rows, 4, 2, 256)), dtype)
+    key = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)) * 0.3, dtype)
+    value = jnp.asarray(rng.normal(size=(rows, capacity, 2, 256)), dtype)
+    assert decode_attention.fits(query, key)
+    out = jax.jit(decode_attention.attend)(query, key, value, lengths)
+    plain = jax.nn.dot_product_attention(query, key, value, key_value_seq_lengths=lengths,
+                                         implementation='xla')
+    assert out.shape == plain.shape and out.dtype == plain.dtype
+    q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
+    read = np.arange(capacity)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
+    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    truth = np.einsum('bnts,bsnd->btnd', probs / probs.sum(-1, keepdims=True), v)
+    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
+                                     "decode kernel")
+

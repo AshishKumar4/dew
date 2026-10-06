@@ -13,6 +13,7 @@ reports. These values are JAX pytrees.
 
 from __future__ import annotations
 
+import enum
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
@@ -356,6 +357,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
     _ema_is_reference: ClassVar[bool] = False
+    # The name an objective that trains other networks beside its model nests
+    # the model under in every collection, as PPO nests its policy beside the
+    # critic; None when the saved tree is the model's.
+    _model_part: ClassVar[str | None] = None
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
     shown: Mapping[str, Shown] = {}
@@ -562,6 +567,26 @@ class Objective(ABC, Generic[Loss, Effects]):
             return state.variables
         return state.averaged
 
+    @classmethod
+    def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
+                         mesh: MeshSpec | None = None, layout: Layout | None = None,
+                         param_dtype: DTypeLike | None = None,
+                         parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))
+                         ) -> Variables:
+        """Return the model's variables from a run of this objective, as every run loader reads them.
+
+        The arguments are `Checkpoints.variables`'. An objective whose average
+        is its frozen reference gives the trained weights whatever `ema` asks,
+        and one that nests the model beside other networks gives the model's
+        own part, its trained and frozen collections together.
+        """
+        from dew.checkpoints import Checkpoints
+
+        variables = Checkpoints(directory).variables(
+            step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
+            param_dtype=param_dtype, parameter_roots=parameter_roots)
+        return variables if cls._model_part is None else part(variables, cls._model_part)
+
     def inference_record(self) -> JSON:
         """Return the registered model and task settings that let a saved step be rebuilt.
 
@@ -569,16 +594,17 @@ class Objective(ABC, Generic[Loss, Effects]):
         custom research method can still restore its raw state.
         """
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task:
+    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> Task | SavedTask:
         """Return the trained model as its inference task, over `state`'s weights.
 
-        With `ema` None, the task uses `state.averaged` when the objective
-        keeps an average and the live parameters otherwise, which is how
-        `dew.pipeline` reads a run. True requires the average, and False
-        selects the live parameters. An objective with a reference policy
-        returns the trained policy, never the frozen reference its loss
-        compares against. The arrays keep their placement. Objectives
-        without a generation task raise `TypeError`.
+        With `ema` None, the task uses `state.averaged` when the objective keeps an
+        average and the live parameters otherwise, which is how `dew.pipeline` reads a
+        run. True requires the average, and False selects the live parameters. An
+        objective with a reference policy returns the trained policy, never the frozen
+        reference its loss compares against. The arrays keep their placement.
+        Objectives without a generation task raise `TypeError`. A plugin objective
+        returns its own `saved_task` class, so the return type also allows a
+        `SavedTask` besides Dew's own tasks.
         """
         raise TypeError(f"{type(self).__name__} has no inference task")
 
@@ -672,6 +698,20 @@ def merge_totals(accumulated: tuple[float, float],
 def mean_of_totals(accumulated: tuple[float, float]) -> float:
     """Divide a metric's summed total by its summed count."""
     return accumulated[0] / accumulated[1]
+
+
+class Omitted(enum.Enum):
+    """A keyword the caller left out, where None is a value of its own.
+
+    An objective built over a loaded bundle takes what the bundle supplies for
+    such a keyword (`variables`, `processor`, a pipeline's `autoencoder`) only
+    when it is omitted; an explicit None clears it.
+    """
+
+    OMITTED = "omitted"
+
+
+OMITTED = Omitted.OMITTED
 
 
 __all__ = [
