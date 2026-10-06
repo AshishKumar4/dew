@@ -11,9 +11,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_stubs import batch_for
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
-from test_diffusion_run_sources import batch_for
 
 import dew
 from dew.checkpoints import Checkpoints

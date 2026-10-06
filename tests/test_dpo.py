@@ -16,12 +16,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
+from rl_support import TinyHead
 
 from dew.data import DataPartition, Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
-from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
@@ -86,30 +85,6 @@ def test_the_fixture_names_its_reference(reference):
 
 
 # --- the objective -------------------------------------------------------------
-
-class TinyHead(nn.Module):
-    """A position-wise map with the backbone's scoring contract: int32 ids
-    in, float32 logits out, the head split off behind `hidden_states` and
-    `output_table`."""
-
-    vocab_size: int
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False):
-        x = nn.Embed(self.vocab_size, 8)(tokens)
-        h = nn.LayerNorm()(x)
-        return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
-
-    def __call__(self, tokens, train: bool = False):
-        return self.lm_head(
-            self.hidden_states(tokens, train=train)).astype(jnp.float32)
-
-    def output_table(self):
-        return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False)
-
 
 def pair_batch(seed=0):
     """Two pairs of full-length rows, `[PAIRS, 2, WIDTH]`, with prompt

@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_rl_surrogate import clipped_surrogate
+from rl_support import clipped_surrogate
 
 from dew.data import Dataset
 from dew.nn.backbones.causal_transformer import CausalTransformer
