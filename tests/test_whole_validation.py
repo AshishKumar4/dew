@@ -21,16 +21,20 @@ from test_objective_inputs import cases, corpus_windows
 from dew import Dataset, Evaluation
 from dew.config import ModelConfig
 from dew.data import DataPartition, Loading, TFDSImages
+from dew.data.chat import Role
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Flow
-from dew.objectives.base import VALID_ROWS, Step
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.base import VALID_ROWS, Objective, Step
 from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
-from dew.objectives.lm import Perplexity
+from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives
 from dew.sampling import Euler
 
 ROWS = 8
 """A batch's rows: one per device of the lane's eight."""
+TOKEN_ACCURACY = FIXTURES / "token_accuracy"
+"""TRL's token-accuracy references (`tools/token_accuracy_reference.py`)."""
 RECORDS = 9
 """The split: a batch and one record, so on two processes one share runs out
 a batch before the other's and covers it with a copy of its last."""
@@ -182,6 +186,76 @@ def test_a_pass_scores_every_record_once_and_a_deterministic_loss_is_the_unbatch
     """Every registered objective with an evaluation loss, on one process
     (`tests/test_multiprocess.py` runs the same on two)."""
     assert_every_record_once(name, evaluated(name, windows, tmp_path))
+
+
+def test_an_accuracy_counts_neither_the_hits_nor_the_answers_of_a_repeat_row():
+    """`Objective.accuracy` over a batch whose last row repeats the first:
+    the repeat's hits and answers both drop out, a target mask weighs each
+    answer, and a batch with nothing counted reports 0."""
+    correct = jnp.asarray([[1.0, 0.0, 1.0], [0.0, 0.0, 1.0], [1.0, 1.0, 1.0]])
+    weights = jnp.asarray([[1.0, 1.0, 0.0], [1.0, 1.0, 1.0], [1.0, 1.0, 1.0]])
+    padded = {VALID_ROWS: np.asarray([True, True, False])}
+    accuracy, counted = Objective.accuracy(correct, padded, weights).mean()
+    assert bool(counted) and accuracy == np.float32(2) / np.float32(5)
+    assert Objective.accuracy(correct, {}).mean()[0] == np.float32(6) / np.float32(9)
+    assert float(Objective.accuracy(correct, {}, jnp.zeros_like(correct)).mean()[0]) == 0.0
+
+
+def test_a_validation_token_accuracy_is_the_unpadded_one_and_at_most_one():
+    """TRL's count on tests/fixtures/token_accuracy's five-row batch, padded
+    to eight with three repeats of its row with the most right targets: the
+    loss reports TRL's right over counted, which the repeats' hits pushed
+    above it before they were left out of the count's numerator."""
+    reference = dict(np.load(TOKEN_ACCURACY / "decoder.npz"))
+    model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=2, num_heads=2, mlp_features=32,
+                              max_seq_len=16, attention_impl="reference")
+    params = model.init(jax.random.key(0), jnp.ones((1, 12), jnp.int32))
+    objective = LMObjective(model, seq_len=11, ema_decay=None, loss_role=Role.ASSISTANT, token_accuracy=True)
+    variables = {**objective.init(jax.random.key(0)), "params": params["params"]}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
+    tokens, roles = reference["1/tokens"], reference["1/roles"]
+    real = {"text": jnp.asarray(tokens), "text_roles": jnp.asarray(roles)}
+    scores = objective.evaluate(variables, real, step)
+    best = int(np.argmax(np.sum(np.asarray(scores.correct) * np.asarray(scores.weights), axis=1)))
+    repeats = [best] * 3
+    padded = {"text": jnp.asarray(np.concatenate([tokens, tokens[repeats]])),
+              "text_roles": jnp.asarray(np.concatenate([roles, roles[repeats]])),
+              VALID_ROWS: np.arange(len(tokens) + 3) < len(tokens)}
+    _, aux = objective.loss(variables, padded, step)
+    expected = int(reference["1/correct"]) / int(reference["1/total"])
+    assert float(aux.metrics["token_accuracy"]) == pytest.approx(expected, rel=1e-6)
+    assert float(aux.metrics["token_accuracy"]) <= 1.0
+
+
+def test_a_masked_diffusion_accuracy_leaves_its_repeat_rows_out(windows):
+    """With every weight zero the model predicts token 0 at every masked
+    position, so repeat rows of zeros are all right and the real text, which
+    holds no zero byte, all wrong: the pass's masked accuracy is the real
+    rows' 0, where counting the repeats reported more."""
+    objective, batch = cases(windows)["masked_diffusion"]()
+    records = records_of(batch, 5)
+    variables = jax.tree.map(jnp.zeros_like, objective.init(jax.random.key(0)))
+    zeros = jax.tree.map(np.zeros_like, records[0])
+    padded = {**stacked(records + [zeros] * (ROWS - 5)), VALID_ROWS: np.arange(ROWS) < 5}
+    aux = objective._loss(variables, padded, Step(jnp.asarray(0), jax.random.key(1), None))[1]
+    assert float(aux.metrics["masked_fraction"]) > 0
+    assert float(aux.metrics["masked_accuracy"]) == 0.0
+
+
+def test_a_dpo_accuracy_is_the_real_rows_whatever_the_repeats_hold(windows):
+    """DPO's preference accuracy over five pairs the policy ranks right,
+    padded with repeats that swap chosen and rejected, which it ranks wrong:
+    the pass reports the five pairs' accuracy, as their batch alone does."""
+    objective, batch = cases(windows)["dpo"]()
+    records = records_of(batch, 5)
+    swapped = [jax.tree.map(lambda value: value[::-1], record) for record in records[:ROWS - 5]]
+    with jax.enable_x64(new_val=True):
+        variables = moved(objective.init(jax.random.key(0)), 3)
+        step = Step(jnp.asarray(0), jax.random.key(1), moved(objective.init(jax.random.key(0)), 13))
+        alone = float(objective._loss(variables, stacked(records), step)[1].metrics["accuracy"])
+        padded = {**stacked(records + swapped), VALID_ROWS: np.arange(ROWS) < 5}
+        reported = float(objective._loss(variables, padded, step)[1].metrics["accuracy"])
+    assert alone == 1.0 and reported == alone
 
 
 def perplexity(windows, count: int = RECORDS) -> dict:
