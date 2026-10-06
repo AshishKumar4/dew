@@ -69,10 +69,11 @@ def test_a_kl_autoencoder_gives_the_posterior_end_to_end_tuning_trains_through(d
     DCAutoencoder(model=DCAE(), params={}, latent_scale=1.0),
 ], ids=lambda autoencoder: type(autoencoder).__name__)
 def test_an_autoencoder_whose_latent_is_no_kl_draw_refuses_by_name(autoencoder):
-    """FLUX.2's latent folds 2x2 blocks of its AutoencoderKL's draw and
-    normalizes them by batch-norm statistics, and a DC-AE encodes without
-    a posterior: neither latent is a draw an objective may renormalize, so
-    each refuses the posterior and its decode, naming itself."""
+    """Two autoencoders that inherit the base refusal. FLUX.2's latent folds
+    2x2 blocks of its AutoencoderKL's draw and normalizes them by batch-norm
+    statistics, and a DC-AE encodes without a posterior: neither latent is a
+    draw an objective may renormalize, so each refuses the posterior and its
+    decode, naming itself."""
     name = type(autoencoder).__name__
     with pytest.raises(TypeError, match=name):
         autoencoder.moments(autoencoder.params, jnp.zeros((1, 8, 8, 3)))
