@@ -130,3 +130,33 @@ def test_a_timed_out_handler_does_not_release_ongoing_compute(service, tmp_path,
                 client.request(payload)
         finally:
             finished.set()
+
+
+def test_serving_accepts_only_the_tokenizer_layout_it_can_reproduce(service):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    positions = np.array([[0, 1]], np.int32)
+    calls = []
+
+    class Server:
+        def processor(self, prompt):
+            return SimpleNamespace(tokens=np.array([[1, 2]], np.int32),
+                                   token_fields={"positions": positions}, conditioning={})
+
+        def submit(self, ids, budget, *, key):
+            calls.append(ids.copy())
+            return SimpleNamespace(result=lambda: SimpleNamespace(text=["ok"]))
+
+        def run(self):
+            pass
+
+    models = service.NativeModels.__new__(service.NativeModels)
+    models.np, models.text_servers = np, {"model": Server()}
+    request = {"model": "model", "prompt": "hello", "tokens": 2, "key": 0}
+    assert models.text([request]) == [{"text": ["ok"]}]
+    np.testing.assert_array_equal(calls[0], [1, 2])
+    positions[:] = [[5, 6]]
+    assert isinstance(models.text([request])[0], ValueError)
+    assert len(calls) == 1

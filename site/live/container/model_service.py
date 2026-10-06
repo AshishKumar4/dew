@@ -117,7 +117,8 @@ class NativeModels:
                      "guidance": {"scale": 6, "interval": [0.15, 0.9], "rescale": 0}}, lambda *_: None)
         for name in self.text_servers:
             print("MODEL_PHASE", time.time(), "warm text", name, flush=True)
-            warmed = self.text([{"model": name, "prompt": "The capital of France is", "tokens": 24, "key": 0}])
+            warmed = self.text([{"model": name, "prompt": "The capital of France is",
+                                 "tokens": 24, "key": 0}])
             if isinstance(warmed[0], Exception):
                 raise warmed[0]
 
