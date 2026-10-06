@@ -28,6 +28,7 @@ import optax
 import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
+from moe_support import by_expert, router_variables
 from sharded import assert_sharded
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -53,26 +54,6 @@ TINY_SHARD = 256
 def fixture(name: str) -> dict:
     with np.load(FIXTURES / f"{name}.npz") as data:
         return {key: np.asarray(value) for key, value in data.items()}
-
-
-def by_expert(indices, weights):
-    """One token's slots ordered by expert id, indices and weights together."""
-    order = np.argsort(np.asarray(indices), axis=-1)
-    return (np.take_along_axis(np.asarray(indices), order, axis=-1),
-            np.take_along_axis(np.asarray(weights), order, axis=-1))
-
-
-def router_variables(tensors, bias=False):
-    """The reference gate weight as a `Router` parameter tree.
-
-    torch Linear holds [out, in] and Dew keeps [in, out], the transpose every
-    kernel takes in dew.interop.hf_decoders.
-    """
-    variables = {"params": {"kernel": jnp.asarray(tensors["mlp.gate.weight"].T)}}
-    if bias:
-        variables["moe"] = {"e_score_correction_bias": jnp.asarray(
-            tensors["mlp.gate.e_score_correction_bias"])}
-    return variables
 
 
 def sparse_variables(tensors, num_experts):
