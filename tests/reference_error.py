@@ -130,6 +130,44 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
         f"rounding over {roundings} steps of its scale {scale:.3e}")
 
 
+def chain_roundings(closed_jaxpr) -> int:
+    """An upper bound on the roundings any output of a traced computation
+    goes through, for `assert_computes_the_oracle`: each operation rounds
+    once and each reduction once per term after its first (a contraction's
+    terms, a convolution's window times its input features, a reduction's
+    axes), summed over every operation of the jaxpr and of the jaxprs it
+    calls, a scan's body once per step. A chain from an input to an output
+    visits each operation at most once, so no chain makes more."""
+
+    def length(equation) -> int:
+        name, params = equation.primitive.name, equation.params
+        shape = equation.invars[0].aval.shape if equation.invars else ()
+        if name == "dot_general":
+            (contracting, _), _ = params["dimension_numbers"]
+            return int(np.prod([shape[axis] for axis in contracting], dtype=np.int64))
+        if name == "conv_general_dilated":
+            kernel = equation.invars[1].aval.shape
+            spec = params["dimension_numbers"].rhs_spec
+            return int(np.prod([kernel[axis] for axis in spec[1:]], dtype=np.int64))
+        if name.startswith(("reduce_", "argmax", "argmin", "cum")) and "axes" in params:
+            return int(np.prod([shape[axis] for axis in params["axes"]], dtype=np.int64))
+        return 1
+
+    def walk(jaxpr, times: int) -> int:
+        total = 0
+        for equation in jaxpr.eqns:
+            total += times * length(equation)
+            steps = equation.params.get("length", 1) if equation.primitive.name == "scan" else 1
+            for value in equation.params.values():
+                for inner in value if isinstance(value, (tuple, list)) else (value,):
+                    body = getattr(inner, "jaxpr", inner)
+                    if hasattr(body, "eqns"):
+                        total += walk(body, times * steps)
+        return total
+
+    return walk(closed_jaxpr.jaxpr, 1)
+
+
 def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) -> None:
     """Dew within a quarter of the reference's RMS rounding error of the
     reference's own output."""

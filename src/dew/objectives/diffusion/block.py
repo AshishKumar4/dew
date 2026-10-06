@@ -113,15 +113,15 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     return positions, encoder_mask, packed_positions, decoder_mask, key_positions
 
 
-def _row_mean(losses: jax.Array, mask: jax.Array) -> Ratio:
-    """Average the masked losses within each row, then sum the rows.
+def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
+    """Average the masked losses within each row, then sum the rows (`Objective.row_mean`).
 
     The mass is the row count, so accumulation weighs rows equally however
     many tokens each one counted.
     """
     mass = mask.sum(axis=-1)
-    row_losses = jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1)
-    return Ratio(row_losses.sum(), jnp.asarray(losses.shape[0], jnp.int32))
+    return Objective.row_mean(jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1),
+                              batch)
 
 
 @objectives("block_diffusion")
@@ -305,12 +305,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, _ = self._token_losses(
             variables, batch, step.key, train=True)
         canvas_stats, encoder_stats = (
-            _row_mean(canvas_losses, target_mask),
-            _row_mean(encoder_losses, encoder_target_mask),
+            _row_losses(canvas_losses, target_mask, batch),
+            _row_losses(encoder_losses, encoder_target_mask, batch),
         )
         support = (
-            self.decoder_loss_weight * target_mask.sum()
-            + self.encoder_loss_weight * encoder_target_mask.sum()
+            self.decoder_loss_weight * self.row_mean(target_mask, batch).total
+            + self.encoder_loss_weight * self.row_mean(encoder_target_mask, batch).total
         )
         stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
         return stats, Aux(metrics={"canvas_ce": canvas_stats.mean()[0],

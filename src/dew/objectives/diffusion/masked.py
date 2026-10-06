@@ -183,7 +183,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
             variables, batch, step.key, train=True)
-        nelbo = Ratio(jnp.sum(losses * weights), jnp.sum(real, dtype=jnp.float32))
+        nelbo = Ratio(self.row_mean(losses * weights, batch).total,
+                      self.row_mean(real.astype(jnp.float32), batch).total)
         correct = (predicted == tokens).astype(losses.dtype)
         return nelbo, Aux(metrics={
             "masked_accuracy": jnp.sum(correct * counted) / jnp.maximum(jnp.sum(counted), 1.0),

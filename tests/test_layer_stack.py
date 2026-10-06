@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from sharded import assert_sharded
 
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
@@ -353,6 +354,7 @@ def loss_and_grads(objective, spec, variables, batch, devices=None):
     mesh = spec.build(devices)
     layout = Layout(min_shard=TINY_SHARD)
     placed = jax.device_put(variables, layout.shardings(mesh, variables))
+    assert_sharded(placed["params"], mesh)
     batch = shard_batch(mesh, batch)
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 

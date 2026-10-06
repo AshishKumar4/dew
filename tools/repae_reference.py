@@ -16,20 +16,24 @@ statements of its loop body from `vae.train()` to the SiT update, run on
 REPA-E's own `AutoencoderKL.forward` and `DiagonalGaussianDistribution`,
 `SiT.forward`, `interpolant`, `unpatchify`, `init_bn`, `LabelEmbedder`
 and `build_mlp`, `ReconstructionLoss_Single_Stage` and the script's
-`requires_grad`, `update_ema` and `preprocess_imgs_vae`. The autoencoder's
-encoder, decoder and 1x1 convolutions are tests/fixtures/tiny_diffusers'
-SD VAE, run by diffusers; the SiT's embedders, blocks and final layer and
-the discriminator are small stand-ins (`Patches`, `Times`, `Block`,
-`Final`, `Discriminator`) whose weights the fixture carries, and the
-representation features are a stand-in encoder's over the
-ImageNet-normalized pixels (REPA's `preprocess_raw_image` is held in
-tests/test_alignment.py; at 32 pixels it would resize to none).
+`requires_grad`, `update_ema` and `preprocess_imgs_vae`, with the loss's
+`PerceptualLoss("lpips")` (loss/perceptual_loss.py) over REPA-E's `LPIPS`
+(loss/lpips.py) and its `NLayerDiscriminator` and `weights_init`
+(loss/discriminator.py), all as published. The autoencoder's encoder,
+decoder and 1x1 convolutions are tests/fixtures/tiny_diffusers' SD VAE,
+run by diffusers; LPIPS's VGG16 and linear heads are
+`lpips_reference.drawn_weights()`, which the test draws too; the
+discriminator is built at `ndf=8` (the published 64 at an eighth of the
+width) and the fixture carries its weights; the SiT's embedders, blocks
+and final layer are small stand-ins (`Patches`, `Times`, `Block`, `Final`)
+whose weights the fixture carries, and the representation features are a
+stand-in encoder's over the ImageNet-normalized pixels (REPA's
+`preprocess_raw_image` is held in tests/test_alignment.py; at 32 pixels
+it would resize to none).
 
-The loss config is l1_lpips_kl_gan.yaml with `perceptual_weight` and
-`discriminator_weight` at 0: Dew's `EndToEnd` regularizer is the L1
-reconstruction and the KL, without the published LPIPS and PatchGAN
-terms. The perceptual loss is a stand-in returning zero, which at weight 0
-is what LPIPS contributes. The draws are `DiffusionObjective.loss`'s from
+The loss config is configs/l1_lpips_kl_gan.yaml as published: LPIPS at
+weight 1.0 and the PatchGAN at 0.1 from step 0, so the step's
+discriminator update runs too. The draws are `DiffusionObjective.loss`'s from
 `jax.random.key(KEY)`, which the step's `torch.randn`, `rand` and
 `randn_like` replay in its order: the posterior's sample, the training
 times, the noise and the label-dropout uniforms. The gradients are each
@@ -46,6 +50,7 @@ from __future__ import annotations
 import ast
 import contextlib
 import copy
+import functools
 import json
 import math
 import tarfile
@@ -55,12 +60,14 @@ from collections import OrderedDict
 from pathlib import Path
 
 import jax
+import lpips_reference
 import numpy as np
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
 from safetensors.torch import load as load_safetensors
+from torchvision import models
 
 from dew.diffusion import presets
 
@@ -77,12 +84,12 @@ width 12, which the stand-in encoder's 8-pixel patches match; the
 projector's width, ten classes and `--cfg-prob`'s label dropout."""
 TOKENS = (SIDE // DOWNSCALE // PATCH) ** 2
 
-LOSSES = {"discriminator_start": 0, "discriminator_factor": 1.0, "discriminator_weight": 0.0,
-          "quantizer_weight": 1.0, "perceptual_loss": "lpips", "perceptual_weight": 0.0,
+LOSSES = {"discriminator_start": 0, "discriminator_factor": 1.0, "discriminator_weight": 0.1,
+          "quantizer_weight": 1.0, "perceptual_loss": "lpips", "perceptual_weight": 1.0,
           "reconstruction_loss": "l1", "reconstruction_weight": 1.0, "lecam_regularization_weight": 0.0,
           "kl_weight": KL_WEIGHT, "logvar_init": 0.0}
-"""configs/l1_lpips_kl_gan.yaml with the perceptual and discriminator
-weights at 0."""
+"""configs/l1_lpips_kl_gan.yaml."""
+DISCRIMINATOR_WIDTH = 8
 
 ARGS = types.SimpleNamespace(path_type="linear", prediction="v", weighting="uniform", proj_coeff=0.5,
                              vae_align_proj_coeff=1.5, bn_momentum=0.1, max_grad_norm=1.0, compile=False)
@@ -178,27 +185,6 @@ class Final(Block):
         return self.x(x) + self.c(c)[:, None]
 
 
-class Discriminator(torch.nn.Module):
-    """The PatchGAN's stand-in, which the step trains at weight 0."""
-
-    def __init__(self, **_):
-        super().__init__()
-        self.conv = torch.nn.Conv2d(3, 1, 4, stride=2)
-
-    def forward(self, x):
-        return self.conv(x)
-
-
-class Perceptual(torch.nn.Module):
-    """LPIPS's stand-in at `perceptual_weight` 0: zero."""
-
-    def __init__(self, _):
-        super().__init__()
-
-    def forward(self, inputs, reconstructions):
-        return torch.zeros((), dtype=inputs.dtype)
-
-
 class Config(dict):
     """OmegaConf's reading of the loss config, attributes and `get`, and
     the `dictdot` the autoencoder's `decode` returns."""
@@ -282,6 +268,30 @@ def tiny_vae() -> AutoencoderKL:
     return vae
 
 
+def published_discriminator() -> torch.nn.Module:
+    """REPA-E's `NLayerDiscriminator(input_nc=3, n_layers=3)` at
+    `DISCRIMINATOR_WIDTH`, drawn by its `weights_init`."""
+    scope = definitions(source("loss/discriminator.py"), {"ActNorm", "weights_init", "NLayerDiscriminator"},
+                        {"torch": torch, "nn": torch.nn, "functools": functools})
+    return scope["NLayerDiscriminator"](input_nc=3, ndf=DISCRIMINATOR_WIDTH, n_layers=3).apply(
+        scope["weights_init"])
+
+
+def perceptual(vgg: dict[str, np.ndarray], linear: dict[str, np.ndarray]) -> type:
+    """REPA-E's `PerceptualLoss` over its `LPIPS`, whose weights are these."""
+    scope = definitions(source("loss/perceptual_loss.py"), {"PerceptualLoss"},
+                        {"torch": torch, "models": models,
+                         "LPIPS": lpips_reference.lpips_class(
+                             {key: torch.as_tensor(value) for key, value in vgg.items()},
+                             {key: torch.as_tensor(value) for key, value in linear.items()})})
+    text = source("loss/perceptual_loss.py")
+    for node in ast.parse(text).body:
+        if isinstance(node, ast.Assign) and any(getattr(target, "id", "").startswith("_IMAGENET")
+                                                  for target in node.targets):
+            exec(compile(ast.Module(body=[node], type_ignores=[]), "perceptual_loss.py", "exec"), scope)
+    return scope["PerceptualLoss"]
+
+
 def weights() -> dict[str, np.ndarray]:
     """Every stand-in's and published module's weights, drawn once."""
     torch.manual_seed(0)
@@ -292,7 +302,7 @@ def weights() -> dict[str, np.ndarray]:
                    torch.nn.Linear(WIDTH, PROJECTOR), torch.nn.SiLU(), torch.nn.Linear(PROJECTOR, PROJECTOR),
                    torch.nn.SiLU(), torch.nn.Linear(PROJECTOR, FEATURES)),
                "representation": torch.nn.Conv2d(3, FEATURES, 8, stride=8),
-               "discriminator": Discriminator()}
+               "discriminator": published_discriminator()}
     drawn = {f"{prefix}.{name}": value.detach().numpy().copy()
              for prefix, module in modules.items() for name, value in module.state_dict().items()}
     drawn["model.pos_embed"] = torch.randn(1, TOKENS, WIDTH).numpy()
@@ -330,8 +340,14 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
         {"hinge_d_loss", "compute_lecam_loss", "ReconstructionLoss_Stage2",
          "ReconstructionLoss_Single_Stage"},
         {"torch": torch, "nn": torch.nn, "F": F, "rearrange": rearrange,
-         "autocast": lambda enabled=True: (lambda method: method), "PerceptualLoss": Perceptual,
-         "NLayerDiscriminator": Discriminator, "weights_init": lambda module: None})
+         "autocast": lambda enabled=True: (lambda method: method),
+         "PerceptualLoss": perceptual(*lpips_reference.drawn_weights()),
+         "NLayerDiscriminator": functools.partial(
+             definitions(source("loss/discriminator.py"), {"ActNorm", "NLayerDiscriminator"},
+                         {"torch": torch, "nn": torch.nn, "functools": functools})["NLayerDiscriminator"],
+             ndf=DISCRIMINATOR_WIDTH),
+         "weights_init": definitions(source("loss/discriminator.py"), {"weights_init"},
+                                     {"torch": torch, "nn": torch.nn})["weights_init"]})
     train = source("train_repae.py")
     script = definitions(train, {"requires_grad", "update_ema"}, {"torch": torch, "OrderedDict": OrderedDict})
     definitions(source("utils.py"), {"preprocess_imgs_vae"}, script)
@@ -398,6 +414,8 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
               for name, value in vae.named_parameters()}
     result.update({f"grad/model.{name}{tail}": accelerator.gradients[value].numpy()
                    for name, value in model.named_parameters()})
+    result.update({f"grad/discriminator.{name}{tail}": accelerator.gradients[value].numpy()
+                   for name, value in vae_loss_fn.discriminator.named_parameters()})
     for name, value in before.items():
         result[f"bn/{name}_before{tail}"] = value.numpy()
         result[f"bn/{name}{tail}"] = getattr(model.bn, name).numpy()
@@ -410,6 +428,9 @@ def run(dtype, drawn: dict[str, np.ndarray], pixels: np.ndarray, classes: np.nda
         f"loss/sit{tail}": scope["sit_loss"].detach().numpy(),
         f"loss/reconstruction{tail}": terms["reconstruction_loss"].numpy(),
         f"loss/kl{tail}": (terms["kl_loss"] / KL_WEIGHT).numpy(),
+        f"loss/perceptual{tail}": terms["perceptual_loss"].numpy(),
+        f"loss/generator{tail}": terms["gan_loss"].numpy(),
+        f"loss/discriminator{tail}": scope["d_loss"].detach().numpy(),
         f"loss/autoencoder_alignment{tail}": scope["vae_align_outputs"]["proj_loss"].detach().numpy(),
         f"loss/denoising{tail}": scope["sit_outputs"]["denoising_loss"].mean().detach().numpy(),
         f"loss/alignment{tail}": scope["sit_outputs"]["proj_loss"].detach().numpy()})

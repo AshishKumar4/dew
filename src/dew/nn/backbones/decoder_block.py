@@ -30,7 +30,7 @@ from ..hyper_connections import (
 )
 from ..inputs import LayerInputs, PredictionPhase
 from ..mixers.attention import CausalSelfAttention
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, gated_product
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import at_least_fp32, scaled
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
@@ -139,6 +139,30 @@ class Mixture:
                 "a parallel mixture routes with Gemma 4's router, which has no "
                 "score function, scaling, groups, balancing bias, input scaling "
                 "or shared branch to set")
+
+    def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
+              dense: Callable[..., nn.Module], norm: Callable[..., nn.Module] | None = None,
+              swiglu_limit: float | None = None, init_std: float | None = None,
+              output_init_std: float | None = None, dtype: Dtype | None = None,
+              precision: PrecisionLike = None) -> Callable[..., SparseMLP]:
+        """Build the routed feed-forward used by decoder blocks and independent MLP mixers."""
+        if self.parallel:
+            raise ValueError('a parallel mixture uses Gemma4Experts beside a dense feed-forward')
+        return functools.partial(
+            SparseMLP, num_experts=self.experts, top_k=self.top_k,
+            hidden_features=hidden_features if self.expert_features is None else self.expert_features,
+            out_features=out_features, activation=activation,
+            implementation=self.implementation, dispatch=self.dispatch, capacity_factor=self.capacity_factor,
+            score_function=self.score_function, normalize_weights=self.norm_topk_prob,
+            routed_scaling_factor=self.scaling, expert_groups=self.groups,
+            groups_per_token=self.groups_per_token,
+            group_score=self.group_score, expert_bias=self.bias, media_bias=self.media_bias,
+            scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
+            shared=None if not self.shared_features else functools.partial(
+                dense, hidden_features=self.shared_features),
+            shared_gate=self.shared_gate, init_std=init_std, output_init_std=output_init_std,
+            latent_features=self.latent_features, latent_norm=norm if self.latent_norm else None,
+            dtype=dtype, precision=precision)
 
 
 @logical_axes({

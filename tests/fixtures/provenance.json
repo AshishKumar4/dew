@@ -136,6 +136,26 @@
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "hf/minimax-m2-fp8-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.18.0", "runs": "transformers"}],
+   "note": "Reference is transformers 5.18.0, differing from the suite's 5.16.1 pin because of #48241/#48486 (rotary_dim). --minimax-m2-only; released 128x128 E4M3 storage, loaded by FineGrainedFP8Config(dequantize=True)."
+  },
+  "hf/minimax-m2-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.18.0", "runs": "transformers"}],
+   "note": "Reference is transformers 5.18.0, differing from the suite's 5.16.1 pin because of #48241/#48486 (rotary_dim). --minimax-m2-only; per-expert weights, nonzero routing bias, full and padded fp32/float64 logits."
+  },
+  "hf/qwen2-moe-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--qwen2-moe-only; mixed full/sliding GQA, two softmax MoE layers around a dense layer, unnormalized top-k and sigmoid-gated shared expert."
+  },
+  "hf/granitemoe-tiny": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--granitemoe-only; PowerMoE embedding/residual/attention/logit multipliers, packed input_linear/output_linear and nested router names."
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -243,6 +263,14 @@
     }
    ],
    "note": "Documented generation environment also uses Torch 2.8.0."
+  },
+  "codecs/modelopt/mixed/reference.npz": {
+   "tool": "tools/modelopt_nvfp4_reference.py",
+   "sources": [
+    {"repo": "NVIDIA/Model-Optimizer", "version": "0.47.0", "runs": "modelopt"},
+    {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}
+   ],
+   "note": "Mixed tiny Qwen3 exported by ModelOpt: tensor-scaled FP8 attention weights/static input quantizers and W4A16_NVFP4 feed-forward weights. The exported quantized_layers table is authoritative over generic config_groups. FP8QTensor/NVFP4QTensor read the same files; static FP8 inputs use the author's fp8_eager arithmetic and recorded input scales. Continuous operations widen for float64, discrete QDQ stays fp32."
   },
   "codecs/modelopt/tiny/reference.npz": {
    "tool": "tools/modelopt_nvfp4_reference.py",
@@ -2053,6 +2081,26 @@
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
   },
+  "hf/nemotron-h-moe-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--nemotron-h-only; ungated ReLU² experts, grouped sigmoid top-k with nonzero selection bias, and an ungated shared expert. Seed 2024."
+  },
+  "hf/nemotron-h-moe-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
+  },
+  "hf/nemotron-h-moe-latent-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--nemotron-h-only; latent routed experts with unnormalized sigmoid weights and a full-width shared branch. Seed 2024."
+  },
+  "hf/nemotron-h-moe-latent-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
+  },
   "hf/nemotron-h-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [
@@ -2732,6 +2780,27 @@
    ],
    "note": "PEFT 0.20.0's get_peft_model on tests/fixtures/hf/llama-tiny writes each adapter directory and runs its forward and backward: use_rslora with a rank and an alpha pattern, and lora_dropout 0.25 in training mode with each target's dropout module on a recorded mask; logits, mean next-token cross entropy and every factor's gradient in float32 and float64."
   },
+  "lpips": {
+   "tool": "tools/lpips_reference.py",
+   "sources": [
+    {
+     "repo": "End2End-Diffusion/REPA-E",
+     "version": "2ad4e9f69234c109497fb41d3e5e555de7b4b0de",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Executes REPA-E's loss/lpips.py LPIPS (ScalingLayer, NetLinLayer, vgg16, normalize_tensor, spatial_average) as published in eval mode, its weights read from drawn tables (drawn.npz: distances and the mean's gradient in float32 and float64) and from the published torchvision vgg16-397923af.pth and richzhang v0.1 vgg.pth (published.npz: distances)."
+  },
   "mamba2": {
    "tool": "tools/mamba2_reference.py",
    "sources": [
@@ -3037,12 +3106,17 @@
      "runs": "diffusers"
     },
     {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    },
+    {
      "repo": "pytorch/pytorch",
      "version": "2.14.0",
      "runs": "torch"
     }
    ],
-   "note": "regularizer.npz: KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced. step.npz: executes train_repae.py's loop body from vae.train() through the SiT update, with AutoencoderKL.forward, DiagonalGaussianDistribution, SiT.forward, interpolant, unpatchify, init_bn, extract_latents_stats, LabelEmbedder, build_mlp, ReconstructionLoss_Single_Stage, requires_grad, update_ema and preprocess_imgs_vae as published, around tests/fixtures/tiny_diffusers' SD VAE run by diffusers and stand-in SiT layers, at l1_lpips_kl_gan.yaml with perceptual_weight and discriminator_weight 0 (Dew's L1 + KL scope); the draws are DiffusionObjective's from jax.random.key(11)."
+   "note": "regularizer.npz: KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced. step.npz: executes train_repae.py's loop body from vae.train() through the SiT update and the discriminator update, with AutoencoderKL.forward, DiagonalGaussianDistribution, SiT.forward, interpolant, unpatchify, init_bn, extract_latents_stats, LabelEmbedder, build_mlp, ReconstructionLoss_Single_Stage, PerceptualLoss over LPIPS (loss/lpips.py, torchvision's vgg16 layout), NLayerDiscriminator and weights_init, requires_grad, update_ema and preprocess_imgs_vae as published, at configs/l1_lpips_kl_gan.yaml as published (LPIPS at 1.0, the PatchGAN at 0.1 from step 0); around tests/fixtures/tiny_diffusers' SD VAE run by diffusers, LPIPS weights from lpips_reference.drawn_weights(), the discriminator at ndf=8 (the published 64 at an eighth of the width) with its weights carried, and stand-in SiT layers; the draws are DiffusionObjective's from jax.random.key(11)."
   },
   "rl/advantage.npz": {
    "tool": "tools/parity_rl.py",
@@ -3470,7 +3544,8 @@
   {
    "tool": "tools/modelopt_nvfp4_reference.py",
    "what": "author-exported tiny ModelOpt checkpoint and 32 real pinned q_proj rows",
-   "files": ["codecs/modelopt/tiny/model.safetensors", "codecs/modelopt/real/model.safetensors"]
+   "files": ["codecs/modelopt/tiny/model.safetensors", "codecs/modelopt/real/model.safetensors",
+             "codecs/modelopt/mixed/model.safetensors"]
   },
   {
    "tool": "tools/nvfp4_storage_reference.py",
@@ -3766,7 +3841,11 @@
    "what": "the random weights and probe ids its Nemotron-H references are computed on",
    "files": [
     "hf/nemotron-h-tiny/input_ids.npy",
-    "hf/nemotron-h-tiny/model.safetensors"
+    "hf/nemotron-h-tiny/model.safetensors",
+    "hf/nemotron-h-moe-tiny/input_ids.npy",
+    "hf/nemotron-h-moe-tiny/model.safetensors",
+    "hf/nemotron-h-moe-latent-tiny/input_ids.npy",
+    "hf/nemotron-h-moe-latent-tiny/model.safetensors"
    ]
   },
   {

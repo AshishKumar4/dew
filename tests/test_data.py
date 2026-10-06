@@ -40,6 +40,7 @@ from dew.data.images import ImageTransform, decode_image
 from dew.data.sources import av_utils
 from dew.data.sources.av_utils import choose_clip_start
 from dew.data.sources.hf import HFDatasetSource
+from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
 from dew.registry import datasets
 
@@ -472,18 +473,21 @@ def test_which_records_a_batch_holds_does_not_depend_on_who_stacked_it(workers):
 
 
 @pytest.mark.parametrize("workers", [0, pytest.param(2, marks=pytest.mark.slow)])
-def test_a_pass_over_a_split_the_workers_do_not_divide_is_still_whole_batches(workers):
+def test_a_pass_over_a_split_the_workers_do_not_divide_reads_every_record(workers):
     """Thirty records at a batch of four is seven whole batches and two
-    records over. Two workers take a batch each in turn, so the seventh batch
-    is one worker's alone and the last round is half empty: it still arrives,
-    in its place, and what is dropped is the two records over."""
+    records over. Two workers take a batch each in turn, so the last round is
+    one worker's alone: every batch arrives in its place, and the eighth
+    holds the two records over, filled out with repeats of them that
+    `VALID_ROWS` marks."""
     passes = validation_pass(_Indexed(30), [], batch=4, seed=0, loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
 
     batches, ended = _bounded(passes(DataPartition()), 12)
 
     assert [[int(index) for index in batch["index"]] for batch in batches] == [
-        list(range(start, start + 4)) for start in range(0, 28, 4)]
+        *(list(range(start, start + 4)) for start in range(0, 28, 4)), [28, 29, 28, 29]]
+    assert [np.asarray(batch.get(VALID_ROWS, np.ones(4, bool))).tolist() for batch in batches][-2:] == [
+        [True] * 4, [True, True, False, False]]
     assert ended
 
 
@@ -1575,9 +1579,12 @@ def test_held_out_records_are_one_ordered_pass():
     assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
 
 
-def test_held_out_records_too_few_for_one_batch_are_refused():
-    with pytest.raises(ValueError, match="3 validation records, fewer than one batch of 4"):
-        Dataset.from_records(_columns(), batch=4, validation=_columns(3))
+def test_held_out_records_too_few_for_one_batch_are_one_filled_batch():
+    """Three records at a batch of four are one batch, its fourth row a repeat."""
+    batches = list(Dataset.from_records(_columns(), batch=4, validation=_columns(3)).val(DataPartition()))
+
+    assert len(batches) == 1
+    np.testing.assert_array_equal(batches[0][VALID_ROWS], [True, True, True, False])
 
 
 def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():

@@ -24,7 +24,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.nn.blocks import torch_bicubic_resize
-from dew.objectives.base import Variables
+from dew.objectives.base import Batch, Objective, Variables
 from dew.objectives.diffusion.end_to_end import EndToEnd
 
 ALIGNMENT = "alignment_projector"
@@ -122,14 +122,16 @@ class Alignment:
 
         Under iREPA (`spatial_norm` set) the features are spatially normalized.
         """
-        pixels = (images.astype(jnp.float32) + 1) / 2
+        dtype = jnp.promote_types(images.dtype, jnp.float32)
+        pixels = (images.astype(dtype) + 1) / 2
         pixels = (pixels - jnp.asarray(self.mean)) / jnp.asarray(self.std)
         if self.resolution is not None and self.resolution != pixels.shape[1]:
             pixels = torch_bicubic_resize(pixels, self.resolution, self.resolution)
         features = self.encoder.apply(variables, pixels)
         if not isinstance(features, jax.Array):
             raise TypeError("a representation encoder must return one array of patch features")
-        features = features.reshape(features.shape[0], -1, features.shape[-1]).astype(jnp.float32)
+        features = features.reshape(features.shape[0], -1, features.shape[-1]).astype(
+            jnp.promote_types(features.dtype, jnp.float32))
         if self.spatial_norm is not None:
             features = spatial_zscore(features, self.spatial_norm)
         return jax.lax.stop_gradient(features)
@@ -141,8 +143,10 @@ class Alignment:
         """Return the projector's variables for `count` hidden tokens of `width`."""
         return self.module(features).init(key, jnp.zeros((1, count, width)))
 
-    def loss(self, projector: Variables, hidden: jax.Array, targets: jax.Array) -> jax.Array:
+    def loss(self, projector: Variables, hidden: jax.Array, targets: jax.Array, batch: Batch) -> jax.Array:
         """Return REPA's projection loss, the mean of -cos(target, projection) over tokens and examples.
+
+        The examples are `batch`'s rows (`Objective.row_mean`).
 
         Raises `ValueError` when the model's token count differs from the
         encoder's patch count.
@@ -152,12 +156,12 @@ class Alignment:
                              f"match the encoder's {targets.shape[1]} patches")
         projected = self.module(targets.shape[-1]).apply(projector, hidden)
         assert isinstance(projected, jax.Array)
-        projected = projected.astype(jnp.float32)
+        projected = projected.astype(jnp.promote_types(projected.dtype, jnp.float32))
 
         def unit(value):
             return value / jnp.maximum(jnp.linalg.norm(value, axis=-1, keepdims=True), 1e-12)
 
-        return -jnp.mean(jnp.sum(unit(projected) * unit(targets), axis=-1))
+        return -Objective.row_mean(jnp.sum(unit(projected) * unit(targets), axis=-1), batch).mean()[0]
 
     def captures(self, module: nn.Module, method: str) -> bool:
         """Return whether `capture_intermediates` should keep this call: True for `layer`'s output."""
