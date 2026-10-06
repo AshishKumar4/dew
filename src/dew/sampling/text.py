@@ -512,6 +512,8 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
     Parameters stay unmapped: every operation reads the same tree, and only
     the cache moves with the rows. A model with a block drafter hands its
     drafter's context back as the states `verify` returns.
+    A LongRoPE crossing costs one full-prefix forward over the whole batch
+    to keep static shapes; it happens once per request.
     """
     exposed = isinstance(model, Exposing)
     blocks = _block_drafting(model, params) if isinstance(model, BlockDrafting) and model.dspark else None
