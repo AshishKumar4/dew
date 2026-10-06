@@ -152,7 +152,7 @@ def write_minimax_m2() -> None:
         rope_theta=5000000.0, rms_norm_eps=1e-6, tie_word_embeddings=False,
         bos_token_id=1, eos_token_id=2))
     model.set_experts_implementation('eager')
-    write_tiny('minimax-m2-tiny', model)
+    write_tiny('minimax-m2-tiny', model, padded=True)
     directory = FIXTURES / 'minimax-m2-tiny'
     ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
     with float64(), torch.no_grad():
@@ -1128,7 +1128,7 @@ def write_diffusion_denoiser_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
-def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
+def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
     scatter_weights(model, seed)
@@ -1138,6 +1138,23 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234) -> None:
     ids = probe_ids(model.config.vocab_size)
     np.save(directory / "input_ids.npy", ids)
     np.save(directory / "logits.npy", reference_logits(model, ids))
+    if padded:
+        from copy import deepcopy
+        from diffusers_wan_reference import float64
+
+        tokens = torch.from_numpy(ids.astype(np.int64))
+        valid = torch.ones_like(tokens)
+        tokens[1, :4] = 0
+        valid[1, :4] = 0
+        positions = (valid.cumsum(-1) - 1).clamp(min=0)
+        inputs = {'input_ids': tokens, 'attention_mask': valid, 'position_ids': positions, 'use_cache': False}
+        with torch.no_grad():
+            reference = model(**inputs).logits.numpy()
+        with float64(), torch.no_grad():
+            truth = deepcopy(model).double()(**inputs).logits.numpy()
+        np.savez(directory / 'padded.npz', input_ids=tokens.numpy().astype(np.int32),
+                 attention_mask=valid.numpy().astype(bool), position_ids=positions.numpy().astype(np.int32),
+                 logits=reference, logits_f64=truth)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
