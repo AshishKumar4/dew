@@ -11,6 +11,7 @@ from flax import linen as nn
 
 from dew.nn.mixer_base import MixerBase, MixerContext, mixers
 from dew.nn.moe import SparseMLP
+from dew.nn.protocols import ProjectionGroup, declared_groups
 
 if TYPE_CHECKING:
     from dew.nn.backbones.decoder_block import GatedMLP, Mixture
@@ -29,6 +30,10 @@ class _MLP(nn.Module):
         del decode, positions, segment_ids, kv_store, attention_metadata
         return self.feedforward(x)
 
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """The packed groups its feed-forward declares (`ProjectionSites`), in the scope they share."""
+        return declared_groups(self.feedforward)
+
 
 @mixers("mlp")
 @dataclasses.dataclass(frozen=True)
@@ -40,6 +45,9 @@ class MLPMixer(MixerBase):
     `mixture` makes the slot routed, with the same factory a decoder's
     second feed-forward uses.
     """
+
+    # Tokenwise, with no cache for a mixed call to misread.
+    mixed_step = True
 
     intermediate_size: int
     activation: str = "relu2"

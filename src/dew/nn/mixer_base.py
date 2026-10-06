@@ -114,6 +114,12 @@ class MixerBase:
     """Whether a step with this mixer keeps XLA's Triton GEMM fusions where
     `dew.telemetry.devices.TRITON_GEMM_OFF_GENERATIONS` turns them off."""
 
+    mixed_step = False
+    """Whether the mixer this kind builds runs a server's mixed call
+    (`dew.nn.inputs.Admitted`) as the separate decode and prefill calls
+    would, or keeps no cache for it to read: one that does not read the
+    call's layout would take its one row of tokens as one sequence."""
+
     def build(self, ctx: MixerContext) -> Callable[..., nn.Module]:
         """The block's mixer factory for this value at this layer's geometry."""
         raise NotImplementedError(
