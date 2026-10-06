@@ -270,7 +270,7 @@ class FID:
         pytorch-fid 0.3.0's (bilinear resize without antialiasing) to within
         1e-5 relative.
         """
-        # tests/test_metrics.py holds the distance to pytorch-fid 0.3.0's within 1e-5 relative.
+        # tests/test_fid.py holds the distance to pytorch-fid 0.3.0's within 1e-5 relative.
         if batch_size < 1:
             raise ValueError(f"fid: a batch holds at least one image, got batch_size={batch_size}")
         with metric_device():

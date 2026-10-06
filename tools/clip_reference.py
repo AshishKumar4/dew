@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write the CLIP fixtures tests/test_text_encoders.py and tests/test_metrics.py
+"""Write the CLIP fixtures tests/test_text_encoders.py and tests/test_clip_metrics.py
 check against.
 
 Everything here runs under torch and transformers, which dew does not depend
