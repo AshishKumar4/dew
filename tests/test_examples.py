@@ -19,8 +19,8 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from diffusion_stubs import RES, TOKENS, StubText
 from PIL import Image
-from test_diffusion_objective import RES, TOKENS, StubText
 from test_inference import make_run
 
 from dew import Checkpoints

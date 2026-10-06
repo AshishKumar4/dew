@@ -558,7 +558,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     SD VAE: a saved run's task restores the tuned autoencoder and its
     running statistics, and samples exactly as the trained objective's own
     task does."""
-    from test_diffusion_run_sources import batch_for
+    from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig

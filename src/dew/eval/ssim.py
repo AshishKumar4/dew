@@ -3,7 +3,7 @@
 This is the SSIM of Wang et al. (2004), with the standard parameters: an
 11x11 gaussian window, sigma 1.5, and the mean over channels taken after
 per-channel SSIM. No scipy/skimage dependency;
-`tests/test_metrics.py` states the tolerance against the filtered equations
+`tests/test_image_metrics.py` states the tolerance against the filtered equations
 and the difference observed.
 """
 

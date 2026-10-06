@@ -4,8 +4,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import raw_leaf
 from flax import linen as nn, struct
-from test_trainer import raw_leaf
 
 from dew.checkpoints import Checkpoints
 from dew.nn.blocks import TokenEmbedding

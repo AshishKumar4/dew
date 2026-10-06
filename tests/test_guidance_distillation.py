@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_diffusion_run_sources import batch_for
+from diffusion_stubs import batch_for
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, TrainerConfig

@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_rl_surrogate import token_mean
+from rl_support import token_mean
 from test_tool_episodes import PROMPT, RESPONSE, build, collect
 
 from dew.objectives.base import Step

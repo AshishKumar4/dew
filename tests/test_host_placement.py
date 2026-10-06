@@ -34,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_trainer import BATCH, Counting, Features, Regression, Spread, val_batches
+from affine_run import BATCH, Counting, Features, Regression, Spread, val_batches
 
 from dew.data import Dataset
 from dew.inference.banks import CheckpointBanks, HeldBanks
