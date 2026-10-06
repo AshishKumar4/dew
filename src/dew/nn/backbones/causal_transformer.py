@@ -37,6 +37,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.registry import from_record, mixers, models
 
+from ..activations import ungated_activation
 from ..attention import RMSNorm
 from ..attention_residuals import AttentionResiduals, DepthAttention
 from ..blocks import TokenEmbedding, normal_kernel
@@ -83,7 +84,6 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     remat_policy,
-    ungated_activation,
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 

@@ -33,6 +33,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
 from .kernels.generation import device_generation, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs, xla_ragged_dot
@@ -502,12 +503,10 @@ _projection.defjvp(_projection_jvp, symbolic_zeros=True)
 
 @jax.custom_jvp
 def exact_gelu(x: jax.Array) -> jax.Array:
-    """The erf gelu in at least fp32, returned in `x`'s dtype, in both
+    """`dew.nn.activations.gelu_exact`, rounded once to `x`'s dtype in both
     differentiation directions: a bf16 gate's activation rounds once, wherever
     the compiler places it."""
-    x = jax.lax.optimization_barrier(x)
-    work = x.astype(jnp.promote_types(x.dtype, jnp.float32))
-    return nn.gelu(work, approximate=False).astype(x.dtype)
+    return gelu_exact(jax.lax.optimization_barrier(x))
 
 
 @exact_gelu.defjvp
@@ -516,9 +515,8 @@ def _exact_gelu_jvp(primals: tuple[jax.Array], tangents: tuple[jax.Array]
     x, = primals
     dx, = tangents
     output = exact_gelu(x)
-    work = x.astype(jnp.promote_types(x.dtype, jnp.float32))
-    _, derivative = jax.jvp(lambda value: nn.gelu(value, approximate=False),
-                            (work,), (jnp.ones_like(work),))
+    work = x.astype(at_least_fp32(x.dtype))
+    _, derivative = jax.jvp(gelu_exact, (work,), (jnp.ones_like(work),))
     tangent = derivative * jax.lax.optimization_barrier(dx).astype(work.dtype)
     return output, jax.lax.optimization_barrier(tangent.astype(x.dtype))
 
@@ -560,11 +558,7 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
     round nowhere. A `Situ` computes its own product."""
     if isinstance(activation, Situ):
         return activation
-    gates = {
-        "swiglu": nn.silu,
-        "geglu": functools.partial(nn.gelu, approximate=True),
-        "geglu_exact": exact_gelu,
-    }
+    gates = {"swiglu": silu, "geglu": gelu_tanh, "geglu_exact": exact_gelu}
     if activation not in gates:
         raise ValueError(f"mlp must be 'swiglu', 'geglu', 'geglu_exact' or a Situ, got {activation!r}")
     activate = gates[activation]
@@ -1018,7 +1012,7 @@ class ExpertMLP(nn.Module):
         # covers both (decoder_block.RESIDUALS).
         if self.activation == 'relu2':
             up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
-            hidden = jnp.square(nn.relu(up))
+            hidden = relu2(up)
             return checkpoint_name(linear(hidden, kernels[1]), 'down_proj')
         gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
         up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
