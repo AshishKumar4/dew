@@ -242,9 +242,12 @@ class BlockWiring:
     pre_norms: bool = True
     output_norms: bool = False
     parallel_residual: bool = False
+    shared_parallel_norm: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
 
     def __post_init__(self):
+        if self.shared_parallel_norm and not self.parallel_residual:
+            raise ValueError('shared_parallel_norm requires parallel_residual')
         if self.layer_scalar not in (None, "frozen", "trainable"):
             raise ValueError("layer_scalar must be None, frozen or trainable")
 
@@ -464,7 +467,7 @@ class DecoderBlock(nn.Module):
         if self.wiring.pre_norms:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
-        if self.wiring.pre_norms and self.feedforward is not None:
+        if self.wiring.pre_norms and self.feedforward is not None and not self.wiring.shared_parallel_norm:
             self.post_attention_layernorm = norm(name='post_attention_layernorm')
         if self.wiring.output_norms:
             self.attention_output_norm = norm(name='attention_output_norm')
@@ -611,7 +614,9 @@ class DecoderBlock(nn.Module):
         if self.feedforward is not None:
             routes = self._routes(per_layer_input)
             state, read, site = self._read(state, "mlp")
-            hidden = self.mlp(self.post_attention_layernorm(read) if self.wiring.pre_norms else read,
+            mlp_input = (normed if self.wiring.shared_parallel_norm else
+                         self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
+            hidden = self.mlp(mlp_input,
                               **self._feedforward_inputs(attention_metadata),
                               **({} if self.parallel is not None else routes))
             if self.parallel is not None:
