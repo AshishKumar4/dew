@@ -362,7 +362,7 @@ class DiffusionObjective(Objective[Ratio]):
             if alignment is None or autoencoder is None or inputs.mask is not None:
                 raise ValueError("end-to-end tuning trains a KL autoencoder through REPA's loss; it "
                                  "needs `alignment`, a KL autoencoder and no masked-image input")
-            # The step trains through the posterior; an autoencoder without one refuses it by name.
+            # An autoencoder without the posterior the step trains through refuses it by name.
             jax.eval_shape(autoencoder.moments, autoencoder.params, jnp.zeros((1, *inputs.sample.shape)))
         if inputs.mask is not None and autoencoder is None:
             raise ValueError("Masked-image conditioning requires an autoencoder")
@@ -452,9 +452,9 @@ class DiffusionObjective(Objective[Ratio]):
 
         A text tower and a VAE are released weights of hundreds of megabytes, which a
         trace without arguments would compile into the state executable as
-        constants. The loss's frozen networks ride beside a starting tree without
-        them, a pipeline's. This is one mapping, so an objective that starts from more
-        than the towers extends both this and `init`.
+        constants. The loss's frozen networks ride beside a starting tree without them.
+        This is one mapping, so an objective that starts from more than the towers
+        extends both this and `init`.
         """
         held: dict[str, Any] = dict(self.variables or {"encoders": self.encoder_params()})
         if self.variables is None and self.autoencoder is not None:
