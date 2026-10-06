@@ -3422,6 +3422,17 @@
    ],
    "note": "AutoTokenizer's encode (with and without special tokens), decode, length and eos/bos ids on GPT-2's and T5-small's published tokenizers and the committed qwen38-dense-tiny and llama_cpp tokenizers."
   },
+  "torch_optim": {
+   "tool": "tools/torch_optim_reference.py",
+   "sources": [
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.1",
+     "runs": "torch"
+    }
+   ],
+   "note": "OneCycleLR, ExponentialLR and CosineAnnealingLR values over their steps, and a grouped Adam run with coupled weight decay, a beta1 cycle and a clamp, in float32 on CPU."
+  },
   "tread": {
    "tool": "tools/tread_reference.py",
    "sources": [

@@ -260,3 +260,20 @@ def test_a_jepa_run_without_probes_schedules_no_validation_pass():
     recipe = load_recipe("jepa")
     with pytest.raises(ValueError, match="probe_classes"):
         recipe.JepaRunConfig()
+
+
+def test_param_groups_on_the_command_line_read_their_schedules_as_records():
+    """A group's schedule is the record that names it, as the run's record
+    writes it, and the config's own schedule steps per epoch by its flag."""
+    from dew.training.optim import Cosine, OneCycle, ParamGroup
+    groups = [{"name": "delays", "patterns": ["*/delay"], "bounds": [0, 24],
+               "schedule": {"name": "cosine", "fields": {"peak": 0.1, "warmup_steps": 0, "every": 40}}},
+              {"name": "rest", "patterns": ["*"],
+               "b1": {"name": "one_cycle", "fields": {"peak": 0.85, "init": 0.95, "end": 0.95}}}]
+    config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups), "optim.schedule:one-cycle",
+                               "--optim.schedule.peak", "5e-3", "--optim.schedule.every", "40"])
+    assert config.optim.schedule == OneCycle(peak=5e-3, every=40)
+    assert config.optim.param_groups == (
+        ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
+                   bounds=(0.0, 24.0)),
+        ParamGroup("rest", ("*",), b1=OneCycle(peak=0.85, init=0.95, end=0.95)))
