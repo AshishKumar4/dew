@@ -34,12 +34,11 @@ and torchsde==0.2.6:
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
 import sys
 import tempfile
-from collections.abc import Iterator, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
@@ -60,9 +59,7 @@ for _name, _value in (("FLAX_WEIGHTS_NAME", "flax_model.msgpack"),
     if not hasattr(transformers_utils, _name):
         setattr(transformers_utils, _name, _value)
 
-import jax
-import jax.numpy as jnp
-from diffusers_wan_reference import float64_scheduler
+from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
 from diffusers.schedulers import (
     scheduling_ddim, scheduling_ddpm, scheduling_deis_multistep,
     scheduling_dpmsolver_multistep, scheduling_dpmsolver_sde,
@@ -72,7 +69,8 @@ from diffusers.schedulers import (
     scheduling_k_dpm_2_discrete, scheduling_lcm, scheduling_lms_discrete, scheduling_pndm,
     scheduling_tcd, scheduling_unipc_multistep,
 )
-from diffusers.pipelines.stable_diffusion_xl.pipeline_stable_diffusion_xl import rescale_noise_cfg
+from diffusers_reference_helpers import fed_noise as fed_noise, step_noise as step_noise
+from diffusers_wan_reference import float64_scheduler
 
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler
 from dew.diffusion.schedules.source import SourceSchedule
@@ -125,34 +123,6 @@ def oracle(model_input: torch.Tensor, time: torch.Tensor, label: float = 0.0) ->
     every scheduler decision and on nothing else."""
     scalar = torch.as_tensor(time, dtype=torch.float64)
     return torch.sin(model_input) * 0.07 + scalar * 0.001 + label
-
-
-@contextlib.contextmanager
-def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[list[int]]:
-    """The module's `randn_tensor` handing out `noises` in order, so a
-    stochastic class integrates the draws Dew's solver makes. The yielded list
-    counts the draws the walk actually took."""
-    taken: list[int] = []
-
-    def draw(shape, generator=None, device=None, dtype=None, layout=None):
-        noise = torch.tensor(noises[len(taken)], dtype=dtype or torch.float64)
-        assert tuple(noise.shape) == tuple(shape), (noise.shape, shape)
-        taken.append(1)
-        return noise
-
-    if getattr(module, "randn_tensor", None) is None:
-        yield taken
-        return
-    with patch.object(module, "randn_tensor", draw):
-        yield taken
-
-
-def step_noise(count: int) -> list[np.ndarray]:
-    """One standard normal per step under the walk's key folded with the step
-    index, which is what `sample` hands its solver."""
-    key = jax.random.PRNGKey(0)
-    return [np.asarray(jax.random.normal(jax.random.fold_in(key, index), SHAPE, jnp.float32),
-                       np.float64) for index in range(count)]
 
 
 class RecordedBrownian:
@@ -429,7 +399,7 @@ def trajectory_gradient(module: ModuleType, case: Case, initial: torch.Tensor,
         with patch.object(module, "BrownianTreeNoiseSampler", ReplayBrownian):
             latents, _ = walk(scheduler, module, case, x, [])
     else:
-        noises = step_noise(len(scheduler.timesteps)) if noises is None else noises
+        noises = step_noise(SHAPE, len(scheduler.timesteps), np.float64) if noises is None else noises
         runner = guided_walk if case.guidance is not None else walk
         latents, _ = runner(scheduler, module, case, x, noises)
     (gradient,) = torch.autograd.grad((latents[-1] * cotangent.to(dtype)).sum(), x)
@@ -458,9 +428,7 @@ def rounding(destination: Path, copies: int) -> None:
     torch.set_num_threads(2)
     arrays: dict[str, np.ndarray] = {"copies": np.asarray(copies)}
     shape = (SHAPE[0], SHAPE[1], SHAPE[2] * copies)
-    key = jax.random.PRNGKey(0)
-    noises = [np.asarray(jax.random.normal(jax.random.fold_in(key, index), shape, jnp.float32),
-                         np.float64) for index in range(STEPS)]
+    noises = step_noise(shape, STEPS, np.float64)
     for name in STATE_CASES:
         case, module = CASES[name], MODULES[CASES[name].scheduler]
         generator = torch.Generator().manual_seed(SEED)
@@ -534,7 +502,7 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
         arrays["noise"] = np.stack(RecordedBrownian.draws)
         arrays["bounds"] = np.asarray(RecordedBrownian.bounds, np.float64)
     else:
-        noises = step_noise(len(scheduler.timesteps))
+        noises = step_noise(SHAPE, len(scheduler.timesteps), np.float64)
         runner = guided_walk if case.guidance is not None else walk
         latents, inputs = runner(scheduler, module, case, x_T, noises)
     assert len(latents) == case.steps, (name, len(latents), case.steps)
@@ -633,7 +601,7 @@ def refused_record() -> dict[str, np.ndarray]:
         times = scheduler.timesteps.tolist()
         x = torch.zeros(SHAPE, dtype=torch.float64)
         try:
-            walk(scheduler, module, case, x, step_noise(len(times)))
+            walk(scheduler, module, case, x, step_noise(SHAPE, len(times), np.float64))
         except Exception as failure:
             reason = f"{type(failure).__name__}: {failure}"
         else:

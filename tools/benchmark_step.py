@@ -157,6 +157,9 @@ class Case:
     matmul_precision: str | None = None
     """What every matmul asks XLA for (`ModelConfig.matmul_precision`), written
     into a model that declares `precision`; None keeps the model's own."""
+    orders: bool = False
+    """Layout comparisons use 52 exact residual orders against fp64 when True.
+    Other measurements and rows retain their ordinary single-draw path."""
     batch_size: int = 8
     accumulation: int = 1
     """Microbatches of `batch_size` rows the trainer pools into one optimizer

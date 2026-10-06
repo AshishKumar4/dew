@@ -42,6 +42,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
+from dew.nn.activations import activation
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from dew.nn.conv import Conv
 from dew.nn.sharding import logical_axes
@@ -60,11 +61,6 @@ class CLIPTowerOutput(NamedTuple):
     """
     last_hidden_state: jax.Array
     pooler_output: jax.Array
-
-
-def quick_gelu(x):
-    """CLIP's activation, `x * sigmoid(1.702 x)`, ACT2FN's `quick_gelu`."""
-    return x * jax.nn.sigmoid(1.702 * x)
 
 
 @logical_axes(
@@ -111,9 +107,9 @@ class CLIPAttention(nn.Module):
 class MLP(nn.Module):
     """Two biased maps with an activation between: the feed-forward of a CLIP,
     SigLIP or Llama 4 vision layer, which differ only in the activation.
-    `activation` is the reference's name: 'quick_gelu' (CLIP),
-    'gelu_pytorch_tanh' (SigLIP) or 'gelu' (Llama 4's exact erf form; jax's
-    default is the tanh approximation, so exactness is spelled out)."""
+    `activation` is the reference's `hidden_act`: 'quick_gelu' (CLIP),
+    'gelu_pytorch_tanh' (SigLIP) or 'gelu' (Llama 4's exact form), computed
+    as `dew.nn.activations.activation` computes it."""
     hidden_size: int
     intermediate_size: int
     activation: str = "quick_gelu"
@@ -127,17 +123,11 @@ class MLP(nn.Module):
         self.fc2 = dense(self.hidden_size, name="fc2")
 
     def __call__(self, hidden_states):
-        if self.activation == "quick_gelu":
-            act = quick_gelu
-        elif self.activation == "gelu_pytorch_tanh":
-            act = functools.partial(jax.nn.gelu, approximate=True)
-        elif self.activation == "gelu":
-            act = functools.partial(jax.nn.gelu, approximate=False)
-        else:
+        if self.activation not in ("quick_gelu", "gelu_pytorch_tanh", "gelu"):
             raise ValueError(
                 f"activation {self.activation!r} is not expressible: this MLP "
                 "runs quick_gelu, gelu_pytorch_tanh or gelu")
-        return self.fc2(act(self.fc1(hidden_states)))
+        return self.fc2(activation(self.activation)(self.fc1(hidden_states)))
 
 
 class CLIPEncoderLayer(nn.Module):

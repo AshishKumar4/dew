@@ -329,17 +329,18 @@ class DecisionObjective(Objective[Ratio]):
 
         That is the backbone, head, layout, tokenizer and special tokens.
         """
-        from dew.config import ModelConfig, _to_json
+        from dew.config import ModelConfig
         from dew.inference.tasks import recorded_tokenizer
+        from dew.registry import to_record
 
         head = self.model.head
         return {
             "objective": objectives.name_of(type(self)),
-            "model": _to_json(ModelConfig.from_model(self.model.backbone), ModelConfig),
+            "model": to_record(ModelConfig.from_model(self.model.backbone), ModelConfig),
             "head": {"layers": head.layers, "dropout_rate": head.dropout_rate},
             "layout": {"name": type(self.layout).__name__,
-                       "fields": _to_json(self.layout, type(self.layout))},
-            "specials": _to_json(self.specials, Specials),
+                       "fields": to_record(self.layout, type(self.layout))},
+            "specials": to_record(self.specials, Specials),
             "tokenizer": recorded_tokenizer(RunProcessor(self.tokenizer)),
         }
 

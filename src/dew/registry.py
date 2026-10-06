@@ -30,6 +30,7 @@ a record whose field declares that class rebuilds the member.
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import functools
 import importlib
 import importlib.metadata
@@ -385,6 +386,74 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     return built
 
 
+def to_record(value, annotation) -> JSON:
+    """Return `value` as the record `from_record(annotation, ...)` rebuilds it from.
+
+    The record is JSON: a dict, a list, or a scalar json.dump can write. A
+    registered member is `{"name": ..., "fields": {...}}` and any other
+    dataclass the record of its fields. `annotation` is the declared field
+    type, so the write side names the same registry and member types the read
+    side rebuilds from, and a value no registry holds where the field names
+    one is refused rather than written as a record nothing reads back.
+    """
+    from flax import linen as nn
+
+    from dew.records import recorded_duration
+
+    if isinstance(value, datetime.timedelta):
+        return recorded_duration(value)
+    if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
+        return dtype_name(value)
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        held = _table_of(annotation)
+        if held is not None and not any(type(value) is member
+                                      for member in held.values()):
+            raise ValueError(
+                f"{type(value).__qualname__} is not a registered {held.kind}; a "
+                f"run config can only record members that load back, so register "
+                f"it once with `@dew.registry.{held.kind}s(\"{type(value).__name__.lower()}\")`")
+        if held is None:
+            held = _table_of(type(value))
+        fields = {f.name: to_record(getattr(value, f.name), _declared_type(type(value), f.name))
+                  for f in dataclasses.fields(value) if _recorded(f)
+                  and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
+        if held is None:
+            return fields
+        return {"name": held.name_of(type(value)), "fields": fields}
+    if isinstance(value, (list, tuple)):
+        entries = entry_types(annotation, len(value))
+        return [to_record(entry_value, entry)
+                for entry_value, entry in zip(value, entries, strict=True)]
+    if isinstance(value, Mapping):
+        entries = entry_types(annotation, len(value))
+        return {_record_key(key): to_record(entry_value, entry)
+                for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    raise TypeError(
+        f"{type(value).__name__} is not something a run record can carry; a "
+        f"config field holds JSON scalars, sequences, mappings, and the "
+        f"registered values this writes as their name and fields")
+
+
+def _record_key(key: object) -> str:
+    """Return one mapping key as JSON names it, since JSON has only string keys.
+
+    A tree path is its parts joined the way every message in this tree joins
+    them, `params/layers_0/self_attn/q_proj`, which is the spelling `_key`
+    splits back into the tuple the field declares. A key that is
+    neither a name nor a path of them has no spelling a record reads back,
+    so it is refused here rather than written as its repr.
+    """
+    if isinstance(key, tuple):
+        return "/".join(_record_key(part) for part in key)
+    if not isinstance(key, (str, int, float)):
+        raise TypeError(
+            f"{key!r} is not a key a run record can carry; a config mapping is keyed "
+            f"by a name, a number, or a tree path of names")
+    return str(key)
+
+
 _MAPPINGS = (dict, Mapping, MutableMapping)
 
 
@@ -394,7 +463,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
 
     This is the one walk from a record to a value, for a module field and a
     run record alike. A registered member is the record that names it,
-    `{"name": ..., "fields": {...}}` (`dew.config._to_json` writes it), where
+    `{"name": ..., "fields": {...}}` (`to_record` writes it), where
     the field declares the table's members or a class the member derives
     from; a dataclass is the record of its fields. Containers are walked, so
     a mapping of records and a tuple of records build their values too, a
@@ -752,6 +821,7 @@ __all__ = [
     "Registry",
     "datasets",
     "encoders",
+    "from_record",
     "metrics",
     "mixers",
     "models",
@@ -760,6 +830,7 @@ __all__ = [
     "projectors",
     "schedules",
     "solvers",
+    "to_record",
     "towers",
     "with_precision",
 ]

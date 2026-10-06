@@ -23,6 +23,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.registry import from_record, towers
 
+from .activations import activation
 from .attention import LayerNorm, RMSNorm
 from .conv import Conv
 from .sharding import logical_axes
@@ -116,18 +117,9 @@ def _inputs(features, mask, width: int) -> tuple[jax.Array, jax.Array]:
 
 
 def _activation(x, name: str = "silu"):
-    # Torch evaluates these elementwise activations in its fp32 opmath dtype.
-    dtype = x.dtype
-    x = x.astype(jnp.promote_types(dtype, jnp.float32))
-    if name == "silu":
-        y = jax.nn.silu(x)
-    elif name in ("gelu", "gelu_pytorch_tanh"):
-        y = jax.nn.gelu(x, approximate=name == "gelu_pytorch_tanh")
-    elif name == "relu":
-        y = jax.nn.relu(x)
-    else:
+    if name not in ("silu", "gelu", "gelu_pytorch_tanh", "relu"):
         raise ValueError(f"audio hidden_act {name!r} has no implementation")
-    return y.astype(dtype)
+    return activation(name)(x)
 
 
 def _clip(x, bound: float):

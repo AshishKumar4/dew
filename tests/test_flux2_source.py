@@ -160,7 +160,7 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, array
 
 
 @pytest.mark.network
-def test_the_published_autoencoder_matches_the_source():
+def test_the_published_autoencoder_matches_the_source(monkeypatch):
     """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
     ships), downloaded, on a smooth 128x192 image, against the source run in
     float64 (`flux2_published.npz`): the pipeline's folded, normalized latent
@@ -168,6 +168,7 @@ def test_the_published_autoencoder_matches_the_source():
     float32 distance from that result, or 1e-5."""
     import importlib.util
 
+    monkeypatch.syspath_prepend(str(ROOT / "tools"))
     spec = importlib.util.spec_from_file_location(
         "diffusers_flux2_reference", ROOT / "tools/diffusers_flux2_reference.py"
     )

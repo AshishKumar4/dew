@@ -109,7 +109,7 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
 
-    from dew.inference.serving import _inference_projections
+    from dew.inference.projections import _inference_projections
 
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(np.asarray, bound.variables)
@@ -141,7 +141,7 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
 
 @pytest.mark.parametrize("case", ["kv_shared", "k_eq_v", "output_gate"])
 def test_inference_projection_layout_preserves_special_attention_logits(case):
-    from dew.inference.serving import _inference_projections
+    from dew.inference.projections import _inference_projections
 
     with jax.enable_x64():
         model = CausalTransformer(
@@ -233,7 +233,7 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
 
 def test_reload_normalizes_source_precision_before_concatenating_projections():
     """A float64 value just above an FP16 midpoint must not double-round through FP32."""
-    from dew.inference.serving import _inference_projections
+    from dew.inference.projections import _inference_projections
 
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
@@ -328,7 +328,7 @@ def test_a_step_without_admission_draws_from_its_own_logits_without_merging_ever
     keeps a held row's (on an RTX 4080 at 64 slots, 136 us of an 8.4 ms
     step). A step that seats rows still merges, since those draw from their
     prompt's logits."""
-    from dew.inference.serving import _advanced, _joined
+    from dew.inference.serving_kernel import _advanced, _joined
 
     server = Server.from_task(task(Sampling(temperature=0, eos_id=None)), slots=2, capacity=64, admission=1)
     server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)

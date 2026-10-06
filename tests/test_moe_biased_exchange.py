@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from moe_support import exchange_worker
 
 from dew.nn.gpt_oss import GptOssExperts, GptOssMLP
 from dew.training import Layout, MeshSpec
@@ -278,25 +279,10 @@ def test_full_biased_router_and_experts_take_identical_pooled_adam_steps(dtype, 
 
 @pytest.mark.mesh
 def test_biased_router_updates_pool_across_two_real_cpu_processes(tmp_path):
-    import subprocess
-    import sys
+    from test_multiprocess import run_pool
 
-    from test_multiprocess import free_port, report_of, terminate, worker_env
-
-    coordinator = f'127.0.0.1:{free_port()}'
-    worker = Path(__file__).with_name('moe_biased_exchange_worker.py')
-    outputs = [tmp_path / f'rank{rank}.json' for rank in range(2)]
-    running = [subprocess.Popen(
-        [sys.executable, str(worker), str(rank), coordinator, str(output)],
-        env=worker_env(1), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-        text=True, start_new_session=True) for rank, output in enumerate(outputs)]
-    try:
-        reports = [report_of(process, output, timeout=120)
-                   for process, output in zip(running, outputs, strict=True)]
-    finally:
-        for process in running:
-            if process.poll() is None:
-                terminate(process)
+    reports = run_pool(Path(__file__).with_name('moe_biased_exchange_worker.py'), tmp_path, 2,
+                       timeout=120, start=exchange_worker)
     for report in reports:
         assert report['processes'] == 2
         for errors in report['errors'].values():

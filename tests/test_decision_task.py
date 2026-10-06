@@ -213,14 +213,13 @@ def test_a_gate_abstains_below_its_threshold(decide):
 def test_a_calibration_is_a_run_record_value():
     """A fitted calibration writes as its fields and reads back equal through
     the one record walk a run config uses."""
-    from dew.config import _to_json
-    from dew.registry import from_record
+    from dew.registry import from_record, to_record
 
     scored = synthetic(1.5, 600, 3, seed=4)
     temperatures = Temperatures.fit(scored, bucket_minimum=100)
     binning = Binning.fit(scored, temperatures, bins=5, bucket_minimum=100)
     calibration = Calibration(temperatures, binning, Abstention.fit(scored, temperatures, binning))
-    written = json.loads(json.dumps(_to_json(calibration, Calibration)))
+    written = json.loads(json.dumps(to_record(calibration, Calibration)))
     assert from_record(Calibration, written) == calibration
 
 

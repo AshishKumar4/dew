@@ -400,6 +400,77 @@ def test_layout_parity_refuses_a_floor_past_its_compute_dtypes_rounding():
         tool.widest_floor({"['layers_23']['layer_scalar']": 2.21}, "bfloat16")
 
 
+def test_layout_parity_orders_use_the_shared_k_rule_and_reject_coarser_gradients():
+    from reference_error import ORDERS
+
+    tool = load("layout_parity")
+    reference = {"D": np.linspace(1, 2, ORDERS), "@loss": np.ones(ORDERS)}
+    passing = tool.judged_orders(reference, {name: values * 1.5 for name, values in reference.items()})
+    assert passing["status"] == "works" and not passing["failed_leaves"]
+    failing = tool.judged_orders(reference, {"D": reference["D"] * 3, "@loss": reference["@loss"]})
+    assert failing["status"] == "MISMATCH" and set(failing["failed_leaves"]) == {"D"}
+    assert failing["worst_leaf"] == "D"
+    short = tool.judged_orders({"D": reference["D"][:-1]}, {"D": reference["D"][:-1]})
+    assert short["status"] == "MISMATCH" and "orders" in short["failed_leaves"]["D"]
+
+
+def test_layout_parity_orders_require_float64_function_invariance():
+    tool = load("layout_parity")
+    truth = {"weight": np.array([1.0, -2.0, 0.25]), "cancelled": np.array([0.0])}
+    assert tool.order_invariance(truth, truth, 3.0, 3.0) == 0
+    with pytest.raises(ValueError, match="changes the function"):
+        tool.order_invariance({**truth, "weight": truth["weight"] + 1e-3}, truth, 3.0, 3.0)
+    with pytest.raises(ValueError, match="changes the function"):
+        tool.order_invariance(truth, truth, 3.01, 3.0)
+    with pytest.raises(ValueError, match="different leaves"):
+        tool.order_invariance({"weight": truth["weight"]}, truth, 3.0, 3.0)
+
+
+def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
+    from residual_orders import permuted
+
+    from dew.interop import Pretrained
+
+    loaded = Pretrained.load(FIXTURES / 'hf/nemotron-h-moe-tiny', dtype='float32',
+                             attention_impl='reference')
+    order = np.array([3, 0, 12, 5, 10, 1, 8, 7, 2, 14, 4, 13, 6, 15, 9, 11])
+    ids = jnp.array([[2, 7, 11, 3]], jnp.int32)
+    tool = load('layout_parity')
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64), loaded.variables)
+        model = loaded.model.clone(dtype=jnp.float64)
+        truth = np.asarray(model.apply(wide, ids))
+        reordered = np.asarray(model.apply(permuted(wide, order), ids))
+    tool.order_invariance({'logits': reordered}, {'logits': truth},
+                          float(reordered.sum()), float(truth.sum()))
+
+
+def test_layout_parity_routes_declaring_rows_to_orders_in_default_mode(monkeypatch, tmp_path):
+    tool = load('layout_parity')
+    called = []
+
+    def ordered(models, layouts, **kwargs):
+        called.extend(models)
+        assert jax.config.jax_enable_x64
+        return [{'model': models[0], 'layout': layouts[0], 'status': 'works', 'orders': 52}]
+
+    monkeypatch.setattr(tool, 'run_orders', ordered)
+    gradient = {'weight': np.array([1.0])}
+    reference = tool.Reference(losses=[2.0], gradient=gradient, flops_per_device=None,
+                               floors={'weight': 1e-6}, loss_floor=1e-6)
+    monkeypatch.setattr(tool, 'computed_reference', lambda *args: reference)
+    monkeypatch.setattr(tool, 'trained', lambda *args, **kwargs: (
+        [2.0], gradient, {'flops_per_device': None, 'mesh': {'data': 1}}))
+    before = jax.config.jax_enable_x64
+    rows = tool.run(['nemotron_h_moe', 'dense'], ['sequence4'], dtype='float32', steps=1, anchor=False,
+                    mixture={}, objective={}, references=tool.References(), devices=4,
+                    speak=lambda line: None, keep=lambda rows: None, orders_out=tmp_path)
+    assert called == ['nemotron_h_moe']
+    assert rows[0]['orders'] == 52 and rows[1]['status'] == 'works'
+    assert 'orders' not in rows[1]
+    assert jax.config.jax_enable_x64 == before
+
+
 def test_layout_parity_judges_a_leaf_below_the_steps_rounding_against_the_whole_gradient():
     """A gradient whose terms cancel, such as a scale just ahead of a
     normalisation that undoes it, is rounding noise, and relative to its own
@@ -987,6 +1058,23 @@ def test_a_distribution_whose_requirement_names_a_url_is_refused(tmp_path, monke
     monkeypatch.setattr(sys, "argv", ["check_distribution.py", str(clean)])
     check.main()
     assert "dewml-0.1.0-py3-none-any.whl: 2 requirements" in capsys.readouterr().out
+
+
+# ---------------------------------------------------------------------------
+# tools/torch_optim_reference.py
+# ---------------------------------------------------------------------------
+
+def test_torch_optim_fixture_is_what_the_generator_writes(tmp_path):
+    """The stored gradients and initial parameters exactly; torch's schedule
+    values and Adam steps within float32 rounding of a parameter of order 1."""
+    pytest.importorskip("torch")
+    load("torch_optim_reference").main(["--out", str(tmp_path)])
+    committed = FIXTURES / "torch_optim"
+    assert_fixture_files(tmp_path, committed, "torch_optim_reference")
+    with np.load(committed / "reference.npz") as stored:
+        computed = [name for name in stored.files if not name.startswith(("initial/", "grads/"))]
+    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz",
+                          dict.fromkeys(computed, 1e-6))
 
 
 # ---------------------------------------------------------------------------
