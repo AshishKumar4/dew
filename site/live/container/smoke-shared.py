@@ -40,7 +40,15 @@ async def main():
                 assert any(output.get("text", "").strip() for output in outputs)
             else:
                 assert any(output.get("png") for output in outputs)
-        print("Browser text/image protocol passed through the isolated shared context.", flush=True)
+        await socket.send(json.dumps({"op": "execute", "id": "stop", "code": "import time; time.sleep(60)"}))
+        await asyncio.sleep(0.5)
+        await socket.send(json.dumps({"op": "interrupt"}))
+        while True:
+            message = json.loads(await asyncio.wait_for(socket.recv(), timeout=10))
+            if message.get("id") == "stop" and message["type"] == "done":
+                assert message["status"] in ("error", "aborted"), message
+                break
+        print("Browser text/image and Stop protocol passed through the isolated shared context.", flush=True)
 
 
 if __name__ == "__main__":

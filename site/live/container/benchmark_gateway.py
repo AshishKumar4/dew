@@ -89,6 +89,13 @@ def main():
             assert collect(client, message).strip() == 'private stdin probe'
             execute(client,
                 "import errno, os, resource, socket\n"
+                "for proc in Path('/proc').glob('[0-9]*'):\n"
+                " try:\n  uid = next(line for line in (proc / 'status').read_text().splitlines() "
+                "if line.startswith('Uid:')).split()[1]\n"
+                " except (OSError, StopIteration):\n  continue\n"
+                " assert int(uid) == os.getuid(), 'guest saw a foreign process'\n"
+                "assert {line.split(':')[0].strip() for line in Path('/proc/net/dev').read_text().splitlines()[2:]} == {'lo'}\n"
+
                 "status = Path('/proc/self/status').read_text().splitlines()\n"
                 "assert all(line.split(':')[1].strip() == '0000000000000000' "
                 "for line in status if line.startswith('Cap'))\n"

@@ -15,6 +15,14 @@ path='/run/dew/gateway-token'
 fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_TRUNC,0o600)
 with os.fdopen(fd,'w') as f:f.write(secrets.token_urlsafe(32))
 PY
+/opt/venv/bin/python - <<'PYTHON'
+import json
+from pathlib import Path
+path = Path('/opt/venv/share/jupyter/kernels/python3/kernel.json')
+spec = json.loads(path.read_text())
+spec['interrupt_mode'] = 'message'
+path.write_text(json.dumps(spec))
+PYTHON
 KG_AUTH_TOKEN=$(cat /run/dew/gateway-token)
 export KG_AUTH_TOKEN
 nohup env JUPYTER_RUNTIME_DIR=/run/dew/gateway PYTHONPATH=/opt/live /opt/venv/bin/jupyter-kernelgateway \
