@@ -88,6 +88,7 @@ from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
 
+    from dew.config import ModelConfig
     from dew.lora import Adapter, LoRA
     from dew.training.distributed import Layout, MeshSpec
 
@@ -235,6 +236,26 @@ def _wrapper_layouts(tensors, record, variables):
     return tuple(bindings), retained
 
 
+def _scalar_mode(layouts: tuple[WeightLayout, ...], variables: Mapping[str, object]) -> str | None:
+    """Return where the tree being written keeps the layer scalars `layouts`
+    read, 'trainable' in `params` and 'frozen' in `constants`, or None where
+    no layout reads one.
+
+    Gemma 4 publishes its per-layer skip scale as a buffer, and a model that
+    trains it keeps every one in `params`. The tree decides, as
+    DiffusionGemma's export does (`diffusion_gemma.scalar_placement`), so a
+    standalone decoder and one inside a media wrapper are read alike.
+    """
+    for layout in layouts:
+        path = layout.paths[0]
+        if path[-1] == "layer_scalar":
+            node: object = variables.get("params")
+            for part in path[1:]:
+                node = node.get(part) if isinstance(node, Mapping) else None
+            return "frozen" if node is None else "trainable"
+    return None
+
+
 def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tuple[str, str], ...],
                              quantized: tuple[str, ...]) -> None:
     """Share only aliases verified on original values before codec narrowing.
@@ -294,9 +315,13 @@ class Pretrained:
     generation_config: Mapping[str, object] = field(default_factory=dict)
     weight_layouts: tuple[WeightLayout, ...] = ()
     retained_tensors: Mapping[str, np.ndarray] = field(default_factory=dict)
-    export_adapter: (
-        Callable[[nn.Module, Mapping[str, object], Mapping[str, object]], Mapping[str, np.ndarray]] | None
-    ) = field(default=None, repr=False)
+    export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = field(default=None, repr=False)
+    """The encoder `export` writes the model, its variables and `config` through, or None to write
+    through `weight_layouts`.
+
+    The route that built the model installs the encoder for it (a decoder family's, DiffusionGemma's,
+    the torchax graph's), so each one takes the model it encodes and none asks which model it holds.
+    """
     quantized_tensors: tuple[str, ...] = ()
     quantized_scale_dtype: str | None = None
     """The dtype a quantized source stored its scales in, when its format leaves that to the checkpoint.
@@ -348,7 +373,12 @@ class Pretrained:
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None) -> Self:
-        """Return a trained run's selected checkpoint, rebuilt from the run's own inference record."""
+        """Return a trained run's selected checkpoint, rebuilt from the run's own inference record.
+
+        The architecture the record names says which layout it saves in
+        (`_RUN_LAYOUTS`), and a decoder's masked-diffusion run is a
+        `PretrainedMaskedDecoder`.
+        """
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
         from dew.records import record, text
@@ -365,23 +395,11 @@ class Pretrained:
             Sampling(**sampling), budget if isinstance(budget, int) else None)
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
-        if isinstance(model, CausalTransformer):
-            bundle = PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer,
-                                                   generation_config=generation)
-            if kind == 'masked_diffusion':
-                bundle = PretrainedMaskedDecoder(
-                    model, bundle.variables, bundle.processor, bundle.config, bundle.source,
-                    bundle.model_config, bundle.generation_config,
-                    export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
-        elif isinstance(model, DiffusionGemma):
-            from dew.interop import diffusion_gemma
-            config = diffusion_gemma.published_config(model)
-            bundle = PretrainedBlockDecoder(model, variables, None, config, None, model_config.fields(), {},
-                                             export_adapter=diffusion_gemma.export_weights,
-                                             tokenizer=tokenizer)
-        else:
+        layout = _RUN_LAYOUTS.get(model_config.architecture)
+        if layout is None:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
                             "load diffusion runs with TextToImage.from_run")
+        bundle = layout(model_config, model, variables, kind, tokenizer, generation)
         if not isinstance(bundle, cls):
             raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
@@ -542,24 +560,11 @@ class Pretrained:
         if self.adapter is not None:
             values = self.adapter.merge(values)
         quantization = self._quantization()
-        family = self.config.get("model_type")
         if self.export_adapter is not None:
             tensors = self.export_adapter(self.model, values, self.config)
-        elif (
-            isinstance(self.model, CausalTransformer)
-            and isinstance(family, str)
-            and family in decoders.families()
-            and not decoders.families()[family].preserve_source_layout
-            and quantization is None
-        ):
-            # The decoder export's own encoder, so this and `PretrainedDecoder.from_model`
-            # leave the same weights. A quantized source keeps its packed format
-            # by going back over its source names, below.
-            return decoders.export_decoder_weights(self.model, values, decoders._export_config(self.model))
         elif self.weight_layouts:
             # Source names and geometry first; the packed format goes back over them.
-            text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
-            scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
+            scalar_mode = _scalar_mode(self.weight_layouts, values)
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
                 return decoders._layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
@@ -815,6 +820,40 @@ class PretrainedFallback(Pretrained):
     `AutoModelForCausalLM.from_pretrained(source).generate`. Train it like any
     source, `LMObjective(fallback, seq_len)`.
     """
+
+
+def _decoder_run(model_config: ModelConfig, model: nn.Module, variables: Variables, kind: str,
+                 tokenizer: str | None, generation: Mapping[str, object] | None) -> Pretrained:
+    """A `causal_transformer` run, in the Hugging Face family its fields
+    derive (`PretrainedDecoder.from_model`); a masked-diffusion run
+    generates by unmasking."""
+    decoder = from_record(CausalTransformer, model)
+    bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
+                                          generation_config=generation)
+    if kind != "masked_diffusion":
+        return bundle
+    return PretrainedMaskedDecoder(decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
+                                   bundle.model_config, bundle.generation_config,
+                                   export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
+
+
+def _block_run(model_config: ModelConfig, model: nn.Module, variables: Variables, kind: str,
+               tokenizer: str | None, generation: Mapping[str, object] | None) -> Pretrained:
+    """A `diffusion_gemma` run, in the layout transformers'
+    DiffusionGemmaForBlockDiffusion reads (`diffusion_gemma.published_config`)."""
+    from dew.interop import diffusion_gemma
+
+    block = from_record(DiffusionGemma, model)
+    return PretrainedBlockDecoder(block, variables, None, diffusion_gemma.published_config(block), None,
+                                  model_config.fields(), {}, export_adapter=diffusion_gemma.export_weights,
+                                  tokenizer=tokenizer)
+
+
+# The layout a run's model is saved in, by the architecture its record names:
+# the record a run is rebuilt from names the codec that writes it back, which
+# is the one thing model registration is needed for. Each codec reads the
+# model that record built as the class it registers (`from_record`).
+_RUN_LAYOUTS = MappingProxyType({"causal_transformer": _decoder_run, "diffusion_gemma": _block_run})
 
 
 def _native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
@@ -1857,10 +1896,12 @@ def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
 
 
 def _source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module, gguf_path: Path | None = None) -> Processor | None:
+                      model: nn.Module, gguf_path: Path | None = None, *, media: bool = False
+                      ) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
-    Only a model with towers reads images or audio, and only through the
+    Only a `media` source, a wrapper whose towers the loader built beside its
+    decoder (`_media_wrapper`), reads images or audio, and only through the
     processor its repo ships; a text decoder takes its tokenizer whatever
     processor files sit beside it (DiffusionGemma publishes a Gemma 4
     processor config beside a text-only model), and a tiny multimodal
@@ -1868,7 +1909,7 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
-    if isinstance(model, MultimodalTransformer) and processor_files:
+    if media and processor_files:
         from transformers import AutoProcessor
         options = {"backend": "pil"} if config.get("model_type") == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
@@ -2135,6 +2176,28 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     return _Built(model, variables, record, wrapper, layouts, retained)
 
 
+def _media_wrapper(config: Mapping[str, object]) -> bool:
+    """Whether a source is a media wrapper, its decoder under text_config and
+    its towers beside it.
+
+    Where its model_type is a registered decoder family, its towers have no
+    counterpart and the text half, read from the nested config, is the
+    model, unless the family reads its media bundle whole
+    (`DecoderFamily.wrapper`); `translate_config` refuses the rest.
+    DiffusionGemma nests its text config too and is a family of its own.
+    """
+    family = config.get("model_type")
+    return (family != "diffusion_gemma" and "text_config" in config
+            and (family not in decoders.families() or decoders._bundles(config)))
+
+
+def _derived_weights(model: CausalTransformer, variables: Mapping[str, object],
+                     config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
+    """Write a loaded decoder through the decoder export's own encoder, under
+    the config its fields derive rather than the `config` it shipped."""
+    return decoders.export_decoder_weights(model, variables, decoders._export_config(model))
+
+
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
                     verified: verify.VerifiedMapping | None, *, dtype: str, attention_impl: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool) -> _Built:
@@ -2198,6 +2261,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         param_dtype = _checkpoint_dtype(config, tensors)
     tensors, quantized_tensors, scale_dtype, grid = _decoded(tensors, config, param_dtype)
     export_adapter = None
+    media = _media_wrapper(config)
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
 
@@ -2208,12 +2272,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         record, layouts, retained = config, (), {}
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif "text_config" in config and (family not in decoders.families() or decoders._bundles(config)):
-        # A wrapper repo carries its decoder under text_config. Where its
-        # model_type is a registered decoder family, its towers have no
-        # counterpart and the text half, read from the nested config, is the
-        # model, unless the family reads its media bundle whole
-        # (`DecoderFamily.wrapper`); `translate_config` refuses the rest.
+    elif media:
         model, variables, record, built, layouts, retained = _wrapper_source(
             config, tensors, directory, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len,
             param_dtype=param_dtype, lazy=streaming)
@@ -2221,8 +2280,15 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         model, variables, record, built, layouts, retained = _decoder_source(
             config, tensors, directory, verified, dtype=dtype, attention_impl=attention_impl,
             max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
+        if (isinstance(family, str) and family in decoders.families()
+                and not decoders.families()[family].preserve_source_layout
+                and source_quantization(config) is None):
+            # The decoder export's own encoder, so this and `PretrainedDecoder.from_model`
+            # leave the same weights. A quantized source keeps its packed format
+            # by going back over its source names (`weight_layouts`).
+            export_adapter = _derived_weights
     model = _input_quantization(model, layouts, config, grid)
-    processor = _source_processor(directory, config, record, model, gguf_path)
+    processor = _source_processor(directory, config, record, model, gguf_path, media=media)
     generation_config = _generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in
@@ -2238,8 +2304,10 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                     revision=None if commit is None else directory.name,
                     tokenizer="byte" if named == "byte" else None)
 
-    if isinstance(model, DiffusionGemma):
+    if family == "diffusion_gemma":
         return bundle(PretrainedBlockDecoder)
-    if isinstance(model, CausalTransformer) and not model.causal and model.mask_token_id is not None:
+    # The masked-diffusion families' records attend both ways and reserve a
+    # mask id to denoise; a wrapper's record nests its decoder's.
+    if record.get("causal") is False and record.get("mask_token_id") is not None:
         return bundle(PretrainedMaskedDecoder)
     return bundle(PretrainedDecoder)

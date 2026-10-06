@@ -13,7 +13,6 @@ import dataclasses
 from collections.abc import Mapping
 
 import numpy as np
-from flax import linen as nn
 from flax.traverse_util import flatten_dict
 
 from dew import records
@@ -247,7 +246,7 @@ def _refuse_unreadable(config: Mapping[str, object]) -> None:
 
 
 def export_weights(
-    model: nn.Module, variables: Variables, config: Mapping[str, object]
+    model: DiffusionGemma, variables: Variables, config: Mapping[str, object]
 ) -> dict[str, np.ndarray]:
     """Return the checkpoint tensors for a DiffusionGemma, keyed by source name.
 
@@ -258,8 +257,6 @@ def export_weights(
     from dew.interop.hf_decoders import export_decoder_weights
     from dew.nn.vision.gemma4 import _GEMMA4_VISION_TENSORS
 
-    if not isinstance(model, DiffusionGemma):
-        raise TypeError("DiffusionGemma export requires its native model value")
     _refuse_unreadable(config)
     params = variables["params"]
     text_variables = {collection: tree["text"] for collection, tree in variables.items()

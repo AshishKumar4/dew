@@ -989,6 +989,43 @@ def test_standalone_gemma4_export_preserves_computation(fixture, mode, dense, tm
                                       variables[collection][layer]["layer_scalar"])
 
 
+@pytest.mark.parametrize("fixture, trainable", [
+    ("gemma4-moe-tiny", lambda model: model.clone(layer_scalar="trainable")),
+    ("gemma4-native-tiny", lambda model: model.clone(
+        language_model=model.language_model.clone(layer_scalar="trainable"))),
+], ids=["decoder", "wrapper"])
+def test_a_loaded_gemma4_writes_its_trained_layer_scalars_under_their_source_names(fixture, trainable,
+                                                                                  tmp_path):
+    """A loaded Gemma 4, alone or inside its media wrapper, saves through the
+    source names it was read from. Trained, its layer scalars sit in
+    `params`, and those values are what the export's buffers carry: the
+    reload holds them under `constants` and computes the trained logits."""
+    import jax.numpy as jnp
+    from flax.core import unfreeze
+    from flax.traverse_util import flatten_dict, unflatten_dict
+
+    loaded = Pretrained.load(FIXTURES / fixture, dtype="float32", attention_impl="reference")
+    model = trainable(loaded.model)
+    variables = unfreeze(loaded.variables)
+    constants, params = flatten_dict(variables["constants"]), flatten_dict(variables["params"])
+    scalars = sorted(path for path in constants if path[-1] == "layer_scalar")
+    assert scalars
+    for index, path in enumerate(scalars):
+        params[path] = jnp.full_like(constants.pop(path), 0.75 + index * 0.125)
+    variables.update(constants=unflatten_dict(constants), params=unflatten_dict(params))
+    ids = jnp.arange(2, 10, dtype=jnp.int32)[None, :]
+    expected = np.asarray(jax.jit(model.apply)(variables, ids))
+
+    dataclasses.replace(loaded, model=model).save(tmp_path, variables=variables)
+
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    held = flatten_dict(restored.variables["constants"])
+    for path in scalars:
+        np.testing.assert_array_equal(held[path], params[path])
+    actual = np.asarray(jax.jit(restored.model.apply)(restored.variables, ids))
+    np.testing.assert_array_equal(actual, expected)
+
+
 def glm5_native_export_case(variant):
     import jax.numpy as jnp
     from flax.core import unfreeze
