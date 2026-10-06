@@ -1,5 +1,9 @@
 {
  "references": {
+  "clef/tiny/images.npz": {
+   "tool": "tools/clef_reference.py",
+   "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
   "clef/tiny/logits.npz": {
    "tool": "tools/clef_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
