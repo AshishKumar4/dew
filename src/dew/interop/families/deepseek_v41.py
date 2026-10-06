@@ -39,12 +39,15 @@ from dew.interop.hf_decoders import (
     _Ropes,
     _yarn_record,
 )
-from dew.nn import vision as vision_nn
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.engram import Engram
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.vision.deepseek_v41 import (
+    translate_deepseek_v41_projector_config,
+    translate_deepseek_v41_vision_config,
+)
 
 # The release's config.json nests the text model's fields under text_config
 # beside a vision tower.
@@ -120,8 +123,8 @@ def _deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
     text = _v41_decoder(hf_config, used, media_bias=True)
     return {
         'model_type': 'deepseek_v41', 'text_model_type': 'deepseek_v41', 'text': text,
-        'tower': vision_nn.translate_deepseek_v41_vision_config(hf_config),
-        'projector': vision_nn.translate_deepseek_v41_projector_config(
+        'tower': translate_deepseek_v41_vision_config(hf_config),
+        'projector': translate_deepseek_v41_projector_config(
             hf_config, _record_int(text, 'emb_features')),
         'image_token_id': _record_int(hf_config, 'image_token_id'),
         'tokens_per_image': None, **_NO_AUDIO}
