@@ -2,31 +2,38 @@
 
 A request is a state (text, or any JSON) and named questions, each a
 `Noul`, a `Choice` or a `Score` (TypeSafe Jev's three, docs.typesafe.ai).
-The model lays each question out with the state (`MarkerLayout`,
-`StateFirstLayout`), reads the row with a backbone, scores every option
-with a `DecisionHead`, and answers with a distribution over exactly the
-options the question names. `Decide` is the task that answers requests,
-and `DecisionObjective` trains one on proper scoring rules.
-`LayaCheckpoint` reads convaiinnovations/laya's released checkpoints.
+The model lays the questions out with the state (Laya's `MarkerLayout`, the
+`StateFirstLayout` for a causal backbone, or Clef's `JointLayout`), reads
+the rows with a backbone, scores every option with a head (Laya's
+`DecisionHead` or Clef's `JointSchemaHead`), and answers with a
+distribution over exactly the options each question names. `Decide` is the
+task that answers requests, and `DecisionObjective` trains one on proper
+scoring rules. `LayaCheckpoint` reads convaiinnovations/laya's released
+checkpoints, and `ClefHead` Cloudflare/clef's released head.
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
+from dew.decision.clef import ClefHead
 from dew.decision.data import DecisionTable, Example
-from dew.decision.head import KINDS, DecisionHead, kind_of
+from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     DecisionInputs,
     Encoded,
+    JointLayout,
+    Laid,
     Layout,
     MarkerLayout,
+    QuestionLayout,
     Specials,
     StateFirstLayout,
     render,
 )
-from dew.decision.metrics import AURC, ECE, Accuracy
+from dew.decision.metrics import AURC, ECE, Accuracy, Answered
 from dew.decision.model import DecisionModel
 from dew.decision.objective import NONE_OF_THE_ABOVE, DecisionObjective, Encoding
 from dew.decision.questions import (
+    KINDS,
     Answer,
     Choice,
     ChoiceAnswer,
@@ -39,6 +46,7 @@ from dew.decision.questions import (
     Score,
     ScoreAnswer,
     TopProbability,
+    kind_of,
 )
 from dew.decision.scoring import Brier, Combined, LogLoss, RankedProbability, ScoringRule, Spherical
 from dew.decision.task import TASK_FILE, Budget, Decide, Usage, Weights
@@ -46,18 +54,21 @@ from dew.decision.task import TASK_FILE, Budget, Decide, Usage, Weights
 __all__ = [
     "AURC",
     "ECE",
+    "HEADS",
     "KINDS",
     "NONE_OF_THE_ABOVE",
     "TASK_FILE",
     "Abstention",
     "Accuracy",
     "Answer",
+    "Answered",
     "Binning",
     "Brier",
     "Budget",
     "Calibration",
     "Choice",
     "ChoiceAnswer",
+    "ClefHead",
     "Combined",
     "Confidence",
     "Decide",
@@ -70,7 +81,11 @@ __all__ = [
     "Encoding",
     "EntropyConfidence",
     "Example",
+    "Head",
     "JevConfidence",
+    "JointLayout",
+    "JointSchemaHead",
+    "Laid",
     "LayaCheckpoint",
     "Layout",
     "LogLoss",
@@ -78,6 +93,7 @@ __all__ = [
     "Noul",
     "NoulAnswer",
     "Question",
+    "QuestionLayout",
     "RankedProbability",
     "Score",
     "ScoreAnswer",
