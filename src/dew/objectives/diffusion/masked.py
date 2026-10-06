@@ -204,42 +204,42 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         Returns the rows, their per-token cross entropies under that
         corruption, the time weight of each masked token, the mask itself,
-        the argmax prediction, and which slots hold real tokens.
+        the argmax prediction, and which slots hold text.
 
-        A packed batch (data:packed-tokens) names each window's documents in
+        The model reads every field the batch's `ModelInputs` carries, and a
+        model that takes no such field refuses it. A packed batch
+        (data:packed-tokens) names each window's documents in
         `text_segment_ids`, 0 for the padded tail, and their positions in
         `text_positions`. Each document then attends to itself alone, in both
         directions, with its own positions, and the tail is neither masked
         nor scored: a packed window scores as its documents would one by one.
+        Padding under `attention_mask` is not scored either, and a media
+        placeholder (`image_indices` or `audio_indices` at or above zero) is
+        the media's slot, which the model reads and nothing masks or predicts.
         """
         params = thaw(params)
         prepared = _batch_text(batch)
-        unread = sorted(set(prepared.token_fields) - {"positions", "segment_ids"})
-        if unread or prepared.conditioning:
-            raise ValueError(
-                f"masked diffusion reads token ids and their packing; this batch also carries "
-                f"{unread + sorted(prepared.conditioning)}")
         tokens = prepared.tokens
         if tokens.shape[-1] != self.seq_len:
             raise ValueError(
                 f"the objective was built for {self.seq_len}-token rows, got {tokens.shape[-1]}")
-        segment_ids = prepared.token_fields.get("segment_ids")
-        real = jnp.ones(tokens.shape, bool) if segment_ids is None else segment_ids != 0
+        fields = prepared.token_fields
+        real = jnp.ones(tokens.shape, bool)
+        if "segment_ids" in fields:
+            real &= fields["segment_ids"] != 0
+        if "attention_mask" in fields:
+            real &= fields["attention_mask"].astype(bool)
+        for media in ("image_indices", "audio_indices"):
+            if media in fields:
+                real &= fields[media] < 0
         time_key, mask_key, dropout_key = jax.random.split(key, 3)
         t = self.process.sample_t(time_key, tokens.shape[0])
         masked, is_masked = self.process.corrupt(mask_key, tokens, t)
         is_masked = is_masked & real
         masked = jnp.where(is_masked, masked, tokens)
 
-        hidden = self.model.apply(
-            params,
-            masked,
-            train=train,
-            positions=prepared.token_fields.get("positions"),
-            segment_ids=segment_ids,
-            rngs={"dropout": dropout_key},
-            method="hidden_states",
-        )
+        hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
+                                  method="hidden_states", **prepared.kwargs())
         head = affine_head(self.model, params)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.

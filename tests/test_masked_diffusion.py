@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from model_support import flat_tree
 
 from dew.checkpoints import Checkpoints
@@ -27,6 +28,7 @@ from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import BATCH_AXES, ModelInputs
+from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.registry import models, with_precision
@@ -57,6 +59,38 @@ def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     # The same 1e-5 relative loss contract as the bias-free chunked head.
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
     np.testing.assert_array_equal(predicted, logits.argmax(-1))
+
+
+class _MediaReader(nn.Module):
+    """A bidirectional model whose every state reads how many media slots its row holds."""
+
+    causal = False
+
+    @nn.compact
+    def hidden_states(self, tokens, train=False, image_indices=None):
+        media = jnp.zeros(tokens.shape) if image_indices is None else (image_indices >= 0) * 1.0
+        return nn.Embed(32, 8)(tokens) + media.sum(-1)[:, None, None] * self.param("media", nn.zeros, (8,))
+
+    def output_table(self):
+        return OutputTable(self.variables["params"]["Embed_0"]["embedding"], vocab_major=True)
+
+    def __call__(self, tokens, **fields):
+        return self.hidden_states(tokens, **fields)
+
+
+def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
+    tokens = jnp.tile(jnp.arange(1, 9, dtype=jnp.int32), (8, 1))
+    slots = jnp.where(jnp.arange(8) < 2, jnp.arange(8), -1) * jnp.ones((8, 1), jnp.int32)
+    objective = MaskedDiffusionObjective(_MediaReader(), MDLM(mask_id=31)(), seq_len=8, ema_decay=None)
+    params = objective.init(jax.random.key(0))
+    params["params"]["media"] = jnp.ones(8)
+    media = {"text": ModelInputs(tokens, {"image_indices": slots})}
+    _, losses, _, counted, _, real = objective._token_losses(params, media, jax.random.key(1), train=False)
+    plain = objective._token_losses(params, {"text": tokens}, jax.random.key(1), train=False)[1]
+
+    np.testing.assert_array_equal(real, slots < 0)
+    assert not counted[:, :2].any() and counted[:, 2:].any()
+    assert not np.allclose(losses[:, 2:], plain[:, 2:])
 
 
 def loaded(name: str):
