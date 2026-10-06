@@ -1184,30 +1184,29 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
                      softcap=None, segment_ids=None, key_value_seq_lengths=None):
     """Dispatch one whole-sequence attention call to the kernel it names,
-    differentiable in forward mode under `forward_mode_attention`."""
-    call = functools.partial(
-        _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
-        causal=causal, sliding_window=sliding_window, mask=mask, softcap=softcap, segment_ids=segment_ids,
-        key_value_seq_lengths=key_value_seq_lengths)
-    if not _FORWARD_MODE.get():
-        return call(query, key, value, bias=bias, sinks=sinks, implementation=implementation)
+    differentiable in forward mode under `forward_mode_attention`.
+
+    'auto' resolves here, once, against this call's shapes and backend, and
+    `_attention_kernel` runs the call on the kernel it resolved to.
+    """
+    if sliding_window is not None and sliding_window < 1:
+        raise ValueError(f"sliding_window must be positive, got {sliding_window}")
+    if sinks is not None and softcap is not None:
+        raise ValueError(
+            "attention sinks and a logit softcap have no reference that "
+            "combines them, so no path takes both")
     lengths = (None if key_value_seq_lengths is None
                else jnp.asarray(key_value_seq_lengths, jnp.int32))
+    masked = mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3])
     resolved = resolve_implementation(
-        implementation,
-        query,
-        key,
-        dtype=dtype,
-        precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax,
-        softcap=softcap,
-        sinks=sinks,
-        causal=causal,
-        sliding_window=sliding_window,
-        mask=mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3]),
-        bias=bias,
-    )
-    if resolved not in ('cudnn', 'triton', 'tpu'):
+        implementation, query, key, dtype=dtype, precision=precision,
+        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
+        causal=causal, sliding_window=sliding_window, mask=masked, bias=bias)
+    call = functools.partial(
+        _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
+        causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
+        segment_ids=segment_ids, lengths=lengths)
+    if not _FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'tpu'):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
     def fused(query, key, value, bias, sinks):
@@ -1234,34 +1233,20 @@ def forward_differentiable(value, tangent, *arrays):
     return attend(*arrays)
 
 
-def _attention_kernel(query, key, value, dtype=None, precision=None,
-                      force_fp32_for_softmax=True, implementation='auto',
-                      causal=False, sliding_window=None, mask=None, bias=None, sinks=None,
-                      softcap=None, segment_ids=None, key_value_seq_lengths=None):
-    """Dispatch one whole-sequence attention call to the kernel it names.
+def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, precision,
+                      force_fp32_for_softmax, causal, sliding_window, mask, masked, softcap,
+                      segment_ids, lengths):
+    """Run one whole-sequence attention call on the kernel `attention_kernel` resolved.
 
-    'auto' resolves here, against this call's shapes and backend. Splash takes
-    sinks, a softcap and packed segment ids itself; elsewhere segment ids become
-    the document mask, and sinks and a softcap run their own XLA paths, since
+    `masked` is `mask` with the key `lengths` in it. Splash takes sinks, a
+    softcap and packed segment ids itself; elsewhere segment ids become the
+    document mask, and sinks and a softcap run their own XLA paths, since
     `jax.nn.dot_product_attention` has neither. The rest goes to
     `fused_attention` once the arguments it cannot honour have raised. Key
     lengths reach cudnn and xla as they are and every other path as the mask
     they mean, which splash cannot describe, so 'auto' never picks 'tpu' for
     them.
     """
-    if sliding_window is not None and sliding_window < 1:
-        raise ValueError(f"sliding_window must be positive, got {sliding_window}")
-    if sinks is not None and softcap is not None:
-        raise ValueError(
-            "attention sinks and a logit softcap have no reference that "
-            "combines them, so no path takes both")
-    lengths = (None if key_value_seq_lengths is None
-               else jnp.asarray(key_value_seq_lengths, jnp.int32))
-    masked = mask if lengths is None else with_key_lengths(mask, lengths, key.shape[-3])
-    implementation = resolve_implementation(
-        implementation, query, key, dtype=dtype, precision=precision,
-        force_fp32_for_softmax=force_fp32_for_softmax, softcap=softcap, sinks=sinks,
-        causal=causal, sliding_window=sliding_window, mask=masked, bias=bias)
     if segment_ids is not None and implementation != 'tpu':
         mask = with_documents(mask, segment_ids)
         masked = with_documents(masked, segment_ids)
