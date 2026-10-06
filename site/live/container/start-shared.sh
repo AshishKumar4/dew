@@ -3,6 +3,7 @@
 set -eu
 umask 077
 mkdir -p /run/dew/model
+chmod 0711 /run/dew
 chown model:model /run/dew/model
 chmod 0711 /run/dew/model
 sh /opt/live/start-gateway.sh
