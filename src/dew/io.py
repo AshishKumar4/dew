@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import jax
 from etils import epath
 
-from dew.checkpoints import RUN_FILE, is_uri
+from dew.checkpoints import RUN_FILE, _frozen_entries, is_uri
 from dew.training.tracker import WandbTracker
 
 REGISTRY = "wandb-registry-model"
@@ -20,13 +20,15 @@ REGISTRY = "wandb-registry-model"
 def publish(directory: str, name: str, *, tracker: WandbTracker,
             aliases: Sequence[str] = ()):
     """Log the checkpoint step directory at `directory` as a model artifact of
-    the tracker's run, with the run's `run.json` beside it, and link it into the
+    the tracker's run, laid out as its run directory is, and link it into the
     W&B model registry under `name`.
 
-    `directory` is one step directory (`Checkpoints.path(step)`), and the run
-    spec is read from its parent, the run directory, so what is published is
-    what `Pipeline.from_run` needs. The artifact carries 'latest'
-    and `aliases`; the registry link carries `aliases`.
+    `directory` is one step directory (`Checkpoints.path(step)`). The artifact
+    holds it under its own name, the run's `run.json` and the
+    `dew.checkpoints.FROZEN_STORE` entries the step records, each at its place
+    in the run directory, so a download is a run directory `from_run` and
+    `Checkpoints.restore` read. The artifact carries 'latest' and `aliases`;
+    the registry link carries `aliases`.
 
     Only process zero publishes, and it returns None everywhere else: every
     process holds the same checkpoint, so a second upload would duplicate
@@ -43,15 +45,21 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
 
     artifact = wandb.Artifact(name=name, type="model")
     path = epath.Path(directory)
-    spec = path.parent / RUN_FILE
+    run = path.parent
+    spec = run / RUN_FILE
+    entries = _frozen_entries(directory)
     if is_uri(directory):
-        artifact.add_reference(str(path))
+        artifact.add_reference(str(path), name=path.name)
         if spec.exists():
-            artifact.add_reference(str(spec))
+            artifact.add_reference(str(spec), name=RUN_FILE)
+        for entry in entries:
+            artifact.add_reference(str(run / entry), name=entry)
     else:
-        artifact.add_dir(directory)
+        artifact.add_dir(directory, name=path.name)
         if spec.exists():
-            artifact.add_file(str(spec))
+            artifact.add_file(str(spec), name=RUN_FILE)
+        for entry in entries:
+            artifact.add_dir(str(run / entry), name=entry)
     logged = tracker.run.log_artifact(artifact, aliases=["latest", *aliases])
     tracker.run.link_artifact(
         artifact=logged, target_path=f"{REGISTRY}/{name}", aliases=list(aliases))

@@ -31,6 +31,7 @@ import multiprocess_worker as worker
 import numpy as np
 import pytest
 
+from dew.checkpoints import FROZEN_STORE
 from dew.position import ENVELOPE
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
@@ -490,12 +491,14 @@ def test_a_checkpoint_written_by_a_pool_restores_in_one_process(tmp_path):
 
     A checkpoint is bytes, not arithmetic, so the restored parameters have
     to be equal, not close. The reading run also uses a different mesh, as a
-    resume on smaller hardware does.
+    resume on smaller hardware does. The DiT's `constants` (its time
+    embedding's frequencies) go to the store once (`FROZEN_STORE`).
     """
     pool = run_pool("steps", tmp_path / "pool", 2, fsdp_size=2, steps=4, save=True,
                     name="pool", run_dir=tmp_path / "written")
     written = worker.checkpoint_dir(tmp_path / "written", "pool")
     assert pool[0]["checkpoint_path"] == str(written)
+    assert len(list((written / FROZEN_STORE).iterdir())) == 1
 
     restored = run_worker("steps", tmp_path / "restored.json", fsdp_size=1, steps=0,
                           save=True, name="pool", run_dir=tmp_path / "written")
