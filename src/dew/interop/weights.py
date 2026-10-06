@@ -5,7 +5,6 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 
 from dew import records
@@ -52,11 +51,11 @@ def auto_storage_dtype(config: Mapping[str, object], tensors: Mapping[str, np.nd
         if storage is None:
             raise ValueError(f"dtype={stated!r} names no floating parameter storage")
         return storage
-    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
-                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
     for tensor in tensors.values():
-        if tensor.dtype in storable:
-            return storable[tensor.dtype]
+        try:
+            return dtype_name(tensor.dtype)
+        except ValueError:
+            continue
     raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
                      "float16 tensor in the checkpoint")
 

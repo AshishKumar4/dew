@@ -428,6 +428,27 @@ def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path, stated, stored)
     assert leaf_dtypes(loaded.variables) == {np.dtype(stored)}
 
 
+def test_auto_storage_skips_payloads_that_are_no_parameter_storage():
+    """Packed, integer and wider payloads ahead of the first float32,
+    bfloat16 or float16 tensor do not decide the storage; a stated dtype
+    wins, `dtype` over `torch_dtype`, and neither is refused by name."""
+    from dew.interop.weights import auto_storage_dtype
+
+    tensors = {"packed": np.zeros(2, np.uint8), "fp8": np.zeros(2, ml_dtypes.float8_e4m3fn),
+               "scale": np.zeros(2, ml_dtypes.float8_e8m0fnu), "fp4": np.zeros(2, ml_dtypes.float4_e2m1fn),
+               "index": np.zeros(2, np.int32), "wide": np.zeros(2, np.float64),
+               "first": np.zeros(2, ml_dtypes.bfloat16), "then": np.zeros(2, np.float16)}
+
+    assert auto_storage_dtype({}, tensors) == "bfloat16"
+    assert auto_storage_dtype({}, dict(reversed(tensors.items()))) == "float16"
+    assert auto_storage_dtype({"dtype": "float32", "torch_dtype": "float16"}, tensors) == "float32"
+    assert auto_storage_dtype({"torch_dtype": "float16"}, tensors) == "float16"
+    with pytest.raises(ValueError, match="'float64' is not one of"):
+        auto_storage_dtype({"dtype": "float64"}, tensors)
+    with pytest.raises(ValueError, match="found neither a stated dtype nor a float32"):
+        auto_storage_dtype({}, {name: tensors[name] for name in ("packed", "fp8", "index", "wide")})
+
+
 def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
     import dew
 
