@@ -417,7 +417,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         if FAKE_SCORE in state["params"]:
             return state
         teacher = state[TEACHER]
-        state = _from_teacher(state, teacher)
+        state = dict(_from_teacher(state, teacher))
         for collection, held in teacher.items():
             state[collection] = {**state[collection], FAKE_SCORE: jax.tree.map(jnp.copy, held)}
         return state
