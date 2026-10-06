@@ -1005,3 +1005,31 @@ def test_the_slop_gate_reports_a_broad_suppress_as_it_reports_an_empty_handler()
               "try:\n    step()\nexcept Exception:\n    pass\n")
     module = lint.Module(Path("snippet.py"), "src/dew/snippet.py", source, ast.parse(source))
     assert sorted(finding.line for finding in lint.swallowed(module)) == [2, 8]
+
+
+# ---------------------------------------------------------------------------
+# tools/hf_coverage.py
+# ---------------------------------------------------------------------------
+
+def test_the_census_counts_a_speculative_drafter_as_refused_by_design(tmp_path):
+    """A drafter's qwen3 config is no model the qwen3 family misreads: the
+    census counts its downloads apart from the refusals a family could still
+    take, under the reason the loader gives, and a qwen3 model beside it
+    stays tier 1."""
+    tool = load("hf_coverage")
+    drafter = json.loads((FIXTURES / "hf" / "kimi-k3-dspark" / "config.json").read_text())
+    model = json.loads((FIXTURES / "hf" / "qwen3-tiny" / "config.json").read_text())
+    rows = [{"id": name, "commit": None, "downloads": downloads, "model_type": "qwen3",
+             "architectures": config["architectures"], "config": config}
+            for name, downloads, config in (("drafter", 3, drafter), ("model", 1, model))]
+    (tmp_path / "census.json").write_text(json.dumps(rows))
+
+    tool.classify(tmp_path)
+
+    coverage = json.loads((tmp_path / "coverage.json").read_text())
+    routes = {row["id"]: (row["route"], row["detail"]) for row in coverage["models"]}
+    assert routes["model"][0] == "tier 1"
+    assert routes["drafter"][0] == "by design"
+    assert "['DSparkDraftModel']" in routes["drafter"][1]
+    assert coverage["summary"]["all types"]["by design"] == {"models": 1, "download_share": 0.75}
+    assert coverage["summary"]["all types"]["refused"]["models"] == 0

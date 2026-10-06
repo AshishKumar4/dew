@@ -49,6 +49,8 @@ FIXTURES = ROOT / "tests" / "fixtures" / "lora"
 LLAMA = ROOT / "tests" / "fixtures" / "hf" / "llama-tiny"
 ADAPTER = FIXTURES / "llama-tiny" / "adapter"
 
+IMAGES = ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+
 
 @pytest.fixture(scope="module")
 def decoder():
@@ -471,6 +473,34 @@ def test_a_target_that_is_not_a_dense_is_refused_when_called(decoder, reference)
               "layouts": {}}
     with pytest.raises(TypeError, match=r"params/embed_tokens.*targets nn.Dense and nn.DenseGeneral kernels"):
         lora.adapted(decoder.model, record).apply(decoder.variables, jnp.asarray(reference["input_ids"]))
+
+
+@pytest.mark.parametrize("objective", ["rcm", "ladd"])
+def test_a_distillation_that_runs_its_teacher_through_the_student_refuses_an_adapted_student(objective):
+    """rCM's teacher and fake score, and LADD's teacher, are whole trees the
+    student's model applies, with no factors for an adapter's branch: an
+    adapted student is refused when the objective is built, not at the
+    first step, where the teacher's tree has no `lora_A`."""
+    from dew.diffusion.presets import Flow
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.diffusion import (
+        AdversarialDistillation,
+        AdversarialDistillationObjective,
+        ConsistencyDistillation,
+        ConsistencyDistillationObjective,
+    )
+
+    base = _BranchHost(nn.Dense(3))
+    teacher = base.init(jax.random.key(0), jnp.zeros((1, 3)))
+    student = LoRA(rank=2, modules=("proj",)).apply(base, teacher, key=1).model
+    inputs = InputSpec(Field("image", (4, 4, 3)))
+    with pytest.raises(ValueError, match="holds no factors for an adapter's branch"):
+        if objective == "rcm":
+            ConsistencyDistillationObjective(student, Flow()(), inputs, ConsistencyDistillation(),
+                                             teacher=teacher)
+        else:
+            AdversarialDistillationObjective(student, Flow()(), inputs,
+                                             AdversarialDistillation(feature_layers=(0,)), teacher=teacher)
 
 
 def test_freeze_refuses_a_filter_that_splits_nothing(decoder):
@@ -950,6 +980,17 @@ def test_diffusers_reads_the_adapter_dew_writes_at_dews_prediction(family, pipel
                                      f"{family} adapted")
     assert_as_exact_as_the_reference(np.asarray(merged), arrays["fp32.merged"], arrays["fp64.merged"],
                                      f"{family} merged")
+def test_an_explicit_none_clears_what_a_pipeline_supplies(pipelines):
+    """`DiffusionObjective(pipe, autoencoder=None)` trains in pixel space and
+    `variables=None` draws the denoiser, as they do without a pipeline; only
+    an omitted keyword takes the pipeline's."""
+    pipe = pipelines["flux"]
+    cleared = DiffusionObjective(pipe, autoencoder=None, variables=None)
+    assert cleared.autoencoder is None and cleared.variables is None
+    kept = DiffusionObjective(pipe)
+    assert kept.autoencoder is pipe.autoencoder and kept.variables is pipe.variables
+
+
 def test_a_loss_head_trains_beside_an_adapted_pipelines_factors(pipelines):
     """A head the objective adds to what trains, EDM2's uncertainty weighting,
     lands under `params` beside the factors, and the base stays frozen."""
@@ -963,55 +1004,64 @@ def test_a_loss_head_trains_beside_an_adapted_pipelines_factors(pipelines):
     assert not any(_is_factor(path) for path, _ in jax.tree_util.tree_leaves_with_path(state[FROZEN]))
 
 
-def test_a_pretrained_pipeline_run_trains_its_lora_and_saves_it_from_the_run(pipelines, tmp_path):
-    """`--pretrained <pipeline> lora:lora --lora.rank 2 --lora.modules to_q ...` on a
-    diffusion run: the config binds the adapter to the loaded denoiser, two
-    steps move every factor and leave the base, the text towers and the VAE
-    bitwise, and `Adapter.from_run` rebuilds the adapter from the run's own
-    record, so it writes the file the in-process adapter writes."""
-    import grain.python as grain
+def _recipe_run(tmp_path, image_size, *args):
+    """A diffusion recipe run from argv as a user types it: two steps on the
+    TFDS image fixture, with `args` ending in the run's LoRA flags
+    (`--lora.rank`, `--lora.modules`) and no subcommand. Returns the parsed
+    config and the trained state."""
+    from test_diffusion_corpora import recipe
 
-    from dew.config import TrainerConfig
-    from dew.data import Loading, TFDSImages
+    module = recipe()
+    config = module.DiffusionRecipeConfig.cli([
+        "--model.dtype", "float32", "--model.attention-impl", "xla",
+        "data:tfds-images", "--data.path", str(IMAGES), "--data.image-size", str(image_size),
+        "--data.augmentation", "none", "--data.val-batches", "None", "solver:euler", "guidance:none",
+        "--sampling-steps", "2", "--ema-decay", "None", "--val-metrics",
+        "--trainer.checkpoint-dir", str(tmp_path), "--trainer.batch-size", str(jax.device_count()),
+        "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
+        "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
+        *args])
+    return config, module.main(config)
+
+
+def _same_files(ours: Path, theirs: Path) -> None:
+    """Every file one adapter directory holds, byte for byte in the other."""
+    names = sorted(path.name for path in theirs.iterdir())
+    assert sorted(path.name for path in ours.iterdir()) == names and names
+    for name in names:
+        assert (ours / name).read_bytes() == (theirs / name).read_bytes(), name
+
+
+def test_a_pretrained_pipeline_run_from_the_command_line_trains_its_lora(pipelines, tmp_path):
+    """`--pretrained <pipeline> --lora.rank 2 --lora.modules to_q ...` through
+    the diffusion recipe's own argv: the flags alone turn the adapter on, the
+    run binds it to the loaded denoiser, two steps move every factor and
+    leave the base, the text towers and the VAE bitwise, and
+    `Adapter.from_run` writes, byte for byte, the Diffusers file an adapter
+    bound the same way in process writes."""
     from dew.interop.pretrained import load_diffusion_source
-    from dew.objectives.diffusion import DiffusionRunConfig
-    from dew.sampling import Euler
 
-    rows = jax.device_count()
-    spec = LoRA(rank=2, modules=DENOISER_MODULES)
     directory = pipelines["flux"].source
-    config = DiffusionRunConfig(
-        pretrained=str(directory), preset=None, data=TFDSImages(image_size=16), solver=Euler(), guidance=None,
-        sampling_steps=2, unconditional_prob=0.0, ema_decay=None, val_metrics=(), lora=spec,
-        model=dataclasses.replace(DiffusionRunConfig().model, dtype="float32", attention_impl="xla"),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=rows, steps=2, eval_every=None,
-                              checkpoint_every=2, compilation_cache_dir=None))
-    objective = config.build()
-    examples = [{"image": np.full((16, 16, 3), 200, np.uint8),
-                 **jax.tree.map(lambda ids: ids[0], objective.inputs.tokenize([PROMPTS[row % 2]]))}
-                for row in range(2 * rows)]
-    data = Dataset.from_grain(grain.MapDataset.source(examples), batch=rows, loading=Loading(workers=0))
-    initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
+    config, state = _recipe_run(tmp_path, 16, "--pretrained", str(directory), "preset:none",
+                                "--unconditional-prob", "0.0", "--lora.rank", "2", "--lora.modules",
+                                *DENOISER_MODULES)
+    assert config.lora == LoRA(rank=2, modules=DENOISER_MODULES)
 
-    state = config.train(objective, data, name="run")
-
+    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
+    tuned = source.adapt(config.lora, key=config.trainer.key)
     moved = _flat(state.variables["params"])
     assert moved and all(name.endswith(lora.FACTORS) for name in moved)
-    assert all(bool(jnp.any(leaf != _flat(initial.variables["params"])[name]))
+    assert all(bool(jnp.any(leaf != _flat(tuned.variables["params"])[name]))
                for name, leaf in moved.items() if name.endswith("lora_B"))
     for collection in (FROZEN, "encoders", "autoencoder"):
-        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
+        for before, after in zip(jax.tree.leaves(tuned.variables[collection]),
                                  jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
-    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
-    source.adapt(spec, key=config.trainer.key).adapter.save(state.variables, tmp_path / "in-process")
+    assert tuned.adapter is not None
+    tuned.adapter.save(state.variables, tmp_path / "in-process")
     rebuilt = Adapter.from_run(tmp_path / "run")
     rebuilt.save(rebuilt.variables, tmp_path / "from-run")
-    ours, header = read_file(tmp_path / "from-run" / lora.DIFFUSERS_WEIGHTS)
-    theirs, expected = read_file(tmp_path / "in-process" / lora.DIFFUSERS_WEIGHTS)
-    assert ours.keys() == theirs.keys() and header == expected
-    for name in theirs:
-        np.testing.assert_array_equal(ours[name], theirs[name], err_msg=name)
+    _same_files(tmp_path / "from-run", tmp_path / "in-process")
 
 
 def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
@@ -1058,57 +1108,35 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
 
 
-def test_a_scratch_diffusion_run_trains_its_lora_and_saves_it_from_the_run(tmp_path):
-    """`lora:lora --lora.rank 2 --lora.modules final_proj` on a diffusion run
-    from scratch: the config binds the adapter to the objective's own fresh
-    draw of the denoiser from the run's key, with the factors from the key
-    folded with 1. Two steps move every factor and leave the drawn weights
-    and the text tower bitwise, and `Adapter.from_run` writes the PEFT
-    directory an adapter bound the same way in process writes. The DiT's
-    blocks are adaLN-Zero, so with their modulation frozen at zero only the
-    output projection carries a gradient; it is the one target."""
-    import grain.python as grain
-
-    from dew.config import ModelConfig, TrainerConfig
-    from dew.data import Loading, TFDSImages
-    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
-    from dew.sampling import Euler
-
-    rows = jax.device_count()
-    config = DiffusionRunConfig(
-        model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                         "num_heads": 2}, dtype="float32", attention_impl="xla"),
-        data=TFDSImages(image_size=8), solver=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
-        val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        lora=LoRA(rank=2, modules=("final_proj",)),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=rows, steps=2, eval_every=None,
-                              checkpoint_every=2, compilation_cache_dir=None))
-    objective = config.build()
-    caption = jax.tree.map(lambda ids: ids[0], objective.inputs.tokenize(["a"]))
-    examples = [{"image": np.full((8, 8, 3), 200, np.uint8), **caption} for _ in range(2 * rows)]
-    data = Dataset.from_grain(grain.MapDataset.source(examples), batch=rows, loading=Loading(workers=0))
-    initial = Trainer(objective, optax.sgd(0.0), key=config.trainer.key).initial_state()
-
-    state = config.train(objective, data, name="run")
+def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path):
+    """`--lora.rank 2 --lora.modules final_proj` on a diffusion run from
+    scratch, through the recipe's argv: the run binds the adapter to the
+    objective's own fresh draw of the denoiser from the run's key, with the
+    factors from the key folded with 1. Two steps move every factor and leave
+    the drawn weights and the text tower bitwise, and `Adapter.from_run`
+    writes, byte for byte, the PEFT directory an adapter bound the same way
+    in process writes. The DiT's blocks are adaLN-Zero, so with their
+    modulation frozen at zero only the output projection carries a gradient;
+    it is the one target."""
+    config, state = _recipe_run(
+        tmp_path, 8, "--model.architecture", "simple_dit", "--model.config",
+        '{"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2}',
+        "--text.encoder", "char_table", "--text.checkpoint", "char_table", "--lora.rank", "2",
+        "--lora.modules", "final_proj")
+    assert config.lora == LoRA(rank=2, modules=("final_proj",))
 
     moved = _flat(state.variables["params"])
     assert set(moved) == {f"output.final_proj.{factor}" for factor in lora.FACTORS}
-    before = _flat(initial.variables["params"])
-    assert all(bool(jnp.any(leaf != before[name])) for name, leaf in moved.items())
-    for collection in (FROZEN, "encoders"):
-        for before, after in zip(jax.tree.leaves(initial.variables[collection]),
-                                 jax.tree.leaves(state.variables[collection]), strict=True):
-            np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
     plain = dataclasses.replace(config, lora=None).build()
     key = jax.random.key(config.trainer.key)
     drawn = plain.model_variables(plain.init(key))
     for before, after in zip(jax.tree.leaves(drawn["params"]), jax.tree.leaves(state.variables[FROZEN]),
                              strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
-    assert config.lora is not None
-    config.lora.apply(plain.model, drawn, key=jax.random.fold_in(key, 1)).save(state.variables,
-                                                                               tmp_path / "in-process")
+    adapter = config.lora.apply(plain.model, drawn, key=jax.random.fold_in(key, 1))
+    assert all(bool(jnp.any(leaf != _flat(adapter.variables["params"])[name])) for name, leaf in moved.items()
+               if name.endswith("lora_B"))
+    adapter.save(state.variables, tmp_path / "in-process")
     rebuilt = Adapter.from_run(tmp_path / "run")
     rebuilt.save(rebuilt.variables, tmp_path / "from-run")
-    for name in (lora.PEFT_CONFIG, lora.PEFT_WEIGHTS):
-        assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
+    _same_files(tmp_path / "from-run", tmp_path / "in-process")

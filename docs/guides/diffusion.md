@@ -126,7 +126,7 @@ images = objective.pipeline(state)(["a red bird"], key=0).host().images
 
 `tuned.adapter.save` writes `pytorch_lora_weights.safetensors`, with the denoiser's PEFT config in its header, which Diffusers' `load_lora_weights` reads for that family. `tuned.save` writes the whole pipeline in the diffusers layout with the factors merged into the kernels. Both take the trainer's `state.variables` as they come back from `fit`. `LoRA.load(pipe.model, pipe.variables, path, layouts=pipe.layouts)` reads such a file back, as well as one that Diffusers or a PEFT trainer wrote.
 
-A recipe run takes the same spec as `lora:lora --lora.rank 16 --lora.modules to_q to_k to_v to_out.0` next to `--pretrained`. Without `--pretrained`, a run from scratch puts the adapter on a fresh draw of the denoiser from the run's key. `Adapter.from_run(run)` rebuilds a run's adapter from the run alone, so `adapter.save(adapter.variables, path)` writes the same file.
+A recipe run takes the same spec as `--lora.rank 16 --lora.modules to_q to_k to_v to_out.0` next to `--pretrained`. Without `--pretrained`, a run from scratch puts the adapter on a fresh draw of the denoiser from the run's key. `Adapter.from_run(run)` rebuilds a run's adapter from the run alone, so `adapter.save(adapter.variables, path)` writes the same file.
 
 <!-- not run: needs torch, diffusers and peft -->
 ```python

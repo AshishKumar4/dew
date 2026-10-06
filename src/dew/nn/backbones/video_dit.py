@@ -1,11 +1,9 @@
-"""
-Video DiT with factorized spatial-temporal attention, built from the shared
-DiT machinery.
+"""Video DiT with factorized spatial-temporal attention, built from the shared DiT blocks.
 
-Each layer is a spatial ModulatedBlock over the patch tokens of every frame
+Each layer is a spatial ModulatedBlock over the patch tokens of every frame,
 followed by a temporal ModulatedBlock over the frame axis of every patch
-position, the standard factorized design, so compute stays linear in T for
-the spatial half and linear in S for the temporal half.
+position. This is the standard factorized design, so the spatial half's compute
+grows linearly in T and the temporal half's linearly in S.
 """
 
 import jax.numpy as jnp

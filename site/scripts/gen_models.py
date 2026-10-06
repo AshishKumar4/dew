@@ -53,6 +53,7 @@ DECODERS = {
     "kimi_k2": ("Kimi K2", "Mixture of experts"),
     "kimi_k25": ("Kimi K2.5, text", "Mixture of experts"),
     "qwen3_next": ("Qwen3-Next", "Hybrid and linear attention"),
+    "nemotron_h": ("Nemotron-H, dense", "Hybrid and linear attention"),
     "glm5_next_text": ("GLM-5.3-Flash, text", "Hybrid and linear attention"),
     "kimi_linear": ("Kimi Linear", "Hybrid and linear attention"),
     "kimi_k3": ("Kimi K3, text", "Hybrid and linear attention"),

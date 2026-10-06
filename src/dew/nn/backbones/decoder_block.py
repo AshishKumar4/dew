@@ -152,7 +152,7 @@ class GatedMLP(nn.Module):
     `activation` picks act: swiglu is silu, geglu is the tanh approximation of
     gelu (HF's gelu_pytorch_tanh), and geglu_exact is the erf form (HF's gelu).
     A `Situ` is Kimi K3's SiTU, which transforms both halves
-    (`dew.nn.moe.gated_product`). `gelu`, `gelu_exact` and `relu` build the
+    (`dew.nn.moe.gated_product`). `gelu`, `gelu_exact`, `relu` and `relu2` build the
     ungated MLP with two projections. The ungated `gelu_exact` uses Torch's
     `1 + erf` arithmetic, which the converted checkpoints were trained with;
     `jax.nn.gelu(approximate=False)` goes through erfc and rounds the negative
@@ -179,7 +179,7 @@ class GatedMLP(nn.Module):
         dense = functools.partial(
             nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        if self.activation not in ('gelu', 'gelu_exact', 'relu'):
+        if self.activation not in ('gelu', 'gelu_exact', 'relu', 'relu2'):
             if self.has_variable('params', 'gate_up_proj'):
                 self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
             else:
@@ -194,10 +194,12 @@ class GatedMLP(nn.Module):
     def __call__(self, x):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
-        if self.activation in ('gelu', 'gelu_exact', 'relu'):
+        if self.activation in ('gelu', 'gelu_exact', 'relu', 'relu2'):
             up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
             if self.activation == 'relu':
                 hidden = nn.relu(up)
+            elif self.activation == 'relu2':
+                hidden = jnp.square(nn.relu(up))
             elif self.activation == 'gelu_exact':
                 # Torch's GELU uses 1 + erf. Flax's erfc(-x) rounds its
                 # negative tail differently before this trained projection.
@@ -409,7 +411,8 @@ class DecoderBlock(nn.Module):
 
     `engram` first writes the layer's n-gram lookup into the streams, reading
     the metadata's `engram_ids` at `engram_index`. A DSpark target layer
-    (`prediction_slot`) sows the mean of the streams its attention reads as
+    (`prediction_slot`) sows the mean of the streams its attention reads, or
+    of those it hands on when `prediction_site` is 'output', as
     `prediction_inputs/draft_context`.
     """
     # Upstream references. Mamba-2's mixer-only block: modeling_mamba2.py:608-632.
@@ -442,7 +445,8 @@ class DecoderBlock(nn.Module):
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
-    prediction_slot: int | None = None  # records its input's stream mean for DSpark
+    prediction_slot: int | None = None  # records its streams' mean for DSpark
+    prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_slot` records
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
     dtype: Dtype | None = None
@@ -643,13 +647,10 @@ class DecoderBlock(nn.Module):
                 streams = self.engram_layer(
                     streams, attention_metadata.engram_ids[:, :, self.engram_index],
                     None if attention_metadata.media is None else ~attention_metadata.media)
-            if (self.prediction_slot is not None and not self.is_initializing()
-                    and self.is_mutable_collection('prediction_inputs')):
-                # DSpark reads each target layer's attention input, after its
-                # engram, averaged over the streams (V4.1 inference/model.py:1264-1266).
-                mean = jnp.mean(streams, axis=2)
-                self.sow('prediction_inputs', 'draft_context', mean,
-                         reduce_fn=lambda _, value: value, init_fn=lambda: mean)
+            if self.prediction_site == 'input':
+                # V4.1's DSpark reads each target layer's attention input,
+                # after its engram (V4.1 inference/model.py:1264-1266).
+                self._record_prediction(streams)
             return _Streams(constrain(streams, STREAMS), pre)
         if self.residual_site is not None:
             return _Depth(residual[:, :, :-1], residual[:, :, -1], self.residual_site.finished)
@@ -715,6 +716,10 @@ class DecoderBlock(nn.Module):
         if isinstance(state, _Streams):
             spec = self.hyper_connections
             assert spec is not None
+            if self.prediction_site == 'output':
+                # V4-Flash-0731's DSpark reads each target layer's output
+                # (V4-Flash-0731 inference/model.py:918-921).
+                self._record_prediction(state.streams)
             if not spec.single_pass:
                 return state.streams
             assert state.pre is not None
@@ -738,6 +743,15 @@ class DecoderBlock(nn.Module):
         if self.wiring.layer_scalar:
             x = x * self.output_scalar.astype(x.dtype)
         return x
+
+    def _record_prediction(self, streams):
+        """Sow a DSpark target layer's streams averaged over the copies, when
+        the caller collects `prediction_inputs`."""
+        if (self.prediction_slot is not None and not self.is_initializing()
+                and self.is_mutable_collection('prediction_inputs')):
+            mean = jnp.mean(streams, axis=2)
+            self.sow('prediction_inputs', 'draft_context', mean,
+                     reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
              prediction_phase: PredictionPhase, train: bool):

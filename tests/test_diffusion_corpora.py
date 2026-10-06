@@ -6,8 +6,6 @@ import json
 import sys
 from pathlib import Path
 
-import tyro
-
 from dew.data import ArrayRecordImages, OnlineImages, TFDSImages
 from dew.objectives.diffusion import DiffusionRunConfig
 
@@ -27,8 +25,8 @@ def recipe():
 
 
 def parse(args):
-    return tyro.cli(tyro.conf.CascadeSubcommandArgs[recipe().DiffusionRecipeConfig],
-                    args=[*args, "--trainer.steps", "1"])
+    return recipe().DiffusionRecipeConfig.cli(
+                    [*args, "--trainer.steps", "1"])
 
 
 def test_a_corpus_is_a_subcommand_and_its_record_reads_back_without_the_recipe():
