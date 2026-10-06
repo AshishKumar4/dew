@@ -30,7 +30,7 @@ from dew.diffusion.presets import MeanFlow, Shortcut
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Step, Variables
 from dew.registry import objectives, trainings
@@ -119,9 +119,10 @@ def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
 
 SMOOTH_TIME_SCALE = 0.002
 """The Fourier time scale a model trained through a derivative in time takes
-when its config names none. On a 2-D two-class toy (RTX 4080), one-step
-class accuracy at simple_dit's default 16 against 0.002 was MeanFlow 23%
-against 99%, an sCM student 11% against 98.6%."""
+when its config names none, and the fastest an sCM teacher's may turn. On a
+2-D two-class toy (RTX 4080), one-step class accuracy at simple_dit's
+default 16 against 0.002 was MeanFlow 23% against 99%, an sCM student 11%
+against 98.6%."""
 
 
 @trainings("mean_flow")
@@ -149,7 +150,8 @@ class MeanFlowTraining(Training):
         object.__setattr__(self, "guidance_interval", (start, stop))
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> MeanFlowObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> MeanFlowObjective:
         return MeanFlowObjective(model, process, inputs, self, autoencoder=autoencoder, variables=variables,
                                  unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
                                  solver=run.solver, guidance=None, steps=run.sampling_steps)
@@ -175,7 +177,8 @@ class ShortcutTraining(Training):
             raise ValueError(f"sections is a power of two, not {self.sections}")
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> ShortcutObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> ShortcutObjective:
         return ShortcutObjective(model, process, inputs, self, autoencoder=autoencoder, variables=variables,
                                  unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
                                  solver=run.solver, guidance=None, steps=run.sampling_steps)
@@ -213,7 +216,6 @@ class MeanFlowObjective(DiffusionObjective):
             raise ValueError("MeanFlow trains an interval model of velocity on the unshifted linear "
                              "path; build the process with presets.MeanFlow")
         _own_loss("MeanFlow", kwargs)
-        kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
@@ -229,10 +231,8 @@ class MeanFlowObjective(DiffusionObjective):
                 jax.random.normal(noise, shape, dtype=jnp.float32), jax.random.uniform(dropping, (count,)))
 
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
         given, blank = self._conditions(variables, batch, condition_key, dropout=False)
@@ -308,7 +308,6 @@ class ShortcutObjective(DiffusionObjective):
             raise ValueError("a shortcut model is an interval model of velocity on the unshifted "
                              "linear path; build the process with presets.Shortcut")
         _own_loss("a shortcut model", kwargs)
-        kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
@@ -323,10 +322,8 @@ class ShortcutObjective(DiffusionObjective):
                 jax.random.bernoulli(dropping, self.unconditional_prob, (count,)))
 
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         rows = count // self.shortcut.bootstrap_every
         schedule = self.process.schedule
