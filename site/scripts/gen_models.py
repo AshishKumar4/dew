@@ -39,6 +39,7 @@ DECODERS = {
     "gemma4_text": ("Gemma 4, text", "Dense decoders"),
     "olmo3": ("OLMo 3", "Dense decoders"),
     "mixtral": ("Mixtral", "Mixture of experts"),
+    "minimax_m2": ("MiniMax-M2", "Mixture of experts"),
     "qwen3_moe": ("Qwen3-MoE", "Mixture of experts"),
     "qwen3_5_moe_text": ("Qwen 3.5 MoE, text", "Mixture of experts"),
     "gpt_oss": ("gpt-oss", "Mixture of experts"),
