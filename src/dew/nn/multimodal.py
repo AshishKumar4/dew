@@ -429,10 +429,6 @@ class MultimodalTransformer(nn.Module):
         """The decoder's vocabulary bias, for the same affine head its forward scores."""
         return self.language_model.vocabulary_bias(params['language_model'])
 
-    def head_table(self, params):
-        """Return the decoder's head as its tree stores it, and whether its rows are the vocabulary."""
-        return self.language_model.head_table(params["language_model"])
-
     def output_table(self) -> OutputTable | None:
         """Return the decoder's head as the matrix its final states contract,
         or None where none does (`CausalTransformer.output_table`)."""
