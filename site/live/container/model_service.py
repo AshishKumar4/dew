@@ -117,7 +117,9 @@ class NativeModels:
                      "guidance": {"scale": 6, "interval": [0.15, 0.9], "rescale": 0}}, lambda *_: None)
         for name in self.text_servers:
             print("MODEL_PHASE", time.time(), "warm text", name, flush=True)
-            self.text([{ "model": name, "prompt": "The capital of France is", "tokens": 24, "key": 0}])
+            warmed = self.text([{"model": name, "prompt": "The capital of France is", "tokens": 24, "key": 0}])
+            if isinstance(warmed[0], Exception):
+                raise warmed[0]
 
     def describe(self, request):
         if request["repo"] != self.repo:
@@ -167,10 +169,11 @@ class NativeModels:
                 if inputs.conditioning or set(inputs.token_fields) - {"positions", "attention_mask"}:
                     raise ValueError("the live text server does not accept media or custom token layouts")
                 ids = self.np.asarray(inputs.tokens)[0]
-                valid = self.np.asarray(inputs.token_fields.get("attention_mask", self.np.ones_like(inputs.tokens)))
+                valid = self.np.asarray(inputs.token_fields.get(
+                    "attention_mask", self.np.ones_like(inputs.tokens)))
                 positions = inputs.token_fields.get("positions")
-                if not valid.all() or positions is not None and not self.np.array_equal(
-                        self.np.asarray(positions)[0], self.np.arange(len(ids))):
+                if not valid.all() or (positions is not None and not self.np.array_equal(
+                        self.np.asarray(positions)[0], self.np.arange(len(ids)))):
                     raise ValueError("the live text server requires one unpadded, sequential-position prompt")
                 tickets.append(server.submit(ids, request["tokens"], key=request["key"]))
             except Exception as error:
