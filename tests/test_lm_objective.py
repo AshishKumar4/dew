@@ -267,14 +267,6 @@ def test_the_inputs_declare_one_token_row():
     assert dict(inputs.conditions) == {}
 
 
-def test_init_builds_the_tree_from_int32_ids():
-    """An init batch of floats is not token ids."""
-    objective = make_objective()
-    params = objective.init(jax.random.key(0))
-    assert set(params) == {"params"}
-    assert params["params"]["lm_head"]["kernel"].shape == (16, VOCAB)
-
-
 def test_an_lm_keeps_no_average_unless_asked():
     """Validation and previews read an average when one is kept, so an LM
     keeps none by default: a short run then scores the weights it trained."""

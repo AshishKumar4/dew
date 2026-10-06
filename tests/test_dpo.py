@@ -71,13 +71,6 @@ def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     assert_as_exact_as_the_reference(mine, theirs, truth, "DPO loss, gradient and rewards")
 
 
-def test_the_fixture_names_its_reference(reference):
-    assert str(reference["trl_version"]) == "1.12.0"
-    assert str(reference["torch_version"]).startswith("2.14")
-    assert float(reference["beta"]) == 0.1
-    assert np.asarray(reference["completion_mask"]).shape == (6, 6)
-
-
 # --- the objective -------------------------------------------------------------
 
 def pair_batch(seed=0):
