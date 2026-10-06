@@ -78,7 +78,7 @@ import torch
 from transformers import (
     AutoModelForCausalLM, AutoTokenizer, DeepseekV3Config, DeepseekV3ForCausalLM,
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
-    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM,
+    GemmaConfig, GemmaForCausalLM, LlamaConfig, LlamaForCausalLM, Phi3Config, Phi3ForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -128,6 +128,82 @@ NEMOTRON_H_CONFIGS = (
     ("nemotron-h-4b", "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"),
     ("nemotron-h-30b-a3b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"),
 )
+PHI3_CONFIGS = (
+    ('phi3-mini-4k', 'microsoft/Phi-3-mini-4k-instruct', 'f39ac1d28e925b323eae81227eaba4464caced4e'),
+    ('phi4-mini', 'microsoft/Phi-4-mini-instruct', 'cfbefacb99257ffa30c83adab238a50856ac3083'),
+)
+
+
+def tiny_phi3() -> Phi3ForCausalLM:
+    """Unequal fused qkv widths, a window and two nontrivial LongRoPE tables."""
+    torch.manual_seed(0)
+    return Phi3ForCausalLM(Phi3Config(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=48,
+        original_max_position_embeddings=8, sliding_window=5, rms_norm_eps=3e-5,
+        rope_parameters={'rope_type': 'longrope', 'rope_theta': 10000.,
+                         'short_factor': [1.1, 1.3, 1.5, 1.7], 'long_factor': [2., 3., 4., 5.],
+                         'original_max_position_embeddings': 8, 'factor': 6.},
+        resid_pdrop=0., embd_pdrop=0., attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
+    """Same-weight fp32 and float64 logits, padded rows and greedy continuation."""
+    from unittest.mock import patch
+
+    from diffusers_wan_reference import float64
+
+    model.config._attn_implementation = 'eager'
+    write_tiny(name, model)
+    directory = FIXTURES / name
+    ids = np.load(directory / 'input_ids.npy')
+    mask = np.ones_like(ids, bool)
+    mask[1, :3] = False
+    padded = np.where(mask, ids, 0)
+    np.save(directory / 'padded_ids.npy', padded)
+    np.save(directory / 'attention_mask.npy', mask)
+    model.eval()
+    with torch.no_grad():
+        generated = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
+                                   max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
+        logits = model(torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+                       use_cache=False).logits.numpy()
+        short = model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.numpy()
+        if name == 'phi3-tiny':
+            np.save(directory / 'transformers_generated.npy', generated)
+            generated = ids[:, :4].copy()
+            scores = []
+            for _ in range(6):
+                score = model(torch.from_numpy(generated).long(), use_cache=False).logits[:, -1].numpy()
+                scores.append(score)
+                generated = np.concatenate((generated, score.argmax(-1)[:, None]), axis=1)
+            np.save(directory / 'generation_logits.npy', np.stack(scores, axis=1))
+    np.save(directory / 'generated.npy', generated)
+    np.save(directory / 'padded_logits.npy', logits)
+    np.save(directory / 'short_logits.npy', short)
+    tensor = torch.tensor
+
+    def wide_tensor(*args, dtype=None, **kwargs):
+        return tensor(*args, dtype=torch.float64 if dtype == torch.float32 else dtype, **kwargs)
+
+    with float64(), patch.object(torch, 'tensor', wide_tensor), torch.no_grad():
+        model.double()
+        # Static buffers built in fp32 must be rebuilt in the truth's
+        # arithmetic, including the original table a short call restores.
+        if hasattr(model, 'model') and hasattr(model.model, 'rotary_emb'):
+            model.model.rotary_emb = type(model.model.rotary_emb)(model.config)
+        truth = model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
+        padded_truth = model(torch.from_numpy(padded).long(), attention_mask=torch.from_numpy(mask),
+                             use_cache=False).logits.double().numpy()
+        short_truth = model(torch.from_numpy(ids[:, :4]).long(), use_cache=False).logits.double().numpy()
+        if name == 'phi3-tiny':
+            scores_f64 = [model(torch.from_numpy(generated[:, :4 + step]).long(),
+                                use_cache=False).logits[:, -1].double().numpy() for step in range(6)]
+            np.save(directory / 'generation_logits_f64.npy', np.stack(scores_f64, axis=1))
+    np.save(directory / 'logits_f64.npy', truth)
+    np.save(directory / 'padded_logits_f64.npy', padded_truth)
+    np.save(directory / 'short_logits_f64.npy', short_truth)
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -1131,9 +1207,16 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
+    parser.add_argument('--classic-family', choices=('phi3',),
+                        help='only this classic decoder fixture and its pinned released configs')
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    if args.classic_family == 'phi3':
+        write_classic_tiny('phi3-tiny', tiny_phi3())
+        for config in PHI3_CONFIGS:
+            write_released_config(*config)
+        return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:
         write_released_config(name, repo, revision)
