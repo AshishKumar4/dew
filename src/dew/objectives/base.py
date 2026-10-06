@@ -528,6 +528,22 @@ class Objective(ABC, Generic[Loss, Effects]):
         return Ratio(jnp.sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
 
+    @staticmethod
+    def accuracy(correct: jax.Array, batch: Batch, weights: jax.Array | None = None, *,
+                 rows: int | tuple[int, ...] = 0) -> Ratio:
+        """Return the right answers among the counted ones, as the `Ratio` of the two.
+
+        `correct` is 1 where an answer is right and 0 where it is wrong, and
+        `weights` (1 everywhere by default) is what each answer counts for, a
+        target mask for instance. Both sums go through `row_mean` over every
+        axis, with `rows` as it reads them, so a repeat row of an evaluation
+        batch counts in neither. `.mean()` is the accuracy, and 0 when nothing
+        is counted. Every accuracy an objective reports is this one.
+        """
+        counted = jnp.ones_like(correct) if weights is None else weights
+        hits = Objective.row_mean(correct * counted, batch, rows=rows).total
+        return Ratio(hits, Objective.row_mean(counted, batch, rows=rows).total)
+
     def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
         loss = self.loss(variables, batch, step)
         if _has_aux(loss):
