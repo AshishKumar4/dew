@@ -21,9 +21,18 @@ if (secretsAt >= 0) {
 	const secrets = JSON.parse(readFileSync(path.resolve(wranglerArgs[secretsAt + 1]), 'utf8'));
 	const preview = wranglerArgs.includes('preview');
 	const endpoint = preview ? 'https://live-preview.dewml.dev' : 'https://live.dewml.dev';
-	const response = await fetch(`${endpoint}/v1/operator/warm`, { method: 'POST', headers: {
-		Authorization: `Bearer ${secrets.RUNNER_SECRET}`, 'User-Agent': 'Dew-Gateway-Operator/1.0',
-	} });
-	if (!response.ok) throw new Error(`model pool warmup refused: ${response.status} ${await response.text()}`);
-	console.log('live: model pool warmup scheduled', await response.json());
+	for (let attempt = 0; attempt < 30; attempt++) {
+		const response = await fetch(`${endpoint}/v1/operator/warm`, { method: 'POST', headers: {
+			Authorization: `Bearer ${secrets.RUNNER_SECRET}`, 'User-Agent': 'Dew-Gateway-Operator/1.0',
+		} });
+		const body = await response.text();
+		if (response.ok) {
+			console.log('live: model pool warmup scheduled', JSON.parse(body));
+			break;
+		}
+		if (attempt === 29 || response.status !== 403 || !body.includes('"origin"')) {
+			throw new Error(`model pool warmup refused: ${response.status} ${body}`);
+		}
+		await new Promise((resolve) => setTimeout(resolve, 1000));
+	}
 }
