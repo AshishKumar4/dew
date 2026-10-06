@@ -8,6 +8,8 @@ from guest_limits import install
 if os.environ.get("DEW_GUEST_TRACE") == "1":
     print("GUEST_ENTRY started",flush=True)
 install()
+# The launcher's host PID is outside this private PID namespace; unshare owns the child lifetime.
+os.environ.pop("JPY_PARENT_PID", None)
 if os.environ.get("DEW_GUEST_TRACE") == "1":
     print("GUEST_ENTRY limits installed",flush=True)
 if os.environ.get("DEW_GUEST_TRACE") == "1":
