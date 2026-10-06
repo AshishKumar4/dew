@@ -908,6 +908,29 @@ def test_nemotron_h_released_configs_translate(name):
 
 
 @pytest.mark.parametrize("name", HYBRID[1:])
+def test_nemotron_h_routed_mixer_rebuilds_from_its_run_record(name):
+    from dew.registry import mixers
+
+    mixer = translate_config(fixture_config(name)).value.kind_of("moe").mixer
+    assert isinstance(mixer, MLPMixer) and mixer.mixture is not None
+    fields = dataclasses.asdict(mixer)
+    assert mixers.from_record({"name": "mlp", "fields": fields}) == mixer
+
+
+@pytest.mark.parametrize("fields", [{"layers": (1,)}, {"hash_layers": (1,)}, {"media_bias": True}])
+def test_nemotron_h_mixer_refuses_controls_owned_by_the_decoder_feedforward(fields):
+    with pytest.raises(ValueError, match="decoder feed-forward slot"):
+        MLPMixer(intermediate_size=16, mixture=Mixture(experts=8, **fields))
+
+
+def test_nemotron_h_zero_shared_width_uses_the_references_dense_width():
+    config = {**fixture_config("nemotron-h-moe-tiny"), "moe_shared_expert_intermediate_size": 0}
+    mixer = translate_config(config).value.kind_of("moe").mixer
+    assert isinstance(mixer, MLPMixer) and mixer.mixture is not None
+    assert mixer.mixture.shared_features == config["intermediate_size"]
+
+
+@pytest.mark.parametrize("name", HYBRID[1:])
 def test_nemotron_h_fused_experts_export_the_source_layout(name, tmp_path):
     """The native 3-D layout and transformers' per-expert save layout compute the same model."""
     from safetensors.numpy import save_file
