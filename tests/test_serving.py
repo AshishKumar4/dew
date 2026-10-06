@@ -803,7 +803,8 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote():
     assert ticket.result().text == bound.bind(other)("1234567", 8, key=0).text
 
 
-def test_hf_text_prompt_canonical_positions_match_generation():
+def test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws():
+    """The server derives the same positions from its row cursor as the HF processor."""
     from pathlib import Path
 
     from dew.interop import PretrainedDecoder
@@ -817,7 +818,8 @@ def test_hf_text_prompt_canonical_positions_match_generation():
     np.testing.assert_array_equal(ticket.result().tokens, bound("hello there", 4, key=0).tokens)
 
 
-def test_server_refuses_noncanonical_prepared_positions():
+def test_a_prompt_with_custom_valid_positions_is_refused():
+    """Only the positions the row cursor reproduces are safe to drop."""
     from dew.nn.inputs import ModelInputs
 
     bound = task(Sampling(temperature=0))
@@ -826,3 +828,18 @@ def test_server_refuses_noncanonical_prepared_positions():
                          {"positions": jnp.array([[5, 6, 7]], jnp.int32)})
     with pytest.raises(ValueError, match="positions"):
         server.submit(inputs, 4, key=0)
+
+
+def test_a_padding_positions_value_is_not_part_of_a_served_row():
+    """The server strips padding and derives valid-token positions from its cursor."""
+    from dew.nn.inputs import ModelInputs
+
+    bound = task(Sampling(temperature=0))
+    server = Server.from_task(bound, slots=2, capacity=64)
+    inputs = ModelInputs(jnp.array([[0, 1, 2]], jnp.int32),
+                         {"attention_mask": jnp.array([[False, True, True]]),
+                          "positions": jnp.array([[1, 0, 1]], jnp.int32)})
+    ticket = server.submit(inputs, 4, key=0)
+    server.run()
+    expected = bound(jnp.array([[1, 2]], jnp.int32), 4, key=0)
+    np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
