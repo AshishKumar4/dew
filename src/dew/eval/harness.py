@@ -36,6 +36,7 @@ from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
 from dew.inference.tasks import TextGeneration, _ceiling
+from dew.nn.inputs import pad_token_rows
 from dew.objectives.likelihood import token_log_probs
 from dew.sampling.text import Sampling
 
@@ -65,12 +66,6 @@ def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
 def _batches(count: int, size: int) -> list[range]:
     """Yield `count` indices in runs of at most `size`, in order."""
     return [range(start, min(start + size, count)) for start in range(0, count, size)]
-
-
-def _padded(rows: Sequence[Sequence[int]]) -> np.ndarray:
-    """Return one batch's token rows, right-padded to the longest with zeros."""
-    width = max(len(row) for row in rows)
-    return np.asarray([[*row, *([0] * (width - len(row)))] for row in rows], np.int32)
 
 
 @register_model("dew")
@@ -220,7 +215,7 @@ class DewLM(TemplateLM):
             rows.append([*context, *continuation][-(self.max_length + 1):])
         answers: list[tuple[float, bool]] = []
         for batch in _batches(len(rows), self.batch_size):
-            tokens = _padded([rows[index] for index in batch])
+            tokens, _ = pad_token_rows([rows[index] for index in batch], padding_side="right")
             probabilities, argmax = _scored(self.task.model, self.task.variables,
                                             jnp.asarray(tokens))
             values, matched = np.asarray(probabilities), np.asarray(argmax)
