@@ -97,8 +97,10 @@ from dew.inference.serving_kernel import (
     _state_shardings,
 )
 from dew.inference.tasks import Processor, TextGeneration, _bucket, _ceiling, _decoded, _prepared, _sized
+from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
+from dew.nn.rope import LongRopeScaling
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
@@ -332,6 +334,18 @@ class PagedRows:
 Rows = DenseRows | PagedRows
 
 
+def _refuse_longrope_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
+                           prefix: bool = False, mixed: bool = False) -> None:
+    """Refuse serving modes whose cache cannot rebuild a crossing request."""
+    if isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling):
+        modes = [name for name, active in (('paged', paged), ('chunked', chunked),
+                                          ('prefix', prefix), ('mixed admission', mixed)) if active]
+        if modes:
+            raise ValueError(
+                f'LongRoPE crossing position {model.rope_scaling.original_max_position_embeddings} '
+                f'cannot rebuild {", ".join(modes)} serving; use whole-prompt dense admission')
+
+
 class Server:
     """Serves text requests with continuous batching over one resident KV cache.
 
@@ -358,6 +372,8 @@ class Server:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
             raise ValueError("admission must be between one and the slot count")
+        _refuse_longrope_modes(model, paged=isinstance(rows, PagedRows),
+                               chunked=rows.chunk is not None, mixed=rows.placement.mixed)
         if type(decode_steps) is not int or decode_steps < 1:
             raise ValueError("decode_steps must be a positive number of iterations per device call")
         self.mesh = mesh_of(variables)
@@ -515,6 +531,8 @@ class Server:
                 raise ValueError(f"{type(model).__name__} declares no kv_cache layout to replace")
             model = model.clone(kv_cache=kv_cache)
         layout = model.kv_cache if isinstance(model, Layered) else KVCache()
+        _refuse_longrope_modes(model, paged=layout.page_size is not None,
+                               chunked=chunk is not None, prefix=prefix_cache)
         # One program serves one capacity, so the cache holds whole tiles of it
         # rather than a power-of-two bucket: every decode step's attention reads
         # each slot, and a capacity of 384 bucketed to 512 read a third more.

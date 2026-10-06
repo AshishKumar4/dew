@@ -51,6 +51,10 @@ class DecoderState:
     """Each later prediction depth's predecessor state at the last real token:
     entry `d` feeds depth `d + 1`, as `reseed` carries them; `hidden` is
     depth zero's."""
+    tokens: jax.Array | None = None
+    lengths: jax.Array | None = None
+    """Compact token history for a positional table change that invalidates KV."""
+
 
 
 @struct.dataclass
@@ -421,6 +425,18 @@ def _completed(done: Completed, search: Beam, top, extending, position: int, *,
             jnp.concatenate([done.terminated, ended & top], axis=1), order, axis=1))
 
 
+class _BeamCarry(NamedTuple):
+    """The live beams, their model state and scores, and the completed hypotheses."""
+
+    state: DecoderState
+    beams: StepState
+    live: jax.Array
+    drawn: jax.Array
+    scored: jax.Array
+    extending: jax.Array
+    done: Completed
+
+
 def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
                  stopping: Callable[[StepState, jax.Array], jax.Array],
@@ -436,30 +452,29 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
     real = jnp.repeat(start.active, width)
     top = (jnp.arange(keep) < width)[None, :]
 
-    def step(carry, position):
-        state, beams, live, drawn, scored, extending, done = carry
-        best, index, chosen, vocab = _beam_candidates(state, beams, transform, live, real,
-                                                      extending, prompts, width, keep)
+    def step(carry: _BeamCarry, position):
+        best, index, chosen, vocab = _beam_candidates(carry.state, carry.beams, transform, carry.live, real,
+                                                      carry.extending, prompts, width, keep)
         parent, token = index // vocab, (index % vocab).astype(jnp.int32)
 
         branch = _beam_rows(parent, prompts, width)
-        candidates = jax.tree.map(lambda leaf: jnp.take(leaf, branch, axis=0), beams)
+        candidates = jax.tree.map(lambda leaf: jnp.take(leaf, branch, axis=0), carry.beams)
         flat = token.reshape(-1)
         ended = stopping(candidates.commit(flat, jnp.repeat(start.active, keep)), flat)
         ended = ended.reshape(prompts, keep) & jnp.repeat(start.active, keep).reshape(prompts, keep)
         hit = ended | (position + 1 >= budget)
 
-        grown = jnp.take(drawn, branch, axis=0).reshape(prompts, keep, budget)
+        grown = jnp.take(carry.drawn, branch, axis=0).reshape(prompts, keep, budget)
         grown = grown.at[:, :, position].set(token)
-        traced = jnp.take(scored, branch, axis=0).reshape(prompts, keep, budget)
+        traced = jnp.take(carry.scored, branch, axis=0).reshape(prompts, keep, budget)
         traced = traced.at[:, :, position].set(chosen)
 
         alive = best + hit.astype(jnp.float32) * DEAD
         forward = lax.top_k(alive, width)[1]
-        state, beams, selected = _beam_continue(state, beams, ops, parent, token, forward,
+        state, beams, selected = _beam_continue(carry.state, carry.beams, ops, parent, token, forward,
                                                 real, prompts, width)
 
-        done = _completed(done, search, top, extending, position,
+        done = _completed(carry.done, search, top, carry.extending, position,
                           best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
         live = _pick(alive, forward)
@@ -467,16 +482,16 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         # budget where the penalty rewards length; otherwise from here.
         reach = float(budget) if never and penalty > 0 else (position + 1.0)
         worst = jnp.where(done.flag, jnp.min(done.score, axis=1, keepdims=True), DEAD)
-        extending = extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
+        extending = carry.extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)
         state = ops.advance(state, selected, real)
         drawn = _pick(grown, forward).reshape(prompts * width, budget)
         scored = _pick(traced, forward).reshape(prompts * width, budget)
-        return (state, beams, live, drawn, scored, extending, done), None
+        return _BeamCarry(state, beams, live, drawn, scored, extending, done), None
 
     initial = _beam_start(state, start, ops, prompts, width, budget)
-    (_, _, _, _, _, _, done), _ = lax.scan(step, initial, jnp.arange(budget))
-    return _beam_draws(done, start, prompts, n, budget)
+    finished, _ = lax.scan(step, initial, jnp.arange(budget))
+    return _beam_draws(finished.done, start, prompts, n, budget)
 
 
 def _beam_candidates(state: DecoderState, beams: StepState, transform, live, real, extending,
@@ -504,14 +519,14 @@ def _beam_candidates(state: DecoderState, beams: StepState, transform, live, rea
 
 
 def _beam_start(state: DecoderState, start: StepState, ops: DecodeOps, prompts: int,
-                width: int, budget: int):
+                width: int, budget: int) -> _BeamCarry:
     """The carry the search scans from: `width` copies of each prompt.
 
     Only beam zero starts alive, so the first step's continuations all come
     from the one prefilled row and the search does not begin by scoring
     `width` copies of the same distribution.
     """
-    return (
+    return _BeamCarry(
         ops.reindex(state, jnp.repeat(jnp.arange(prompts), width)),
         jax.tree.map(lambda leaf: jnp.repeat(leaf, width, axis=0), start),
         jnp.broadcast_to(jnp.where(jnp.arange(width) == 0, 0.0, DEAD), (prompts, width)),
@@ -787,14 +802,23 @@ def _recorded(block_size: int, step: StepState, emitted: jax.Array, behavior: ja
         out.raw_log_probs.at[index, landing].set(original, mode="drop"))
 
 
-def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
+class _SpeculativeCarry(NamedTuple):
+    """The target state and accepted history, row termination, and emitted response slots."""
+
+    state: DecoderState
+    step: StepState
+    terminated: jax.Array
+    out: _Emitted
+
+
+def _block(carry: _SpeculativeCarry, plan: Speculative, ops: DecodeOps, transform, stopping, budget: int,
            slots: jax.Array, index: jax.Array):
     """One speculative block: draft `plan.block` candidates, verify them,
     accept the longest prefix the test allows, and emit what follows it,
     replaying the accepted prefix into the cache saved before the block."""
     verify, block_size = ops.verify, plan.block
     assert verify is not None
-    state, step, terminated, out = carry
+    state, step = carry.state, carry.step
     active, saved, rows = step.active, state.cache, step.rows
     base = _coordinates(state, step, slots)
     keys = jax.vmap(lambda key, count: jax.random.split(
@@ -816,13 +840,13 @@ def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget
 
     emitted, behavior, original = _emission(block_size, slots, matched, replacement, proposed,
                                             targets, raw, rows)
-    count, terminated = _emitted_count(block_size, step, emitted, active, terminated, budget,
+    count, terminated = _emitted_count(block_size, step, emitted, active, carry.terminated, budget,
                                        stopping, matched)
     checkify.check(
         jnp.all(jnp.stack([wellformed(raw[at]) | ~(at < count) for at in range(block_size + 1)])),
         "the model produced an emitted position without a distribution to score")
     keep, committed, out = _recorded(block_size, step, emitted, behavior, original, count,
-                                     slots, index, active, terminated, budget, out)
+                                     slots, index, active, terminated, budget, carry.out)
 
     following, again, seen = verify(dataclasses.replace(state, cache=saved), emitted, keep)
     assert seen is not None
@@ -842,7 +866,7 @@ def _block(carry, plan: Speculative, ops: DecodeOps, transform, stopping, budget
         following, logits=jnp.where((count > 0)[:, None],
                                     jnp.take_along_axis(again, last[:, None, None], axis=1)[:, 0],
                                     state.logits))
-    return (following, committed, terminated, out), None
+    return _SpeculativeCarry(following, committed, terminated, out), None
 
 
 def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
@@ -856,19 +880,21 @@ def _speculate(state: DecoderState, start: StepState, ops: DecodeOps,
     slots = jnp.arange(block_size + 1)[None, :]
     index = jnp.arange(rows)[:, None]
 
-    def outer(carry, _):
+    def outer(carry: _SpeculativeCarry, _):
         # Every rank reduces the same global mask, so the pool skips the same
         # blocks. A skipped block runs no model call at all, which is where
         # the saved target forwards come from.
-        return lax.cond(jnp.any(carry[1].active),
+        return lax.cond(jnp.any(carry.step.active),
                         lambda held: _block(held, plan, ops, transform, stopping, budget,
                                             slots, index),
                         lambda held: (held, None), carry)
 
     empty = _Emitted(jnp.zeros((rows, budget), jnp.int32), jnp.zeros((rows, budget), bool),
                      jnp.zeros((rows, budget), jnp.float32), jnp.zeros((rows, budget), jnp.float32))
-    (_, _, terminated, out), _ = lax.scan(
-        outer, (state, start, jnp.zeros(rows, bool), empty), None, length=-(-budget // 2))
+    finished, _ = lax.scan(
+        outer, _SpeculativeCarry(state, start, jnp.zeros(rows, bool), empty),
+        None, length=-(-budget // 2))
+    out = finished.out
     return Draws(out.tokens, out.valid,
                  jnp.where(out.valid, out.behavior_log_probs, 0.0),
-                 jnp.where(out.valid, out.raw_log_probs, 0.0), terminated)
+                 jnp.where(out.valid, out.raw_log_probs, 0.0), finished.terminated)

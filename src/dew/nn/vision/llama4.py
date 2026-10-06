@@ -15,6 +15,7 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew.interop.weights import translate_parameters
+from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
@@ -168,8 +169,7 @@ class Llama4VisionAdapterMLP(nn.Module):
     def __call__(self, hidden_states):
         # The reference gels after both maps, including the last one
         # (modeling_llama4.py, Llama4VisionMLP2.forward).
-        gelu = functools.partial(jax.nn.gelu, approximate=False)
-        return gelu(self.fc2(gelu(self.fc1(hidden_states))))
+        return gelu_exact(self.fc2(gelu_exact(self.fc1(hidden_states))))
 
 
 class Llama4VisionAdapter(nn.Module):

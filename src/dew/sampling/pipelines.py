@@ -18,7 +18,8 @@ from jax.experimental import multihost_utils
 from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
-from dew.artifacts import agreed, uint8_pixels
+from dew.artifacts import uint8_pixels
+from dew.coordination import agreed
 from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder

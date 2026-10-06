@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.artifacts import agreed, broadcast_from_process_zero, stop_at_exit
+from dew.coordination import agreed, broadcast_from_process_zero, stop_at_exit
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (

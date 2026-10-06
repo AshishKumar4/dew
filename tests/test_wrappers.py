@@ -208,7 +208,7 @@ def test_wrapper_tower_and_projector_match_the_reference():
 def test_only_the_untied_wrappers_get_an_lm_head_leaf():
     """Gemma ties its head to the embedding table and Llama 4 and Qwen 3.5 do
     not, so the map writes an lm_head leaf for exactly the untied families.
-    The four parity tests below score these same trees."""
+    The four parity cases below score these same trees."""
     for name, tied in (("gemma3-tiny-mm", True), ("llama4-tiny-mm", False),
                        ("gemma4-tiny-mm", True), ("qwen35-tiny-mm", False)):
         _, _, variables = load_wrapper(name)
@@ -266,43 +266,27 @@ def _multimodal_logits(name, image_id, shift=0):
             np.load(directory / "wrapper_ref.npy"), positions)
 
 
-def test_gemma3_multimodal_forward_matches_the_wrapper():
-    """fp32 end-to-end parity on the tiny Gemma 3 wrapper: tolerance 1e-4,
-    observed max |logit difference| 2.4e-06 with identical argmax. Soft tokens
-    at shifted positions miss by more than 1.0, so the placement is live."""
-    logits, reference, _ = _multimodal_logits("gemma3-tiny-mm", 202)
+@pytest.mark.parametrize("name, image_id", [
+    ("gemma3-tiny-mm", 202),  # observed 2.4e-06
+    ("llama4-tiny-mm", 92),  # observed 4.1e-06
+    ("gemma4-tiny-mm", 60),  # observed 1.4e-05
+    # Observed 2.4e-05. The wrapper reference runs on pre-merged embeddings,
+    # since the image-grid positions it would otherwise use are outside what
+    # the decoder models.
+    ("qwen35-tiny-mm", 200),
+])
+def test_a_multimodal_forward_matches_the_wrapper(name, image_id):
+    """fp32 end-to-end parity on a tiny wrapper: tolerance 1e-4, the observed
+    max |logit difference| beside each family, with identical argmax."""
+    logits, reference, _ = _multimodal_logits(name, image_id)
     assert np.max(np.abs(logits - reference)) < 1e-4
     assert (logits.argmax(-1) == reference.argmax(-1)).all()
-    misplaced, _, _ = _multimodal_logits("gemma3-tiny-mm", 202, shift=1)
-    assert np.max(np.abs(misplaced - reference)) > 1.0
 
 
-def test_llama4_multimodal_forward_matches_the_wrapper():
-    """fp32 end-to-end parity on the tiny Llama 4 wrapper: tolerance 1e-4,
-    observed max |logit difference| 4.1e-06 with identical argmax."""
-    logits, reference, _ = _multimodal_logits("llama4-tiny-mm", 92)
-    assert np.max(np.abs(logits - reference)) < 1e-4
-    assert (logits.argmax(-1) == reference.argmax(-1)).all()
-
-
-def test_gemma4_multimodal_forward_matches_the_wrapper():
-    """fp32 end-to-end parity on the tiny Gemma 4 wrapper: tolerance 1e-4,
-    observed max |logit difference| 1.4e-05 with identical argmax. Soft tokens
-    at shifted positions miss by more than 1.0, so the placement is live."""
-    logits, reference, _ = _multimodal_logits("gemma4-tiny-mm", 60)
-    assert np.max(np.abs(logits - reference)) < 1e-4
-    assert (logits.argmax(-1) == reference.argmax(-1)).all()
-    misplaced, _, _ = _multimodal_logits("gemma4-tiny-mm", 60, shift=1)
-    assert np.max(np.abs(misplaced - reference)) > 1.0
-
-
-def test_qwen35_multimodal_forward_matches_the_wrapper():
-    """fp32 end-to-end parity on the tiny Qwen 3.5 wrapper: tolerance 1e-4,
-    observed max |logit difference| 2.4e-05 with identical argmax. The wrapper
-    reference runs on pre-merged embeddings, since the image-grid positions it
-    would otherwise use are outside what the decoder models."""
-    logits, reference, _ = _multimodal_logits("qwen35-tiny-mm", 200)
-    assert np.max(np.abs(logits - reference)) < 1e-4
-    assert (logits.argmax(-1) == reference.argmax(-1)).all()
-    misplaced, _, _ = _multimodal_logits("qwen35-tiny-mm", 200, shift=1)
+@pytest.mark.parametrize("name, image_id", [
+    ("gemma3-tiny-mm", 202), ("gemma4-tiny-mm", 60), ("qwen35-tiny-mm", 200)])
+def test_soft_tokens_at_shifted_positions_miss_the_wrapper(name, image_id):
+    """Soft tokens at shifted positions miss by more than 1.0, so the
+    placement is live."""
+    misplaced, reference, _ = _multimodal_logits(name, image_id, shift=1)
     assert np.max(np.abs(misplaced - reference)) > 1.0

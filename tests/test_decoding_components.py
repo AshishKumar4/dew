@@ -434,8 +434,10 @@ def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
     """
     from transformers.generation.stopping_criteria import StopStringCriteria
 
+    from dew.sampling.vocabulary import matching_mode
+
     tokenizer = byte_level_tokenizer(tmp_path)
-    assert decoding.matching_mode(tokenizer) == "byte_level"
+    assert matching_mode(tokenizer) == "byte_level"
     pair = tokenizer.encode("é")
     assert len(pair) == 2 and tokenizer.decode(pair) == "é"
 
@@ -500,3 +502,17 @@ def test_policy_subclasses_keep_their_own_callable_behavior():
     lowered = decoding.components((ShiftedTemperature(1.0),))[0]
     actual = jax.jit(lambda transform, s, x: transform(s, x))(lowered, state, logits)
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(logits + 3.0))
+
+
+def test_shared_vocabulary_probing_reaches_the_tokenizer_beneath_nested_processors(tmp_path):
+    """Nesting preserves each id's bytes, without requiring the Rust vocabulary's iteration order."""
+    from types import SimpleNamespace
+
+    from dew.sampling.vocabulary import vocabulary_of, vocabulary_pieces
+
+    tokenizer = byte_level_tokenizer(tmp_path)
+    held = SimpleNamespace(reference=SimpleNamespace(reference=SimpleNamespace(tokenizer=tokenizer)))
+    assert vocabulary_of(held, "stop strings") is tokenizer
+    direct = vocabulary_pieces(tokenizer, "byte_level")
+    wrapped = vocabulary_pieces(vocabulary_of(held, "guided decoding"), "byte_level")
+    assert dict(zip(wrapped[1], wrapped[0], strict=True)) == dict(zip(direct[1], direct[0], strict=True))

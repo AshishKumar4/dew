@@ -24,6 +24,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import Admitted, ModelInputs
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.mixers.attention import CausalSelfAttention
+from dew.nn.rope import LongRopeScaling
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec
 from dew.objectives.base import Variables
@@ -318,6 +319,9 @@ def _mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement
     as the two would. `width` is a row's pages in its table."""
     if not isinstance(model, CausalTransformer):
         return f"{type(model).__name__} is not a CausalTransformer"
+    if isinstance(model.rope_scaling, LongRopeScaling):
+        return (f'LongRoPE crossing position {model.rope_scaling.original_max_position_embeddings} '
+                'requires separate admission so each request keeps its own table and rebuild history')
     if placement.groups > 1:
         return "its slots split into the mesh's row groups"
     if prediction_depths(model):

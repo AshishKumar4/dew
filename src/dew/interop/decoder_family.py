@@ -87,7 +87,7 @@ class DecoderFamily:
         split: dict[str, np.ndarray] = {}
         for name, tensor in prepared.items():
             packing = self.packing(name)
-            split.update({name: tensor} if packing is None else packing.split(name, tensor))
+            split.update({name: tensor} if packing is None else packing.split(name, tensor, config))
         return split
 
     def packing(self, name: str) -> Packed | None:

@@ -31,7 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
+from dew.artifacts import TextSamples, TokenScores
+from dew.coordination import agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec

@@ -15,7 +15,7 @@ import numpy as np
 from flax import struct
 from jax.core import Tracer
 
-from dew.artifacts import agreed
+from dew.coordination import agreed
 from dew.nn.sharding import DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 
 if TYPE_CHECKING:

@@ -124,6 +124,7 @@ from dew.interop.families.nemotron_h import (
 from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
 from dew.interop.families.phi import _PHI_NAMES, _phi_config, _phi_export
+from dew.interop.families.phi3 import _PHI3_PACKED, _phi3_config, _phi3_export, _phi3_path
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen2_moe_config,
@@ -143,6 +144,7 @@ from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
+from dew.nn.rope import LongRopeScaling
 
 ENTRIES = (
     DecoderFamily(
@@ -187,6 +189,13 @@ ENTRIES = (
         weight_path=_falcon_path, export_path=partial(_renamed_name, _FALCON_NAMES),
         prepare=_falcon_prepare, export_weights=_falcon_export_weights, preserve_source_layout=False,
         tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    ),
+    DecoderFamily(
+        ('phi3',), _phi3_config,
+        lambda fields: isinstance(fields.rope_scaling, LongRopeScaling),
+        'phi3', 'Phi3ForCausalLM', _phi3_export,
+        weight_path=_phi3_path, packed=_PHI3_PACKED,
+        export_weights=_decoder_tensors, preserve_source_layout=True,
     ),
     DecoderFamily(
         ('minimax_m2',),

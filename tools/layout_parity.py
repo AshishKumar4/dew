@@ -207,7 +207,7 @@ def zoo() -> dict[str, Any]:
     a JEPA encoder predicts its masked patches' features, and a decoder reads
     an image through a vision tower (`multimodal`), each with heads and
     tokens every layout above divides."""
-    from benchmark_step import Case
+    from benchmark_cases import Case
 
     dense: dict[str, object] = {"vocab_size": 512, "emb_features": 64, "num_layers": 4, "num_heads": 8,
              "num_kv_heads": 4, "head_dim": 8, "mlp_features": 128, "max_seq_len": 33}
@@ -373,7 +373,7 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     computes its own state and must find it bitwise equal to that one, and
     every other trainer copies it: the same state, without a compile of the
     model's initialization on every layout."""
-    import benchmark_step as bench
+    import benchmark_models as bench
     import jax
     import numpy as np
     import optax
@@ -568,7 +568,7 @@ def permutation_floor(case, batch, reference: Mapping[str, NDArray],
 
 def anchor_program(case, batch, state):
     """The same fp64 loss/gradient executable reused for each residual order."""
-    import benchmark_step as bench
+    import benchmark_models as bench
     import jax
     import jax.numpy as jnp
 
@@ -637,13 +637,16 @@ def computed_reference(case, batch, steps: int) -> Reference:
 def source_digest() -> str:
     """The Dew this process imported and the tools that build and judge a
     reference, wherever each was imported from."""
+    import benchmark_cases
+    import benchmark_models
     import benchmark_step
 
     import dew
 
     package = Path(dew.__file__).parent
     files = [(str(path.relative_to(package)), path) for path in sorted(package.glob("**/*.py"))]
-    files += [(f"tools/{Path(tool).name}", Path(tool)) for tool in (benchmark_step.__file__, __file__)]
+    files += [(f"tools/{Path(tool).name}", Path(tool)) for tool in (
+        benchmark_step.__file__, __file__, benchmark_cases.__file__, benchmark_models.__file__)]
     digest = hashlib.sha256()
     for name, path in files:
         digest.update(name.encode())
@@ -887,7 +890,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
     because the trainer donates it. This is a multi-draw validation job for
     the Colab queue; it must not be run on the shared workstation.
     """
-    import benchmark_step as bench
+    import benchmark_models as bench
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -1010,7 +1013,7 @@ def prepared(models: Sequence[str], *, dtype: str, steps: int, anchor: bool, mix
              objective: dict[str, Any], references: References, speak: Callable[[str], None]) -> bool:
     """Each model's reference, and with `anchor` its fp64 anchor, computed
     into `references` where missing; whether every model's is there."""
-    import benchmark_step as bench
+    import benchmark_models as bench
 
     whole = True
     for model in models:
@@ -1040,10 +1043,10 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     phases: a failure on one process fails that row on every process, or,
     where the others wait in a collective it left, ends the pool within the
     failure grace (dew.artifacts) with the rows kept so far."""
-    import benchmark_step as bench
+    import benchmark_models as bench
     import jax
 
-    from dew.artifacts import agreed
+    from dew.coordination import agreed
     from dew.nn.sharding import LayoutRefused
 
     rows = []

@@ -6,7 +6,7 @@ a `Packed` tensor is split on load and packed again on export, so one table
 holds both directions.
 """
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -369,13 +369,24 @@ class Packed:
     parts: tuple[str, ...]
     axis: int = -1
     transpose: tuple[int, ...] | None = None
+    widths: Callable[[Mapping[str, object]], tuple[int, ...]] | None = None
+    """Config-derived unequal part widths, as in Phi-3's grouped-query qkv."""
 
-    def split(self, name: str, tensor: np.ndarray) -> dict[str, np.ndarray]:
+    def split(self, name: str, tensor: np.ndarray,
+              config: Mapping[str, object] | None = None) -> dict[str, np.ndarray]:
         """The parts of the source tensor `name`, as views of it."""
         stem = name.removesuffix(self.name)
         stored = tensor if self.transpose is None else tensor.transpose(self.transpose)
+        sections: int | np.ndarray = len(self.parts)
+        if self.widths is not None:
+            if config is None:
+                raise ValueError(f'{name} needs translated geometry to split its projections')
+            widths = self.widths(config)
+            if len(widths) != len(self.parts) or min(widths) < 1 or sum(widths) != stored.shape[self.axis]:
+                raise ValueError(f'{name} has shape {stored.shape}, incompatible with part widths {widths}')
+            sections = np.cumsum(widths[:-1])
         return {stem + part: piece for part, piece in
-                zip(self.parts, np.split(stored, len(self.parts), axis=self.axis), strict=True)}
+                zip(self.parts, np.split(stored, sections, axis=self.axis), strict=True)}
 
     def layout(self, name: str, parts: Sequence[WeightLayout]) -> WeightLayout:
         """The layout of the source tensor `name`, from each part's one-leaf layout."""

@@ -37,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[2]
 PROFILE = True
 
 
+# Begin snippet: text-fixture
 def text_fixture(out):
     tokenizer = ByteTokenizer()
     tokens = np.asarray(tokenizer.encode("dew trains jax models. " * 100), np.uint8)
@@ -49,17 +50,22 @@ def text_fixture(out):
                                                "val_tokens": 520, "eos_id": 255}))
     data = TokenWindows(path=str(corpus), seq_len=64, loading=Loading(workers=0)).load(batch=8)
     return tokenizer, data
+# End snippet: text-fixture
 
 
+# Begin snippet: image-fixture
 def image_fixture(size):
     images = np.zeros((8, size, size, 3), np.uint8)
     images[:, :, ::2] = 255
     return Dataset(train=lambda partition: itertools.repeat({"image": images}), val=None, records=8, batch=8)
+# End snippet: image-fixture
 
 
+# Begin snippet: decoder
 def decoder():
     return CausalTransformer(vocab_size=256, emb_features=32,
                              num_layers=1, num_heads=2, mlp_features=64, max_seq_len=128)
+# End snippet: decoder
 
 
 def lm(out, smoke):
@@ -186,11 +192,15 @@ def pretrained(out, smoke):
         prompt = np.load(ROOT / "tests/fixtures/hf/qwen3-tiny/input_ids.npy")[:1, :8]
         training_tokens = np.pad(prompt, ((0, 0), (0, 9 - prompt.shape[1])))
     else:
+        # Begin snippet: finetune-data
         prompt = "The capital of France is"
         processed = bundle.processor("The capital of France is Paris.")
         training_tokens = np.asarray(processed.tokens[:, :9], np.int32)
+        # End snippet: finetune-data
+    # Begin snippet: finetune-dataset
     data = Dataset(train=lambda partition: itertools.repeat({"text": training_tokens}),
                    val=None, records=1, batch=1)
+    # End snippet: finetune-dataset
     text = task(prompt, 12, key=0).text
     # Begin snippet: finetune
     objective = LMObjective(bundle, seq_len=training_tokens.shape[1] - 1, ema_decay=None)

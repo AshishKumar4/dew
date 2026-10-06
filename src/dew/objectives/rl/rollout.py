@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.artifacts import agree_process_phase
+from dew.coordination import agree_process_phase
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown

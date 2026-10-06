@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import flat_tree
 
 from dew.checkpoints import Checkpoints
 from dew.data import ByteTokenizer, Dataset
@@ -71,11 +72,6 @@ def loaded(name: str):
     return model, variables
 
 
-def flat(tree):
-    return {".".join(str(entry.key) for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
-
-
 def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     """Evaluation on llada-tiny unmasks the fully masked rows into vocabulary
     ids: [4, 12] int32 with no mask id left. A sampler returning its input
@@ -117,12 +113,12 @@ def test_the_objective_reports_the_loaded_tree_and_returns_it_from_init():
     assert jax.tree.leaves(fresh.initializer) == []
 
     key = jax.random.key(0)
-    held = flat(variables)
+    held = flat_tree(variables)
     for tree in (holding.init(key), holding.initializer(key), fresh.init(key, variables)):
-        assert flat(tree).keys() == held.keys()
-        for name, leaf in flat(tree).items():
+        assert flat_tree(tree).keys() == held.keys()
+        for name, leaf in flat_tree(tree).items():
             np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
-    drawn = flat(fresh.init(key))
+    drawn = flat_tree(fresh.init(key))
     assert drawn.keys() == held.keys()
     assert any(not np.array_equal(np.asarray(leaf), np.asarray(held[name]))
                for name, leaf in drawn.items()), "the fresh init returned the held tree"
@@ -150,7 +146,7 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
 
     state = Trainer(objective, optax.sgd(1e-2), key=jax.random.key(0)).initial_state()
 
-    built, held = flat(state.variables), flat(variables)
+    built, held = flat_tree(state.variables), flat_tree(variables)
     assert built.keys() == held.keys()
     for name, leaf in built.items():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))

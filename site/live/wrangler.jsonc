@@ -19,6 +19,14 @@
 		{
 			"class_name": "SnapshotPreparer",
 			"scheduling_policy": "durable_object"
+		},
+		{
+			"class_name": "RunnerPreparer",
+			"scheduling_policy": "durable_object"
+		},
+		{
+			"class_name": "RemoteJob",
+			"scheduling_policy": "durable_object"
 		}
 	],
 	"durable_objects": {
@@ -27,7 +35,11 @@
 			{ "name": "COORDINATOR", "class_name": "Coordinator" },
 			{ "name": "SHARED", "class_name": "SharedHost" },
 			{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
-			{ "name": "PREPARER", "class_name": "SnapshotPreparer" }
+			{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
+			{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
+			{ "name": "RUNNER_CACHE", "class_name": "RunnerCache" },
+			{ "name": "RUNNER_PREPARER", "class_name": "RunnerPreparer" },
+			{ "name": "REMOTE_JOB", "class_name": "RemoteJob" }
 		]
 	},
 	// v2 moves the containers to the durable_object scheduling policy, which needs a new
@@ -38,7 +50,8 @@
 		{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] },
 		{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
 		{ "tag": "v3", "deleted_classes": ["Kernel"] },
-		{ "tag": "v4", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] }
+		{ "tag": "v4", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] },
+		{ "tag": "v5", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] }
 	],
 	// Requests to the API per visitor IP; sessions have their own limits below.
 	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
@@ -77,7 +90,8 @@
 				{ "tag": "v3", "deleted_classes": ["Kernel"] },
 				{ "tag": "v4", "new_sqlite_classes": ["SnapshotLab"] },
 				{ "tag": "v5", "deleted_classes": ["SnapshotLab"] },
-				{ "tag": "v6", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] }
+				{ "tag": "v6", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] },
+				{ "tag": "v7", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] }
 			],
 			"routes": [{ "pattern": "live-preview.dewml.dev", "custom_domain": true }],
 			"containers": [
@@ -88,6 +102,14 @@
 				{
 					"class_name": "SnapshotPreparer",
 					"scheduling_policy": "durable_object"
+				},
+				{
+					"class_name": "RunnerPreparer",
+					"scheduling_policy": "durable_object"
+				},
+				{
+					"class_name": "RemoteJob",
+					"scheduling_policy": "durable_object"
 				}
 			],
 			"durable_objects": {
@@ -96,7 +118,11 @@
 					{ "name": "COORDINATOR", "class_name": "Coordinator" },
 					{ "name": "SHARED", "class_name": "SharedHost" },
 					{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
-					{ "name": "PREPARER", "class_name": "SnapshotPreparer" }
+					{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
+					{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
+					{ "name": "RUNNER_CACHE", "class_name": "RunnerCache" },
+					{ "name": "RUNNER_PREPARER", "class_name": "RunnerPreparer" },
+					{ "name": "REMOTE_JOB", "class_name": "RemoteJob" }
 				]
 			},
 			"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7402", "simple": { "limit": 30, "period": 60 } }],

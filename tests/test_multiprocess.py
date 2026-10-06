@@ -135,13 +135,17 @@ def run_worker(mode, out: Path, **flags) -> dict:
     return report_of(spawn(mode, out, **flags), out)
 
 
-def run_pool(mode, directory: Path, processes: int, *, timeout=600, **flags) -> list[dict]:
-    """`processes` workers in one pool, and their reports in process order."""
+def run_pool(mode, directory: Path, processes: int, *, timeout=600, start=spawn,
+             **flags) -> list[dict]:
+    """`processes` workers in one pool, and their reports in process order.
+
+    `start` launches each worker; another worker script's launcher takes
+    `spawn`'s arguments and builds its own command."""
     directory.mkdir(parents=True, exist_ok=True)
     coordinator = f"127.0.0.1:{free_port()}"
     outs = [directory / f"process{index}.json" for index in range(processes)]
     running = [
-        spawn(mode, out, processes=processes, process_id=index, coordinator=coordinator,
+        start(mode, out, processes=processes, process_id=index, coordinator=coordinator,
               **flags)
         for index, out in enumerate(outs)]
     try:

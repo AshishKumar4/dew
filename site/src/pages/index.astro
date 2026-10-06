@@ -2,7 +2,8 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
-import { Code } from '@astrojs/starlight/components';
+import EditableExample from '../components/landing/EditableExample.astro';
+import { example, trainingExample } from '../data/framework-examples.mjs';
 import HeroOutput from '../components/landing/HeroOutput.astro';
 import LiveSampler from '../components/landing/LiveSampler.astro';
 import LiveText from '../components/landing/LiveText.astro';
@@ -18,13 +19,6 @@ import { live } from '../live.mjs';
 import '../styles/landing.css';
 
 const readPublic = (...parts: string[]) => readFileSync(path.join(process.cwd(), 'public', ...parts), 'utf8');
-const snippet = (...names: string[]) => names.map((name) => {
-	const text = framework.split(`# Begin snippet: ${name}\n`)[1]?.split(`# End snippet: ${name}`)[0];
-	if (!text) throw new Error(`framework.py: missing snippet ${name}`);
-	const lines = text.split('\n');
-	const indent = Math.min(...lines.filter((line) => line.trim()).map((line) => line.match(/^ */)![0].length));
-	return lines.map((line) => line.slice(indent)).join('\n').trim();
-}).join('\n\n');
 const recorded = (name: string) => {
 	const root = ['examples', 'framework', name];
 	return { result: JSON.parse(readPublic(...root, 'result.json')), capture: JSON.parse(readPublic(...root, 'capture.json')) };
@@ -39,7 +33,6 @@ while (expanded.length < Math.max(terminalReplay.final_cursor_row + 1, terminalR
 if (JSON.stringify(expanded.slice(-terminalReplay.source_rows)) !== JSON.stringify(terminalReplay.source_final_screen)) {
 	throw new Error('Training replay changes the recorded final viewport');
 }
-const shortHero = heroCode.slice(heroCode.indexOf('model ='));
 const replays = ['aurora', 'lighthouse', 'village'].map((name) => {
 	const meta = JSON.parse(readPublic('hero', 'replay', name, 'meta.json'));
 	if (Math.round(meta.model.parameters / 1e6) !== 176 || !/^[0-9a-f]{40}$/.test(meta.model.dew_commit)) {
@@ -91,7 +84,7 @@ const tutorialNames: Record<string, string> = {
 			<h2 class="band-title">Training</h2>
 			<p class="band-lede">A small decoder trains on Tiny Shakespeare on {capture.meta.where}, then writes one sample from each of the prompts <code>ROMEO:</code> and <code>JULIET:</code>.</p>
 			<div class="run-grid">
-				<Code code={shortHero.trimEnd()} lang="python" title="train.py" />
+				<EditableExample code={trainingExample(heroCode)} title="train.py" filename="train.py" />
 				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} columns={hero.columns} source_rows={hero.source_rows} playbackSeconds={terminalReplay.duration} />
 			</div>
 			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full script</a></p>
@@ -100,21 +93,21 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Language modeling</h2>
 			<p class="band-lede">The objective creates the model's variables, computes the loss and runs evaluation. <code>Trainer.fit</code> steps the optimizer, logs progress and saves checkpoints, and every model on this page trains through that one call.</p>
-			<Code code={snippet('lm')} lang="python" title="framework.py" />
+			<EditableExample code={example(framework, 'lm')} title="Language modeling" filename="dew-lm.py" />
 			<p class="framework-note"><a href={fullScript}>Full script</a></p>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Representation learning</h2>
 			<p class="band-lede">A JEPA encoder sees part of an image and learns to predict the representations of the patches it cannot see.</p>
-			<Code code={snippet('jepa')} lang="python" title="framework.py" />
+			<EditableExample code={example(framework, 'jepa')} title="JEPA" filename="dew-jepa.py" />
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Fine-tuning</h2>
 			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, generate from it, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names.</p>
 			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
-			<Code code={snippet('pretrained-source', 'finetune-load', 'finetune')} lang="python" title="framework.py (Qwen3-0.6B)" />
+			<EditableExample code={example(framework, 'pretrained')} title="Fine-tune Qwen3-0.6B" filename="dew-finetune.py" />
 			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
 				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}
 				source_rows={records.pretrained.capture.hero.screen.length} playbackSeconds={0} />
@@ -126,7 +119,7 @@ const tutorialNames: Record<string, string> = {
 			<h2 class="band-title">Diffusion</h2>
 			<p class="band-lede">The process sets how training adds noise and what the model learns to predict. At generation time a solver runs the process in reverse, and you can switch solvers without retraining.</p>
 			<LiveSampler setup={samplerSetup} cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
-			<Code code={snippet('diffusion')} lang="python" title="Define and train a DiT" />
+			<EditableExample code={example(framework, 'diffusion')} title="Define and train a DiT" filename="dew-diffusion.py" />
 			<p class="framework-note">A {modelSize}M-parameter text-to-image model at {resolution}, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
 			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>
 				<div class="replay-frame" style={`aspect-ratio: ${entry.width} / ${entry.height}`}>
@@ -139,17 +132,17 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Serving</h2>
 			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. <code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache.</p>
-			<Code code={snippet('serving')} lang="python" title="framework.py (batched decoding)" />
+			<EditableExample code={example(framework, 'serving')} title="Batched decoding" filename="dew-serving.py" />
 			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
 			<p class="framework-note">Store weights in int8 or fp8:</p>
-			<Code code={snippet('int8', 'fp8')} lang="python" title="framework.py (weight-only int8 and fp8)" />
+			<EditableExample code={example(framework, 'formats')} title="Weight-only int8 and fp8" filename="dew-formats.py" />
 			<p class="framework-note">The <a href="/guides/inference/">serving guide</a> covers the paged KV cache, prefix sharing, constrained decoding, and the error each quantized format adds.</p>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Distributed</h2>
 			<p class="band-lede">To use more devices, give <code>Trainer</code> a mesh; the objective and data stay as they are. FSDP shards parameters and optimizer state, tensor parallelism splits each layer's weight matrices, and an expert axis puts an MoE's experts on different devices. The devices left over form the data-parallel axis.</p>
-			<Code code={snippet('mesh')} lang="python" title="framework.py (same objective and data)" />
+			<EditableExample code={example(framework, 'mesh')} title="Four simulated CPU devices" filename="dew-mesh.py" />
 			<figure class="mesh-overview">
 				<div class="mesh-devices">{mesh.devices.map((id: number, index: number) => <div class="mesh-device"><strong>cpu:{id}</strong><span>fsdp {Math.floor(index / mesh.axes.tensor)} · tensor {index % mesh.axes.tensor}</span></div>)}</div>
 				<figcaption>{mesh.devices.length} simulated CPU devices: {mesh.axes.fsdp} FSDP shards × {mesh.axes.tensor} tensor slices.</figcaption>
@@ -160,7 +153,7 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Post-training</h2>
 			<p class="band-lede">GRPO samples a group of completions for each prompt and scores them with a reward function. The reward here is the fraction of adjacent tokens that count up by one, modulo 13.</p>
-			<Code code={snippet('grpo')} lang="python" title="framework.py (rollout and reward)" />
+			<EditableExample code={example(framework, 'grpo')} title="Rollout and reward" filename="dew-grpo.py" />
 			<figure class="reward-figure">
 				<svg viewBox="0 0 380 180" role="img" aria-label={`Mean completion reward at each of ${reward.length} GRPO updates; fraction of adjacent tokens counting up modulo 13.`}>
 					<line x1="40" y1="40" x2="40" y2="140" /><line x1="40" y1="140" x2="340" y2="140" />
@@ -176,9 +169,9 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Reliability</h2>
 			<p class="band-lede">A checkpoint stores the training state and the position in the data stream. When the job receives SIGTERM, <code>fit</code> stops at the next step every process agrees on, writes a checkpoint and exits with status 143. Run the same command again to resume.</p>
-			<Code code={snippet('determinism', 'reliability')} lang="python" title="framework.py (save and resume)" />
+			<EditableExample code={example(framework, 'reliability')} title="Save and resume" filename="dew-resume.py" />
 			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}, then resumed and trained to step ${records.reliability.result.resumed_step}.\nEvery TrainState leaf matches an uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
-			<Code code={snippet('profile')} lang="python" title="framework.py (JAX/XProf capture)" />
+			<EditableExample code={example(framework, 'profile')} title="JAX/XProf capture" filename="dew-profile.py" />
 			<p class="framework-note"><a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
 		</section>
 

@@ -369,6 +369,25 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
 
 
+def test_train_scores_every_named_validation_split(tmp_path):
+    """#36 item 5: a held-out split and a test set, scored together at each
+    evaluation and logged under their own names."""
+    run = RunConfig(trainer=TrainerConfig(
+        name="splits", checkpoint_dir=str(tmp_path / "runs"), steps=2, batch_size=8,
+        eval_every=1, checkpoint_every=None))
+    held = next(batches())
+    splits = {"val": lambda partition: iter([held]),
+              "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
+    run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="splits",
+              validation=splits)
+    rows = [json.loads(line) for line in
+            (tmp_path / "runs" / "splits" / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    val, test = ({row["step"]: row["scalars"][f"{split}/loss"]
+                  for row in rows if f"{split}/loss" in row["scalars"]} for split in ("val", "test"))
+    assert sorted(val) == sorted(test) == [1, 2]
+    assert all(test[step] > val[step] for step in val), "the shifted test targets score a higher loss"
+
+
 @pytest.mark.mesh(devices=2)
 def test_train_runs_the_trainer_its_config_describes(tmp_path):
     """Every field a trainer holds, off its default, shows in the run `train`

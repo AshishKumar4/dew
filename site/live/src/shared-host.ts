@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import { limitsOf } from './limits';
+import { SESSION_HEADER } from './kernel';
 import type { SnapshotGeneration } from './snapshots';
 
 const PORT = 8888;
@@ -80,7 +81,9 @@ export class SharedHost extends DurableObject<Env> {
 		}
 	}
 
-	async relay(session: string, request: Request): Promise<Response> {
+	override async fetch(request: Request): Promise<Response> {
+		const session = request.headers.get(SESSION_HEADER);
+		if (!session) return new Response('no session', { status: 400 });
 		await this.allocate(session);
 		return this.request(session, 'ws', request);
 	}
