@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -34,8 +34,8 @@ from dew.artifacts import ImageGrid, VideoGrid
 from dew.coordination import agreed, collective_host
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
-from dew.diffusion.schedules import expand
-from dew.diffusion.transforms import broadcast_rates
+from dew.diffusion.schedules import FlowMatchingScheduler, expand
+from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
@@ -49,6 +49,7 @@ from dew.objectives.base import (
     EMASpec,
     Objective,
     Omitted,
+    ProgramModule,
     Ratio,
     Step,
     Variables,
@@ -63,7 +64,7 @@ from dew.registry import objectives, trainings
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.sample import sample
-from dew.sampling.solvers import DDIM, Solver
+from dew.sampling.solvers import DDIM, Consistency, Solver
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -101,15 +102,6 @@ def _own_loss(name: str, kwargs: dict) -> None:
     if unused:
         raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
     kwargs.setdefault("guidance", None)
-
-
-def _from_teacher(variables: Variables, teacher: Variables) -> Variables:
-    """`variables` with the model's leaves copied from `teacher`'s, in buffers the step may donate, the
-    weights under `FROZEN` in an adapter's split, which freezes all but its factors."""
-    copied = dict(jax.tree.map(jnp.copy, dict(teacher)))
-    if FROZEN in variables:
-        copied[FROZEN] = copied.pop("params")
-    return merge(variables, copied)
 
 
 def _without_loss_heads(variables: Variables) -> Variables:
@@ -806,12 +798,11 @@ class Training(ABC):
     guided: ClassVar[bool] = True
 
     @abstractmethod
-    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  base: nn.Module, autoencoder: AutoEncoder | None,
-                  variables: Variables | None) -> DiffusionObjective:
-        """Return this mode's objective over the run's model, process, inputs, autoencoder and variables.
+    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
+        """Return this mode's objective over `variables` and `run`: the run's model, process, inputs,
+        autoencoder, EMA decay, condition dropout and sampling, as `DiffusionObjective` takes them.
 
-        `base` is `model` without the run's adapter, for a teacher. It samples as the run says.
+        `base` is the run's model without its adapter, for a teacher.
         """
 
     def check(self, run: DiffusionRunConfig) -> None:
@@ -850,15 +841,11 @@ class Denoising(Training):
     uncertainty: int | None = None
     alignment: RepresentationAlignment | None = None
 
-    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  base: nn.Module, autoencoder: AutoEncoder | None,
-                  variables: Variables | None) -> DiffusionObjective:
-        return DiffusionObjective(
-            model, process, inputs, autoencoder=autoencoder, variables=variables,
-            unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay, solver=run.solver,
-            guidance=run.guidance, steps=run.sampling_steps, uncertainty=self.uncertainty,
-            alignment=None if self.alignment is None else self.alignment.build(variables),
-            end_to_end=None if self.alignment is None else self.alignment.end_to_end)
+    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
+        alignment = self.alignment
+        return DiffusionObjective(variables=variables, uncertainty=self.uncertainty, **run,
+                                  alignment=None if alignment is None else alignment.build(variables),
+                                  end_to_end=None if alignment is None else alignment.end_to_end)
 
     def check(self, run: DiffusionRunConfig) -> None:
         super().check(run)
@@ -866,15 +853,81 @@ class Denoising(Training):
             raise ValueError("end-to-end tuning trains a run's own `autoencoder`; a pipeline sets none")
 
 
-def teacher_variables(directory: str, variables: Variables | None) -> Variables:
-    """Return a distilled run's teacher model variables.
+@dataclasses.dataclass(frozen=True)
+class Distillation(Training):
+    """A mode that distills a saved run, whose directory `teacher` names; a run without one is refused.
 
-    They are a saved distilled tree's own copy, else the teacher run's published ones.
+    The teacher's model is this run's `model` without the run's adapter. An objective built in
+    code is given the teacher's model and weights directly.
     """
-    from dew.checkpoints import Checkpoints
 
-    if variables is not None:
-        return variables[TEACHER]
-    restored = Checkpoints(directory).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
-    return _without_loss_heads({name: tree for name, tree in restored.items()
-                                if name not in ("encoders", "autoencoder")})
+    teacher: str = ""
+
+    def check(self, run: DiffusionRunConfig) -> None:
+        super().check(run)
+        if not self.teacher:
+            raise ValueError(f"{trainings.name_of(type(self))} distills a teacher; name its run directory")
+
+    def teacher_variables(self, variables: Variables | None) -> Variables:
+        """Return the teacher's model variables: a saved distilled tree's own copy, else the teacher
+        run's published ones."""
+        from dew.checkpoints import Checkpoints
+
+        if variables is not None:
+            return variables[TEACHER]
+        restored = Checkpoints(self.teacher).variables(ema=None, step=None, mesh=None, layout=None,
+                                                       param_dtype=None)
+        return _without_loss_heads({name: tree for name, tree in restored.items()
+                                    if name not in ("encoders", "autoencoder")})
+
+
+class FlowDistillationObjective(DiffusionObjective):
+    """A few-step student of a flow teacher's model, trained on a loss of its own: rCM's and LADD's.
+
+    `teacher` is the teacher's model and `teacher_variables` its variables, frozen under `TEACHER`.
+    A tree that lacks the loss's own `network` starts the student as the teacher, in buffers the
+    step may donate, the weights under `FROZEN` in an adapter's split, which freezes all but its
+    factors, beside that network (`network_variables`). Sampling runs `Consistency`, unguided.
+    """
+
+    network: ClassVar[str]
+    """The network the loss trains beside the student under `params`."""
+
+    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *, teacher: nn.Module,
+                 teacher_variables: Variables, **kwargs):
+        name = objectives.name_of(type(self))
+        if not (isinstance(process.schedule, FlowMatchingScheduler) and not process.interval
+                and isinstance(process.prediction, FlowMatchPredictionTransform)):
+            raise ValueError(f"{name} distills a velocity model on the linear path; build the process with "
+                             "presets.Flow()")
+        _own_loss(name, kwargs)
+        kwargs.setdefault("solver", Consistency())
+        super().__init__(model, process, inputs, **kwargs)
+        self.teacher = teacher
+        self.teacher_variables = teacher_variables
+
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The student, then the frozen teacher."""
+        return (*super().program_key(), ProgramModule(self.teacher, None, trained=False))
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        self.model, self.teacher = modules
+
+    def held_variables(self) -> Variables:
+        return {**super().held_variables(), TEACHER: self.teacher_variables}
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Start the student as the tree's teacher and add the loss's `network`, unless the tree holds it."""
+        state = super().complete_variables(key, tree)
+        if self.network in state["params"]:
+            return state
+        copied = dict(jax.tree.map(jnp.copy, dict(state[TEACHER])))
+        if FROZEN in state:
+            copied[FROZEN] = copied.pop("params")
+        state = merge(state, copied)
+        return merge(state, self.network_variables(key, state))
+
+    @abstractmethod
+    def network_variables(self, key: jax.Array, state: Variables) -> Variables:
+        """Return the loss's `network`'s variables by collection, beside `state`'s student started
+        as the teacher."""

@@ -24,7 +24,7 @@ import dataclasses
 import itertools
 import math
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Literal, NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -34,37 +34,17 @@ from flax import linen as nn
 from dew.diffusion.presets import Flow
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
-from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
-from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import TimeScaled
 from dew.objectives.base import Aux, EMASpec, ProgramModule, Step, Variables
 from dew.registry import models, objectives, trainings
-from dew.sampling.solvers import Consistency
 
 from .few_step import SMOOTH_TIME_SCALE
-from .objective import (
-    FAKE_SCORE,
-    TEACHER,
-    DiffusionObjective,
-    Training,
-    _from_teacher,
-    _own_loss,
-    teacher_variables,
-)
-
-if TYPE_CHECKING:
-    from .config import DiffusionRunConfig
+from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, Distillation, FlowDistillationObjective
 
 Velocity = Callable[[jax.Array, jax.Array], jax.Array]
 """A rectified-flow velocity v(x, rf) at rf time."""
-
-
-
-def trig_time(rf: jax.Array) -> jax.Array:
-    """Return the TrigFlow time of an rf time: the arctan of sigma = rf / (1 - rf)."""
-    return jnp.arctan(rf / (1 - rf))
 
 
 def trig_prediction(velocity: Velocity, x: jax.Array, t: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -207,23 +187,18 @@ class _Draws(NamedTuple):
 
 @trainings("rcm")
 @dataclasses.dataclass(frozen=True)
-class ConsistencyDistillation(Training):
+class ConsistencyDistillation(Distillation):
     """rCM distillation of a saved flow run into a few-step student.
 
     rCM is sCM's consistency loss regularized by DMD2's, or either loss alone when
     the other's weight is 0. It trains under the `Flow` preset and samples unguided.
-    `ConsistencyDistillationObjective` documents the other fields.
-
-    `teacher` is the teacher run's directory, which a run loads; a run without one
-    is refused. The teacher's model is this run's `model` without the run's adapter,
-    and the student and the fake score start from the teacher's weights. An objective
-    built in code is given the teacher's model and weights directly.
+    `ConsistencyDistillationObjective` documents the other fields, and the student
+    and the fake score start from the teacher's weights.
     """
 
     preset_class = Flow
     guided = False
 
-    teacher: str = ""
     consistency_weight: float = 100.0
     dmd_weight: float = 1.0
     teacher_guidance: float = 1.0
@@ -246,20 +221,11 @@ class ConsistencyDistillation(Training):
             mean, std = (float(value) for value in getattr(self, name))
             object.__setattr__(self, name, (mean, std))
 
-    def check(self, run: DiffusionRunConfig) -> None:
-        super().check(run)
-        if not self.teacher:
-            raise ValueError("rCM distills a teacher; name its run directory")
-
-    def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  base: nn.Module, autoencoder: AutoEncoder | None,
-                  variables: Variables | None) -> ConsistencyDistillationObjective:
+    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
         self.check_teacher()
-        return ConsistencyDistillationObjective(
-            model, process, inputs, self, teacher=base,
-            teacher_variables=teacher_variables(self.teacher, variables), autoencoder=autoencoder,
-            variables=variables, ema_decay=run.ema_decay, solver=run.solver, guidance=None,
-            steps=run.sampling_steps)
+        return ConsistencyDistillationObjective(distillation=self, teacher=base,
+                                                teacher_variables=self.teacher_variables(variables),
+                                                variables=variables, **run)
 
     def check_teacher(self) -> None:
         """Refuse sCM from a teacher whose time features turn too fast to differentiate in time.
@@ -285,7 +251,7 @@ class ConsistencyDistillation(Training):
 
 
 @objectives("rcm")
-class ConsistencyDistillationObjective(DiffusionObjective):
+class ConsistencyDistillationObjective(FlowDistillationObjective):
     """Trains rCM: sCM distillation of a flow teacher, regularized by DMD2.
 
     `teacher` and `teacher_variables` are the teacher's model, which the fake
@@ -326,29 +292,16 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     `simple_dit(time_scale=0.002)` for this, in place of the default 16.
     """
 
-    def __init__(
-        self,
-        model: nn.Module,
-        process: Process,
-        inputs: InputSpec,
-        distillation: ConsistencyDistillation,
-        *,
-        teacher: nn.Module,
-        teacher_variables: Variables,
-        **kwargs,
-    ):
-        schedule = process.schedule
-        if not (isinstance(schedule, FlowMatchingScheduler) and schedule.shift == 1.0 and not process.interval
-                and isinstance(process.prediction, FlowMatchPredictionTransform)):
+    network = FAKE_SCORE
+
+    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec,
+                 distillation: ConsistencyDistillation, **kwargs):
+        if isinstance(process.schedule, FlowMatchingScheduler) and process.schedule.shift != 1.0:
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
-        _own_loss("rCM", kwargs)
-        kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)
         super().__init__(model, process, inputs, **kwargs)
-        self.teacher = teacher
-        self.fake_score = teacher
-        self.teacher_variables = teacher_variables
+        self.fake_score = self.teacher
         self.distillation = distillation
         if self.ema is not None:
             decay = self.ema.decay
@@ -399,25 +352,16 @@ class ConsistencyDistillationObjective(DiffusionObjective):
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The student, the frozen teacher, then the fake score, which trains."""
-        return (*super().program_key(), ProgramModule(self.teacher, None, trained=False),
-                ProgramModule(self.fake_score, None, trained=True))
+        return (*super().program_key(), ProgramModule(self.fake_score, None, trained=True))
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
-        self.model, self.teacher, self.fake_score = modules
+        *student_and_teacher, self.fake_score = modules
+        super().substitute(student_and_teacher)
 
-    def held_variables(self) -> Variables:
-        return {**super().held_variables(), TEACHER: self.teacher_variables}
-
-    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
-        """Start the student and the fake score as the tree's teacher, unless it holds a fake score."""
-        state = super().complete_variables(key, tree)
-        if FAKE_SCORE in state["params"]:
-            return state
-        teacher = state[TEACHER]
-        state = dict(_from_teacher(state, teacher))
-        for collection, held in teacher.items():
-            state[collection] = {**state[collection], FAKE_SCORE: jax.tree.map(jnp.copy, held)}
-        return state
+    def network_variables(self, key: jax.Array, state: Variables) -> Variables:
+        """The fake score, started as the teacher too."""
+        return {collection: {FAKE_SCORE: jax.tree.map(jnp.copy, held)}
+                for collection, held in state[TEACHER].items()}
 
     def _network(self, model: nn.Module, variables: Variables, conditions) -> Velocity:
         schedule = self.process.schedule
@@ -443,9 +387,10 @@ class ConsistencyDistillationObjective(DiffusionObjective):
 
     @staticmethod
     def _times(normal, moments) -> jax.Array:
-        """rCM's log-normal training time in rf time, as TrigFlow time."""
+        """rCM's log-normal training time in rf time, as TrigFlow time, the arctan of rf / (1 - rf)."""
         mean, std = moments
-        return trig_time(jnp.clip(jax.nn.sigmoid(mean + std * normal), 0.0, 1.0))
+        rf = jnp.clip(jax.nn.sigmoid(mean + std * normal), 0.0, 1.0)
+        return jnp.arctan(rf / (1 - rf))
 
     def _draws(self, step: Step, count: int, shape) -> _Draws:
         """Every random value the step at `step` reads, from its key."""
@@ -548,5 +493,4 @@ __all__ = [
     "distribution_matching_loss",
     "guided",
     "trig_prediction",
-    "trig_time",
 ]
