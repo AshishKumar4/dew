@@ -1562,8 +1562,8 @@ def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
         def __getitem__(self, index):
             return Image.fromarray(np.full((5, 5, 3), index, np.uint8)), index
 
-    data = Dataset.from_torch(Pictures(), batch=4, fields=("image", "label"), validation=Pictures())
-    batch = next(data.val(DataPartition()))
+    batch = next(Dataset.from_torch(Pictures(), batch=4, fields=("image", "label"),
+                                    validation=Pictures()).val(DataPartition()))
 
     assert batch["image"].shape == (4, 5, 5, 3) and batch["image"].dtype == np.uint8
     np.testing.assert_array_equal(batch["image"][:, 0, 0, 0], batch["label"])

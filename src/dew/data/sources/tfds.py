@@ -42,13 +42,12 @@ PREPARE = ("Prepare it in a separate environment with "
            "builder.data_dir it wrote as path=. Where TensorFlow is installed, "
            "leaving path unset has dew prepare it into its own TFDS directory.")
 
-# The program `prepared` runs in a process of its own. TFDS's GCS copies are
+# What `prepared` runs in a process of its own. TFDS's GCS copies are
 # TFRecords, which dew does not read, so they are not fetched.
 _PREPARING = """
-import sys
-import tensorflow_datasets as tfds
-name, data_dir, config, version = sys.argv[1:]
-tfds.builder(name, data_dir=data_dir, config=config or None, version=version or None).download_and_prepare(
+import sys, tensorflow_datasets as tfds
+name, data_dir, config, version = (argument or None for argument in sys.argv[1:])
+tfds.builder(name, data_dir=data_dir, config=config, version=version).download_and_prepare(
     file_format="array_record", download_config=tfds.download.DownloadConfig(try_download_gcs=False))
 """
 
