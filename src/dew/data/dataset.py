@@ -689,7 +689,8 @@ class Dataset:
 
         A dict sample keeps its keys, and `fields` names the values of a
         tuple sample, `("image", "label")` for torchvision's. Tensors and PIL
-        images arrive as numpy. A `DataLoader` and an `IterableDataset` are
+        images arrive as numpy, an image as its own array: a grey one `[H, W]`
+        and a palette one its indices. A `DataLoader` and an `IterableDataset` are
         refused, naming what to pass instead
         (`dew.data.sources.pytorch.TorchRecords`). The first sample is read
         here, so one `fields` does not name is refused before the run.
