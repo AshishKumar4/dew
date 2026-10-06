@@ -9,6 +9,7 @@ import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 
 from dew.artifacts import Decisions
 from dew.data.dataset import Dataset, Loading, train_stream, validation_pass
@@ -16,7 +17,7 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.data import DecisionTable, Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
-from dew.decision.model import DecisionModel
+from dew.decision.model import DecisionModel, Ordered
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, Weights, laid_out
@@ -25,7 +26,6 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -199,8 +199,9 @@ def _laid_rows(examples: Iterable[Example | Mapping[str, object]], *,
 class DecisionObjective(Objective[Ratio]):
     """Trains a decision model on questions with known answers.
 
-    The model is a backbone with `hidden_states`, read by a `DecisionHead`.
-    `backbone` is a `CausalTransformer` built from scratch, a loaded model
+    The model is any backbone with final states (`dew.nn.protocols.HiddenStates`),
+    read by a head, Laya's `DecisionHead` unless `head` says otherwise.
+    `backbone` is a model built from scratch, a loaded model
     (`Pretrained.load`, adapted with LoRA or partly frozen through `freeze`, as
     `LMObjective` accepts one), or a whole `Decide` task, such as Laya's released
     checkpoint, which brings its head and layout with it. A bidirectional
@@ -221,7 +222,7 @@ class DecisionObjective(Objective[Ratio]):
     artifact = Decisions
     saved_task = Decide
 
-    def __init__(self, backbone: CausalTransformer | Source[CausalTransformer] | Adapter | Decide, *,
+    def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
                  specials: Specials | None = None, layout: Layout | None = None,
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
@@ -243,9 +244,6 @@ class DecisionObjective(Objective[Ratio]):
                 tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
-        if not isinstance(module, CausalTransformer):
-            raise TypeError(f"a decision model reads a CausalTransformer's hidden states, "
-                            f"not a {type(module).__name__}'s")
         if variables is not OMITTED:
             held = variables
         if tokenizer is None:
@@ -254,8 +252,16 @@ class DecisionObjective(Objective[Ratio]):
             raise ValueError("label_smoothing is a share of the target, in [0, 1)")
         if not 0.0 <= none_of_the_above <= 1.0:
             raise ValueError("none_of_the_above is a probability")
-        self.model = DecisionModel(module, head or DecisionHead(module.emb_features, dtype=module.dtype))
-        self.layout = layout or (StateFirstLayout() if module.causal else MarkerLayout())
+        if head is None:
+            width, dtype = DecisionModel.head_size(module)
+            head = DecisionHead(width, dtype=dtype)
+        self.model = DecisionModel(module, head)
+        if layout is None:
+            if not isinstance(module, Ordered):
+                raise ValueError(f"a {type(module).__name__} does not say whether it reads its tokens in "
+                                 "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)")
+            layout = StateFirstLayout() if module.causal else MarkerLayout()
+        self.layout = layout
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
