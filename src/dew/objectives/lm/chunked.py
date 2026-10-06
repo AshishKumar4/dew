@@ -93,14 +93,30 @@ def _capped(logits, softcap, temperature: float = 1.0):
     return logits / temperature
 
 
+def _biased_operands(hidden, head_weight, bias, vocab_major: bool = False):
+    """An affine head as the same tiled product, with one constant feature.
+
+    Only biased heads append the feature. Autodiff through concatenation
+    returns the bias cotangent from the existing bounded-head backward.
+    """
+    if bias is None:
+        return hidden, head_weight
+    if bias.shape != (head_weight.shape[0 if vocab_major else 1],):
+        raise ValueError('head_bias must have one entry per vocabulary column')
+    hidden = jnp.concatenate((hidden, jnp.ones((*hidden.shape[:-1], 1), hidden.dtype)), axis=-1)
+    expanded = bias[:, None] if vocab_major else bias[None, :]
+    return hidden, jnp.concatenate((head_weight, expanded), axis=1 if vocab_major else 0)
+
+
 def head_logits(hidden, head_weight, *, softcap: float | None,
                 precision: PrecisionLike, vocab_major: bool = False,
-                temperature: float = 1.0) -> jax.Array:
+                temperature: float = 1.0, bias=None) -> jax.Array:
     """`hidden @ head_weight` as the model's forward scores it: the states
     against the `[features, vocab]` head (`[vocab, features]` with
     `vocab_major`), accumulated in fp32, softcapped when the backbone caps;
     `[..., vocab]` fp32. The product follows the states' dtype
     (`dew.nn.precision.head_product`)."""
+    hidden, head_weight = _biased_operands(hidden, head_weight, bias, vocab_major)
     return _capped(head_product('...d,vd->...v' if vocab_major else '...d,dv->...v',
                                 hidden, head_weight, precision), softcap, temperature)
 
@@ -465,7 +481,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                           tile: tuple[int, int] | None = (1024, 8192),
                           vocab_major: bool = False,
                           predict: bool = True, temperature: float = 1.0,
-                          excluded: int | None = None):
+                          excluded: int | None = None, bias=None):
     """Per-token cross entropy of `hidden @ head_weight`, its top-1 column
     and its log partition.
 
@@ -517,6 +533,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
     the tokens' gradient cross devices. Otherwise the head is gathered whole
     on each device, and its gradient is the one sum that crosses devices.
     """
+    hidden, head_weight = _biased_operands(hidden, head_weight, bias, vocab_major)
     features = head_weight.shape[1 if vocab_major else 0]
     if hidden.shape[-1] != features:
         raise ValueError(
@@ -661,7 +678,7 @@ SUPPORT_BLOCK = 1 << 15
 
 def support_log_probs(hidden, head_weight, targets, support_ids, support_columns, *,
                       temperature: float = 1.0, softcap: float | None = None,
-                      precision: PrecisionLike = None):
+                      precision: PrecisionLike = None, bias=None):
     """Each target's log-probability renormalized over its recorded sampling support.
 
     Keep-sampling-mask (DeepSeek-V3.2 section 3.1; slime 5bae5bb `loss.py`
@@ -679,6 +696,7 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
     `-inf` for a target outside its support, and whether each target had one;
     a target with none scores 0.0 here.
     """
+    hidden, head_weight = _biased_operands(hidden, head_weight, bias)
     table = jnp.asarray(head_weight).T
     width = targets.shape[1]
     kept = support_ids.shape[1]

@@ -622,6 +622,8 @@ class CausalTransformer(nn.Module):
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
     parallel_residual: bool = False
     """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
+    shared_parallel_norm: bool = False
+    """Both parallel branches read one LayerNorm, as in Phi, Falcon-7B and GPT-J."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -665,6 +667,8 @@ class CausalTransformer(nn.Module):
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
     tie_embeddings: bool = True
+    lm_head_bias: bool = False
+    """A vocabulary bias on an untied output head, as in Phi and GPT-J."""
     # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
     """Placeholder ids that the embedding lookup reads as token zero. The labels
@@ -1017,6 +1021,8 @@ class CausalTransformer(nn.Module):
             raise ValueError('norm_bias requires LayerNorm')
         if self.norm_type == 'layer' and self.scale_offset:
             raise ValueError('scale_offset describes RMSNorm weights')
+        if self.lm_head_bias and self.tie_embeddings:
+            raise ValueError('lm_head_bias requires an untied output head')
         if self.position_embedding not in ('rotary', 'learned'):
             raise ValueError('position_embedding must be rotary or learned')
         if self.position_embedding == "learned" and (
@@ -1314,7 +1320,8 @@ class CausalTransformer(nn.Module):
             nope=self.position_embedding != 'rotary')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual)
+                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
+                             shared_parallel_norm=self.shared_parallel_norm)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
@@ -1355,7 +1362,7 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype)(name='norm')
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
-                features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
+                features=self.vocab_size, use_bias=self.lm_head_bias, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
@@ -2298,6 +2305,10 @@ class CausalTransformer(nn.Module):
         # The same matrix `_logits` contracts.
         table, vocab_major = self.head_table(params)
         return table.T if vocab_major else table
+
+    def head_bias(self, params):
+        """The untied head's vocabulary bias, or None for a bias-free head."""
+        return params['lm_head']['bias'] if self.lm_head_bias else None
 
     def head_table(self, params):
         """Return the head matrix as the tree stores it, and whether its rows are the vocabulary.
