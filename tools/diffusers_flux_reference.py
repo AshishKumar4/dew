@@ -22,9 +22,7 @@ Run in the isolated reference environment on CPU:
 
 from __future__ import annotations
 
-import contextlib
 import json
-import math
 import os
 import sys
 from dataclasses import dataclass, field
@@ -34,6 +32,11 @@ os.environ["JAX_PLATFORMS"] = "cpu"
 
 import numpy as np
 import torch
+from diffusers_reference_helpers import (
+    frequency_exponent as frequency_exponent,
+    rounded_frequency_table as rounded_frequency_table,
+    rounded_timestep_embedding as rounded_timestep_embedding,
+)
 
 # The SD3 tool restores the transformers names diffusers 0.34.0 imports.
 from diffusers_sd3_reference import bundle, clip_tokenizers, t5_tokenizer
@@ -65,44 +68,6 @@ CASES: dict[str, Case] = {
     # a per-row tensor rather than one scalar.
     "mixed": Case(dict(guidance_embeds=True), guidance=(3.5, 7.0)),
 }
-
-
-def frequency_exponent(half: int, shift: float, max_period: float) -> torch.Tensor:
-    """`get_timestep_embedding`'s float32 exponent, its own arithmetic."""
-    exponent = -math.log(max_period) * torch.arange(start=0, end=half, dtype=torch.float32)
-    return exponent / (half - shift)
-
-
-def rounded_timestep_embedding(timesteps, embedding_dim, flip_sin_to_cos=False,
-                               downscale_freq_shift=1, scale=1, max_period=10000):
-    """The source's `get_timestep_embedding` with its exponential taken in
-    float64 and rounded once to float32.
-
-    Torch's float32 `exp` is off by one unit in the last place at some of the
-    entries, and one ulp of a frequency is one ulp of the 3500-radian angle a
-    distilled guidance embeds; the rounded table is the one Dew builds on the
-    host, so a walk over it holds the rest of the source to the suite's bound
-    with nothing else altered.
-    """
-    half = embedding_dim // 2
-    table = torch.exp(frequency_exponent(half, downscale_freq_shift, max_period).double()).float()
-    angle = scale * (timesteps[:, None].float() * table[None, :])
-    embedded = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1)
-    if flip_sin_to_cos:
-        embedded = torch.cat([embedded[:, half:], embedded[:, :half]], dim=-1)
-    return embedded
-
-
-@contextlib.contextmanager
-def rounded_frequency_table():
-    from diffusers.models import embeddings
-
-    original = embeddings.get_timestep_embedding
-    embeddings.get_timestep_embedding = rounded_timestep_embedding
-    try:
-        yield
-    finally:
-        embeddings.get_timestep_embedding = original
 
 
 def torch_exp_disagreements(half: int) -> int:

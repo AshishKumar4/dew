@@ -28,22 +28,18 @@ Three model conventions cover the schedulers:
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import ModuleType
-from unittest.mock import patch
 
 # The per-step noise is the test suite's draw, which conftest.py makes on
 # the CPU; a GPU draw of the same key differs in the last float32 bit and
 # the fixture would then not regenerate byte-identically.
 os.environ["JAX_PLATFORMS"] = "cpu"
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import torch
 from diffusers.schedulers import (
@@ -52,6 +48,7 @@ from diffusers.schedulers import (
     scheduling_k_dpm_2_discrete, scheduling_lcm, scheduling_lms_discrete, scheduling_pndm,
     scheduling_tcd, scheduling_unipc_multistep,
 )
+from diffusers_reference_helpers import fed_noise as fed_noise, step_noise as step_noise
 
 from dew.diffusion import EpsilonPredictionTransform, LinearNoiseScheduler, Process
 
@@ -82,34 +79,6 @@ def trailing_grid(steps: int) -> np.ndarray:
     steps, then the table's index 0 where its sigma_min terminal lands."""
     timesteps = np.arange(TRAIN_STEPS, 0, -TRAIN_STEPS / (steps - 1)).round().astype(np.int64) - 1
     return np.concatenate([timesteps, [0]])
-
-
-def step_noise(steps: int) -> list[np.ndarray]:
-    """The noise `sample` draws at each interval: one standard normal per
-    step under the walk's key folded with the step index."""
-    key = jax.random.PRNGKey(0)
-    return [np.asarray(jax.random.normal(jax.random.fold_in(key, i), SHAPE, dtype=jnp.float32))
-            for i in range(steps - 1)]
-
-
-@contextlib.contextmanager
-def fed_noise(module: ModuleType, noises: list[np.ndarray]) -> Iterator[None]:
-    """The scheduler module's `randn_tensor` handing out `noises` in order,
-    in the dtype the scheduler asks for, so its arithmetic runs on the draws
-    Dew's solver makes. A module that never draws has no `randn_tensor`."""
-    queue = list(noises)
-
-    def draw(shape, generator=None, device=None, dtype=None, layout=None):
-        noise = torch.tensor(queue.pop(0), dtype=dtype)
-        assert tuple(noise.shape) == tuple(shape), (noise.shape, shape)
-        return noise
-
-    original = getattr(module, "randn_tensor", None)
-    if original is None:
-        yield
-        return
-    with patch.object(module, "randn_tensor", draw):
-        yield
 
 
 def vp_epsilon(x: torch.Tensor, index: int) -> torch.Tensor:
@@ -413,7 +382,7 @@ def run(name: str, case: Case) -> dict[str, np.ndarray]:
     cotangent = torch.randn(SHAPE, generator=generator, dtype=torch.float64)
     x_T.requires_grad_(True)
     module, walk = WALKS[case.scheduler]
-    latents = walk(module, case, x_T, step_noise(len(case.grid)))
+    latents = walk(module, case, x_T, step_noise(SHAPE, len(case.grid) - 1, np.float32))
     assert len(latents) == len(case.grid) - 1, (name, len(latents), len(case.grid))
     (grad,) = torch.autograd.grad((latents[-1] * cotangent).sum(), x_T)
     return {
