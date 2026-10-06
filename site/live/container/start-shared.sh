@@ -1,6 +1,7 @@
 #!/bin/sh
 # Only trusted serving processes can read model weights; Python contexts use IPC.
 set -eu
+umask 077
 mkdir -p /run/dew/model
 chown model:model /run/dew/model
 chmod 0711 /run/dew/model

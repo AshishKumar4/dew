@@ -10,6 +10,7 @@ import socket
 import socketserver
 import struct
 import threading
+import time
 from pathlib import Path
 
 MAX_REQUEST = 32_768
@@ -94,6 +95,7 @@ class NativeModels:
         from dew.interop import PretrainedDecoder
         from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage
 
+        print("MODEL_PHASE", time.time(), "pipeline load", flush=True)
         self.np, self.progress = np, progress
         self.cfg = CFG
         self.solvers = {solver.__name__: solver for solver in (DPMSolverMultistep, EulerAncestral, Heun)}
@@ -102,15 +104,18 @@ class NativeModels:
         self.text_servers = {}
         for line in (root / "text-models").read_text().split():
             name, _ = line.split("@")
+            print("MODEL_PHASE", time.time(), "text load", name, flush=True)
             bundle = PretrainedDecoder.load(f"/opt/models/{name}", dtype=jnp.float32, max_seq_len=256)
             task = bundle.text_generation(sampling=Sampling(temperature=0))
             self.text_servers[name] = Server.from_task(task, slots=8, capacity=256)
+        print("MODEL_PHASE", time.time(), "warm sample", flush=True)
         self.sample({"repo": self.repo, "revision": self.revision,
                      "prompt": "the northern lights over a frozen lake at night", "negative": "",
                      "prepare_key": 3, "prepare_steps": 15, "steps": 15, "key": 3,
                      "solver": {"name": "DPMSolverMultistep", "args": {}},
                      "guidance": {"scale": 6, "interval": [0.15, 0.9], "rescale": 0}}, lambda *_: None)
         for name in self.text_servers:
+            print("MODEL_PHASE", time.time(), "warm text", name, flush=True)
             self.text([{ "model": name, "prompt": "The capital of France is", "tokens": 24, "key": 0}])
 
     def describe(self, request):
@@ -183,7 +188,7 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
 
     def process_request(self, request, address):
         uid = struct.unpack("3i", request.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, 12))[1]
-        token = object()
+        token = {"queued": False}
         with self.lock:
             if uid not in self.uids:
                 error = {"name": "PermissionError",
@@ -211,7 +216,8 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
         try:
             super().process_request_thread(request, address)
         finally:
-            self.release(uid, token)
+            if not token["queued"]:
+                self.release(uid, token)
 
     def release(self, uid, token):
         with self.lock:
@@ -266,8 +272,8 @@ class ModelRequest(socketserver.StreamRequestHandler):
         token = self.server.pending[uid]
         completed = threading.Event()
 
-        def emit(value):
-            if "result" in value or "error" in value:
+        def emit(value, release=True):
+            if release and ("result" in value or "error" in value):
                 self.server.release(uid, token)
             try:
                 self.wfile.write(json.dumps(value, allow_nan=False).encode() + b"\n")
@@ -284,11 +290,16 @@ class ModelRequest(socketserver.StreamRequestHandler):
             if not raw.endswith(b"\n") or len(raw) > MAX_REQUEST:
                 raise ValueError("the model request is too large")
             request = validate(json.loads(raw))
-            self.server.jobs.put_nowait((request, emit))
+            token["queued"] = True
+            try:
+                self.server.jobs.put_nowait((request, emit))
+            except queue.Full:
+                token["queued"] = False
+                raise
             if not completed.wait(90):
                 raise TimeoutError("the shared model did not finish within 90 seconds")
         except Exception as error:
-            emit({"error": {"name": type(error).__name__, "message": str(error)}})
+            emit({"error": {"name": type(error).__name__, "message": str(error)}}, release=False)
 
 
 if __name__ == "__main__":

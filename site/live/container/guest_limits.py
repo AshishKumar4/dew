@@ -50,7 +50,9 @@ def install(cpu_seconds=10):
             raise RuntimeError(f"could not restrict {name}: {result}")
 
     try:
-        for name in ("fork", "vfork", "unshare", "setns", "ptrace", "process_vm_readv", "process_vm_writev"):
+        for name in ("fork", "vfork", "unshare", "setns", "ptrace", "process_vm_readv", "process_vm_writev",
+                     "io_uring_setup", "io_uring_enter", "io_uring_register", "bpf", "perf_event_open",
+                     "userfaultfd", "keyctl", "add_key", "request_key"):
             deny(name)
         # libc retries clone for threads when clone3 is unavailable. A clone
         # without CLONE_THREAD could multiply the per-process memory allowance.
