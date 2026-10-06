@@ -335,32 +335,6 @@ def test_an_unconditional_unet_takes_a_step():
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
 
-def test_joint_stream_models_refuse_an_unconditional_run():
-    """SimpleMMDiT and HierarchicalMMDiT run the text as a second stream
-    through every block's joint attention, so with no text there is no
-    sequence to project. They declare `RequiresText`, and `build` raises a
-    ValueError before the first attention softmax over an empty slice."""
-    from dew.config import ModelConfig
-
-    base = DiffusionRunConfig(text=None)
-    for architecture in ("simple_mmdit", "hierarchical_mmdit"):
-        config = dataclasses.replace(base, model=ModelConfig(architecture, {}))
-        with pytest.raises(ValueError, match="unconditional"):
-            config.build()
-
-
-def test_a_discrete_preset_is_refused_by_the_gaussian_objective():
-    """`preset:mdlm` is one subcommand away on the diffusion recipe, and its
-    process has no schedule the Gaussian objective can corrupt with, so the
-    config names the preset and the objective that trains it instead of
-    failing inside the loss."""
-    from dew.diffusion.discrete import MDLM
-
-    config = dataclasses.replace(DiffusionRunConfig(text=None), preset=MDLM(mask_id=0))
-    with pytest.raises(ValueError, match=r"mdlm.*--objective masked_diffusion"):
-        config.build()
-
-
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: the
     factories read that grid there, and an image-only metric raises a

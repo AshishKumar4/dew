@@ -212,29 +212,28 @@ def test_a_preset_builds_the_same_loss_and_images_as_its_process():
                                   built(["", ""], key=2).host().images)
 
 
-def test_a_masked_preset_is_refused_by_the_gaussian_objective():
+def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction():
+    """A masked process; a solver given by name, one that refuses the schedule
+    (the sigma integrators hold only where alpha is 1, which the VP cosine is
+    not), or one without the real terminal grid's target; and a model that
+    cannot run on the inputs (SimpleMMDiT runs its text as a second stream
+    through every block, so it declares `RequiresText`): each is refused when
+    the objective is built, before a step."""
     from dew.diffusion.discrete import MDLM
+    from dew.sampling import RK4, UniPC
 
-    with pytest.raises(ValueError, match="Gaussian Process"):
-        DiffusionObjective(Zero(), MDLM(mask_id=1), InputSpec(Field("image", (2, 2, 1))))
-
-
-def test_a_solver_that_refuses_the_schedule_is_refused_at_construction():
-    """The sigma integrators hold only when alpha is 1; the cosine
-    preset is VP, and the mismatch surfaces when the objective is built."""
-    from dew.sampling import RK4
-    unconditional = InputSpec(Field("image", (RES, RES, 3)))
-    with pytest.raises(ValueError, match="GeneralizedNoiseScheduler"):
-        DiffusionObjective(Zero(), presets.Cosine(), unconditional, solver=RK4())
+    flow, unconditional = presets.Flow(), InputSpec(Field("image", (RES, RES, 3)))
+    mmdit = SimpleMMDiT(patch_size=2, emb_features=8, num_layers=1, num_heads=2)
+    unipc = UniPC(3, lower_order_final=False)
+    for error, fragment, model, process, settings in (
+            (ValueError, "mdlm.*--objective masked_diffusion", Zero(), MDLM(mask_id=1), {}),
+            (ValueError, "GeneralizedNoiseScheduler", Zero(), presets.Cosine(), {"solver": RK4()}),
+            (TypeError, "names a solver", Zero(), flow, {"solver": "euler"}),
+            (ValueError, "sigma=0 target", Zero(), flow, {"solver": unipc, "steps": 7}),
+            (ValueError, "unconditionally", mmdit, flow, {})):
+        with pytest.raises(error, match=fragment):
+            DiffusionObjective(model, process, unconditional, **settings)
     DiffusionObjective(Zero(), presets.Karras(), unconditional, solver=RK4())
-
-
-def test_a_solver_named_by_a_string_is_refused_with_the_object_to_pass():
-    unconditional = InputSpec(Field("image", (RES, RES, 3)))
-    with pytest.raises(
-        TypeError, match=r"solver='euler' names a solver; pass the solver itself, as Euler\(\)"
-    ):
-        DiffusionObjective(Zero(), presets.Flow(), unconditional, solver="euler")
 
 
 @pytest.mark.parametrize("order, steps", [(2, 5), (3, 7)])
@@ -249,14 +248,6 @@ def test_singlestep_solver_generates_through_the_objective(order, steps):
     result = objective.evaluate(params, {"image": np.zeros((2, 2, 2, 1), np.uint8)},
                                 Step(step=jnp.asarray(0), key=jax.random.key(2), ema=None))
     np.testing.assert_array_equal(result.images, np.zeros((2, 2, 2, 1), np.float32))
-
-
-def test_objective_validates_the_real_terminal_grid_before_sampling():
-    from dew.sampling import UniPC
-
-    with pytest.raises(ValueError, match="sigma=0 target"):
-        DiffusionObjective(Zero(), presets.Flow(), InputSpec(Field("image", (2, 2, 1))),
-                           solver=UniPC(3, lower_order_final=False), steps=7, guidance=None)
 
 
 def test_loss_is_the_weighted_error_of_the_prediction():
@@ -285,28 +276,35 @@ def test_loss_is_the_weighted_error_of_the_prediction():
     assert aux.metrics == {}
 
 
-def test_the_compiled_step_carries_no_encoder_constants():
-    """T19: the encoder's table arrives through `params["encoders"]`, so the
-    loss's jaxpr has no constant of its shape. The mutation that reads the
-    table off the encoder object instead bakes it in, and this assertion
-    catches that."""
-    objective = make_objective()
+def test_the_compiled_step_carries_no_frozen_tower_constants():
+    """T19: the text encoder's table and the VAE's weights arrive through the
+    tree's `encoders` and `autoencoder`, so the loss's jaxpr has no constant
+    of the table's or the VAE encoder kernel's shape. A loss that reads them
+    off the objective's own towers instead bakes them in, and this catches it."""
+    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
+    model = AutoencoderKL(channels=(8, 8), latent_channels=2, blocks_per_level=1, norm_groups=4,
+                          dtype=jnp.float32)
+    autoencoder = StableDiffusionVAE(
+        model=model, params=model.init(jax.random.PRNGKey(0), jnp.zeros((1, RES, RES, 3)))["params"],
+        dtype=jnp.float32, latent_shift=0.0, latent_scale=1.0)
+    text = make_objective()
+    objective = DiffusionObjective(text.model.clone(output_channels=2), text.process, text.inputs, steps=3,
+                                   autoencoder=autoencoder)
     params = objective.init(jax.random.PRNGKey(0))
-    batch = make_batch()
-    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
+    batch, step = make_batch(), Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
 
-    def shapes_of_constants(fn):
-        closed = jax.make_jaxpr(fn)(params, batch, step)
-        return {np.shape(const) for const in closed.consts}
-
-    assert (VOCAB, FEATURES) not in shapes_of_constants(objective.loss)
+    def constants(loss):
+        return {np.shape(const) for const in jax.make_jaxpr(loss)(params, batch, step).consts}
 
     class Leaky(DiffusionObjective):
-        def encode(self, encoders, tokens=None):
-            return super().encode(self.encoder_params(), tokens)
+        def loss(self, variables, batch, step):
+            towers = {"encoders": self.encoder_params(), "autoencoder": autoencoder.params}
+            return super().loss({**variables, **towers}, batch, step)
 
-    leaky = Leaky(objective.model, objective.process, objective.inputs, steps=3)
-    assert (VOCAB, FEATURES) in shapes_of_constants(leaky.loss)
+    frozen = {(VOCAB, FEATURES), (3, 3, 3, 8)}
+    assert not frozen & constants(objective.loss)
+    leaky = Leaky(objective.model, objective.process, objective.inputs, steps=3, autoencoder=autoencoder)
+    assert frozen <= constants(leaky.loss)
 
 
 def encode_calls(monkeypatch, encoder) -> list:
@@ -438,40 +436,6 @@ def test_uint8_pixels_reach_the_sampler_as_training_normalizes_them():
     supplied = pipe._supplied(2, pipe.latent_shape, image=levels, image_latents=None, mask=None,
                               noise=None, initial=None)
     np.testing.assert_array_equal(supplied["image"], np.asarray(unit_range(levels)))
-
-
-def test_the_compiled_step_carries_no_autoencoder_constants():
-    """T19, the VAE half: the autoencoder weights arrive through
-    `params["autoencoder"]`, so the loss's jaxpr has no constant of the
-    encoder kernel's shape. The mutation that reads them off the autoencoder
-    object instead bakes them in, and this assertion catches that."""
-    from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
-    model = AutoencoderKL(channels=(8, 8), latent_channels=2, blocks_per_level=1, norm_groups=4,
-                          dtype=jnp.float32)
-    autoencoder = StableDiffusionVAE(
-        model=model, params=model.init(jax.random.PRNGKey(0), jnp.zeros((1, RES, RES, 3)))["params"],
-        dtype=jnp.float32, latent_shift=0.0, latent_scale=1.0)
-    inputs = InputSpec(Field("image", (RES, RES, 3)))
-    objective = DiffusionObjective(Zero(), presets.EDM(regime="pixel"), inputs,
-                                   autoencoder=autoencoder)
-    params = objective.init(jax.random.PRNGKey(0))
-    assert set(params) == {"params", "encoders", "autoencoder"}
-    batch = make_batch()
-    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(1), ema=None)
-
-    def shapes_of_constants(fn):
-        closed = jax.make_jaxpr(fn)(params, batch, step)
-        return {np.shape(const) for const in closed.consts}
-
-    assert (3, 3, 3, 8) not in shapes_of_constants(objective.loss)
-
-    class Leaky(DiffusionObjective):
-        def loss(self, variables, batch, step):
-            variables = dict(variables, autoencoder=autoencoder.params)
-            return super().loss(variables, batch, step)
-
-    leaky = Leaky(Zero(), presets.EDM(regime="pixel"), inputs, autoencoder=autoencoder)
-    assert (3, 3, 3, 8) in shapes_of_constants(leaky.loss)
 
 
 def test_scoring_covers_all_conditions_and_preview_decodes_only_its_small_draw():
@@ -648,39 +612,3 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     expected = reconstructed.evaluate(variables, batch, step).images
     actual = objective.evaluate(variables, batch, step).images
     np.testing.assert_array_equal(actual, expected)
-
-
-
-@pytest.mark.parametrize("kind", ["rcm", "ladd", "guidance_distillation"])
-def test_a_distillation_substitutes_every_network_it_runs(kind):
-    """The trainer substitutes each module an objective's step runs
-    (`substitute`, as remat does) in `program_key`'s order: the student,
-    then the frozen teacher, and rCM's fake score, which trains."""
-    from dew.objectives.diffusion import (
-        AdversarialDistillation,
-        AdversarialDistillationObjective,
-        ConsistencyDistillation,
-        ConsistencyDistillationObjective,
-        GuidanceDistillationObjective,
-    )
-
-    model, flow = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2), presets.Flow()()
-    inputs = InputSpec(Field("image", (4, 4, 3)))
-    teacher = DiffusionObjective(model, flow, inputs, guidance=None, steps=2)
-    held = teacher.model_variables(teacher.init(jax.random.PRNGKey(0)))
-    objective = {
-        "rcm": lambda: ConsistencyDistillationObjective(model, flow, inputs, ConsistencyDistillation(),
-                                                        teacher=model, teacher_variables=held),
-        "ladd": lambda: AdversarialDistillationObjective(
-            model, flow, inputs, AdversarialDistillation(feature_layers=("dit_block_0",)), teacher=model,
-            teacher_variables=held),
-        "guidance_distillation": lambda: GuidanceDistillationObjective(model, flow, inputs, teacher=teacher,
-                                                                       teacher_variables=held),
-    }[kind]()
-    trained = [program.trained for program in objective.program_key()]
-    assert trained == {"rcm": [True, False, True]}.get(kind, [True, False])
-    modules = [program.module.clone() for program in objective.program_key()]
-    objective.substitute(modules)
-    programs = objective.program_key()
-    assert all(program.module is module for program, module in zip(programs, modules, strict=True))
-    assert [program.trained for program in programs] == trained

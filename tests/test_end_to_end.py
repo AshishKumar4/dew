@@ -543,9 +543,6 @@ def test_each_network_steps_on_its_own_optimizer_as_repa_e_s_three_do(repae_step
 
 
 def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
-    """REPA-E trains the autoencoder through REPA's loss and its KL
-    posterior: without `alignment` it is refused, and so is an autoencoder
-    whose latent is no posterior draw, a DC-AE's, which names itself."""
     task = objective(EndToEnd(**L1_KL))
     with pytest.raises(ValueError, match="needs `alignment`"):
         DiffusionObjective(task.model, task.process, task.inputs, autoencoder=task.autoencoder,
