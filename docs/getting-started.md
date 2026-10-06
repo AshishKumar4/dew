@@ -15,7 +15,7 @@ from flax import linen as nn
 
 from dew import Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Ratio, Objective
+from dew.objectives.base import Aux, Objective
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)
 y = 2 * x + 1
@@ -42,7 +42,7 @@ class Regression(Objective):
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
         errors = (prediction - batch["y"]) ** 2
-        loss = Ratio(jnp.sum(errors), jnp.asarray(errors.size))
+        loss = self.row_mean(errors, batch)
         mse, _ = loss.mean()
         return loss, Aux(metrics={"mse": mse})
 
@@ -55,7 +55,7 @@ objective = Regression(model)
 
 `loss(variables, batch, step)` returns two values:
 
-- `Ratio(total, mass)`, a sum and the count it is averaged over. The trainer adds totals and masses over a gradient-accumulation window and divides once, so the gradient is the gradient of the mean over the whole window. Here the mass is the number of squared errors.
+- `Ratio(total, mass)`, a sum and the count it is averaged over. The trainer adds totals and masses over a gradient-accumulation window and divides once, so the gradient is the gradient of the mean over the whole window. `self.row_mean(errors, batch)` builds it from the batch's rows: here the sum of the squared errors and their number. A validation pass's last batch is filled out with repeat rows, which it counts for nothing.
 - `Aux(metrics=...)`, scalars to log. `Ratio.mean` turns a `Ratio` into its value.
 
 `step` is a `Step`: `step.step` counts accepted microbatches and `step.key` is a fresh random key for this attempt. This loss is deterministic and uses neither.

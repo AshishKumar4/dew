@@ -38,7 +38,7 @@ from dew.diffusion.transforms import FlowMatchPredictionTransform
 from dew.inputs import InputSpec, unit_range
 from dew.nn.attention import forward_mode_attention
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, EMASpec, Ratio, Step, Variables
+from dew.objectives.base import Aux, EMASpec, Step, Variables
 from dew.registry import models, objectives, trainings
 from dew.sampling.solvers import Consistency
 
@@ -524,7 +524,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             return critic_loss(generated, fake, t)
 
         losses = jax.lax.cond(student_phase, student_losses, critic_losses, variables)
-        return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
+        return self.row_mean(losses, batch), Aux(metrics={})
 
     def _distribution_matching(self, params, student_params, given, blank, draws: _Draws, iteration):
         options = self.distillation
