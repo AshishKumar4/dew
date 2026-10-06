@@ -54,6 +54,11 @@ from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.moe import GatedActivation, Situ
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.text_encoders import check_tree
+from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
+from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
+from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
+from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
+from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
 from dew.objectives.base import Variables
 from dew.registry import from_record, towers
 
@@ -881,11 +886,11 @@ def _record_float(record: Mapping[str, object], field: str, default: float | Non
 def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_siglip_vision_config(hf_config)
+    tower = translate_siglip_vision_config(hf_config)
     used.add("vision_config")
     mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
-    projector = vision_nn.translate_gemma_projector_config(
+    projector = translate_gemma_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"), mm)
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
@@ -904,9 +909,9 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Llama 4 wrapper: MetaCLIP-style tower, shuffle adapter, outer map."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_llama4_vision_config(hf_config)
+    tower = translate_llama4_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_llama4_projector_config(
+    projector = translate_llama4_projector_config(
         records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     _wrapper_tokens(used)
@@ -947,7 +952,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     slots = None
     projector: Mapping[str, object]
     if isinstance(encoder, audio_nn.Gemma4Audio):
-        projector = vision_nn.translate_gemma4_projector_config(
+        projector = translate_gemma4_projector_config(
             {"rms_norm_eps": encoder.rms_norm_eps}, text_width)
     else:
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
@@ -966,9 +971,9 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
     text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
-    tower = vision_nn.translate_gemma4_vision_config(hf_config)
+    tower = translate_gemma4_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_gemma4_projector_config(
+    projector = translate_gemma4_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     _wrapper_tokens(used)
@@ -995,9 +1000,9 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
         _refuse('language_model_only', 'the multimodal wrapper requires its vision component')
     used.add('language_model_only')
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_qwen35_vision_config(hf_config)
+    tower = translate_qwen35_vision_config(hf_config)
     used.add("vision_config")
-    projector = vision_nn.translate_qwen35_projector_config(
+    projector = translate_qwen35_projector_config(
         hf_config, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     _wrapper_tokens(used)
@@ -1019,8 +1024,8 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Read a Gemma 3n wrapper: MobileNet tower, vocabulary embedders and its audio."""
     text = _wrapper_text(hf_config, used)
-    tower = vision_nn.translate_gemma3n_vision_config(hf_config)
-    projector = vision_nn.translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
+    tower = translate_gemma3n_vision_config(hf_config)
+    projector = translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
     used.add("vision_config")
     count = _record_int(tower["fields"], "msfa_output_resolution") ** 2
     if hf_config.get("vision_soft_tokens_per_image", count) != count:

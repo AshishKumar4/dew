@@ -35,6 +35,7 @@ import struct
 import sys
 import types
 from pathlib import Path
+from unittest.mock import patch
 
 import numpy as np
 import requests
@@ -49,7 +50,8 @@ import triton
 import triton.language as tl
 from modelopt.torch.export import export_hf_checkpoint
 from modelopt.torch.kernels.quantization.gemm.fp4_kernel_hopper import fp4_fake_quant_kernel as sm89_kernel
-from modelopt.torch.quantization.qtensor import NVFP4QTensor
+from modelopt.torch.quantization.qtensor import FP8QTensor, NVFP4QTensor
+from modelopt.torch.quantization.tensor_quant import fp8_eager
 from safetensors.torch import load_file, save_file
 from transformers import Qwen3Config, Qwen3ForCausalLM
 from triton.language.extra.cuda import libdevice
@@ -124,13 +126,16 @@ def author_qdq(x: torch.Tensor, global_scale: torch.Tensor, *, corrected: bool =
 
 def author_weight(stored: dict[str, torch.Tensor], stem: str) -> torch.Tensor:
     packed = stored[stem + ".weight"]
+    if packed.dtype == torch.float8_e4m3fn:
+        quantized = FP8QTensor(packed.shape, torch.bfloat16, packed)
+        return quantized.dequantize(scale=stored[stem + '.weight_scale'])
     shape = torch.Size((packed.shape[0], 2 * packed.shape[1]))
     quantized = NVFP4QTensor(shape, torch.bfloat16, packed)
     return quantized.dequantize(scale=stored[stem + ".weight_scale"],
                                double_scale=stored[stem + ".weight_scale_2"], block_sizes={-1: 16})
 
 
-def tiny() -> None:
+def tiny(*, mixed: bool = False) -> None:
     from diffusers_wan_reference import float64
 
     torch.manual_seed(2049)
@@ -141,16 +146,25 @@ def tiny() -> None:
     config.architectures = ["Qwen3ForCausalLM"]
     ids = torch.tensor([[2, 8, 17, 5, 23, 9, 51, 43], [31, 16, 3, 19, 42, 11, 78, 39]], device="cuda")
     model = Qwen3ForCausalLM(config).to("cuda", dtype=torch.bfloat16).eval()
-    model = mtq.quantize(model, copy.deepcopy(mtq.NVFP4_DEFAULT_CFG),
+    scheme = copy.deepcopy(mtq.NVFP4_DEFAULT_CFG)
+    if mixed:
+        scheme = {'algorithm': 'max', 'quant_cfg': [
+            {'quantizer_name': '*', 'enable': False},
+            {'quantizer_name': '*self_attn.*weight_quantizer', 'cfg': {'num_bits': (4, 3), 'axis': None}},
+            {'quantizer_name': '*self_attn.*input_quantizer', 'cfg': {'num_bits': (4, 3), 'axis': None}},
+            {'quantizer_name': '*mlp.*weight_quantizer', 'cfg': {
+                'num_bits': (2, 1), 'block_sizes': {-1: 16, 'type': 'dynamic', 'scale_bits': (4, 3)}}},
+        ]}
+    model = mtq.quantize(model, scheme,
                          forward_loop=lambda module: module(ids, use_cache=False))
-    directory = ROOT / "tiny"
+    directory = ROOT / ('mixed' if mixed else 'tiny')
     export_hf_checkpoint(model, dtype=torch.bfloat16, export_dir=directory)
     stored = load_file(directory / "model.safetensors", device="cuda")
     config = Qwen3Config.from_pretrained(directory)
     del config.quantization_config
     config._attn_implementation = "eager"
     reference = Qwen3ForCausalLM(config).to("cuda").eval()
-    quantized = [name.removesuffix(".weight_scale_2") for name in stored if name.endswith(".weight_scale_2")]
+    quantized = [name.removesuffix('.weight_scale') for name in stored if name.endswith('.weight_scale')]
     suffixes = (".weight_scale", ".weight_scale_2", ".input_scale")
     parts = {stem + suffix for stem in quantized for suffix in suffixes}
     state = {name: value.float() for name, value in stored.items() if name not in parts}
@@ -166,17 +180,26 @@ def tiny() -> None:
     hooks = []
     for stem in quantized:
         module = reference.get_submodule(stem)
+        if stem + '.input_scale' not in stored:
+            continue
         overall = stored[stem + ".input_scale"]
+        is_fp8 = stored[stem + '.weight'].dtype == torch.float8_e4m3fn
 
-        def input_hook(_, args, overall=overall, stem=stem):
+        def input_hook(_, args, overall=overall, stem=stem, is_fp8=is_fp8):
             value = args[0]
+            def quantize(x):
+                if is_fp8:
+                    with patch.object(torch.Tensor, 'to', original_to):
+                        return fp8_eager(x, overall * 448)
+                return author_qdq(x, overall)
             # The same discrete kernel runs in fp32 in the widened model.
             if value.dtype == torch.float64:
-                return (author_qdq(direct_float(value), overall).double(),)
-            output = author_qdq(value, overall)
+                return (quantize(direct_float(value)).double(),)
+            output = quantize(value)
             arrays[stem + "/forward_inputs"] = value.detach().cpu().numpy()
             arrays[stem + "/forward_qdq"] = output.detach().cpu().numpy()
-            arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall, corrected=False).cpu().numpy()
+            if not is_fp8:
+                arrays[stem + "/forward_sm89_qdq"] = author_qdq(value, overall, corrected=False).cpu().numpy()
             return (output,)
 
         hooks.append(module.register_forward_pre_hook(input_hook))
@@ -191,19 +214,26 @@ def tiny() -> None:
     probe[0] = 0
     probe[1, :16] = 1e-5
     for stem in quantized:
+        if stem + '.input_scale' not in stored:
+            continue
         overall = stored[stem + ".input_scale"]
         arrays[stem + "/inputs"] = probe.cpu().numpy()
         arrays[stem + "/global"] = overall.cpu().numpy()
-        arrays[stem + "/qdq"] = author_qdq(probe, overall).cpu().numpy()
-        arrays[stem + "/qdq_bf16"] = author_qdq(probe.bfloat16(), overall).float().cpu().numpy()
-        arrays[stem + "/sm89_qdq"] = author_qdq(probe, overall, corrected=False).cpu().numpy()
+        if stored[stem + '.weight'].dtype == torch.float8_e4m3fn:
+            arrays[stem + '/qdq'] = fp8_eager(probe, overall * 448).cpu().numpy()
+            arrays[stem + '/qdq_bf16'] = fp8_eager(probe.bfloat16(), overall * 448).float().cpu().numpy()
+        else:
+            arrays[stem + "/qdq"] = author_qdq(probe, overall).cpu().numpy()
+            arrays[stem + "/qdq_bf16"] = author_qdq(probe.bfloat16(), overall).float().cpu().numpy()
+            arrays[stem + "/sm89_qdq"] = author_qdq(probe, overall, corrected=False).cpu().numpy()
     np.savez(directory / "reference.npz", **arrays)
     assert torch.Tensor.to is original_to
     print("tiny", directory, "reference RMS", float(np.sqrt(np.mean(
         (arrays["logits"] - arrays["logits_f64"]) ** 2))))
     differences = {stem: int(np.count_nonzero(
         arrays[stem + "/forward_qdq"].view(np.uint32)
-        != arrays[stem + "/forward_sm89_qdq"].view(np.uint32))) for stem in quantized}
+        != arrays[stem + "/forward_sm89_qdq"].view(np.uint32))) for stem in quantized
+        if stem + '/forward_sm89_qdq' in arrays}
     print("sm89 conversion-only forward differences", json.dumps(differences))
 
 
@@ -254,5 +284,7 @@ if __name__ == "__main__":
     validate_conversion()
     if sys.argv[1] == "tiny":
         tiny()
+    elif sys.argv[1] == 'mixed':
+        tiny(mixed=True)
     else:
         real()

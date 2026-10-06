@@ -4,6 +4,7 @@ from functools import partial
 
 from dew.interop import mamba2
 from dew.interop.families.deepseek import (
+    _MINIMAX_M2_NAMES,
     _deepseek_config,
     _deepseek_v2_mixture,
     _deepseek_v4_config,
@@ -11,6 +12,7 @@ from dew.interop.families.deepseek import (
     _deepseek_v4_prepare,
     _kimi_k25_config,
     _kimi_k25_path,
+    _minimax_m2_config,
 )
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
 from dew.interop.families.gemma import (
@@ -62,6 +64,10 @@ from dew.interop.families.kimi import (
     _kimi_linear_prepare,
 )
 from dew.interop.families.llama import (
+    _GRANITEMOE_NAMES,
+    _GRANITEMOE_PACKED,
+    _granitemoe_config,
+    _granitemoe_path,
     _llama_config,
     _ministral_config,
     _mistral_config,
@@ -90,6 +96,7 @@ from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
 from dew.interop.families.phi3 import _PHI3_PACKED, _phi3_config, _phi3_export, _phi3_path
 from dew.interop.families.qwen import (
     _qwen2_config,
+    _qwen2_moe_config,
     _qwen3_config,
     _qwen3_export,
     _qwen3_moe_config,
@@ -126,6 +133,18 @@ ENTRIES = (
         'phi3', 'Phi3ForCausalLM', _phi3_export,
         weight_path=_phi3_path, packed=_PHI3_PACKED,
         export_weights=_decoder_tensors, preserve_source_layout=True,
+    ),
+    DecoderFamily(
+        ('minimax_m2',),
+        _minimax_m2_config,
+        lambda fields: bool(fields.qk_norm and fields.qk_norm_scope == 'projection'
+                            and fields.pre_norms and fields.mixture is not None),
+        'minimax_m2',
+        'MiniMaxM2ForCausalLM',
+        lambda model: {},
+        weight_path=partial(_renamed_path, _MINIMAX_M2_NAMES),
+        export_path=partial(_renamed_name, _MINIMAX_M2_NAMES),
+        preserve_source_layout=True,
     ),
     DecoderFamily(
         ("nemotron_h",),
@@ -524,6 +543,18 @@ ENTRIES = (
         preserve_source_layout=False,
     ),
     DecoderFamily(
+        ('qwen2_moe',),
+        _qwen2_moe_config,
+        lambda fields: bool(not fields.qk_norm and fields.mixture is not None
+                            and fields.mixture.shared_gate),
+        'qwen2_moe',
+        'Qwen2MoeForCausalLM',
+        lambda model: {},
+        weight_path=_qwen35_moe_path,
+        packed=_FUSED_EXPERTS,
+        preserve_source_layout=True,
+    ),
+    DecoderFamily(
         ("qwen2",),
         _qwen2_config,
         lambda fields: bool(fields.attention_bias and fields.o_proj_bias is False),
@@ -531,6 +562,20 @@ ENTRIES = (
         "Qwen2ForCausalLM",
         _qwen3_export,
         preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('granitemoe',),
+        _granitemoe_config,
+        lambda fields: bool(fields.mixture is not None and not fields.qk_norm
+                            and (fields.embedding_multiplier != 1.0 or fields.residual_multiplier != 1.0
+                                 or fields.logits_scaling != 1.0 or fields.attention_scale is not None)),
+        'granitemoe',
+        'GraniteMoeForCausalLM',
+        lambda model: {},
+        weight_path=_granitemoe_path,
+        export_path=partial(_renamed_name, _GRANITEMOE_NAMES),
+        packed=_GRANITEMOE_PACKED,
+        preserve_source_layout=True,
     ),
     DecoderFamily(
         ("mixtral",),

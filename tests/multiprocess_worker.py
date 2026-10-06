@@ -940,7 +940,9 @@ def _evaluation_parts(case: _EvaluationCase):
             if case.failure == "metric":
                 raise ValueError("host metric failed")
             values = np.asarray(artifact.features)
-            assert np.array_equal(artifact.labels, np.arange(8))
+            # The real rows alone, in global order: a share that ran out
+            # scores none of its copy's rows.
+            assert np.array_equal(artifact.labels, np.asarray(batch["x"])[:, 0])
             assert batch["a_metadata"] == 7 and batch["a_python"] == 9
             return float(values.sum()), values.size
 
@@ -2012,7 +2014,26 @@ def mode_step_fits(args) -> dict:
             "unknown": fits_everywhere(None)}
 
 
+def mode_whole_validation(args) -> dict:
+    """Every evaluated objective's validation pass and `Perplexity`'s, on this
+    pool, as `tests/test_whole_validation.py` runs them on one process."""
+    import sys
+
+    import jax
+
+    # The recipe cases import `recipes`, which sits at the repository root.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from test_objective_inputs import corpus_windows
+    from test_whole_validation import EVALUATED, evaluated, perplexity
+
+    root = Path(args.run_dir) / f"process{jax.process_index()}"
+    windows = corpus_windows(root / "corpus")
+    return {"passes": {name: evaluated(name, windows, root / name) for name in EVALUATED},
+            "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
+
+
 MODES = {"host_training": mode_host_training, "step_fits": mode_step_fits,
+         "whole_validation": mode_whole_validation,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
          "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit,

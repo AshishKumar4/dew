@@ -72,7 +72,7 @@ def test_modelopt_mixed_precision_is_refused_with_its_missing_input_rules(tmp_pa
     config = {"model_type": "qwen3",
               "quantization_config": {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION"}}
     (tmp_path / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError, match=r"'modelopt'.*MIXED_PRECISION.*other input activations"):
+    with pytest.raises(ValueError, match=r"ModelOpt MIXED_PRECISION quantized_layers"):
         Pretrained.load(tmp_path, dtype="float32")
 
 

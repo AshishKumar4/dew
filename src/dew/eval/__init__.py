@@ -1,10 +1,12 @@
-"""Score image metrics: `FID`, `CLIPScore`, `PSNR`, `SSIM`, `LPIPS` and `CLIPDistance`,
-each a `Metric` the trainer scores an `ImageGrid` with, and each registered
-in `dew.registry.metrics` under the name a run record gives it.
+"""Image metrics: `FID`, `CLIPScore`, `PSNR`, `SSIM`, `LPIPS` and `CLIPDistance`.
+
+Each is a `Metric` that the trainer scores an `ImageGrid` with, registered in
+`dew.registry.metrics` under the name a run record uses for it.
 
 `FID().score(generated, reference)` and `CLIPScore().score(images, prompts)`
-are the same numbers over image sets already in hand, with no trainer and no
-batch."""
+compute the same numbers over image sets you already have, without a trainer
+or a batch.
+"""
 
 from .common import ImageMetric, Mean
 from .fid import FID, frechet_distance
