@@ -26,6 +26,7 @@ DECODERS = {
     "gpt2": ("GPT-2", "Dense decoders"),
     "gpt_neox": ("GPT-NeoX", "Dense decoders"),
     "opt": ("OPT", "Dense decoders"),
+    "gpt_neo": ("GPT-Neo", "Dense decoders"),
     "llama": ("Llama", "Dense decoders"),
     "mistral": ("Mistral", "Dense decoders"),
     "ministral": ("Ministral", "Dense decoders"),

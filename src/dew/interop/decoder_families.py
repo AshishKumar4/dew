@@ -38,10 +38,13 @@ from dew.interop.families.glm import (
 from dew.interop.families.gpt2 import (
     _GPT2_NAMES,
     _GPT2_PACKED,
+    _GPT_NEO_NAMES,
     _gpt2_config,
     _gpt2_export,
     _gpt2_path,
     _gpt2_prepare,
+    _gpt_neo_config,
+    _gpt_neo_export,
 )
 from dew.interop.families.gpt_neox import (
     _GPT_NEOX_NAMES,
@@ -116,6 +119,15 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ('gpt_neo',), _gpt_neo_config,
+        lambda fields: fields.position_embedding == 'learned' and fields.attention_scale == 1.0
+                       and fields.attention_bias is False and fields.o_proj_bias is True,
+        'gpt_neo', 'GPTNeoForCausalLM', _gpt_neo_export,
+        weight_path=partial(_renamed_path, _GPT_NEO_NAMES),
+        export_path=partial(_renamed_name, _GPT_NEO_NAMES), preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+    ),
     DecoderFamily(
         ("nemotron_h",),
         _nemotron_h_config,
