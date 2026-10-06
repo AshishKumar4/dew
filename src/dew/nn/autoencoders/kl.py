@@ -18,7 +18,9 @@ def posterior_latent(moments: jnp.ndarray, key: jax.Array | None) -> jnp.ndarray
     if key is None:
         return mean
     deviation = jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
-    return mean + deviation * jax.random.normal(key, mean.shape, dtype=mean.dtype)
+    # Drawn in float32, as the rest of a step's draws are, whatever the
+    # moments' precision, so a float64 run draws the same numbers.
+    return mean + deviation * jax.random.normal(key, mean.shape, dtype=jnp.float32).astype(mean.dtype)
 
 
 class AutoencoderKL(nn.Module):

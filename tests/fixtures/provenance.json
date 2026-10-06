@@ -2616,6 +2616,27 @@
    ],
    "note": "PEFT 0.20.0's get_peft_model on tests/fixtures/hf/llama-tiny writes each adapter directory and runs its forward and backward: use_rslora with a rank and an alpha pattern, and lora_dropout 0.25 in training mode with each target's dropout module on a recorded mask; logits, mean next-token cross entropy and every factor's gradient in float32 and float64."
   },
+  "lpips": {
+   "tool": "tools/lpips_reference.py",
+   "sources": [
+    {
+     "repo": "End2End-Diffusion/REPA-E",
+     "version": "2ad4e9f69234c109497fb41d3e5e555de7b4b0de",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Executes REPA-E's loss/lpips.py LPIPS (ScalingLayer, NetLinLayer, vgg16, normalize_tensor, spatial_average) as published in eval mode, its weights read from drawn tables (drawn.npz: distances and the mean's gradient in float32 and float64) and from the published torchvision vgg16-397923af.pth and richzhang v0.1 vgg.pth (published.npz: distances)."
+  },
   "mamba2": {
    "tool": "tools/mamba2_reference.py",
    "sources": [
@@ -2921,12 +2942,17 @@
      "runs": "diffusers"
     },
     {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    },
+    {
      "repo": "pytorch/pytorch",
      "version": "2.14.0",
      "runs": "torch"
     }
    ],
-   "note": "regularizer.npz: KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced. step.npz: executes train_repae.py's loop body from vae.train() through the SiT update, with AutoencoderKL.forward, DiagonalGaussianDistribution, SiT.forward, interpolant, unpatchify, init_bn, extract_latents_stats, LabelEmbedder, build_mlp, ReconstructionLoss_Single_Stage, requires_grad, update_ema and preprocess_imgs_vae as published, around tests/fixtures/tiny_diffusers' SD VAE run by diffusers and stand-in SiT layers, at l1_lpips_kl_gan.yaml with perceptual_weight and discriminator_weight 0 (Dew's L1 + KL scope); the draws are DiffusionObjective's from jax.random.key(11)."
+   "note": "regularizer.npz: KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced. step.npz: executes train_repae.py's loop body from vae.train() through the SiT update and the discriminator update, with AutoencoderKL.forward, DiagonalGaussianDistribution, SiT.forward, interpolant, unpatchify, init_bn, extract_latents_stats, LabelEmbedder, build_mlp, ReconstructionLoss_Single_Stage, PerceptualLoss over LPIPS (loss/lpips.py, torchvision's vgg16 layout), NLayerDiscriminator and weights_init, requires_grad, update_ema and preprocess_imgs_vae as published, at configs/l1_lpips_kl_gan.yaml as published (LPIPS at 1.0, the PatchGAN at 0.1 from step 0); around tests/fixtures/tiny_diffusers' SD VAE run by diffusers, LPIPS weights from lpips_reference.drawn_weights(), the discriminator at ndf=8 (the published 64 at an eighth of the width) with its weights carried, and stand-in SiT layers; the draws are DiffusionObjective's from jax.random.key(11)."
   },
   "rl/advantage.npz": {
    "tool": "tools/parity_rl.py",
