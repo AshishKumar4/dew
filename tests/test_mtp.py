@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import TINY_DECODER
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
@@ -29,9 +30,7 @@ SEQ = 8
 
 
 def tiny(**overrides):
-    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
-                  "mlp_features": 64, "max_seq_len": 16}
-    return CausalTransformer(**{**config, **overrides})
+    return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, **overrides})
 
 
 def test_no_depths_leaves_the_tree_unchanged():
