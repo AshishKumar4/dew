@@ -130,6 +130,36 @@ def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
             * positions[:, None, None, :]).astype(dtype)
 
 
+def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:
+    """The keys a window of `sliding_window` keeps before and after each query,
+    counted as `jax.nn.dot_product_attention`'s `local_window_size` counts them.
+
+    A causal window keeps the query and the w - 1 keys before it. A
+    bidirectional one keeps the keys within w - 1 positions on either side,
+    |q - k| < w: ModernBERT's |q - k| <= local_attention // 2, which is w =
+    local_attention // 2 + 1 (masking_utils.py:141-158, transformers 5.16.1).
+    A model layer passes one only where its kind asks for it
+    (`LayerKind.bidirectional_window`).
+    """
+    return sliding_window - 1, 0 if causal else sliding_window - 1
+
+
+def structural_mask(query_positions, kv_len: int, causal: bool,
+                    sliding_window: int | None) -> jax.Array | None:
+    """The `[B, 1, T, S]` keys that causality and a window leave each query,
+    from shared `[T]` or per-row `[B, T]` positions, or None when neither
+    applies. A negative query position sees nothing."""
+    if causal:
+        return causal_attention_mask(query_positions, kv_len, sliding_window)
+    if sliding_window is None:
+        return None
+    positions = jnp.asarray(query_positions)
+    if positions.ndim == 1:
+        positions = positions[None, :]
+    distance = positions[:, :, None] - jnp.arange(kv_len)[None, None, :]
+    return ((positions[:, :, None] >= 0) & (jnp.abs(distance) < sliding_window))[:, None]
+
+
 def document_mask(segment_ids) -> jax.Array:
     """Keep each packed document to itself: `[B, S, S]` boolean.
 
@@ -162,13 +192,13 @@ def combined_attention_mask(query_length: int, key_length: int, causal: bool,
     """Fold causality and a sliding window into `mask`.
 
     A causal flag keeps the keys at or before each query's row; a window
-    narrows that to the most recent keys. Both read the row index, the way
-    the fused kernels take them as flags. Unset stays unset, so a caller
-    that distinguishes no mask from an all-true one keeps doing so.
+    narrows that to the most recent keys, or to the nearest on either side
+    without the flag (`window_sides`). Both read the row index, the way the
+    fused kernels take them as flags. Unset stays unset, so a caller that
+    distinguishes no mask from an all-true one keeps doing so.
     """
-    if causal or sliding_window is not None:
-        structural = causal_attention_mask(
-            jnp.arange(query_length), key_length, sliding_window)
+    structural = structural_mask(jnp.arange(query_length), key_length, causal, sliding_window)
+    if structural is not None:
         mask = structural if mask is None else jnp.logical_and(mask, structural)
     return mask
 
@@ -460,12 +490,12 @@ def cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
     kv_lengths = key_value_seq_lengths
     if kv_lengths is None and kv_pad:
         kv_lengths = jnp.full(key.shape[:1], kv_len, jnp.int32)
-    # A left window of l means the l+1 most recent keys on both the xla and
-    # the cudnn path, which is the window this function counts.
+    # A window of (l, r) keeps the l keys before the query and the r after it
+    # on both the xla and the cudnn path, the sides `window_sides` counts.
     out = jax.nn.dot_product_attention(
         query, key, value, bias=bias, mask=mask, is_causal=causal,
         key_value_seq_lengths=kv_lengths,
-        local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
+        local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
         implementation='cudnn')
     return out[:, :q_len] if q_pad else out
 
@@ -672,9 +702,9 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
 
         query = stripe(query, shards)
         mask, bias = rows_in_order(mask), rows_in_order(bias)
-        if causal or sliding_window is not None:
-            structural = causal_attention_mask(
-                stripe(jnp.arange(q_len), shards, axis=0), kv_len, sliding_window)
+        structural = structural_mask(
+            stripe(jnp.arange(q_len), shards, axis=0), kv_len, causal, sliding_window)
+        if structural is not None:
             mask = structural if mask is None else jnp.logical_and(mask, structural)
     else:
         padding = -q_len % shards
@@ -887,7 +917,8 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
     selection reads the query alone.
 
     `causal` restricts query i to keys 0..i, top-left aligned like jax's
-    is_causal, and `sliding_window=w` to the w most recent of those; both read
+    is_causal, and `sliding_window=w` to the w most recent of those, or
+    without `causal` to the keys within w - 1 of i (`window_sides`); both read
     the row index, so a decode step against a cache passes `mask` instead.
     `bias` is additive and broadcasts to [B, H, Q, K] (T5's position table).
     `sinks` is one learned value-free logit per query head in the denominator.
@@ -1094,6 +1125,10 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 f"cudnn attention needs a head dimension that is a multiple of 8 "
                 f"and at most {CUDNN_MAX_HEAD_DIM}, got {head_dim}; use attention_impl "
                 "'xla' for this shape.")
+        if sliding_window is not None and not causal:
+            raise ValueError(
+                "cudnn attention windows only the keys before a query, and this "
+                "bidirectional call windows both sides; use attention_impl 'xla'.")
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
     elif implementation == 'triton':
@@ -1108,12 +1143,12 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         out = folded_attention(query, key, value, key_value_seq_lengths)
     elif implementation == 'xla':
-        # A left window of l means the l+1 most recent keys on both the xla and
-        # the cudnn path, which is the window this function counts.
+        # A window of (l, r) keeps the l keys before the query and the r after
+        # it on both the xla and the cudnn path, the sides `window_sides` counts.
         out = jax.nn.dot_product_attention(
             query, key, value, bias=bias, mask=mask, is_causal=causal,
             key_value_seq_lengths=key_value_seq_lengths,
-            local_window_size=None if sliding_window is None else (sliding_window - 1, 0),
+            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
             implementation='xla')
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
@@ -1315,7 +1350,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     xla kernel would narrow the call, `_xla_kernel_narrows`): the reference
     path when the call asks for arithmetic no fused kernel performs
     (`reference_only`), else cudnn where `cudnn_runs` and the call has no
-    sinks (triton in its place where `triton_runs`), the tpu kernel where
+    sinks and no bidirectional window (triton in its place where
+    `triton_runs`), the tpu kernel where
     `tpu_runs`, and xla anywhere else. Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
@@ -1327,7 +1363,10 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
         return implementation
     if reference_only(query, dtype, precision, force_fp32_for_softmax):
         return 'reference'
-    if sinks is None and cudnn_runs(query, softcap):
+    # cuDNN keeps a window behind the query only (jax.nn.dot_product_attention
+    # refuses a right window without the causal mask), so a bidirectional
+    # window goes past it.
+    if sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None):
         return 'triton' if triton_runs(query, sliding_window, mask, bias) else 'cudnn'
     if tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask, bias=bias):
         return 'tpu'
@@ -1759,14 +1798,15 @@ def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
 
     CausalMask and LocalMask are comparisons the kernel evaluates per block, so
     emptied blocks leave the grid and nothing Q*K-sized is stored. Dew's window
-    is causal already, so it replaces the causal flag. An explicit boolean mask
+    holds the causal flag's side already (`window_sides`), so it replaces the
+    flag. An explicit boolean mask
     is ANDed in as dense blocks, so only a concrete, small one is taken.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask
 
     shape = (q_len, kv_len)
     if sliding_window is not None:
-        structural = splash_attention_mask.LocalMask(shape, (sliding_window - 1, 0), 0)
+        structural = splash_attention_mask.LocalMask(shape, window_sides(causal, sliding_window), 0)
     elif causal:
         structural = splash_attention_mask.CausalMask(shape)
     else:
@@ -1832,9 +1872,10 @@ def pallas_flash_attention(query, key, value, bias, mask, causal, sliding_window
     if bias is not None:
         combined = jnp.broadcast_to(bias.astype(q.dtype),
                                     (q.shape[0], q.shape[1], q.shape[2], k.shape[2]))
-    if sliding_window is not None:
-        band = causal_attention_mask(
-            jnp.arange(query.shape[-3]), key.shape[-3], sliding_window)
+    # The kernel takes causality as its flag, so only a window becomes a band.
+    band = None if sliding_window is None else structural_mask(
+        jnp.arange(query.shape[-3]), key.shape[-3], causal, sliding_window)
+    if band is not None:
         mask = band if mask is None else jnp.logical_and(mask, band)
     if mask is not None:
         seated = jnp.broadcast_to(

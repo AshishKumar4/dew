@@ -98,7 +98,7 @@ class DPOObjective(LMObjective):
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
-        accuracy = (pair_chosen > pair_rejected).astype(jnp.float32).mean()
+        accuracy, _ = self.accuracy((pair_chosen > pair_rejected).astype(jnp.float32), batch).mean()
         return self.row_mean(terms, batch), Aux[Variables]({
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),

@@ -1,0 +1,242 @@
+"""`DecisionObjective`: proper scoring rules, metrics, row encoding, and training through LoRA."""
+
+import json
+from dataclasses import replace
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import pytest
+
+from dew.artifacts import Decisions
+from dew.checkpoints import Checkpoints
+from dew.data.text import ByteTokenizer
+from dew.decision import (
+    AURC,
+    ECE,
+    NONE_OF_THE_ABOVE,
+    Accuracy,
+    Brier,
+    Choice,
+    Decide,
+    DecisionObjective,
+    Encoding,
+    Example,
+    LogLoss,
+    Noul,
+    RankedProbability,
+    Score,
+    Specials,
+    Spherical,
+    StateFirstLayout,
+    Weights,
+)
+from dew.lora import LoRA
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.base import FROZEN
+from dew.training.trainer import Trainer
+
+FIXTURES = Path(__file__).parent / "fixtures" / "laya"
+RULES = [LogLoss(), Brier(), Spherical(), RankedProbability()]
+
+
+def expected_charge(rule, logits, truth):
+    """The rule's charge on `logits` averaged over outcomes drawn from
+    `truth`, the options read as ordered levels."""
+    count = len(truth)
+    options = jnp.ones((count, count), bool)
+    charges = rule.charge(jnp.tile(logits, (count, 1)), jnp.eye(count), options, jnp.ones((count,), bool))
+    return float(jnp.dot(truth, charges))
+
+
+@pytest.mark.parametrize("rule", RULES, ids=lambda rule: rule.name)
+def test_each_rule_is_proper(rule):
+    """Charged in expectation over outcomes from q, every forecast does worse than q itself."""
+    rng = np.random.default_rng(0)
+    for _ in range(20):
+        truth = rng.dirichlet(np.ones(4))
+        honest = expected_charge(rule, jnp.log(truth), truth)
+        for _ in range(10):
+            other = jnp.asarray(rng.normal(size=4))
+            assert honest <= expected_charge(rule, other, truth) + 1e-6
+
+
+def test_rules_add_and_scale_and_rps_reads_only_levels():
+    logits = jnp.asarray([[2.0, 0.0, -1.0], [0.5, 0.5, 0.0]])
+    target = jnp.eye(3)[jnp.asarray([0, 2])]
+    options = jnp.ones((2, 3), bool)
+    ordinal = jnp.asarray([True, False])
+    combined = LogLoss() + 0.5 * Brier()
+    np.testing.assert_allclose(combined.charge(logits, target, options, ordinal),
+                               LogLoss().charge(logits, target, options, ordinal)
+                               + 0.5 * Brier().charge(logits, target, options, ordinal), rtol=1e-6)
+    assert combined.name == "log_loss+0.5*brier"
+    assert float(RankedProbability().charge(logits, target, options, ordinal)[1]) == 0.0
+    with pytest.raises(ValueError, match="positive"):
+        LogLoss() + -1.0 * Brier()
+
+
+def test_a_rule_ignores_slots_past_a_rows_options():
+    logits = jnp.asarray([[1.0, 0.0, 99.0]])
+    options = jnp.asarray([[True, True, False]])
+    target = jnp.asarray([[1.0, 0.0, 0.0]])
+    for rule in RULES:
+        narrow = rule.charge(logits[:, :2], target[:, :2], options[:, :2], jnp.asarray([True]))
+        np.testing.assert_allclose(rule.charge(logits, target, options, jnp.asarray([True])), narrow,
+                                   rtol=1e-6)
+
+
+def decisions(tops, correct):
+    """Two-option rows whose top probability is `tops` and whose label is right where `correct`."""
+    tops = np.asarray(tops)
+    probabilities = np.stack([tops, 1 - tops], axis=1)
+    return Decisions(probabilities=probabilities, options=np.ones((len(tops), 2), bool),
+                     labels=np.where(correct, 0, 1), ordinal=np.zeros(len(tops), bool))
+
+
+def test_aurc_counts_a_group_of_equal_confidences_whole():
+    """Two answers at 0.9, one right, then one right at 0.6: the 0.9 group's
+    risk of a half covers two answers, the last a third covers one, as
+    Laya's `aurc` weighs levels; and the dataset's order does not matter."""
+    metric = AURC()
+    first = metric(decisions([0.9, 0.9, 0.6], [True, False, True]), {})
+    swapped = metric(decisions([0.9, 0.9, 0.6], [False, True, True]), {})
+    expected = (0.5 * 2 + (1 / 3) * 1) / 3
+    assert metric.finalize(first) == pytest.approx(expected)
+    assert metric.finalize(swapped) == pytest.approx(expected)
+
+
+def test_ece_and_accuracy_merge_across_batches_as_one_pass():
+    """Laya's `ece_score` over 15 bins, closed on the right, with 0 in the first."""
+    rng = np.random.default_rng(1)
+    tops = rng.uniform(0.5, 1.0, 200)
+    correct = rng.uniform(size=200) < tops
+    tops[:3] = [0.6, 2 / 3, 1.0]
+    metric = ECE()
+    whole = metric.finalize(metric(decisions(tops, correct), {}))
+    merged = metric.finalize(metric.merge(metric(decisions(tops[:70], correct[:70]), {}),
+                                          metric(decisions(tops[70:], correct[70:]), {})))
+    edges = np.linspace(0, 1, 16)
+    laya = sum(np.mean(inside) * abs(tops[inside].mean() - correct[inside].mean())
+               for lo, hi, first in zip(edges[:-1], edges[1:], [True] + [False] * 14, strict=True)
+               if (inside := ((tops >= lo) if first else (tops > lo)) & (tops <= hi)).any())
+    assert whole == pytest.approx(laya, abs=1e-12) and merged == pytest.approx(laya, abs=1e-12)
+    accuracy = Accuracy()
+    assert accuracy.finalize(accuracy(decisions(tops, correct), {})) == pytest.approx(correct.mean())
+
+
+TOKENIZER = ByteTokenizer()
+SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
+LAYOUT = StateFirstLayout(max_len=96, head_max_len=48, option_tokens=8)
+INTENT = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
+EXAMPLES = [Example(state, {"team": INTENT}, {"team": label})
+            for state, label in (("charged twice", "billing"), ("site is down", "technical"),
+                                 ("how much is pro", "sales"), ("refund please", "billing"),
+                                 ("error 500", "technical"), ("upgrade cost", "sales"),
+                                 ("double charge", "billing"), ("cannot log in", "technical"))]
+
+
+def test_an_encoding_shuffles_a_choice_and_moves_its_label_with_it():
+    encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, width=4)
+    rng = np.random.default_rng(0)
+    rows = [encoding(EXAMPLES[0], "team", rng) for _ in range(30)]
+    labels = {int(row["labels"]) for row in rows}
+    assert labels == {0, 1, 2}  # the right option lands in every slot
+    for row in rows:
+        marker = int(row["markers"][int(row["labels"])])
+        option = bytes(int(token) for token in row["tokens"][marker - 18:marker]).decode()
+        assert "billing" in option
+    plain = encoding(EXAMPLES[0], "team", None)
+    assert int(plain["labels"]) == 0 and plain["options"].tolist() == [True, True, True, False]
+
+
+def test_an_encoding_keeps_levels_in_order_and_adds_none_of_the_above():
+    rating = Example("fine", {"q": Score("How bad?", ["calm", "upset", "furious"])}, {"q": 2})
+    encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, width=4, none_of_the_above=1.0)
+    rng = np.random.default_rng(3)
+    assert all(int(encoding(rating, "q", rng)["labels"]) == 2 for _ in range(10))
+    unshuffled = replace(encoding, shuffle=False)
+    seen = set()
+    for _ in range(40):
+        row = unshuffled(EXAMPLES[0], "team", rng)
+        assert int(row["options"].sum()) in (3, 4)
+        seen.add((int(row["options"].sum()), int(row["labels"])))
+    # Without its right option the row's answer is the added one, last; with
+    # it, still billing, first.
+    assert seen == {(3, 2), (4, 0)}
+    assert NONE_OF_THE_ABOVE == "none of the above"
+
+
+def tiny_backbone() -> CausalTransformer:
+    return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
+                             max_seq_len=128, attention_impl="xla")
+
+
+def leaves(tree, *path):
+    for name in path:
+        tree = tree[name]
+    return jax.tree.leaves(tree)
+
+
+def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from_the_run(tmp_path):
+    """The backbone runs under its adapter, applied as its own module: the
+    factors and the head move, every base weight stays bitwise where it
+    was, and the saved run loads as a Decide task with identical
+    probabilities."""
+    model = tiny_backbone()
+    base = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(model, base, key=1)
+    objective = DecisionObjective(adapter, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  loss=LogLoss() + 0.5 * Brier())
+    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES)
+    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    start = objective.init(jax.random.key(2))
+    state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
+        data, steps=3, log_every=100, checkpoint_every=3, eval_every=3, metrics=[Accuracy(), ECE()])
+    checkpoints.wait()
+
+    trained = state.variables
+    frozen = zip(leaves(start, FROZEN, "backbone"), leaves(trained, FROZEN, "backbone"), strict=True)
+    for before, after in frozen:
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+    factors = [leaf for path, leaf in jax.tree_util.tree_leaves_with_path(trained["params"]["backbone"])
+               if "lora_B" in jax.tree_util.keystr(path)]
+    assert factors and all(np.abs(np.asarray(leaf)).max() > 0 for leaf in factors)
+    moved = [not np.array_equal(np.asarray(a), np.asarray(b))
+             for a, b in zip(leaves(start, "params", "head"), leaves(trained, "params", "head"), strict=True)]
+    assert all(moved)
+
+    live = objective.pipeline(state)
+    reloaded = Decide.from_run(str(tmp_path))
+    asked = {"team": INTENT, "urgent": Noul("Is it urgent?")}
+    first, second = live("charged twice!", asked), reloaded("charged twice!", asked)
+    for answer, again in zip(first.values(), second.values(), strict=True):
+        np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+
+def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
+    """A calibration saved into a run reloads with the step it was fitted
+    on; trained further, the run's latest weights refuse it rather than
+    reuse it stale."""
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES)
+    checkpoints = Checkpoints(str(tmp_path), keep=2)
+    trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints)
+    state = trainer.fit(data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    calibrated = objective.pipeline(state).calibrated(data.val, type_minimum=1, bucket_minimum=1)
+    assert calibrated.weights == Weights(1, ema=False)
+    calibrated.save(str(tmp_path))
+    reloaded = Decide.from_run(str(tmp_path))
+    assert reloaded.calibration == calibrated.calibration
+    assert json.loads((tmp_path / "decide.json").read_text())["weights"] == {"step": 1, "ema": False}
+
+    trainer.fit(data, steps=2, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    with pytest.raises(ValueError, match="fitted on step 1"):
+        Decide.from_run(str(tmp_path))
+    assert Decide.from_run(str(tmp_path), step=1).calibration == calibrated.calibration
+    with pytest.raises(ValueError, match="no run checkpoint"):
+        Decide.from_pretrained(FIXTURES / "tiny").save(str(tmp_path))

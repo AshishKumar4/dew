@@ -194,6 +194,11 @@ class HFDatasetSource:
         """The split's column names, which loads it."""
         return list(self._table().column_names)
 
+    @property
+    def features(self) -> Features:
+        """The split's column types, a ClassLabel's names among them, which loads it."""
+        return self._table().features
+
     def __getitem__(self, index: int) -> Batch:
         # `datasets` decodes an image column into a PIL image and every
         # transform in the data layer is numpy and cv2. PIL images carry the
