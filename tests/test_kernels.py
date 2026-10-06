@@ -27,6 +27,7 @@ from dew.nn.attention import (
     cudnn_runs,
     folded_attention,
     folds,
+    fused_attention,
     resolve_implementation,
     scaled_dot_product_attention,
     tpu_runs,
@@ -84,7 +85,9 @@ def test_cudnn_trains_odd_lengths_and_agrees_with_xla(q_len, kv_len, causal,
 @pytest.mark.parametrize("installed, call, chosen", [
     (True, {}, "triton"),
     (True, {"causal": True}, "triton"),
-    (True, {"sliding_window": 64}, "cudnn"),
+    (True, {"sliding_window": 64, "causal": True}, "cudnn"),
+    (True, {"sliding_window": 64}, "xla"),
+    (False, {"sliding_window": 64}, "xla"),
     (True, {"bias": jnp.zeros((1, 1, 128, 128), jnp.bfloat16)}, "cudnn"),
     (True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn"),
     (False, {}, "cudnn"),
@@ -95,7 +98,8 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
     """Where cudnn's kernel runs, 'auto' takes tokamax's Pallas-Triton kernel
     for heads up to 64 wide and a call with no window, mask or bias, if
     tokamax is installed: the calls it measured faster on
-    (`triton_runs`). Anything else stays on cudnn."""
+    (`triton_runs`). Anything else stays on cudnn, except a bidirectional
+    window, which cudnn cannot take (`window_sides`) and xla does."""
     from importlib import util
 
     from dew.nn import attention
@@ -106,6 +110,17 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
                         else None if name == 'tokamax' else found(name))
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 64)), jnp.bfloat16)
     assert attention.resolve_implementation('auto', query, query, **call) == chosen
+
+
+def test_cudnn_refuses_a_bidirectional_window_by_name(without_deterministic_ops):
+    """jax's cuDNN call keeps a window on the left of the query alone, so an
+    explicit 'cudnn' names the two-sided window it cannot take instead of
+    failing inside jax at trace time."""
+    query = jnp.zeros((1, 128, 4, 64), jnp.bfloat16)
+    with pytest.raises(ValueError, match="bidirectional"):
+        fused_attention(query, query, query, bias=None, mask=None, causal=False, sliding_window=8,
+                        implementation='cudnn', softcap=None, sinks=None, segment_ids=None,
+                        key_value_seq_lengths=None)
 
 
 @on_gpu
