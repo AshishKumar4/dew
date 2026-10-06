@@ -23,8 +23,9 @@ from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import FROZEN, Variables
+from dew.objectives.base import FROZEN, Variables, merge
 from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, solvers, trainings
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import EulerAncestral
@@ -64,12 +65,6 @@ else:
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
 # a stage that names one restates it.
 ATTENTION = {"heads": 8}
-
-# Architectures that run the text as a second stream through every block's
-# joint attention. With no text there is no sequence to project, so `build`
-# raises for an unconditional run on one of these before the first attention
-# softmax over an empty slice.
-TEXT_STREAM_MODELS = ("simple_mmdit", "hierarchical_mmdit")
 
 # The default unet has attention everywhere but the full-resolution stage,
 # where it costs the most. Every other architecture takes its own kwargs as
@@ -211,7 +206,8 @@ class FlowGRPO(Training):
                              f"under; the registered metrics are {sorted(metrics)}")
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> FlowGRPOObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> FlowGRPOObjective:
         from dew.objectives.rl.flow import FlowGRPOObjective
         from dew.sampling.flow import FlowSDE
 
@@ -381,23 +377,22 @@ class DiffusionRunConfig(RunConfig):
 
         These are the run's precision settings over `model.config`, plus the channels
         the model denoises when the architecture takes them as `output_channels`. The
-        published families name theirs as their sources do, in `model.config`.
+        published families name theirs as their sources do, in `model.config`. On the
+        model those build, an `IntervalModel` embeds the duration under an interval
+        process, and MeanFlow, whose loss differentiates in time, turns a `TimeScaled`
+        model's time features at `SMOOTH_TIME_SCALE` unless `model.config` names a scale.
         """
         fields = dict(self.model.fields())
-        declared = {field.name for field in dataclasses.fields(models[self.model.architecture])}
-        if "interval" in declared and self.preset is not None:
-            # An interval process's model reads the interval's duration.
+        if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.architecture])}:
+            fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
+                                         else autoencoder.latent_channels)
+        model = models.build(self.model.architecture, fields)
+        if isinstance(model, IntervalModel) and self.preset is not None:
             built = self.preset()
             fields["interval"] = isinstance(built, Process) and built.interval
-        if isinstance(self.mode, MeanFlowTraining) and "time_scale" in declared \
+        if isinstance(self.mode, MeanFlowTraining) and isinstance(model, TimeScaled) \
                 and "time_scale" not in self.model.config:
-            # MeanFlow's loss differentiates the model in time; the default
-            # time embedding is far too fast in it to learn from.
             fields["time_scale"] = SMOOTH_TIME_SCALE
-        if "output_channels" in declared:
-            sample = self.sample_field()
-            fields["output_channels"] = (sample.shape[-1] if autoencoder is None
-                                         else autoencoder.latent_channels)
         return fields
 
     @property
@@ -443,24 +438,25 @@ class DiffusionRunConfig(RunConfig):
             return objective
         # The objective's own init draws the denoiser beside its heads and
         # towers; the adapter freezes the denoiser's weights, and the heads
-        # stay under `params` to train.
+        # stay under `params` to train, beside their own `constants`.
         key = jax.random.key(self.trainer.key)
         drawn = objective.init(key)
         adapter = self.lora.apply(objective.model, objective.model_variables(drawn),
                                   key=jax.random.fold_in(key, 1))
-        heads = {name: tree for name, tree in drawn["params"].items() if name in LOSS_HEADS}
-        start = {**drawn, **adapter.variables, "params": {**heads, **adapter.variables["params"]}}
-        return self._objective(start, adapter.model)
+        heads = {collection: {name: tree for name, tree in drawn[collection].items() if name in LOSS_HEADS}
+                 for collection in ("params", "constants") if collection in drawn}
+        return self._objective(merge({**drawn, **adapter.variables}, heads), adapter.model)
 
     def _objective(self, variables: Variables | None, adapted: nn.Module | None) -> DiffusionObjective:
         """The configured objective over `variables`, with `adapted` in place
         of the model a run from scratch builds."""
         if self.pretrained is None:
-            model, conditions, autoencoder = self._scratch(variables)
-            model = model if adapted is None else adapted
+            base, conditions, autoencoder = self._scratch(variables)
+            model = base if adapted is None else adapted
             sample, convention = self.sample_field(), None
         else:
             source = self._source(variables)
+            base = source.model
             if self.lora is not None:
                 # The adapter binds to the denoiser and the pipeline's
                 # weights, so the objective trains its factors alone.
@@ -477,7 +473,8 @@ class DiffusionRunConfig(RunConfig):
             sample = source.inputs.sample
         inputs = InputSpec(sample=sample, conditions=conditions)
         process = self._process(convention)
-        return self.mode.objective(self, model, process, inputs, autoencoder=autoencoder, variables=variables)
+        return self.mode.objective(self, model, process, inputs, base=base, autoencoder=autoencoder,
+                                   variables=variables)
 
     def rollout(self, objective: DiffusionObjective):
         """Return the mode's rollout for `objective`, which the trainer runs.
@@ -512,11 +509,6 @@ class DiffusionRunConfig(RunConfig):
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
         autoencoder."""
-        if self.context is None and self.model.architecture in TEXT_STREAM_MODELS:
-            raise ValueError(
-                f"an unconditional run needs a model that attends without text, and "
-                f"{self.model.architecture!r} runs the text as a second stream through "
-                "every block")
         autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
             params=None if variables is None else self._autoencoder_params(variables)))
         conditions = {}

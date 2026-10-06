@@ -276,3 +276,40 @@ def test_from_run_publishes_the_model_without_the_alignment_head(tmp_path):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
     np.testing.assert_array_equal(restored([{}, {}], key=9).host().images,
                                   published([{}, {}], key=9).host().images)
+
+
+def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
+    """A REPA run on the tiny Flux holds the encoder its tree lacks and draws
+    the projector; a step moves both sides. REPA-E needs a run's own autoencoder."""
+    import dataclasses
+    import tarfile
+
+    import optax
+    from test_diffusion_run_sources import batch_for, precision
+
+    from dew.data import TFDSImages
+    from dew.objectives.diffusion import Denoising, DiffusionRunConfig, EndToEnd, RepresentationAlignment
+    from dew.training import Trainer
+
+    for name in ("flux_source", "rae"):
+        with tarfile.open(Path(__file__).resolve().parent / "fixtures" / f"{name}.tar.xz") as archive:
+            archive.extractall(tmp_path / name, filter="data")
+    alignment = RepresentationAlignment(encoder=str(tmp_path / "rae" / "dinov2_plain"), layer="x_embedder",
+                                        width=8, resolution=56)
+    config = DiffusionRunConfig(pretrained=str(tmp_path / "flux_source" / "pipeline"), preset=None,
+                                model=precision(), data=TFDSImages(image_size=16), solver=Euler(),
+                                guidance=None, sampling_steps=2, ema_decay=None, val_metrics=(),
+                                mode=Denoising(alignment=alignment))
+    objective = config.build()
+    trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.PRNGKey(3))
+    state = trainer.initial_state()
+    before = jax.tree.map(np.asarray, state.variables["params"])  # the step donates these buffers
+    held = state.variables[REPRESENTATION], objective.alignment.variables
+    assert jax.tree.all(jax.tree.map(lambda got, want: np.array_equal(got, want), *held))
+    batch = batch_for(objective, 16)
+    state, *_ = trainer.compile(state, batch)(state, batch)
+    moved = jax.tree.map(lambda got, want: not np.array_equal(got, want), state.variables["params"], before)
+    assert all(any(jax.tree.leaves(moved[name])) for name in (ALIGNMENT, "x_embedder"))
+    with pytest.raises(ValueError, match="own `autoencoder`"):
+        dataclasses.replace(config, mode=Denoising(alignment=dataclasses.replace(
+            alignment, end_to_end=EndToEnd())))
