@@ -132,6 +132,11 @@ class FluxTransformer(nn.Module):
     def features(self) -> int:
         return self.heads * self.head_dim
 
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
+        return "conditioning"
+
     def _conditioning(self, time, guidance, pooled):
         """`CombinedTimestepGuidanceTextProjEmbeddings`: the time, the
         distilled guidance where the checkpoint embeds it, and the pooled text.
