@@ -78,6 +78,14 @@ from dew.interop.families.masked_diffusion import (
     _llada_path,
     _mask_token_export,
 )
+from dew.interop.families.modernbert import (
+    _MODERNBERT_PACKED,
+    _modernbert_config,
+    _modernbert_export,
+    _modernbert_export_path,
+    _modernbert_path,
+    _modernbert_prepare,
+)
 from dew.interop.families.nemotron_h import (
     PACKED as _NEMOTRON_H_PACKED,
     config_from_hf as _nemotron_h_config,
@@ -117,6 +125,14 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ('modernbert',), _modernbert_config,
+        lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
+        'modernbert', 'ModernBertForMaskedLM', _modernbert_export,
+        weight_path=_modernbert_path, export_path=_modernbert_export_path,
+        prepare=_modernbert_prepare, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
+        tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
+    ),
     DecoderFamily(
         ("nemotron_h",),
         _nemotron_h_config,
