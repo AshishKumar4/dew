@@ -37,6 +37,7 @@ import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
+from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.data import Dataset, DatasetSpec, Ramp
@@ -46,7 +47,6 @@ from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import _declared_type, datasets, from_record, models, schedules, to_record, with_precision
-from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec

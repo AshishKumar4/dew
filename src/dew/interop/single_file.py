@@ -46,10 +46,10 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from dew.cache import dew_cache_dir
 from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
-from dew.telemetry.instrumentation import dew_cache_dir
 
 if TYPE_CHECKING:
     import torch

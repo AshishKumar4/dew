@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.diffusion.block import CanvasGeneration
+from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of
@@ -354,14 +354,11 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
         denoise = process.denoiser(model, variables, inputs=prepared, mutable_mask=changeable[None])
         def continued(draw_key):
             tokens = sample(denoise, prepared.tokens, steps, solver=solver, key=draw_key)[0]
-            response = tokens[prompt:]
-            is_eos = jnp.isin(response, jnp.asarray(eos_ids, jnp.int32))
-            first = jnp.min(jnp.where(is_eos, jnp.arange(budget), budget))
             active = jnp.any(changeable)
-            length = jnp.where(active, jnp.minimum(first + 1, budget), 0)
-            response = jnp.where(jnp.arange(budget) < length, response, pad_id)
+            response, length, ended = through_eos(tokens[prompt:], jnp.where(active, budget, 0),
+                                                  eos_ids, pad_id)
             return CanvasGeneration(jnp.concatenate([tokens[:prompt], response]), length,
-                                    active & is_eos.any(), jnp.where(active, steps, 0))
+                                    ended, jnp.where(active, steps, 0))
         return jax.lax.map(continued, continuation_keys(key, n))
 
     generated = jax.vmap(row)(full, mutable, keys)

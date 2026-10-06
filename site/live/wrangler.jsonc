@@ -1,7 +1,7 @@
 // live.dewml.dev: the "Run live" buttons on dewml.dev. The Worker checks the
 // visitor with Turnstile, the Coordinator enforces the limits below, and each
-// session gets its own Kernel container. Deploy with `pnpm live:deploy`, which
-// pins the container to one Dew commit; see deploy.mjs.
+// session gets an isolated Python context with shared model weights. Deploy with
+// `pnpm live:deploy`, which pins trusted snapshot preparation; see deploy.mjs.
 {
 	"$schema": "../node_modules/wrangler/config-schema.json",
 	"name": "dewml-live",
@@ -13,16 +13,21 @@
 	"preview_urls": false,
 	"containers": [
 		{
-			// Each Kernel starts its own container (src/kernel.ts), on standard-4.
-			"class_name": "LiveKernel",
-			"scheduling_policy": "durable_object",
-			"images": { "kernel": { "dockerfile": "./container/Dockerfile" } }
+			"class_name": "SharedHost",
+			"scheduling_policy": "durable_object"
+		},
+		{
+			"class_name": "SnapshotPreparer",
+			"scheduling_policy": "durable_object"
 		}
 	],
 	"durable_objects": {
 		"bindings": [
 			{ "name": "KERNEL", "class_name": "LiveKernel" },
-			{ "name": "COORDINATOR", "class_name": "Coordinator" }
+			{ "name": "COORDINATOR", "class_name": "Coordinator" },
+			{ "name": "SHARED", "class_name": "SharedHost" },
+			{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
+			{ "name": "PREPARER", "class_name": "SnapshotPreparer" }
 		]
 	},
 	// v2 moves the containers to the durable_object scheduling policy, which needs a new
@@ -32,12 +37,14 @@
 	"migrations": [
 		{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] },
 		{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
-		{ "tag": "v3", "deleted_classes": ["Kernel"] }
+		{ "tag": "v3", "deleted_classes": ["Kernel"] },
+		{ "tag": "v4", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] }
 	],
 	// Requests to the API per visitor IP; sessions have their own limits below.
 	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
 	"vars": {
 		// Space-separated. preview.dewml.dev uses the preview Worker below.
+		"SNAPSHOT_COMMIT": "set-by-live-deploy",
 		"ALLOWED_ORIGINS": "https://dewml.dev",
 		"TURNSTILE_HOSTNAMES": "dewml.dev",
 		// Whether a token from Cloudflare's always-pass test sitekey counts; only the preview Worker takes them.
@@ -46,7 +53,7 @@
 		"BUDGET_SECONDS": "144000",
 		"MAX_SESSIONS": "8",
 		"WALL_SECONDS": "1200",
-		// How long a spare container waits for the next session: it costs about $0.02 a
+		// How long a spare Python context waits for the next session: it costs about $0.02 a
 		// window idle (12 GiB and 20 GB provisioned), plus about 4 vCPU-minutes to load
 		// and compile, and counts against the budget.
 		"WARM_SECONDS": "600",
@@ -57,7 +64,7 @@
 	},
 	"observability": { "enabled": true },
 	"env": {
-		// live-preview.dewml.dev, which preview.dewml.dev uses: the same Worker and image, but
+		// live-preview.dewml.dev, which preview.dewml.dev uses: the same Worker and snapshot, but
 		// with Turnstile's test secret, so a headless browser can run the page end to end.
 		// Anyone can pass its check, so its budget and session count are small. Deploy with
 		// `pnpm live:deploy <sha> -- --env preview`.
@@ -69,24 +76,32 @@
 				{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
 				{ "tag": "v3", "deleted_classes": ["Kernel"] },
 				{ "tag": "v4", "new_sqlite_classes": ["SnapshotLab"] },
-				{ "tag": "v5", "deleted_classes": ["SnapshotLab"] }
+				{ "tag": "v5", "deleted_classes": ["SnapshotLab"] },
+				{ "tag": "v6", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] }
 			],
 			"routes": [{ "pattern": "live-preview.dewml.dev", "custom_domain": true }],
 			"containers": [
 				{
-					"class_name": "LiveKernel",
-					"scheduling_policy": "durable_object",
-					"images": { "kernel": { "dockerfile": "./container/Dockerfile" } }
+					"class_name": "SharedHost",
+					"scheduling_policy": "durable_object"
+				},
+				{
+					"class_name": "SnapshotPreparer",
+					"scheduling_policy": "durable_object"
 				}
 			],
 			"durable_objects": {
 				"bindings": [
 					{ "name": "KERNEL", "class_name": "LiveKernel" },
-					{ "name": "COORDINATOR", "class_name": "Coordinator" }
+					{ "name": "COORDINATOR", "class_name": "Coordinator" },
+					{ "name": "SHARED", "class_name": "SharedHost" },
+					{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
+					{ "name": "PREPARER", "class_name": "SnapshotPreparer" }
 				]
 			},
 			"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7402", "simple": { "limit": 30, "period": 60 } }],
 			"vars": {
+				"SNAPSHOT_COMMIT": "set-by-live-deploy",
 				"ALLOWED_ORIGINS": "https://preview.dewml.dev",
 				"TURNSTILE_HOSTNAMES": "preview.dewml.dev",
 				"TURNSTILE_TEST_KEYS": "accept",
