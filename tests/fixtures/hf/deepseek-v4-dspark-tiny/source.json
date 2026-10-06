@@ -1,0 +1,12 @@
+{
+ "release": {
+  "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+  "revision": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+  "path": "inference/model.py"
+ },
+ "transformers": {
+  "version": "5.16.1"
+ },
+ "seed": 0,
+ "tied_selections": 8
+}
