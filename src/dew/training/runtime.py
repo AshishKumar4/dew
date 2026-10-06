@@ -22,8 +22,8 @@ import jax
 from jax._src.distributed import global_state
 from jax.experimental import multihost_utils
 
-from dew.artifacts import broadcast_from_process_zero, end_pool_on_failure
 from dew.cache import enable_compilation_cache
+from dew.coordination import broadcast_from_process_zero, end_pool_on_failure
 from dew.pool import (
     PREEMPTED_EXIT,
     PROCESS_COUNT,

@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
 
-from dew.artifacts import PeerFailure, agree_process_phase, agreed
+from dew.coordination import PeerFailure, agree_process_phase, agreed
 from dew.nn.inputs import ModelInputs, local_rows
 from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
