@@ -36,6 +36,7 @@ from steady_state import steady_state
 from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
+from dew.config import OptimConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, freeze, merge, select, under
 from dew.training import (
@@ -48,6 +49,7 @@ from dew.training import (
     ema_update,
     trainer as trainer_module,
 )
+from dew.training.optim import Cosine
 from dew.training.transaction import write_back
 
 BATCH = 8
@@ -184,6 +186,18 @@ def test_train_state_exposes_the_whole_variables_tree():
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
+
+
+def test_an_optim_config_is_built_over_the_updates_fit_makes():
+    """Four steps of two microbatches are two updates: the run is the config built over two, bit
+    for bit, not over four. Before fit there is no length to build it over."""
+    config = OptimConfig(schedule=Cosine(peak=0.1, warmup_steps=0), weight_decay=0.1, b2=0.99)
+    with pytest.raises(ValueError, match="fit"):
+        make_trainer(optimizer=config).initial_state()
+    built, over_two, over_four = (make_trainer(optimizer=given, accumulation=2).fit(Data(), steps=4).variables
+                                  for given in (config, config.build(2), config.build(4)))
+    jax.tree.map(np.testing.assert_array_equal, built, over_two)
+    assert not all(jax.tree.leaves(jax.tree.map(np.array_equal, built, over_four)))
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])

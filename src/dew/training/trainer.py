@@ -84,7 +84,6 @@ from dew.telemetry.records import (
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
     PARAMETER_AXES,
-    PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
     MeshSpec,
@@ -92,6 +91,7 @@ from dew.training.distributed import (
     batch_divisor,
     batch_shardings,
     link_bandwidth,
+    prefetched_bytes,
     shard_batch,
 )
 from dew.training.evaluation import Evaluation
@@ -106,6 +106,7 @@ from dew.training.transaction import Transaction, compact_qk, with_ema
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from dew.config import OptimConfig
     from dew.telemetry.profile import Profiler
 
 # Consecutive non-finite losses that stop a run.
@@ -542,17 +543,6 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0)
     return fits_everywhere(-1 if executable is None else step_headroom(executable, local, held=held))
 
 
-def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
-    """Return the bytes a device holds of the batches `fit` places while a step runs.
-
-    These are the batches next to the one the step reads: the `PREFETCH_DEPTH` it
-    queues and the one it is placing, each laid out as `shardings` places `batch`.
-    """
-    shares = jax.tree.map(lambda leaf, sharding: math.prod(sharding.shard_shape(np.shape(leaf)))
-                          * np.dtype(leaf.dtype).itemsize, batch, shardings)
-    return (PREFETCH_DEPTH + 1) * sum(jax.tree.leaves(shares))
-
-
 def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
     """Return a model's remat as a record stores it.
 
@@ -804,7 +794,7 @@ class Trainer(Generic[Loss, Effects]):
     def __init__(
         self,
         objective: Objective[Loss, Effects],
-        optimizer: optax.GradientTransformation,
+        optimizer: optax.GradientTransformation | OptimConfig,
         *,
         key: int | jax.Array,
         mesh: MeshSpec = _DEFAULT_MESH,
@@ -822,14 +812,13 @@ class Trainer(Generic[Loss, Effects]):
         The mesh, the compiled step and the capabilities' resources come into
         being in `fit`, so constructing a Trainer allocates nothing.
 
-        `accumulation` is how many microbatches pool into one optimizer
-        commit. The optimizer the run steps is the objective's
-        (`Objective.optimizer`), made from `optimizer`. `step` replaces the
-        built-in transaction. A custom step then
-        owns the clocks, the scaler, the EMA and the mutable writes, and the
-        compiled wrapper owns only the attempted-step counter. `rollout` runs
-        once per batch read, before the step and outside replay. `layout` and
-        `mesh` say where the state lives.
+        `accumulation` is how many microbatches pool into one optimizer commit. `optimizer`
+        is an optax transformation, or an `OptimConfig` each `fit` builds over its `steps //
+        accumulation` updates; the run steps the objective's (`Objective.optimizer`), made from
+        it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
+        scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
+        attempted-step counter. `rollout` runs once per batch read, before the step and outside
+        replay. `layout` and `mesh` say where the state lives.
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
@@ -839,7 +828,9 @@ class Trainer(Generic[Loss, Effects]):
                 "custom steps own their execution"
             )
         self.objective = objective
-        self.optimizer = objective.optimizer(optimizer, accumulation=accumulation)
+        built = isinstance(optimizer, optax.GradientTransformation)
+        self._config = None if built else optimizer
+        self._optimizer = objective.optimizer(optimizer, accumulation=accumulation) if built else None
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
         self.key = request_key(key)
@@ -874,6 +865,12 @@ class Trainer(Generic[Loss, Effects]):
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
         self._resumed_rung: JSON = None
+
+    @property
+    def optimizer(self) -> optax.GradientTransformation:
+        if self._optimizer is None:
+            raise ValueError("an OptimConfig is built over the run's length, which only fit(steps=...) gives")
+        return self._optimizer
 
     # ------------------------------------------------------------------
     # The state
@@ -1503,6 +1500,9 @@ class Trainer(Generic[Loss, Effects]):
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work.
         """
+        if self._config is not None:
+            built = self._config.build(steps // self.accumulation)
+            self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
         selection, stop = self._fit_policies(best, stop, metrics, validation, checkpoint_every, restore_best)
         self._preflight(dataset, stop, eval_every, metrics, preview=preview)
         preview = preview and self.tracker is not None

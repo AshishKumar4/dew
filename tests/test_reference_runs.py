@@ -4,8 +4,8 @@ The reference runs in tools/reference_runs compare whole fine-tunes on real
 weights and GPUs. This is their loop at a size the suite replays: the
 committed qwen3-tiny checkpoint, eight steps of fixed token rows, cross
 entropy over every shifted target, global-norm clipping at 1.0 and AdamW
-(0.9/0.95, eps 1e-8, decoupled decay 0.1) on optax's warmup-cosine schedule.
-tools/reference_runs/lm_steps_fixture.py ran it under transformers 5.16.1
+(0.9/0.95, eps 1e-8, decoupled decay 0.1 on all parameters) on optax's warmup-cosine
+schedule. tools/reference_runs/lm_steps_fixture.py ran it under transformers 5.16.1
 and torch 2.14 on CPU in float64, the truth, and in float32, the reference.
 Dew runs the trainer's own compiled step at fp32 and is held to the rule of
 tests/reference_error.py over the steps: its RMS distance from float64 at
@@ -32,7 +32,7 @@ from dew.config import OptimConfig
 from dew.interop import Pretrained
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import MeshSpec, Trainer
-from dew.training.optim import Cosine
+from dew.training.optim import Cosine, ParamGroup
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
@@ -60,8 +60,8 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     schedule = Cosine(peak=options["lr_peak"], warmup_steps=options["warmup"], end=options["lr_end"],
                       init=options["lr_init"])
     solver = OptimConfig(
-        optimizer="adamw", optimizer_opts={"b1": 0.9, "b2": 0.95, "eps": 1e-8}, schedule=schedule,
-        weight_decay=0.1, clip_grads=1.0).build(steps)
+        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-8}, schedule=schedule,
+        weight_decay=0.1, clip_grads=1.0, param_groups=(ParamGroup("all", ("*",)),)).build(steps)
     trainer = Trainer(objective, optax.chain(recorded_norm(), solver), key=jax.random.key(0),
                       mesh=MeshSpec(), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
