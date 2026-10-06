@@ -106,6 +106,8 @@ def test_a_tfrecord_preparation_is_refused_before_reading(tmp_path):
 
 
 def test_missing_records_request_preparation_only_for_the_selected_split(tmp_path):
+    """A missing shard otherwise raises inside a grain worker on the first
+    record that needed it, steps into a run."""
     directory = tmp_path / "prepared"
     shutil.copytree(FIXTURE, directory)
     (directory / "dew_images-train.array_record-00000-of-00001").unlink()
