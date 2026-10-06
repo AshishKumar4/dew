@@ -9,11 +9,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from diffusion_stubs import label_table
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
-from dew.inputs import CharTable, Condition, Field, InputSpec
+from dew.inputs import Condition, Field, InputSpec
 from dew.objectives.base import Step
 from dew.objectives.diffusion.few_step import ShortcutObjective, ShortcutTraining
 
@@ -41,17 +42,6 @@ class Tiny(nn.Module):
                  + column(level) * jnp.cos(x) * weights[2] + column(y) * weights[3])
 
 
-def labelled() -> CharTable:
-    """Character tables of one feature: the digit k reads k, and the padding
-    id 0 reads the null class."""
-    table = CharTable.from_pretrained(tokens=2, features=1)
-    entries = np.zeros((table.vocab, 1), np.float32)
-    entries[0] = SETTINGS["num_classes"]
-    for digit in range(SETTINGS["num_classes"]):
-        entries[table.tokenize([str(digit)])["input_ids"][0, 1]] = digit
-    return CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
-
-
 def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
     """`ShortcutObjective.loss` on the reference's own draws: the
     self-consistency rows' levels and dyadic times, their targets two half
@@ -62,7 +52,9 @@ def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
     the float64 rule."""
     count = SETTINGS["batch_size"]
     rows = count // SETTINGS["bootstrap_every"]
-    inputs = InputSpec(Field("image", CASE["pixels"].shape[1:]), {"textcontext": Condition(labelled())})
+    classes = SETTINGS["num_classes"]
+    table = label_table({str(digit): digit for digit in range(classes)}, null=classes)
+    inputs = InputSpec(Field("image", CASE["pixels"].shape[1:]), {"textcontext": Condition(table)})
     task = ShortcutObjective(Tiny(), presets.Shortcut()(), inputs,
                              ShortcutTraining(sections=SETTINGS["denoise_timesteps"],
                                               bootstrap_every=SETTINGS["bootstrap_every"]),

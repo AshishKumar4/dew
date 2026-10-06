@@ -292,8 +292,10 @@ def distilled(monkeypatch, optimizer, prefix=""):
     and settings, trained by `Trainer` with `optimizer` for the fixture's
     iterations on the reference's draws: the objective and its final state.
     `prefix` "dcm/" trains rCM's discrete-time consistency on its draws."""
+    from diffusion_stubs import label_table
+
     from dew.diffusion import presets
-    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.inputs import Condition, Field, InputSpec
     from dew.objectives.diffusion import ConsistencyDistillation, ConsistencyDistillationObjective
     from dew.objectives.diffusion.consistency import _Draws
     from dew.training import Trainer
@@ -301,12 +303,8 @@ def distilled(monkeypatch, optimizer, prefix=""):
 
     config = json.loads(str(TRAINING["config"]))
     pixels, labels = TRAINING["pixels"], TRAINING["label"]
-    table = CharTable.from_pretrained(tokens=2, features=1)
-    entries = np.zeros((table.vocab, 1), np.float32)
     names = [str(row) for row in range(pixels.shape[0])]
-    for name, label in zip(names, labels, strict=True):
-        entries[table.tokenize([name])["input_ids"][0, 1]] = label
-    table = CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
+    table = label_table(dict(zip(names, labels, strict=True)))
     inputs = InputSpec(Field("image", pixels.shape[1:]), {"textcontext": Condition(table)})
     (mean_g, std_g), (mean_d, std_d) = config["times"]["G"], config["times"]["D"]
     teacher = {"params": {"weights": jnp.asarray(TRAINING["teacher"])}}
