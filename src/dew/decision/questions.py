@@ -256,6 +256,16 @@ class ScoreAnswer:
 
 type Answer = NoulAnswer | ChoiceAnswer | ScoreAnswer
 
+KINDS: tuple[type[Question], ...] = (Choice, Score, Noul)
+"""The question types in the order a laid-out row numbers them, Laya's
+(laya/common.py QTYPES: choice 0, score 1, noul 2). A head whose type
+embedding orders them otherwise maps these numbers to its own rows."""
+
+
+def kind_of(question: Question) -> int:
+    """Return the number a laid-out row gives `question`'s type (`KINDS`)."""
+    return KINDS.index(type(question))
+
 
 class Confidence(ABC):
     """A statistic of an answer's distribution, between 0 and 1."""

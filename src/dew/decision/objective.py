@@ -9,23 +9,23 @@ import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 
 from dew.artifacts import Decisions
 from dew.data.dataset import Dataset, Loading, train_stream, validation_pass
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.data import DecisionTable, Example
-from dew.decision.head import KINDS, DecisionHead, kind_of
+from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
-from dew.decision.model import DecisionModel
-from dew.decision.questions import Choice, Score
+from dew.decision.model import DecisionModel, Ordered
+from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
-from dew.decision.task import Decide, Weights
+from dew.decision.task import Decide, Weights, laid_out
 from dew.inference.pipeline import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -50,54 +50,71 @@ _SCORE = KINDS.index(Score)
 
 @dataclass(frozen=True)
 class Encoding:
-    """How a labelled question becomes the fixed-width row a step trains on.
+    """How a labelled example becomes the fixed-size row a step trains on.
 
-    Every row is `max_len` tokens and `width` option slots. With `shuffle`, a
-    choice's options are laid out in a fresh random order every time the row is
-    read (Laya's `--shuffle-options`), while a score's levels and a noul's two
-    answers keep their order. With `none_of_the_above` p, a choice row gains a
-    "none of the above" option with probability p, and half of those rows also
-    lose their right option, which makes "none of the above" the right answer.
-    That teaches the model to say that no option fits instead of picking the
-    nearest wrong one.
+    Every row is `max_len` tokens, `questions` question slots and `width` option
+    slots. A layout of one row per question lays out one answered question; a
+    joint layout lays out every question of the example, scoring the answered
+    ones. With `shuffle`, a choice's options are laid out in a fresh random order
+    every time the row is read (Laya's `--shuffle-options`), while a score's
+    levels and a noul's two answers keep their order. With `none_of_the_above`
+    p, an answered choice gains a "none of the above" option with probability p,
+    and half of those also lose their right option, which makes "none of the
+    above" the right answer. That teaches the model to say that no option fits
+    instead of picking the nearest wrong one.
     """
 
     layout: Layout
     tokenizer: Tokenizer
     specials: Specials
     width: int
+    questions: int = 1
     shuffle: bool = True
     none_of_the_above: float = 0.0
 
-    def __call__(self, example: Example, name: str, rng: np.random.Generator | None) -> Batch:
-        question, label = example.questions[name], example.labels()[name]
-        if isinstance(question, Choice) and rng is not None and rng.random() < self.none_of_the_above:
-            question, label = _none_of_the_above(question, label, drop=rng.random() < 0.5)
-        count = len(question.options)
-        order = (rng.permutation(count) if rng is not None and self.shuffle and isinstance(question, Choice)
-                 else np.arange(count))
-        tokens = self.layout.state(self.tokenizer, self.specials, example.state)
-        match example.state:
-            case list():
-                conversation = True
-            case _:
-                conversation = False
-        encoded = self.layout.encode(self.tokenizer, self.specials, question, tokens,
-                                     conversation=conversation, order=[int(slot) for slot in order])
-        if len(encoded.markers) != count:
-            raise ValueError(f"{count - len(encoded.markers)} of a question's {count} options fall past "
-                             f"max_len={self.layout.max_len}; raise it or lower head_max_len")
-        if count > self.width:
-            raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
+    def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
+        labels = example.labels()
+        asked: dict[str, Question] = {}
+        answers: dict[str, int] = {}
+        for name in names:
+            question, label = example.questions[name], labels.get(name)
+            if (label is not None and isinstance(question, Choice) and rng is not None
+                    and rng.random() < self.none_of_the_above):
+                question, label = _none_of_the_above(question, label, drop=rng.random() < 0.5)
+            asked[name] = question
+            if label is not None:
+                answers[name] = label
+        orders = ({name: [int(slot) for slot in rng.permutation(len(question.options))]
+                   for name, question in asked.items() if isinstance(question, Choice)}
+                  if rng is not None and self.shuffle else None)
+        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders)
+        if len(rows) != 1 or len(rows[0].questions) > self.questions:
+            raise ValueError(f"an encoding lays out one row of at most {self.questions} questions, "
+                             f"and the layout gave {len(rows)} rows")
+        encoded = rows[0]
         length = self.layout.max_len
         row: Batch = {
             "tokens": _padded(encoded.tokens, length, self.specials.pad),
             "valid": _padded((True,) * len(encoded.tokens), length, fill=False),
-            "markers": _padded(encoded.markers, self.width, 0),
-            "options": _padded((True,) * count, self.width, fill=False),
-            "kinds": np.int32(kind_of(question)),
-            "labels": np.int32(int(np.flatnonzero(order == label)[0])),
+            "kinds": np.zeros(self.questions, np.int32), "questions": np.zeros(self.questions, bool),
+            "spans": np.zeros((self.questions, 2), np.int32),
+            "option_spans": np.zeros((self.questions, self.width, 2), np.int32),
+            "options": np.zeros((self.questions, self.width), bool),
+            "labels": np.zeros(self.questions, np.int32), "scored": np.zeros(self.questions, bool),
         }
+        for slot, laid in enumerate(encoded.questions):
+            count = len(asked[laid.name].options)
+            if len(laid.options) != count:
+                raise ValueError(f"{count - len(laid.options)} of question {laid.name!r}'s {count} options "
+                                 f"fall past max_len={length}; raise it or shorten the question")
+            if count > self.width:
+                raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
+            row["kinds"][slot], row["questions"][slot], row["spans"][slot] = laid.kind, True, laid.span
+            row["option_spans"][slot, :count] = laid.options
+            row["options"][slot, :count] = True
+            if laid.name in answers:
+                row["labels"][slot] = laid.order.index(answers[laid.name])
+                row["scored"][slot] = True
         if encoded.positions is not None and encoded.slots is not None:
             row["positions"] = _padded(encoded.positions, length, 0)
             row["slots"] = _padded(encoded.slots, length, 0)
@@ -124,9 +141,10 @@ def _padded(values: Sequence[int | bool], length: int, fill: int | bool = 0) -> 
 
 
 class _Rows:
-    """The answered questions of a set of examples, read by index as `{"row": i}`."""
+    """The rows of a set of examples, each an example and the questions it lays
+    out, read by index as `{"row": i}`."""
 
-    def __init__(self, rows: Sequence[tuple[Example, str]], origin: str):
+    def __init__(self, rows: Sequence[tuple[Example, tuple[str, ...]]], origin: str):
         self.rows = rows
         self.origin = origin
 
@@ -147,8 +165,8 @@ class _Encode(pygrain.RandomMapTransform):
         self.encoding, self.rows, self.augment = encoding, rows, augment
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        example, name = self.rows.rows[int(element["row"])]
-        return self.encoding(example, name, rng if self.augment else None)
+        example, names = self.rows.rows[int(element["row"])]
+        return self.encoding(example, names, rng if self.augment else None)
 
 
 def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
@@ -167,16 +185,23 @@ def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return None
 
 
-def _answered(examples: Iterable[Example | Mapping[str, object]]) -> list[tuple[Example, str]]:
-    return [(example, name) for example in map(Example.of, examples) for name in example.labels()]
+def _laid_rows(examples: Iterable[Example | Mapping[str, object]], *,
+               joint: bool) -> list[tuple[Example, tuple[str, ...]]]:
+    """Each row an example lays out: one per answered question, or, for a joint
+    layout, one asking all its questions where any is answered."""
+    held = [Example.of(example) for example in examples]
+    if joint:
+        return [(example, tuple(example.questions)) for example in held if example.labels()]
+    return [(example, (name,)) for example in held for name in example.labels()]
 
 
 @objectives("decision")
 class DecisionObjective(Objective[Ratio]):
     """Trains a decision model on questions with known answers.
 
-    The model is a backbone with `hidden_states`, read by a `DecisionHead`.
-    `backbone` is a `CausalTransformer` built from scratch, a loaded model
+    The model is any backbone with final states (`dew.nn.protocols.HiddenStates`),
+    read by a head, Laya's `DecisionHead` unless `head` says otherwise.
+    `backbone` is a model built from scratch, a loaded model
     (`Pretrained.load`, adapted with LoRA or partly frozen through `freeze`, as
     `LMObjective` accepts one), or a whole `Decide` task, such as Laya's released
     checkpoint, which brings its head and layout with it. A bidirectional
@@ -197,10 +222,10 @@ class DecisionObjective(Objective[Ratio]):
     artifact = Decisions
     saved_task = Decide
 
-    def __init__(self, backbone: CausalTransformer | Source[CausalTransformer] | Adapter | Decide, *,
+    def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
                  specials: Specials | None = None, layout: Layout | None = None,
-                 head: DecisionHead | None = None, variables: Variables | None | Omitted = OMITTED,
+                 head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0):
         held: Variables | None = None
@@ -219,9 +244,6 @@ class DecisionObjective(Objective[Ratio]):
                 tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
-        if not isinstance(module, CausalTransformer):
-            raise TypeError(f"a decision model reads a CausalTransformer's hidden states, "
-                            f"not a {type(module).__name__}'s")
         if variables is not OMITTED:
             held = variables
         if tokenizer is None:
@@ -230,8 +252,16 @@ class DecisionObjective(Objective[Ratio]):
             raise ValueError("label_smoothing is a share of the target, in [0, 1)")
         if not 0.0 <= none_of_the_above <= 1.0:
             raise ValueError("none_of_the_above is a probability")
-        self.model = DecisionModel(module, head or DecisionHead(module.emb_features, dtype=module.dtype))
-        self.layout = layout or (StateFirstLayout() if module.causal else MarkerLayout())
+        if head is None:
+            width, dtype = DecisionModel.head_size(module)
+            head = DecisionHead(width, dtype=dtype)
+        self.model = DecisionModel(module, head)
+        if layout is None:
+            if not isinstance(module, Ordered):
+                raise ValueError(f"a {type(module).__name__} does not say whether it reads its tokens in "
+                                 "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)")
+            layout = StateFirstLayout() if module.causal else MarkerLayout()
+        self.layout = layout
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
@@ -248,7 +278,6 @@ class DecisionObjective(Objective[Ratio]):
         given = self.held_variables() if variables is None else variables
         backbone_key, head_key = jax.random.split(key)
         tokens = jnp.zeros((1, self.layout.max_len), jnp.int32)
-        valid = jnp.ones((1, self.layout.max_len), bool)
         parts = {name: part(given, name) for name in ("backbone", "head")
                  if given is not None and any(name in tree for tree in given.values())}
         if "backbone" not in parts:
@@ -256,33 +285,41 @@ class DecisionObjective(Objective[Ratio]):
         if "head" not in parts:
             states = jnp.zeros((1, self.layout.max_len, self.model.backbone.emb_features),
                                self.model.backbone.dtype or jnp.float32)
-            parts["head"] = self.model.head.init(head_key, states, valid, jnp.zeros((1, 1), jnp.int32),
-                                                 jnp.zeros((1,), jnp.int32))
+            one = jnp.ones((1, 1), bool)
+            inputs = DecisionInputs(tokens=tokens, valid=jnp.ones_like(tokens, bool),
+                                    kinds=jnp.zeros((1, 1), jnp.int32), questions=one,
+                                    spans=jnp.asarray([[[0, 1]]]), option_spans=jnp.asarray([[[[0, 1]]]]),
+                                    options=one[..., None])
+            table = (self.model.table(joined({"backbone": parts["backbone"]})) if self.model.head.reads_table
+                     else None)
+            parts["head"] = self.model.head.init(head_key, states, inputs, table)
         return joined(parts)
 
-    def _laid_out(self, batch: Batch) -> DecisionInputs:
-        return DecisionInputs(tokens=batch["tokens"], valid=batch["valid"], markers=batch["markers"],
-                              options=batch["options"], kinds=batch["kinds"],
-                              positions=batch.get("positions"), slots=batch.get("slots"))
-
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        inputs = self._laid_out(batch)
+        inputs = laid_out(batch)
         logits = self.model.logits(variables, inputs, train=True, rngs={"dropout": step.key})
-        options = inputs.options
+        options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
+        # A padding question has no options; it is scored nothing over a
+        # finite, even distribution, so no NaN reaches its gradient.
+        empty = ~jnp.any(options, axis=-1, keepdims=True)
+        logits, options = jnp.where(empty, 0.0, logits), options | empty
         count = jnp.sum(options, axis=-1, keepdims=True)
-        right = jax.nn.one_hot(batch["labels"], options.shape[1])
+        right = jax.nn.one_hot(batch["labels"], options.shape[-1])
         target = jnp.where(options, (1.0 - self.label_smoothing) * right + self.label_smoothing / count, 0.0)
         charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
-        accuracy, _ = self.accuracy(correct, batch).mean()
-        return self.row_mean(charge, batch), Aux(metrics={"accuracy": accuracy})
+        accuracy, _ = self.accuracy(correct, batch, scored).mean()
+        loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
+        return loss, Aux(metrics={"accuracy": accuracy})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
-        inputs = self._laid_out(batch)
+        inputs = laid_out(batch)
         weights = params if step.ema is None else step.ema
-        probabilities = jax.nn.softmax(self._logits(weights, inputs), axis=-1)
+        logits = self._logits(weights, inputs)
+        empty = ~jnp.any(inputs.options, axis=-1, keepdims=True)
+        probabilities = jax.nn.softmax(jnp.where(empty, 0.0, logits), axis=-1)
         return Decisions(probabilities=probabilities, options=inputs.options, labels=batch["labels"],
-                         ordinal=inputs.kinds == _SCORE)
+                         ordinal=inputs.kinds == _SCORE, scored=batch["scored"])
 
     @functools.cached_property
     def _logits(self):
@@ -303,20 +340,22 @@ class DecisionObjective(Objective[Ratio]):
                 raise ValueError("a decision table holds out its own validation rows")
             examples, validation = examples.examples()
         loading = Loading() if loading is None else loading
-        train = _answered(examples)
-        held = None if validation is None else _answered(validation)
+        joint = self.layout.joint
+        train = _laid_rows(examples, joint=joint)
+        held = None if validation is None else _laid_rows(validation, joint=joint)
         width = max(len(example.questions[name].options) + (self.none_of_the_above > 0)
-                    for example, name in train + (held or []))
-        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle_options,
-                            self.none_of_the_above)
-        rows = _Rows(train, f"{len(train)} answered questions")
+                    for example, names in train + (held or []) for name in names)
+        questions = max(len(names) for _, names in train + (held or []))
+        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
+                            self.shuffle_options, self.none_of_the_above)
+        rows = _Rows(train, f"{len(train)} rows")
         if len(rows) < batch:
-            raise ValueError(f"{len(rows)} answered questions, fewer than one batch of {batch}")
+            raise ValueError(f"{len(rows)} rows of answered questions, fewer than one batch of {batch}")
         scoring = None
         if held is not None:
-            held_rows = _Rows(held, f"{len(held)} held-out answered questions")
+            held_rows = _Rows(held, f"{len(held)} held-out rows")
             if len(held_rows) < batch:
-                raise ValueError(f"{len(held_rows)} held-out answered questions, "
+                raise ValueError(f"{len(held_rows)} held-out rows of answered questions, "
                                  f"fewer than one batch of {batch}")
             scoring = validation_pass(held_rows, [_Encode(encoding, held_rows, augment=False)], batch=batch,
                                       seed=seed, loading=loading)
@@ -333,19 +372,25 @@ class DecisionObjective(Objective[Ratio]):
         from dew.inference.tasks import recorded_tokenizer
         from dew.registry import to_record
 
-        head = self.model.head
         return {
             "objective": objectives.name_of(type(self)),
             "model": to_record(ModelConfig.from_model(self.model.backbone), ModelConfig),
-            "head": {"layers": head.layers, "dropout_rate": head.dropout_rate},
+            "head": self.model.head.record(),
             "layout": {"name": type(self.layout).__name__,
                        "fields": to_record(self.layout, type(self.layout))},
             "specials": to_record(self.specials, Specials),
             "tokenizer": recorded_tokenizer(RunProcessor(self.tokenizer)),
         }
 
-    def pipeline(self, state: "TrainState", *, ema: bool | None = None) -> Decide:
-        """Return the trained model as a `Decide` task over the state's weights."""
+    def pipeline(self, state: "TrainState", *, ema: bool | None = None,
+                 processor: TaskProcessor | None | Omitted = OMITTED) -> Decide:
+        """Return the trained model as a `Decide` task over the state's weights.
+
+        A `Decide` encodes with the objective's own tokenizer and layout, so it
+        takes no processor.
+        """
+        if processor is not OMITTED:
+            raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
         return Decide(self.model, self._pipeline_weights(state, ema), self.layout, self.tokenizer,
                       self.specials, weights=Weights(int(state.step), averaged))

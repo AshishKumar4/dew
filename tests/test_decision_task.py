@@ -1,5 +1,7 @@
 """`Decide`: batching, tournaments, calibration and Jev's wire form, against Laya's own agent."""
 
+import base64
+import io
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +24,7 @@ from dew.decision import (
     Temperatures,
 )
 from dew.decision.calibration import softmax
+from dew.decision.task import decoded_images
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -79,19 +82,54 @@ def test_systemone_refuses_a_request_jev_would_refuse(decide, request_body, mess
         decide.systemone(request_body)
 
 
+def png(color: tuple[int, int, int]) -> bytes:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 3), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_images_decode_from_every_form_a_request_carries():
+    """Clef's `images` extension: PIL images, encoded bytes, and base64,
+    bare or as a data URL, all read as the same pixels."""
+    from PIL import Image
+
+    raw = png((200, 10, 30))
+    encoded = base64.b64encode(raw).decode()
+    images = decoded_images([Image.open(io.BytesIO(raw)), raw, encoded, f"data:image/png;base64,{encoded}"])
+    assert [image.size for image in images] == [(4, 3)] * 4
+    assert all(image.convert("RGB").getpixel((0, 0)) == (200, 10, 30) for image in images)
+    assert decoded_images(None) == []
+    for bad, message in ((["%%%"], "not base64"), ([base64.b64encode(b"text").decode()], "Pillow"),
+                         ([3], "PIL image"), ("x", "a list")):
+        with pytest.raises(ValueError, match=message):
+            decoded_images(bad)
+
+
+def test_strict_answers_drop_the_extensions_and_hold_jevs_fields(decide):
+    """A text backbone refuses images it cannot read; a strict answer drops
+    them, as Jev's endpoint knows no images, and holds Jev's fields alone."""
+    with_images = {**CASES["quickstart"], "images": [base64.b64encode(png((0, 0, 0))).decode()]}
+    with pytest.raises(ValueError, match="vision encoder"):
+        decide.systemone(with_images)
+    assert decide.systemone(with_images, strict=True) == decide.systemone(CASES["quickstart"])
+    with pytest.raises(ValueError, match="no details"):
+        decide.systemone(CASES["quickstart"], strict=True, details=True)
+
+
 def test_a_small_budget_splits_passes_without_moving_a_logit(decide):
     """Every question of every case at a budget of two rows a pass, held to
     Laya's one-row logits under the float64 rule."""
     small = replace(decide, budget=Budget(tokens=256, rows=2))
-    rows, questions, keys = [], [], []
+    rows, keys = [], []
     for case, request in CASES.items():
         laid = small._encoded(request["state"], {name: Question.from_wire(wire)
                                                  for name, wire in request["questions"].items()})
-        for name, question, encoded in laid:
-            rows.append(encoded)
-            questions.append(question)
-            keys.append(f"sequential/{case}/{name}")
-    found = small.logits(rows, questions)
+        rows.extend(laid)
+        keys.extend(f"sequential/{case}/{encoded.questions[0].name}" for encoded in laid)
+    found = [logits[0, :len(encoded.questions[0].options)]
+             for encoded, logits in zip(rows, small.logits(rows), strict=True)]
     with np.load(TINY / "logits.npz") as reference:
         assert_as_exact_as_the_reference(np.concatenate(found),
                                          np.concatenate([reference[key] for key in keys]),
@@ -227,3 +265,42 @@ def test_an_example_refuses_an_answer_its_question_cannot_give():
     with pytest.raises(ValueError, match="none of"):
         Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
                     "answers": {"department": "legal"}})
+
+
+def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
+    """`save_pretrained` writes what `from_pretrained` reads: Laya's tensors
+    under Laya's names (all but the action head and the unused temperature
+    buffer, which no answer reads), the encoder's config, the tokenizer and
+    the temperatures, so the reloaded task answers every case identically."""
+    from safetensors.numpy import load_file
+
+    from dew.interop.hf_decoders import translate_config
+
+    decide.save_pretrained(tmp_path)
+    written, original = load_file(tmp_path / "model.safetensors"), load_file(TINY / "model.safetensors")
+    kept = {name for name in original if not name.startswith("act_head.") and name != "temperature"}
+    assert set(written) == kept
+    for name in kept:
+        np.testing.assert_array_equal(written[name], original[name], err_msg=name)
+    # The published encoder config names no architecture, which reads as the
+    # masked LM; the written one names the bare encoder its tensors are.
+    configs = [replace(translate_config(json.loads((root / "encoder" / "config.json").read_text())).value,
+                       head_transform=None, head_bias=False) for root in (tmp_path, TINY)]
+    assert configs[0] == configs[1]
+    # The temperatures go out as Laya's agent applies them, held within [0.5, 5],
+    # since llama.cpp's server applies what it reads: the published 0.3 for
+    # eleven options and more is written as the 0.5 both answer with.
+    agent = json.loads((tmp_path / "rl_agent_config.json").read_text())
+    published = json.loads((TINY / "rl_agent_config.json").read_text())
+    assert agent["temperature"] == published["temperature"]
+    assert agent["head_layers"] == published["head_layers"]
+    assert agent["temperature_by_options"] == {**published["temperature_by_options"], "choice:11+": 0.5}
+    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
+    for request in CASES.values():
+        assert again.systemone(request) == decide.systemone(request)
+
+
+def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):
+    gated = decide.gated(0.5)
+    with pytest.raises(ValueError, match="temperatures alone"):
+        gated.save_pretrained(tmp_path)

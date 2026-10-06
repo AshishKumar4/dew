@@ -13,7 +13,7 @@ bucket: a question type and its option count, as `bucket` names it.
 """
 
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
@@ -74,8 +74,19 @@ class Temperatures:
 
         That is its bucket's temperature, or else its type's, or else 1.
         """
-        chosen = self.buckets.get(_bucket(kind, count), self.types.get(kind, 1.0))
-        return min(self.highest, max(self.lowest, chosen))
+        return self._held(self.buckets.get(_bucket(kind, count), self.types.get(kind, 1.0)))
+
+    def applied(self) -> "Temperatures":
+        """Return these temperatures as `of` applies them, each held within [`lowest`, `highest`].
+
+        A reader that does not hold them itself, as llama.cpp's server does not,
+        then answers as this does.
+        """
+        return replace(self, types={kind: self._held(value) for kind, value in self.types.items()},
+                       buckets={name: self._held(value) for name, value in self.buckets.items()})
+
+    def _held(self, value: float) -> float:
+        return min(self.highest, max(self.lowest, value))
 
     @classmethod
     def fit(cls, scored: Sequence[Scored], *, type_minimum: int = 10, bucket_minimum: int = 2000,
