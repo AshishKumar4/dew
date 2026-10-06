@@ -36,7 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from test_masked_diffusion import flat
+from model_support import flat_tree
 
 from dew.interop import Pretrained, PretrainedDecoder
 from tools import masked_diffusion_export_reference as tool
@@ -102,7 +102,7 @@ def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip
     trained values bit for bit, so it computes the same logits."""
     assert trip.reloaded.model == trip.source.model, "the export rebuilds a different model"
 
-    held, again = flat(trip.trained), flat(trip.reloaded.variables)
+    held, again = flat_tree(trip.trained), flat_tree(trip.reloaded.variables)
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name
@@ -159,7 +159,7 @@ def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
 
     assert written["mask_token_id"] == source.model.mask_token_id
     assert reloaded.model == source.model, "the derived config rebuilds a different model"
-    held, again = flat(source.variables), flat(reloaded.variables)
+    held, again = flat_tree(source.variables), flat_tree(reloaded.variables)
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name

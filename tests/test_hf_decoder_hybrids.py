@@ -11,7 +11,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_hf_decoders import DEEPSEEK, fixture_config, flat_tree, fp32_decoder, scaled_difference
+from model_support import flat_tree
+from test_hf_decoders import DEEPSEEK, fixture_config, fp32_decoder, scaled_difference
 
 from dew.interop import PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights

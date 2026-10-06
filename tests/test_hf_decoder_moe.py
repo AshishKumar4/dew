@@ -12,7 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_hf_decoders import GEMMA4_MOE, fixture_config, flat_tree, fp32_decoder
+from model_support import flat_tree
+from test_hf_decoders import GEMMA4_MOE, fixture_config, fp32_decoder
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4

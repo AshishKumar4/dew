@@ -88,6 +88,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from model_support import flat_tree
 from reference_error import (
     ORDERS,
     assert_as_exact_as_the_reference,
@@ -127,11 +128,6 @@ COPIED_MTP = ("glm4_moe", "glm_moe_dsa")
 # the source's tensor layout, against the reference's `.grad`.
 GRADIENTS = ("glm_moe_dsa", "deepseek_v4", "kimi_k25", "qwen3_next", "glm5_next")
 GRADIENT = 1e-4
-
-
-def flat(tree):
-    return {".".join(str(entry.key) for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
 
 @pytest.fixture(scope="module")
@@ -212,7 +208,7 @@ def test_the_trained_export_reloads_leaf_for_leaf_and_recomputes_the_logits(trip
     trained values bit for bit, so it computes the same logits."""
     assert trip.reloaded.model == trip.source.model, "the export rebuilds a different model"
 
-    held, again = flat(trip.trained), flat(trip.reloaded.variables)
+    held, again = flat_tree(trip.trained), flat_tree(trip.reloaded.variables)
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name
@@ -1089,6 +1085,6 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
         np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     for collection in ("params", "moe"):
         if collection in variables:
-            actual_leaves = flat(restored.variables[collection])
-            for name, value in flat(variables[collection]).items():
+            actual_leaves = flat_tree(restored.variables[collection])
+            for name, value in flat_tree(variables[collection]).items():
                 np.testing.assert_array_equal(actual_leaves[name], value)
