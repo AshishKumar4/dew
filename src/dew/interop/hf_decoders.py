@@ -1842,7 +1842,7 @@ def _export_config(model) -> Mapping[str, object]:
     # reads the field without passing it on). A checkpoint written under a
     # family that would drop the dial is refused naming it.
     if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
-            and family.export_model_type not in ('qwen2', 'dream')):
+            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo')):
         raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
