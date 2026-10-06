@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING, Any
 import jax
 import jax.numpy as jnp
 import pytest
-import tyro
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from test_instrumentation import Regression, batches
@@ -219,7 +218,7 @@ def test_the_run_length_is_steps_or_epochs():
 
 
 def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
-    config = tyro.cli(tyro.conf.CascadeSubcommandArgs[RunConfig], args=[
+    config = RunConfig.cli( [
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
         "--trainer.steps", "5", "--model.architecture", "uvit",
         "--model.config", '{"emb_features": 32}',

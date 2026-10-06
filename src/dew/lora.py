@@ -80,15 +80,16 @@ class Target:
 class LoRA:
     """A low-rank adapter spec with PEFT's own fields.
 
-    This is what a user writes and a run records (`RunConfig.lora`,
-    `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`).
+    A user writes it and a run records it (`RunConfig.lora`,
+    `--lora.rank 16 --lora.modules q_proj v_proj`).
 
-    `modules` are PEFT's `target_modules`: a projection matches when its name
+    `modules` are PEFT's `target_modules`. A projection matches when its name
     relative to the model (`model.layers.0.self_attn.q_proj`, or `to_q` under a
     pipeline component) equals an entry or ends in `.` followed by the entry.
-    `alpha` None uses PEFT's own default, twice the rank. `rslora` scales by
-    `alpha / sqrt(rank)`, and `dropout` drops the branch's input in a training
-    forward pass.
+    `alpha` None means twice the rank. `rslora` scales by `alpha / sqrt(rank)`, and
+    `dropout` drops the branch's input in a training forward pass. `rank` must be a
+    positive int, `modules` must name at least one projection, and `dropout` must be
+    in [0, 1).
     """
 
     rank: int
@@ -213,7 +214,6 @@ class Adapter:
         the source at hand. A recorded binding whose shapes do not fit the restored
         factors is refused by name.
         """
-        from dew.checkpoints import Checkpoints
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
         from dew.records import record, text
@@ -223,11 +223,9 @@ class Adapter:
         config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         if config.adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        model = config.build()
-        kind = text(declaration['objective'], 'objective')
-        averaged = False if objectives[kind]._ema_is_reference else ema
-        variables = Checkpoints(str(directory)).variables(step=step, ema=averaged)
-        return cls.recorded(model, variables, config.adapter)
+        variables = objectives[text(declaration['objective'], 'objective')]._saved_variables(
+            str(directory), step=step, ema=ema)
+        return cls.recorded(config.build(), variables, config.adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: Mapping) -> Adapter:

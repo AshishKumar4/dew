@@ -371,11 +371,14 @@ def _modelopt_input_qdq(x: jax.Array, spec: NVFP4Input, qarray: ModuleType) -> j
 
 
 def checkpoint_input_quantization(model: nn.Module, inputs: Mapping[str, NVFP4Input | FP8Input]) -> nn.Module:
-    """Wrap the checkpoint's Linear scopes through the existing Qwix provider path.
+    """Return `model` with its checkpoint's input quantization on the Linear layers.
 
-    The weights already hold the source reader's decoded values. Input QDQ
-    happens before the existing dot, so dtype, accumulation precision and
-    Dense's bias placement stay where the model defines them.
+    `inputs` maps each Linear's module path to its NVFP4 or FP8 input scales. The
+    wrapper goes through Qwix, as the rest of this module does: before each
+    matched layer's dot, its input is quantized to its declared format and back with those
+    scales. The weights already hold the values the source reader decoded, and
+    the dot itself is unchanged, so its dtype, accumulation precision and the
+    bias placement stay as the model defines them.
     """
     qwix = _qwix()
     by_pattern = {re.escape(path): spec for path, spec in inputs.items()}

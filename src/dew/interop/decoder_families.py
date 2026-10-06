@@ -78,6 +78,13 @@ from dew.interop.families.masked_diffusion import (
     _llada_path,
     _mask_token_export,
 )
+from dew.interop.families.nemotron_h import (
+    PACKED as _NEMOTRON_H_PACKED,
+    config_from_hf as _nemotron_h_config,
+    export_path as _nemotron_h_export_path,
+    matches as _nemotron_h_matches,
+    weight_path as _nemotron_h_path,
+)
 from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
 from dew.interop.families.qwen import (
@@ -110,6 +117,19 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ("nemotron_h",),
+        _nemotron_h_config,
+        _nemotron_h_matches,
+        "nemotron_h",
+        "NemotronHForCausalLM",
+        lambda model: {},
+        weight_path=_nemotron_h_path,
+        export_path=_nemotron_h_export_path,
+        packed=_NEMOTRON_H_PACKED,
+        preserve_source_layout=True,
+        tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
+    ),
     DecoderFamily(
         ("gpt_neox",),
         _gpt_neox_config,

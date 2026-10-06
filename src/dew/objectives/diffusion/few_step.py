@@ -127,7 +127,7 @@ against 99%, an sCM student 11% against 98.6%."""
 @trainings("mean_flow")
 @dataclasses.dataclass(frozen=True)
 class MeanFlowTraining(Training):
-    """MeanFlow training under the `MeanFlow` preset, where one step samples the model.
+    """MeanFlow training under the `MeanFlow` preset, for a model that samples in one step.
 
     `MeanFlowObjective` documents the fields. Sampling is unguided, because the
     guidance is trained in.
@@ -160,7 +160,8 @@ class MeanFlowTraining(Training):
 class ShortcutTraining(Training):
     """Shortcut-model training under the `Shortcut` preset.
 
-    `ShortcutObjective` documents the fields. Sampling is unguided.
+    `ShortcutObjective` documents the fields, and `sections` must be a power of two,
+    at least 2. Sampling is unguided.
     """
 
     preset_class = Shortcut

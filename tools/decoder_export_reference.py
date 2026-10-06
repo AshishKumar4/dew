@@ -191,7 +191,12 @@ def _prediction_prefixes(config) -> tuple[str, ...]:
 
 
 class _StableTopK(TorchFunctionMode):
-    """torch.topk with ties broken toward the lower index, like jax.lax.top_k."""
+    """torch.topk with ties broken toward the lower index, like jax.lax.top_k.
+    Given a `found` list, each call appends its scored rows and sorted picks."""
+
+    def __init__(self, found: list[tuple[torch.Tensor, torch.Tensor]] | None = None):
+        super().__init__()
+        self.found = found
 
     def __torch_function__(self, func: Callable[..., object], types: Sequence[type],
                            args: tuple[object, ...] = (), kwargs: dict[str, object] | None = None) -> object:
@@ -207,6 +212,9 @@ class _StableTopK(TorchFunctionMode):
         if largest is not True or keywords.get('out') is not None:
             raise ValueError('only descending top-k without an out buffer is supported here')
         indices = torch.argsort(operand, dim=axis, descending=True, stable=True).narrow(axis, 0, count)
+        if self.found is not None:
+            rows, picks = operand.detach().movedim(axis, -1), indices.movedim(axis, -1)
+            self.found.append((rows.reshape(-1, rows.size(-1)), picks.reshape(-1, count).sort(-1).values))
         return torch.return_types.topk((torch.gather(operand, axis, indices), indices))
 
 
@@ -219,25 +227,31 @@ _INDEXERS = {
 
 
 @contextmanager
-def lower_index_ties(model, block: torch.nn.Module | None = None) -> Iterator[None]:
+def lower_index_ties(model, block: torch.nn.Module | None = None,
+                     classes: type[torch.nn.Module] | tuple[type[torch.nn.Module], ...] | None = None,
+                     found: list[tuple[torch.Tensor, torch.Tensor]] | None = None) -> Iterator[None]:
     """Run `model` (or `block`, a bare layer of its family) with its sparse
     indexer breaking equal scores toward the lower token index, which is what
     jax.lax.top_k does and torch leaves unspecified. Families without an
-    indexer run unchanged."""
-    named = _INDEXERS.get(model.config.model_type)
-    if named is None:
-        yield
-        return
-    from importlib import import_module
-    indexer = getattr(import_module(named[0]), named[1])
+    indexer run unchanged. `classes` names the modules to run so instead of
+    the family's indexer, for a reference outside transformers, which has no
+    config to look it up by (DeepSeek-V4-Flash-0731's inference/model.py
+    `Indexer` and `Gate`); `found` collects every such top-k (`_StableTopK`)."""
+    if classes is None:
+        named = _INDEXERS.get(model.config.model_type)
+        if named is None:
+            yield
+            return
+        from importlib import import_module
+        classes = getattr(import_module(named[0]), named[1])
     target = model if block is None else block
-    held = [(m, m.forward) for m in target.modules() if isinstance(m, indexer)]
+    held = [(m, m.forward) for m in target.modules() if isinstance(m, classes)]
     if not held:
-        raise ValueError(f'{model.config.model_type} reference has no {named[1]}')
+        raise ValueError(f'the reference has no {classes}')
 
     def stable(original):
         def forward(*args, **kwargs):
-            with _StableTopK():
+            with _StableTopK(found):
                 return original(*args, **kwargs)
         return forward
     try:

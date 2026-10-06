@@ -24,7 +24,6 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import tyro
 
 from dew.config import ModelConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
@@ -356,4 +355,4 @@ def main(config: LmRunConfig) -> TrainState:
 
 
 if __name__ == '__main__':
-    main(tyro.cli(tyro.conf.CascadeSubcommandArgs[LmRunConfig]))
+    main(LmRunConfig.cli())

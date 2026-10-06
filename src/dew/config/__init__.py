@@ -25,7 +25,7 @@ import re
 import sys
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self
 
 import jax
 import optax
@@ -660,6 +660,10 @@ def _key(key: object) -> str:
 class RunConfig:
     """A whole run's configuration; recipes subclass it to add their objective's settings."""
 
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora"}
+    """The optional settings `cli` turns on by their own flags, each with the
+    subcommand its flags imply."""
+
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
@@ -668,11 +672,11 @@ class RunConfig:
     lora: Annotated[LoRA, tyro.conf.subcommand("lora")] | None = None
     """The low-rank adapter the run trains instead of the whole model.
 
-    On the command line it is `lora:lora --lora.rank 16 --lora.modules q_proj v_proj`.
-    A recipe attaches it to the source `--pretrained` loads (`Pretrained.adapt`),
-    or, from scratch, to a fresh draw of the model from the run's key. The
-    objective then trains only the factors, and the run records the bound adapter
-    on its model.
+    On the command line, set it with `--lora.rank 16 --lora.modules q_proj v_proj`
+    (see `cli`). A recipe attaches it to the source that `--pretrained` loads
+    (`Pretrained.adapt`), or, when training from scratch, to a model freshly
+    initialized from the run's key. The objective then trains only the adapter's
+    factors, and the run's record stores the model with the adapter attached.
     """
 
     def to_dict(self) -> dict[str, JSON]:
@@ -701,6 +705,25 @@ class RunConfig:
         target = path / RUN_FILE
         target.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
         return str(target)
+
+    @classmethod
+    def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
+        """Parse a run from `args`, or from the process's own command line when `args` is None.
+
+        An optional setting such as `lora` is turned on by its own flags. For
+        example, `--lora.rank 16 --lora.modules q_proj` stands for
+        `lora:lora --lora.rank 16 ...`, and with no `--lora.` flag the run
+        trains without an adapter.
+        """
+        given = list(sys.argv[1:] if args is None else args)
+        for field, subcommand in cls._FLAG_SELECTED.items():
+            flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
+            if flags and not any(arg.startswith(f"{field}:") for arg in given):
+                given.insert(flags[0], f"{field}:{subcommand}")
+        parser = tyro.conf.CascadeSubcommandArgs[cls]
+        if default is None:
+            return tyro.cli(parser, args=given)
+        return tyro.cli(parser, args=given, default=default)
 
     @classmethod
     def load(cls, directory: str) -> Self:

@@ -962,15 +962,19 @@ EXPERT_AXES: Mapping[str, LogicalAxes] = {
 
 
 class ExpertMLP(nn.Module):
-    """The routed experts of one layer: each token through the gated MLPs its
+    """The routed experts of one layer: each token through the MLPs its
     router chose.
 
     Tokens gather into expert order straight from their rows (MaxText's
-    `moe_use_direct_token_gather`), the three projections run as grouped
+    `moe_use_direct_token_gather`), the projections run as grouped
     matmuls, and the results return to token order summed with their router
     weights in fp32 (`maxtext layers/moe.py:940` `permute`, `:1101`
     `unpermute`). `dispatch` and `capacity_factor` are `expert_dispatch`'s;
     `expert_projection` holds one precision contract under both dispatches.
+
+    `relu2` is Nemotron-H's ungated expert: up_proj, squared ReLU, down_proj.
+    It allocates no gate and uses two grouped matmuls. Other activations
+    keep the gated three-projection path.
 
     `swiglu_limit` is DeepSeek V4's clamp before the activation
     (`DeepseekV4Experts._apply_gate`): the gate is capped from above and the up
@@ -999,9 +1003,13 @@ class ExpertMLP(nn.Module):
                 f"swiglu_limit caps the gate and up projections, so it is "
                 f"positive, got {self.swiglu_limit}; None leaves them unclamped")
         expert = functools.partial(ExpertLinear, num_experts=self.num_experts)
-        self.gate_proj = expert(in_features=self.out_features,
-                                features=self.hidden_features, init_std=self.init_std,
-                                name='gate_proj')
+        if self.activation == 'relu2':
+            if self.swiglu_limit is not None:
+                raise ValueError('swiglu_limit requires gated experts')
+        else:
+            self.gate_proj = expert(in_features=self.out_features,
+                                    features=self.hidden_features, init_std=self.init_std,
+                                    name='gate_proj')
         self.up_proj = expert(in_features=self.out_features,
                               features=self.hidden_features, init_std=self.init_std,
                               name='up_proj')
@@ -1011,13 +1019,17 @@ class ExpertMLP(nn.Module):
                                           else self.output_init_std))
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
-                 kernels: tuple[jax.Array, jax.Array, jax.Array], *, dtype: Dtype) -> jax.Array:
+                 kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
         def linear(x: jax.Array, kernel: jax.Array) -> jax.Array:
             return jnp.asarray(expert_projection(
                 x, kernel, sizes, dtype, self.implementation, self.precision))
 
         # The same residual names as the dense MLP's, so one remat policy
         # covers both (decoder_block.RESIDUALS).
+        if self.activation == 'relu2':
+            up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
+            hidden = jnp.square(nn.relu(up))
+            return checkpoint_name(linear(hidden, kernels[1]), 'down_proj')
         gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
         up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
         if self.swiglu_limit is not None:
@@ -1035,13 +1047,14 @@ class ExpertMLP(nn.Module):
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
         if weights.shape != indices.shape:
             raise ValueError(f"routing {indices.shape} does not describe weights {weights.shape}")
-        kernels = (self.gate_proj.kernel, self.up_proj.kernel, self.down_proj.kernel)
-        # One compute dtype for all three projections, named rather than
+        names = ('up_proj', 'down_proj') if self.activation == 'relu2' else tuple(EXPERT_AXES)
+        kernels = tuple(getattr(self, name).kernel for name in names)
+        # One compute dtype for every projection, named rather than
         # inferred inside the dispatch, where the parameters may be widened.
         compute = expert_compute_dtype(x, *kernels, dtype=self.dtype)
         slots = expert_dispatch(
             functools.partial(self._project, dtype=compute), x, indices, kernels,
-            tuple(EXPERT_AXES.values()), num_experts=self.num_experts, dispatch=self.dispatch,
+            tuple(EXPERT_AXES[name] for name in names), num_experts=self.num_experts, dispatch=self.dispatch,
             initializing=self.is_initializing(), output_dtype=compute,
             input_weights=weights if self.scale_inputs else None,
             capacity_factor=self.capacity_factor)
@@ -1066,7 +1079,7 @@ class ExpertMLP(nn.Module):
     ("routed_expert_up_proj",): (None, "embed"),
 })
 class SparseMLP(nn.Module):
-    """A router over `num_experts` gated MLPs, `top_k` of them per token.
+    """A router over `num_experts` MLPs, `top_k` of them per token.
 
     Goes where `GatedMLP` goes and holds the submodules a Hugging Face sparse
     layer names: `gate`, `experts`, and with `shared` (a factory taking a name)

@@ -138,6 +138,14 @@ def _any_value(key: str, hf_config: Mapping[str, object]) -> bool:
     return True
 
 
+def _repeats(name: str, section: str | None = None) -> Callable[[str, Mapping[str, object]], bool]:
+    """A legacy field is inert only when it repeats the reference's field."""
+    def repeats(key: str, hf_config: Mapping[str, object]) -> bool:
+        record = hf_config if section is None else hf_config.get(section)
+        return isinstance(record, Mapping) and record.get(name) == hf_config[key]
+    return repeats
+
+
 # Fields released configs carry that the pinned reference (transformers
 # 5.16.1) neither declares on the family's config class nor reads in its
 # modeling, so the reference computes the same model whatever they hold.
@@ -158,6 +166,17 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Qwen2.5's text configs state the multimodal rotary off; on, it is a
     # Qwen2-VL rotary the qwen2 reference never applies.
     'qwen2': {'use_mrope': lambda key, hf_config: hf_config[key] is False},
+    # Released Nemotron-H configs retain these older names. The native
+    # reference reads layer_norm_epsilon, has no rotary positions, and
+    # derives dt directly from the Mamba projection.
+    'nemotron_h': {
+        'mamba_num_groups': _repeats('n_groups'),
+        'mamba_state_dim': _repeats('ssm_state_size'),
+        'num_query_groups': _repeats('num_key_value_heads'),
+        'rms_norm_eps': _repeats('layer_norm_epsilon'),
+        'norm_eps': _repeats('layer_norm_epsilon'),
+        **dict.fromkeys(('time_step_rank', 'rope_theta', 'partial_rotary_factor'), _any_value),
+    },
     # The published HF ports carry mamba_ssm's own fields. The reference
     # normalizes with MambaRMSNormGated alone and gates before it
     # normalizes (modeling_mamba2.py:417, :477 passes norm_before_gate=False,
@@ -174,6 +193,12 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
         'time_step_init_scheme': _any_value,
         'time_step_scale': _any_value,
     },
+    # Ornith's Qwen3.5 wrappers repeat the text width at the top level.
+    # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
+    # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
+    # modeling_qwen3_5_moe.py:1868).
+    'qwen3_5': {'hidden_size': _repeats('hidden_size', section='text_config')},
+    'qwen3_5_moe': {'hidden_size': _repeats('hidden_size', section='text_config')},
 }
 
 
@@ -202,6 +227,38 @@ def _inert(model_type: object, hf_config: Mapping[str, object]) -> set[str]:
 
 def _refuse(field: str, detail: str) -> NoReturn:
     raise ValueError(f"{field} is not expressible: {detail}")
+
+
+class DrafterRefused(ValueError):
+    """Raised, by design, for a config.json that describes a speculative drafter.
+
+    A drafter reads a target model's hidden states and drafts through the
+    target's embedding and head, which its checkpoint does not carry, so it is
+    no language model on its own. The message names its architecture, the
+    target layers it reads and where its draft arithmetic lives. It is a
+    ValueError, so a caller that catches ValueError catches it too.
+    """
+
+
+def _refuse_drafter(hf_config: Mapping[str, object]) -> None:
+    """Refuse a SpecForge DFlash drafter, DSpark's among them, by the
+    `num_target_layers` it places its target layers by (dflash.py:256-298 in
+    RadixArk/Kimi-K3-DSpark at 3c5bac3). DFlashDraftModel, DFlash2DraftModel,
+    DSparkDraftModel and Qwen3DSparkModel all carry it under model_type qwen3,
+    beside the layers they read in dflash_config or at the top level."""
+    if 'num_target_layers' not in hf_config:
+        return
+    nested = hf_config.get('dflash_config')
+    taps = (nested.get('target_layer_ids') if isinstance(nested, Mapping) else None) or hf_config.get(
+        'target_layer_ids')
+    read = f"after its layers {taps}" if taps else "after the layers dflash.py spaces over them"
+    raise DrafterRefused(
+        f"architectures {hf_config.get('architectures')} is not expressible: it is a speculative "
+        f"drafter that reads a {hf_config['num_target_layers']}-layer target's hidden states {read} "
+        "and drafts through that target's embedding and head, which its checkpoint does not "
+        "carry. The draft arithmetic it is served with lives in SGLang's speculative decoding "
+        "(DSPARK, DFLASH), not in a model Dew builds; Dew drafts with a drafter its target's "
+        "own checkpoint carries (CausalTransformer.draft)")
 
 
 def _refuse_encoder_fields(text: Mapping[str, object]) -> None:
@@ -710,8 +767,9 @@ def _softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
 
 
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
-    """Translate one registered family, refusing computation with no counterpart."""
+    """Translate one registered family's config, refusing any setting Dew does not compute."""
 
+    _refuse_drafter(hf_config)
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
     # whole model and whose text_config holds the decoder;
@@ -1483,10 +1541,9 @@ def _stack_experts(params: LazyTree) -> None:
         nested = block.get('block') if isinstance(block, dict) else None
         if depth.startswith(('mtp_', 'dspark_')) and isinstance(nested, dict):
             blocks.append((depth, nested))
-    for layer, block in blocks:
-        mlp = block.get('mlp')
-        if not isinstance(mlp, dict):
-            continue
+    slots = [(f'{layer}.{name}', slot) for layer, block in blocks for name, slot in block.items()
+             if name in ('mlp', 'self_attn') and isinstance(slot, dict)]
+    for layer, mlp in slots:
         experts = mlp.get('experts')
         if not isinstance(experts, dict):
             continue
@@ -1522,29 +1579,30 @@ def translate_weights(
     param_dtype: str = "float32",
     lazy: bool = False,
 ) -> Variables:
-    """Map HF tensors into a CausalTransformer tree. Parameters default to FP32.
+    """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by default.
 
-    Each tensor goes through its family's `prepare_weights` and `weight_path`;
-    a 2-D kernel is transposed from torch's [out, in] to Dense's [in, out],
-    and per-expert tensors stack onto an expert axis.
+    Each tensor goes through its family's `prepare_weights` and `weight_path`. A
+    2-D kernel is transposed from torch's [out, in] to Dense's [in, out], and
+    per-expert tensors are stacked on an expert axis.
 
-    A tied checkpoint carries lm_head.weight as well, as a copy of the
-    embedding (Qwen3-0.6B does). The copy is checked and dropped. The tree has
-    one leaf for the two, and a checkpoint whose "tied" head is a different
-    matrix would otherwise load as a model that computes something else.
-    param_dtype changes floating parameter storage, independently of compute
-    dtype. Router and frozen state remain FP32; integer indices retain their
-    native dtype. Conversion happens per leaf before its layout copy.
+    A tied checkpoint also stores lm_head.weight as a copy of the embedding
+    (Qwen3-0.6B does). The copy is checked and dropped, because the tree has one
+    leaf for both, and a checkpoint whose "tied" head were a different matrix
+    would otherwise load as a model that computes something else.
 
-    With `lazy` every leaf is a `SourceLeaf` over the stored tensors, read
-    only when it is placed (`dew.interop.streaming`); otherwise each is read
+    `param_dtype` sets the storage dtype of floating parameters, separately from
+    the compute dtype. Router and frozen state stay in FP32, and integer indices
+    keep their own dtype. Each leaf is converted before its layout copy.
+
+    With `lazy`, every leaf is a `SourceLeaf` over the stored tensors that is read
+    only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
     whole here.
 
-    `model_type` names the source's own family where the caller read it off
-    a config.json. Without it the family comes from the record, which is
-    what the backbone would be built from and so cannot tell two families
-    apart that compute the same thing under different tensor names: Kimi
-    K2.5's decoder is DeepSeek V3's computation nested under
+    `model_type` names the source's own family when the caller read it from a
+    config.json. Without it, the family comes from the record, which describes
+    what the backbone would be built from, so it cannot tell apart two families
+    that compute the same thing under different tensor names. Kimi K2.5's
+    decoder, for example, is DeepSeek V3's computation nested under
     `language_model.`.
     """
     family = (_family_for_config(config) if model_type is None

@@ -57,9 +57,11 @@ from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
+    OMITTED,
     Aux,
     EMASpec,
     Objective,
+    Omitted,
     PathFilter,
     Prediction,
     Ratio,
@@ -602,7 +604,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         head_chunks: int = 4,
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         samples: Samples | None = None,
-        variables: Variables | None = None,
+        variables: Variables | None | Omitted = OMITTED,
         balance_rate: float | None = None,
         aux_loss_alpha: float | None = None,
         seq_aux: bool = True,
@@ -613,13 +615,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
         token_accuracy: bool = True,
-        processor: Processor | None = None,
+        processor: Processor | None | Omitted = OMITTED,
     ):
         """Build the objective; the class docstring describes each argument."""
         if isinstance(model, Source):
-            variables = model.variables if variables is None else variables
-            processor = model.text_processor if processor is None else processor
+            variables = model.variables if variables is OMITTED else variables
+            processor = model.text_processor if processor is OMITTED else processor
             model = model.model
+        variables = None if variables is OMITTED else variables
+        processor = None if processor is OMITTED else processor
         decoder = _decoder(model)
         if decoder is not None and decoder.causal is False:
             raise ValueError("LMObjective requires a causal model for next-token likelihoods")

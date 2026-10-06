@@ -335,6 +335,17 @@
    ],
    "note": "Brownian records call the upstream scheduler's torchsde-backed sampler (torchsde 0.2.6 documented at tool:28)."
   },
+  "diffusers/source_rounding.npz": {
+   "tool": "tools/diffusers_source_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "0.34.0",
+     "runs": "diffusers"
+    }
+   ],
+   "note": "The rounding mode with copies=32. Five pointwise source_schedulers cases use independent initial states and replayed per-step JAX noise on (2, 3, 128), both precisions over the same float32 inputs. CFG epsilon uses 52 pixel orders of the original (2, 3, 4) input and cotangent; each float64 VJP commutes with its order within 1e-12 relative RMS, and order zero reproduces the original float32 gradient bit for bit. Original source_schedulers arrays are unchanged. Torch 2.14.0+cpu, JAX 0.11.2.post3."
+  },
   "diffusers_handoff.npz": {
    "tool": "tools/diffusers_handoff_reference.py",
    "sources": [
@@ -452,7 +463,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3."
+   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3. orders.npz holds 52 spatial channel permutations of unet/variant, with every float64 output and gradient checked against the identity and its fp32 identity reproduced bit for bit."
   },
   "flaxdiff_pipeline": {
    "tool": "tools/flaxdiff_pipeline_reference.py",
@@ -484,7 +495,7 @@
      "runs": "jax"
     }
    ],
-   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors): the closing clean prediction."
+   "note": "RK4Sampler.sample_step and MultiStepDPM.take_next_step through DiffusionSampler.sample_step, on KarrasVENoiseScheduler, walked as generate_samples walks its grid, around a stand-in denoiser; x_T and the cotangent are inputs. Also generate_samples as published from x_T (its priors): the closing clean prediction. rounding.npz adds RK4's clipped output over four copies of the independent initial states (128, 64); its float64 namespace widens every explicit jnp.float32 timestep cast so sigma arithmetic also runs in float64. The original solvers.npz arrays are unchanged."
   },
   "flow/densities.npz": {
    "tool": "tools/flow_density_reference.py",
@@ -711,6 +722,28 @@
    ],
    "note": "Fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers; its batching helper and output container are stand-ins."
   },
+  "guidance/apg_ensemble.npz": {
+   "tool": "tools/guidance_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The apg-ensemble mode executes the same published AdaptiveProjectedGuidance over 1024 independent initial states (torch seed 23), in float32 and float64. Every existing apg.npz result is checked to regenerate bit for bit."
+  },
+  "guidance/apg_projection.npz": {
+   "tool": "tools/guidance_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The apg-projection mode executes the published AdaptiveProjectedGuidance over 1024 pairs of nearly parallel raw predictions (torch seed 29), at ordinary, 1e30 and 1e-20 scales and with branches of different scales, without a norm clip, in float32 and float64. This isolates the projection's precision, exponent range and norm floor from model, norm-clip and Euler rounding."
+  },
   "guidance/autoguidance.npz": {
    "tool": "tools/guidance_reference.py",
    "sources": [
@@ -783,6 +816,22 @@
     }
    ]
   },
+  "hf/deepseek-v4-dspark-tiny": {
+   "tool": "tools/deepseek_v4_dspark_reference.py",
+   "sources": [
+    {
+     "repo": "deepseek-ai/DeepSeek-V4-Flash-0731",
+     "version": "7872f01b1d1fe23eabc4c98b48bffcef5a386062",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The release's inference/model.py over the V4.1 tool's kernel stand-ins with the quantizers and the indexer's rotation off for DSpark's drafts, transformers for the trunk's logits; both in float64 for reference_f64.npz (tools/deepseek_v4_dspark_reference.py:1)."
+  },
   "hf/deepseek-v4-tiny/logits.npy": {
    "tool": "tools/hf_reference_b.py",
    "sources": [
@@ -814,7 +863,7 @@
      "runs": "model"
     }
    ],
-   "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:54)."
+   "note": "Downloaded release code with local kernel stand-ins and documented patches (tools/deepseek_v41_reference.py:60). orders.npz records 52 residual orders (rounding_orders.py, seed 0), the reference's plain-SGD distances, identity reproduction and float64 invariance under every order."
   },
   "hf/deepseek-v41-tiny/kernels.npz": {
    "tool": "tools/deepseek_v41_reference.py",
@@ -1876,6 +1925,48 @@
    ],
    "note": "Dew's reference_logits helper calls the actual Transformers model; no Dew model forward."
   },
+  "hf/nemotron-h-moe-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--nemotron-h-only; ungated ReLU² experts, grouped sigmoid top-k with nonzero selection bias, and an ungated shared expert. Seed 2024."
+  },
+  "hf/nemotron-h-moe-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
+  },
+  "hf/nemotron-h-moe-latent-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "--nemotron-h-only; latent routed experts with unnormalized sigmoid weights and a full-width shared branch. Seed 2024."
+  },
+  "hf/nemotron-h-moe-latent-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
+   "note": "The same fp32 weights widened through SSD, norms, attention, router type casts and head."
+  },
+  "hf/nemotron-h-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "--nemotron-h-only; grouped SSD, positionless GQA and ReLU² MLP. source.json pins commit 93c8b7b485963a10800c91f55304db6be211c2bd and seed 2024."
+  },
+  "hf/nemotron-h-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "--nemotron-h-only; the same fp32 checkpoint widened through the reference's SSD, norm, softmax and head casts."
+  },
   "hf/mixtral-tiny/generate.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -2533,6 +2624,27 @@
    ],
    "note": "PEFT 0.20.0's get_peft_model on tests/fixtures/hf/llama-tiny writes each adapter directory and runs its forward and backward: use_rslora with a rank and an alpha pattern, and lora_dropout 0.25 in training mode with each target's dropout module on a recorded mask; logits, mean next-token cross entropy and every factor's gradient in float32 and float64."
   },
+  "lpips": {
+   "tool": "tools/lpips_reference.py",
+   "sources": [
+    {
+     "repo": "End2End-Diffusion/REPA-E",
+     "version": "2ad4e9f69234c109497fb41d3e5e555de7b4b0de",
+     "runs": "fetched"
+    },
+    {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    },
+    {
+     "repo": "pytorch/pytorch",
+     "version": "2.14.0",
+     "runs": "torch"
+    }
+   ],
+   "note": "Executes REPA-E's loss/lpips.py LPIPS (ScalingLayer, NetLinLayer, vgg16, normalize_tensor, spatial_average) as published in eval mode, its weights read from drawn tables (drawn.npz: distances and the mean's gradient in float32 and float64) and from the published torchvision vgg16-397923af.pth and richzhang v0.1 vgg.pth (published.npz: distances)."
+  },
   "mamba2": {
    "tool": "tools/mamba2_reference.py",
    "sources": [
@@ -2838,12 +2950,17 @@
      "runs": "diffusers"
     },
     {
+     "repo": "pytorch/vision",
+     "version": "0.29.0",
+     "runs": "torchvision"
+    },
+    {
      "repo": "pytorch/pytorch",
      "version": "2.14.0",
      "runs": "torch"
     }
    ],
-   "note": "regularizer.npz: KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced. step.npz: executes train_repae.py's loop body from vae.train() through the SiT update, with AutoencoderKL.forward, DiagonalGaussianDistribution, SiT.forward, interpolant, unpatchify, init_bn, extract_latents_stats, LabelEmbedder, build_mlp, ReconstructionLoss_Single_Stage, requires_grad, update_ema and preprocess_imgs_vae as published, around tests/fixtures/tiny_diffusers' SD VAE run by diffusers and stand-in SiT layers, at l1_lpips_kl_gan.yaml with perceptual_weight and discriminator_weight 0 (Dew's L1 + KL scope); the draws are DiffusionObjective's from jax.random.key(11)."
+   "note": "regularizer.npz: KL executes fetched upstream class; reconstruction and BatchNorm setup are locally reproduced. step.npz: executes train_repae.py's loop body from vae.train() through the SiT update and the discriminator update, with AutoencoderKL.forward, DiagonalGaussianDistribution, SiT.forward, interpolant, unpatchify, init_bn, extract_latents_stats, LabelEmbedder, build_mlp, ReconstructionLoss_Single_Stage, PerceptualLoss over LPIPS (loss/lpips.py, torchvision's vgg16 layout), NLayerDiscriminator and weights_init, requires_grad, update_ema and preprocess_imgs_vae as published, at configs/l1_lpips_kl_gan.yaml as published (LPIPS at 1.0, the PatchGAN at 0.1 from step 0); around tests/fixtures/tiny_diffusers' SD VAE run by diffusers, LPIPS weights from lpips_reference.drawn_weights(), the discriminator at ndf=8 (the published 64 at an eighth of the width) with its weights carried, and stand-in SiT layers; the draws are DiffusionObjective's from jax.random.key(11)."
   },
   "rl/advantage.npz": {
    "tool": "tools/parity_rl.py",
@@ -3536,6 +3653,18 @@
     "hf/qwen38-dense-tiny/video_0.npy",
     "hf/qwen38-dense-tiny/video_1.npy",
     "hf/qwen38-moe-tiny/model.safetensors"
+   ]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "the random weights and probe ids its Nemotron-H references are computed on",
+   "files": [
+    "hf/nemotron-h-tiny/input_ids.npy",
+    "hf/nemotron-h-tiny/model.safetensors",
+    "hf/nemotron-h-moe-tiny/input_ids.npy",
+    "hf/nemotron-h-moe-tiny/model.safetensors",
+    "hf/nemotron-h-moe-latent-tiny/input_ids.npy",
+    "hf/nemotron-h-moe-latent-tiny/model.safetensors"
    ]
   },
   {

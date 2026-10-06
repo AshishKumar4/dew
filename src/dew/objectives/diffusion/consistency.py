@@ -43,7 +43,15 @@ from dew.registry import models, objectives, trainings
 from dew.sampling.solvers import Consistency
 
 from .few_step import SMOOTH_TIME_SCALE
-from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, Training, _own_loss, teacher_variables
+from .objective import (
+    FAKE_SCORE,
+    TEACHER,
+    DiffusionObjective,
+    Training,
+    _own_loss,
+    _unadapted,
+    teacher_variables,
+)
 
 if TYPE_CHECKING:
     from .config import DiffusionRunConfig
@@ -201,12 +209,14 @@ class _Draws(NamedTuple):
 class ConsistencyDistillation(Training):
     """rCM distillation of a saved flow run into a few-step student.
 
-    rCM is sCM's consistency loss regularized by DMD2's, or either one alone when
-    the other's weight is 0 (`ConsistencyDistillationObjective` documents the other
-    fields), under the `Flow` preset, sampling unguided. `teacher` is the teacher
-    run's directory a run loads it from. Its model is this run's `model`, and the
-    student and the fake score start from its weights; an objective built in code
-    takes the teacher's weights instead.
+    rCM is sCM's consistency loss regularized by DMD2's, or either loss alone when
+    the other's weight is 0. It trains under the `Flow` preset and samples unguided.
+    `ConsistencyDistillationObjective` documents the other fields.
+
+    `teacher` is the teacher run's directory, which a run loads; a run without one
+    is refused. The teacher's model is this run's `model`, and the student and the
+    fake score start from the teacher's weights. An objective built in code is given
+    the teacher's weights directly.
     """
 
     preset_class = Flow
@@ -250,11 +260,13 @@ class ConsistencyDistillation(Training):
             guidance=None, steps=run.sampling_steps)
 
     def check_teacher(self, architecture: str) -> None:
-        """Refuse sCM over a teacher whose time embedding changes too fast in time.
+        """Refuse sCM from a teacher whose time embedding changes too fast with time.
 
-        The student starts from the teacher's variables, including its Fourier table,
-        so it trains with the teacher's time scale whatever this run's model config
-        says.
+        The student starts from the teacher's variables, including its Fourier table, so
+        it trains with the teacher's time scale whatever this run's model config says.
+        For continuous consistency with a positive `consistency_weight`, on an
+        architecture that has a `time_scale` field, this raises ValueError unless the
+        teacher trained at `SMOOTH_TIME_SCALE`.
         """
         from .config import DiffusionRunConfig
 
@@ -314,6 +326,10 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     sCM's loss differentiates the student with respect to time, so the
     student's time embedding must be smooth in time. A run config sets
     `simple_dit(time_scale=0.002)` for this, in place of the default 16.
+
+    The teacher and the fake score run through the student's model, so a
+    LoRA-adapted student, whose model asks every tree for its factors, is
+    refused.
     """
 
     def __init__(
@@ -332,6 +348,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
         _own_loss("rCM", kwargs)
+        _unadapted("rCM", model, "teacher and fake score")
         kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)
