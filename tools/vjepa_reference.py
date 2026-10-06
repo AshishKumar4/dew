@@ -12,11 +12,8 @@ them. The tool records both outputs and, against fixed cotangents on both,
 the gradients of the images and of every parameter: once in float32 and
 once in float64 (`diffusers_wan_reference.widened`, under which the sincos
 tables are generated in float64 too), the truth tests/reference_error.py
-measures both from.
-
-One disclosed adaptation: every block's MLP runs on tanh-approximate GELU
-where V-JEPA's runs exact (erf) GELU. Dew's JEPA keeps the tanh GELU for
-the step time it saves (src/dew/nn/backbones/jepa.py).
+measures both from. The blocks run V-JEPA's own exact (erf) GELU, as Dew's
+JEPA does.
 
 Cases:
 - `published`: V-JEPA's `vit_*`/`vit_predictor` construction (LayerNorm
@@ -91,7 +88,7 @@ def jepa():
 
 
 def build(config: dict):
-    """The case's encoder and predictor, tanh GELU in every MLP."""
+    """The case's encoder and predictor."""
     vision_transformer, predictor = jepa()
     norm = partial(torch.nn.LayerNorm, eps=config["eps"])
     encoder = vision_transformer.VisionTransformer(
@@ -104,8 +101,6 @@ def build(config: dict):
         depth=config["pred_depth"], num_heads=config["pred_num_heads"], mlp_ratio=config["mlp_ratio"],
         qkv_bias=True, norm_layer=norm, use_mask_tokens=True, num_mask_tokens=1,
         zero_init_mask_tokens=False)
-    for block in [*encoder.blocks, *head.predictor_blocks]:
-        block.mlp.act = torch.nn.GELU(approximate="tanh")
     return encoder.eval(), head.eval()
 
 
