@@ -42,7 +42,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
-from flax import struct
+from flax import linen as nn, struct
 from flax.typing import PrecisionLike
 
 from dew.nn.inputs import ModelKwarg
@@ -56,7 +56,8 @@ if TYPE_CHECKING:
 
 __all__ = ["AffineHead", "CacheCapacity", "CacheRebuilding", "DenoisingModel", "HiddenStates", "Indexed",
            "Logits", "LogitsFromHidden", "MixedAdmission", "ModelKwarg", "OutputTable", "PackedProjections",
-           "ProjectionGroup", "ProjectionSites", "Recomputing", "StreamedPrediction", "TritonGemm"]
+           "ProjectionGroup", "ProjectionSites", "ReadsTrain", "Recomputing", "StreamedPrediction",
+           "TritonGemm", "declared_groups"]
 
 
 @struct.dataclass
@@ -184,6 +185,14 @@ class ProjectionSites(Protocol):
     def projection_groups(self) -> tuple[ProjectionGroup, ...]: ...
 
 
+def declared_groups(*modules: nn.Module) -> tuple[ProjectionGroup, ...]:
+    """The groups the bound `modules` declare (`ProjectionSites`), in order;
+    a module that declares none, such as a mixer with its own projections,
+    adds nothing."""
+    return tuple(group for module in modules if isinstance(module, ProjectionSites)
+                 for group in module.projection_groups())
+
+
 @runtime_checkable
 class PackedProjections(Protocol):
     """A decoder that serves its decode step from packed projections.
@@ -261,3 +270,13 @@ class TritonGemm(Protocol):
 
     @property
     def keeps_triton_gemm(self) -> bool: ...
+
+
+@runtime_checkable
+class ReadsTrain(Protocol):
+    """A token mixer whose call takes `train` when `reads_train` holds: one
+    that runs a dropout of its own while training. A block passes the flag to
+    such a mixer alone, since another mixer's call does not take it."""
+
+    @property
+    def reads_train(self) -> bool: ...
