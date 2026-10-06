@@ -26,6 +26,7 @@ from flax import linen as nn
 from flax.core import freeze
 from jax.typing import ArrayLike, DTypeLike
 
+from dew.cache import persist_compilations
 from dew.coordination import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
@@ -277,8 +278,11 @@ def _pulled(repo_id: str, revision: str | None) -> str:
 
 
 def run_record(directory: str, step: int | str | None = None) -> Mapping[str, object]:
-    """The inference declaration of the selected checkpoint, not training configuration."""
+    """The inference declaration of the selected checkpoint, not training
+    configuration. A task loaded from it compiles into the persistent cache
+    (`persist_compilations`)."""
     from dew.checkpoints import Checkpoints
+    persist_compilations()
     record = Checkpoints(directory).artifact(step)
     if record is None:
         raise ValueError("this checkpoint's objective declares no inference record; declare "

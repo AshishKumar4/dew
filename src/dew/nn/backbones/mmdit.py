@@ -175,7 +175,12 @@ class SimpleMMDiT(_DiTStackOptions):
         ]
         self.output = self._output(self.patch_size, self.output_channels, modulated=True)
 
-    def __call__(self, x, temb, textcontext, train: bool = False):  # textcontext is required
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `textcontext`, which runs as a second stream through every block."""
+        return "textcontext"
+
+    def __call__(self, x, temb, textcontext, train: bool = False):
         _, H, W, _ = x.shape
 
         img, inv_idx = self.embed(x)
@@ -275,18 +280,15 @@ class HierarchicalMMDiT(_AttentionStackOptions):
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
-        """Its `remat` as a checkpoint's rung records it (`Recomputing`)."""
         return self.remat
 
     @nn.nowrap
     def recompute_more(self) -> Self | None:
-        """This stack one rung up `DIFFUSION_REMAT`, or None at its top (`Recomputing`)."""
         stronger = stronger_remat(self.remat)
         return None if stronger is None else self.clone(remat=stronger)
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
-        """This stack at `record`'s rung where that is above its own (`Recomputing`)."""
         restored = restored_remat(self.remat, record)
         return self if restored is None else self.clone(remat=restored)
 
@@ -374,6 +376,11 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         self.decoder_path(num_stages)
 
         self.output = self._output(self.base_patch_size, self.output_channels, modulated=True)
+
+    @property
+    def text_keyword(self) -> str:
+        """Every call takes the text as `textcontext`, which runs as a second stream through every block."""
+        return "textcontext"
 
     def __call__(self, x, temb, textcontext, train: bool = False):
         _, H, W, _ = x.shape

@@ -61,6 +61,14 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
             'latent_shift': np.asarray(self.latent_shift).tolist(),
             'latent_scale': np.asarray(self.latent_scale).tolist()}}
 
+    def moments(self, params, images):
+        """Return `AutoencoderKL.moments` of the frames, which `encode_batch` draws its latent from."""
+        return jnp.asarray(self.model.apply({"params": params}, images, method=self.model.moments))
+
+    def decode_raw(self, params, latents):
+        """Decode a posterior draw as `decode_batch` does, traced in the caller's step, not jitted apart."""
+        return jnp.asarray(self.model.apply({"params": params}, latents, method=self.model.decode))
+
     @property
     def downscale_factor(self) -> int:
         return self._downscale_factor

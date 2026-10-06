@@ -221,6 +221,11 @@ class TorchCausalLM(nn.Module):
         architectures all predict each token from the ones before it."""
         return True
 
+    @property
+    def mask_token_id(self) -> int | None:
+        """None: a causal LM is not trained to fill masked tokens."""
+        return None
+
     def __call__(self, tokens, train: bool = False) -> jax.Array:
         logits, _ = self._run(tokens)
         return logits.astype(jnp.float32)
