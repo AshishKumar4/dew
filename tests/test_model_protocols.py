@@ -456,8 +456,8 @@ def _decoding(name: str) -> dict:
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
     """The resized model reads the same variables to the model's logits, and
     a causal one decodes into a cache of `CAPACITY` slots and draws the same
-    tokens; its attention reduces over the shorter cache, so the cached
-    logits agree to rounding."""
+    tokens. Its attention reduces over the shorter cache, so the cached
+    logits are the model's bits or as exact as them (`as_exact`)."""
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     sized = model.with_cache_capacity(CAPACITY)
@@ -470,8 +470,8 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
-    for got, want in zip(sized_scores, scores, strict=True):
-        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-5)
+    as_exact(sized_scores, scores, lambda: _greedy(_float64(model), widened(variables), read.tokens,
+                                                   forced=drawn, **_decoding(name))[2], "cached logits")
 
 
 def _float64(model):
