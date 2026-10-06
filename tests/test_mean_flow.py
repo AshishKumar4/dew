@@ -205,6 +205,9 @@ def test_the_time_embeddings_take_the_models_time_scale():
 
 
 def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():
+    """The run's model embeds the interval's duration (`IntervalModel`), and
+    its time features turn at `SMOOTH_TIME_SCALE` (`TimeScaled`) unless its
+    config names a scale."""
     from dew.config import ModelConfig
     from dew.data import TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, MeanFlowTraining
@@ -214,5 +217,5 @@ def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_on
                                   preset=presets.MeanFlow(), solver=Euler(), guidance=None, text=None,
                                   val_metrics=(), mode=MeanFlowTraining()).build().model
 
-    assert built({"patch_size": 2}).time_scale == 0.002
+    assert built({"patch_size": 2}).time_scale == 0.002 and built({"patch_size": 2}).interval
     assert built({"patch_size": 2, "time_scale": 16}).time_scale == 16
