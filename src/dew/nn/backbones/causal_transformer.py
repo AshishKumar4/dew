@@ -64,6 +64,7 @@ from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, head_dot_general, head_product, scaled
+from ..protocols import OutputTable
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
     RESIDUAL,
@@ -1829,6 +1830,17 @@ class CausalTransformer(nn.Module):
         """Return the final normalized states, without the vocabulary projection."""
         return self.hidden_and_mtp_inputs(tokens, **kwargs)[0]
 
+    def logits(self, tokens, *, train: bool = False, **fields):
+        """Return the `[B, S, vocab]` fp32 logits of the whole sequence: the
+        head `__call__` scores with over `hidden_states`, which takes `fields`.
+        Without `decode` the call writes no cache."""
+        return self._logits(self.hidden_states(tokens, train=train, **fields))
+
+    def logits_from_hidden(self, hidden):
+        """Return the logits of final states `hidden`, through the head
+        `__call__` and every MTP depth score with."""
+        return self._logits(hidden)
+
     def hidden_and_mtp_inputs(self, tokens, train: bool = False, decode: bool = False,
                               positions=None, segment_ids=None,
                               input_embeddings=None,
@@ -2356,6 +2368,28 @@ class CausalTransformer(nn.Module):
         if self.tie_embeddings:
             return params['embed_tokens']['embedding'], True
         return params['lm_head']['kernel'], False
+
+    def output_table(self) -> OutputTable | None:
+        """Return the head as the matrix `logits_from_hidden` contracts, from the bound variables.
+
+        The matrix is the parameter itself, as `head_table` gives it, with the
+        vocabulary bias, the softcap and the precision `_logits` applies. It
+        is None where no matrix alone gives the logits: past a
+        `head_transform`, and when the untied head's scope holds variables
+        beside its kernel, which its call contracts as well (`dew.lora`'s
+        factors on `lm_head`, which its interceptor adds to the product).
+        """
+        if self.head_transform is not None:
+            return None
+        if self.tie_embeddings:
+            matrix, vocab_major = self.embed_tokens.embedding, True
+        else:
+            head = self.lm_head.variables["params"]
+            if set(head) != {"kernel"}:
+                return None
+            matrix, vocab_major = head["kernel"], False
+        return OutputTable(matrix, vocab_major, self.head_bias_value if self.head_bias else None,
+                           self.final_logit_softcap, self.precision)
 
     def init_cache(self, batch_size: int):
         """Allocate a zeroed decode cache for `batch_size` sequences.
