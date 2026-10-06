@@ -1,5 +1,7 @@
 """Clef's layout and head against Clef's own code (Cloudflare/clef 2f3de3dd), under the float64 rule."""
 
+import base64
+import io
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -8,6 +10,7 @@ import jax
 import numpy as np
 import optax
 import pytest
+from PIL import Image
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
@@ -15,6 +18,7 @@ from dew.checkpoints import Checkpoints
 from dew.data.text import HFTokenizer
 from dew.decision import (
     Choice,
+    ChoiceAnswer,
     Decide,
     DecisionInputs,
     DecisionObjective,
@@ -29,6 +33,7 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.clef import ClefHead
+from dew.decision.images import Images
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -192,7 +197,48 @@ def test_a_clef_release_fine_tunes_and_reloads_from_the_run(tmp_path):
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(before, after, strict=True))
 
     live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    assert live.processor is not None  # the release's, which reads images
     asked = {"team": team, "urgent": urgent}
     first, second = live("charged twice!", asked), reloaded("charged twice!", asked)
     for answer, again in zip(first.values(), second.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+
+def test_a_clef_release_reads_images_as_clefs_own_model_does(tmp_path):
+    """A request's images, laid out before the state by the backbone's own
+    processor as Clef's `systemone` lays them out: the same token ids, and
+    logits held to twice Clef's fp32 model's distance from its float64 run,
+    the vision tower included. `systemone` reads them as data URLs."""
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (tmp_path / source.name).symlink_to(source.resolve())
+    decide = Decide.from_pretrained(tmp_path, attention_impl="xla")
+    pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
+    request = CASES["quickstart"]
+    questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+    media = Images.of(decide.processor, pictures, JointLayout.image)
+    [row] = decide.layout.rows(decide.tokenizer, decide.specials, request["state"], questions,
+                               media=media.tokens)
+    assert list(row.tokens) == json.loads((TINY / "images.json").read_text())["ids"]
+    scores = np.asarray(decide.model.logits(decide.variables, DecisionInputs.collate([row], 0),
+                                            media=media.inputs(decide.processor, row)))
+    with np.load(TINY / "images.npz") as logits:
+        names = [laid.name for laid in row.questions]
+        found = [scores[0, slot, :len(laid.options)] for slot, laid in enumerate(row.questions)]
+        reference = [logits[name] for name in names]
+        truth = [logits[f"{name}/f64"] for name in names]
+        assert_as_exact_as_the_reference(np.concatenate(found), np.concatenate(reference),
+                                         np.concatenate(truth), "Clef over Dew's Qwen 3.5, with images")
+
+    def url(picture: Image.Image) -> str:
+        encoded = io.BytesIO()
+        picture.save(encoded, format="PNG")
+        return "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode()
+
+    served = decide.systemone({**request, "images": [url(picture) for picture in pictures]})
+    assert served == decide.systemone({**request, "images": pictures})
+    assert served["usage"]["input_tokens"] == len(row.tokens)
+    seen = decide(request["state"], questions, images=pictures)["department"]
+    assert isinstance(seen, ChoiceAnswer)
+    shown = {option: round(float(p), 4) for option, p in zip(seen.options, seen.probabilities, strict=True)}
+    assert served["answers"]["department"]["probabilities"] == shown
+    assert decide.systemone(request)["answers"] != served["answers"]

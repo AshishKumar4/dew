@@ -9,6 +9,7 @@ from flax.typing import Dtype
 
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
+from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import AffineHead, HiddenStates, OutputTable
 from dew.objectives.base import Variables, part, thaw
 
@@ -35,11 +36,22 @@ class DecisionModel:
             raise TypeError(f"a decision head reads its backbone's final states (`HiddenStates`), "
                             f"which a {type(self.backbone).__name__} does not give")
 
-    def states(self, variables: Variables, inputs: DecisionInputs, *, train: bool = False,
-               rngs: dict[str, jax.Array] | None = None) -> jax.Array:
-        """Return the backbone's `[B, L, features]` final states."""
+    def states(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
+               train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
+        """Return the backbone's `[B, L, features]` final states.
+
+        `media` are the backbone's own inputs for images the rows hold
+        (`Images.inputs`), with which it reads them.
+        """
         backbone = thaw(part(variables, "backbone"))
         method = "hidden_states"
+        if media is not None:
+            if inputs.positions is not None:
+                raise ValueError("a row of option positions holds no images")
+            return _array(self.backbone.apply(
+                backbone, inputs, media, rngs=rngs,
+                method=lambda module, rows, given: module.hidden_states(
+                    rows.tokens, train=train, attention_mask=rows.valid, **given.kwargs())))
         if inputs.positions is None or inputs.slots is None:
             return _array(self.backbone.apply(backbone, inputs.tokens, train=train,
                                               attention_mask=inputs.valid, method=method, rngs=rngs))
@@ -78,10 +90,10 @@ class DecisionModel:
         reduced = jnp.finfo(shape.dtype).bits < 32
         return shape.shape[-1], shape.dtype if reduced else None
 
-    def logits(self, variables: Variables, inputs: DecisionInputs, *, train: bool = False,
-               rngs: dict[str, jax.Array] | None = None) -> jax.Array:
+    def logits(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
+               train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
-        states = self.states(variables, inputs, train=train, rngs=rngs)
+        states = self.states(variables, inputs, media=media, train=train, rngs=rngs)
         table = self.table(variables) if self.head.reads_table else None
         logits = _array(self.head.apply(thaw(part(variables, "head")), states, inputs, table, train=train,
                                         rngs=rngs))
