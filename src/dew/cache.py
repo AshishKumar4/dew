@@ -48,3 +48,18 @@ def enable_compilation_cache(path: str):
     # caching everything keeps startup predictable.
     jax.config.update('jax_persistent_cache_min_entry_size_bytes', -1)
     jax.config.update('jax_persistent_cache_min_compile_time_secs', 0.0)
+
+
+def persist_compilations() -> None:
+    """Point XLA at the on-disk executable cache, unless a directory is set.
+
+    A loaded task compiles for seconds the first time its shapes are seen
+    (a minute for a text-to-image sample on an A100), and a serving process
+    restarts. Training turns the same cache on in `prepare_process`; a task
+    turns it on where it is loaded, `dew.pipeline` or a saved run's record
+    (`dew.inference.tasks.run_record`). Reading the setting is what makes it
+    idempotent and what leaves a trainer's own directory, or a caller's, alone.
+    """
+    if jax.config.jax_compilation_cache_dir:
+        return
+    enable_compilation_cache(default_compilation_cache_dir())

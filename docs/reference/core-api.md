@@ -446,8 +446,10 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 ```text
 pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=None, step=None,
          revision=None) -> TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
-Objective.pipeline(state, *, ema=None) -> the objective's task over state.averaged or state.variables
-LMObjective.pipeline(state, *, ema=None, processor=None) -> TextGeneration
+Objective.pipeline(state, *, ema=None, processor=OMITTED) -> the objective's task (build_task) over
+    state.averaged or state.variables; processor omitted keeps the objective's own, None clears it
+Objective.build_task(variables, *, processor=OMITTED) -> TextGeneration (LM, GRPO, PPO's actor),
+    MaskedGeneration (MDLM), BlockGeneration (block SFT), TextToImage (diffusion, which takes no processor)
 TextGeneration(model, variables, processor=None, sampling=Sampling(), max_new_tokens=None,
                max_length=None, n=1, logits=None, stopping=(), strategy=None)
 task(request, max_new_tokens=None, *, key=None, n=None, sampling=None,
@@ -477,7 +479,6 @@ Adapter.from_run(directory, *, step=None, ema=None) -> Adapter
 Adapter.merge(variables) -> variables;  Adapter.save(variables, path)
 Pretrained.save(directory, *, variables=None, max_shard_size="5GB")
 Pretrained.push_to_hub(repo_id, *, variables=None, private=False, commit_message=..., max_shard_size="5GB")
-PPOObjective.pipeline(state, *, ema=None, processor=None) -> TextGeneration
 TextToImage(model, process, inputs, params, autoencoder=None, steps=50, guidance=None,
             solver=DDIM(), grid=None, final_denoise=True, finish=None, blank=None)
 TextToImage.from_objective(objective, variables) -> TextToImage

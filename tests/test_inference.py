@@ -26,7 +26,7 @@ from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
-from dew.inference import RunProcessor
+from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
@@ -473,10 +473,12 @@ def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
                                atol=2e-6, rtol=2e-6)
 
 
-def test_pipeline_points_xla_at_the_persistent_compilation_cache(tmp_path, monkeypatch):
-    """Loading a task turns the on-disk executable cache on, in the directory
-    the library picks, and a directory somebody already chose survives the
-    next load: a serving process compiles a shape once, ever."""
+@pytest.mark.parametrize("load", [dew.pipeline, TextGeneration.from_run], ids=["pipeline", "from_run"])
+def test_loading_a_task_points_xla_at_the_persistent_compilation_cache(tmp_path, monkeypatch, load):
+    """Loading a task, through `dew.pipeline` or a task's own `from_run`,
+    turns the on-disk executable cache on, in the directory the library
+    picks, and a directory somebody already chose survives the next load: a
+    serving process compiles a shape once, ever."""
     from pathlib import Path
 
     from dew.cache import default_compilation_cache_dir
@@ -486,12 +488,12 @@ def test_pipeline_points_xla_at_the_persistent_compilation_cache(tmp_path, monke
     previous = jax.config.jax_compilation_cache_dir
     try:
         jax.config.update("jax_compilation_cache_dir", None)
-        dew.pipeline(str(tmp_path))
+        load(str(tmp_path))
         chosen = default_compilation_cache_dir()
         assert jax.config.jax_compilation_cache_dir == chosen
         assert Path(chosen).is_dir() and str(tmp_path / "xdg") in chosen
         jax.config.update("jax_compilation_cache_dir", str(tmp_path / "mine"))
-        dew.pipeline(str(tmp_path))
+        load(str(tmp_path))
         assert jax.config.jax_compilation_cache_dir == str(tmp_path / "mine")
     finally:
         jax.config.update("jax_compilation_cache_dir", previous)
