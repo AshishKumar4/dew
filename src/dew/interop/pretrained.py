@@ -635,7 +635,7 @@ class PretrainedDecoder(Pretrained):
     model: CausalTransformer | MultimodalTransformer
 
     @classmethod
-    def from_model(cls, model: CausalTransformer, variables: Variables, *,
+    def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
                    generation_config: Mapping[str, object] | None = None) -> PretrainedDecoder:
         """Wrap a decoder trained in Dew as a bundle that `save` writes in its family's Hugging Face layout.
@@ -645,18 +645,20 @@ class PretrainedDecoder(Pretrained):
         loaded source of the derived family exports through, so both write the same
         weights. Gemma 4 writes frozen or trainable layer-scalar values into HF
         buffers; reloading that layout reproduces the computation, but not which
-        scalars were trainable.
+        scalars were trainable. The config is derived from a `causal_transformer`'s
+        fields, so any other model is refused, naming it.
 
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
         `Pretrained.load` reads back includes its processor. `generation_config` is
         what generation_config.json records, `GENERATION_DEFAULTS` when None.
         """
-        config = decoders._export_config(model)
-        decoders._refuse_lossy_export(model, config)
-        built = {entry.name: getattr(model, entry.name) for entry in dataclasses.fields(model)
+        decoder = _published_decoder(model)
+        config = decoders._export_config(decoder)
+        decoders._refuse_lossy_export(decoder, config)
+        built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
                  if entry.init and entry.name not in ("parent", "name")}
-        return cls(model, variables, None, config, None, built,
+        return cls(decoder, variables, None, config, None, built,
                    decoders.GENERATION_DEFAULTS if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 
@@ -822,12 +824,23 @@ class PretrainedFallback(Pretrained):
     """
 
 
+def _published_decoder(model: nn.Module) -> CausalTransformer:
+    """`model` as the decoder record a Hugging Face decoder family's config is
+    derived from, read through `from_record`; a model of another record has
+    no such layout and is refused, naming it."""
+    try:
+        return from_record(CausalTransformer, model)
+    except ValueError as error:
+        raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout: a decoder family's "
+                        "config is derived from a causal_transformer's fields") from error
+
+
 def _decoder_run(model_config: ModelConfig, model: nn.Module, variables: Variables, kind: str,
                  tokenizer: str | None, generation: Mapping[str, object] | None) -> Pretrained:
     """A `causal_transformer` run, in the Hugging Face family its fields
     derive (`PretrainedDecoder.from_model`); a masked-diffusion run
     generates by unmasking."""
-    decoder = from_record(CausalTransformer, model)
+    decoder = _published_decoder(model)
     bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
                                           generation_config=generation)
     if kind != "masked_diffusion":
