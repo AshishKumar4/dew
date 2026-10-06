@@ -119,7 +119,7 @@ export class LiveSession {
 		});
 		const body = await response.json().catch(() => ({}));
 		if (!response.ok) throw new Error(body.message ?? `The live service answered ${response.status}.`);
-		status('Starting a container and loading the model. This takes about a minute…');
+		status('Connecting to the shared model and opening an isolated Python context…');
 		const socket = new WebSocket(body.socket);
 		const { promise: ready, resolve, reject } = Promise.withResolvers<void>();
 		const onMessage = (event: MessageEvent) => {
