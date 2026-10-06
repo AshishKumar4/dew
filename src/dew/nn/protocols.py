@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 
 __all__ = ["AffineHead", "CacheCapacity", "CacheRebuilding", "DenoisingModel", "HardVocabularyEmbedder",
            "HiddenStates", "Indexed", "Logits", "LogitsFromHidden", "MaskToken", "MixedAdmission",
-           "ModelKwarg", "Ordered", "OutputTable", "PackedProjections", "ProjectionGroup",
+           "ModelKwarg", "Ordered", "OutputTable", "PackedProjections", "Predicting", "ProjectionGroup",
            "ProjectionSites", "ReadsTrain", "Recomputing", "StreamedPrediction", "TritonGemm",
            "declared_groups"]
 
@@ -279,6 +279,21 @@ class Indexed(Protocol):
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
+
+
+@runtime_checkable
+class Predicting(Protocol):
+    """A decoder that declares how many multi-token prediction depths it carries.
+
+    Depth d pairs the state at position p with the embedding of the token at
+    p + d and scores the token after it (arXiv 2412.19437, section 2.2).
+    Through `apply`, `method='mtp_hidden_states'` gives one final-normed
+    state array per depth from the trunk's states and the tokens, and
+    `method='mtp_logits'` their logits under the shared head.
+    """
+
+    @property
+    def num_nextn_predict_layers(self) -> int: ...
 
 
 @runtime_checkable
