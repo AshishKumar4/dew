@@ -82,8 +82,9 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
                         'tmpfs', str(directory)], check=True)
         arguments = ["/kernel.json" if arg == self.connection_file else arg for arg in kernel_cmd[3:]]
         command = [
-            "bwrap", "--unshare-user", "--unshare-net", "--die-with-parent", "--new-session",
-            "--ro-bind", "/", "/",
+            "bwrap", "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
+            "--die-with-parent", "--new-session",
+            "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
             "--size", str(64 * 1024 * 1024), "--tmpfs", "/work",
             "--size", str(16 * 1024 * 1024), "--tmpfs", "/tmp",
             "--ro-bind", str(connection), "/kernel.json",
@@ -97,7 +98,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         env = {
             "PATH": "/opt/venv/bin:/usr/bin:/bin", "HOME": "/work", "TMPDIR": "/tmp",
             "LANG": "C.UTF-8", "PYTHONPATH": "/opt/live", "IPYTHONDIR": "/work/ipython", "JUPYTER_RUNTIME_DIR": "/work/jupyter",
-            "HF_HOME": "/opt/hf", "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu",
+            "HF_HOME": "/work/hf", "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu",
             "JAX_COMPILATION_CACHE_DIR": "/work/xla", "OPENBLAS_NUM_THREADS": "1", "OMP_NUM_THREADS": "1",
             "MALLOC_ARENA_MAX": "2",
             **({"DEW_GUEST_TRACE": "1"} if os.environ.get("DEW_GUEST_TRACE") == "1" else {}),

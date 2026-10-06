@@ -2,6 +2,7 @@
 # Private administrative evaluation. Public routing waits for boundary and
 # memory/concurrency checks; no production configuration invokes this script.
 set -eu
+umask 077
 mkdir -p /run/dew/gateway /sessions/connections /sessions/ipc /work
 chmod 0711 /sessions /sessions/connections /sessions/ipc
 : > /kernel.json
