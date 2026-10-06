@@ -23,7 +23,9 @@ logits, and `logits_from_hidden` is the exact head for a head no matrix alone
 gives. `HardVocabularyEmbedder` is a media embedder's: the range of the text
 vocabulary it embeds itself.
 `DenoisingModel` is an annotation only: every Flax module has a `__call__`, so
-an `isinstance` check on it would hold for any model.
+an `isinstance` check on it would hold for any model. `RequiresText`,
+`IntervalModel` and `TimeScaled` are what a denoiser declares about the
+text and time it reads.
 
 The serving and training hooks are read off the model itself, not through
 `apply`, from the layers it declares; a wrapper answers for its decoder.
@@ -53,10 +55,10 @@ if TYPE_CHECKING:
     from dew.records import JSON
 
 __all__ = ["AffineHead", "CacheCapacity", "CacheRebuilding", "DenoisingModel", "HardVocabularyEmbedder",
-           "HiddenStates", "Indexed", "Logits", "LogitsFromHidden", "MaskToken", "MixedAdmission",
-           "ModelKwarg", "Ordered", "OutputTable", "PackedProjections", "Predicting", "ProjectionGroup",
-           "ProjectionSites", "ReadsTrain", "Recomputing", "StreamedPrediction", "TritonGemm",
-           "declared_groups"]
+           "HiddenStates", "Indexed", "IntervalModel", "Logits", "LogitsFromHidden", "MaskToken",
+           "MixedAdmission", "ModelKwarg", "Ordered", "OutputTable", "PackedProjections", "Predicting",
+           "ProjectionGroup", "ProjectionSites", "ReadsTrain", "Recomputing", "RequiresText",
+           "StreamedPrediction", "TimeScaled", "TritonGemm", "declared_groups"]
 
 
 @struct.dataclass
@@ -269,3 +271,34 @@ class ReadsTrain(Protocol):
 
     @property
     def reads_train(self) -> bool: ...
+
+
+class RequiresText(Protocol):
+    """A denoising model that cannot run without text, which reaches it under
+    the keyword `text_keyword` on every call. Any other runs unconditionally."""
+
+    @property
+    def text_keyword(self) -> str: ...
+
+
+@runtime_checkable
+class IntervalModel(Protocol):
+    """A denoising model that, with its `interval` field set
+    (`model.clone(interval=True)`), embeds the `duration` an interval process
+    hands it beside its time, a missing one as zero; unset, it refuses one."""
+
+    @property
+    def interval(self) -> bool: ...
+
+
+@runtime_checkable
+class TimeScaled(Protocol):
+    """A denoising model whose `time_scale` field is its time's unit: at scale
+    s on time t (and duration d) it computes what it does at s / k on k t (and
+    k d). A loss that differentiates it in time needs the scale small
+    (`dew.objectives.diffusion.few_step.SMOOTH_TIME_SCALE`). A table of time
+    features in the variables, as `FourierEmbedding`'s, is drawn at `init`'s
+    scale and loaded variables keep theirs."""
+
+    @property
+    def time_scale(self) -> float: ...
