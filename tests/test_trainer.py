@@ -588,7 +588,7 @@ def ladder_lm_trainer(directory, fits):
     trainer = make_trainer(directory, objective=objective, optimizer=optax.adam(1e-2))
 
     def headroom(executable, devices, held=0):
-        rung = (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat))
+        rung = (objective.head_tile is not None, trainer_module.recompute_record(objective))
         return 0 if fits(rung) else -1
     return trainer, objective, headroom
 
@@ -623,7 +623,7 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: True)
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     actual = resumed.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
-    assert (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat)) == (
+    assert (objective.head_tile is not None, trainer_module.recompute_record(objective)) == (
         True, 'minimal')
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
@@ -640,7 +640,7 @@ def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(t
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
-    assert trainer_module.remat_record(objective.model.remat) == 'full'
+    assert trainer_module.recompute_record(objective) == 'full'
     assert "the rung its checkpoint trained on" in caplog.text
 
 

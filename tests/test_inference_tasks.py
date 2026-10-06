@@ -9,8 +9,10 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from test_text_rollout_contract import decoder
 
+from dew.diffusion.block import BlockProcess
 from dew.inference import BlockGeneration, TextGeneration
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
@@ -218,6 +220,59 @@ def test_a_diffusion_gemma_source_generates_canvases_without_likelihood_claims()
 
     rebound = task.bind(jax.tree.map(lambda leaf: leaf * 0.5, loaded.variables))
     assert not np.array_equal(rebound(prompts, 7, key=jax.random.key(11)).tokens, result.tokens)
+
+
+class Counting(nn.Module):
+    """A user's own block denoiser, no Dew class: its prefix cache counts the
+    clean tokens it encoded, and it scores each canvas slot as its own
+    position past them, modulo the vocabulary, so a canvas commits the next
+    positions in order."""
+
+    vocab_size: int = 11
+    canvas_length: int = 4
+    max_seq_len: int = 16
+
+    def init_cache(self, batch_size):
+        self.put_variable("cache", "length", jnp.zeros((batch_size,), jnp.int32))
+
+    def encode(self, tokens, **fields):
+        self.put_variable("cache", "length", self.get_variable("cache", "length") + tokens.shape[1])
+        return jnp.zeros((*tokens.shape, self.vocab_size))
+
+    @nn.compact
+    def __call__(self, tokens, *, self_conditioning_logits=None, self_conditioning_mask=None):
+        scale = self.param("scale", nn.initializers.constant(30.0), ())
+        encoded = (self.get_variable("cache", "length") if self.has_variable("cache", "length")
+                   else jnp.zeros(tokens.shape[0], jnp.int32))
+        position = encoded[:, None] + jnp.arange(tokens.shape[1])
+        return scale * jax.nn.one_hot(position % self.vocab_size, self.vocab_size)
+
+
+def test_a_user_block_denoiser_generates_through_the_block_task():
+    """Block generation runs on what a block denoiser does (`BlockDenoiser`),
+    not on DiffusionGemma: a user module that encodes a prompt into its
+    cache, refines canvases against it and commits them through `encode`
+    continues the prompt's positions canvas after canvas, cropped to the
+    budget."""
+    model = Counting()
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = BlockGeneration(model, variables, BlockProcess(canvas_length=4, vocab_size=11))
+    generated = task([[1, 5, 7], [2, 4, 6]], 6, key=0)
+    np.testing.assert_array_equal(generated.tokens,
+                                  [[1, 5, 7, 3, 4, 5, 6, 7, 8], [2, 4, 6, 3, 4, 5, 6, 7, 8]])
+    np.testing.assert_array_equal(generated.lengths, [6, 6])
+    assert not bool(generated.terminated.any())
+
+
+def test_a_causal_decoder_is_no_block_denoiser_and_the_task_names_what_it_lacks():
+    """A causal language model scores tokens, but has no canvas to refine or
+    clean tokens to commit, so block generation refuses it by name rather
+    than fail inside the loop."""
+    model = decoder("attention")
+    task = BlockGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                           BlockProcess(canvas_length=4, vocab_size=model.vocab_size))
+    with pytest.raises(TypeError, match=r"block denoiser \(BlockDenoiser\).* has no canvas_length, encode"):
+        task([[1, 2, 3]], 4, key=0)
 
 
 def test_seed_is_the_key():
