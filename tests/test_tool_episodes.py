@@ -16,6 +16,7 @@ from flax import linen as nn
 
 from dew.data import Dataset
 from dew.inference import TextGeneration
+from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.episodes import (
@@ -57,8 +58,6 @@ class ToolPolicy(nn.Module):
 
     vocab_size: int = VOCAB
     max_seq_len: int = PROMPT + RESPONSE
-    final_logit_softcap = None
-    precision = None
 
     def setup(self):
         self.table = self.param("table", lambda key: jnp.asarray(transition_logits()))
@@ -66,8 +65,8 @@ class ToolPolicy(nn.Module):
     def hidden_states(self, tokens, train=False, attention_mask=None, positions=None, segment_ids=None):
         return jax.nn.one_hot(tokens, self.vocab_size)
 
-    def head_weight(self, params):
-        return params["table"]
+    def output_table(self):
+        return OutputTable(self.table, vocab_major=False)
 
     @nn.compact
     def init_cache(self, batch_size):

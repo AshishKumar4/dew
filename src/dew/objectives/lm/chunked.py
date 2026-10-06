@@ -43,6 +43,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import at_least_fp32, head_product, rounded_operand, rounded_to, rounds_to_bf16
+from dew.nn.protocols import OutputTable
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -106,6 +107,22 @@ def _capped(logits, softcap, temperature: float = 1.0):
 def _biased_logits(logits, bias):
     """The vocabulary bias after the product's rounding, in fp32 or wider."""
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
+
+
+def affine_head(model, variables) -> OutputTable:
+    """`model`'s head over `variables` as the matrix the functions here contract (`AffineHead`).
+
+    A model whose final states reach the vocabulary through more than one
+    matrix, past a prediction head or an adapter's factors on it, is refused:
+    its logits come from no table a tile can slice.
+    """
+    table = model.apply(variables, method="output_table")
+    if table is None:
+        raise ValueError(
+            f"a prediction head or an adapter's factors sit between this {type(model).__name__}'s "
+            f"final states and its vocabulary, so no matrix alone gives its logits, and the head "
+            f"is scored one vocabulary tile at a time")
+    return table
 
 
 def head_logits(hidden, head_weight, *, softcap: float | None,
@@ -717,7 +734,7 @@ SUPPORT_BLOCK = 1 << 15
 
 def support_log_probs(hidden, head_weight, targets, support_ids, support_columns, *,
                       temperature: float = 1.0, softcap: float | None = None,
-                      precision: PrecisionLike = None, bias=None):
+                      precision: PrecisionLike = None, vocab_major: bool = False, bias=None):
     """Each target's log-probability renormalized over its recorded sampling support.
 
     Keep-sampling-mask (DeepSeek-V3.2 section 3.1; slime 5bae5bb `loss.py`
@@ -731,11 +748,13 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
     row's kept ids back to back and `support_columns` `[B, C]` the column of
     the target each belongs to, both -1 on padding, so the arrays shard with
     their rows. Only those columns of the head are scored, `SUPPORT_BLOCK`
-    entries at a time and rematerialized in the backward pass. Returns the log-probs,
-    `-inf` for a target outside its support, and whether each target had one;
-    a target with none scores 0.0 here.
+    entries at a time and rematerialized in the backward pass. `head_weight`
+    is `[features, vocab]`, or `[vocab, features]` with `vocab_major`, as in
+    `chunked_cross_entropy`. Returns the log-probs, `-inf` for a target
+    outside its support, and whether each target had one; a target with none
+    scores 0.0 here.
     """
-    table = jnp.asarray(head_weight).T
+    table = jnp.asarray(head_weight) if vocab_major else jnp.asarray(head_weight).T
     width = targets.shape[1]
     kept = support_ids.shape[1]
     block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))
