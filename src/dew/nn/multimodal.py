@@ -433,14 +433,6 @@ class MultimodalTransformer(nn.Module):
         hidden = self.hidden_states(tokens, **kwargs)
         return hidden, self.language_model.logits_from_hidden(hidden[jnp.arange(hidden.shape[0]), slots])
 
-    def head_weight(self, params):
-        """Return the decoder's shared fp32 head matrix, for an objective's chunked scoring."""
-        return self.language_model.head_weight(params["language_model"])
-
-    def vocabulary_bias(self, params):
-        """The decoder's vocabulary bias, for the same affine head its forward scores."""
-        return self.language_model.vocabulary_bias(params['language_model'])
-
     def output_table(self) -> OutputTable | None:
         """Return the decoder's head as the matrix its final states contract,
         or None where none does (`CausalTransformer.output_table`)."""
