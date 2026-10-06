@@ -757,11 +757,14 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     the name the model holds.
 
     `dtype` is the compute dtype; `param_dtype` is where the parameters are
-    stored and `matmul_precision` what every matmul asks XLA for. Those two
-    reach the model only where it declares the field (`param_dtype`,
-    `precision`), so a model that declares neither takes neither and a run
-    that names neither writes neither. Unset, parameters stay float32 and the
-    model keeps its own precision.
+    stored and `matmul_precision` what every matmul asks XLA for. Each is
+    written into the field the model declares for it (`dtype`, `param_dtype`,
+    `precision`), and a run that names neither of the last two writes
+    neither. Unset, parameters stay float32 and the model keeps its own
+    precision. A setting the model declares no field for raises ValueError
+    naming the model and the field, since the run would not compute as it
+    says; a composite that declares no `dtype` takes the run's dtype when a
+    registered part in its config declares one (`with_precision`).
 
     The UNets keep per-stage attention settings in `attention_configs`,
     which do not inherit the model dtype and default `force_fp32_for_softmax`
@@ -774,6 +777,16 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     """
     member = models[name]
     declared = {f.name for f in dataclasses.fields(member) if f.init}
+    named = {"dtype": dtype, "param_dtype": param_dtype, "precision": matmul_precision}
+    unreached = [field for field, value in named.items() if value is not None and field not in declared
+                 and not (field == "dtype" and any(_part_takes_dtype(configured(part))
+                                                    for part in config.values()))]
+    if unreached:
+        settings = ", ".join(f"{_PRECISION_FLAGS[field]} {named[field]}" for field in unreached)
+        raise ValueError(
+            f"the model {name!r} declares no {' or '.join(unreached)} field, so the run's {settings} "
+            f"would not reach it; set {', '.join(_PRECISION_FLAGS[field] for field in unreached)} "
+            f"to None")
     written: PrecisionFields = {}
     if "dtype" in declared:
         written["dtype"] = dtype
@@ -848,21 +861,31 @@ def with_precision(name: str, config: Mapping[str, object], *,
     return {key: _with_part_dtype(configured(value), dtype) for key, value in fields.items()}
 
 
+def _part_takes_dtype(value: Configured) -> bool:
+    """Whether a composite's field is a registered model, recorded or built,
+    that declares a compute dtype."""
+    from flax import linen as nn
+
+    if isinstance(value, nn.Module):
+        return type(value) in models.values() and "dtype" in {f.name for f in dataclasses.fields(value)}
+    if not isinstance(value, Mapping) or set(value) != {"name", "fields"}:
+        return False
+    name, fields = value["name"], value["fields"]
+    return (isinstance(name, str) and name in models and isinstance(fields, Mapping)
+            and "dtype" in {field.name for field in dataclasses.fields(models[name])})
+
+
 def _with_part_dtype(value: Configured, dtype: str) -> Configured:
     """A composite's part with the run's compute dtype, where the part is a
     registered model, recorded or built, that declares one."""
     from flax import linen as nn
 
-    if isinstance(value, nn.Module):
-        owns = type(value) in models.values() and "dtype" in {f.name for f in dataclasses.fields(value)}
-        return value.clone(dtype=resolve_dtype(dtype)) if owns else value
-    if not isinstance(value, Mapping) or set(value) != {"name", "fields"}:
+    if not _part_takes_dtype(value):
         return value
-    name, fields = value["name"], value["fields"]
-    if (isinstance(name, str) and name in models and isinstance(fields, Mapping)
-            and "dtype" in {field.name for field in dataclasses.fields(models[name])}):
-        return {"name": name, "fields": {**fields, "dtype": dtype}}
-    return value
+    if isinstance(value, nn.Module):
+        return value.clone(dtype=resolve_dtype(dtype))
+    assert isinstance(value, Mapping) and isinstance(value["fields"], Mapping)
+    return {"name": value["name"], "fields": {**value["fields"], "dtype": dtype}}
 
 
 # Every table's record is `{"name": ..., "fields": {...}}`, which
