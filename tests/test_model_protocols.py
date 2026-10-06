@@ -40,6 +40,7 @@ adapter on the head, media through the multimodal reads, the JEPA encoders'
 representations (test_architectures.py's cases), and the torchax fallback.
 """
 
+import dataclasses
 import functools
 import json
 from pathlib import Path
@@ -51,6 +52,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
+from reference_error import assert_as_exact_as_the_reference, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 
 from dew.interop import Pretrained, hf_decoders
@@ -58,7 +60,7 @@ from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dit import TextContext
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import OutputTable, ProjectionSites, Recomputing
+from dew.nn.protocols import OutputTable, Recomputing
 from dew.objectives.lm.chunked import head_logits
 from dew.registry import models
 
@@ -419,15 +421,17 @@ CAPACITY = LENGTH + STEPS
 """Room for the prompt and the greedy steps, below every checkpoint's own capacity."""
 
 
-def _greedy(model, variables, tokens, **call):
+def _greedy(model, variables, tokens, forced=None, **call):
     """The cache `init_cache` allocates, the `STEPS` greedy draws after
-    `tokens` and the logits of every call, through `call` (the decode mode,
-    or DiffusionGemma's `encode`, the clean commits a canvas reads)."""
+    `tokens` (or the `forced` ones) and the logits of every call, through
+    `call` (the decode mode, or DiffusionGemma's `encode`, the clean commits
+    a canvas reads)."""
     cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
     logits, held = model.apply({**variables, "cache": cache}, tokens, mutable=["cache"], **call)
     drawn, scores = [], [logits]
-    for _ in range(STEPS):
-        drawn.append(jnp.argmax(logits[:, -1], axis=-1).astype(jnp.int32))
+    for step in range(STEPS):
+        drawn.append(jnp.argmax(logits[:, -1], axis=-1).astype(jnp.int32) if forced is None
+                     else forced[:, step])
         logits, held = model.apply({**variables, "cache": held["cache"]}, drawn[-1][:, None],
                                    mutable=["cache"], **call)
         scores.append(logits)
@@ -440,12 +444,10 @@ def _decoding(name: str) -> dict:
 
 @pytest.mark.parametrize("name", CHECKPOINTS)
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
-    """The resized model reads the same variables: its whole-sequence
-    logits are the model's, and a causal one decodes into a cache with
-    `CAPACITY` slots where the model's had `max_seq_len` (an axis a cache
-    derives from it shrinks with it) and draws the same tokens. Its
-    attention reduces over the shorter cache, so the cached logits agree to
-    rounding."""
+    """The resized model reads the same variables to the model's logits, and
+    a causal one decodes into a cache of `CAPACITY` slots and draws the same
+    tokens; its attention reduces over the shorter cache, so the cached
+    logits agree to rounding."""
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     sized = model.with_cache_capacity(CAPACITY)
@@ -455,25 +457,47 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     cache, drawn, scores = _greedy(model, variables, read.tokens, **_decoding(name))
     sized_cache, sized_drawn, sized_scores = _greedy(sized, variables, read.tokens, **_decoding(name))
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
-    for before, after in zip(jax.tree.leaves(cache), jax.tree.leaves(sized_cache), strict=True):
-        assert all(old == new or (old, new) == (model.max_seq_len, CAPACITY) or new < old
-                   for old, new in zip(before.shape, after.shape, strict=True)), (before.shape, after.shape)
-    assert any(CAPACITY in after.shape for after in jax.tree.leaves(sized_cache)) or not any(
-        model.max_seq_len in before.shape for before in jax.tree.leaves(cache))
+    assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
+            == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
     for got, want in zip(sized_scores, scores, strict=True):
         np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-5)
 
 
+def _float64(model):
+    """`model` computing in float64, its own `dtype` and every module it
+    holds: the truth a float32 run's rounding is measured from."""
+    fields = [field.name for field in dataclasses.fields(model) if field.name not in ("parent", "name")]
+    held = {name: _float64(getattr(model, name)) for name in fields
+            if isinstance(getattr(model, name), nn.Module)}
+    return model.clone(**held, **({"dtype": jnp.float64} if "dtype" in fields else {}))
+
+
+def _flat(tree) -> np.ndarray:
+    return np.concatenate([np.ravel(np.asarray(leaf, np.float64)) for leaf in jax.tree.leaves(tree)])
+
+
+def as_exact(dew, reference, truth, label: str) -> None:
+    """`dew` the reference's bits, or where they differ as exact as the
+    reference (tests/reference_error.py) from `truth()`, the float64 twin."""
+    if all(np.array_equal(np.asarray(mine), np.asarray(theirs))
+           for mine, theirs in zip(jax.tree.leaves(dew), jax.tree.leaves(reference), strict=True)):
+        return
+    with jax.enable_x64(new_val=True):
+        wanted = truth()
+    assert_as_exact_as_the_reference(_flat(dew), _flat(reference), _flat(wanted), label)
+
+
 def _call(model, variables, inputs, **apply) -> jax.Array:
-    """A training forward: a token model's logits, a denoiser's output."""
-    return model.apply(variables, *inputs, train=True, rngs={"dropout": jax.random.key(2)}, **apply)
+    """A forward without dropout, whose float64 twin would draw other masks:
+    a token model's logits, a denoiser's output."""
+    return model.apply(variables, *inputs, **apply)
 
 
 def _stepped(model, variables, inputs, **apply) -> tuple[jax.Array, dict]:
-    """A training step's forward and its gradient in every floating parameter."""
+    """A step's forward and its gradient in every floating parameter."""
     output = _call(model, variables, inputs, **apply)
-    cotangent = jax.random.normal(jax.random.key(1), output.shape, output.dtype)
+    cotangent = jax.random.normal(jax.random.key(1), output.shape, jnp.float32).astype(output.dtype)
     flat = flatten_dict(variables["params"])
     floats = {path: leaf for path, leaf in flat.items() if jnp.issubdtype(leaf.dtype, jnp.inexact)}
     held = {path: leaf for path, leaf in flat.items() if path not in floats}
@@ -495,11 +519,13 @@ def _rungs(model) -> list:
 
 
 def _climbs_and_restores(model, variables, inputs, **apply) -> None:
-    """Each rung holds less than the one below it, and steps the same
-    forward and backward bitwise: the step runs eagerly, so each recomputed
-    block replays the operations its forward ran. A rung's record restores
-    it from any rung below it and moves no rung above it, and the rung
-    runs over the model's variables, every collection where it was."""
+    """Each rung holds less than the one below it and steps the same forward,
+    bitwise. Its backward recomputes, which can round apart (gemma2-tiny's
+    gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8; test_decoder_remat.py
+    found the same), so the gradients are the model's bits or as exact as them.
+    A rung's record restores it from any rung below it and moves no rung
+    above it, and the rung runs over the model's variables, every collection
+    where it was."""
     rungs = _rungs(model)
     records = [rung.recompute_record() for rung in rungs]
     assert len(rungs) > 1
@@ -511,11 +537,13 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
     output, gradient_tree = _stepped(model, variables, inputs, **apply)
+    truth = functools.cache(
+        lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
     written = model.apply(variables, *inputs, mutable=True, **apply)[1]
     for rung in rungs[1:]:
         stepped = _stepped(rung, variables, inputs, **apply)
         same(stepped[0], output)
-        same(stepped[1], gradient_tree)
+        as_exact(stepped[1], gradient_tree, truth, f"gradient at {rung.recompute_record()}")
         assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written.keys()
 
 
@@ -565,10 +593,10 @@ def test_packed_projections_serve_the_models_numbers(name):
     """Every group a decoder declares packs: the packed variables still
     declare the same groups, and give the same logits and the same cached
     decode. One wider product can round apart from three (falcon-tiny's
-    logits moved by 1.2e-7, Kimi K2's by 7.2e-7), so the logits agree to
-    rounding and the drawn tokens exactly. Each module the forward runs
-    declares no group the model leaves out, and a bidirectional decoder,
-    which serves no decode step, declares none."""
+    logits moved by 1.2e-7, Kimi K2's by 7.2e-7, qwen3-next-tiny's by 1.8e-5
+    on another CPU), so the drawn tokens are the model's and the logits its
+    bits or as exact as them. A bidirectional decoder, which serves no
+    decode step, declares none."""
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     groups = model.inference_projection_groups(variables)
@@ -584,24 +612,14 @@ def test_packed_projections_serve_the_models_numbers(name):
     _, drawn, scores = _greedy(model, variables, read.tokens, decode=True)
     _, packed_drawn, packed_scores = _greedy(model, packed, read.tokens, decode=True)
     same(packed_drawn, drawn)
-    for got, want in zip([model.apply(packed, read.tokens), *packed_scores], [read.logits, *scores],
-                         strict=True):
-        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=1e-5, atol=1e-5)
 
-    declared, busy = set(), []
+    def truth():
+        wide, wide_variables = _float64(model), widened(variables)
+        return [wide.apply(wide_variables, read.tokens, method="logits"),
+                *_greedy(wide, wide_variables, read.tokens, forced=drawn, decode=True)[2]]
 
-    def declaring(next_fun, args, kwargs, context):
-        if not busy and context.method_name == "__call__" and isinstance(context.module, ProjectionSites):
-            busy.append(context.module)
-            try:
-                declared.update(context.module.projection_groups())
-            finally:
-                busy.pop()
-        return next_fun(*args, **kwargs)
-
-    with nn.intercept_methods(declaring):
-        model.apply(variables, read.tokens)
-    assert declared <= set(groups) and bool(declared) == bool(groups)
+    as_exact([model.apply(packed, read.tokens, method="logits"), *packed_scores], [read.logits, *scores],
+             truth, f"{name} packed")
 
 
 def _request() -> ModelInputs:
