@@ -9,7 +9,10 @@ Python's version of each is below. No dependency, one output format,
 
 Scope is per rule, because the rules are not all about the same thing:
 
-- `src/dew` is the published contract, so every rule runs there.
+- `src/dew` is the published contract, so every rule runs there. A plugin
+  package checks itself with `--root` (its checkout) and `--package` (its
+  name, so `src/<package>` is the contract and its own modules are the ones
+  SLOP008 will not see patched).
 - `tests`, `tools`, `recipes` and `examples` are scripts and proofs. Their
   names and annotations are local, so the contract rules (SLOP001, SLOP002,
   SLOP004, SLOP005) do not run there. A swallowed exception, a narration
@@ -28,6 +31,7 @@ so an exception handed to a function that re-raises elsewhere reads as reported.
 
 from __future__ import annotations
 
+import argparse
 import ast
 import io
 import re
@@ -109,6 +113,7 @@ class Module:
     relative: str
     source: str
     tree: ast.Module
+    package: str = "dew"
 
     @property
     def lines(self) -> list[str]:
@@ -116,7 +121,7 @@ class Module:
 
     @property
     def is_source(self) -> bool:
-        return self.relative.startswith("src/dew/")
+        return self.relative.startswith(f"src/{self.package}/")
 
 
 def _named(node: ast.expr | None) -> str:
@@ -209,13 +214,27 @@ def _alias_value(node: ast.stmt) -> tuple[str, ast.expr] | None:
     if (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name)
             and _named(node.annotation).rsplit(".", 1)[-1] == "TypeAlias" and node.value):
         return node.target.id, node.value
+    generic = isinstance(node, ast.Assign) and isinstance(node.value, ast.Subscript) and isinstance(
+        node.value.value, ast.Name | ast.Attribute)
     if (isinstance(node, ast.Assign) and len(node.targets) == 1
             and isinstance(node.targets[0], ast.Name)
-            and isinstance(node.value, ast.Subscript | ast.BinOp)
+            and (isinstance(node.value, ast.BinOp) or generic)
             and any(_named(name).rsplit(".", 1)[-1] in {"Any", "object"}
-                    for name in ast.walk(node.value) if isinstance(name, ast.Name | ast.Attribute))):
+                    for name in _outside_calls(node.value))):
         return node.targets[0].id, node.value
     return None
+
+
+def _outside_calls(node: ast.AST) -> Iterator[ast.Name | ast.Attribute]:
+    """The names an expression spells outside any call's arguments: in
+    `np.asarray(rows, object)[keep]`, `object` is NumPy's object dtype, not
+    a type in an alias."""
+    if isinstance(node, ast.Call):
+        return
+    if isinstance(node, ast.Name | ast.Attribute):
+        yield node
+    for child in ast.iter_child_nodes(node):
+        yield from _outside_calls(child)
 
 
 def contracts(module: Module) -> Iterator[Finding]:
@@ -503,9 +522,9 @@ def mocks(module: Module) -> Iterator[Finding]:
         elif name.endswith("monkeypatch.setattr"):
             target = (node.args[0].value if isinstance(node.args[0], ast.Constant)
                       else _named(node.args[0]))
-        if not isinstance(target, str) or not target.startswith(("dew.", "dew")):
+        if not isinstance(target, str) or not target.startswith(f"{module.package}."):
             continue
-        if not target.startswith("dew.") or any(seam in target.lower() for seam in SEAMS):
+        if any(seam in target.lower() for seam in SEAMS):
             continue
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
                       f"patches {target}; the fix is a seam the test can pass a double to")
@@ -539,21 +558,27 @@ def check(module: Module) -> Iterator[Finding]:
     yield from sorted(findings, key=lambda finding: (finding.line, finding.col, finding.code))
 
 
-def collect(roots: Sequence[str]) -> Iterator[Module]:
-    """Every Python file under the named roots, skipping stub-only trees."""
+def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
+    """Every Python file under the named roots of `checkout`, skipping stub-only trees."""
     for root in roots:
-        for path in sorted((ROOT / root).rglob("*.py")):
-            relative = path.relative_to(ROOT).as_posix()
+        for path in sorted((checkout / root).rglob("*.py")):
+            relative = path.relative_to(checkout).as_posix()
             if "/stubs/" in f"/{relative}":
                 continue
-            yield Module(path, relative, path.read_text(), ast.parse(path.read_text()))
+            yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
 
 
-def main() -> int:
-    roots = sys.argv[1:] or ["src/dew", "tests", "tools", "recipes", "examples"]
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
+    parser.add_argument("roots", nargs="*", help="directories under the checkout; by default the package's "
+                        "source, tests, tools, recipes and examples")
+    parser.add_argument("--root", type=Path, default=ROOT, help="the checkout (default: Dew's)")
+    parser.add_argument("--package", default="dew", help="the package under src/ (default: dew)")
+    args = parser.parse_args(argv)
+    roots = args.roots or [f"src/{args.package}", "tests", "tools", "recipes", "examples"]
     counts: dict[str, int] = {}
     files: dict[str, set[str]] = {}
-    for module in collect(roots):
+    for module in collect(roots, args.root.resolve(), args.package):
         for finding in check(module):
             print(finding)
             counts[finding.code] = counts.get(finding.code, 0) + 1

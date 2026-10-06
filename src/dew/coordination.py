@@ -19,12 +19,15 @@ import sys
 import threading
 import types
 from collections.abc import Callable
-from typing import Literal, overload
+from typing import TYPE_CHECKING, Literal, overload
 
 import jax
 import numpy as np
 from jax.experimental import multihost_utils
 from jax.sharding import NamedSharding, PartitionSpec
+
+if TYPE_CHECKING:
+    from jax._src.distributed import State
 
 GATHER_BYTES = 256 * 2 ** 20
 """The bytes of global leaves `collective_host` gathers in one computation.
@@ -262,11 +265,46 @@ FAILURE_POLL_SECONDS = 5.0
 """How often a pool's failure watch reads the coordination service."""
 
 
-def _client():
-    """The jax.distributed client, through orbax's public accessor for it."""
-    from orbax.checkpoint import multihost
+def _distributed() -> State:
+    """jax.distributed's state in this process: its client, the pool's size
+    as it formed and its preemption service.
 
-    return multihost.get_jax_distributed_client()
+    JAX exports none of them; its own multihost_utils and orbax read this
+    object, and Dew reads it here alone. orbax names no public accessor
+    (`orbax.checkpoint.multihost`, once imported, has none), and a jax that
+    keeps the state elsewhere is refused, naming its version, not read wrong.
+    """
+    try:
+        from jax._src.distributed import global_state
+    except ImportError as error:
+        raise RuntimeError(f"jax {jax.__version__} keeps no jax.distributed state where Dew reads "
+                           "its pool; install the jax release dewml requires") from error
+    return global_state
+
+
+def _client():
+    """The pool's jax.distributed client."""
+    client = _distributed().client
+    if client is None:
+        raise RuntimeError("this process is in no pool: jax.distributed.initialize has not run")
+    return client
+
+
+def pool_formed() -> bool:
+    """Whether this process joined a pool through jax.distributed."""
+    return _distributed().client is not None
+
+
+def pool_size() -> int:
+    """The processes of this process's pool as it formed, read without
+    opening the backend, which jax.process_count() would open."""
+    return _distributed().num_processes
+
+
+def preemption_service() -> bool:
+    """Whether the pool runs jax's preemption service
+    (jax_enable_preemption_service)."""
+    return _distributed().preemption_sync_manager is not None
 
 
 def this_process() -> str:
@@ -313,19 +351,21 @@ def stop_at_exit(thread: threading.Thread, stop: Callable[[], None], *, timeout:
     return lambda: atexit.unregister(finish)
 
 
-def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
+def end_pool_on_failure(grace: float | None = None) -> None:
     """End this process when a failure goes unheard, or when it fails itself.
 
     A process that raises past its program, or meets a peer's failure it
     cannot hear, would otherwise hang in a collective no GPU backend times
     out, or in jax.distributed's 300 s shutdown barrier. So an uncaught
     exception prints, publishes and leaves at once, and a watch thread ends
-    the process `grace` seconds after any published failure no agreement
-    withdrew; `dew launch`, srun and a pod's scheduler then stop the rest.
+    the process `grace` seconds (`FAILURE_GRACE_SECONDS` as it is at the
+    call, by default) after any published failure no agreement withdrew;
+    `dew launch`, srun and a pod's scheduler then stop the rest.
 
     It needs only the coordination service, so it goes in before the backend
     opens, and its watch ends with the program (`stop_at_exit`).
     """
+    grace = FAILURE_GRACE_SECONDS if grace is None else grace
     previous = sys.excepthook
     client = _client()
 
