@@ -31,103 +31,73 @@ same 2D rotary as Qwen 3.5's and a SwiGLU feed-forward, and a final norm; its
 projector is the aligner, which groups squares of the patch grid through an
 exact-GELU MLP and lays the image out as its decoder reads it.
 
-Each family lives in its own module beside this one (`vision_siglip`,
-`vision_llama4`, `vision_gemma4`, `vision_qwen35`, `vision_deepseek_v41`,
-`vision_gemma3n`) over the bases in `vision_common`. This module re-exports
-their names and keeps where each kind's tensors sit and which map reads them.
+Each family lives in its own module of this package (`siglip`, `llama4`,
+`gemma4`, `qwen35`, `deepseek_v41`, `gemma3n`) over the bases in `common`,
+with its path map and its config and weight translators. The package exports
+the classes a caller constructs or subclasses, and keeps where each kind's
+tensors sit and which map reads them.
 """
 
 from collections.abc import Callable, Mapping
 
 import numpy as np
 
-from dew.nn.vision_common import (
-    PIXEL_VALUES_KEY as PIXEL_VALUES_KEY,
-    ProjectorBase as ProjectorBase,
-    TowerBase as TowerBase,
-    TowerGeometry as TowerGeometry,
-    projector_weight_path as projector_weight_path,
-)
-from dew.nn.vision_deepseek_v41 import (
+from dew.objectives.base import Variables
+
+from .common import ProjectorBase as ProjectorBase, TowerBase as TowerBase, TowerGeometry as TowerGeometry
+from .deepseek_v41 import (
     DeepseekV41Projector as DeepseekV41Projector,
     DeepseekV41ProjectorModule as DeepseekV41ProjectorModule,
     DeepseekV41Vision as DeepseekV41Vision,
-    DeepseekV41VisionBlock as DeepseekV41VisionBlock,
     DeepseekV41VisionTransformer as DeepseekV41VisionTransformer,
-    deepseek_v41_vision_path as deepseek_v41_vision_path,
-    translate_deepseek_v41_projector_config as translate_deepseek_v41_projector_config,
-    translate_deepseek_v41_projector_weights as translate_deepseek_v41_projector_weights,
-    translate_deepseek_v41_vision_config as translate_deepseek_v41_vision_config,
-    translate_deepseek_v41_vision_weights as translate_deepseek_v41_vision_weights,
+    deepseek_v41_vision_path,
+    translate_deepseek_v41_projector_weights,
+    translate_deepseek_v41_vision_weights,
 )
-from dew.nn.vision_gemma3n import (
+from .gemma3n import (
     Gemma3nProjector as Gemma3nProjector,
     Gemma3nProjectorModule as Gemma3nProjectorModule,
     Gemma3nVision as Gemma3nVision,
-    gemma3n_vision_path as gemma3n_vision_path,
-    translate_gemma3n_projector_config as translate_gemma3n_projector_config,
-    translate_gemma3n_projector_weights as translate_gemma3n_projector_weights,
-    translate_gemma3n_vision_config as translate_gemma3n_vision_config,
-    translate_gemma3n_vision_weights as translate_gemma3n_vision_weights,
+    gemma3n_vision_path,
+    translate_gemma3n_projector_weights,
+    translate_gemma3n_vision_weights,
 )
-from dew.nn.vision_gemma4 import (
-    _GEMMA4_VISION_TENSORS as _GEMMA4_VISION_TENSORS,
-    Gemma4ClippableLinear as Gemma4ClippableLinear,
+from .gemma4 import (
     Gemma4Projector as Gemma4Projector,
     Gemma4ProjectorModule as Gemma4ProjectorModule,
     Gemma4Vision as Gemma4Vision,
-    Gemma4VisionAttention as Gemma4VisionAttention,
-    Gemma4VisionEncoderLayer as Gemma4VisionEncoderLayer,
-    Gemma4VisionMLP as Gemma4VisionMLP,
     Gemma4VisionTransformer as Gemma4VisionTransformer,
-    export_gemma4_vision_config as export_gemma4_vision_config,
-    gemma4_vision_path as gemma4_vision_path,
-    translate_gemma4_projector_config as translate_gemma4_projector_config,
-    translate_gemma4_projector_weights as translate_gemma4_projector_weights,
-    translate_gemma4_vision_config as translate_gemma4_vision_config,
-    translate_gemma4_vision_weights as translate_gemma4_vision_weights,
+    gemma4_vision_path,
+    translate_gemma4_projector_weights,
+    translate_gemma4_vision_weights,
 )
-from dew.nn.vision_llama4 import (
+from .llama4 import (
     Llama4Projector as Llama4Projector,
     Llama4ProjectorModule as Llama4ProjectorModule,
     Llama4Vision as Llama4Vision,
-    Llama4VisionAdapter as Llama4VisionAdapter,
-    Llama4VisionAdapterMLP as Llama4VisionAdapterMLP,
-    Llama4VisionAttention as Llama4VisionAttention,
-    Llama4VisionEncoderLayer as Llama4VisionEncoderLayer,
     Llama4VisionTransformer as Llama4VisionTransformer,
-    llama4_vision_path as llama4_vision_path,
-    pixel_shuffle as pixel_shuffle,
-    translate_llama4_projector_config as translate_llama4_projector_config,
-    translate_llama4_projector_weights as translate_llama4_projector_weights,
-    translate_llama4_vision_config as translate_llama4_vision_config,
-    translate_llama4_vision_weights as translate_llama4_vision_weights,
+    llama4_vision_path,
+    translate_llama4_projector_weights,
+    translate_llama4_vision_weights,
 )
-from dew.nn.vision_qwen35 import (
+from .qwen35 import (
     Qwen35Projector as Qwen35Projector,
     Qwen35ProjectorModule as Qwen35ProjectorModule,
     Qwen35Vision as Qwen35Vision,
-    Qwen35VisionAttention as Qwen35VisionAttention,
-    Qwen35VisionBlock as Qwen35VisionBlock,
     Qwen35VisionTransformer as Qwen35VisionTransformer,
-    qwen35_vision_path as qwen35_vision_path,
-    translate_qwen35_projector_config as translate_qwen35_projector_config,
-    translate_qwen35_projector_weights as translate_qwen35_projector_weights,
-    translate_qwen35_vision_config as translate_qwen35_vision_config,
-    translate_qwen35_vision_weights as translate_qwen35_vision_weights,
+    qwen35_vision_path,
+    translate_qwen35_projector_weights,
+    translate_qwen35_vision_weights,
 )
-from dew.nn.vision_siglip import (
+from .siglip import (
     GemmaProjector as GemmaProjector,
     GemmaProjectorModule as GemmaProjectorModule,
     SiglipVision as SiglipVision,
     SiglipVisionTransformer as SiglipVisionTransformer,
-    siglip_vision_path as siglip_vision_path,
-    translate_gemma_projector_config as translate_gemma_projector_config,
-    translate_gemma_projector_weights as translate_gemma_projector_weights,
-    translate_siglip_vision_config as translate_siglip_vision_config,
-    translate_siglip_vision_weights as translate_siglip_vision_weights,
+    siglip_vision_path,
+    translate_gemma_projector_weights,
+    translate_siglip_vision_weights,
 )
-from dew.objectives.base import Variables
 
 # Where each tower and projector kind's tensors sit in a media checkpoint, and
 # the translators that read them.
