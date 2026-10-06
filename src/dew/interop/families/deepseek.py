@@ -51,16 +51,20 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     because the released indexes ship no MTP weights; the weight path refuses
     any MTP tensor instead of dropping a prediction block.
     """
-    for name, expected in (
-        ('use_qk_norm', True), ('qk_norm_type', 'per_layer'),
-        ('use_routing_bias', True), ('scoring_func', 'sigmoid'),
-        ('shared_intermediate_size', 0), ('router_jitter_noise', 0.0),
-        ('layernorm_full_attention_beta', 1.0),
-        ('layernorm_linear_attention_beta', 1.0), ('layernorm_mlp_beta', 1.0),
+    for name, expected, reason in (
+        ('use_qk_norm', True, 'MiniMax-M2 normalizes its query and key projections'),
+        ('qk_norm_type', 'per_layer', 'MiniMax-M2 normalizes whole projections before splitting heads'),
+        ('use_routing_bias', True, 'MiniMax-M2 selects experts with its balancing bias'),
+        ('scoring_func', 'sigmoid', 'MiniMax-M2 normalizes selected sigmoid probabilities'),
+        ('shared_intermediate_size', 0, 'MiniMax-M2 has no shared expert branch'),
+        ('router_jitter_noise', 0.0, 'training-time input jitter has no counterpart'),
+        ('layernorm_full_attention_beta', 1.0, 'the full-attention norm has no extra multiplier'),
+        ('layernorm_linear_attention_beta', 1.0, 'MiniMax-M2 has no linear-attention block'),
+        ('layernorm_mlp_beta', 1.0, 'the feed-forward norm has no extra multiplier'),
     ):
         used.add(name)
         if hf_config.get(name, expected) != expected:
-            _refuse(name, f'MiniMax-M2 requires {expected!r}; router jitter has no training counterpart')
+            _refuse(name, f'{reason}; requires {expected!r}')
     used.add('attn_type_list')
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     if hf_config.get('attn_type_list', [1] * layers) != [1] * layers:
