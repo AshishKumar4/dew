@@ -6,6 +6,10 @@ import { ManagedPreparer } from './preparer';
 const JOB_MS = 40 * 60_000;
 
 export class RunnerFleet extends DurableObject<Env> {
+	async active(): Promise<number> {
+		return Object.keys((await this.ctx.storage.get<Record<string, number>>('jobs')) ?? {}).length;
+	}
+
 	async plan(key: string): Promise<RunnerPlan> {
 		const plan = await this.ctx.storage.get<RunnerPlan>(`plan:${key}`);
 		if (!plan) throw new Error('the runner environment has no registered public revision');
