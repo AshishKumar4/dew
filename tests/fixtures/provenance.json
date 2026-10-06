@@ -455,7 +455,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3."
+   "note": "flaxdiff/models (hilbert, s5, common, attention, vit_common, dit_common, simple_unet, simple_vit, simple_dit, simple_mmdit, video_dit, unet_3d) fetched at the commit, SHA-256 checked; reference attention without forced-fp32 softmax; float32 and float64 (every jnp.float32 read as jnp.float64, x64) forward and gradients, on one CPU thread without XNNPACK. JAX 0.11.2.post3. orders.npz holds 52 spatial channel permutations of unet/variant, with every float64 output and gradient checked against the identity and its fp32 identity reproduced bit for bit."
   },
   "flaxdiff_pipeline": {
    "tool": "tools/flaxdiff_pipeline_reference.py",
@@ -713,6 +713,28 @@
     }
    ],
    "note": "Fetches and executes Diffusers' published AdaptiveProjectedGuidance guider (BaseGuidance.__init__/set_state, prepare_inputs, forward, _is_apg_enabled, normalized_guidance, MomentumBuffer) without importing diffusers; its batching helper and output container are stand-ins."
+  },
+  "guidance/apg_ensemble.npz": {
+   "tool": "tools/guidance_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The apg-ensemble mode executes the same published AdaptiveProjectedGuidance over 1024 independent initial states (torch seed 23), in float32 and float64. Every existing apg.npz result is checked to regenerate bit for bit."
+  },
+  "guidance/apg_projection.npz": {
+   "tool": "tools/guidance_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/diffusers",
+     "version": "5ff8e59ff9fe81c6e2df4fb4c6ea0d97a5df5ab2",
+     "runs": "fetched"
+    }
+   ],
+   "note": "The apg-projection mode executes the published AdaptiveProjectedGuidance over 1024 pairs of nearly parallel raw predictions (torch seed 29), at ordinary, 1e30 and 1e-20 scales and with branches of different scales, without a norm clip, in float32 and float64. This isolates the projection's precision, exponent range and norm floor from model, norm-clip and Euler rounding."
   },
   "guidance/autoguidance.npz": {
    "tool": "tools/guidance_reference.py",
