@@ -75,6 +75,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `plots` | Matplotlib charts in local reports |
 | `wandb`, `mlflow`, `tensorboard` | Experiment trackers |
 | `inference-clients` | The Ollama and OpenAI Python clients, including vLLM-compatible endpoints |
+| `serve` | Starlette and uvicorn, for serving a decision model in Jev's wire format (`examples/serve_decisions.py`) |
 | `hpo` | Optuna, for `dew.config.sweep` |
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
@@ -104,7 +105,7 @@ cd dew
 uv venv --python 3.14
 source .venv/bin/activate
 uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile]' -c constraints.txt
+uv pip install -e '.[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile]' -c constraints.txt
 ```
 
 These are the extras CI installs, with the same JAX build CI uses: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
