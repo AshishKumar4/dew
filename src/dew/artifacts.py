@@ -64,13 +64,15 @@ class TokenScores:
 
 @struct.dataclass
 class Decisions:
-    """A decision model's probabilities `[N, K]` over each row's options, the
-    real options `[N, K]`, the right option `[N]` of each row, and which rows
-    `[N]` ask a score, whose options are ordered levels."""
+    """A decision model's probabilities `[N, Q, K]` over the options of each
+    row's questions, the real options `[N, Q, K]`, each question's right option
+    `[N, Q]`, which questions `[N, Q]` ask a score, whose options are ordered
+    levels, and which `[N, Q]` have a known answer to score."""
     probabilities: jax.Array
     options: jax.Array
     labels: jax.Array
     ordinal: jax.Array
+    scored: jax.Array
 
 
 # Scoring and preview hooks each return one artifact or a tuple. Metrics

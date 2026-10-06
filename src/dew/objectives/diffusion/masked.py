@@ -52,13 +52,13 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.objectives.lm.objective import _batch_text
+from dew.records import JSON
 from dew.registry import objectives
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.training.state import TrainState
 
 TEXT_KEY = "text"
 
@@ -111,17 +111,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         `processor` is what `pipeline` uses to turn text into ids and decode
         them, unless it is given another one. A run records its tokenizer."""
-        if isinstance(model, Source):
-            from dew.nn.backbones.causal_transformer import CausalTransformer
-
-            variables = model.variables if variables is OMITTED else variables
-            processor = model.text_processor if processor is OMITTED else processor
-            if not isinstance(model.model, CausalTransformer):
-                raise TypeError(f"masked diffusion trains a CausalTransformer, and this source's model "
-                                f"is a {type(model.model).__name__}")
-            model = model.model
-        variables = None if variables is OMITTED else variables
-        processor = None if processor is OMITTED else processor
+        model = self.bind_model(model, variables=variables, processor=processor)
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
@@ -134,52 +124,33 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.steps = steps
         self.samples = samples
         self.decode = decode
-        self.variables = variables
-        self.processor = processor
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
         # The EMA follows what moves; the frozen collection never does.
         self.ema = None if ema_decay is None else EMASpec(
             decay=optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def inference_record(self):
-        from dew.config import ModelConfig
+    def task_record(self) -> Mapping[str, JSON]:
+        """The row length, tokenizer, process, solver and sampling steps."""
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import objectives, to_record
-        if not any(member is type(self) for member in objectives.values()):
-            return None
-        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
-        return {'objective': objectives.name_of(type(self)), 'model': model,
-                'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
+        from dew.registry import to_record
+        return {'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
                 'process': self.process.to_json(), 'solver': to_record(self.solver, type(self.solver)),
                 'sampling_steps': self.steps}
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None,
-                 processor: Processor | None = None) -> MaskedGeneration:
-        """Return the trained model as a full-response MDLM task over the state's weights.
-
-        The task is a `MaskedGeneration` with this objective's solver and steps.
-        """
+    def build_task(self, variables: Variables, *,
+                   processor: Processor | None | Omitted = OMITTED) -> MaskedGeneration:
+        """Return the model over `variables` as a full-response MDLM task, with this
+        objective's solver and steps."""
         from dew.inference.tasks import MaskedGeneration
 
-        return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
-                                self.processor if processor is None else processor,
+        return MaskedGeneration(self.model, variables, self.process,
+                                self.processor if processor is OMITTED else processor,
                                 solver=self.solver, steps=self.steps)
 
-    def held_variables(self) -> Variables | None:
-        """Return the tree this run starts from, or None for a fresh init."""
-        return self.variables
-
-    def init(self, key, variables: Variables | None = None):
-        given = self.variables if variables is None else variables
-        if given is None:
-            return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
-        if "params" not in given:
-            raise ValueError(
-                "variables is the variables dict ({'params': ...}) that "
-                "Pretrained.load and model.init return")
-        return given
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
     def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
@@ -203,7 +174,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         window's padding has no weight. So `perplexity` over a validation
         pass is the exponential of the ELBO bound per token, the number MDLM
         reports."""
-        params = params if step.ema is None else step.ema
+        params = self.evaluation_variables(params, step)
         losses, weights, correct = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights, correct=correct)
 
@@ -283,7 +254,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         the ids alone.
         """
         def setup():
-            return params if step.ema is None else step.ema, self.samples
+            return self.evaluation_variables(params, step), self.samples
 
         weights, count = agreed("masked diffusion preview setup", setup)
         tokens = agreed("masked diffusion preview generation",
