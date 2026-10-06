@@ -23,7 +23,7 @@ from dew.interop.hf_decoders import _export_config, translate_config, translate_
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.vision import (
+from dew.nn.vision.gemma4 import (
     Gemma4Projector,
     Gemma4Vision,
     export_gemma4_vision_config,
@@ -256,7 +256,7 @@ def export_weights(
     the published implementation cannot build is refused (`_refuse_unreadable`).
     """
     from dew.interop.hf_decoders import export_decoder_weights
-    from dew.nn.vision import _GEMMA4_VISION_TENSORS
+    from dew.nn.vision.gemma4 import _GEMMA4_VISION_TENSORS
 
     if not isinstance(model, DiffusionGemma):
         raise TypeError("DiffusionGemma export requires its native model value")

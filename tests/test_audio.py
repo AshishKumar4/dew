@@ -19,12 +19,9 @@ import pytest
 from safetensors.numpy import load_file
 
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weight_path, audio_weights
-from dew.nn.vision import (
-    Gemma3nProjectorModule,
-    Gemma4ProjectorModule,
-    translate_gemma3n_projector_weights,
-    translate_gemma4_projector_weights,
-)
+from dew.nn.vision import Gemma3nProjectorModule, Gemma4ProjectorModule
+from dew.nn.vision.gemma3n import translate_gemma3n_projector_weights
+from dew.nn.vision.gemma4 import translate_gemma4_projector_weights
 from dew.registry import towers
 
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
