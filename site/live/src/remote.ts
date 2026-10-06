@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { SnapshotRegistry, type SnapshotGeneration } from './snapshots';
 import { commandOf, runnerPlan, type RunnerPlan } from './remote-plan';
+import { ManagedPreparer } from './preparer';
 
 const JOB_MS = 40 * 60_000;
 
@@ -50,50 +51,20 @@ export class RunnerCache extends SnapshotRegistry {
 	}
 }
 
-export class RunnerPreparer extends DurableObject<Env> {
-	private busy = false;
-
+export class RunnerPreparer extends ManagedPreparer {
 	async prepare(key: string): Promise<SnapshotGeneration> {
-		const container = this.ctx.container;
-		if (!container || this.busy || container.running) throw new Error('another CI environment is warming');
-		const plan = await this.env.RUNNER_FLEET.get(this.env.RUNNER_FLEET.idFromName('global')).plan(key);
-		this.busy = true;
-		try {
-			await this.ctx.storage.setAlarm(Date.now() + 15 * 60_000);
-			container.start({ image: 'cloudflare/debian-trixie', instance: 'standard-4',
-				enableInternet: true, entrypoint: ['sleep', 'infinity'] });
-			await container.setInactivityTimeout(15 * 60_000);
-			const started = Date.now();
-			const source = await fetch(`https://raw.githubusercontent.com/AshishKumar4/dew/${this.env.SNAPSHOT_COMMIT}/site/live/container/setup-runner.sh`);
-			if (!source.ok || !source.body) throw new Error('cannot read the pinned runner preparation script');
-			const copy = await container.exec(['sh', '-c', 'cat > /root/setup-runner.sh'], { stdin: source.body });
-			if (await copy.exitCode !== 0) throw new Error('cannot install the runner preparation script');
-			const process = await container.exec(['timeout', '780', 'sh', '/root/setup-runner.sh', plan.commit, plan.python]);
-			const output = await process.output();
-			if (output.exitCode !== 0) throw new Error(`CI environment preparation failed: ${new TextDecoder().decode(output.stderr).slice(-4000)}`);
-			const prepareSeconds = (Date.now() - started) / 1000;
-			const snapshotStart = Date.now();
-			const snapshot = await container.snapshotContainer({ name: `dew-ci-${key.slice(0, 12)}` });
-			const snapshotSeconds = (Date.now() - snapshotStart) / 1000;
-			await container.destroy();
-			container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false,
-				entrypoint: ['sleep', 'infinity'] });
-			await container.setInactivityTimeout(15 * 60_000);
-			const smokeStart = Date.now();
-			const smoke = await (await container.exec(['/workspace/.venv/bin/python', '-c',
-				'import dew,jax,pytest; print(jax.__version__)'], { cwd: '/workspace' })).output();
-			if (smoke.exitCode !== 0) throw new Error('the cached CI environment failed its offline import check');
-			return { snapshot, commit: key, created: Date.now(), prepareSeconds, snapshotSeconds,
-				smokeSeconds: (Date.now() - smokeStart) / 1000 };
-		} finally {
-			this.busy = false;
-			if (container.running) await container.destroy();
-			await this.ctx.storage.deleteAlarm();
-		}
-	}
-
-	override async alarm(): Promise<void> {
-		if (this.ctx.container?.running) await this.ctx.container.destroy();
+		return this.runPreparation(async () => {
+			const plan = await this.env.RUNNER_FLEET.get(this.env.RUNNER_FLEET.idFromName('global')).plan(key);
+			return { commit: key, sourceCommit: this.env.SNAPSHOT_COMMIT, script: 'setup-runner.sh',
+				args: [plan.commit, plan.python], name: `dew-ci-${key.slice(0, 12)}`, entrypoint: ['sleep', 'infinity'],
+				async smoke(container, phase) {
+					await phase('offline CI import smoke');
+					const smoke = await (await container.exec(['/workspace/.venv/bin/python', '-c',
+						'import dew,jax,pytest; print(jax.__version__)'], { cwd: '/workspace', env: { JAX_PLATFORMS: 'cpu' } })).output();
+					if (smoke.exitCode !== 0) throw new Error('the cached CI environment failed its offline import check');
+				},
+			};
+		});
 	}
 }
 
