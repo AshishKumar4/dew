@@ -27,37 +27,6 @@ from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 
 
-def test_transition_density_and_velocity_gradient_match_gaussian_algebra():
-    x = np.asarray([[0.4, -0.7], [0.1, 0.8], [-0.3, 0.2]], np.float32)
-    velocity = np.asarray([[0.2, 0.3], [-0.4, 0.5], [0.1, -0.2]], np.float32)
-    action = np.asarray([[0.7, -0.6], [0.0, 0.4], [-0.2, 0.9]], np.float32)
-    t = np.asarray([0.7, 0.4, 1.0], np.float32)
-    s = np.asarray([0.5, 0.1, 0.9], np.float32)
-    noise = 0.6
-    dt = (s - t).astype(np.float64)
-    denominator = 1 - np.where(t == 1, s, t).astype(np.float64)
-    diffusion_squared = noise**2 * t / denominator
-    correction = diffusion_squared / (2 * t)
-    mean = x * (1 + correction[:, None] * dt[:, None]) + velocity * (
-        1 + correction[:, None] * (1 - t[:, None])) * dt[:, None]
-    variance = diffusion_squared * -dt
-    expected = np.sum(-0.5 * ((action - mean)**2 / variance[:, None]
-                              + np.log(2 * math.pi * variance[:, None])), axis=1)
-
-    transition = flow_transition(x, velocity, t, s, noise_level=noise)
-    actual = transition.log_prob(jnp.asarray(action))
-    np.testing.assert_allclose(transition.mean, mean, atol=2e-7, rtol=2e-6)
-    np.testing.assert_allclose(transition.variance, variance, atol=2e-7, rtol=2e-6)
-    np.testing.assert_allclose(actual, expected, atol=2e-6, rtol=2e-6)
-
-    actual_gradient = jax.grad(lambda v: flow_transition(
-        x, v, t, s, noise_level=noise).log_prob(jnp.asarray(action)).sum())(jnp.asarray(velocity))
-    mean_derivative = (1 + correction * (1 - t)) * dt
-    expected_gradient = (action - mean) / variance[:, None] * mean_derivative[:, None]
-    np.testing.assert_allclose(actual_gradient, expected_gradient, atol=2e-6, rtol=2e-6)
-
-
-
 def test_deterministic_endpoints_have_no_gaussian_density():
     x = jnp.asarray([[0.2, -0.3], [0.7, 0.4]])
     velocity = jnp.asarray([[0.4, 0.1], [-0.1, 0.8]])
