@@ -4,15 +4,20 @@
     dew-remote run <revision> [--python 3.14] -- <command...>
     dew-remote suite <revision> [--python 3.14] [--jobs N]
 
-`suite` runs CI's non-network suite as N concurrent jobs, each one group of
-pytest-split's duration_based_chunks over tests/test_durations.json (as the
-CI shards are, but more of them), and prints one report of every job's
-outcome; it exits nonzero when any job fails or ends without its summary.
+`suite` runs CI's non-network suite as N concurrent jobs and prints one
+report of every job's outcome; it exits nonzero when any job fails or ends
+without its summary. Each job runs whole test files, packed by the seconds
+tests/test_durations.json records at that revision, so it imports only its
+own modules (collecting the whole suite costs a job two minutes); a file
+heavier than a job's share runs as that many pytest-split groups of itself.
 """
 
 import argparse
+import heapq
 import json
+import math
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -20,10 +25,11 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-SUITE = ["python", "-m", "pytest", "-q", "-m", "not network", "--ignore=tests/test_gen_api.py", "-rfE",
-         "--tb=line", "--splitting-algorithm", "duration_based_chunks",
-         "--durations-path", "tests/test_durations.json"]
-"""CI's selection (.github/workflows/ci.yml), reported briefly; `--splits N --group i` follows."""
+SUITE = ["python", "-m", "pytest", "-q", "-m", "not network", "-rfE", "--tb=line"]
+"""CI's selection (.github/workflows/ci.yml), reported briefly; the files follow."""
+SKIPPED = {"tests/test_gen_api.py"}
+"""CI runs it in the lint job, under the griffe it pins."""
+SPLIT = ["--splitting-algorithm", "duration_based_chunks", "--durations-path", "tests/test_durations.json"]
 SUMMARY = re.compile(r"^=*\s*(?:\d+ \w+(?:, )?)+ in [\d.]+s")
 COUNT = re.compile(r"(\d+) (passed|failed|errors?|skipped|xfailed|xpassed)")
 
@@ -87,14 +93,64 @@ def stream(revision: str, python: str, command: list[str], echo: bool = True) ->
     return exit_code, "".join(output)
 
 
-def suite(revision: str, python: str, jobs: int) -> int:
-    """Run the suite's `jobs` groups concurrently and report them as one run.
+def plan(weights: dict[str, float], jobs: int) -> list[list[str]]:
+    """The arguments of about `jobs` pytest commands that run every file in
+    `weights` (its recorded seconds) once, each command near an equal share.
 
-    A group whose output holds no pytest summary lost its stream or its
+    A file heavier than a share runs as that many pytest-split groups of
+    itself; the rest are packed heaviest first into the lightest command.
+    """
+    share = sum(weights.values()) / jobs
+    commands = []
+    for name, weight in weights.items():
+        if weight > share:
+            groups = math.ceil(weight / share)
+            commands += [[name, "--splits", str(groups), "--group", str(group), *SPLIT]
+                         for group in range(1, groups + 1)]
+    remaining = max(jobs - len(commands), 1)
+    bins: list[tuple[float, int, list[str]]] = [(0.0, index, []) for index in range(remaining)]
+    for name, weight in sorted(weights.items(), key=lambda item: (-item[1], item[0])):
+        if weight <= share:
+            held, index, names = heapq.heappop(bins)
+            heapq.heappush(bins, (held + weight, index, [*names, name]))
+    return commands + [sorted(names) for _, _, names in sorted(bins, key=lambda bin_: bin_[1]) if names]
+
+
+def weights_at(revision: str, checkout: Path) -> dict[str, float]:
+    """Every test file of `revision` in `checkout`, with the seconds its
+    recorded tests took; a file the record does not name weighs the mean."""
+    git = ["git", "-C", str(checkout)]
+    subprocess.run([*git, "fetch", "-q", "origin"], check=False)
+    commit = next(candidate for candidate in (revision, f"origin/{revision}") if subprocess.run(
+        [*git, "rev-parse", "-q", "--verify", f"{candidate}^{{commit}}"], capture_output=True
+    ).returncode == 0)
+    listed = subprocess.run([*git, "ls-tree", "-r", "--name-only", commit, "tests/"],
+                            capture_output=True, text=True, check=True).stdout.split()
+    files = [name for name in listed if re.fullmatch(r"tests/test_[^/]*\.py", name) and name not in SKIPPED]
+    recorded = json.loads(subprocess.run([*git, "show", f"{commit}:tests/test_durations.json"],
+                                         capture_output=True, text=True, check=True).stdout)
+    seconds: dict[str, float] = {}
+    for node, weight in recorded.items():
+        seconds[node.split("::")[0]] = seconds.get(node.split("::")[0], 0.0) + weight
+    known = [seconds[name] for name in files if name in seconds]
+    mean = sum(known) / len(known) if known else 1.0
+    return {name: seconds.get(name, mean) for name in files}
+
+
+CHECKOUT = Path(__file__).resolve().parents[1]
+"""The repository this tool sits in, which reads a revision's test files and their record."""
+
+
+def suite(revision: str, python: str, jobs: int, checkout: Path = CHECKOUT) -> int:
+    """Run the suite at `revision` as about `jobs` concurrent commands and report them as one run.
+
+    A command whose output holds no pytest summary lost its stream or its
     runner, not a test, so it runs once more before it counts as failed.
     """
+    commands = plan(weights_at(revision, checkout), jobs)
+
     def group(index: int) -> tuple[int, int, str]:
-        command = [*SUITE, "--splits", str(jobs), "--group", str(index)]
+        command = [*SUITE, *commands[index - 1]]
         for _ in range(2):
             code, output = stream(revision, python, command, echo=False)
             if any(SUMMARY.match(line) for line in output.splitlines()):
@@ -102,8 +158,8 @@ def suite(revision: str, python: str, jobs: int) -> int:
         return index, code, output
 
     began = time.monotonic()
-    with ThreadPoolExecutor(jobs) as pool:
-        groups = sorted(pool.map(group, range(1, jobs + 1)))
+    with ThreadPoolExecutor(len(commands)) as pool:
+        groups = sorted(pool.map(group, range(1, len(commands) + 1)))
     totals: dict[str, int] = {}
     failures, unfinished = [], []
     for index, code, output in groups:
@@ -116,10 +172,11 @@ def suite(revision: str, python: str, jobs: int) -> int:
             totals[kind] = totals.get(kind, 0) + int(count)
         failures += [f"group {index}: {line}" for line in output.splitlines()
                      if line.startswith(("FAILED ", "ERROR "))]
-        # pytest exits 5 for a group the chunks left empty.
+        # pytest exits 5 for a pytest-split group of a file that selects nothing.
         if code not in (0, 5) and not any(line.startswith(f"group {index}: ") for line in failures):
             failures.append(f"group {index}: exit {code}")
-    report = [f"{revision} on Python {python}: {jobs} groups in {(time.monotonic() - began) / 60:.1f} min",
+    minutes = (time.monotonic() - began) / 60
+    report = [f"{revision} on Python {python}: {len(commands)} groups in {minutes:.1f} min",
               ", ".join(f"{count} {kind}" for kind, count in sorted(totals.items())) or "no tests ran",
               *failures, *unfinished]
     path = Path.home() / f".cache/dew/remote/suite-{revision}-{python}-{int(time.time())}.txt"
