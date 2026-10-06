@@ -16,9 +16,10 @@ def main():
     run = subparsers.add_parser("run")
     run.add_argument("revision")
     run.add_argument("--python", choices=("3.12", "3.14"), default="3.12")
-    run.add_argument("command", nargs=argparse.REMAINDER)
-    args = parser.parse_args()
-    command = args.command[1:] if args.command[:1] == ["--"] else args.command
+    arguments = sys.argv[1:]
+    separator = arguments.index("--") if "--" in arguments else len(arguments)
+    args = parser.parse_args(arguments[:separator])
+    command = arguments[separator + 1:]
     if not command:
         parser.error("run needs a command after --")
     config = json.loads((Path.home() / ".config/dew-remote.json").read_text())
