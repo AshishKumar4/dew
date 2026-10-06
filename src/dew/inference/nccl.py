@@ -23,7 +23,7 @@ returns once every tensor has landed, while this side broadcasts them; it then
 sets the version, resets the prefix cache and resumes, with the pause and
 failure rules of `SafetensorsReload`. Every process of a pool calls the push,
 and the policy is gathered to process 0 as `SafetensorsReload` gathers it, in
-groups of at most `dew.artifacts.GATHER_BYTES`.
+groups of at most `dew.coordination.GATHER_BYTES`.
 """
 
 from __future__ import annotations
@@ -42,7 +42,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import SingleDeviceSharding
 
-from dew.artifacts import agreed, collective_host
+from dew.coordination import agreed, collective_host
 from dew.nn.inputs import mesh_of
 from dew.objectives.base import Variables
 from dew.records import JSON

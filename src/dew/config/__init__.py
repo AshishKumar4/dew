@@ -36,10 +36,10 @@ import dew.data  # registers the datasets a config names
 import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
-from dew.artifacts import agree_process_phase, agreed
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import json_list_argument, ramped
 from dew.lora import LoRA, _Adapted, adapted

@@ -19,7 +19,7 @@ def main() -> None:
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
     from test_tool_episodes import Harness, SquareSession, build
 
-    from dew.artifacts import collective_host
+    from dew.coordination import collective_host
     from dew.data import Dataset
     from dew.objectives.rl import EpisodeStatus, Observation
     from dew.training.distributed import shard_batch
