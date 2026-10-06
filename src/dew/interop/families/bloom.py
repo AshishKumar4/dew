@@ -18,7 +18,7 @@ def _bloom_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     # The released 560m config carries Megatron's kernel-fusion flags and
     # ALiBi offset, which transformers' BLOOM forward never reads.
     used.update(('attention_softmax_in_fp32', 'bias_dropout_fusion', 'masked_softmax_fusion',
-                 'skip_bias_add', 'skip_bias_add_qkv', 'offset_alibi', 'n_inner'))
+                 'skip_bias_add', 'skip_bias_add_qkv', 'offset_alibi', 'n_inner', 'seq_length'))
     if hf.get('apply_residual_connection_post_layernorm', False):
         _refuse('apply_residual_connection_post_layernorm', 'BLOOM residuals read the unnormalized input')
     if hf.get('slow_but_exact', False) and records.integer(hf.get('pretraining_tp', 1), 'pretraining_tp') > 1:
