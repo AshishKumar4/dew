@@ -33,6 +33,11 @@ type Media = np.ndarray | Image | Sequence[Media]
 type InputTree = (ModelInputs | jax.Array | np.ndarray | None
                   | Sequence[InputTree] | Mapping[str, object])
 
+# A keyword a model call takes past its tokens: a token field or position
+# array, the conditioning mapping (`ModelInputs.kwargs`), a flag, or None for
+# an absent input.
+type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
+
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 """The mesh axes a request's rows split over: every axis but sequence and stage."""
@@ -633,4 +638,4 @@ class Request:
         return replace(padded, token_fields={**padded.token_fields, VALIDITY_FIELD: valid})
 
 
-__all__ = ["AttentionMetadata", "LayerInputs", "ModelInputs", "RowPlan"]
+__all__ = ["AttentionMetadata", "LayerInputs", "ModelInputs", "ModelKwarg", "RowPlan"]
