@@ -239,7 +239,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         masked = jnp.where(is_masked, masked, tokens)
 
         hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
-                                  method="hidden_states", **prepared.kwargs())
+                                  method="hidden_states", mutable=False, capture_intermediates=False,
+                                  **prepared.kwargs())
         head = affine_head(self.model, params)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
