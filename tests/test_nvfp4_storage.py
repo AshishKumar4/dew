@@ -6,6 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from interop_support import assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
@@ -48,10 +49,7 @@ def test_an_untrained_weight_only_storage_export_keeps_the_sources_bytes(checkpo
     directory, loaded, _ = checkpoint
     loaded.save(tmp_path)
     original, written = read_weights(directory), read_weights(tmp_path)
-    assert set(written) == set(original)
-    for name, value in original.items():
-        assert written[name].dtype == value.dtype, name
-        np.testing.assert_array_equal(written[name].view(np.uint8), value.view(np.uint8), err_msg=name)
+    assert_same_stored_tensors(written, original)
 
 
 @pytest.mark.parametrize("kind, dynamic", [("fp8", True), ("fp8", False), ("nvfp4", False)],

@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import assert_same_stored_tensors
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, codecs
@@ -77,10 +78,7 @@ def test_export_keeps_the_calibrated_input_scale_and_quantized_forward(case, tmp
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     loaded.save(tmp_path)
     written, original = read_weights(tmp_path), read_weights(directory)
-    assert set(written) == set(original)
-    for name, value in original.items():
-        assert written[name].dtype == value.dtype, name
-        np.testing.assert_array_equal(written[name].view(np.uint8), value.view(np.uint8), err_msg=name)
+    assert_same_stored_tensors(written, original)
     reloaded = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
     actual = reloaded.model.apply(reloaded.variables, reference["ids"].astype(np.int32))
     assert_as_exact_as_the_reference(actual, reference["logits"], reference["logits_f64"], "NVFP4 export")
