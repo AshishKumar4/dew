@@ -17,6 +17,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import PartitionSpec as P
+from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -340,17 +341,6 @@ class Data:
     steps_per_epoch = None
 
 
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-
-    def log(self, scalars, step):
-        self.scalars.append(dict(scalars))
-
-    def artifact(self, value, step):
-        pass
-
-
 def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False):
     config = moe_config()
     model = models.build("causal_transformer",
@@ -367,7 +357,7 @@ def run_losses(trainer, steps):
     trainer.tracker = tracker = RecordingTracker()
     state = trainer.fit(Data(token_batches), steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
-    return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
+    return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
 
 @pytest.mark.mesh
@@ -429,7 +419,7 @@ def test_a_from_scratch_run_logs_the_load_and_moves_the_deepseek_bias():
     assert bias.min() < 0 < bias.max(), bias
     # Every step moved every expert by the rate, one way or the other.
     np.testing.assert_allclose(np.abs(bias) / 0.01, np.round(np.abs(bias) / 0.01), atol=1e-4)
-    ticks = [entry for entry in tracker.scalars if "train/moe/max_load" in entry]
+    ticks = [scalars for _, scalars in tracker.scalars if "train/moe/max_load" in scalars]
     loads = [entry["train/moe/max_load"] for entry in ticks]
     assert len(loads) == steps and all(1 / 8 <= load <= 1.0 for load in loads)
     assert all(entry["train/moe/min_load"] <= 1 / 8 for entry in ticks)

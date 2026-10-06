@@ -10,11 +10,12 @@ import { SESSION_HEADER } from './kernel';
 import { limitsOf } from './limits';
 import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
-import { remoteRun } from './remote';
+import { operatorAuthorized, remoteRun } from './remote';
 
 export { Coordinator } from './coordinator';
 export { LiveKernel } from './kernel';
 export { SharedHost } from './shared-host';
+export { ModelPool } from './model-pool';
 export { SnapshotRegistry } from './snapshots';
 export { SnapshotPreparer } from './preparer';
 export { RunnerFleet, RunnerCache, RunnerPreparer, RemoteJob } from './remote';
@@ -96,6 +97,17 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
+		if (url.pathname === '/v1/operator/warm' || url.pathname === '/v1/operator/status') {
+			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
+			const pool = env.POOL.get(env.POOL.idFromName('global'));
+			if (url.pathname.endsWith('/warm') && request.method === 'POST') {
+				const registry = env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global'));
+				const current = await registry.ensure(env.SNAPSHOT_COMMIT);
+				const generation = current.generation ?? await registry.previous();
+				if (generation) await pool.configure(generation);
+			} else if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
+			return Response.json(await pool.status());
+		}
 		if (request.method === 'POST' && url.pathname === '/v1/remote/run') {
 			try { return await remoteRun(request, env); }
 			catch (error) { return Response.json({ message: String(error) }, { status: 400 }); }

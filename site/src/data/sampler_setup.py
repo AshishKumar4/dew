@@ -13,7 +13,7 @@ def from_pretrained(repo_id, *, revision=None):
 
 @cache
 def text_model(name):
-    model = PretrainedDecoder.load(f"/opt/models/{name}", dtype=jnp.float32, max_seq_len=256)
+    model = PretrainedDecoder.load(name, dtype=jnp.float32, max_seq_len=256)
     return model.text_generation(sampling=Sampling(temperature=0))
 
 

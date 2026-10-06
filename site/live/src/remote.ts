@@ -4,6 +4,8 @@ import { commandOf, runnerPlan, type RunnerPlan } from './remote-plan';
 import { ManagedPreparer } from './preparer';
 
 const JOB_MS = 40 * 60_000;
+// Cloudflare's published account ceiling is 1,500 concurrent vCPUs; standard-4 uses four.
+const JOB_LIMIT = 375;
 
 export class RunnerFleet extends DurableObject<Env> {
 	async active(): Promise<number> {
@@ -27,7 +29,7 @@ export class RunnerFleet extends DurableObject<Env> {
 		}
 		return this.ctx.storage.transaction(async (storage) => {
 			const jobs = (await storage.get<Record<string, number>>('jobs')) ?? {};
-			if (Object.keys(jobs).length >= 3) return null;
+			if (Object.keys(jobs).length >= JOB_LIMIT) return null;
 			const id = crypto.randomUUID();
 			jobs[id] = now + JOB_MS;
 			await storage.put('jobs', jobs);
@@ -47,11 +49,6 @@ export class RunnerFleet extends DurableObject<Env> {
 export class RunnerCache extends SnapshotRegistry {
 	constructor(ctx: DurableObjectState, env: Env) {
 		super(ctx, { SNAPSHOT_COMMIT: '', PREPARER: env.RUNNER_PREPARER });
-	}
-
-	override async alarm(): Promise<void> {
-		const active = await this.previous();
-		if (active) await this.refresh(active.commit);
 	}
 }
 
@@ -159,10 +156,14 @@ export class RemoteJob extends DurableObject<Env> {
 	override async alarm(): Promise<void> { await this.expire(); }
 }
 
-export async function remoteRun(request: Request, env: Env): Promise<Response> {
+export function operatorAuthorized(request: Request, env: Env): boolean {
 	const expected = new TextEncoder().encode(`Bearer ${env.RUNNER_SECRET}`);
 	const supplied = new TextEncoder().encode(request.headers.get('Authorization') ?? '');
-	if (!env.RUNNER_SECRET || expected.length !== supplied.length || !crypto.subtle.timingSafeEqual(expected, supplied)) {
+	return Boolean(env.RUNNER_SECRET) && expected.length === supplied.length && crypto.subtle.timingSafeEqual(expected, supplied);
+}
+
+export async function remoteRun(request: Request, env: Env): Promise<Response> {
+	if (!operatorAuthorized(request, env)) {
 		return new Response('Forbidden', { status: 403 });
 	}
 	const reader = request.body?.getReader();
@@ -194,7 +195,7 @@ export async function remoteRun(request: Request, env: Env): Promise<Response> {
 	if (!prepared.generation) return Response.json({ message: 'Preparing the cached CI environment. Retry shortly.' },
 		{ status: 503, headers: { 'Retry-After': '15' } });
 	const id = await fleet.acquire();
-	if (!id) return Response.json({ message: 'All three CPU runners are in use.' },
+	if (!id) return Response.json({ message: `All ${JOB_LIMIT} CPU runners are in use.` },
 		{ status: 429, headers: { 'Retry-After': '15' } });
 	try {
 		return await env.REMOTE_JOB.get(env.REMOTE_JOB.idFromName(id)).run(id, plan, command, prepared.generation);
