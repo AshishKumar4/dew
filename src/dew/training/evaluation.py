@@ -338,8 +338,9 @@ def _covered(batch: Batch | None, last: Batch | None, index: int) -> tuple[Batch
             return held, held
         if last is None:
             raise ValueError(
-                f"process {jax.process_index()}'s share of the split holds no record while a peer's "
-                "holds some: the split has fewer records than there are processes")
+                f"process {jax.process_index()}'s reader yields no batch while a peer's yields one; "
+                "Dew's readers give an empty share one batch whose rows are all repeats "
+                "(`VALID_ROWS` False), and a reader of your own has to as well")
         return {**last, VALID_ROWS: np.zeros(rows_of(last), bool)}, last
 
     return agreed(f"batch cover {index}", cover)

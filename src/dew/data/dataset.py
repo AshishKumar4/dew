@@ -1110,19 +1110,20 @@ class _WorkerBatches[Record](pygrain.MapDataset[Record]):
 
 class _Filled(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
-    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones."""
+    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
+    `real` every row is a repeat."""
 
-    def __init__(self, rows: int):
-        self._rows = rows
+    def __init__(self, rows: int, *, real: bool = True):
+        self._rows, self._real = rows, real
 
     def map(self, element: Batch) -> Batch:
         from dew.nn.inputs import RowPlan
 
         held = rows_of(element)
-        if held == self._rows:
+        if held == self._rows and self._real:
             return element
         plan = RowPlan(None, held, self._rows, 0, 1)
-        return {**plan.pad(element), VALID_ROWS: ~plan.padding}
+        return {**plan.pad(element), VALID_ROWS: ~plan.padding & self._real}
 
 
 def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
@@ -1147,12 +1148,18 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
     worker counts, so neither changes which records a batch holds.
     """
     mine = records[offset + partition.index::partition.count]
+    # A share a pass's split holds no record for, as process 1's of one record
+    # on two, reads one batch of the split's first record with every row a
+    # repeat: it meets its peers' first batch and scores nothing.
+    empty = remainder and not len(mine) and len(records)
+    if empty:
+        mine = records[:1]
     if loading.workers:
         mine = _WorkerBatches(mine, rows, loading.workers, remainder=remainder)
     stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
     stream = stream.batch(rows, drop_remainder=not remainder)
     if remainder:
-        stream = stream.map(_Filled(rows))
+        stream = stream.map(_Filled(rows, real=not empty))
     if loading.workers:
         stream = stream.mp_prefetch(pygrain.MultiprocessingOptions(
             num_workers=loading.workers,

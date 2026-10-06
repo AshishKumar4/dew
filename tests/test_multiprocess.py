@@ -374,7 +374,8 @@ def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tm
     """`tests/test_whole_validation.py`'s passes on a pool of two: each
     process reads its share of a split of a batch and one record, the share
     that runs out first scoring its last batch's copy with every row a
-    repeat, and every objective's loss and `Perplexity` count each record once."""
+    repeat, and every objective's loss and `Perplexity` count each record once.
+    A split of one record leaves process 1's share empty, and it is scored once."""
     from test_whole_validation import assert_every_record_once, assert_the_metric_over_every_record
 
     reports = run_pool("whole_validation", tmp_path / "out", 2, run_dir=tmp_path / "run", timeout=1800)
@@ -382,6 +383,7 @@ def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tm
     for name, report in reports[0]["passes"].items():
         assert_every_record_once(name, report)
     assert_the_metric_over_every_record(reports[0]["perplexity"])
+    assert_the_metric_over_every_record(reports[0]["one"], 1)
 
 
 @pytest.mark.distributed

@@ -2029,7 +2029,7 @@ def mode_whole_validation(args) -> dict:
     root = Path(args.run_dir) / f"process{jax.process_index()}"
     windows = corpus_windows(root / "corpus")
     return {"passes": {name: evaluated(name, windows, root / name) for name in EVALUATED},
-            "perplexity": perplexity(windows)}
+            "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
 
 
 MODES = {"host_training": mode_host_training, "step_fits": mode_step_fits,
