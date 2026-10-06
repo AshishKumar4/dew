@@ -9,6 +9,7 @@ import time
 import urllib.request
 
 from jupyter_client import BlockingKernelClient
+from jupyter_core.utils import ensure_event_loop
 
 
 def dump_processes():
@@ -156,6 +157,7 @@ def main():
                              "arrival_to_result_seconds": time.perf_counter() - submitted,
                              "uid": usage["uid"], "fds": usage["fds"],
                              "pss_bytes": usage["pss_bytes"]})
+            ensure_event_loop().close()
             return rows
 
         with concurrent.futures.ThreadPoolExecutor(len(kernels)) as pool:
@@ -187,8 +189,11 @@ def main():
     finally:
         for identifier, client, _ in kernels:
             client.stop_channels()
+            started = time.perf_counter()
             request("/api/kernels/" + identifier, method="DELETE")
+            assert time.perf_counter() - started < 5, "kernel shutdown required a forced timeout"
         assert not list(pathlib.Path("/sessions/connections").glob("kernel-*.json"))
+        ensure_event_loop().close()
 
 
 if __name__ == "__main__":
