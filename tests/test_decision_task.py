@@ -1,5 +1,7 @@
 """`Decide`: batching, tournaments, calibration and Jev's wire form, against Laya's own agent."""
 
+import base64
+import io
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +24,7 @@ from dew.decision import (
     Temperatures,
 )
 from dew.decision.calibration import softmax
+from dew.decision.task import decoded_images
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -77,6 +80,42 @@ def test_systemone_speaks_jev_and_nothing_more(decide):
 def test_systemone_refuses_a_request_jev_would_refuse(decide, request_body, message):
     with pytest.raises(ValueError, match=message):
         decide.systemone(request_body)
+
+
+def png(color: tuple[int, int, int]) -> bytes:
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (4, 3), color).save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def test_images_decode_from_every_form_a_request_carries():
+    """Clef's `images` extension: PIL images, encoded bytes, and base64,
+    bare or as a data URL, all read as the same pixels."""
+    from PIL import Image
+
+    raw = png((200, 10, 30))
+    encoded = base64.b64encode(raw).decode()
+    images = decoded_images([Image.open(io.BytesIO(raw)), raw, encoded, f"data:image/png;base64,{encoded}"])
+    assert [image.size for image in images] == [(4, 3)] * 4
+    assert all(image.convert("RGB").getpixel((0, 0)) == (200, 10, 30) for image in images)
+    assert decoded_images(None) == []
+    for bad, message in ((["%%%"], "not base64"), ([base64.b64encode(b"text").decode()], "Pillow"),
+                         ([3], "PIL image"), ("x", "a list")):
+        with pytest.raises(ValueError, match=message):
+            decoded_images(bad)
+
+
+def test_strict_answers_drop_the_extensions_and_hold_jevs_fields(decide):
+    """A text backbone refuses images it cannot read; a strict answer drops
+    them, as Jev's endpoint knows no images, and holds Jev's fields alone."""
+    with_images = {**CASES["quickstart"], "images": [base64.b64encode(png((0, 0, 0))).decode()]}
+    with pytest.raises(ValueError, match="vision encoder"):
+        decide.systemone(with_images)
+    assert decide.systemone(with_images, strict=True) == decide.systemone(CASES["quickstart"])
+    with pytest.raises(ValueError, match="no details"):
+        decide.systemone(CASES["quickstart"], strict=True, details=True)
 
 
 def test_a_small_budget_splits_passes_without_moving_a_logit(decide):

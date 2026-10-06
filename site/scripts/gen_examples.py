@@ -22,7 +22,7 @@ GROUPS = [
                          "train_diffusion", "train_jepa", "banking77_decisions"]),
     ("Run a whole job", ["train_flowers_tpu", "sft_gemma4", "sft_diffusion_gemma", "sft_diffusion_gemma_images",
                          "train_rlvr", "train_harbor", "evaluate_and_serve"]),
-    ("Sample and inspect", ["sample_text_to_image", "moe_mesh", "route_decisions"]),
+    ("Sample and inspect", ["sample_text_to_image", "moe_mesh", "route_decisions", "serve_decisions"]),
 ]
 
 COMMAND = re.compile(r"^(python|JAX_PLATFORMS=|CUDA_VISIBLE_DEVICES=|uv |dew |XLA_FLAGS=)")
