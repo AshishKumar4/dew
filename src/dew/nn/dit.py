@@ -19,7 +19,7 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from .activations import gelu_exact, gelu_tanh
+from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
 from .conv import Conv
@@ -454,12 +454,21 @@ class _JepaStackOptions(_AttentionStackOptions, kw_only=True):
 
 @jax.checkpoint
 def _exact_gelu(hidden: jax.Array) -> jax.Array:
-    """`gelu_exact`, recomputed in the backward from `hidden` in its own dtype,
-    which the next matmul keeps anyway. Saved instead, XLA writes the fp32
-    value out for the backward, which made a JEPA training step (ViT-S/16 at
-    224, batch 64, bf16, RTX 4080) 10.4% slower than with tanh GELU;
-    recomputed, 3.2% slower."""
-    return gelu_exact(hidden)
+    """`gelu_exact_torch`, recomputed in the backward from `hidden` in its own
+    dtype, which the next matmul keeps anyway. Saved instead, XLA writes the
+    fp32 value out for the backward, which made a JEPA training step
+    (ViT-S/16 at 224, batch 64, bf16, RTX 4080) 10.4% slower than with tanh
+    GELU; recomputed, 3.2% slower.
+
+    Torch's erf form, not `gelu_exact`'s erfc, for speed: that step with exact
+    GELU in every MLP, on an A100 (ABAB, 50 steps after 5 of warmup, equal
+    peak memory), took 26.68/26.72 ms against erfc's 29.57/29.59 and tanh's
+    27.86 (Colab job dew-gpu-c20-gelu-a100-job-1, results under
+    ~/.cache/dew/integration/94e4c0093a44a944eabeee14ae1fbf693b40026b/).
+    The RTX 4080 measured erf slower than erfc, unverified since. In fp32 the
+    erf form lies further from float64: U-ViT's output went from 1.090 to
+    1.099 times the reference's error (tests/test_uvit_source.py)."""
+    return gelu_exact_torch(hidden)
 
 
 @logical_axes({("mlp", "layers_0"): ("embed", "mlp"), ("mlp", "layers_2"): ("mlp", "embed")})
