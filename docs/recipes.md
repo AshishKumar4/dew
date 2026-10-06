@@ -94,7 +94,7 @@ A dotted flag sets a field inside a configuration object. A subcommand such as `
 
 | Setting | Default | Notes |
 |---|---|---|
-| `--model.dtype` | `bfloat16` | Compute dtype; parameters are stored in float32 unless `--model.param-dtype` says otherwise. |
+| `--model.dtype` | `bfloat16` | Compute dtype. Parameters are stored in float32; `--model.param-dtype` stores them otherwise for a model that declares a `param_dtype` field, and for a `--pretrained` pipeline. A model that declares no field for a precision setting the run names refuses the run, naming the field; set that flag to `None`. |
 | `--model.attention-impl` | `auto` | `auto`, `reference`, `xla`, `cudnn` or `tpu`. The example uses `reference` so no device-specific kernel runs. |
 | `--optim.optimizer` | `adamw` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
 | `--optim.learning-rate` | `2.7e-4` | The constant rate when no schedule is named. |
