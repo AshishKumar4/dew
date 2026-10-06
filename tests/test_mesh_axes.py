@@ -17,6 +17,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
+from sharded import assert_sharded
 
 from dew.data import Dataset
 from dew.nn.backbones.dit import SimpleDiT
@@ -359,8 +360,9 @@ def run_losses(mesh, layout, steps):
     trainer = Trainer(
         LMObjective(tiny(), SEQ_LEN), optax.adam(1e-3), key=jax.random.key(0),
         mesh=mesh, layout=layout, tracker=tracker)
-    trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
-                steps=steps, log_every=1)
+    state = trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
+                        steps=steps, log_every=1)
+    assert_sharded(state.variables["params"], trainer.device_mesh)
     return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
 
 
@@ -374,13 +376,16 @@ TOPOLOGIES = {
     # over data and fsdp and the sequence over its own axis, and the stage
     # axis beside them: the two-layer model splits into two stages of one
     # layer, fed two microbatches of four rows, one of each device's two.
+    # The default rules split the widths over tensor and the residual width
+    # over fsdp, so a tensor mesh splits its parameters both ways
+    # (`sharded.assert_sharded`).
     "fsdp": (MeshSpec(fsdp=8), dense_layout()),
-    "tensor": (MeshSpec(fsdp=4, tensor=2), tensor_layout()),
+    "tensor": (MeshSpec(fsdp=4, tensor=2), dense_layout()),
     "sequence": (MeshSpec(fsdp=4, sequence=2), dense_layout()),
     "data_sequence": (MeshSpec(fsdp=2, sequence=2), dense_layout()),
-    "both": (MeshSpec(fsdp=2, tensor=2, sequence=2), tensor_layout()),
+    "both": (MeshSpec(fsdp=2, tensor=2, sequence=2), dense_layout()),
     "stage": (MeshSpec(fsdp=2, stage=2, microbatches=2), dense_layout()),
-    "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2, microbatches=2), tensor_layout()),
+    "stage_tensor": (MeshSpec(fsdp=2, tensor=2, stage=2, microbatches=2), dense_layout()),
 }
 
 
@@ -422,6 +427,7 @@ def one_step(spec):
     objective = LMObjective(tiny(), SEQ_LEN)
     initial = objective.init(jax.random.key(0))
     placed = jax.device_put(initial, Layout(min_shard=TINY_SHARD).shardings(mesh, initial))
+    assert_sharded(placed["params"], mesh)
     batch = shard_batch(mesh, next(token_batches()))
 
     @jax.jit

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import sys
 import time
 from collections.abc import Iterator, Mapping, Sequence
@@ -10,6 +11,7 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 from jax.sharding import Mesh
 
@@ -21,8 +23,8 @@ from dew.artifacts import (
     broadcast_from_process_zero,
     collective_host,
 )
-from dew.data.dataset import Closeable, DataPartition, Reader
-from dew.objectives.base import Batch, Effects, Loss, Metric, Objective, Step, Variables
+from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
+from dew.objectives.base import VALID_ROWS, Batch, Effects, Loss, Metric, Objective, Step, Variables
 
 from .distributed import MeshSpec, shard_batch
 
@@ -32,13 +34,12 @@ class Evaluation:
     """The result of one evaluation, with its previews kept on process 0.
 
     Every process holds the same `scores`, row counts and RNG identity
-    (`event_key`). Each score's name starts with the split, as in
-    `val/loss`. `coordinated_batches` is the number of batches every process
-    scored, `records` the rows those batches held, and `uneven_shards`
-    whether scoring stopped because some processes ran out of batches before
-    others. `elapsed_seconds` is process 0's wall time, including closing
-    the batch iterator. The metric accumulators and the validation batches
-    are not kept.
+    (`event_key`). Each score's name starts with the split, as in `val/loss`.
+    `coordinated_batches` is the number of batches every process scored, and
+    `records` the number of real rows in them, which covers every record of the
+    split once. `elapsed_seconds` is process 0's wall time, including closing the
+    batch iterator. The metric accumulators and the validation batches are not
+    kept.
     """
 
     step: int
@@ -46,7 +47,6 @@ class Evaluation:
     scores: dict[str, float]
     coordinated_batches: int
     records: int
-    uneven_shards: bool
     event_key: tuple[int, ...]
     elapsed_seconds: float
     previews: tuple[Artifact, ...]
@@ -58,8 +58,7 @@ class Evaluation:
             return dict(self.scores)
         return {**self.scores,
                 "evaluation/coordinated_batches": float(self.coordinated_batches),
-                "evaluation/records": float(self.records),
-                "evaluation/uneven_shards": float(self.uneven_shards)}
+                "evaluation/records": float(self.records)}
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,
@@ -69,36 +68,36 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None) -> Evaluation:
-        """Evaluate `variables` on the batches every process can read, without
-        an optimizer or a tracker.
+        """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
-        Every process calls this with the same objective, metrics and
-        numerical settings. `batches` is called with this process's share of
-        the split (`DataPartition.of(mesh)`) and returns a fresh iterator,
-        which this call opens and closes; you can pass `Dataset.val`
-        directly. Scoring stops at the first batch that some process does not
-        have, so every process scores the same batches. With no `metrics`, no
-        `loss` and no preview, no iterator is opened and the objective does
-        no work, and a preview alone reads at most the first batch. Only
-        process 0's `preview` flag counts, and the preview is made once per
-        call.
+        Every process calls this with the same objective, metrics and numerical
+        settings. `batches` is called with this process's share of the split
+        (`DataPartition.of(mesh)`) and returns a fresh iterator, which this call
+        opens and closes; you can pass `Dataset.val` directly. Every batch holds
+        `VALID_ROWS` (all True when the reader marked none), and the objective's loss
+        and the metrics count only the real rows. A process whose share runs out
+        before the others' scores a copy of its last batch in which every row is a
+        repeat, so every process scores the same number of batches and the pass
+        reads every record of every share. With no `metrics`, no `loss` and no
+        preview, no iterator is opened and the objective does no work, and a preview
+        alone reads at most the first batch. Only process 0's `preview` flag counts,
+        and the preview is made once per call.
 
-        `variables` is the complete Flax variables tree. `averaged`, when
-        given, is the complete set of averaged weights the objective sees as
-        `Step.ema`, not an optimizer state; to evaluate those weights
-        directly, pass `state.averaged` as `variables`. `step` keys the
-        evaluation's RNG and labels the result. `schedule_step` is the step
-        the objective's schedules read and defaults to `step`. When training
-        attempts were rejected, pass the count of accepted microbatches
-        (`TrainState.microstep`, as `fit` does) so the schedule follows only
-        the work training accepted.
+        `variables` is the complete Flax variables tree. `averaged`, when given, is
+        the complete set of averaged weights the objective sees as `Step.ema`, not an
+        optimizer state; to evaluate those weights directly, pass `state.averaged` as
+        `variables`. `step` keys the evaluation's RNG and labels the result.
+        `schedule_step` is the step the objective's schedules read, and defaults to
+        `step`. When training attempts were rejected, pass the number of accepted
+        microbatches (`TrainState.microstep`, as `fit` does) so the schedule follows
+        only the work training accepted.
 
-        The scores are broadcast to every process. Previews stay on process 0,
-        and there is at most one objective preview, however long the
-        validation split is. Reporting the result is the caller's job, and
-        callers in a process pool must agree on any reporting failure before
-        they enter their next collective. A device failure in flight still
-        requires ending the distributed runtime.
+        The scores are broadcast to every process. Previews stay on process 0, and
+        there is at most one objective preview, however long the validation split
+        is. Reporting the result is up to the caller. In a process pool, the callers
+        must agree on whether reporting failed before they enter their next
+        collective, and a device failure in flight still requires ending the
+        distributed runtime.
         """
         from dew.nn.inputs import request_key
         key = request_key(key)
@@ -113,16 +112,15 @@ class Evaluation:
         scores: dict[str, float] = {}
         previews: tuple[Artifact, ...] = ()
         scored = records = 0
-        uneven = False
         if batches is not None and (metrics or preview_enabled or loss):
-            scores, previews, scored, records, uneven = _score_split(
+            scores, previews, scored, records = _score_split(
                 objective, variables, batches, context, mesh, metrics=metrics, split=split,
                 root=root, preview_enabled=preview_enabled, score_key=score_key,
                 preview_key=preview_key, loss=loss)
         scores.update(training_scores)
         elapsed = time.perf_counter() - started
         scores, elapsed = broadcast_from_process_zero((scores, elapsed))
-        return cls(event_step, split, scores, scored, records, uneven, event_words, elapsed, previews)
+        return cls(event_step, split, scores, scored, records, event_words, elapsed, previews)
 
 
 def _pick(artifacts: tuple[Artifact, ...], reads: type):
@@ -221,24 +219,24 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                  context: Step, mesh: Mesh | None, *, metrics: Sequence[Metric],
                  split: str, root: bool, preview_enabled: bool,
                  score_key: jax.Array, preview_key: jax.Array, loss: bool = False,
-                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int, bool]:
-    """Score the coordinated prefix of a validation split.
+                 ) -> tuple[dict[str, float], tuple[Artifact, ...], int, int]:
+    """Score every record of a validation split.
 
-    Returns the finalized scores, root's previews, and the three counts every
-    rank agrees on: the batches scored, the records read, and whether the
-    prefix ended because some ranks ran out of batches before others.
+    Returns the finalized scores, root's previews, and the two counts every
+    rank agrees on: the batches scored and the real records they held.
 
-    Every rank walks these phases in the same order, so a rank that drains
-    early stops the pool at the batch agreement rather than at a collective
-    its peers have already left.
+    Every rank walks these phases in the same order. The pass ends when no
+    rank has a batch left; until then a rank that has drained scores a copy
+    of its last batch whose rows are all repeats (`_covered`), so it meets
+    its peers at every collective.
     """
     summaries = _Accumulators()
     loss_stats = None
     scores: dict[str, float] = {}
     previews: tuple[Artifact, ...] = ()
     source = iterator = None
+    last = None
     scored = records = 0
-    uneven = False
     try:
         def open_source() -> None:
             # Each name is bound as it is built, so a failure part way
@@ -252,13 +250,11 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         assert iterator is not None and mesh is not None
         while True:
             batch, available = _next_batch(iterator, scored)
-            if available != jax.process_count():
-                uneven = available > 0
-                batch = None
+            if not available:
                 break
-            assert batch is not None
-            batch, rows = _placed_batch(mesh, batch, scored)
-            records += rows
+            batch, last = _covered(batch, last, scored)
+            batch = _placed_batch(mesh, batch, scored)
+            records += int(jax.device_get(jnp.sum(batch[VALID_ROWS])))
             produced = None
             if metrics or loss:
                 # The objective scores under the mesh, as the step trains
@@ -306,7 +302,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                 scores[f'{split}/loss'] = float(value)
     finally:
         _close_source(iterator if iterator is not None else source)
-    return scores, previews, scored, records, uneven
+    return scores, previews, scored, records
 
 
 def _next_batch(iterator: Iterator, index: int) -> tuple[Batch | None, int]:
@@ -329,16 +325,51 @@ def _next_batch(iterator: Iterator, index: int) -> tuple[Batch | None, int]:
     return batch, available
 
 
-def _placed_batch(mesh: Mesh, batch: Batch, index: int) -> tuple[Batch, int]:
-    """Shard one validation batch onto the mesh, and count the rows it holds."""
-    def place() -> tuple[Batch, int]:
-        placed = shard_batch(mesh, batch)
-        rows = next((leaf.shape[0] for leaf in jax.tree.leaves(placed) if leaf.ndim), None)
-        if rows is None:
-            raise ValueError("validation batch has no row-bearing array")
-        return placed, int(rows)
+def _covered(batch: Batch | None, last: Batch | None, index: int) -> tuple[Batch, Batch]:
+    """The batch this rank scores at `index`, and the one it keeps to cover the next.
 
-    return agreed(f"batch placement {index}", place)
+    Its own batch carries `VALID_ROWS`, every row real where the reader
+    marked none. A rank whose share has run out while a peer's has not
+    scores a copy of its last batch with every row a repeat.
+    """
+    def cover() -> tuple[Batch, Batch]:
+        if batch is not None:
+            held = batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
+            return held, held
+        if last is None:
+            raise ValueError(
+                f"process {jax.process_index()}'s reader yields no batch while a peer's yields one; "
+                "Dew's readers give an empty share one batch whose rows are all repeats "
+                "(`VALID_ROWS` False), and a reader of your own has to as well")
+        return {**last, VALID_ROWS: np.zeros(rows_of(last), bool)}, last
+
+    return agreed(f"batch cover {index}", cover)
+
+
+def _placed_batch(mesh: Mesh, batch: Batch, index: int) -> Batch:
+    """Shard one validation batch onto the mesh."""
+    return agreed(f"batch placement {index}", lambda: shard_batch(mesh, batch))
+
+
+def _cut(leaf, keep: np.ndarray):
+    """`leaf` without the rows `keep` marks as repeats, when its leading axis
+    is the batch's rows: an array, or a per-row tuple of captions or texts."""
+    if isinstance(leaf, tuple) and len(leaf) == keep.size:
+        return tuple(text for text, kept in zip(leaf, keep, strict=True) if kept)
+    array = np.asarray(leaf) if isinstance(leaf, np.ndarray | jax.Array) else None
+    return array[keep] if array is not None and array.ndim and array.shape[0] == keep.size else leaf
+
+
+def _real_artifact[A: Artifact](artifact: A, keep: np.ndarray) -> A:
+    """`artifact` with every per-row field cut to the real rows."""
+    return dataclasses.replace(artifact, **{field.name: _cut(getattr(artifact, field.name), keep)
+                                            for field in dataclasses.fields(artifact)})
+
+
+def _real_batch(batch: Batch, keep: np.ndarray) -> Batch:
+    """`batch` cut to the real rows, without `VALID_ROWS`."""
+    return jax.tree.map(lambda leaf: _cut(leaf, keep),
+                        {name: leaf for name, leaf in batch.items() if name != VALID_ROWS})
 
 
 def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,
@@ -353,7 +384,11 @@ def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, bat
     produced = agreed(f"scoring batch {index}", lambda: objective.evaluate(
         variables, batch, replace(context, key=_folded(score_key, index))))
     produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
-    artifacts = _artifacts(produced)
+    # The metrics read the real rows alone, so a repeat filling out the
+    # split's last batch scores nothing.
+    keep = np.asarray(home[VALID_ROWS], bool)
+    artifacts = tuple(_real_artifact(artifact, keep) for artifact in _artifacts(produced))
+    home = _real_batch(home, keep)
     for metric in metrics:
         def merge(metric=metric) -> None:
             if not root:
