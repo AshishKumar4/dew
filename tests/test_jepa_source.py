@@ -6,8 +6,8 @@ off its initialization, and records the encoder's embeddings of each
 image's context patches, the predictor's predictions for its target patches
 and, against fixed cotangents on both, the gradients of the images and every
 parameter: in float32 and in float64, the truth both float32 runs are
-measured from (tests/fixtures/jepa/vjepa.npz). Its MLPs run tanh GELU, as
-Dew's JEPA does. Dew's JepaEncoder and JepaPredictor on the same weights are
+measured from (tests/fixtures/jepa/vjepa.npz). Its MLPs run V-JEPA's own
+exact GELU, as Dew's JEPA does. Dew's JepaEncoder and JepaPredictor on the same weights are
 held to tests/reference_error.py's rule: no further from float64 than twice
 the float32 reference.
 """
