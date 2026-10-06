@@ -106,6 +106,10 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=TOKENIZERS)
     out = parser.parse_args(argv).out
+    for name in ("tiny-chat", "tiny-tools"):
+        (out / name).mkdir(parents=True, exist_ok=True)
+        (out / name / "chat_template.jinja").write_bytes(
+            (TOKENIZERS / name / "chat_template.jinja").read_bytes())
     write(out / "tiny-chat", CORPUS, every_byte=False, embed_template=True)
     write(out / "tiny-tools", TOOLS_CORPUS, every_byte=True, embed_template=False)
 
