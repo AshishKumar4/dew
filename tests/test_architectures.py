@@ -22,6 +22,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import PartitionSpec as P
+from recording import RecordingTracker
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import ModelConfig
@@ -337,18 +338,6 @@ class Spread:
 
     def finalize(self, accumulated):
         return accumulated[0] / accumulated[1]
-
-
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-        self.artifacts = []
-
-    def log(self, scalars, step):
-        self.scalars.append((step, dict(scalars)))
-
-    def artifact(self, value, step):
-        self.artifacts.append((step, value))
 
 
 def make_objective(case: Case, model, encoder):
