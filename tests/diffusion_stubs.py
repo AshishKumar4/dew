@@ -1,5 +1,5 @@
-"""What the diffusion suites share: a small registered text encoder and a
-batch the data axis divides."""
+"""What the diffusion suites share: a small registered text encoder, a
+batch the data axis divides, and a table that reads a class off a prompt."""
 
 from dataclasses import dataclass
 
@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.inputs import ConditionEncoder
+from dew.inputs import CharTable, ConditionEncoder
 from dew.nn.dit import TextContext
 from dew.objectives.base import Variables
 from dew.registry import encoders
@@ -68,3 +68,15 @@ def batch_for(objective, size: int) -> dict:
         1, size, size, channels), (rows, 1, 1, 1))
     return {"image": pixels,
             **objective.inputs.tokenize([PROMPTS[row % len(PROMPTS)] for row in range(rows)])}
+
+
+def label_table(labels: dict[str, float], null: float = 0.0) -> CharTable:
+    """A character table of one feature: each name's first character reads
+    its label, and the padding id 0 reads `null`, the class a dropped
+    condition stands for."""
+    table = CharTable.from_pretrained(tokens=2, features=1)
+    entries = np.zeros((table.vocab, 1), np.float32)
+    entries[0] = null
+    for name, label in labels.items():
+        entries[table.tokenize([name])["input_ids"][0, 1]] = label
+    return CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
