@@ -12,8 +12,8 @@ come from is replaced: `models.vgg16(weights=IMAGENET1K_V1)` and
 `load_pretrained` read the weights given here instead of downloading.
 
 - drawn.npz: weights drawn by `drawn_weights` (VGG16's convolutions He
-  normal, the linear heads non-negative), whose per-tensor sums the
-  fixture keeps so a test can check it drew the same; two 64-pixel image
+  uniform, the linear heads non-negative), whose per-tensor SHA-256 the
+  fixture keeps so a test can check it drew the same bits; two 64-pixel image
   pairs in [-1, 1]; each pair's distance and the gradient of their mean
   with respect to the first image, in float32 and in float64.
 - published.npz: the published weights, torchvision's vgg16-397923af.pth
@@ -51,19 +51,25 @@ CHANNELS = (64, 128, 256, 512, 512)
 
 def drawn_weights(seed: int = 0) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]]:
     """VGG16's `features` and the five linear heads, drawn in torchvision's
-    order from `np.random.default_rng(seed)`: each kernel He normal over its
-    fan-in, each bias normal at 0.01, each head's weights the absolute value
-    of a normal at 0.1, in float32."""
+    order from `np.random.default_rng(seed)`'s float32 uniforms: each kernel
+    He uniform over its fan-in, each bias uniform in [-0.01, 0.01), each
+    head's weights uniform in [0, 0.2). A uniform is integer bits times
+    2^-24 and the rest is float32 arithmetic, so every machine draws the
+    same bits. (numpy's float32 normals take their tail through libm's
+    log1pf, whose last bit differs between glibc 2.39 and 2.43.)"""
     rng = np.random.default_rng(seed)
+
+    def uniform(shape, bound: float) -> np.ndarray:
+        return (rng.random(shape, dtype=np.float32) * np.float32(2) - np.float32(1)) * np.float32(bound)
+
     vgg, inputs = {}, 3
     for index, width in zip(CONVOLUTIONS, (64, 64, 128, 128, 256, 256, 256, 512, 512, 512, 512, 512, 512),
                             strict=True):
-        vgg[f"features.{index}.weight"] = (rng.standard_normal((width, inputs, 3, 3), dtype=np.float32)
-                                           * np.float32(np.sqrt(2 / (9 * inputs))))
-        vgg[f"features.{index}.bias"] = rng.standard_normal(width, dtype=np.float32) * np.float32(0.01)
+        vgg[f"features.{index}.weight"] = uniform((width, inputs, 3, 3), np.sqrt(6 / (9 * inputs)))
+        vgg[f"features.{index}.bias"] = uniform(width, 0.01)
         inputs = width
-    linear = {f"lin{stage}.model.1.weight": np.abs(rng.standard_normal((1, width, 1, 1), dtype=np.float32))
-              * np.float32(0.1) for stage, width in enumerate(CHANNELS)}
+    linear = {f"lin{stage}.model.1.weight": rng.random((1, width, 1, 1), dtype=np.float32) * np.float32(0.2)
+              for stage, width in enumerate(CHANNELS)}
     return vgg, linear
 
 
@@ -138,7 +144,7 @@ def main() -> None:
     vgg, linear = drawn_weights()
     first, second = images(rng, 2)
     arrays = {"images": first, "references": second,
-              **{f"sum/{key}": np.float64(value.astype(np.float64).sum())
+              **{f"sha256/{key}": np.str_(hashlib.sha256(value.tobytes()).hexdigest())
                  for key, value in {**vgg, **linear}.items()}}
     for dtype, tail in ((torch.float64, "_f64"), (torch.float32, "")):
         for key, value in distances(vgg, linear, first, second, dtype, gradient=True).items():
