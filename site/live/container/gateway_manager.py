@@ -82,9 +82,8 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
                         'tmpfs', str(directory)], check=True)
         arguments = ["/kernel.json" if arg == self.connection_file else arg for arg in kernel_cmd[3:]]
         command = [
-            "bwrap", "--unshare-user", "--unshare-net", "--unshare-pid", "--unshare-ipc", "--unshare-uts",
-            "--die-with-parent", "--new-session",
-            "--ro-bind", "/", "/", "--proc", "/proc", "--dev", "/dev",
+            "bwrap", "--unshare-user", "--die-with-parent", "--new-session",
+            "--ro-bind", "/", "/", "--dev", "/dev",
             "--size", str(64 * 1024 * 1024), "--tmpfs", "/work",
             "--size", str(16 * 1024 * 1024), "--tmpfs", "/tmp",
             "--ro-bind", str(connection), "/kernel.json",
@@ -104,7 +103,9 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "MALLOC_ARENA_MAX": "2",
             **({"DEW_GUEST_TRACE": "1"} if os.environ.get("DEW_GUEST_TRACE") == "1" else {}),
         }
-        await super()._async_launch_kernel(limited, **{**kwargs, "env": env, "cwd": "/"})
+        isolated = ["unshare", "--mount", "--pid", "--fork", "--mount-proc",
+                    "--ipc", "--uts", "--net", *limited]
+        await super()._async_launch_kernel(isolated, **{**kwargs, "env": env, "cwd": "/"})
 
 
 class LimitedMappingKernelManager(SeedingMappingKernelManager):
