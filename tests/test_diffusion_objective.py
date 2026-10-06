@@ -649,3 +649,38 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     actual = objective.evaluate(variables, batch, step).images
     np.testing.assert_array_equal(actual, expected)
 
+
+
+@pytest.mark.parametrize("kind", ["rcm", "ladd", "guidance_distillation"])
+def test_a_distillation_substitutes_every_network_it_runs(kind):
+    """The trainer substitutes each module an objective's step runs
+    (`substitute`, as remat does) in `program_key`'s order: the student,
+    then the frozen teacher, and rCM's fake score, which trains."""
+    from dew.objectives.diffusion import (
+        AdversarialDistillation,
+        AdversarialDistillationObjective,
+        ConsistencyDistillation,
+        ConsistencyDistillationObjective,
+        GuidanceDistillationObjective,
+    )
+
+    model, flow = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2), presets.Flow()()
+    inputs = InputSpec(Field("image", (4, 4, 3)))
+    teacher = DiffusionObjective(model, flow, inputs, guidance=None, steps=2)
+    held = teacher.model_variables(teacher.init(jax.random.PRNGKey(0)))
+    objective = {
+        "rcm": lambda: ConsistencyDistillationObjective(model, flow, inputs, ConsistencyDistillation(),
+                                                        teacher=model, teacher_variables=held),
+        "ladd": lambda: AdversarialDistillationObjective(
+            model, flow, inputs, AdversarialDistillation(feature_layers=("dit_block_0",)), teacher=model,
+            teacher_variables=held),
+        "guidance_distillation": lambda: GuidanceDistillationObjective(model, flow, inputs, teacher=teacher,
+                                                                       teacher_variables=held),
+    }[kind]()
+    trained = [program.trained for program in objective.program_key()]
+    assert trained == {"rcm": [True, False, True]}.get(kind, [True, False])
+    modules = [program.module.clone() for program in objective.program_key()]
+    objective.substitute(modules)
+    programs = objective.program_key()
+    assert all(program.module is module for program, module in zip(programs, modules, strict=True))
+    assert [program.trained for program in programs] == trained

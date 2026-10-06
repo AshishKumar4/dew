@@ -475,34 +475,6 @@ def test_a_target_that_is_not_a_dense_is_refused_when_called(decoder, reference)
         lora.adapted(decoder.model, record).apply(decoder.variables, jnp.asarray(reference["input_ids"]))
 
 
-@pytest.mark.parametrize("objective", ["rcm", "ladd"])
-def test_a_distillation_that_runs_its_teacher_through_the_student_refuses_an_adapted_student(objective):
-    """rCM's teacher and fake score, and LADD's teacher, are whole trees the
-    student's model applies, with no factors for an adapter's branch: an
-    adapted student is refused when the objective is built, not at the
-    first step, where the teacher's tree has no `lora_A`."""
-    from dew.diffusion.presets import Flow
-    from dew.inputs import Field, InputSpec
-    from dew.objectives.diffusion import (
-        AdversarialDistillation,
-        AdversarialDistillationObjective,
-        ConsistencyDistillation,
-        ConsistencyDistillationObjective,
-    )
-
-    base = _BranchHost(nn.Dense(3))
-    teacher = base.init(jax.random.key(0), jnp.zeros((1, 3)))
-    student = LoRA(rank=2, modules=("proj",)).apply(base, teacher, key=1).model
-    inputs = InputSpec(Field("image", (4, 4, 3)))
-    with pytest.raises(ValueError, match="holds no factors for an adapter's branch"):
-        if objective == "rcm":
-            ConsistencyDistillationObjective(student, Flow()(), inputs, ConsistencyDistillation(),
-                                             teacher=teacher)
-        else:
-            AdversarialDistillationObjective(student, Flow()(), inputs,
-                                             AdversarialDistillation(feature_layers=(0,)), teacher=teacher)
-
-
 def test_freeze_refuses_a_filter_that_splits_nothing(decoder):
     with pytest.raises(ValueError, match="trains nothing"):
         freeze(decoder.variables, lambda path: False)

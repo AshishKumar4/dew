@@ -25,7 +25,7 @@ from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import FROZEN, Variables
+from dew.objectives.base import FROZEN, Variables, merge
 from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, solvers, trainings
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import EulerAncestral
@@ -206,7 +206,8 @@ class FlowGRPO(Training):
                              f"under; the registered metrics are {sorted(metrics)}")
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> FlowGRPOObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> FlowGRPOObjective:
         from dew.objectives.rl.flow import FlowGRPOObjective
         from dew.sampling.flow import FlowSDE
 
@@ -447,24 +448,25 @@ class DiffusionRunConfig(RunConfig):
             return objective
         # The objective's own init draws the denoiser beside its heads and
         # towers; the adapter freezes the denoiser's weights, and the heads
-        # stay under `params` to train.
+        # stay under `params` to train, beside their own `constants`.
         key = jax.random.key(self.trainer.key)
         drawn = objective.init(key)
         adapter = self.lora.apply(objective.model, objective.model_variables(drawn),
                                   key=jax.random.fold_in(key, 1))
-        heads = {name: tree for name, tree in drawn["params"].items() if name in LOSS_HEADS}
-        start = {**drawn, **adapter.variables, "params": {**heads, **adapter.variables["params"]}}
-        return self._objective(start, adapter.model)
+        heads = {collection: {name: tree for name, tree in drawn[collection].items() if name in LOSS_HEADS}
+                 for collection in ("params", "constants") if collection in drawn}
+        return self._objective(merge({**drawn, **adapter.variables}, heads), adapter.model)
 
     def _objective(self, variables: Variables | None, adapted: nn.Module | None) -> DiffusionObjective:
         """The configured objective over `variables`, with `adapted` in place
         of the model a run from scratch builds."""
         if self.pretrained is None:
-            model, conditions, autoencoder = self._scratch(variables)
-            model = model if adapted is None else adapted
+            base, conditions, autoencoder = self._scratch(variables)
+            model = base if adapted is None else adapted
             sample, convention = self.sample_field(), None
         else:
             source = self._source(variables)
+            base = source.model
             if self.lora is not None:
                 # The adapter binds to the denoiser and the pipeline's
                 # weights, so the objective trains its factors alone.
@@ -481,7 +483,8 @@ class DiffusionRunConfig(RunConfig):
             sample = source.inputs.sample
         inputs = InputSpec(sample=sample, conditions=conditions)
         process = self._process(convention)
-        return self.mode.objective(self, model, process, inputs, autoencoder=autoencoder, variables=variables)
+        return self.mode.objective(self, model, process, inputs, base=base, autoencoder=autoencoder,
+                                   variables=variables)
 
     def rollout(self, objective: DiffusionObjective):
         """Return the mode's rollout for `objective`, which the trainer runs.

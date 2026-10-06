@@ -42,6 +42,7 @@ from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.mp import Uncertainty
 from dew.nn.protocols import RequiresText
 from dew.objectives.base import (
+    FROZEN,
     OMITTED,
     Aux,
     Batch,
@@ -51,6 +52,8 @@ from dew.objectives.base import (
     Ratio,
     Step,
     Variables,
+    freeze,
+    merge,
     thaw,
     under,
 )
@@ -92,22 +95,26 @@ LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
 """What trains beside the model under `params` and the model never reads."""
 
 
-def _unadapted(name: str, model: nn.Module, held: str) -> None:
-    """Refuse an adapted `model` for an objective that applies `held`, whole
-    trees with no factors for the adapter's branch, through it."""
-    from dew.lora import _Adapted
-
-    if isinstance(type(model), _Adapted):
-        raise ValueError(f"{name} applies its {held} through the student's model, and a held tree holds no "
-                         f"factors for an adapter's branch: train {name} without a LoRA")
-
-
 def _own_loss(name: str, kwargs: dict) -> None:
     """Refuse the denoising loss's extras, which an objective with its own
     loss would leave unused."""
     unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
     if unused:
         raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+
+
+def _from_teacher(variables: Variables, teacher: Variables) -> Variables:
+    """`variables` with the model's own leaves copied from `teacher`'s, each
+    in a buffer of its own, since the step donates them. A split keeps each
+    leaf where it was: an adapter's factors under `params` and the weights it
+    freezes under `FROZEN`."""
+    copied = merge(thaw(variables), {collection: jax.tree.map(jnp.copy, tree)
+                                     for collection, tree in teacher.items()})
+    if FROZEN not in variables:
+        return copied
+    frozen = {("params", *(entry.key for entry in path))
+              for path, _ in jax.tree_util.tree_leaves_with_path(variables[FROZEN])}
+    return freeze(copied, lambda path: path not in frozen)
 
 
 def _without_loss_heads(variables: Variables) -> Variables:
@@ -497,11 +504,11 @@ class DiffusionObjective(Objective[Ratio]):
         drawn = self.model.init(key, jnp.ones((1, *self.latent_shape)), jnp.ones((1,)),
                                 **conditions)
         state = {**drawn, "encoders": held["encoders"]}
-        for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR):
+        for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR, TEACHER):
             # The frozen weights are state, like the encoders'. They ride in
             # as an argument to the compiled step for the layout to place.
             # A caller holding only some towers takes the rest as built,
-            # and a pretrained discriminator rides in the same way.
+            # and a pretrained discriminator and a teacher ride in the same way.
             value = held[frozen] if frozen in held else self.held_variables().get(frozen)
             if value is not None:
                 state[frozen] = value
@@ -811,10 +818,13 @@ class Training(ABC):
 
     @abstractmethod
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> DiffusionObjective:
         """Return this mode's objective over the run's model, process, inputs, autoencoder and variables.
 
-        It samples as the run says.
+        `model` is the model the objective trains, with the run's adapter when it trains
+        a LoRA, and `base` is the run's model without one, which a teacher of the run's
+        architecture runs. It samples as the run says.
         """
 
     def check(self, run: DiffusionRunConfig) -> None:
@@ -854,7 +864,8 @@ class Denoising(Training):
     alignment: RepresentationAlignment | None = None
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> DiffusionObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> DiffusionObjective:
         return DiffusionObjective(
             model, process, inputs, autoencoder=autoencoder, variables=variables,
             unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay, solver=run.solver,
