@@ -14,6 +14,14 @@ from dew.interop.families.deepseek import (
     _kimi_k25_path,
 )
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
+from dew.interop.families.falcon import (
+    _FALCON_NAMES,
+    _falcon_config,
+    _falcon_export,
+    _falcon_export_weights,
+    _falcon_path,
+    _falcon_prepare,
+)
 from dew.interop.families.gemma import (
     _gemma2_config,
     _gemma2_export,
@@ -147,6 +155,15 @@ ENTRIES = (
         'phi', 'PhiForCausalLM', _phi_export,
         weight_path=partial(_renamed_path, _PHI_NAMES), export_path=partial(_renamed_name, _PHI_NAMES),
         export_weights=_decoder_tensors, preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('falcon',), _falcon_config,
+        lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
+                       and fields.partial_rotary_factor is None,
+        'falcon', 'FalconForCausalLM', _falcon_export,
+        weight_path=_falcon_path, export_path=partial(_renamed_name, _FALCON_NAMES),
+        prepare=_falcon_prepare, export_weights=_falcon_export_weights, preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
     ),
     DecoderFamily(
         ("nemotron_h",),
