@@ -39,6 +39,7 @@ from .prompts import Prompts
 from .providers import HubDataset, PreparedTFDS, load
 from .sources.hf import HFOptions
 from .sources.text import (
+    HubText,
     TokenBytes,
     TokenCorpus,
     TokenDocumentSource,
@@ -57,7 +58,7 @@ __all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
            "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable",
            "Corpus", "DataPartition", "DataPhase", "Dataset",
            "DatasetSpec",
-           "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "ImageDataset",
+           "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "HubText", "ImageDataset",
            "Loading", "LocalVideos", "OnlineImages", "OnlineVideos",
            "PackedTokens", "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
            "Stage",
