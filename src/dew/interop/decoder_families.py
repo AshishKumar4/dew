@@ -90,6 +90,7 @@ from dew.interop.families.nemotron_h import (
 )
 from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
+from dew.interop.families.phi import _PHI_NAMES, _phi_config, _phi_export
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen3_config,
@@ -106,6 +107,7 @@ from dew.interop.hf_decoders import (
     _GEMMA,
     _QWEN35,
     DecoderFamily,
+    _decoder_tensors,
     _every_layer_windowed,
     _kind_mixers,
     _renamed_name,
@@ -138,6 +140,13 @@ ENTRIES = (
         weight_path=partial(_renamed_path, _GPT_NEO_NAMES),
         export_path=partial(_renamed_name, _GPT_NEO_NAMES), preserve_source_layout=False,
         tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+    ),
+    DecoderFamily(
+        ('phi',), _phi_config,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and fields.attention_bias,
+        'phi', 'PhiForCausalLM', _phi_export,
+        weight_path=partial(_renamed_path, _PHI_NAMES), export_path=partial(_renamed_name, _PHI_NAMES),
+        export_weights=_decoder_tensors, preserve_source_layout=False,
     ),
     DecoderFamily(
         ("nemotron_h",),
