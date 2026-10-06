@@ -120,7 +120,7 @@ from dew.nn.mla import MLAMixer
 ENTRIES = (
     DecoderFamily(
         ('phi',), _phi_config,
-        lambda fields: fields.shared_parallel_norm and fields.lm_head_bias and fields.attention_bias,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and fields.attention_bias,
         'phi', 'PhiForCausalLM', _phi_export,
         weight_path=partial(_renamed_path, _PHI_NAMES), export_path=partial(_renamed_name, _PHI_NAMES),
         export_weights=_decoder_tensors, preserve_source_layout=False,

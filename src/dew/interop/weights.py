@@ -106,7 +106,8 @@ def _leaves[LeafT](tensors: Mapping[str, np.ndarray], path_of: TensorPath, param
         stored = np.asarray(tensor)
         order = (*range(2, stored.ndim), 1, 0) if path[-1] == "kernel" else None
         transpose = None if order is None else tuple(int(axis) for axis in np.argsort(order))
-        dtype = checkpoint_dtype(stored.dtype, "float32" if path[0] == "constants" else param_dtype)
+        dtype = checkpoint_dtype(stored.dtype, "float32" if path[0] == "constants"
+                                 or (path[0] == 'params' and path[-1] == 'head_bias') else param_dtype)
         yield name, path, read(stored, dtype, order), transpose
 
 
