@@ -1,0 +1,139 @@
+{
+ "quickstart": {
+  "state": "Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account.",
+  "questions": {
+   "department": {
+    "type": "choice",
+    "instructions": "Which department should handle this?",
+    "criteria": {
+     "billing": "invoices, refunds and charges",
+     "technical": "bugs and outages",
+     "sales": "pricing and upgrades"
+    }
+   },
+   "urgency": {
+    "type": "score",
+    "instructions": "How urgent is this?",
+    "criteria": [
+     "not urgent",
+     "soon",
+     "today",
+     "blocking"
+    ]
+   },
+   "churn": {
+    "type": "noul",
+    "instructions": "Does the customer threaten to leave?"
+   }
+  }
+ },
+ "structured": {
+  "state": {
+   "customer": "Ana",
+   "plan": "pro",
+   "messages": [
+    "refund please",
+    "[MASK] it now"
+   ]
+  },
+  "questions": {
+   "refund": {
+    "type": "noul",
+    "instructions": {
+     "question": "Is this a refund request?",
+     "strict": true
+    },
+    "criteria": {
+     "true": "asks for money back",
+     "false": {
+      "note": "anything else"
+     }
+    }
+   },
+   "tone": {
+    "type": "choice",
+    "instructions": "What is the [MASK] tone?",
+    "criteria": [
+     "calm",
+     "angry",
+     "neutral"
+    ]
+   }
+  }
+ },
+ "conversation": {
+  "state": [
+   {
+    "role": "user",
+    "content": "message 0: Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account."
+   },
+   {
+    "role": "user",
+    "content": "message 1: Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account."
+   },
+   {
+    "role": "user",
+    "content": "message 2: Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account."
+   },
+   {
+    "role": "user",
+    "content": "message 3: Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account."
+   },
+   {
+    "role": "user",
+    "content": "message 4: Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account."
+   },
+   {
+    "role": "user",
+    "content": "message 5: Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account."
+   }
+  ],
+  "questions": {
+   "resolved": {
+    "type": "noul",
+    "instructions": "Has the issue been resolved?",
+    "criteria": {
+     "true": "the agent fixed it",
+     "false": ""
+    }
+   }
+  }
+ },
+ "many_options": {
+  "state": "Hi team, we were billed twice for March and the second charge bounced our rent payment. I need this reversed today or I am cancelling the account.",
+  "questions": {
+   "intent": {
+    "type": "choice",
+    "instructions": "Which request is this?",
+    "criteria": {
+     "intent_0": "request type number 0 about accounts",
+     "intent_1": "request type number 1 about accounts",
+     "intent_2": "request type number 2 about accounts",
+     "intent_3": "request type number 3 about accounts",
+     "intent_4": "request type number 4 about accounts",
+     "intent_5": "request type number 5 about accounts",
+     "intent_6": "request type number 6 about accounts",
+     "intent_7": "request type number 7 about accounts",
+     "intent_8": "request type number 8 about accounts",
+     "intent_9": "request type number 9 about accounts",
+     "intent_10": "request type number 10 about accounts",
+     "intent_11": "request type number 11 about accounts",
+     "intent_12": "request type number 12 about accounts",
+     "intent_13": "request type number 13 about accounts"
+    }
+   }
+  }
+ },
+ "single_option": {
+  "state": "short",
+  "questions": {
+   "only": {
+    "type": "choice",
+    "instructions": "Pick it.",
+    "criteria": {
+     "yes": null
+    }
+   }
+  }
+ }
+}
