@@ -19,37 +19,42 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from PIL import Image
 from test_diffusion_objective import RES, TOKENS, StubText
+from test_inference import make_run
 
+from dew import Checkpoints
+from dew.artifacts import uint8_pixels
 from dew.data import Dataset
+from dew.diffusion.presets import Flow
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
+from dew.sampling import TextToImage
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def single_device(offline=True) -> dict[str, str]:
-    """The environment of a smoke run: the one the docstrings tell a reader to
-    use, minus the suite's eight simulated devices, since a smoke run is a
-    single-device run. `HF_HUB_OFFLINE` keeps a fixture path from becoming a
-    download. A harness suite reads its documents from the Hub, so that one
+def single_device(offline=True, devices=1) -> dict[str, str]:
+    """One CPU device by default, or an isolated mesh for the MoE example.
+    `HF_HUB_OFFLINE` keeps a fixture path from becoming a download.
+    A harness suite reads its documents from the Hub, so that one
     run asks for the network and carries the marker. No smoke reaches a paid
     endpoint, so none is handed the caller's OpenAI key.
     """
     return {**{key: value for key, value in os.environ.items() if key != "OPENAI_API_KEY"},
             "PYTHONPATH": str(REPO_ROOT / "src"),
             "JAX_PLATFORMS": "cpu",
-            "XLA_FLAGS": "--xla_force_host_platform_device_count=1",
+            "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}",
             "HF_HUB_OFFLINE": "1" if offline else "0",
             "TOKENIZERS_PARALLELISM": "false"}
 
 
-def smoke(name, out, *arguments, offline=True, script=None, smoke_args=True):
-    """One example's `--smoke` run, in its own process, on one CPU device (`single_device`)."""
+def smoke(name, out, *arguments, offline=True, script=None, smoke_args=True, devices=1):
+    """Run an example's smoke mode or existing small controls in an isolated CPU process."""
     finished = subprocess.run(
         [sys.executable, str(script or REPO_ROOT / "examples" / f"{name}.py"),
          *(["--smoke", "--out", str(out)] if smoke_args else []), *arguments],
-        cwd=REPO_ROOT, env=single_device(offline), capture_output=True, text=True, timeout=900)
+        cwd=REPO_ROOT, env=single_device(offline, devices), capture_output=True, text=True, timeout=900)
     assert finished.returncode == 0, (
         f"{name} --smoke exited {finished.returncode}\n"
         f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
@@ -63,6 +68,79 @@ def load_example(name):
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def test_readme_demo_resumes_updates_its_policy_freezes_the_reference_and_draws_flow(tmp_path):
+    """The public chain restores a real checkpoint and keeps DPO's reference unchanged."""
+    out = tmp_path / "demo"
+    finished = smoke("readme_demo", out, "--out", str(out), smoke_args=False)
+    assert "Resumed from step 20" in finished.stdout + finished.stderr
+    summary = json.loads((out / "summary.json").read_text())
+    assert summary["language_model"]["first_step"] == 20
+    assert summary["language_model"]["resumed_step"] == summary["language_model"]["updates"] == 24
+    assert summary["dpo"] == {"updates": 4, "reference_max_change": 0.0}
+    checkpoints = Checkpoints(str(out / "lm-checkpoints"))
+    first, _ = checkpoints.restore(step=20)
+    resumed, _ = checkpoints.restore(step=24)
+    assert int(first["updates"]) == 20 and int(resumed["updates"]) == 24
+    assert any(not np.array_equal(a, b) for a, b in zip(
+        jax.tree.leaves(first["variables"]["params"]),
+        jax.tree.leaves(resumed["variables"]["params"]), strict=True))
+    preview = np.load(out / "flow-preview.npy")
+    assert summary["flow"]["updates"] == 3 and preview.shape == (4, 8, 8, 3) and np.isfinite(preview).all()
+    np.testing.assert_array_equal(np.asarray(Image.open(out / "flow-preview.ppm")),
+                                  np.concatenate(list(uint8_pixels(preview)), axis=1))
+
+
+def test_text_to_image_example_records_requested_seeds_and_their_real_pixels(tmp_path, monkeypatch):
+    """A trained local DiT and real tiny CLIP render the manifest's prompts and keys."""
+    monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+    run, out = tmp_path / "run", tmp_path / "samples"
+    make_run(run, Flow(), encoder="clip_text", checkpoint=str(REPO_ROOT / "tests/fixtures/clip/tiny"),
+             steps=1)
+    example = load_example("sample_text_to_image")
+    config = example.Config(model=str(run), out=out, prompts=("a bird", "a flower"),
+                            seeds=(3, 17), samplers=("heun40",), negative="a cat")
+    example.main(config)
+    manifest = json.loads((out / "manifest.json").read_text())
+    assert manifest["model"] == str(run) and manifest["negative"] == "a cat"
+    assert [(batch["seed"], batch["images"]) for batch in manifest["batches"]] == [(3, 2), (17, 2)]
+    pipe = TextToImage.from_run(str(run))
+    solver, steps, guidance = example.SAMPLERS["heun40"]
+    for index, seed in enumerate(config.seeds):
+        prepared = pipe.prepare(config.prompts, key=seed, steps=steps, unconditional=config.negative)
+        images = pipe(prepared, key=seed, steps=steps, solver=solver, guidance=guidance).host().images
+        pixels = uint8_pixels(images)
+        for row, prompt in enumerate(config.prompts):
+            record = manifest["images"][2 * index + row]
+            assert record == {"file": f"heun40/p{row}_s{seed}.png", "prompt": prompt, "seed": seed,
+                              "sampler": "Heun", "steps": 40, "guidance": 5.0,
+                              "guidance_interval": [0.0, 1.0]}
+            np.testing.assert_array_equal(np.asarray(Image.open(out / record["file"])), pixels[row])
+    assert (out / "heun40/p0_s3.png").read_bytes() != (out / "heun40/p0_s17.png").read_bytes()
+
+
+def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
+    """Existing tiny controls train exchange dispatch and record actual routed generations."""
+    out = tmp_path / "mesh"
+    smoke("moe_mesh", out, "--out", str(out), "--steps", "2", "--snapshot-every", "1",
+          "--batch-size", "8", "--sequence-length", "12", "--experts", "2", "--top-k", "1",
+          smoke_args=False, devices=8)
+    record = json.loads((out / "moe-mesh.json").read_text())
+    assert record["mesh"] == {"data": 2, "expert": 2, "fsdp": 2, "tensor": 1, "sequence": 1, "stage": 1}
+    assert len(record["devices"]) == 8 and record["dispatch"] == "exchange" and record["all_to_all_ops"] > 0
+    assert [step["step"] for step in record["steps"]] == [1, 2]
+    assert all(np.isfinite(step["loss"]) for step in record["steps"])
+    assert len(record["generated"]) == 8 and all(record["generated"])
+    assert record["frames"][-1]["step"] is None and len(record["frames"]) == 3
+    assert record["frames"][-1]["rows"] == [[row, row + 1] for row in range(8)]
+    for frame in record["frames"]:
+        for layer in frame["layers"]:
+            sent = np.asarray(layer["sent"])
+            assert sent.shape == (8, 8) and sent.sum() == sum(layer["per_expert"]) == 96
+            assert (sent.sum() - np.trace(sent)) > 0 and layer["rounds"] >= 1
+            assert np.asarray(layer["by_class"]).sum() == 96
+    assert "<svg" in (out / "moe-mesh.svg").read_text()
 
 
 @pytest.mark.parametrize(
