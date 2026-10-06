@@ -14,7 +14,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Generic, Protocol, runtime_checkable
+from typing import Generic
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +23,7 @@ from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
 from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of, prompt_major
+from dew.nn.protocols import BlockDenoiser
 from dew.objectives.base import Variables
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
@@ -69,39 +70,6 @@ class CanvasGeneration(Generic[ArrayT]):
             raise ValueError("this generation has no prompt width")
         rows = self.host()
         return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
-
-
-@runtime_checkable
-class BlockDenoiser(Protocol):
-    """A diffusion language model that `BlockProcess` generates with, as
-    DiffusionGemma is: the operations a canvas request runs on it.
-
-    `init_cache` allocates `batch_size` rows of a prefix cache, and `encode`
-    appends clean tokens to it: a prompt, with its `ModelInputs` fields, or
-    a committed canvas. Calling the model refines a `canvas_length` canvas
-    against that frozen cache and returns its `[B, canvas_length,
-    vocab_size]` logits, self-conditioned on the previous step's
-    (`self_conditioning_logits`, a zero signal in rows whose
-    `self_conditioning_mask` is false). `max_seq_len` bounds the prompt and
-    its canvases. A causal language model scores tokens too, but runs none
-    of these, so it is not one.
-    """
-
-    @property
-    def canvas_length(self) -> int: ...
-
-    @property
-    def vocab_size(self) -> int: ...
-
-    @property
-    def max_seq_len(self) -> int: ...
-
-    def init_cache(self, batch_size: int) -> None: ...
-
-    def encode(self, tokens: jax.Array) -> jax.Array: ...
-
-    def __call__(self, tokens: jax.Array, *, self_conditioning_logits: jax.Array | None = None,
-                 self_conditioning_mask: jax.Array | None = None) -> jax.Array: ...
 
 
 def refuse_non_denoiser(model: nn.Module) -> None:

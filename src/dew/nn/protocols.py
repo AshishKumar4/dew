@@ -42,7 +42,7 @@ from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 from flax import linen as nn, struct
-from flax.typing import PrecisionLike
+from flax.typing import PrecisionLike, VariableDict
 
 from dew.nn.inputs import ModelKwarg
 
@@ -53,9 +53,10 @@ if TYPE_CHECKING:
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "CacheCapacity", "DecoderTraining", "DenoisingModel", "HiddenStates",
-           "IntervalModel", "Logits", "LogitsFromHidden", "ModelKwarg", "OutputTable", "ProjectionGroup",
-           "Recomputing", "RequiresText", "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
+__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "DecoderTraining", "DenoisingModel",
+           "HiddenStates", "IntervalModel", "Logits", "LogitsFromHidden", "ModelKwarg", "OutputTable",
+           "ProjectionGroup", "Recomputing", "RequiresText", "Serving", "TimeScaled", "TokenModel",
+           "TritonGemm"]
 
 
 @struct.dataclass
@@ -227,6 +228,42 @@ class TritonGemm(Protocol):
 
     @property
     def keeps_triton_gemm(self) -> bool: ...
+
+
+@runtime_checkable
+class BlockDenoiser(Protocol):
+    """A diffusion language model that generates and trains a canvas at a
+    time, as DiffusionGemma does. `init_cache` allocates `batch_size` rows of a
+    prefix cache, and `encode` appends clean tokens to it: a prompt, with its
+    `ModelInputs` fields, or a committed canvas. Calling the model refines a
+    `canvas_length` canvas against that frozen cache and returns its `[B,
+    canvas_length, vocab_size]` logits, self-conditioned on the previous step's
+    (`self_conditioning_logits`, a zero signal in rows whose
+    `self_conditioning_mask` is false); `max_seq_len` bounds the prompt and
+    its canvases. `with_trainable_layer_scalars` is the model the published
+    SFT trains, and `trainable_variables` the source's tree as that model
+    reads it. A causal language model scores tokens too, but runs none of
+    these, so it is not one."""
+
+    @property
+    def canvas_length(self) -> int: ...
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def max_seq_len(self) -> int: ...
+
+    def init_cache(self, batch_size: int) -> None: ...
+
+    def encode(self, tokens: jax.Array) -> jax.Array: ...
+
+    def __call__(self, tokens: jax.Array, *, self_conditioning_logits: jax.Array | None = None,
+                 self_conditioning_mask: jax.Array | None = None) -> jax.Array: ...
+
+    def with_trainable_layer_scalars(self) -> Self: ...
+
+    def trainable_variables(self, variables: VariableDict) -> VariableDict: ...
 
 
 @runtime_checkable
