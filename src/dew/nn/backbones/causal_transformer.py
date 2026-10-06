@@ -717,11 +717,11 @@ class CausalTransformer(nn.Module):
     tokenizer, and a fresh model fills it with each id modulo the compressed
     vocabulary's size."""
     dspark: DSpark | None = None
-    """DeepSeek-V4.1's block drafter (`dew.nn.dspark`), or None for a model
-    without one. Its stages are decoder blocks that attend through a
-    `DSparkAttention` built from the V4 attention of its `layer_type` kind. Its
-    target layers sow the stream means that the drafter reads
-    (`draft_context`)."""
+    """DeepSeek's block drafter (`dew.nn.dspark`, V4.1 and V4-Flash-0731), or
+    None for a model without one. Its stages are decoder blocks that attend
+    through a `DSparkAttention` built from the V4 attention of its
+    `layer_type` kind. Its target layers sow the stream means that the
+    drafter reads (`draft_context`)."""
     swiglu_limit: float | None = None  # GLM-5.3-Flash's clamp before every gated MLP's activation
     activation_sparsity_pattern: tuple[float, ...] | None = None
     """Gemma 3n's gaussian top-k activation sparsity, one fraction per layer."""
@@ -1163,11 +1163,14 @@ class CausalTransformer(nn.Module):
             if outside:
                 raise ValueError(f"engram layers {outside} are outside the {self.num_layers} layers")
         if self.dspark is not None:
-            # The stages are V4.1's Single-Pass blocks (v41:1100-1156); a
-            # drafter for another trunk's residual is not built here.
-            if hc is None or not hc.single_pass or self.mixture is None:
-                raise ValueError("the DSpark drafter chains Single-Pass mHC blocks over routed "
-                                 "experts, as the V4.1 trunk it drafts for does")
+            # The stages are the trunk's mHC blocks, V4.1's Single-Pass ones
+            # (v41:1100-1156) or V4's with a learned head on the last stage
+            # (V4-Flash-0731 model.py:818-874); a drafter for another trunk's
+            # residual is not built here.
+            if hc is None or not (hc.single_pass or hc.head == 'weighted') or self.mixture is None:
+                raise ValueError("the DSpark drafter chains mHC blocks over routed experts and "
+                                 "collapses them by Single-Pass's carried pre (V4.1) or by a "
+                                 "learned head (V4), as the trunk it drafts for does")
             outside = sorted(set(self.dspark.target_layers) - set(range(self.num_layers)))
             if outside:
                 raise ValueError(f"DSpark target layers {outside} are outside the {self.num_layers} layers")
@@ -1424,6 +1427,7 @@ class CausalTransformer(nn.Module):
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
             prediction_slot=spec.prediction_slot,
+            prediction_site='input' if self.dspark is None else self.dspark.reads,
             emb_features=self.emb_features,
             norm_eps=self.norm_eps,
             norm_type=self.norm_type,
@@ -1495,7 +1499,8 @@ class CausalTransformer(nn.Module):
             raise ValueError(f"DSpark's stages attend with V4 attention, and kind {layer_type!r} "
                              f"builds {type(drafting).__name__}")
         drafter = drafting.drafter(self.mixer_context(kinds[layer_type], layer_type, kv_shared=False))
-        stages = self.dspark.stages
+        stages, hc = self.dspark.stages, self.hyper_connections
+        assert hc is not None
         return [
             DSparkStage(
                 block=functools.partial(
@@ -1509,6 +1514,7 @@ class CausalTransformer(nn.Module):
                 emb_features=self.emb_features, vocab_size=self.vocab_size,
                 markov_rank=self.dspark.markov_rank,
                 first=stage == 0, last=stage == stages - 1, norm_eps=self.norm_eps,
+                weighted_head=None if hc.single_pass else hc,
                 dtype=self.dtype, precision=self.precision, name=f'dspark_{stage}')
             for stage in range(stages)]
 
@@ -1747,7 +1753,7 @@ class CausalTransformer(nn.Module):
         hc = self.hyper_connections
         assert hc is not None
         return dspark_draft(self.dspark_stages, self.dspark, self.token_embeddings, self._logits,
-                            hc.hc_mult, context, tokens, decode=decode, valid=valid, choose=choose)
+                            hc, context, tokens, decode=decode, valid=valid, choose=choose)
 
     def reach_drafter(self, tokens, dtype):
         """Create the DSpark drafter's parameters, which no forward pass reaches.
