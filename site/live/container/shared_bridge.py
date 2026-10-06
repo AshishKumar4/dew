@@ -95,8 +95,9 @@ class Gateway:
             kernel = await self.api("/api/kernels", {"name": "python3"})
             channels = None
             try:
-                url = f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels?token={self.token}"
-                channels = await connect(url, max_size=MAX_OUTPUT)
+                url = f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels"
+                channels = await connect(url, max_size=MAX_OUTPUT,
+                                         additional_headers={"Authorization": "token " + self.token})
                 context = Context(kernel["id"], channels)
                 result = await context.execute(PRELOAD, lambda _: asyncio.sleep(0))
                 if result["status"] != "ok":
