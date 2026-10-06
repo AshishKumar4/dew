@@ -21,7 +21,7 @@ from dew import records
 from dew.artifacts import Decisions
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
-from dew.data.text import Tokenizer
+from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, softmax
 from dew.decision.data import Example
 from dew.decision.head import Head
@@ -202,6 +202,28 @@ class Decide:
                                                                                     "calibration")),
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
+
+    def save_pretrained(self, directory: str | Path) -> None:
+        """Write this task as a released checkpoint, which `from_pretrained` reads back.
+
+        A ModernBERT backbone under Laya's head and layout is written in Laya's
+        layout (`LayaCheckpoint.save`), the files llama.cpp's converter and
+        `/v1/systemone` server read too. The calibration's temperatures go with
+        it, held within their bounds as this task applies them, so that a reader
+        which does not hold them answers as this task does. A binning map or
+        abstention thresholds, which that layout has no place for, are refused
+        rather than dropped.
+        """
+        if self.calibration.binning is not None or self.calibration.abstention is not None:
+            raise ValueError("a released checkpoint keeps temperatures alone; save the binning and "
+                             "abstention into a run with `save` instead")
+        if not isinstance(self.layout, MarkerLayout) or not isinstance(self.tokenizer, HFTokenizer):
+            raise ValueError("Laya's layout is a MarkerLayout over a Hugging Face tokenizer")
+        applied = self.calibration.temperatures.applied()
+        types = applied.types
+        LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
+                       (types.get("choice", 1.0), types.get("score", 1.0), types.get("noul", 1.0)),
+                       dict(applied.buckets)).save(directory)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.

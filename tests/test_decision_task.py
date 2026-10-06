@@ -265,3 +265,42 @@ def test_an_example_refuses_an_answer_its_question_cannot_give():
     with pytest.raises(ValueError, match="none of"):
         Example.of({"state": "x", "questions": CASES["quickstart"]["questions"],
                     "answers": {"department": "legal"}})
+
+
+def test_a_task_saves_in_layas_layout_and_reads_back_the_same(decide, tmp_path):
+    """`save_pretrained` writes what `from_pretrained` reads: Laya's tensors
+    under Laya's names (all but the action head and the unused temperature
+    buffer, which no answer reads), the encoder's config, the tokenizer and
+    the temperatures, so the reloaded task answers every case identically."""
+    from safetensors.numpy import load_file
+
+    from dew.interop.hf_decoders import translate_config
+
+    decide.save_pretrained(tmp_path)
+    written, original = load_file(tmp_path / "model.safetensors"), load_file(TINY / "model.safetensors")
+    kept = {name for name in original if not name.startswith("act_head.") and name != "temperature"}
+    assert set(written) == kept
+    for name in kept:
+        np.testing.assert_array_equal(written[name], original[name], err_msg=name)
+    # The published encoder config names no architecture, which reads as the
+    # masked LM; the written one names the bare encoder its tensors are.
+    configs = [replace(translate_config(json.loads((root / "encoder" / "config.json").read_text())).value,
+                       head_transform=None, head_bias=False) for root in (tmp_path, TINY)]
+    assert configs[0] == configs[1]
+    # The temperatures go out as Laya's agent applies them, held within [0.5, 5],
+    # since llama.cpp's server applies what it reads: the published 0.3 for
+    # eleven options and more is written as the 0.5 both answer with.
+    agent = json.loads((tmp_path / "rl_agent_config.json").read_text())
+    published = json.loads((TINY / "rl_agent_config.json").read_text())
+    assert agent["temperature"] == published["temperature"]
+    assert agent["head_layers"] == published["head_layers"]
+    assert agent["temperature_by_options"] == {**published["temperature_by_options"], "choice:11+": 0.5}
+    again = replace(Decide.from_pretrained(tmp_path, attention_impl="xla"), name=decide.name)
+    for request in CASES.values():
+        assert again.systemone(request) == decide.systemone(request)
+
+
+def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_path):
+    gated = decide.gated(0.5)
+    with pytest.raises(ValueError, match="temperatures alone"):
+        gated.save_pretrained(tmp_path)
