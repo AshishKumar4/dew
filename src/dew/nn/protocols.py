@@ -12,8 +12,9 @@ through Flax's own `apply`, with `rngs` and `mutable` passed to `apply`:
     table = model.apply(variables, method='output_table')
 
 `Logits` and `HiddenStates` are token models' full-sequence reads, with no
-cache: a call writes no `cache` collection, and `Ordered` says whether those
-states attend causally. `DenoisingModel` is the call every image and video
+cache: a call writes no `cache` collection, `Ordered` says whether those
+states attend causally, and `MaskToken` names the id masked diffusion
+corrupts tokens to. `DenoisingModel` is the call every image and video
 denoiser already has, the raw network that `dew.diffusion.process.Denoiser`
 wraps into a prediction a solver steps with. `AffineHead` and
 `LogitsFromHidden` let a loss score the vocabulary without a second trunk
@@ -44,7 +45,7 @@ if TYPE_CHECKING:
     from dew.nn.dit import TextContext
 
 __all__ = ["AffineHead", "DenoisingModel", "HardVocabularyEmbedder", "HiddenStates", "Logits",
-           "LogitsFromHidden", "ModelKwarg", "Ordered", "OutputTable"]
+           "LogitsFromHidden", "MaskToken", "ModelKwarg", "Ordered", "OutputTable"]
 
 
 @struct.dataclass
@@ -89,6 +90,15 @@ class Ordered(Protocol):
 
     @property
     def causal(self) -> bool: ...
+
+
+@runtime_checkable
+class MaskToken(Protocol):
+    """A token model that names the vocabulary id a masked-diffusion objective
+    corrupts tokens to, or None for one trained without it."""
+
+    @property
+    def mask_token_id(self) -> int | None: ...
 
 
 class DenoisingModel(Protocol):
