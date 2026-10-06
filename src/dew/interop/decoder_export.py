@@ -1,8 +1,4 @@
-"""Write a CausalTransformer back out in its family's Hugging Face layout.
-
-That is its config, its tensors and the tokenizer and generation_config.json
-beside them.
-"""
+"""Write a CausalTransformer back out in its family's Hugging Face layout: config, tensors and assets."""
 
 import dataclasses
 import json

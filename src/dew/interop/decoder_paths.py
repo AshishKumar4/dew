@@ -1,10 +1,4 @@
-"""Map Hugging Face decoder tensor names onto CausalTransformer paths, and back.
-
-`_dew_path` reads a source name into a variables path and `_hf_name` writes
-one back. A family whose names differ respells them through its `Renames`, and
-a `Packed` tensor is split on load and packed again on export, so one table
-holds both directions.
-"""
+"""Map Hugging Face decoder tensor names onto CausalTransformer paths and back, `Packed` tensors included."""
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass

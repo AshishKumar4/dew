@@ -1,11 +1,4 @@
-"""Read Hugging Face decoder configs into CausalTransformer records.
-
-These are the readers every family shares: the rope spellings, the decoder
-fields every family reads (`_base_config`), the tables of fields a
-translation accepts without reading, and the record types. `translate_config`
-reads a config as the family its model_type registers, and `family_entries()`
-loads that registration, `decoder_families.ENTRIES`, on first use.
-"""
+"""Read Hugging Face decoder configs into CausalTransformer records, with the readers every family shares."""
 
 import dataclasses
 import functools

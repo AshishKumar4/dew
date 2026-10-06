@@ -1,10 +1,4 @@
-"""Build a published diffusion pipeline's components from its directory.
-
-Each family's denoiser, the text conditioning it reads, its autoencoder and
-the safety head a file declares are built here, from metadata alone or bound
-to their weights; `dew.interop.diffusion_pipelines` assembles them into a
-pipeline.
-"""
+"""Build a published diffusion pipeline's denoiser, text conditioning, autoencoder and safety head."""
 
 from __future__ import annotations
 

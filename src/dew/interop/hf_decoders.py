@@ -14,11 +14,8 @@ vocabulary. Its `Renames` and `Packed` entries are read one way on load and
 the other on export. `family_entries()` loads that table on first use; read
 it for the covered families rather than a copy here.
 
-This module is the front door. What the families share sits beneath it, and
-each family module imports it from there: the config and rope readers in
-`decoder_config`, the tensor paths in `decoder_paths`, the export in
-`decoder_export` and the `DecoderFamily` record in `decoder_family`. Their
-public names import from here as well.
+What the families share sits beneath this module, and they import it from there:
+`decoder_config`, `decoder_paths`, `decoder_export` and `decoder_family`.
 
 A multimodal wrapper config raises a ValueError naming its model_type.
 DeepSeek's released checkpoints carry `num_nextn_predict_layers: 1` with no

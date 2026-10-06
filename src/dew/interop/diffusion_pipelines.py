@@ -1,11 +1,4 @@
-"""Load a published latent diffusion pipeline as native modules and variables.
-
-`load_diffusion_source` reads a diffusers directory or repo into a
-`PretrainedPipeline`, and `load_diffusion_conditioner` reads its text
-conditioning alone. The call policy each published pipeline carries is kept
-here; the components a pipeline is built from come from
-`dew.interop.diffusion_components`.
-"""
+"""Load a published latent diffusion pipeline, or its text conditioning alone, under its own call policy."""
 
 from __future__ import annotations
 

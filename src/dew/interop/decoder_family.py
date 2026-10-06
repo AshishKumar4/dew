@@ -1,8 +1,4 @@
-"""The `DecoderFamily` record each registered family fills in.
-
-It holds a family's config translation, tensor paths and export vocabulary;
-`decoder_families.ENTRIES` holds one per family.
-"""
+"""The `DecoderFamily` record: one family's config translation, tensor paths and export vocabulary."""
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
