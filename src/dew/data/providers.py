@@ -11,8 +11,10 @@ pipeline here.
 What each provider does:
 
 - `tfds/<builder>` reads the ArrayRecords a preparation run wrote under
-  `TFDSOptions.path`. Nothing is prepared, downloaded or generated: TFDS's
-  read-only builder is used, so the training process needs no TensorFlow.
+  `TFDSOptions.path` through TFDS's read-only builder, so the training
+  process needs no TensorFlow. Without a path it reads dew's own TFDS
+  directory, where a missing builder is prepared first by a separate
+  process (`dew.data.sources.tfds.prepared`).
 - `hf/<name>` reads one Arrow-backed split through `datasets.load_dataset`,
   which downloads the dataset and writes its Arrow cache if the local cache
   has neither. That is the library's own behaviour on its own terms.
@@ -64,8 +66,9 @@ from .dataset import (
     validation_pass,
 )
 from .sources.hf import HFOptions, HubOptions
+from .sources.text import HubText
 from .sources.tfds import PreparedOptions, TFDSOptions
-from .tokens import bounded
+from .tokens import TokenWindows, bounded
 
 if TYPE_CHECKING:
     from datasets import Dataset as ArrowDataset, IterableDataset
@@ -348,8 +351,8 @@ class PreparedTFDS(ProviderDataset):
     """Reads the splits of a prepared TFDS builder from where its preparation
     run wrote them.
 
-    `options` is a `TFDSOptions`, whose `path` names that directory. Nothing
-    is prepared, downloaded or generated here.
+    `options` is a `TFDSOptions`, whose `path` names that directory, or,
+    unset, dew's own TFDS directory, which prepares a missing builder first.
     """
 
     options: PreparedOptions = dataclasses.field(default_factory=TFDSOptions)
@@ -465,7 +468,8 @@ def load(source: Named, *, batch: int,
          records: int | None = None, preprocess: Preprocess | None = None,
          seed: int = 0, shuffle_buffer: int = 0, streaming: bool = False,
          loading: Loading = _DEFAULT_LOADING,
-         dataset: ArrowDataset | IterableDataset | None = None) -> Dataset:
+         dataset: ArrowDataset | IterableDataset | None = None,
+         tokenizer: str | None = None, seq_len: int | None = None) -> Dataset:
     """Return the `Dataset` for `source`, read from where its provider
     already stores it.
 
@@ -484,6 +488,11 @@ def load(source: Named, *, batch: int,
     accepts. `dataset=` is a split the caller already holds. It is an
     argument and not a spec field, because a table in memory has no record
     in a config.
+
+    `tokenizer` and `seq_len`, which only hf accepts, read one split's text
+    as `{"text": int32 [batch, seq_len + 1]}` windows instead, tokenized once
+    into dew's cache: `TokenWindows(hub=HubText(name, split=, tokenizer=,
+    options=), seq_len=)` is that dataset's spec.
     """
     provider, names = _sources(source)
     if provider == "tfds":
@@ -491,10 +500,11 @@ def load(source: Named, *, batch: int,
             raise TypeError(
                 f"the tfds provider reads TFDSOptions; {type(options).__name__} is "
                 f"the other provider's")
-        if streaming or shuffle_buffer or dataset is not None:
+        if streaming or shuffle_buffer or dataset is not None or tokenizer or seq_len:
             raise TypeError(
-                "streaming, shuffle_buffer and dataset= are the hf provider's; a "
-                "prepared tfds split is read at random and shuffled whole from seed=")
+                "streaming, shuffle_buffer, dataset=, tokenizer= and seq_len= are the hf "
+                "provider's; a prepared tfds split is read at random and shuffled whole "
+                "from seed=")
         return PreparedTFDS(
             name=names, split=split, val_split=val_split, val_batches=val_batches,
             records=records, preprocess=preprocess, options=options or TFDSOptions(),
@@ -503,6 +513,17 @@ def load(source: Named, *, batch: int,
         raise TypeError(
             f"the hf provider reads HFOptions; {type(options).__name__} is the "
             f"other provider's")
+    if tokenizer is not None or seq_len is not None:
+        if (not isinstance(names, str) or tokenizer is None or seq_len is None
+                or any((val_split, records, preprocess, dataset, streaming, shuffle_buffer))):
+            raise TypeError(
+                "tokenizer= and seq_len= read one split as token windows, which hold out the "
+                "head of the tokenized split for validation and count their own windows; name "
+                "one hf split and both, and none of val_split, records, preprocess, dataset, "
+                "streaming or shuffle_buffer")
+        hub = HubText(name=names, split=split, tokenizer=tokenizer, options=options or HFOptions())
+        return TokenWindows(hub=hub, seq_len=seq_len, val_batches=val_batches, seed=seed,
+                            loading=loading).load(batch=batch)
     return HubDataset(
         name=names, split=split, val_split=val_split, val_batches=val_batches,
         records=records, preprocess=preprocess, streaming=streaming,
