@@ -142,16 +142,16 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def inference_record(self):
-        from dew.config import ModelConfig, _to_json
+        from dew.config import ModelConfig
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import objectives
+        from dew.registry import objectives, to_record
         if not any(member is type(self) for member in objectives.values()):
             return None
-        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
                 'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': self.process.to_json(), 'solver': _to_json(self.solver, type(self.solver)),
+                'process': self.process.to_json(), 'solver': to_record(self.solver, type(self.solver)),
                 'sampling_steps': self.steps}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
