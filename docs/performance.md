@@ -1956,10 +1956,11 @@ round:
 | 128 | 32 | 36.7-38.3 / 60.4-64.6, 5.30-5.48 / 21.0-22.6 | 1281 / 2700, 7.81 / 70.0 |
 
 On the A100, Dew serves 1.28-1.33 times vLLM's closed-loop throughput at 32
-slots and 1.24 at 128. Under open-loop arrivals its time to first token
+slots and 1.23-1.25 at 128. Under open-loop arrivals its time to first token
 stays at 20-38 ms, while vLLM's grows into seconds once the arrival rate
-nears its throughput. vLLM's median token gap is shorter only at 128 slots
-and 16 requests a second (3.91 against 4.5 ms). Its gap p99 is 61-70 ms
+nears its throughput. vLLM's median token gap is shorter at 128 slots and
+16 requests a second (3.91 against 4.48-4.52 ms), and the two overlap at
+32 slots and 8 a second (2.97-2.99 against 2.85-3.21). Its gap p99 is 61-70 ms
 against Dew's 16-23. vLLM ran its defaults through
 `tools/benchmark_lm_serving.py --backend vllm-engine`.
 
