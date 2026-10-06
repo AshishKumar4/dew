@@ -41,7 +41,7 @@ from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.data import Dataset, DatasetSpec, Ramp
-from dew.data.dataset import json_list_argument, ramped
+from dew.data.dataset import Reader, json_list_argument, ramped
 from dew.lora import LoRA, _Adapted, adapted
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -683,7 +683,8 @@ class RunConfig:
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
-              summary: Mapping[str, object] | None = None) -> TrainState:
+              summary: Mapping[str, object] | None = None,
+              validation: Mapping[str, Reader] | None = None) -> TrainState:
         """Train `objective` on `data` as this config describes; every recipe calls this after building both.
 
         The run lives under `name` in `trainer.checkpoint_dir`, and process zero writes
@@ -704,7 +705,11 @@ class RunConfig:
         `lora` is not applied here: the recipe attaches it to the model and variables
         it builds the objective from. `rollout` is the trainer's rollout, which turns
         each prefetched batch into the one the step trains on, as an on-policy
-        objective samples it.
+        objective samples it. `validation` names the splits each evaluation
+        scores in place of `dataset.val`, as `Trainer.fit` takes them: a held-out
+        split and a test set are logged as `val/...` and `test/...`. With no
+        `trainer.best`, the first split's loss ranks the checkpoints; a `Best`
+        over a metric names its split.
         """
         if dataset.batch != self.trainer.batch_size:
             raise ValueError(
@@ -754,7 +759,7 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
-                best=trainer.best_policies(),
+                best=trainer.best_policies(), validation=validation,
             )
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
