@@ -27,7 +27,7 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         'mlp': activations[activation], 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
         'norm_eps': records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
-        'parallel_residual': True, 'shared_parallel_norm': True, 'lm_head_bias': True,
+        'parallel_residual': True, 'shared_parallel_norm': True, 'head_bias': True,
         'attention_bias': True, 'partial_rotary_factor': partial, 'partial_rotary_type': 'default',
         'dropout_rate': records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
         'embedding_dropout_rate': records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),

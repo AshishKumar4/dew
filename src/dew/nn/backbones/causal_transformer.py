@@ -538,6 +538,7 @@ def _whole(value, axis: int):
     ("embed_tokens",): ("vocab", "embed"),
     ("embed_positions",): (None, "embed"),
     ("lm_head",): ("embed", "vocab"),
+    ("head_bias",): ("vocab",),
     ("embed_tokens_per_layer",): ("vocab", None),
     ("per_layer_model_projection",): ("embed", "mlp"),
     # AltUp's copies enter and leave through embed-by-embed projections, one
@@ -667,8 +668,8 @@ class CausalTransformer(nn.Module):
     sqrt(2 * num_layers). This is lm-engine's `use_depth_scaled_init`."""
     final_logit_softcap: float | None = None
     tie_embeddings: bool = True
-    lm_head_bias: bool = False
-    """A vocabulary bias on an untied output head, as in Phi and GPT-J."""
+    head_bias: bool = False
+    """A vocabulary bias added in fp32 after a tied or untied head's product."""
     # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
     """Placeholder ids that the embedding lookup reads as token zero. The labels
@@ -1021,8 +1022,6 @@ class CausalTransformer(nn.Module):
             raise ValueError('norm_bias requires LayerNorm')
         if self.norm_type == 'layer' and self.scale_offset:
             raise ValueError('scale_offset describes RMSNorm weights')
-        if self.lm_head_bias and self.tie_embeddings:
-            raise ValueError('lm_head_bias requires an untied output head')
         if self.position_embedding not in ('rotary', 'learned'):
             raise ValueError('position_embedding must be rotary or learned')
         if self.position_embedding == "learned" and (
@@ -1359,10 +1358,13 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype)(name='norm')
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
-                features=self.vocab_size, use_bias=self.lm_head_bias, dtype=at_least_fp32(self.dtype),
+                features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
+        if self.head_bias:
+            self.head_bias_value = self.param('head_bias', nn.initializers.zeros,
+                                              (self.vocab_size,), jnp.float32)
 
     @nn.nowrap
     def _layer_specs(self, types: Sequence[str], kinds: dict[str, ResolvedKind], mixer_spec
@@ -1622,6 +1624,8 @@ class CausalTransformer(nn.Module):
         else:
             logits = self.lm_head(x)
         logits = logits.astype(at_least_fp32(logits.dtype))
+        if self.head_bias:
+            logits = logits + self.head_bias_value.astype(logits.dtype)
         if self.final_logit_softcap is not None:
             cap = jnp.asarray(self.final_logit_softcap, logits.dtype)
             logits = cap * jnp.tanh(logits / cap)
@@ -2300,9 +2304,9 @@ class CausalTransformer(nn.Module):
         table, vocab_major = self.head_table(params)
         return table.T if vocab_major else table
 
-    def head_bias(self, params):
-        """The untied head's vocabulary bias, or None for a bias-free head."""
-        return params['lm_head']['bias'] if self.lm_head_bias else None
+    def vocabulary_bias(self, params):
+        """The vocabulary bias, or None for a bias-free head."""
+        return params['head_bias'] if self.head_bias else None
 
     def head_table(self, params):
         """Return the head matrix as the tree stores it, and whether its rows are the vocabulary.

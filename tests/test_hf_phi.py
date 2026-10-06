@@ -56,7 +56,7 @@ def test_phi_affine_head_trains_through_the_public_objective():
         return objective.token_scores({'params': params}, ids).losses.mean()
 
     value, gradient = jax.value_and_grad(loss)(loaded.variables['params'])
-    assert np.linalg.norm(gradient['lm_head']['bias']) > 0
+    assert np.linalg.norm(gradient['head_bias']) > 0
     changed = jax.tree.map(lambda parameter, grad: parameter - 1e-3 * grad,
                            loaded.variables['params'], gradient)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradient))
@@ -85,7 +85,7 @@ def test_phi_reference_catches_a_dropped_term(term):
     variables = jax.tree.map(jnp.asarray, loaded.variables)
     model = loaded.model
     if term == 'head_bias':
-        variables['params']['lm_head']['bias'] *= 0
+        variables['params']['head_bias'] *= 0
     elif term == 'partial_rotary':
         model = model.clone(partial_rotary_factor=1.)
     else:
@@ -105,8 +105,18 @@ def test_phi_released_config_retains_partial_rotary_and_parallel_biases():
     model = translate_config(json.loads((ROOT / 'phi-2' / 'config.json').read_text())).value
     assert (model.emb_features, model.num_heads, model.num_layers) == (2560, 32, 32)
     assert model.partial_rotary_factor == .4 and model.partial_rotary_type == 'default'
-    assert model.parallel_residual and model.shared_parallel_norm and model.lm_head_bias
+    assert model.parallel_residual and model.shared_parallel_norm and model.head_bias
     assert model.norm_bias and model.mlp_bias and model.attention_bias
+
+
+def test_phi_vocabulary_bias_storage_stays_fp32_with_bf16_parameters():
+    from dew.interop.sources import load_shards
+
+    loaded = Pretrained.load(DIRECTORY, dtype='bfloat16', param_dtype='bfloat16',
+                             attention_impl='reference')
+    assert loaded.variables['params']['head_bias'].dtype == jnp.float32
+    np.testing.assert_array_equal(loaded.variables['params']['head_bias'],
+                                  load_shards(DIRECTORY)['lm_head.bias'])
 
 
 @pytest.mark.network
