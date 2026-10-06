@@ -324,9 +324,6 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     sCM's loss differentiates the student with respect to time, so the
     student's time embedding must be smooth in time. A run config sets
     `simple_dit(time_scale=0.002)` for this, in place of the default 16.
-
-    The teacher and the fake score never run through the student's model, so
-    a LoRA-adapted student trains its factors beside a whole fake score.
     """
 
     def __init__(

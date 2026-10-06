@@ -289,9 +289,6 @@ class AdversarialDistillationObjective(DiffusionObjective):
     over the sample. LADD itself drops that term when it trains on synthetic
     data, and on CIFAR-10 at 32 pixels the term at 2.5 dominated and the
     student did better without it. Sampling runs `Consistency`.
-
-    The teacher never runs through the student's model, so a LoRA-adapted
-    student trains its factors alone.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec,
