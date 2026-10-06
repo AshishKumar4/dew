@@ -1,0 +1,114 @@
+# Decision models
+
+A decision model answers typed questions about a state in one forward pass. It generates no text: each question names its options, the model scores every option at once, and the answer is a probability distribution over exactly those options. `dew.decision` covers the three question types of TypeSafe's Jev API, and it loads [Laya](https://huggingface.co/convaiinnovations/laya), an open decision model built on ModernBERT-large, as a native Dew model.
+
+| Question | Options | Answer |
+|---|---|---|
+| `Noul(instructions)` | false, true | `noul`, the probability of yes |
+| `Choice(instructions, criteria)` | 1 to 255 named options, each with an optional description | `choice`, the most likely option |
+| `Score(instructions, criteria)` | 2 to 10 ordered levels, lowest first | `score`, the expected level |
+
+## Answer questions
+
+```python
+from dew.decision import Choice, Decide, Noul, Score
+
+decide = Decide.from_pretrained("convaiinnovations/laya")
+answers = decide("Hi, we were billed twice for March and I want it reversed today.", {
+    "department": Choice("Which department should handle this?",
+                         criteria={"billing": "invoices, refunds", "technical": "bugs, outages"}),
+    "urgency": Score("How urgent is this?", criteria=["not urgent", "soon", "blocking"]),
+    "churn_risk": Noul("Does the user threaten to leave?"),
+})
+answers["department"].choice        # "billing"
+answers["urgency"].score            # the expected level, between 0 and 2
+answers["churn_risk"].noul          # P(yes)
+answers["department"].probabilities # one probability per option, in the question's order
+```
+
+Each question and the state form one row. Laya's layout puts the question first, then a marker token before each option, then the state, and the model reads each option's score at its marker. To answer many requests together, use `decide.batch(...)`, which packs question rows, shortest first, into passes under a token budget. A choice with more options than one row holds comfortably, such as a 77-way intent question, can be decided in rounds with `decide.tournament(state, questions)`: the options are split into groups of 16, and each group's winner goes to a final.
+
+`systemone` takes and returns Jev's wire format, so a client written for Jev talks to a `Decide` task unchanged:
+
+```python
+decide.systemone({
+    "state": "I was charged twice for March, fix it today.",
+    "questions": {
+        "team": {"type": "choice", "instructions": "Which team handles this?",
+                 "criteria": {"billing": "payments", "technical": "outages"}},
+        "urgent": {"type": "noul", "instructions": "Is this urgent?"},
+    },
+})
+# {"model": ..., "answers": {"team": {"type": "choice", "choice": "billing",
+#   "probabilities": {"billing": 0.97, "technical": 0.03}, "confidence": 0.94},
+#   "urgent": {"type": "noul", "noul": 0.91}}, "usage": {"input_tokens": ..., "output_tokens": 0}}
+```
+
+The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. Dew ships no HTTP server; `systemone` is the function such a server would call.
+
+## Confidence and calibration
+
+A confidence is a statistic of the answer's distribution, and the task decides which one:
+
+- `JevConfidence` (the default) is Jev's: for a choice of n options, how far the top probability sits above an even split, (p_max - 1/n) / (1 - 1/n); for a score, one minus the spread of probability around the most likely level, measured against an even spread.
+- `EntropyConfidence` is Laya's, one minus the entropy over log n.
+- `TopProbability` is the answer's own probability, the quantity calibration fits.
+
+`replace(decide, confidence=EntropyConfidence())` switches it. A model's raw probabilities are rarely well calibrated. `decide.calibrated(held_out)` fits a temperature per question type and per option-count bucket on labelled examples, as Laya does. It can also add histogram binning, and abstention thresholds that keep the error of the accepted answers at a target. `decide.gated(0.8)` abstains below a fixed top probability. `decide.score(examples)` reports accuracy, expected calibration error, the area under the risk-coverage curve and the log loss.
+
+## Fine-tune
+
+`DecisionObjective` trains a decision head over any backbone that has hidden states. The backbone can be Laya's own checkpoint (head and layout included), a pretrained language model, adapted with LoRA or partly frozen, or a model built from scratch:
+
+```python
+import optax
+
+from dew import Trainer
+from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, DecisionTable, LogLoss
+from dew.interop import Pretrained
+from dew.lora import LoRA
+
+qwen = Pretrained.load("Qwen/Qwen3-0.6B").adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
+table = DecisionTable(path="mteb/banking77", label="label_text", question="intent",
+                      instructions="Which banking request is this?")
+train, held_out = table.examples()
+
+objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
+data = objective.dataset(train, batch=32, validation=held_out)
+state = Trainer(objective, optax.adamw(1e-4), key=0).fit(
+    data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
+
+decide = objective.pipeline(state).calibrated(held_out)
+```
+
+<!-- BANKING77 results (Laya zero-shot, Laya fine-tuned, Qwen3-0.6B + LoRA; accuracy and ECE) go here when the Colab runs finish. -->
+
+A bidirectional backbone reads Laya's layout. A causal one reads `StateFirstLayout`, which puts the state first and each marker after its option, so every marker has read the state, the question and its option. The backbone and the head are applied as separate modules over one variables tree, so a LoRA backbone trains its factors and the head while the base weights stay fixed.
+
+The loss is a proper scoring rule: its expected value is smallest when the forecast is the true distribution, so it rewards honest probabilities. The rules are `LogLoss`, `Brier`, `Spherical` and `RankedProbability` (for score questions, whose levels are ordered), and they can be added and scaled. `label_smoothing` spreads part of the target over every option. During training a choice's options are reshuffled every time a row is read, so the model cannot learn their positions, and `none_of_the_above=p` adds a "none of the above" option to a share of rows, half of which lose their right answer to it. The same rules, with `Accuracy`, `ECE` and `AURC`, score the validation pass.
+
+Other backbones are one line each:
+
+```python
+DecisionObjective(Decide.from_pretrained("convaiinnovations/laya"))           # Laya, fully fine-tuned
+DecisionObjective(CausalTransformer(vocab_size=50368, num_layers=12, causal=False),
+                  tokenizer=HFTokenizer("answerdotai/ModernBERT-base"))       # from scratch
+DecisionObjective(Pretrained.load("Qwen/Qwen3-8B").adapt(LoRA(rank=256, modules=("q_proj", "v_proj")), key=0))
+```
+
+A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebuild the task from its record, and `decide.save(run)` writes the fitted calibration into it.
+
+## From a table, on the command line
+
+`recipes/decision/train.py` is `laya-train --data tickets.csv`:
+
+```bash
+python recipes/decision/train.py --data.path tickets.csv --data.text text --data.label label \
+    --trainer.batch-size 32 --trainer.epochs 4
+```
+
+It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `DecisionTable` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
+
+## How this relates to Laya
+
+Laya's encoder loads through Dew's ModernBERT family and its head maps onto `DecisionHead`. For the same requests, Dew lays out the same tokens as Laya's own code, and its option logits are within the 2x reference-error rule of Laya's (`tests/test_decision_laya.py`, `tests/reference_error.py`). Laya's inference options are available here as values: per-bucket temperatures, binning, abstention, the parallel option layout and tournaments. Two parts are not. Laya's action head is left out, because its own model card reports that it carries no signal; gate on confidence instead. Laya's router, which picks its English or multilingual checkpoint per request, is shown in `examples/route_decisions.py` and is not built in.
