@@ -21,7 +21,11 @@ def request(payload):
     with socket.socket(socket.AF_UNIX) as connection:
         connection.settimeout(95)
         connection.connect(SOCKET)
-        connection.sendall(json.dumps(payload, allow_nan=False).encode() + b"\n")
+        try:
+            connection.sendall(json.dumps(payload, allow_nan=False).encode() + b"\n")
+        except (BrokenPipeError, ConnectionResetError):
+            # An admission refusal can already be queued before the payload is sent.
+            pass
         with connection.makefile("rb") as stream:
             while True:
                 line = stream.readline(MAX_RESPONSE + 1)
