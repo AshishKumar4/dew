@@ -23,7 +23,7 @@ import fnmatch
 import functools
 import inspect
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, NamedTuple
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -32,9 +32,6 @@ import optax
 
 from dew.nn.sharding import LogicalAxes, declared_axes
 from dew.registry import schedules
-
-if TYPE_CHECKING:
-    from dew.config import OptimConfig
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -84,6 +81,14 @@ def _matrix_sides(path: jax.tree_util.KeyPath, axes: LogicalAxes) -> tuple[tuple
     return tuple(sides[0]), tuple(sides[1])
 
 
+def weight_decay_mask(params):
+    """Mark every parameter but the biases and the vectors, which weight decay spares by default:
+    nanoGPT's split (model.py, `GPT.configure_optimizers`), with Megatron Core's and timm's `bias`
+    of any rank (core/optimizer/__init__.py, optim/_param_groups.py), a per-head one included."""
+    return jax.tree_util.tree_map_with_path(lambda path, param: param.ndim >= 2 and not (
+        isinstance(path[-1], jax.tree_util.DictKey) and path[-1].key == "bias"), params)
+
+
 def muon_weight_dimension_numbers(params):
     """Build a `MuonDimensionNumbers` per parameter, None where AdamW steps in.
 
@@ -104,9 +109,8 @@ def muon_weight_dimension_numbers(params):
     Optax reads one spec tree shaped like the parameters and treats a None
     leaf as an AdamW parameter (optax/contrib/_muon.py:660-675).
     """
-    def leaf(path: jax.tree_util.KeyPath, param: jax.Array) -> optax.contrib.MuonDimensionNumbers | None:
-        last = path[-1]
-        if param.ndim < 2 or (isinstance(last, jax.tree_util.DictKey) and last.key == "bias"):
+    def leaf(path: jax.tree_util.KeyPath, param: jax.Array, decays: bool):
+        if not decays:
             return None
         axes = declared_axes(path, param.ndim)
         if axes is None:
@@ -120,17 +124,19 @@ def muon_weight_dimension_numbers(params):
         if SELECTION_AXES & named or axes[-1] in BATCH_AXES:
             return None
         return optax.contrib.MuonDimensionNumbers(*_matrix_sides(path, axes))
-    return jax.tree_util.tree_map_with_path(leaf, params)
+    return jax.tree_util.tree_map_with_path(leaf, params, weight_decay_mask(params))
 
 
-def _muon_groups(learning_rate, **opts):
-    """Run Muon over the matrices and AdamW over the rest, on one schedule."""
+def _muon_groups(learning_rate, weight_decay=0.0, adam_weight_decay=None, **opts):
+    """Run Muon over the matrices and AdamW over the rest, on one schedule. The AdamW group decays
+    its norms and biases too, at `adam_weight_decay` or else `weight_decay`: Moonlight shares the
+    decay among matrix and non-matrix parameters, RMSNorm's included (arXiv 2502.16982, 2.2)."""
     # optax partitions the parameters into the two groups and masks each
     # optimizer to its own (optax/contrib/_muon.py:694).
     return optax.contrib.muon(
-        learning_rate,
-        muon_weight_dimension_numbers=muon_weight_dimension_numbers,
-        **opts)
+        learning_rate, weight_decay=weight_decay,
+        adam_weight_decay=weight_decay if adam_weight_decay is None else adam_weight_decay,
+        muon_weight_dimension_numbers=muon_weight_dimension_numbers, **opts)
 
 
 QK_PROJECTIONS = frozenset({'q_proj', 'q_b_proj', 'k_proj', 'kv_b_proj'})
@@ -406,7 +412,8 @@ def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float) -> optax.GradientTransformation:
+def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float,
+                   mask=None) -> optax.GradientTransformation:
     """`solver` after torch's `Adam(weight_decay=...)`, which adds
     `weight_decay * param` to the gradient before the moments read it.
 
@@ -417,21 +424,21 @@ def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float) ->
     """
     if not weight_decay:
         return solver
-    return optax.chain(optax.add_decayed_weights(weight_decay), solver)
+    return optax.chain(optax.add_decayed_weights(weight_decay, mask), solver)
 
 
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
-          *, nesterov: bool = False):
+          mask=None, *, nesterov: bool = False):
     """optax.adam, with torch's coupled weight decay (`_coupled_decay`)."""
     return _coupled_decay(optax.adam(learning_rate, b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
-                         weight_decay)
+                         weight_decay, mask)
 
 
-def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, *,
+def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, mask=None, *,
                nesterov: bool = False):
     """optax.adam's chain over bf16 moments, with torch's coupled weight decay (`_coupled_decay`)."""
     return _coupled_decay(optax.chain(bf16_moments(b1, b2, eps, eps_root, nesterov),
-                                     optax.scale_by_learning_rate(learning_rate)), weight_decay)
+                                     optax.scale_by_learning_rate(learning_rate)), weight_decay, mask)
 
 
 def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
@@ -889,12 +896,6 @@ class Exponential(ScheduleBase):
         if not self.offset:
             return decay
         return lambda count: self.offset + decay(count)
-
-
-def learning_rate_schedule(config: OptimConfig, steps: int):
-    """The rate `config` names: its schedule over a `steps`-update run, or
-    the constant `learning_rate` when it names none."""
-    return config.learning_rate if config.schedule is None else config.schedule.schedule(steps)
 
 
 __all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",

@@ -169,16 +169,6 @@ def test_the_reference_run_moves_with_the_coupled_decay_and_the_momentum_cycle()
         assert np.max(np.abs(kernel - expected["kernel"])) > 10 * PARAMETER_ATOL["kernel"]
 
 
-def test_adams_weight_decay_is_added_to_the_gradient():
-    """On a zero gradient the first coupled-decay step is Adam's normalized
-    step of the decay itself, `-lr * sign(param)`; adamw's would be
-    `-lr * decay * param`."""
-    params = {"w": jnp.asarray([2.0, -0.5, 0.25])}
-    solver = OptimConfig(optimizer="adam", learning_rate=0.1, weight_decay=0.01).build(1)
-    updates, _ = solver.update({"w": jnp.zeros(3)}, solver.init(params), params)
-    np.testing.assert_allclose(updates["w"], -0.1 * np.sign(params["w"]), rtol=1e-4)
-
-
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
     config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(

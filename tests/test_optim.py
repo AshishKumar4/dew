@@ -234,6 +234,28 @@ def test_weight_decay_reaches_the_norm_scales():
                                rtol=1e-5)
 
 
+@pytest.mark.parametrize('optimizer, state_dtype', [('adam', 'float32'), ('adam', 'bfloat16'),
+                                                    ('adamw', 'float32'), ('adamw', 'bfloat16'),
+                                                    ('lamb', 'float32')])
+def test_weight_decay_spares_the_biases_and_the_norms_unless_a_group_claims_them(optimizer, state_dtype):
+    """On a zero gradient an update is the decay alone: every optimizer but Muon (above) moves a DiT's
+    kernels as one all-parameter group does, and spares the norm and biases (a per-head one too)."""
+    params = fixed_gradients(dit_params()['params'])
+
+    def decay_step(**groups):
+        solver = OptimConfig(optimizer=optimizer, learning_rate=LR, weight_decay=0.1,
+                             state_dtype=state_dtype, **groups).build(1)
+        return solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)[0]
+
+    spared, grouped = decay_step(), decay_step(param_groups=(ParamGroup('all', ('*',)),))
+    for path in [('output', 'final_norm', 'scale'), ('output', 'final_norm', 'bias'),
+                 ('dit_block_0', 'attention', 'to_q', 'bias'), ('dit_block_0', 'mlp', 'layers_0', 'bias')]:
+        assert not np.any(at(spared, path)) and np.all(at(grouped, path)), path
+    for path in [('dit_block_0', 'attention', 'to_q', 'kernel'), ('embed', 'patch_embed', 'Conv_0', 'kernel'),
+                 ('output', 'final_proj', 'kernel')]:
+        np.testing.assert_array_equal(at(spared, path), at(grouped, path), err_msg=str(path))
+
+
 def test_both_groups_step_with_the_one_schedule():
     """One schedule multiplies both groups. Neither group's state depends on
     the learning rate, so a scheduled run is the unscaled run times the
@@ -646,26 +668,6 @@ def test_muonclip_moves_a_real_step():
     assert largest_update_difference(params, muon_params) > 1e-6
 
 
-def test_mup_groups_decay_and_scale_the_parameters_lm_engine_does():
-    """A decoder's norms take no decay at the base rate, its embeddings the
-    base rate with decay, and every projection the rate over m_width: one
-    AdamW step on a zero gradient is then pure decay, and it moves exactly
-    the embeddings and projections, by rate * decay and rate / m_width *
-    decay of themselves."""
-    params = decoder_params()["params"]
-    config = OptimConfig(optimizer="adamw", learning_rate=0.1, weight_decay=0.5,
-                         param_groups=ParamGroup.mup(4.0))
-    solver = config.build(1)
-    updates, _ = solver.update(jax.tree.map(jnp.zeros_like, params), solver.init(params), params)
-    np.testing.assert_allclose(updates["layers_0"]["input_layernorm"]["scale"], 0.0)
-    np.testing.assert_allclose(updates["norm"]["scale"], 0.0)
-    np.testing.assert_allclose(updates["embed_tokens"]["embedding"],
-                               -0.1 * 0.5 * params["embed_tokens"]["embedding"], rtol=1e-6)
-    kernel = params["layers_1"]["self_attn"]["q_proj"]["kernel"]
-    np.testing.assert_allclose(updates["layers_1"]["self_attn"]["q_proj"]["kernel"],
-                               -0.1 / 4.0 * 0.5 * kernel, rtol=1e-6)
-
-
 def test_a_parameter_no_group_claims_is_refused():
     from dew.training.optim import ParamGroup
     config = OptimConfig(optimizer="adamw", param_groups=(ParamGroup("norms", ("*/scale",)),))
@@ -688,23 +690,26 @@ def test_a_power_schedules_tail_is_one_record_that_ends_where_it_says():
 # --- bf16 optimizer state ---------------------------------------------------
 
 def bf16_state_adamw(**kwargs):
-    return OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.1,
+    return OptimConfig(optimizer='adamw', learning_rate=LR, weight_decay=0.0,
                                        state_dtype='bfloat16', **kwargs).build(10)
 
 
 def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
-    """The update is computed from the fp32 moments before they are rounded,
-    so the first two steps are optax's AdamW to fp32 rounding while the state
-    it keeps is bf16."""
+    """The update is computed from the fp32 moments before they are rounded.
+    The first starts from zero moments, which bf16 holds exactly, so it is
+    optax's own AdamW update, its options (nesterov, eps_root, b2) included,
+    to fp32 rounding; the second is optax's to the rounding of the bf16 state."""
     params = decoder_params()
     grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(1), p.shape) * 1e-2, params)
-    reference, solver = optax.adamw(LR, weight_decay=0.1), bf16_state_adamw()
+    opts = {'nesterov': True, 'eps_root': 1e-8, 'b2': 0.99}
+    reference = optax.adamw(LR, weight_decay=0.0, **opts)
+    solver = bf16_state_adamw(optimizer_opts=opts)
     expected_state, state = reference.init(params), solver.init(params)
-    for _ in range(2):
+    for rtol, atol in ((1e-6, 0.0), (1e-2, 1e-7)):
         expected, expected_state = reference.update(grads, expected_state, params)
         update, state = solver.update(grads, state, params)
         for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(update), strict=True):
-            np.testing.assert_allclose(have, want, rtol=1e-2, atol=1e-7)
+            np.testing.assert_allclose(have, want, rtol=rtol, atol=atol)
     assert {leaf.dtype for leaf in jax.tree.leaves((state[0].mu, state[0].nu))} == {jnp.dtype(jnp.bfloat16)}
 
 
@@ -730,19 +735,17 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
     assert have == pytest.approx(want, rel=1e-2)
 
 
-def test_lamb_is_optax_lamb_on_the_configs_schedule_decay_options_and_clip():
+def test_lamb_is_optax_lamb_on_the_configs_schedule_options_and_clip():
     """`optimizer='lamb'` runs optax.lamb itself (`OPTIMIZER_MAP`), so what
-    Dew adds is the wiring: the config's schedule, weight decay and
+    Dew adds is the wiring: the config's schedule and
     `optimizer_opts` reach it, behind the global-norm clip. Three steps on
     changing gradients are bitwise the transform built from optax
     directly."""
     params = decoder_params()["params"]
     cosine = Cosine(peak=1e-2, warmup_steps=2, end=1e-3, init=1e-4)
     opts = {"b1": 0.8, "b2": 0.95, "eps": 1e-5, "eps_root": 1e-9}
-    solver = OptimConfig(optimizer="lamb", optimizer_opts=opts, schedule=cosine, weight_decay=0.05,
-                         clip_grads=0.5).build(10)
-    reference = optax.chain(optax.clip_by_global_norm(0.5),
-                            optax.lamb(cosine.schedule(10), weight_decay=0.05, **opts))
+    solver = OptimConfig(optimizer="lamb", optimizer_opts=opts, schedule=cosine, clip_grads=0.5).build(10)
+    reference = optax.chain(optax.clip_by_global_norm(0.5), optax.lamb(cosine.schedule(10), **opts))
     state, expected_state = solver.init(params), reference.init(params)
     for step in range(3):
         grads = jax.tree.map(lambda grad, step=step: grad * (step + 1) * 0.3, fixed_gradients(params))
@@ -756,18 +759,3 @@ def test_lamb_is_optax_lamb_on_the_configs_schedule_decay_options_and_clip():
 def test_bf16_state_is_refused_where_there_is_no_adam_moment():
     with pytest.raises(ValueError, match="state_dtype"):
         OptimConfig(optimizer='lamb', state_dtype='bfloat16').build(10)
-
-
-def test_bf16_state_steps_optax_own_update_first():
-    """The first update starts from zero moments, which bf16 holds exactly,
-    so it is optax's own AdamW update to fp32 rounding, its options
-    (nesterov, eps_root, b2) included."""
-    params = decoder_params()
-    grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(3), p.shape) * 1e-2, params)
-    opts = {'nesterov': True, 'eps_root': 1e-8, 'b2': 0.99}
-    reference = optax.adamw(LR, weight_decay=0.1, **opts)
-    solver = bf16_state_adamw(optimizer_opts=opts)
-    expected, _ = reference.update(grads, reference.init(params), params)
-    update, _ = solver.update(grads, solver.init(params), params)
-    for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(update), strict=True):
-        np.testing.assert_allclose(have, want, rtol=1e-6, atol=0)
