@@ -134,11 +134,12 @@ Import `Dataset`, `DataPartition` and `Loading` from `dew.data`.
 Dataset(train, val, records, batch, ramp=None)
 Dataset.from_records(records, *, batch, seed=0, validation=None, loading=Loading())
 Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())
+Dataset.from_torch(dataset, *, batch, fields=None, seed=0, validation=None, loading=Loading())
 DataPartition(index=0, count=1, readers=1, reader=0)
 Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
 ```
 
-`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, with its last batch padded by repeated rows that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
+`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, with its last batch padded by repeated rows that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order. `from_torch` reads a map-style `torch.utils.data.Dataset` as `from_records` reads a source, naming a tuple sample's entries with `fields`; it refuses a `DataLoader` and an `IterableDataset`.
 
 `train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass; `val` is `None` when there is no validation data. Each iterator reads the share of every global batch that its `DataPartition` names. The partition splits each batch into `count` disjoint shares; `index` is the share to read; `readers` is the number of processes that read that share alike; and `reader` is which of those processes this one is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row.
 
@@ -162,7 +163,7 @@ An image specification takes its validation data from `val_split`, one of the da
 
 `Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines the caller assembled. A `MapDataset` is repeated and cut into the reader's share, and its position is saved as one global record count. A pipeline that is read as it comes is passed as a function of the `DataPartition` that builds the `IterDataset` of that share. That pipeline is batched where it is and reports Grain's own iterator state.
 
-A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file or `TokenRecords` over ArrayRecord shards of token arrays. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in both.
+A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file or `TokenRecords` over ArrayRecord shards of token arrays. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in both. `TokenWindows(hub=HubText(name, split=, column=, tokenizer=, options=))` reads a Hugging Face text split instead, tokenized once into `dew_cache_dir()/tokens`, which is what `dew.data.load("hf/<name>", tokenizer=, seq_len=)` builds.
 
 
 ## Checkpoints

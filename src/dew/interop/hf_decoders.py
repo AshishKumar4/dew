@@ -34,7 +34,6 @@ from typing import NoReturn, Protocol, TypedDict
 
 import jax
 import numpy as np
-from flax import linen as nn
 from flax.traverse_util import flatten_dict
 
 from dew import records
@@ -1731,7 +1730,7 @@ def save_export_assets(
         json.dump(values, handle, indent=2)
 
 
-def export_decoder_weights(model: nn.Module, variables: Mapping[str, object],
+def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     """Encode whole native variables as canonical model.* / lm_head.* tensors.
 
@@ -1744,8 +1743,6 @@ def export_decoder_weights(model: nn.Module, variables: Mapping[str, object],
     its weight encoder without translating geometry that encoder may not
     support.
     """
-    if not isinstance(model, CausalTransformer):
-        raise TypeError('decoder weight export requires a CausalTransformer')
     model_type = config.get('model_type')
     if not isinstance(model_type, str) or model_type not in families():
         raise ValueError(f'no decoder tensor encoder for model_type {model_type!r}')

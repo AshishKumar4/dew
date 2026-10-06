@@ -46,6 +46,11 @@ def just_index(record, rng):
             "draw": np.int32(rng.integers(1 << 20))}
 
 
+def keep_words(captions):
+    """A caption reader that hands the words back as they were written."""
+    return {"caption": list(captions)}
+
+
 def indices(iterator, batches):
     return [[int(value) for value in batch["index"]]
             for batch in itertools.islice(iterator, batches)]
@@ -156,24 +161,6 @@ def test_a_pass_over_the_prepared_split_reads_every_record_once():
     np.testing.assert_array_equal(np.sort(pixels), np.arange(10, 26))
 
 
-def test_prepared_tfds_rows_without_preprocess_arrive_as_32_bit_fields():
-    batch = next(dew.data.load("tfds/dew_images", batch=4, options=TFDSOptions(path=str(PREPARED)),
-                               **READ).train(DataPartition()))
-
-    assert batch["label"].dtype == np.int32
-    assert batch["image"].dtype == np.uint8 and batch["image"].shape[0] == 4
-
-
-def test_the_data_dir_above_a_prepared_version_resolves_by_name():
-    """A caller who prepared into a data_dir names the builder, not the
-    version directory TFDS chose inside it."""
-    data = dew.data.load("tfds/dew_images", batch=4,
-                         options=TFDSOptions(path=str(FIXTURES)),
-                         preprocess=image_and_label, **READ)
-
-    assert data.records == 16
-
-
 def test_a_version_named_beside_a_resolved_path_is_an_identity_constraint():
     """A caller who has the version directory may still say which version it
     must hold; the metadata answers, so a match reads and a mismatch stops."""
@@ -218,18 +205,6 @@ def test_a_split_the_prepared_data_does_not_hold_is_refused():
                       options=TFDSOptions(path=str(PREPARED)))
 
 
-def test_a_half_copied_prepared_dataset_is_refused_before_the_run(tmp_path):
-    """A missing shard otherwise raises inside a grain worker on the first
-    record that needed it, steps into a run."""
-    copy = tmp_path / "dew_images" / "1.0.0"
-    copy.parent.mkdir(parents=True)
-    shutil.copytree(PREPARED, copy)
-    next(copy.glob("*train.array_record*")).unlink()
-
-    with pytest.raises(FileNotFoundError, match="Missing prepared ArrayRecord shard"):
-        dew.data.load("tfds/dew_images", batch=4, options=TFDSOptions(path=str(copy)))
-
-
 def test_an_option_no_provider_knows_is_refused_by_the_signature():
     with pytest.raises(TypeError, match="builder_name"):
         dew.data.load("tfds/dew_images", batch=4,
@@ -270,9 +245,41 @@ def test_a_decoder_the_caller_supplies_reaches_the_builder():
     assert "tensorflow" not in sys.modules
 
 
-def test_the_tfds_provider_needs_a_prepared_path():
-    with pytest.raises(ValueError, match="never prepares its own data"):
+def test_a_builder_named_without_a_path_is_prepared_once_into_dews_directory(tmp_path, monkeypatch):
+    """Preparation is `sys.executable -c <program> <builder> <data_dir> ...`
+    with no GPU visible, and the data_dir is then read by builder name. The
+    interpreter here is a script that writes the prepared fixture where TFDS
+    would, so the route runs, lock and all, without TensorFlow; an empty
+    package only makes one findable."""
+    from dew.data import TFDSImages
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    (tmp_path / "site" / "tensorflow").mkdir(parents=True)
+    (tmp_path / "site" / "tensorflow" / "__init__.py").touch()
+    monkeypatch.syspath_prepend(str(tmp_path / "site"))
+    runs, python = tmp_path / "runs", tmp_path / "python"
+    python.write_text(f'#!/bin/sh\necho "$3 [$CUDA_VISIBLE_DEVICES]" >> {runs}\n'
+                      f'cp -r {FIXTURES / "dew_images"} "$4/"\n')
+    python.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(python))
+
+    for _ in range(2):
+        data = dew.data.load("tfds/dew_images", batch=4, **READ)
+    assert runs.read_text() == "dew_images []\n", "prepared once, with no GPU visible"
+    batch = next(data.train(DataPartition()))
+    assert data.records == 16 and batch["image"].dtype == np.uint8
+    assert batch["label"].dtype == np.int32, "rows without preprocess arrive as 32-bit fields"
+    data = TFDSImages(name="dew_images", image_size=8, **READ).load(batch=4, tokenize=keep_words)
+    assert set(next(data.train(DataPartition()))["caption"]) <= {"a photo of a red", "a photo of a blue"}
+
+
+def test_a_builder_named_without_a_path_or_tensorflow_names_how_to_prepare_it(tmp_path, monkeypatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    monkeypatch.setitem(sys.modules, "tensorflow", None)
+
+    with pytest.raises(FileNotFoundError, match=r"needs TensorFlow.*separate environment"):
         dew.data.load("tfds/dew_images", batch=4)
+    assert list(tmp_path.iterdir()) == []
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +330,43 @@ def test_an_arrow_split_holds_a_named_validation_split(jsonl):
 
     assert data.val is not None
     assert indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
+
+
+def test_a_text_split_reads_as_token_windows_tokenized_once(tmp_path, monkeypatch):
+    """`tokenizer=` tokenizes the split's text column into dew's cache: the
+    stream is the rows, each ended with the eos id, and a second load reads
+    those files without writing them again. The spec it builds is what a run
+    config records."""
+    from dew.config import RunConfig
+    from dew.data import HubText, TokenWindows
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    texts = [f"{index}: to be, or not to be\n" * (index + 1) for index in range(12)]
+    (tmp_path / "plays.jsonl").write_text("".join(json.dumps({"text": text}) + "\n" for text in texts))
+    hub = HubText(name="json", options=HFOptions(data_files=str(tmp_path / "plays.jsonl")))
+    first = dew.data.load("hf/json", batch=4, tokenizer="byte", seq_len=16, options=hub.options, **READ)
+    written = {path.name: path.stat().st_mtime_ns for path in hub.directory.iterdir()}
+    spec = TokenWindows(hub=hub, seq_len=16, **READ)
+    batch = next(spec.load(batch=4).train(DataPartition()))
+    stream = b"".join((hub.directory / split).read_bytes() for split in ("val.bin", "train.bin"))
+
+    assert batch["text"].shape == (4, 17) and batch["text"].dtype == np.int32
+    assert stream == b"".join(text.encode() + b"\xff" for text in texts)
+    assert all(bytes(row.astype(np.uint8).tolist()) in stream for row in batch["text"])
+    assert spec.load(batch=4).records == first.records
+    assert {path.name: path.stat().st_mtime_ns for path in hub.directory.iterdir()} == written
+    config = RunConfig(data=spec)
+    assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
+
+
+@pytest.mark.parametrize("source, arguments", [
+    ("tfds/dew_images", {"tokenizer": "byte", "seq_len": 8}),
+    ("hf/json", {"tokenizer": "byte"}),
+    ("hf/json", {"tokenizer": "byte", "seq_len": 8, "val_split": "test"}),
+])
+def test_token_windows_over_a_split_refuse_what_shapes_provider_rows(source, arguments):
+    with pytest.raises(TypeError, match="seq_len="):
+        dew.data.load(source, batch=4, **arguments)
 
 
 def test_a_record_count_that_disagrees_with_the_split_is_refused(jsonl):
