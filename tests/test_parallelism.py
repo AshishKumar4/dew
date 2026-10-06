@@ -15,6 +15,7 @@ import optax
 import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
+from sharded import assert_sharded
 
 from dew.artifacts import Representations
 from dew.data import DataPartition, Loading
@@ -137,9 +138,12 @@ def make_trainer(tmp_path=None, fsdp=1, optimizer=None, objective=None, tracker=
 
 
 def run_losses(steps, **kwargs):
-    """Per-step losses of a fit, as the tracker receives them."""
+    """Per-step losses of a fit, as the tracker receives them; the trained
+    parameters are split over the mesh's parameter axes."""
     tracker = RecordingTracker()
-    make_trainer(tracker=tracker, **kwargs).fit(Data(batches), steps=steps, log_every=1)
+    trainer = make_trainer(tracker=tracker, **kwargs)
+    state = trainer.fit(Data(batches), steps=steps, log_every=1)
+    assert_sharded(state.variables["params"], trainer.device_mesh)
     return tracker.losses()
 
 

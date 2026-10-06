@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
 from dew.inference import RunProcessor, TextGeneration
@@ -579,6 +580,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
     placed = bound.bind(place(bound.variables, mesh, Layout(min_shard=1, tolerance=1.0)))
     server, tickets = served_alongside(placed, slots=8, admission=8, **options)
+    assert_sharded(placed.variables["params"], server.mesh)
     assert server.groups == jax.device_count() // mesh.tensor
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
@@ -642,6 +644,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
         dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
     )
     server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
+    assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), row)
