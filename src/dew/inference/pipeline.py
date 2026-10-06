@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -21,13 +21,14 @@ import numpy as np
 from etils import epath
 from jax.typing import DTypeLike
 
+from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 from dew.checkpoints import RUN_FILE
+from dew.data.text import Tokenizer
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import SavedTask, Variables
 from dew.registry import dtype_name
 from dew.sampling.pipelines import TextToImage
-from dew.telemetry.instrumentation import default_compilation_cache_dir, enable_compilation_cache
 
 if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec
@@ -180,17 +181,6 @@ def _updatable(tree: Variables) -> Variables:
     return rebuilt
 
 
-class RunTokenizer(Protocol):
-    """Declares what a run's tokenizer offers, as `ByteTokenizer` and `HFTokenizer` do."""
-
-    @property
-    def bos_id(self) -> int | None: ...
-
-    def encode(self, text: str) -> list[int]: ...
-
-    def decode(self, ids: jax.typing.ArrayLike | Sequence[int]) -> str: ...
-
-
 @dataclass(frozen=True)
 class RunProcessor:
     """Adapts a run's tokenizer to the `Processor` interface a task uses.
@@ -200,7 +190,7 @@ class RunProcessor:
     string per token row.
     """
 
-    tokenizer: RunTokenizer
+    tokenizer: Tokenizer
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None) -> ModelInputs:

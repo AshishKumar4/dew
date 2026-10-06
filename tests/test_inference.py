@@ -479,7 +479,7 @@ def test_pipeline_points_xla_at_the_persistent_compilation_cache(tmp_path, monke
     next load: a serving process compiles a shape once, ever."""
     from pathlib import Path
 
-    from dew.telemetry.instrumentation import default_compilation_cache_dir
+    from dew.cache import default_compilation_cache_dir
 
     make_lm_run(tmp_path)
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "xdg"))
@@ -758,6 +758,7 @@ def test_every_objective_that_publishes_a_task_declares_it():
     """Each registered objective's `saved_task` is the task its own
     `pipeline` returns: subclasses inherit their parent's, and an objective
     with no saved task declares None."""
+    from dew.decision import Decide
     from dew.inference import tasks
     from dew.objectives.diffusion import objective as diffusion
     from dew.registry import objectives
@@ -765,13 +766,13 @@ def test_every_objective_that_publishes_a_task_declares_it():
 
     declared = {kind: objectives[kind].saved_task for kind in (
         "diffusion", "ladd", "rcm", "mean_flow", "shortcut", "guidance_distillation", "flow_grpo", "lm",
-        "dpo", "grpo", "ppo", "block_diffusion", "masked_diffusion", "jepa", "distillation")}
+        "dpo", "grpo", "ppo", "block_diffusion", "masked_diffusion", "jepa", "distillation", "decision")}
     assert declared == {
         "diffusion": TextToImage, "ladd": TextToImage, "rcm": TextToImage, "mean_flow": TextToImage,
         "shortcut": TextToImage, "guidance_distillation": TextToImage, "flow_grpo": TextToImage,
         "lm": tasks.TextGeneration, "dpo": tasks.TextGeneration, "grpo": tasks.TextGeneration,
         "ppo": tasks.TextGeneration, "block_diffusion": tasks.BlockGeneration,
-        "masked_diffusion": tasks.MaskedGeneration, "jepa": None, "distillation": None}
+        "masked_diffusion": tasks.MaskedGeneration, "jepa": None, "distillation": None, "decision": Decide}
     assert diffusion.DiffusionObjective.saved_task is TextToImage
 
 

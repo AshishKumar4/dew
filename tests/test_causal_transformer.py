@@ -42,6 +42,8 @@ def tokens(rng, batch=2, length=SEQ):
     ({"chunk": 0}, True, "chunk"),
     ({"window": 2, "chunk": 2}, True, "one or the other"),
     ({"chunk": 2}, False, "not causal"),
+    ({"window": 2, "bidirectional_window": True}, True, "not causal"),
+    ({"bidirectional_window": True}, False, "needs a window"),
     ({"num_kv_heads": 3}, True, "multiple"),
     ({"num_kv_heads": 0}, True, "multiple"),
 ])
@@ -457,6 +459,43 @@ def test_sliding_attention_forgets_past_the_window(rng):
     moved = jnp.abs(baseline - changed).max(axis=(0, 2)) > 1e-5
     assert [int(index) for index in jnp.where(moved)[0]] == list(
         range(flipped, flipped + 5))
+
+
+def bidirectional_reach(rng, implementation, path, kind):
+    """Which positions move when token 6 of a two-layer bidirectional
+    sliding stack changes, through the kernel's window, the validity mask or
+    packed documents (one document, so the reach is the same)."""
+    model = tiny(layer_types=('sliding_attention',) * 2, causal=False, attention_impl=implementation,
+                 kinds={'sliding_attention': kind})
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    inputs = {"plain": {}, "valid": {"attention_mask": jnp.ones(ids.shape, bool)},
+              "packed": {"segment_ids": jnp.ones(ids.shape, jnp.int32),
+                         "positions": jnp.broadcast_to(jnp.arange(SEQ), ids.shape)}}[path]
+    baseline = model.apply(params, ids, **inputs)
+    changed = model.apply(params, ids.at[:, 6].set((ids[:, 6] + 5) % VOCAB), **inputs)
+    moved = jnp.abs(baseline - changed).max(axis=(0, 2)) > 1e-5
+    return [int(index) for index in jnp.where(moved)[0]]
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("path", ["plain", "valid", "packed"])
+def test_a_two_sided_window_reaches_both_sides(rng, implementation, path):
+    """Two layers of a two-sided window of 3 see 2 keys either side each, so
+    a token moves the 4 on either side of it and nothing further, on every
+    path. ModernBERT's window is |q - k| < w (`window_sides`)."""
+    reach = bidirectional_reach(rng, implementation, path, {'window': 3, 'bidirectional_window': True})
+    assert reach == list(range(2, 11))
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+@pytest.mark.parametrize("path", ["plain", "valid", "packed"])
+def test_a_bidirectional_layer_without_a_two_sided_window_reads_its_whole_row(rng, implementation, path):
+    """DiffusionGemma's decoder attends every canvas key whatever its sliding
+    layers' window (modeling_diffusion_gemma.py:1399-1401), so a
+    bidirectional layer whose kind does not keep its window on both sides
+    reads the whole row on every path."""
+    assert bidirectional_reach(rng, implementation, path, {'window': 3}) == list(range(SEQ))
 
 
 def test_sliding_attention_decode_matches_the_full_sequence(rng):
