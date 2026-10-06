@@ -81,6 +81,7 @@ from transformers import (
     Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
     GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
     PhiConfig, PhiForCausalLM,
+    FalconConfig, FalconForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -167,6 +168,20 @@ def tiny_phi() -> PhiForCausalLM:
         num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=48,
         layer_norm_eps=3e-5, resid_pdrop=0., embd_pdrop=0., attention_dropout=0.,
         rope_parameters={'rope_type': 'default', 'rope_theta': 10000., 'partial_rotary_factor': .5},
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+FALCON_CONFIG = ('falcon-7b', 'tiiuae/falcon-7b', 'ec89142b67d748a1865ea4451372db8313ada0d8')
+
+
+def tiny_falcon(multi_query: bool = True) -> FalconForCausalLM:
+    """A biased one-norm parallel block, with contiguous MQA or head-interleaved MHA."""
+    torch.manual_seed(0)
+    return FalconForCausalLM(FalconConfig(
+        vocab_size=64, hidden_size=24, ffn_hidden_size=48, num_hidden_layers=2,
+        num_attention_heads=3, multi_query=multi_query, bias=True, parallel_attn=True,
+        max_position_embeddings=48, layer_norm_epsilon=3e-5,
+        hidden_dropout=0., attention_dropout=0.,
         bos_token_id=1, eos_token_id=None, pad_token_id=0))
 
 
@@ -1255,7 +1270,7 @@ def main() -> None:
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
-    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi'),
+    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'falcon'),
                         help='only this classic decoder fixture and its pinned released config')
     args = parser.parse_args()
 
@@ -1272,6 +1287,11 @@ def main() -> None:
     if args.classic_family == 'phi':
         write_classic_tiny('phi-tiny', tiny_phi())
         write_released_config(*PHI_CONFIG)
+        return
+    if args.classic_family == 'falcon':
+        write_classic_tiny('falcon-tiny', tiny_falcon())
+        write_classic_tiny('falcon-mha-tiny', tiny_falcon(multi_query=False))
+        write_released_config(*FALCON_CONFIG)
         return
     write_nemotron_h()
     for name, repo, revision in NEMOTRON_H_CONFIGS:
