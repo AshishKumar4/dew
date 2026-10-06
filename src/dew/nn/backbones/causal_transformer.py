@@ -539,6 +539,7 @@ def _whole(value, axis: int):
     ("embed_tokens",): ("vocab", "embed"),
     ("embed_positions",): (None, "embed"),
     ("lm_head",): ("embed", "vocab"),
+    ("head_bias",): ("vocab",),
     ("embed_tokens_per_layer",): ("vocab", None),
     ("per_layer_model_projection",): ("embed", "mlp"),
     # AltUp's copies enter and leave through embed-by-embed projections, one
@@ -602,7 +603,7 @@ class CausalTransformer(nn.Module):
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
     max_seq_len: int = 2048
-    position_embedding: Literal['rotary', 'learned'] = 'rotary'
+    position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.
     It does not depend on the decode cache's capacity."""
@@ -618,7 +619,7 @@ class CausalTransformer(nn.Module):
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
     embedding_norm: bool = False
-    """Normalize token embeddings before the first block, as ModernBERT does."""
+    """Normalize token embeddings before the first block, as BLOOM and ModernBERT do."""
     first_attention_norm: bool = True
     """Whether the first block norms its attention input. ModernBERT's first
     block reads the embedding norm's output as it is (modeling_modernbert.py,
@@ -629,6 +630,8 @@ class CausalTransformer(nn.Module):
     pre_norms: bool = True           # norm each sublayer's input; False + sandwich is OLMo 3
     parallel_residual: bool = False
     """Whether attention and the feed-forward both read the same residual, as in GPT-NeoX."""
+    shared_parallel_norm: bool = False
+    """Both parallel branches read one LayerNorm, as in Phi, Falcon-7B and GPT-J."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
     v_norm: bool = False                     # Gemma 4's scale-free values norm
@@ -679,7 +682,8 @@ class CausalTransformer(nn.Module):
     feed-forward, 'gelu' is the tanh form and 'gelu_exact' the erf form.
     `hidden_states` stays the final norm's output, the encoder's."""
     head_bias: bool = False
-    """Whether the vocabulary projection adds a bias, as ModernBERT's decoder does."""
+    """A vocabulary bias added in fp32 after a tied or untied head's product, as
+    Phi's, GPT-J's and ModernBERT's decoders add one (`vocabulary_bias`)."""
     tie_embeddings: bool = True
     # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
@@ -1039,12 +1043,12 @@ class CausalTransformer(nn.Module):
             raise ValueError("head_transform must be None, 'gelu' or 'gelu_exact'")
         if self.norm_type == 'layer' and self.scale_offset:
             raise ValueError('scale_offset describes RMSNorm weights')
-        if self.position_embedding not in ('rotary', 'learned'):
-            raise ValueError('position_embedding must be rotary or learned')
-        if self.position_embedding == "learned" and (
+        if self.position_embedding not in ('rotary', 'learned', 'alibi'):
+            raise ValueError('position_embedding must be rotary, learned or alibi')
+        if self.position_embedding != "rotary" and (
             self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
         ):
-            raise ValueError('learned positions require the default unrotated attention mixer')
+            raise ValueError('learned positions and ALiBi require the default unrotated attention mixer')
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
             raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
@@ -1318,10 +1322,11 @@ class CausalTransformer(nn.Module):
         # and otherwise rides the model's. Both build over the layer's
         # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary')
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual)
+                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
+                             shared_parallel_norm=self.shared_parallel_norm)
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
@@ -2325,6 +2330,10 @@ class CausalTransformer(nn.Module):
         table, vocab_major = self.head_table(params)
         return table.T if vocab_major else table
 
+    def vocabulary_bias(self, params):
+        """The vocabulary bias, or None for a bias-free head."""
+        return params['head_bias'] if self.head_bias else None
+
     def head_table(self, params):
         """Return the head matrix as the tree stores it, and whether its rows are the vocabulary.
 
@@ -2334,9 +2343,9 @@ class CausalTransformer(nn.Module):
         its backward pass (`chunked_cross_entropy` with `vocab_major`) keeps the
         parameter itself and no transposed copy.
         """
-        if self.head_transform is not None or self.head_bias:
+        if self.head_transform is not None:
             raise ValueError(
-                "a prediction head or head bias sits between the final states and the "
+                "a prediction head sits between the final states and the "
                 "vocabulary, so no matrix alone gives this model's logits, and the "
                 "objectives that score through the chunked head cannot train it yet; "
                 "the model's own call scores it")
