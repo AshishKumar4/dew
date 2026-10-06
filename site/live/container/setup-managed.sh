@@ -22,7 +22,7 @@ for file in text-to-image text-models; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/$file" -o "/opt/live/$file"
 done
 for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh benchmark_gateway.py warm-managed.py progress.py model_client.py model_service.py \
-            shared_bridge.py kernel_outputs.py start-shared.sh; do
+            shared_bridge.py kernel_outputs.py start-shared.sh smoke-shared.py; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$source/site/live/container/$file" -o "/opt/live/$file"
 done
 printf '%s\n' "$commit" > /opt/live/dew-commit
