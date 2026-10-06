@@ -1,7 +1,7 @@
 // The /sample page in Chrome, against the built site in dist/: pressing Run sends
 // the editor's cell, and only that cell, to the kernel, and shows the image the
 // kernel returns. Turnstile, the Worker and the kernel are stand-ins that speak
-// the protocol in live/container/server.py.
+// the protocol in live/container/shared_bridge.py.
 //
 //   pnpm build && pnpm test
 
