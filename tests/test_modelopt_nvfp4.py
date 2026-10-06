@@ -109,7 +109,7 @@ def test_the_pinned_real_modelopt_layer_uses_its_stored_multipliers_bit_for_bit(
 
 
 @pytest.mark.parametrize("mutation, message", [
-    ({"quant_algo": "MIXED_PRECISION"}, "other input activations"),
+    ({"quant_algo": "MIXED_PRECISION"}, "MIXED_PRECISION quantized_layers"),
     ({"kv_cache_quant_algo": "FP8"}, "KV cache quantization"),
 ])
 def test_modelopt_variants_without_a_reference_forward_stay_refused_by_name(checkpoint, mutation, message):
