@@ -16,6 +16,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.linen.dtypes import canonicalize_dtype, promote_dtype
 from flax.typing import Dtype, PrecisionLike
@@ -107,6 +108,26 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     if key_valid is not None:
         mask = mask & jnp.asarray(key_valid, bool)[:, None, :]
     return mask[:, None]
+
+
+def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
+    """BLOOM/Falcon's per-head linear key-position bias, `[B, H, 1, K]`.
+
+    The slopes follow transformers' `build_alibi_tensor`, including the odd
+    powers appended for a non-power-of-two head count. Dropping the query's
+    position subtracts one constant from every visible logit of that query,
+    which leaves softmax unchanged.
+    """
+    power = 2 ** math.floor(math.log2(num_heads))
+    base = np.float32(2 ** (-(2 ** -(math.log2(power) - 3))))
+    slopes = np.power(base, np.arange(1, power + 1, dtype=np.float32))
+    if power != num_heads:
+        extra = np.float32(2 ** (-(2 ** -(math.log2(2 * power) - 3))))
+        slopes = np.concatenate((slopes, np.power(
+            extra, np.arange(1, 2 * (num_heads - power), 2, dtype=np.float32))))
+    positions = jnp.atleast_2d(key_positions)
+    return (jnp.asarray(slopes)[None, :, None, None]
+            * positions[:, None, None, :]).astype(dtype)
 
 
 def document_mask(segment_ids) -> jax.Array:

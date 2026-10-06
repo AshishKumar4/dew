@@ -47,7 +47,8 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 
 def _gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
-                       config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+                       config: Mapping[str, object] | None = None, *,
+                       attention_name: str = 'attention') -> Mapping[str, np.ndarray]:
     if config is None:
         raise ValueError('GPT-NeoX fused qkv preparation requires translated num_heads and head_dim')
     heads = records.integer(config['num_heads'], 'num_heads')
@@ -76,13 +77,14 @@ def _gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
                     f"{name} disagrees with the configured rotary frequencies in its stored dtype"
                 )
             continue
-        if '.attention.query_key_value.' not in name:
+        fused = f'{attention_name}.query_key_value'
+        if f'.{fused}.' not in name:
             prepared[name] = tensor
             continue
         shape = (heads, 3, dimension, *tensor.shape[1:])
         grouped = tensor.reshape(shape)
         for index, part in enumerate(('q_proj', 'k_proj', 'v_proj')):
-            prepared[name.replace('attention.query_key_value', f'self_attn.{part}')] = (
+            prepared[name.replace(fused, f'self_attn.{part}')] = (
                 grouped[:, index].reshape(heads * dimension, *tensor.shape[1:]))
     return prepared
 
@@ -117,7 +119,8 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, object],
-                             config: Mapping[str, object]) -> LazyTensors:
+                             config: Mapping[str, object], *,
+                             attention_name: str = 'attention') -> LazyTensors:
     """The shared writer's tensors with each layer's q, k and v interleaved by
     head into `query_key_value`, the inverse of `_gpt_neox_prepare`."""
     tensors = _decoder_tensors(model, variables, config)
@@ -125,7 +128,7 @@ def _gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, o
     for name in tensors:
         stem, found, leaf = name.partition('.self_attn.q_proj.')
         if found:
-            fused[f'{stem}.attention.query_key_value.{leaf}'] = tuple(
+            fused[f'{stem}.{attention_name}.query_key_value.{leaf}'] = tuple(
                 f'{stem}.self_attn.{part}.{leaf}' for part in ('q_proj', 'k_proj', 'v_proj'))
     parts = {part for names in fused.values() for part in names}
     specs = {name: spec for name, spec in tensors.specs.items() if name not in parts}

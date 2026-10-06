@@ -601,7 +601,7 @@ class CausalTransformer(nn.Module):
     tuple gives one width per layer (Gemma 3n), and 0 means no feed-forward
     (Mamba-2)."""
     max_seq_len: int = 2048
-    position_embedding: Literal['rotary', 'learned'] = 'rotary'
+    position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.
     It does not depend on the decode cache's capacity."""
@@ -616,6 +616,8 @@ class CausalTransformer(nn.Module):
     norm_eps: float = 1e-5
     norm_type: Literal['rms', 'layer'] = 'rms'
     norm_bias: bool = False
+    embedding_norm: bool = False
+    """Normalize token embeddings before the first block, as BLOOM does."""
     scale_offset: bool = False       # RMSNorm weight is (1 + w), as Gemma stores it
     scale_after_cast: bool = False   # apply the weight after casting, as Llama and Qwen3 do
     sandwich_norms: bool = False     # add a norm after each sublayer, as Gemma does
@@ -1017,12 +1019,12 @@ class CausalTransformer(nn.Module):
             raise ValueError('norm_bias requires LayerNorm')
         if self.norm_type == 'layer' and self.scale_offset:
             raise ValueError('scale_offset describes RMSNorm weights')
-        if self.position_embedding not in ('rotary', 'learned'):
-            raise ValueError('position_embedding must be rotary or learned')
-        if self.position_embedding == "learned" and (
+        if self.position_embedding not in ('rotary', 'learned', 'alibi'):
+            raise ValueError('position_embedding must be rotary, learned or alibi')
+        if self.position_embedding != "rotary" and (
             self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
         ):
-            raise ValueError('learned positions require the default unrotated attention mixer')
+            raise ValueError('learned positions and ALiBi require the default unrotated attention mixer')
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
             raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
@@ -1285,6 +1287,11 @@ class CausalTransformer(nn.Module):
                             else nn.initializers.normal(self.initializer_range)))
         if self.embedding_dropout_rate:
             self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+        if self.embedding_norm:
+            self.embedding_layernorm = decoder_norm(
+                self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
+                dtype=self.dtype)(name='embedding_layernorm')
         if self.position_embedding == 'learned':
             self.embed_positions = TokenEmbedding(
                 num_embeddings=self.position_embedding_size or self.max_seq_len,
@@ -1311,7 +1318,7 @@ class CausalTransformer(nn.Module):
         # and otherwise rides the model's. Both build over the layer's
         # context.
         mixer_spec = self.mixer if self.mixer is not None else AttentionMixer(
-            nope=self.position_embedding != 'rotary')
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
         specs = self._layer_specs(types, kinds, mixer_spec)
         wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
                              layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual)
@@ -1843,6 +1850,8 @@ class CausalTransformer(nn.Module):
                 if start is not None:
                     places = places + start[:, None]
             x = x + self.embed_positions(jnp.maximum(places + self.position_embedding_offset, 0))
+        if self.embedding_norm:
+            x = self.embedding_layernorm(x)
         if self.embedding_dropout_rate:
             x = self.embedding_dropout(x, deterministic=not train)
         # A prediction depth reads these unscaled embeddings, media
