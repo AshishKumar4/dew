@@ -10,7 +10,8 @@ in a vision wrapper.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from typing import Literal
 
 import numpy as np
 
@@ -38,6 +39,7 @@ from dew.interop.hf_decoders import (
 )
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.dspark import DSpark
 from dew.nn.hyper_connections import HyperConnections
 
 
@@ -664,6 +666,50 @@ def _v4_mixture(hf_config: Mapping[str, object], layers: int,
     )
 
 
+type DSparkFields = NativeFields[DSpark]
+
+
+def _dspark(text: Mapping[str, object], layers: int, ratios: Sequence[object], seen: set[str], *,
+            reads: Literal['input', 'output']) -> DSparkFields | None:
+    """The DSpark drafter record of a V4.1 or V4-Flash-0731 config (section
+    2.4.3; v41:129-136, 0731 model.py:82-86), or None when it names no
+    block. Its stages attend a sliding window (v41:1034, 0731 model.py:753)
+    and read their target layers where `reads` says.
+
+    The stages are `compress_ratios`' entries past the trunk's, one sliding
+    0 each, as the release builds stage `s`'s attention from entry
+    `layers + s` (0731 model.py:459, :901-902). That is the count the
+    release runs. V4-Flash-0731's config.json keeps V4's
+    `num_nextn_predict_layers` of 1 where its weight index ships mtp.0 to
+    mtp.2 and its inference/config.json names n_mtp_layers 3, so a stated
+    count of 1 reads as that misstatement and any other count that
+    disagrees is refused.
+    """
+    seen.update(('num_nextn_predict_layers', 'dspark_block_size', 'dspark_noise_token_id',
+                 'dspark_target_layer_ids', 'dspark_markov_rank', 'dspark_n_routed_experts',
+                 'dspark_num_experts_per_tok'))
+    block = _record_int(text, 'dspark_block_size', 0)
+    if not block:
+        return None
+    stages = len(ratios) - layers
+    if stages < 1 or tuple(ratios[layers:]) != (0,) * stages:
+        _refuse('compress_ratios', "the DSpark stages are sliding layers, one trailing 0 each")
+    stated = _record_int(text, 'num_nextn_predict_layers', stages)
+    if stated not in (stages, 1):
+        _refuse(f"num_nextn_predict_layers {stated}",
+                f"compress_ratios lists {stages} DSpark stages after the {layers} layers")
+    return native_fields(DSpark)(stages=stages, block_size=block,
+            noise_token_id=_record_int(text, 'dspark_noise_token_id'),
+            target_layers=records.integers(text.get('dspark_target_layer_ids', ()),
+                                              'dspark_target_layer_ids'),
+            markov_rank=_record_int(text, 'dspark_markov_rank'),
+            experts=_record_int(text, 'dspark_n_routed_experts',
+                                   _record_int(text, 'n_routed_experts')),
+            top_k=_record_int(text, 'dspark_num_experts_per_tok',
+                                 _record_int(text, 'num_experts_per_tok')),
+            layer_type='sliding_attention', reads=reads)
+
+
 def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a DeepSeek-V4-Flash or V4-Pro config into `CausalTransformer` fields.
 
@@ -722,9 +768,11 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
                  'swiglu_limit', 'hc_mult', 'hc_eps', 'hc_sinkhorn_iters'))
     # Transformers omits the prediction depth (modeling_deepseek_v4.py:1212);
     # the released inference/model.py MTPBlock executes its raw-stream
-    # e_proj/h_proj composition. The router's logit output and aux
-    # coefficient are training knobs, its jitter is read nowhere, and ep_size
-    # is a runtime parallel hint.
+    # e_proj/h_proj composition, and V4-Flash-0731's replaces it with DSpark's
+    # stages (0731 model.py:818-874, :898-904), which `_dspark` reads from a
+    # config naming a block. The router's logit output and aux coefficient are
+    # training knobs, its jitter is read nowhere, and ep_size is a runtime
+    # parallel hint.
     used.update(('num_nextn_predict_layers', 'output_router_logits',
                  'router_aux_loss_coef', 'router_jitter_noise', 'ep_size'))
     groups = _record_int(hf_config, 'o_groups')
@@ -742,11 +790,17 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
                 "stacked head dims into equal groups")
     kinds = _v4_attention_kinds(hf_config, used, layer_types, fields, window,
                                 (compress_theta, compress_ramp))
-    depth = hf_config.get('num_nextn_predict_layers', 1)
+    ratios = hf_config.get('compress_ratios')
+    dspark = _dspark(hf_config, layers, ratios if isinstance(ratios, (list, tuple)) else (), used,
+                     reads='output')
+    if dspark is not None:
+        # 0731's stages are V4 sliding layers (0731 model.py:753, :482-485).
+        kinds.setdefault('sliding_attention', native_fields(LayerKind)(window=window))
+        config['dspark'] = dspark
+    depth = 0 if dspark is not None else hf_config.get('num_nextn_predict_layers', 1)
     if type(depth) is not int or depth not in (0, 1):
         _refuse('num_nextn_predict_layers', 'V4 supports the released single prediction depth')
     if depth:
-        ratios = hf_config.get('compress_ratios')
         if isinstance(ratios, (list, tuple)) and len(ratios) > layers and ratios[layers] != 0:
             _refuse('compress_ratios prediction depth', 'the released V4 prediction block is sliding-only')
         kinds['mtp_attention'] = native_fields(LayerKind)(window=int(window), rope_theta=main_theta,
@@ -847,6 +901,37 @@ _DEEPSEEK_V4_TRUNK = {
 }
 
 
+# A DSpark stage's own leaves beside its block, under `mtp.{stage}.`, as
+# both releases name them; each adds its Markov head's spelling.
+_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
+    'main_proj.weight': ('main_proj', 'kernel'), 'main_norm.weight': ('main_norm', 'scale'),
+    'norm.weight': ('norm', 'scale'), 'confidence_head.proj.weight': ('confidence', 'kernel')}
+# V4-Flash-0731's Markov tables (0731 model.py:795-799) and the mHC head its
+# last stage collapses by (:838-841).
+_V4_DSPARK_LEAVES: dict[str, tuple[str, ...]] = {
+    **_DSPARK_LEAVES,
+    'markov_head.markov_w1.weight': ('markov_embed',), 'markov_head.markov_w2.weight': ('markov_head',),
+    'hc_head_fn': ('hc_head', 'hc_fn'), 'hc_head_base': ('hc_head', 'hc_base'),
+    'hc_head_scale': ('hc_head', 'hc_scale')}
+
+
+def _dspark_path(name: str, config: Mapping[str, object], leaves: Mapping[str, tuple[str, ...]],
+                 layer_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None]
+                 ) -> tuple[str, ...] | None:
+    """The path of one DSpark tensor `mtp.{stage}.*`: the stage's own leaf
+    in `leaves`, or its block's, which `layer_path` places as layer 0's."""
+    parts = name.split('.')
+    dspark = config.get('dspark')
+    stages = dspark['stages'] if isinstance(dspark, Mapping) else 0
+    if len(parts) < 3 or not parts[1].isdigit() or int(parts[1]) >= stages:
+        raise ValueError(f"{name} names an undeclared DSpark stage")
+    stage, tail = f'dspark_{parts[1]}', '.'.join(parts[2:])
+    if tail in leaves:
+        return ('params', stage, *leaves[tail])
+    path = layer_path('layers.0.' + tail, config)
+    return None if path is None else (path[0], stage, 'block', *path[2:])
+
+
 def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the decoder's path for one DeepSeek V4 tensor name.
 
@@ -864,7 +949,10 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
     The release's prediction depth has its own split input projections,
     mHC block, collapse head and final norm (official inference/model.py,
     MTPBlock), while sharing the trunk embedding and vocabulary head.
+    V4-Flash-0731's `mtp.*` are DSpark's stages instead (`_dspark_path`).
     """
+    if name.startswith('mtp.') and isinstance(config.get('dspark'), Mapping):
+        return _dspark_path(name, config, _V4_DSPARK_LEAVES, _deepseek_v4_path)
     if name.startswith('mtp.'):
         parts = name.split('.')
         if (
