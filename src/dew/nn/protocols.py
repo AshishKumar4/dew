@@ -273,6 +273,7 @@ class ReadsTrain(Protocol):
     def reads_train(self) -> bool: ...
 
 
+@runtime_checkable
 class RequiresText(Protocol):
     """A denoising model that cannot run without text, which reaches it under
     the keyword `text_keyword` on every call. Any other runs unconditionally."""
