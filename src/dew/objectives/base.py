@@ -19,7 +19,17 @@ import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Generic, Literal, Protocol, Self, runtime_checkable
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Generic,
+    Literal,
+    NamedTuple,
+    Protocol,
+    Self,
+    runtime_checkable,
+)
 
 import jax
 import jax.numpy as jnp
@@ -157,7 +167,6 @@ class Shown:
     better: Literal["higher", "lower"] | None = None
     percent: bool = False
     group: str | None = None
-
 
 
 @dataclass(frozen=True)
@@ -342,10 +351,41 @@ class SavedTask(Protocol):
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self: ...
 
 
+class Omitted(enum.Enum):
+    """A keyword the caller left out, where None is a value of its own.
+
+    An objective built over a loaded bundle takes what the bundle supplies for
+    such a keyword (`variables`, `processor`, a pipeline's `autoencoder`) only
+    when it is omitted; an explicit None clears it.
+    """
+
+    OMITTED = "omitted"
+
+
+OMITTED = Omitted.OMITTED
+
+
+class ProgramModule(NamedTuple):
+    """One module an objective's compiled programs execute (`Objective.program_key`)."""
+
+    module: nn.Module
+    head_tile: tuple[int, int] | None
+    """The tile its vocabulary head computes the backward in, or None for a
+    head that keeps its whole logits or a module without one."""
+    trained: bool
+    """Whether the step moves the module's parameters, so its backward runs:
+    False for a frozen teacher or reference."""
+
+
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
     _inputs: InputSpec | None = None
+    variables: Variables | None = None
+    """The tree training starts from (a loaded checkpoint, an adapter's
+    split), or None to draw one (`init`)."""
+    processor: Processor | None = None
+    """What turns text into ids and back for the objective's task, or None."""
 
     @property
     def inputs(self) -> InputSpec | None:
@@ -409,6 +449,27 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return jnp.asarray(a=True)
 
+    def bind_model[Model: nn.Module](self, source: Model | Source[Model], *,
+                                      variables: Variables | None | Omitted = OMITTED,
+                                      processor: Processor | None | Omitted = OMITTED) -> Model:
+        """Hold `source`'s starting tree and processor as `variables` and `processor`, and return its model.
+
+        A loaded source (`Source`, such as `Pretrained.load`'s) supplies all
+        three, and `variables` and `processor` override its own, an explicit
+        None included. A bare model supplies none, so what is omitted is None.
+        The constructor keeps the model as `model`, the module the objective
+        trains, which `program_key` names by default.
+        """
+        if _loaded(source):
+            variables = source.variables if variables is OMITTED else variables
+            processor = source.text_processor if processor is OMITTED else processor
+            model = source.model
+        else:
+            model = source
+        self.variables = None if variables is OMITTED else variables
+        self.processor = None if processor is OMITTED else processor
+        return model
+
     def held_variables(self) -> Variables | None:
         """Return the arrays this objective starts from, or None when it initializes them from a key.
 
@@ -416,8 +477,30 @@ class Objective(ABC, Generic[Loss, Effects]):
         that keeps a frozen tower next to the model it trains returns the
         tower. The trainer calls this once and passes the result to `init`, so
         an objective never has to read its own held arrays inside a trace.
+        The default is the starting tree, `variables`.
         """
-        return None
+        return self.variables
+
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """Every module this objective's compiled programs execute, in an order its configuration fixes.
+
+        The trainer substitutes them (`substitute`) to rematerialize or
+        quantize, and a compiled validation loss is reused only while they
+        are the same modules. The default is the `model` the objective
+        holds, trained, with no head tile, or nothing for one that holds
+        none. One that runs several networks overrides this and names each,
+        a frozen teacher's untrained.
+        """
+        model = vars(self).get("model")
+        return () if model is None else (ProgramModule(model, None, trained=True),)
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        """Replace the modules `program_key` names, one per entry in its order."""
+        if len(modules) != len(self.program_key()):
+            raise ValueError(f"{type(self).__name__} runs {len(self.program_key())} modules, "
+                             f"and {len(modules)} were given")
+        if modules:
+            (self.model,) = modules
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -450,16 +533,47 @@ class Objective(ABC, Generic[Loss, Effects]):
         held = self.held_variables()
         return Partial(self.init) if held is None else Partial(self.init, variables=held)
 
-    @abstractmethod
+    _held_parts: ClassVar[bool] = False
+    """Whether the held tree may be parts a fresh draw goes beside (a
+    pipeline's frozen towers) rather than a starting tree, which holds `params`."""
+
     def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
         """Return the whole variables tree, every collection, from one key.
 
         It must be pure, because the trainer traces it once for shapes and
         once for values. `variables` is the held tree the caller supplies,
         which is how the trainer passes it as data; None means take it from
-        this objective's own `held_variables`. An objective that holds nothing
-        ignores it.
+        this objective's own `held_variables`.
+
+        A held tree that holds `params` is the starting tree, kept as given,
+        split or whole; otherwise `fresh_variables` draws one. A held tree
+        without `params` is refused, unless the objective holds parts a draw
+        goes beside. `complete_variables` then adds what the objective's own
+        modules need. An objective of several networks overrides this whole.
         """
+        held = self.held_variables() if variables is None else variables
+        if held is not None and "params" in held:
+            tree = held
+        elif held is None or self._held_parts:
+            tree = self.fresh_variables(key, held)
+        else:
+            raise ValueError("variables is the variables dict ({'params': ...}) that "
+                             "Pretrained.load and model.init return")
+        return self.complete_variables(key, tree)
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        """Draw the tree training starts from when none is held.
+
+        `held` is the parts a draw goes beside, for an objective that holds
+        them, else None. An objective that inherits `init` implements this.
+        """
+        raise NotImplementedError(f"{type(self).__name__} draws no fresh tree: give it variables, "
+                                  "or implement fresh_variables")
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Return `tree`, held or drawn, with what the objective's own modules
+        add: a loss head, a projector, a phase's split. The default adds nothing."""
+        return tree
 
     @property
     def _validation_loss(self):
@@ -469,14 +583,15 @@ class Objective(ABC, Generic[Loss, Effects]):
         tiled head. Argument shapes alone cannot identify those programs.
         Keep only the current specialization, not a history of old models.
         """
-        held = vars(self)
-        model, head = held.get('model'), held.get('head_tile')
-        cached = held.get('_validation_loss_cache')
-        if cached is None or cached[0] is not model or cached[1] != head:
+        programs = tuple((program.module, program.head_tile) for program in self.program_key())
+        cached = vars(self).get('_validation_loss_cache')
+        if cached is None or len(cached[0]) != len(programs) or any(
+                module is not was or tile != had for (module, tile), (was, had) in zip(programs, cached[0],
+                                                                                      strict=True)):
             compiled = jax.jit(lambda variables, batch, step: self._loss(variables, batch, step)[0])
-            cached = (model, head, compiled)
+            cached = (programs, compiled)
             self._validation_loss_cache = cached
-        return cached[2]
+        return cached[1]
 
     @functools.cached_property
     def _validation_reduction(self):
@@ -616,6 +731,12 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return None
 
+    def evaluation_variables(self, variables: Variables, step: Step) -> Variables:
+        """Return the weights a validation pass and a preview score: the
+        step's average when the run keeps one, unless that average is the
+        objective's frozen reference (`_ema_is_reference`), else `variables`."""
+        return variables if step.ema is None or self._ema_is_reference else step.ema
+
     def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
         if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.variables
@@ -678,7 +799,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         return scored if scored is not None else self.evaluate(params, batch, step)
 
 
-
 M = TypeVar("M", bound="nn.Module", covariant=True)
 
 
@@ -702,6 +822,11 @@ class Source(Protocol[M]):
 
 
 S = TypeVar("S")
+
+
+def _loaded[Model: nn.Module](source: Model | Source[Model]) -> TypeIs[Source[Model]]:
+    """Whether `source` is a loaded source rather than a bare model."""
+    return isinstance(source, Source)
 
 
 @runtime_checkable
@@ -754,20 +879,6 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     return accumulated[0] / accumulated[1]
 
 
-class Omitted(enum.Enum):
-    """A keyword the caller left out, where None is a value of its own.
-
-    An objective built over a loaded bundle takes what the bundle supplies for
-    such a keyword (`variables`, `processor`, a pipeline's `autoencoder`) only
-    when it is omitted; an explicit None clears it.
-    """
-
-    OMITTED = "omitted"
-
-
-OMITTED = Omitted.OMITTED
-
-
 __all__ = [
     "FROZEN",
     "VALID_ROWS",
@@ -779,6 +890,7 @@ __all__ = [
     "Path",
     "PathFilter",
     "Prediction",
+    "ProgramModule",
     "Ratio",
     "SavedTask",
     "Shown",

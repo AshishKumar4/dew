@@ -209,6 +209,35 @@ def test_a_pair_of_equal_widths_needs_no_projection():
     )
 
 
+def test_a_validation_pass_scores_with_the_teacher_the_trainer_substituted():
+    """A validation loss is compiled once per set of modules the objective
+    runs: once the trainer swaps the teacher (`substitute`, as remat does),
+    the next pass scores with the new one, as an objective built over it
+    does, and not with the program compiled for the old one."""
+    from dew.training import Evaluation
+
+    arrays = fixture()
+    objective, params = fixture_objective(arrays, features=[], beta=0.0)
+    tokens = np.asarray(arrays["tokens"])
+    # One row per device of the lane's eight.
+    batch = {TEXT_KEY: np.resize(tokens, (8, *tokens.shape[1:]))}
+
+    def scored(held):
+        return Evaluation.run(held, params, lambda partition: iter([batch]), key=3,
+                              loss=True).scores["val/loss"]
+
+    before = scored(objective)
+    softened = [program.module.clone(final_logit_softcap=2.0) if not program.trained else program.module
+                for program in objective.program_key()]
+    objective.substitute(softened)
+    built, _ = fixture_objective(arrays, features=[], beta=0.0)
+    built.substitute(softened)
+    after = scored(objective)
+
+    assert after != before
+    assert after == scored(built)
+
+
 def test_a_layer_the_model_does_not_have_is_named_at_init():
     student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None)
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)

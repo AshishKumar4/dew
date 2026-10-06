@@ -111,17 +111,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         `processor` is what `pipeline` uses to turn text into ids and decode
         them, unless it is given another one. A run records its tokenizer."""
-        if isinstance(model, Source):
-            from dew.nn.backbones.causal_transformer import CausalTransformer
+        from dew.nn.backbones.causal_transformer import CausalTransformer
 
-            variables = model.variables if variables is OMITTED else variables
-            processor = model.text_processor if processor is OMITTED else processor
-            if not isinstance(model.model, CausalTransformer):
-                raise TypeError(f"masked diffusion trains a CausalTransformer, and this source's model "
-                                f"is a {type(model.model).__name__}")
-            model = model.model
-        variables = None if variables is OMITTED else variables
-        processor = None if processor is OMITTED else processor
+        model = self.bind_model(model, variables=variables, processor=processor)
+        if not isinstance(model, CausalTransformer):
+            raise TypeError(f"masked diffusion trains a CausalTransformer, and this source's model "
+                            f"is a {type(model).__name__}")
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
@@ -134,8 +129,6 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.steps = steps
         self.samples = samples
         self.decode = decode
-        self.variables = variables
-        self.processor = processor
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
         # The EMA follows what moves; the frozen collection never does.
         self.ema = None if ema_decay is None else EMASpec(
@@ -167,19 +160,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
                                 self.processor if processor is None else processor,
                                 solver=self.solver, steps=self.steps)
 
-    def held_variables(self) -> Variables | None:
-        """Return the tree this run starts from, or None for a fresh init."""
-        return self.variables
-
-    def init(self, key, variables: Variables | None = None):
-        given = self.variables if variables is None else variables
-        if given is None:
-            return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
-        if "params" not in given:
-            raise ValueError(
-                "variables is the variables dict ({'params': ...}) that "
-                "Pretrained.load and model.init return")
-        return given
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
     def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
@@ -203,7 +185,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         window's padding has no weight. So `perplexity` over a validation
         pass is the exponential of the ELBO bound per token, the number MDLM
         reports."""
-        params = params if step.ema is None else step.ema
+        params = self.evaluation_variables(params, step)
         losses, weights, correct = self._scored(params, batch, step.key)
         return TokenScores(losses=losses, weights=weights, correct=correct)
 
@@ -283,7 +265,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         the ids alone.
         """
         def setup():
-            return params if step.ema is None else step.ema, self.samples
+            return self.evaluation_variables(params, step), self.samples
 
         weights, count = agreed("masked diffusion preview setup", setup)
         tokens = agreed("masked diffusion preview generation",
