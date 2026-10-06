@@ -1,0 +1,13 @@
+name: Diag
+on:
+  push:
+    branches: [ "ci/diag/**" ]
+jobs:
+  draws:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+    - run: pip install numpy==2.5.2 && python tests/diag_draws.py
