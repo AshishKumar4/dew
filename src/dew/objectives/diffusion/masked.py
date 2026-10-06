@@ -52,13 +52,13 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import chunked_cross_entropy
 from dew.objectives.lm.objective import _batch_text
+from dew.records import JSON
 from dew.registry import objectives
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.training.state import TrainState
 
 TEXT_KEY = "text"
 
@@ -135,29 +135,23 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             decay=optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def inference_record(self):
-        from dew.config import ModelConfig
+    def task_record(self) -> Mapping[str, JSON]:
+        """The row length, tokenizer, process, solver and sampling steps."""
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import objectives, to_record
-        if not any(member is type(self) for member in objectives.values()):
-            return None
-        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
-        return {'objective': objectives.name_of(type(self)), 'model': model,
-                'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
+        from dew.registry import to_record
+        return {'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
                 'process': self.process.to_json(), 'solver': to_record(self.solver, type(self.solver)),
                 'sampling_steps': self.steps}
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None,
-                 processor: Processor | None = None) -> MaskedGeneration:
-        """Return the trained model as a full-response MDLM task over the state's weights.
-
-        The task is a `MaskedGeneration` with this objective's solver and steps.
-        """
+    def build_task(self, variables: Variables, *,
+                   processor: Processor | None | Omitted = OMITTED) -> MaskedGeneration:
+        """Return the model over `variables` as a full-response MDLM task, with this
+        objective's solver and steps."""
         from dew.inference.tasks import MaskedGeneration
 
-        return MaskedGeneration(self.model, self._pipeline_weights(state, ema), self.process,
-                                self.processor if processor is None else processor,
+        return MaskedGeneration(self.model, variables, self.process,
+                                self.processor if processor is OMITTED else processor,
                                 solver=self.solver, steps=self.steps)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:

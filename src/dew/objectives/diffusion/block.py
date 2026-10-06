@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import functools
 import math
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import jax
@@ -44,12 +45,12 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits
+from dew.records import JSON
 from dew.registry import objectives
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import DecoderBank
-    from dew.training.state import TrainState
 
 
 @struct.dataclass
@@ -209,22 +210,17 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
         self.head_chunks = head_chunks
 
-    def inference_record(self):
-        from dew.config import ModelConfig
+    def task_record(self) -> Mapping[str, JSON]:
+        """The sequence length, canvas budget, tokenizer and block process."""
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import objectives, to_record
-        if not any(member is type(self) for member in objectives.values()):
-            return None
-        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
-        return {'objective': objectives.name_of(type(self)), 'model': model,
-                'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size,
+        return {'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
                 'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json()}
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None,
-                 processor: Processor | None = None) -> BlockGeneration:
-        """Return the trained model as a `BlockGeneration` task over the state's weights.
+    def build_task(self, variables: Variables, *,
+                   processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
+        """Return the model over `variables` as a `BlockGeneration` task.
 
         The sampler keeps the published defaults, and the caller sets the
         tokenizer's EOS ids.
@@ -233,8 +229,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         from dew.inference.tasks import BlockGeneration
 
         process = BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
-        return BlockGeneration(self.model, self._pipeline_weights(state, ema), process,
-                               self.processor if processor is None else processor,
+        return BlockGeneration(self.model, variables, process,
+                               self.processor if processor is OMITTED else processor,
                                pad_token_id=self.pad_token_id)
 
     @property

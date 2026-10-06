@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import dataclasses
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
 
@@ -55,6 +56,7 @@ from dew.objectives.base import (
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment, RepresentationAlignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
+from dew.records import JSON
 from dew.registry import objectives, trainings
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import TextToImage
@@ -62,9 +64,9 @@ from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 
 if TYPE_CHECKING:
+    from dew.inference.tasks import Processor
     from dew.objectives.diffusion.config import DiffusionRunConfig
     from dew.objectives.rl.flow import FlowRollout
-    from dew.training.state import TrainState
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
@@ -369,15 +371,10 @@ class DiffusionObjective(Objective[Ratio]):
         check_solver(self.process, solver, steps)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
-    def inference_record(self):
-        """Declare the model, input encoders and sampling convention of this step."""
-        from dew.config import ModelConfig
-        from dew.registry import objectives, to_record
-        if not any(member is type(self) for member in objectives.values()):
-            return None
-        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
-        return {'objective': objectives.name_of(type(self)), 'model': model,
-                'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
+    def task_record(self) -> Mapping[str, JSON]:
+        """The process, input encoders, autoencoder and sampling convention."""
+        from dew.registry import to_record
+        return {'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
                 'solver': to_record(self.solver, type(self.solver)),
                 'guidance': to_record(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
@@ -385,14 +382,19 @@ class DiffusionObjective(Objective[Ratio]):
                 # A tuned autoencoder's weights and statistics sit in the run's own tree.
                 'end_to_end': None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd)}
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None) -> TextToImage:
-        """Return the model over the state's published weights as a `TextToImage` task.
+    def build_task(self, variables: Variables, *,
+                   processor: Processor | None | Omitted = OMITTED) -> TextToImage:
+        """Return the model over `variables`' published weights as a `TextToImage` task.
 
-        The task samples the same way this objective's evaluation does.
+        The task samples the same way this objective's evaluation does. Its
+        conditions are encoded by the run's own towers, so it takes no processor.
         """
         from dew.sampling.pipelines import TextToImage
 
-        return TextToImage.from_objective(self, thaw(self._pipeline_weights(state, ema)))
+        if processor is not OMITTED:
+            raise TypeError("a text-to-image task encodes its conditions with the run's own towers, "
+                            "so it takes no processor")
+        return TextToImage.from_objective(self, thaw(variables))
 
     @property
     def latent_shape(self) -> tuple[int, ...]:

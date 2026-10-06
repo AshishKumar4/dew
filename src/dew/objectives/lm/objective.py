@@ -71,12 +71,12 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import chunked_cross_entropy, chunked_tile, head_logits, support_log_probs
+from dew.records import JSON
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
     from dew.nn.backbones.causal_transformer import DecoderBank
-    from dew.training.state import TrainState
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
@@ -710,33 +710,25 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         return TextGeneration(self.model, params, sampling=sampling)
 
-    def inference_record(self):
-        """Describe this decoder for inference, without a training RunConfig or copies of the parameters."""
-        from dew.config import ModelConfig
-        from dew.registry import objectives, to_record
-        if not any(member is type(self) for member in objectives.values()):
-            return None
-        kind = objectives.name_of(type(self))
+    def task_record(self) -> Mapping[str, JSON]:
+        """The decoder's row length, preview budget, sampling policy and tokenizer."""
+        from dew.registry import to_record
         samples = self.samples
         return {
-            'objective': kind,
-            'model': to_record(ModelConfig.from_model(self.model), ModelConfig),
             'seq_len': self.seq_len,
             'sample_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': to_record(Sampling() if samples is None else samples.sampling, Sampling),
             'tokenizer': recorded_tokenizer(self.processor),
         }
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None,
-                 processor: Processor | None = None) -> TextGeneration:
-        """Return the decoder over the state's weights as a generation task.
+    def build_task(self, variables: Variables, *,
+                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
+        """Return the decoder over `variables` as a generation task.
 
         It samples, and uses the same token budget, as this objective's previews do.
-        `processor`, or the objective's own when it is None, encodes and decodes.
         """
         samples = self.samples
-        return TextGeneration(self.model, self._pipeline_weights(state, ema),
-                              self.processor if processor is None else processor,
+        return TextGeneration(self.model, variables, self.processor if processor is OMITTED else processor,
                               sampling=Sampling() if samples is None else samples.sampling,
                               max_new_tokens=None if samples is None or samples.max_new_tokens <= 0
                               else samples.max_new_tokens)

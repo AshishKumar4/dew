@@ -40,10 +40,12 @@ from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
 from dew.objectives.base import (
+    OMITTED,
     Aux,
     Batch,
     EMASpec,
     Objective,
+    Omitted,
     Prediction,
     ProgramModule,
     Ratio,
@@ -56,7 +58,7 @@ Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.inference.tasks import Processor
 
 TEACHER = "teacher"
 """The collection holding the teacher's whole variables tree."""
@@ -252,9 +254,6 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         return self.student.preview(self.student_variables(params), batch, self._student_step(step),
                                     scored=scored)
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None):
-        """Return the student's inference pipeline, without the teacher."""
-        return self.student.pipeline(
-            replace(state, variables=self.student_variables(state.variables),
-                    ema=None if state.ema is None else self.student_variables(state.ema)),
-            ema=ema)
+    def build_task(self, variables: Variables, *, processor: Processor | None | Omitted = OMITTED):
+        """Return the student's task, without the teacher."""
+        return self.student.build_task(self.student_variables(variables), processor=processor)
