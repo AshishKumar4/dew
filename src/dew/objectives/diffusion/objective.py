@@ -571,6 +571,16 @@ class DiffusionObjective(Objective[Ratio]):
                   for keyword, condition in self.inputs.conditions.items()}
         return self.encode(params["encoders"], tokens)
 
+    def clean_samples(self, variables, batch, key) -> jax.Array:
+        """Return the batch's samples in [-1, 1], or their latents drawn with `key` under an autoencoder.
+
+        They are what a loss corrupts; each loss splits its own `key` from its step's.
+        """
+        samples = unit_range(batch[self.inputs.sample.key])
+        if self.autoencoder is None:
+            return samples
+        return self.autoencoder.encode(variables["autoencoder"], samples, key)
+
     def denoiser(self, params, given, unconditional):
         """Build the process's denoiser over the model's own collections.
 
@@ -628,10 +638,8 @@ class DiffusionObjective(Objective[Ratio]):
         if self.end_to_end is not None:
             end_to_end = self._end_to_end_latents(variables, images, encode_key, step.step, batch)
             samples = end_to_end.samples
-        elif self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], images, encode_key)
         else:
-            samples = images
+            samples = self.clean_samples(variables, batch, encode_key)
         noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
         # The times are drawn in float32 and read at the samples' precision,
         # so a float64 run interpolates in float64.

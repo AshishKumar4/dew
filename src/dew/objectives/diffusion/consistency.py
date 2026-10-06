@@ -35,7 +35,7 @@ from dew.diffusion.presets import Flow
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, EMASpec, Step, Variables
@@ -475,10 +475,8 @@ class ConsistencyDistillationObjective(DiffusionObjective):
 
     def loss(self, variables, batch, step: Step):
         options = self.distillation
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         given, blank = self._conditions(variables, batch, drop_key, dropout=False)
         draws = self._draws(step, count, samples.shape)

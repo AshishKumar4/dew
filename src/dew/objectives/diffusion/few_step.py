@@ -30,7 +30,7 @@ from dew.diffusion.presets import MeanFlow, Shortcut
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Step, Variables
 from dew.registry import objectives, trainings
@@ -229,10 +229,8 @@ class MeanFlowObjective(DiffusionObjective):
                 jax.random.normal(noise, shape, dtype=jnp.float32), jax.random.uniform(dropping, (count,)))
 
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
         given, blank = self._conditions(variables, batch, condition_key, dropout=False)
@@ -323,10 +321,8 @@ class ShortcutObjective(DiffusionObjective):
                 jax.random.bernoulli(dropping, self.unconditional_prob, (count,)))
 
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         rows = count // self.shortcut.bootstrap_every
         schedule = self.process.schedule
