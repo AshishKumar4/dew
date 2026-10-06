@@ -1,10 +1,11 @@
 """Masked diffusion language modelling (MDLM, by Sahoo and coauthors, 2024).
 
 A row of token ids is corrupted by masking each position with the process's
-probability at a drawn time. The model, a `CausalTransformer` with
-`causal=False`, reads the whole corrupted row and predicts the original
-tokens. The loss is the cross entropy at the masked positions, under a distribution
-that gives the mask token no mass (MDLM's SUBS parameterization), weighted by
+probability at a drawn time. The model reads the whole corrupted row, its
+states attending both ways (`dew.nn.protocols.Ordered` with `causal` False),
+and predicts the original tokens through its head (`AffineHead`). The loss
+is the cross entropy at the masked positions, under a distribution that
+gives the mask token no mass (MDLM's SUBS parameterization), weighted by
 the process's NELBO weight and averaged over every position of the batch.
 That average is the continuous-time negative ELBO the paper trains. The
 cross entropy is the LM objective's chunked one, which holds one vocabulary
@@ -30,12 +31,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from flax import linen as nn
 
 from dew.artifacts import TextSamples, TokenScores
 from dew.coordination import agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
+from dew.nn.protocols import AffineHead, HiddenStates, Ordered
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -50,7 +53,7 @@ from dew.objectives.base import (
     Variables,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_cross_entropy
+from dew.objectives.lm.chunked import affine_head, chunked_cross_entropy
 from dew.objectives.lm.objective import _batch_text
 from dew.records import JSON
 from dew.registry import objectives
@@ -58,7 +61,6 @@ from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
-    from dew.nn.backbones.causal_transformer import CausalTransformer
 
 TEXT_KEY = "text"
 
@@ -81,7 +83,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     def __init__(
         self,
-        model: CausalTransformer | Source,
+        model: nn.Module | Source,
         process: DiscreteProcess,
         seq_len: int,
         *,
@@ -96,7 +98,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
-        `model` must be a `CausalTransformer` with `causal=False`. `solver`
+        `model` gives its final states and its head (`HiddenStates`,
+        `AffineHead`), and its states attend both ways (`Ordered` with
+        `causal` False), as `CausalTransformer(causal=False)`'s do. `solver`
         and `steps` set how generation unmasks, in the preview and in the
         task `pipeline` returns, and `samples` is how many rows the preview
         draws. `decode` turns a row of ids into the text the artifact shows;
@@ -112,10 +116,15 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         `processor` is what `pipeline` uses to turn text into ids and decode
         them, unless it is given another one. A run records its tokenizer."""
         model = self.bind_model(model, variables=variables, processor=processor)
-        if model.causal:
+        lacking = [read.__name__ for read in (HiddenStates, AffineHead) if not isinstance(model, read)]
+        if lacking:
+            raise TypeError(
+                f"masked diffusion scores a model's final states through its head, and a "
+                f"{type(model).__name__} gives no {' or '.join(lacking)}")
+        if not isinstance(model, Ordered) or model.causal:
             raise ValueError(
-                "a masked diffusion model reads the whole corrupted row, so it needs "
-                "CausalTransformer(causal=False)")
+                "a masked diffusion model reads the whole corrupted row, so its states attend "
+                "both ways (Ordered with causal False), as CausalTransformer(causal=False)'s do")
         self.model = model
         self.process = process
         self.seq_len = seq_len
@@ -195,50 +204,50 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         Returns the rows, their per-token cross entropies under that
         corruption, the time weight of each masked token, the mask itself,
-        the argmax prediction, and which slots hold real tokens.
+        the argmax prediction, and which slots hold text.
 
-        A packed batch (data:packed-tokens) names each window's documents in
+        The model reads every field the batch's `ModelInputs` carries, and a
+        model that takes no such field refuses it. A packed batch
+        (data:packed-tokens) names each window's documents in
         `text_segment_ids`, 0 for the padded tail, and their positions in
         `text_positions`. Each document then attends to itself alone, in both
         directions, with its own positions, and the tail is neither masked
         nor scored: a packed window scores as its documents would one by one.
+        Padding under `attention_mask` is not scored either, and a media
+        placeholder (`image_indices` or `audio_indices` at or above zero) is
+        the media's slot, which the model reads and nothing masks or predicts.
         """
         params = thaw(params)
         prepared = _batch_text(batch)
-        unread = sorted(set(prepared.token_fields) - {"positions", "segment_ids"})
-        if unread or prepared.conditioning:
-            raise ValueError(
-                f"masked diffusion reads token ids and their packing; this batch also carries "
-                f"{unread + sorted(prepared.conditioning)}")
         tokens = prepared.tokens
         if tokens.shape[-1] != self.seq_len:
             raise ValueError(
                 f"the objective was built for {self.seq_len}-token rows, got {tokens.shape[-1]}")
-        segment_ids = prepared.token_fields.get("segment_ids")
-        real = jnp.ones(tokens.shape, bool) if segment_ids is None else segment_ids != 0
+        fields = prepared.token_fields
+        real = jnp.ones(tokens.shape, bool)
+        if "segment_ids" in fields:
+            real &= fields["segment_ids"] != 0
+        if "attention_mask" in fields:
+            real &= fields["attention_mask"].astype(bool)
+        for media in ("image_indices", "audio_indices"):
+            if media in fields:
+                real &= fields[media] < 0
         time_key, mask_key, dropout_key = jax.random.split(key, 3)
         t = self.process.sample_t(time_key, tokens.shape[0])
         masked, is_masked = self.process.corrupt(mask_key, tokens, t)
         is_masked = is_masked & real
         masked = jnp.where(is_masked, masked, tokens)
 
-        hidden = self.model.apply(
-            params,
-            masked,
-            train=train,
-            positions=prepared.token_fields.get("positions"),
-            segment_ids=segment_ids,
-            rngs={"dropout": dropout_key},
-            method=type(self.model).hidden_states,
-        )
-        head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
-        bias = self.model.apply(params, params['params'], method=type(self.model).vocabulary_bias)
+        hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
+                                  method="hidden_states", mutable=False, capture_intermediates=False,
+                                  **prepared.kwargs())
+        head = affine_head(self.model, params)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         losses, predicted, _ = chunked_cross_entropy(
-            hidden, head, tokens, self.head_chunks,
-            softcap=self.model.final_logit_softcap, precision=self.model.precision,
-            excluded=self.process.mask_id, bias=bias)
+            hidden, head.matrix, tokens, self.head_chunks, vocab_major=head.vocab_major,
+            softcap=head.softcap, precision=head.precision, excluded=self.process.mask_id,
+            bias=head.bias)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
