@@ -7,7 +7,7 @@ the step's key, and a golden fingerprint of five real steps pins the numbers
 of the objective and the trainer together.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -15,64 +15,19 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_stubs import FEATURES, RES, TOKENS, VOCAB, StubText
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CharTable, CLIPText, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CharTable, CLIPText, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
 from dew.nn.dit import TextContext
-from dew.objectives.base import Step, Variables
+from dew.objectives.base import Step
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
-from dew.registry import encoders
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
-
-RES = 8
-TOKENS = 5
-FEATURES = 6
-VOCAB = 11
-
-
-@encoders("stub_text")
-@dataclass(frozen=True, eq=False)
-class StubText(ConditionEncoder[str]):
-    """A text encoder with a table of `VOCAB` vectors: tokenize maps a prompt to
-    ids by character behind a start token, encode looks them up. Small, and
-    shaped like CLIP's output, so the models' text keyword takes it; registered,
-    so a run's text condition can name it."""
-
-    checkpoint: str
-    params: Variables
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str, *, params=None, **fields):
-        if params is None:
-            params = {"table": jnp.asarray(
-                np.random.RandomState(0).normal(size=(VOCAB, FEATURES)).astype(np.float32))}
-        return cls(checkpoint=checkpoint, params=params)
-
-    def tokenize(self, data):
-        ids = np.zeros((len(data), TOKENS), np.int32)
-        mask = np.zeros((len(data), TOKENS), np.int32)
-        for row, text in enumerate(data):
-            codes = [1] + [2 + (ord(char) % (VOCAB - 2)) for char in text[:TOKENS - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
-
-    def encode(self, params, tokens):
-        return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
-                           mask=jnp.asarray(tokens["attention_mask"]))
-
-    def captions(self, tokens):
-        return tuple("".join(chr(97 + int(i)) for i in row[row > 1])
-                     for row in np.asarray(tokens["input_ids"]))
-
-    def to_json(self):
-        return {"checkpoint": self.checkpoint}
-
 
 _DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
 

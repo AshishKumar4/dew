@@ -142,7 +142,7 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
     restored, _, _ = trainer.place()
     assert restored.ema is None
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        from test_trainer import raw_leaf
+        from affine_run import raw_leaf
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
     with pytest.raises(ValueError, match="EMA configuration"):
         Trainer(frozen_objective, optimizer, key=jax.random.PRNGKey(1), checkpoints=checkpoints).place()

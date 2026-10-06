@@ -10,7 +10,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from test_diffusion_objective import RES, StubText
+from diffusion_stubs import RES, StubText
 
 from dew.config import RunConfig
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages

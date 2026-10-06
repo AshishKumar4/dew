@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import equations
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import rounded_operand, rounded_to
@@ -697,21 +698,6 @@ def test_the_backward_saves_the_inputs_and_a_few_numbers_per_token(tokens):
     assert residual_elements(tiled, hidden, head) <= budget
     # The same count over the pass this replaces, which does tape the logits.
     assert residual_elements(full, hidden, head) > budget
-
-
-def equations(graph):
-    if hasattr(graph, "eqns"):
-        for equation in graph.eqns:
-            yield equation
-            yield from equations(equation.params)
-    elif hasattr(graph, "jaxpr"):
-        yield from equations(graph.jaxpr)
-    elif isinstance(graph, dict):
-        for value in graph.values():
-            yield from equations(value)
-    elif isinstance(graph, (tuple, list)):
-        for value in graph:
-            yield from equations(value)
 
 
 def test_no_matmul_is_wider_than_one_tile():

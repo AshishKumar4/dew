@@ -18,10 +18,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
+from rl_support import TinyHead, clipped_surrogate, token_mean
 from steady_state import steady_state
-from test_rl_surrogate import clipped_surrogate, token_mean
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.objectives.base import Step
@@ -123,38 +122,6 @@ def test_a_flat_mean_moves_the_loss(reference):
 
 
 # --- the objective -------------------------------------------------------------
-
-class TinyHead(nn.Module):
-    """A position-wise map with the backbone's scoring contract: int32 ids
-    in, float32 logits out, the head split off behind `hidden_states` and
-    `head_weight`."""
-
-    vocab_size: int
-    final_logit_softcap = None
-    precision = None
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False, segment_ids=None, positions=None):
-        x = nn.Embed(self.vocab_size, 8)(tokens)
-        h = nn.LayerNorm()(x)
-        return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
-
-    @nn.compact
-    def init_cache(self, batch_size):
-        """A placeholder cache: the trunk mixes nothing across positions, so
-        incremental decoding keeps no state, but `generate` threads one."""
-        self.variable("cache", "index", lambda: jnp.zeros((batch_size,), jnp.int32))
-
-    def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None):
-        return self.lm_head(
-            self.hidden_states(tokens, train=train)).astype(jnp.float32)
-
-    def head_weight(self, params):
-        return params["lm_head"]["kernel"].astype(jnp.float32)
-
 
 def rollout_batch(seed=0):
     """Two packed rows, one chain each, the last RESPONSE_WIDTH ids sampled,
