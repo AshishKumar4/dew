@@ -148,7 +148,9 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     """The teacher is a saved run; the student and fake score start from
     it. Past the warmup one step in two trains the student and the other
     the fake score, each leaving the other's gradient zero, and the saved
-    student's task samples as the objective's own."""
+    student's task samples as the objective's own. A LoRA student distills
+    the same teacher, whose model and the fake score's are the run's
+    without the adapter."""
     import dataclasses
 
     import optax
@@ -158,7 +160,8 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import TFDSImages
     from dew.diffusion.presets import Flow
-    from dew.objectives.base import Step
+    from dew.lora import LoRA
+    from dew.objectives.base import FROZEN, Step
     from dew.objectives.diffusion import (
         ConsistencyDistillation,
         ConsistencyDistillationObjective,
@@ -199,6 +202,10 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     ).save(str(fast))
     with pytest.raises(ValueError, match="time_scale=16"):
         dataclasses.replace(teacher_run, mode=ConsistencyDistillation(teacher=str(fast))).build()
+    # A teacher whose time features turn slower still is as smooth to differentiate.
+    dataclasses.replace(teacher_run, model=dataclasses.replace(
+        teacher_run.model, config={**teacher_run.model.config, "time_scale": 0.001})).save(str(fast))
+    ConsistencyDistillation(teacher=str(fast)).check_teacher()
 
     config = dataclasses.replace(teacher_run, mode=ConsistencyDistillation(
         teacher=str(tmp_path / "teacher"), teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,
@@ -226,6 +233,20 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     student, critic = gradients(3), gradients(2)
     assert size({k: v for k, v in student.items() if k != FAKE_SCORE}) > 0 and size(student[FAKE_SCORE]) == 0
     assert size({k: v for k, v in critic.items() if k != FAKE_SCORE}) == 0 and size(critic[FAKE_SCORE]) > 0
+
+    # A LoRA student starts as the teacher: B is zero, up to its branch's rounding.
+    adapted = dataclasses.replace(config, lora=LoRA(rank=2, modules=("ada_proj", "final_proj"))).build()
+    assert [program.trained for program in adapted.program_key()] == [True, False, True]
+    start = adapted.init(jax.random.PRNGKey(0))
+    assert {path[-1].key for path, _ in jax.tree_util.tree_flatten_with_path(start["params"])[0]
+            if path[0].key != FAKE_SCORE} == {"lora_A", "lora_B"}
+    for step in (Step(jnp.asarray(at), jax.random.PRNGKey(4), None) for at in (3, 2)):
+        np.testing.assert_allclose(*(objective.loss(tree, batch, step)[0].total
+                                     for objective, tree in ((adapted, start), (task, params))), rtol=1e-5)
+    trainer = Trainer(adapted, optax.adam(1e-3), key=jax.random.PRNGKey(5))
+    tuned = trainer.initial_state()
+    tuned, *_ = trainer.compile(tuned, batch)(tuned, batch)
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(tuned.variables[FROZEN]))
 
     trainer = Trainer(task, optax.adam(1e-3), key=jax.random.PRNGKey(5))
     distilled = trainer.initial_state()
@@ -296,7 +317,7 @@ def distilled(monkeypatch, optimizer, prefix=""):
             student_update_freq=config["student_update_freq"],
             max_simulation_steps=config["max_simulation_steps_fake"], student_times=(mean_g, std_g),
             critic_times=(mean_d, std_d), **discrete_fields(prefix)),
-        teacher=teacher, ema_decay=power_decay(config["ema_rate"]))
+        teacher=Weighted(), teacher_variables=teacher, ema_decay=power_decay(config["ema_rate"]))
     drawn = {name: jnp.asarray(TRAINING[f"{prefix}draws/{name}"]) for name in _Draws._fields}
     monkeypatch.setattr(ConsistencyDistillationObjective, "_draws", lambda self, step, count, shape: _Draws(
         **{name: value[step.step] for name, value in drawn.items()}))

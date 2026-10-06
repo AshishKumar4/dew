@@ -21,6 +21,7 @@ from test_mean_flow import CLASSES, labelled
 from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
 from dew.inputs import Condition, Field, InputSpec, unit_range
+from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.autoencoders.vae import translate_vae_weights
@@ -546,6 +547,10 @@ def test_end_to_end_needs_alignment_and_a_kl_autoencoder():
     with pytest.raises(ValueError, match="needs `alignment`"):
         DiffusionObjective(task.model, task.process, task.inputs, autoencoder=task.autoencoder,
                            end_to_end=EndToEnd(**L1_KL))
+    with pytest.raises(TypeError, match="DCAutoencoder"):
+        DiffusionObjective(task.model, task.process, task.inputs,
+                           autoencoder=DCAutoencoder(model=DCAE(), params={}, latent_scale=1.0),
+                           alignment=task.alignment, end_to_end=EndToEnd(**L1_KL))
 
 
 def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_one(tmp_path):

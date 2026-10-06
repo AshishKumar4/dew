@@ -132,6 +132,23 @@ def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(sourc
     np.testing.assert_allclose(row_means, reference["canvas_loss"], atol=1e-5, rtol=0)
 
 
+def test_the_model_the_trainer_substitutes_is_the_one_the_losses_run(source):
+    """The trainer rematerializes or quantizes a step by substituting the
+    modules `program_key` names. The losses run the clone sized to the SFT
+    sequence, so that is the module named, and a substitute changes what
+    they score: one that caps the logits near zero moves both cross
+    entropies to the uniform distribution's."""
+    loaded, batch, step, _ = source
+    obj = objective(loaded)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    before = float(obj.scalar_loss(variables, batch, step)[0])
+    (program,) = obj.program_key()
+    obj.substitute([program.module.clone(text=program.module.text.clone(final_logit_softcap=1e-6))])
+    after = float(obj.scalar_loss(variables, batch, step)[0])
+    assert after == pytest.approx(2 * math.log(program.module.vocab_size), abs=1e-4)
+    assert abs(after - before) > 1e-3
+
+
 def dataset(batch):
     rows = next(iter(batch.values())).shape[0]
     records = [{name: value[row] for name, value in batch.items()} for row in range(rows)]

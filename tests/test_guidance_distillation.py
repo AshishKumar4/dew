@@ -105,6 +105,9 @@ def test_the_loss_is_the_papers_equation(runs):
                               **with_guidance(student_given, scale))
     expected = jnp.mean(0.5 * jnp.square(output - target))
     assert float(loss.total / loss.mass) == pytest.approx(float(expected), rel=1e-5)
+    modules = [program.module.clone() for program in task.program_key()]
+    task.substitute(modules)
+    assert all(program.module is module for program, module in zip(task.program_key(), modules, strict=True))
 
 
 def test_a_saved_student_samples_one_branch_at_its_conditioners_guidance(runs, tmp_path):
