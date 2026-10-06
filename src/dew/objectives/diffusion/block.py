@@ -217,13 +217,13 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.processor = processor
 
     def inference_record(self):
-        from dew.config import ModelConfig, _to_json
+        from dew.config import ModelConfig
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import objectives
+        from dew.registry import objectives, to_record
         if not any(member is type(self) for member in objectives.values()):
             return None
-        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
                 'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
