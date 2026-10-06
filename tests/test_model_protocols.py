@@ -213,13 +213,22 @@ def test_the_clean_read_is_the_causal_encoders_forward_over_the_shared_tree(name
     """The encoder the canvas shares its tree with, run over the whole
     sequence: the same logits and states as the text model's own forward
     over the text tree, and the gradient its forward gives that tree, with
-    none for the parameters only the canvas reads. `encode`, the cached
-    commit, still moves the cache the clean read leaves alone."""
+    none for the parameters only the canvas reads. Packed rows reach it as
+    they reach the text model: two documents a row, the second's states
+    moved off the unpacked row's. `encode`, the cached commit, still moves
+    the cache the clean read leaves alone."""
     source, read = loaded(name, dtype), reads(name, dtype)
     model, variables = source.model, source.variables
     text = _text(variables)
     same(read.logits, model.text.apply(text, read.tokens))
     same(read.hidden, model.text.apply(text, read.tokens, method="hidden_states"))
+    boundary, places = LENGTH // 2, jnp.arange(LENGTH)
+    packing = {"segment_ids": jnp.broadcast_to((places >= boundary).astype(jnp.int32), read.tokens.shape),
+               "positions": jnp.broadcast_to(jnp.where(places >= boundary, places - boundary, places),
+                                             read.tokens.shape)}
+    packed = model.apply(variables, read.tokens, method="hidden_states", **packing)
+    same(packed, model.text.apply(text, read.tokens, method="hidden_states", **packing))
+    assert not np.array_equal(np.asarray(packed[:, boundary:]), np.asarray(read.hidden[:, boundary:]))
     cotangent = _cotangent(read.logits)
     clean = gradient(model, variables, read.tokens, cotangent, method="logits")
     encoder = gradient(model.text, text, read.tokens, cotangent)
