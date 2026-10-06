@@ -23,7 +23,7 @@ from flax import linen as nn
 from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, ProgramModule, Step, Variables
 from dew.registry import objectives, trainings
@@ -146,10 +146,8 @@ class GuidanceDistillationObjective(DiffusionObjective):
         return state
 
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         low, high = self.scales
         scale = jax.random.uniform(scale_key, (count,), minval=low, maxval=high)

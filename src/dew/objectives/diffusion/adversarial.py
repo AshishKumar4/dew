@@ -33,7 +33,7 @@ from dew.diffusion.presets import Flow
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.dit import TextContext, masked_mean
 from dew.objectives.base import Aux, Batch, Objective, Step, Variables
@@ -366,10 +366,8 @@ class AdversarialDistillationObjective(DiffusionObjective):
         return grids
 
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, renoise_key = jax.random.split(step.key, 5)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
         assert self.process.prediction is not None
