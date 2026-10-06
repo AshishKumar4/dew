@@ -801,3 +801,28 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote():
     server.run()
     assert server.prefix_hits == hits
     assert ticket.result().text == bound.bind(other)("1234567", 8, key=0).text
+
+
+def test_hf_text_prompt_canonical_positions_match_generation():
+    from pathlib import Path
+
+    from dew.interop import PretrainedDecoder
+
+    fixture = Path(__file__).parent / "fixtures/hf/qwen38-dense-tiny"
+    bundle = PretrainedDecoder.load(str(fixture), dtype=jnp.float32, max_seq_len=64)
+    bound = bundle.text_generation(sampling=Sampling(temperature=0))
+    server = Server.from_task(bound, slots=2, capacity=64)
+    ticket = server.submit("hello there", 4, key=0)
+    server.run()
+    np.testing.assert_array_equal(ticket.result().tokens, bound("hello there", 4, key=0).tokens)
+
+
+def test_server_refuses_noncanonical_prepared_positions():
+    from dew.nn.inputs import ModelInputs
+
+    bound = task(Sampling(temperature=0))
+    server = Server.from_task(bound, slots=2, capacity=64)
+    inputs = ModelInputs(jnp.array([[1, 2, 3]], jnp.int32),
+                         {"positions": jnp.array([[5, 6, 7]], jnp.int32)})
+    with pytest.raises(ValueError, match="positions"):
+        server.submit(inputs, 4, key=0)
