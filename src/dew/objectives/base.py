@@ -337,6 +337,11 @@ class EMASpec:
     decay: optax.Schedule
     select: PathFilter = everything
 
+    @classmethod
+    def constant(cls, decay: float | None) -> EMASpec | None:
+        """Follow what moves at a constant `decay`, never the frozen collection; None keeps no EMA."""
+        return None if decay is None else cls(optax.constant_schedule(decay), lambda path: path[0] != FROZEN)
+
 
 class SavedTask(Protocol):
     """The task class a saved run of an objective loads as (`Objective.saved_task`).

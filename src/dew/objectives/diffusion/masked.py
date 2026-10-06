@@ -30,7 +30,6 @@ from typing import TYPE_CHECKING
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import linen as nn
 
 from dew.artifacts import TextSamples, TokenScores
@@ -40,7 +39,6 @@ from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
 from dew.nn.protocols import AffineHead, HiddenStates, TokenModel
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
     EMASpec,
@@ -134,9 +132,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.samples = samples
         self.decode = decode
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
-        # The EMA follows what moves; the frozen collection never does.
-        self.ema = None if ema_decay is None else EMASpec(
-            decay=optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
+        self.ema = EMASpec.constant(ema_decay)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
