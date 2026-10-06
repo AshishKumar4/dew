@@ -132,7 +132,7 @@ def test_a_timed_out_handler_does_not_release_ongoing_compute(service, tmp_path,
             finished.set()
 
 
-def test_an_early_rejection_remains_readable_when_the_client_sends_after_close(service, tmp_path, monkeypatch):
+def test_an_early_rejection_remains_readable_after_the_peer_closes(service, tmp_path, monkeypatch):
     import threading
     from types import SimpleNamespace
 
