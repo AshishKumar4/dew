@@ -26,7 +26,7 @@ from dew.registry import from_record, towers
 from .attention import LayerNorm, RMSNorm
 from .conv import Conv
 from .sharding import logical_axes
-from .vision import TowerBase, TowerGeometry
+from .vision_common import TowerBase, TowerGeometry
 
 
 @struct.dataclass
