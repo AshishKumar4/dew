@@ -51,6 +51,10 @@ class DecoderState:
     """Each later prediction depth's predecessor state at the last real token:
     entry `d` feeds depth `d + 1`, as `reseed` carries them; `hidden` is
     depth zero's."""
+    tokens: jax.Array | None = None
+    lengths: jax.Array | None = None
+    """Compact token history for a positional table change that invalidates KV."""
+
 
 
 @struct.dataclass

@@ -86,6 +86,7 @@ from dew.interop.families.nemotron_h import (
 )
 from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
+from dew.interop.families.phi3 import _PHI3_PACKED, _phi3_config, _phi3_export, _phi3_path
 from dew.interop.families.qwen import (
     _qwen2_config,
     _qwen3_config,
@@ -102,6 +103,7 @@ from dew.interop.hf_decoders import (
     _GEMMA,
     _QWEN35,
     DecoderFamily,
+    _decoder_tensors,
     _every_layer_windowed,
     _kind_mixers,
     _renamed_name,
@@ -114,8 +116,16 @@ from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
+from dew.nn.rope import LongRopeScaling
 
 ENTRIES = (
+    DecoderFamily(
+        ('phi3',), _phi3_config,
+        lambda fields: isinstance(fields.rope_scaling, LongRopeScaling),
+        'phi3', 'Phi3ForCausalLM', _phi3_export,
+        weight_path=_phi3_path, packed=_PHI3_PACKED,
+        export_weights=_decoder_tensors, preserve_source_layout=True,
+    ),
     DecoderFamily(
         ("nemotron_h",),
         _nemotron_h_config,
