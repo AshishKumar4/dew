@@ -23,7 +23,14 @@ again in float64, and writes to tests/fixtures/clef/tiny:
 A choice whose criteria are a list is given to Clef as a mapping of each
 option to None, which is what the list means and what Clef's code reads.
 
-    PYTHONPATH=src:tools python tools/clef_reference.py
+With `--images`, it reads that head back and runs the quickstart request
+with the backbone fixture's two images (images.npy) as Clef's `systemone`
+runs one, its processor laying the images out before the state, and writes
+images.json (the row's token ids) and images.npz (each question's fp32
+logits under `<id>` and float64 ones under `<id>/f64`, the vision tower
+included).
+
+    PYTHONPATH=src:tools python tools/clef_reference.py [--images]
 """
 
 import copy
@@ -123,5 +130,38 @@ def main() -> None:
     (OUT / "source.json").write_text(json.dumps({"repo": CLEF_REPO, "revision": CLEF_REVISION}) + "\n")
 
 
+def images() -> None:
+    from diffusers_wan_reference import float64
+    from PIL import Image
+    from safetensors.torch import load_file
+    from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
+
+    clef = clef_module()
+    processor = AutoProcessor.from_pretrained(BACKBONE)
+    backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
+                                                               attn_implementation="eager").eval()
+    head = clef.JointSchemaHead(**json.loads((OUT / "joint_head_config.json").read_text())).eval()
+    head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
+    model = clef.ClefModel(backbone, head).eval()
+    exact = copy.deepcopy(model).double()
+    request = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())["quickstart"]
+    pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
+    encoded = clef.encode_record(processor.tokenizer, {**as_clef(request), "images": pictures},
+                                 processor=processor)
+    batch = clef.collate_records([encoded], processor.tokenizer.pad_token_id, torch.device("cpu"))
+    with torch.no_grad():
+        found = model(batch)[0]
+    exact_batch = {**batch, "media": {key: value.double() if value.is_floating_point() else value
+                                      for key, value in batch["media"].items()}}
+    with float64(), torch.no_grad():
+        whole64 = exact(exact_batch)[0]
+    logits = {}
+    for question, fp32, whole in zip(encoded.questions, found, whole64, strict=True):
+        logits[question.question_id] = fp32.numpy()
+        logits[f"{question.question_id}/f64"] = whole.double().numpy()
+    (OUT / "images.json").write_text(json.dumps({"ids": list(encoded.input_ids)}) + "\n")
+    np.savez(OUT / "images.npz", **logits)
+
+
 if __name__ == "__main__":
-    main()
+    images() if "--images" in sys.argv[1:] else main()

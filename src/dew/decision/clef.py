@@ -25,6 +25,7 @@ from dew.decision.laya import unpacked_attention
 from dew.decision.layout import DecisionInputs, Specials
 from dew.decision.model import DecisionModel
 from dew.interop import sources
+from dew.interop.processors import Processor
 from dew.interop.safetensors_io import read_file
 from dew.interop.weights import translate_parameters
 from dew.objectives.base import Variables, joined
@@ -120,6 +121,8 @@ class ClefCheckpoint:
     variables: Variables
     tokenizer: HFTokenizer
     specials: Specials
+    processor: Processor | None
+    """The backbone's processor, which prepares a request's images."""
 
     @staticmethod
     def exists(name_or_dir: str | Path, *, revision: str | None = None) -> bool:
@@ -156,4 +159,4 @@ class ClefCheckpoint:
         tokenizer = HFTokenizer(str(root), local_files_only=True)
         return cls(DecisionModel(bundle.model, head.head),
                    joined({"backbone": bundle.variables, "head": {"params": head.params}}),
-                   tokenizer, Specials.of(tokenizer))
+                   tokenizer, Specials.of(tokenizer), bundle.processor)
