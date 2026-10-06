@@ -11,6 +11,7 @@ this module follows the paper's equation.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Sequence
 from dataclasses import replace
 from typing import TYPE_CHECKING
 
@@ -24,7 +25,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Step, Variables
+from dew.objectives.base import Aux, ProgramModule, Step, Variables
 from dew.registry import objectives, trainings
 
 from .objective import TEACHER, DiffusionObjective, Training, _own_loss
@@ -125,6 +126,16 @@ class GuidanceDistillationObjective(DiffusionObjective):
         self.teacher = teacher
         self.teacher_variables = teacher_variables
         self.scales = scales
+
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The student, then the teacher's modules, which the step does not train."""
+        return (*super().program_key(),
+                *(program._replace(trained=False) for program in self.teacher.program_key()))
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        count = len(super().program_key())
+        super().substitute(modules[:count])
+        self.teacher.substitute(modules[count:])
 
     def held_variables(self) -> Variables:
         return {**super().held_variables(), TEACHER: self.teacher_variables}

@@ -24,7 +24,7 @@ that collapse shows in the training curves, before a probe run.
 from __future__ import annotations
 
 import functools
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -38,6 +38,7 @@ from dew.objectives.base import (
     Aux,
     EMASpec,
     Objective,
+    ProgramModule,
     Ratio,
     Shown,
     Step,
@@ -147,6 +148,14 @@ class JepaObjective(Objective[Ratio]):
             decay=optax.linear_schedule(momentum[0], momentum[1], momentum_steps),
             select=under("params", CONTEXT_ENCODER),
         )
+
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The encoder, which also runs as the target, then the predictor."""
+        return (ProgramModule(self.encoder, None, trained=True),
+                ProgramModule(self.predictor, None, trained=True))
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        self.encoder, self.predictor = modules
 
     def held_variables(self) -> Variables | None:
         """The modules' given starting trees, by module, or None when both are drawn."""

@@ -15,7 +15,20 @@ from jax.experimental import multihost_utils
 from dew.coordination import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
-from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables, joined, part
+from dew.objectives.base import (
+    OMITTED,
+    Aux,
+    EMASpec,
+    Objective,
+    Omitted,
+    ProgramModule,
+    Ratio,
+    Shown,
+    Step,
+    Variables,
+    joined,
+    part,
+)
 from dew.records import JSON, json_value, record
 from dew.registry import objectives
 from dew.rl import gae
@@ -123,6 +136,14 @@ class PPOObjective(Objective[Ratio, Variables]):
         self.ema = None if reference is None else EMASpec(reference.decay,
             lambda path: len(path) > 1 and path[1] == "policy" and reference.select((path[0], *path[2:])))
 
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The actor's modules, then the critic."""
+        return (*self.actor.program_key(), ProgramModule(self.critic, None, trained=True))
+
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        *actor, self.critic = modules
+        self.actor.substitute(actor)
+
     def held_variables(self) -> Variables | None:
         """Return the actor's held variables, such as a loaded policy checkpoint, or None.
 
@@ -152,11 +173,10 @@ class PPOObjective(Objective[Ratio, Variables]):
         return json_value({**record(actor, 'inference record'), 'objective': objectives.name_of(type(self))},
                           'inference record')
 
-    def pipeline(self, state: TrainState, *, ema: bool | None = None,
-                 processor: Processor | None = None) -> TextGeneration:
+    def build_task(self, variables: Variables, *,
+                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
         """Return the trained actor as a `TextGeneration`, without the critic or the frozen KL reference."""
-        actor_state = replace(state, variables=part(state.variables, "policy"))
-        return self.actor.pipeline(actor_state, ema=ema, processor=processor)
+        return self.actor.build_task(part(variables, "policy"), processor=processor)
 
     def values(self, variables: Variables, batch: Mapping[str, object]) -> jax.Array:
         """Return the critic's value of the state before each packed id, as `[rows, width]`.
