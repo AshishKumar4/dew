@@ -56,6 +56,7 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
+    from torch.utils.data import Dataset as TorchDataset
 
 
 # grain's worker processes read absl flags; a script that never runs absl.app
@@ -678,6 +679,27 @@ class Dataset:
             records=len(source),
             batch=batch,
         )
+
+    @classmethod
+    def from_torch(cls, dataset: TorchDataset, *, batch: int, fields: Sequence[str] | None = None,
+                   seed: int = 0, validation: TorchDataset | None = None,
+                   loading: Loading = _DEFAULT_LOADING) -> Dataset:
+        """Build a dataset from a map-style `torch.utils.data.Dataset`, read
+        by index as `from_records` reads a source.
+
+        A dict sample keeps its keys, and `fields` names the values of a
+        tuple sample, `("image", "label")` for torchvision's. Tensors and PIL
+        images arrive as numpy. A `DataLoader` and an `IterableDataset` are
+        refused, naming what to pass instead
+        (`dew.data.sources.pytorch.TorchRecords`). The first sample is read
+        here, so one `fields` does not name is refused before the run.
+        """
+        from .sources.pytorch import TorchRecords
+
+        records = TorchRecords(dataset, fields)
+        held = None if validation is None else TorchRecords(validation, fields)
+        records[0]
+        return cls.from_records(records, batch=batch, seed=seed, validation=held, loading=loading)
 
     @property
     def steps_per_epoch(self) -> int | None:

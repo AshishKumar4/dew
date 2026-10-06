@@ -205,9 +205,14 @@ class HFDatasetSource:
         # array interface, so they convert here; strings, numbers and lists
         # travel as they are.
         row: Mapping[str, object] = self._table()[index]
-        return {key: np.asarray(value) if isinstance(value, ArrayInterface) else value
+        return {key: self.array(key, value) if isinstance(value, ArrayInterface) else value
                 for key, value in row.items()}
 
+    def array(self, name: str, value: ArrayInterface) -> np.ndarray:
+        """The array of the value in column `name` that describes its own
+        buffer, a decoded image's in its own mode. A reader that wants a
+        column in another form overrides this."""
+        return np.asarray(value)
 
     def __getstate__(self) -> Held:
         # grain pickles the source into every worker process. A table read

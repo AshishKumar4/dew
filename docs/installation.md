@@ -115,7 +115,9 @@ Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or `$XDG_CACHE_
 
 ## Preparing TFDS data
 
-Training reads prepared TFDS ArrayRecords and does not import TensorFlow. Preparing a dataset does need TensorFlow and sometimes dataset-specific packages (Oxford Flowers reads its label files with SciPy). TFDS 4.9.10 also imports `importlib_resources` while it prepares a dataset but only declares it for Python before 3.9, so the command installs it too. TensorFlow 2.21.0 has no Python 3.14 wheels, so prepare in a separate Python 3.13 environment:
+Training reads prepared TFDS ArrayRecords and does not import TensorFlow. Preparing a dataset does need TensorFlow and sometimes dataset-specific packages (Oxford Flowers reads its label files with SciPy). TFDS 4.9.10 also imports `importlib_resources` while it prepares a dataset but only declares it for Python before 3.9, so the command installs it too.
+
+Where those are installed in the training environment, on Python 3.13 or earlier with `tensorflow` and `importlib_resources`, `dew.data.load("tfds/mnist", batch=64)` and `TFDSImages(name="mnist")` prepare the builder themselves, in a separate Python process, into `~/.cache/dew/tfds` (`$XDG_CACHE_HOME/dew/tfds` when that is set), and every later call reads it from there, offline. TensorFlow 2.21.0 has no Python 3.14 wheels, so on 3.14 prepare in a separate Python 3.13 environment:
 
 ```bash
 uv venv --python 3.13 .venv-tfds-prepare
@@ -135,7 +137,7 @@ print("export DEW_FLOWERS_PATH=" + shlex.quote(str(builder.data_dir)))
 PY
 ```
 
-The script downloads the data if needed and prints an `export` line with the prepared version directory. Run that line in the shell you train from:
+The script downloads the data if needed and prints an `export` line with the prepared version directory. To have `load("tfds/<builder>")` and `TFDSImages(name=)` find it without a path, prepare it with `data_dir` set to the training environment's `~/.cache/dew/tfds` instead. Otherwise run the printed line in the shell you train from:
 
 <!-- not run: needs the prepared TFDS directory the script above writes -->
 ```python
@@ -149,7 +151,7 @@ data = TFDSImages(
 ).load(batch=4)
 ```
 
-Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`; the diffusion recipe's `data:oxford-flowers102` reads it with flower captions. With `labels=None`, `TFDSImages` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards are missing, the reader raises an error that asks you to prepare the data. Training never downloads or prepares TFDS data.
+Recipes take the same path as `--data.path "$DEW_FLOWERS_PATH"`; the diffusion recipe's `data:oxford-flowers102` reads it with flower captions. With `labels=None`, `TFDSImages` reads the class names from the `label.labels.txt` file TFDS writes there; `--data.labels` names another file. If the metadata or shards under a `path` are missing, the reader raises an error that asks you to prepare the data; Dew prepares only into its own directory, never into a `path` you name.
 
 ## Building the documentation
 

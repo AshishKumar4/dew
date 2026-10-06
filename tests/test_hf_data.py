@@ -167,13 +167,6 @@ def test_a_table_read_from_files_travels_as_its_paths(tmp_path, monkeypatch):
     assert reloaded[3]["caption"] == "caption number 3"
 
 
-def test_a_named_dataset_the_parent_never_read_loads_by_name_in_the_worker(hub):
-    reloaded = pickle.loads(pickle.dumps(HFDatasetSource(name="acme/pets", split="validation")))
-
-    assert reloaded[3]["caption"] == "caption number 3"
-    assert hub == [{"name": "acme/pets", "split": "validation"}]
-
-
 def test_the_table_loads_once_under_concurrent_reads(monkeypatch):
     """grain reads a source from several threads at once. Two of them loading
     the same table raced inside datasets and tore down tqdm's lock."""
@@ -265,8 +258,9 @@ def test_the_options_travel_to_a_worker_with_the_source(forwarded):
     source = HFDatasetSource(name="acme/pets", options=HFOptions(config="full", revision="v2"))
 
     reloaded = pickle.loads(pickle.dumps(source))
-    len(reloaded)
 
+    assert reloaded[3]["caption"] == "caption number 3"
+    assert [call["path"] for call in forwarded] == ["acme/pets"]
     assert [call["name"] for call in forwarded] == ["full"]
     assert [call["revision"] for call in forwarded] == ["v2"]
 
@@ -316,12 +310,19 @@ def test_a_hub_dataset_holds_its_validation_batches_out_of_training(hub):
 
 def _classes(records=RECORDS, size=IMAGE_SIZE):
     """A class-labelled image table without captions, laid out as CIFAR-10 is:
-    the image under "img", the class under "label"."""
+    the image under "img", the class under "label". Record i is one flat
+    colour, stored grey, 16-bit grey, as a palette, or fully transparent."""
     from PIL import Image
 
+    def stored(index):
+        grey = np.full((size, size), 16 * index, np.uint8)
+        return (Image.fromarray(grey),
+                Image.fromarray(grey.astype(np.uint16) * 256 + 255),
+                Image.fromarray(np.dstack([grey] * 3)).quantize(),
+                Image.fromarray(np.dstack([grey] * 3 + [grey * 0])))[index % 4]
+
     return datasets.Dataset.from_dict({
-        "img": [Image.fromarray(np.random.RandomState(i).randint(0, 256, (size, size, 3), np.uint8))
-                for i in range(records)],
+        "img": [stored(i) for i in range(records)],
         "label": [i % 10 for i in range(records)],
     })
 
@@ -331,29 +332,31 @@ def classes(monkeypatch):
     monkeypatch.setattr(datasets, "load_dataset", lambda path, split=None, **kwargs: _classes())
 
 
-def test_columns_name_where_an_uncaptioned_class_dataset_keeps_its_fields(classes):
-    data = _hub_images(image_column="img", caption_columns=(), val_batches=1).load(batch=4)
+def test_an_uncaptioned_class_dataset_reads_as_rgb_whatever_mode_it_stores(classes):
+    """Loaded without a caption reader, a split with no caption column needs
+    no caption_columns=(), and grey, 16-bit, palette and alpha images reach
+    the batch as the RGB colour they show, a transparent one as white."""
+    data = _hub_images(image_column="img", val_batches=1).load(batch=4)
 
     batch = next(data.val(DataPartition()))
     assert batch["image"].shape == (4, SCALE, SCALE, 3) and batch["image"].dtype == np.uint8
+    np.testing.assert_array_equal(batch["image"][:, 0, 0], np.repeat([[0], [16], [32], [255]], 3, 1))
     np.testing.assert_array_equal(batch["label"], [0, 1, 2, 3])
     assert "caption" not in batch
 
 
-def test_an_uncaptioned_dataset_refuses_a_caption_reader(classes):
-    with pytest.raises(TypeError, match="reads no captions"):
-        _hub_images(image_column="img", caption_columns=()).load(batch=4, tokenize=keep_captions)
-
-
-@pytest.mark.parametrize("fields, message", [
-    ({}, r"image_column='image'.*\['img', 'label'\]"),
-    ({"image_column": "img"}, r"caption_columns=\('caption', 'text'\).*caption_columns=\(\)"),
+@pytest.mark.parametrize("fields, tokenize, error, message", [
+    ({}, None, ValueError, r"image_column='image'.*\['img', 'label'\]"),
+    ({"image_column": "img"}, keep_captions, ValueError, r"caption_columns=\('caption', 'text'\)"),
+    ({"image_column": "img", "caption_columns": ()}, keep_captions, TypeError, "reads no captions"),
 ])
-def test_a_column_the_dataset_does_not_have_is_refused_when_it_loads(classes, fields, message):
+def test_a_column_the_dataset_does_not_have_is_refused_when_it_loads(classes, fields, tokenize,
+                                                                      error, message):
     """The refusal used to come from inside grain's reader on the first batch,
-    as a KeyError naming no field of the spec."""
-    with pytest.raises(ValueError, match=message):
-        _hub_images(**fields).load(batch=4)
+    as a KeyError naming no field of the spec. A caption reader over a split
+    without captions is refused, so no conditional run trains on none."""
+    with pytest.raises(error, match=message):
+        _hub_images(**fields).load(batch=4, tokenize=tokenize)
 
 
 def test_validation_is_scored_on_unaugmented_images(hub):
