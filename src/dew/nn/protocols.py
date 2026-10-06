@@ -20,7 +20,10 @@ without a second trunk pass: `output_table` gives the matrix a tiled loss
 contracts in place of the logits, and `logits_from_hidden` is the exact head
 for a head no matrix alone gives.
 `DenoisingModel` is an annotation only: every Flax module has a `__call__`, so
-an `isinstance` check on it would hold for any model.
+an `isinstance` check on it would hold for any model. `RequiresText`,
+`IntervalModel` and `TimeScaled` are what a denoiser declares about its
+conditions and its time: the text it cannot run without, the interval
+duration it can embed, and how fast its time features turn.
 
 The keywords a model takes past its tokens are `ModelKwarg` values:
 `ModelInputs.kwargs()` gives a request's token fields and conditioning, and
@@ -41,8 +44,8 @@ if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
     from dew.nn.dit import TextContext
 
-__all__ = ["AffineHead", "DenoisingModel", "HiddenStates", "Logits", "LogitsFromHidden", "ModelKwarg",
-           "OutputTable"]
+__all__ = ["AffineHead", "DenoisingModel", "HiddenStates", "IntervalModel", "Logits", "LogitsFromHidden",
+           "ModelKwarg", "OutputTable", "RequiresText", "TimeScaled"]
 
 
 @struct.dataclass
@@ -105,3 +108,48 @@ class LogitsFromHidden(Protocol):
     """The exact head from final states, for scoring states a loss already holds."""
 
     def logits_from_hidden(self, hidden: jax.Array) -> jax.Array: ...
+
+
+@runtime_checkable
+class RequiresText(Protocol):
+    """A denoising model that cannot run without text, which reaches it under
+    the model keyword `text_keyword` on every call: the text runs as a stream
+    of its own through the blocks, or every block attends to it, so an
+    unconditional call has nothing to run. A denoising model without this
+    capability runs unconditionally."""
+
+    @property
+    def text_keyword(self) -> str: ...
+
+
+@runtime_checkable
+class IntervalModel(Protocol):
+    """A denoising model that, with `interval` set, embeds the `duration` of
+    the interval it predicts over beside its time, as MeanFlow's and shortcut
+    models' networks do (`dew.diffusion.process.Process.interval`).
+
+    Set, a call without a duration is the instantaneous prediction, the zero
+    duration's; unset, a duration is refused. `interval` is a field, so
+    `model.clone(interval=True)` is the model an interval process runs.
+    """
+
+    @property
+    def interval(self) -> bool: ...
+
+
+@runtime_checkable
+class TimeScaled(Protocol):
+    """A denoising model whose time features turn `time_scale` times faster
+    than its unit table's: the model at scale s reading time t (and duration
+    d) computes what it computes at s / k reading k t (and k d).
+
+    A loss that differentiates the model in time, as MeanFlow's and sCM's do,
+    needs the scale small (`dew.objectives.diffusion.few_step.SMOOTH_TIME_SCALE`).
+    `time_scale` is a field, so `model.clone(time_scale=...)` sets it. Where
+    the features are a table in the variables, as `FourierEmbedding`'s
+    `constants` are, it sets the table `init` draws; variables loaded from
+    another run carry that run's.
+    """
+
+    @property
+    def time_scale(self) -> float: ...
