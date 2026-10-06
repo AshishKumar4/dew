@@ -620,7 +620,8 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
 
 def test_a_packed_batch_scores_like_its_documents_alone():
     """Packing is only a layout: the two documents' losses have to be the ones
-    they get on their own, and the boundary target is dropped on both sides."""
+    they get on their own, from the whole logits and through the same chunked
+    head, and the boundary target is dropped on both sides."""
     objective = packed_objective()
     params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, (doc_a, doc_b) = documents()
@@ -629,46 +630,25 @@ def test_a_packed_batch_scores_like_its_documents_alone():
         params, tokens, segment_ids=segment_ids, positions=positions)[:2]
     ce = weighted_mean(losses, weights)
 
-    total, count = 0.0, 0.0
+    total, chunked, count = 0.0, 0.0, 0.0
     for document in (doc_a, doc_b):
-        alone = only_document(document)
+        alone_tokens, alone_segments, alone_positions = alone = only_document(document)
         alone_losses, alone_weights = counted_losses(objective, params, *alone)
         total += float((alone_losses * alone_weights).sum())
         count += float(alone_weights.sum())
+        head_losses, head_weights = objective.token_scores(
+            params, alone_tokens, segment_ids=alone_segments, positions=alone_positions)[:2]
+        # Every transition inside the document; its last target is padding.
+        assert float(jnp.sum(head_weights)) == len(document) - 1
+        chunked += weighted_mean(head_losses, head_weights) * (len(document) - 1)
 
     packed_losses, packed_weights = counted_losses(
         objective, params, tokens, segment_ids, positions)
     assert count == packed_weights.sum() == len(doc_a) + len(doc_b) - 2
     assert ce == pytest.approx(total / count, rel=1e-5)
     assert ce == pytest.approx(float((packed_losses * packed_weights).sum() / count), rel=1e-6)
-
-
-def test_a_packed_batch_scores_like_its_documents_through_the_chunked_head():
-    """Both rearrangements at once: the row is packed and the vocabulary is
-    scored in chunks. The loss has to be the one the documents get on their
-    own through the same chunked head, weighted by the targets each counts."""
-    objective = packed_objective()
-    params = objective.init(jax.random.key(0))
-    tokens, segment_ids, positions, (doc_a, doc_b) = documents()
-
-    losses, weights = objective.token_scores(
-        params, tokens, segment_ids=segment_ids, positions=positions)[:2]
-    packed = weighted_mean(losses, weights)
-
-    total, count = 0.0, 0
-    for document in (doc_a, doc_b):
-        alone_tokens, alone_segments, alone_positions = only_document(document)
-        alone_losses, alone_weights = objective.token_scores(
-            params, alone_tokens, segment_ids=alone_segments, positions=alone_positions)[:2]
-        # Every transition inside the document; its last target is padding.
-        counted = len(document) - 1
-        assert float(jnp.sum(alone_weights)) == counted
-        total += weighted_mean(alone_losses, alone_weights) * counted
-        count += counted
-
-    assert count == len(doc_a) + len(doc_b) - 2
     # Largest relative difference observed on CPU: 7.1e-08.
-    assert packed == pytest.approx(total / count, rel=1e-6)
+    assert ce == pytest.approx(chunked / count, rel=1e-6)
 
 
 def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():

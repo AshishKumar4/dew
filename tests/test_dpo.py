@@ -26,12 +26,6 @@ from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
-
-
-def preference_logsigmoid(*halves_and_beta):
-    """The pair mean of the DPO sigmoid terms, the loss `DPOObjective` reduces to."""
-    terms, _ = preference_logsigmoid_terms(*halves_and_beta)
-    return jnp.mean(terms)
 VOCAB = 8
 PAIRS = 2
 WIDTH = 6
@@ -137,31 +131,6 @@ def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
     np.testing.assert_allclose(aux.metrics["rewards/rejected"], rewards_rejected.mean(), rtol=1e-5, atol=1e-6)
     assert float(aux.metrics["accuracy"]) == float((rewards_chosen > rewards_rejected).mean())
     np.testing.assert_allclose(loss, np.logaddexp(0, rewards_rejected - rewards_chosen).mean(), rtol=1e-6)
-
-
-def test_the_loss_composes_the_term_over_head_log_probs():
-    """The objective's loss is the preference term over the chunked head's
-    per-token log-probabilities, policy from the live params and reference
-    from the frozen tree."""
-    objective = DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, beta=0.5)
-    params = objective.init(jax.random.key(0))
-    frozen = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf)), params)
-    batch = pair_batch()
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
-
-    loss, aux = objective.scalar_loss(params, batch, step)
-
-    chosen_ids, rejected_ids, chosen_mask, rejected_mask = flat(batch)
-    stack = np.concatenate([chosen_ids, rejected_ids])
-    policy = np.asarray(objective.per_token_log_probs(params, stack))
-    ref = np.asarray(objective.per_token_log_probs(frozen, stack))
-    half = PAIRS
-    expected = preference_logsigmoid(
-        jnp.asarray(policy[:half]), jnp.asarray(policy[half:]),
-        jnp.asarray(ref[:half]), jnp.asarray(ref[half:]),
-        jnp.asarray(chosen_mask), jnp.asarray(rejected_mask), 0.5)
-    assert float(loss) == pytest.approx(float(expected), rel=1e-5)
-    assert set(aux.metrics) == {"rewards/chosen", "rewards/rejected", "accuracy"}
 
 
 def test_the_reference_comes_from_the_frozen_tree():
