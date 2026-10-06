@@ -91,15 +91,18 @@ def test_sequential_calls_release_the_same_kernel_uid(service, tmp_path, monkeyp
             assert result == {"repo": "model", "revision": "pinned"}
 
 
-def test_pixel_transport_does_not_reconstruct_floats_from_a_png():
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_pixel_transport_does_not_reconstruct_floats_from_a_png(dtype):
     import base64
 
+    import ml_dtypes
     import numpy as np
 
     client = module("model_client")
-    pixels = np.array([[[[0.00001, -0.234567, 0.99999]]]], np.float32)
+    kind = ml_dtypes.bfloat16 if dtype == "bfloat16" else np.float32
+    pixels = np.array([[[[0.00001, -0.234567, 0.99999]]]], kind)
     result = client.ImageResult({"pngs": [], "pixels": base64.b64encode(pixels.tobytes()).decode(),
-                                 "shape": list(pixels.shape), "dtype": pixels.dtype.str})
+                                 "shape": list(pixels.shape), "dtype": dtype if dtype == "bfloat16" else pixels.dtype.str})
     np.testing.assert_array_equal(result.images, pixels)
 
 

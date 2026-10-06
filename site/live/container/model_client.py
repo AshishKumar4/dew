@@ -91,7 +91,11 @@ class ImageResult:
     def images(self):
         import numpy as np
         data = base64.b64decode(self.result["pixels"])
-        return np.frombuffer(data, dtype=self.result["dtype"]).reshape(self.result["shape"]).copy()
+        dtype = self.result["dtype"]
+        if dtype == "bfloat16":
+            from ml_dtypes import bfloat16
+            dtype = bfloat16
+        return np.frombuffer(data, dtype=dtype).reshape(self.result["shape"]).copy()
 
 
 class Pipeline:
