@@ -88,16 +88,12 @@ def test_the_distance_and_its_gradient_are_repa_es():
         print("DIAG apart", float(np.sqrt(np.mean((gradient - truth64) ** 2))), "images dtype", reference["images"].dtype,
               "jaxpr dtypes", sorted({str(v.aval.dtype) for e in jax.make_jaxpr(jax.grad(mean))(first).eqns for v in e.outvars}))
         import subprocess, sys
-        script = str(Path(__file__).parent / "diag_lpips_f64.py")
-        for flags in ("", "--xla_cpu_multi_thread_eigen=false", "--xla_cpu_use_thunk_runtime=false",
-                      "--xla_cpu_max_isa=SSE4_2", "--xla_cpu_max_isa=AVX", "--xla_cpu_enable_fast_math=false",
-                      "--xla_cpu_use_xnnpack=false", "--xla_cpu_use_onednn=false"):
-            env = {**os.environ, "XLA_FLAGS": flags, "JAX_PLATFORMS": "cpu",
-                   "PYTHONPATH": str(Path(__file__).parent.parent / "src")}
-            done = subprocess.run([sys.executable, script], env=env, capture_output=True, text=True,
-                                  cwd=str(Path(__file__).parent.parent))
-            lines = [line for line in (done.stdout + done.stderr).splitlines() if line.startswith("@@") or "rror" in line]
-            print("DIAG", repr(flags), "|", " || ".join(lines)[:600])
+        script = str(Path(__file__).parent / "diag_lpips_stages.py")
+        done = subprocess.run([sys.executable, script], capture_output=True, text=True,
+                              cwd=str(Path(__file__).parent.parent))
+        for line in (done.stdout + done.stderr).splitlines():
+            if line.startswith("@@") or "rror" in line:
+                print("DIAG", line[:400])
     assert_computes_the_oracle(gradient, reference["gradient_f64"], "the gradient", roundings=roundings)
 
 
