@@ -95,7 +95,8 @@ def main():
                 "if line.startswith('Uid:')).split()[1]\n"
                 " except (OSError, StopIteration):\n  continue\n"
                 " assert int(uid) == os.getuid(), 'guest saw a foreign process'\n"
-                "assert {line.split(':')[0].strip() for line in Path('/proc/net/dev').read_text().splitlines()[2:]} == {'lo'}\n"
+                "links = {line.split(':')[0].strip() for line in "
+                "Path('/proc/net/dev').read_text().splitlines()[2:]}\nassert links == {'lo'}\n"
 
                 "status = Path('/proc/self/status').read_text().splitlines()\n"
                 "assert all(line.split(':')[1].strip() == '0000000000000000' "
