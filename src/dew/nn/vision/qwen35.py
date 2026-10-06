@@ -18,7 +18,10 @@ from dew.interop.weights import checkpoint_array, translate_parameters
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.nn.text_encoders import MLP
-from dew.nn.vision_common import (
+from dew.objectives.base import Variables
+from dew.registry import Record, projectors, towers
+
+from .common import (
     ProjectorBase,
     TowerBase,
     TowerGeometry,
@@ -27,8 +30,6 @@ from dew.nn.vision_common import (
     _vision_section,
     projector_weight_path,
 )
-from dew.objectives.base import Variables
-from dew.registry import Record, projectors, towers
 
 
 def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> tuple[jax.Array, jax.Array]:

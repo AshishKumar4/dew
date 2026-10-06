@@ -14,10 +14,10 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
-from dew.nn.vision_common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _vision_section
 from dew.registry import Record, from_record, projectors, towers
 
-from .mobilenet import _ARCHITECTURE, MobileNetV5Encoder
+from ..mobilenet import _ARCHITECTURE, MobileNetV5Encoder
+from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _vision_section
 
 
 @towers("gemma3n")

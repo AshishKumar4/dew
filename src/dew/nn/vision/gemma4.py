@@ -18,7 +18,10 @@ from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
-from dew.nn.vision_common import (
+from dew.objectives.base import Variables
+from dew.registry import Record, projectors, towers
+
+from .common import (
     _PROJECTOR_PATHS,
     ProjectorBase,
     TowerBase,
@@ -26,8 +29,6 @@ from dew.nn.vision_common import (
     _vision_section,
     projector_weight_path,
 )
-from dew.objectives.base import Variables
-from dew.registry import Record, projectors, towers
 
 
 def _gemma4_rope_tables(positions: jax.Array, head_dim: int,

@@ -20,6 +20,7 @@ from test_audio import gemma_features
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
+from dew.nn.vision import gemma3n, gemma4
 from dew.registry import models, projectors, with_precision
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
@@ -54,15 +55,15 @@ class _Wrapper:
             self.projector = V.Gemma3nProjectorModule(
                 self.audio.hidden_size, text_config["emb_features"], vocab_size=record["vocab_size"],
                 vocab_offset=record["vocab_offset"], norm_eps=self.audio.rms_norm_eps, precision=HIGHEST)
-            self.projector_variables = {"params": V.translate_gemma3n_projector_weights(embed_audio)}
-            self.vision = projectors.from_record(V.translate_gemma3n_projector_config(
+            self.projector_variables = {"params": gemma3n.translate_gemma3n_projector_weights(embed_audio)}
+            self.vision = projectors.from_record(gemma3n.translate_gemma3n_projector_config(
                 self.config, text_config["emb_features"])).build().clone(precision=HIGHEST)
-            self.vision_variables = {"params": V.translate_gemma3n_projector_weights(
+            self.vision_variables = {"params": gemma3n.translate_gemma3n_projector_weights(
                 _component(tensors, "model.embed_vision."))}
         else:
             self.projector = V.Gemma4ProjectorModule(text_width=text_config["emb_features"],
                                                      norm_eps=self.audio.rms_norm_eps, precision=HIGHEST)
-            self.projector_variables = {"params": V.translate_gemma4_projector_weights(embed_audio)}
+            self.projector_variables = {"params": gemma4.translate_gemma4_projector_weights(embed_audio)}
 
     def variables(self):
         return {"encoder": self.encoder_variables["params"], "projector": self.projector_variables["params"]}
