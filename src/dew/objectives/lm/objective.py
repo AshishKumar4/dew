@@ -839,8 +839,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def _head_bias(self, params):
         """The model's affine-head term, absent for every bias-free decoder."""
-        return (self.model.apply(params, params['params'], method='head_bias')
-                if isinstance(self.model, CausalTransformer) and self.model.lm_head_bias else None)
+        return (self.model.apply(params, params['params'], method='vocabulary_bias')
+                if _decoder(self.model) is not None else None)
 
     def _row_weights(self, prepared, targets, roles, dtype):
         """Weight the targets the row itself scores.

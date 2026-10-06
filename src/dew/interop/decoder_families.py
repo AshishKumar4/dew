@@ -124,7 +124,7 @@ from dew.nn.mla import MLAMixer
 ENTRIES = (
     DecoderFamily(
         ('gptj',), _gptj_config,
-        lambda fields: fields.shared_parallel_norm and fields.lm_head_bias and not fields.attention_bias,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
         'gptj', 'GPTJForCausalLM', _gptj_export,
         weight_path=_gptj_path, export_path=partial(_renamed_name, _GPTJ_NAMES),
         prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,

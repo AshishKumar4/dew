@@ -24,7 +24,7 @@ def _gptj_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         'position_embedding': 'rotary', 'position_embedding_size': None,
         'partial_rotary_factor': rotated / head_dim, 'partial_rotary_type': 'default',
         'attention_bias': False, 'parallel_residual': True, 'shared_parallel_norm': True,
-        'lm_head_bias': True, 'tie_embeddings': bool(hf.get('tie_word_embeddings', False)),
+        'head_bias': True, 'tie_embeddings': bool(hf.get('tie_word_embeddings', False)),
     })
     return config
 
