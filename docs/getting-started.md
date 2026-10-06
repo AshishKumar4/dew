@@ -55,7 +55,7 @@ objective = Regression(model)
 
 `loss(variables, batch, step)` returns two values:
 
-- `Ratio(total, mass)`, a sum and the count it is averaged over. The trainer adds totals and masses over a gradient-accumulation window and divides once, so the gradient is the gradient of the mean over the whole window. `self.row_mean(errors, batch)` builds it from the batch's rows: here the sum of the squared errors and their number. A validation pass's last batch is filled out with repeat rows, which it counts for nothing.
+- `Ratio(total, mass)`, a sum and the count it is averaged over. The trainer adds totals and masses over a gradient-accumulation window and divides once, so the gradient is the gradient of the mean over the whole window. `self.row_mean(errors, batch)` builds it from the batch's rows, here the sum of the squared errors and their count. It leaves out the repeated rows that pad a validation pass's last batch.
 - `Aux(metrics=...)`, scalars to log. `Ratio.mean` turns a `Ratio` into its value.
 
 `step` is a `Step`: `step.step` counts accepted microbatches and `step.key` is a fresh random key for this attempt. This loss is deterministic and uses neither.

@@ -587,27 +587,26 @@ class Dataset:
                    loading: Loading = _DEFAULT_LOADING) -> Dataset:
         """Build a dataset from Grain pipelines the caller built.
 
-        The caller decides the order, the shuffle and what each record turns
-        into. This adds what every spec's `load` adds, with the same helpers:
-        the reader's share of the batch, whole training batches, a validation
-        pass over every record with its last batch filled out (`VALID_ROWS`),
-        and the state pair a checkpoint saves.
+        The caller decides the order, the shuffle and what each record turns into.
+        This adds what every spec's `load` adds, with the same helpers: the reader's
+        share of the batch, whole training batches, a validation pass over every
+        record with its last batch padded (`VALID_ROWS`), and the state pair a
+        checkpoint saves.
 
         A `MapDataset` is read by index, so it gets the same training stream as
-        every spec: repeated endlessly, cut into the reader's share, and saved
-        as one global record count. A pipeline read in sequence is sharded by
-        whoever builds it, so pass it as a function that takes the partition
-        and builds that share's `IterDataset`. It is batched as it is and
-        reports Grain's own iterator state, which `dew.checkpoints` restores
-        only into a reader of the same share.
+        every spec: repeated endlessly, cut into the reader's share, and saved as one
+        global record count. A pipeline read in sequence is sharded by whoever builds
+        it, so pass it as a function that takes the partition and builds that
+        share's `IterDataset`. It is batched as it is and reports Grain's own
+        iterator state, which `dew.checkpoints` restores only into a reader of the
+        same share.
 
-        `records` is the number of records in one pass, which
-        `steps_per_epoch` divides. It defaults to a `MapDataset`'s own length,
-        so if you repeated your dataset before passing it in, give the length
-        of one pass instead. A Grain pipeline has no description of its own, so
-        the saved position names the pipeline's type and length, not the
-        corpus under it. If you swap the corpus under one pipeline, Dew cannot
-        detect it.
+        `records` is the number of records in one pass, which `steps_per_epoch`
+        divides. It defaults to a `MapDataset`'s own length, so if you repeated your
+        dataset before passing it in, give the length of one pass instead. A Grain
+        pipeline has no description of its own, so the saved position names the
+        pipeline's type and length, not the corpus under it. If you swap the corpus
+        under one pipeline, Dew cannot detect it.
         """
         mapped = train if isinstance(train, pygrain.MapDataset) else None
         for pipeline in (train, validation):
@@ -646,13 +645,13 @@ class Dataset:
                      loading: Loading = _DEFAULT_LOADING) -> Dataset:
         """Build a dataset from records the caller holds: columns, rows or a source.
 
-        `records` is a mapping of columns whose first axis is the record, such
-        as `{"x": x, "y": y}`, a sequence of per-record mappings, or any source
-        read by index. Training reshuffles the records from `seed` every epoch,
-        with the same stream every spec reads (`train_stream`), so the position
-        a checkpoint saves is a global record count and each process reads its
-        own share of every batch. `validation` is read once, in order, every
-        record of it, the last batch filled out (`VALID_ROWS`).
+        `records` is a mapping of columns whose first axis is the record, such as
+        `{"x": x, "y": y}`, a sequence of per-record mappings, or any source read by
+        index. Training reshuffles the records from `seed` every epoch, with the same
+        stream every spec reads (`train_stream`), so the position a checkpoint saves
+        is a global record count and each process reads its own share of every
+        batch. `validation` is read once, in order, and every record is scored, with
+        the last batch padded (`VALID_ROWS`).
         """
         held = None if validation is None else in_memory(validation)
         source = in_memory(records)

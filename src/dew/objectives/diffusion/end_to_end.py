@@ -75,15 +75,17 @@ def _moments(values: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array]:
 
 
 class PatchDiscriminator(nn.Module):
-    """pix2pix's PatchGAN as taming-transformers' `NLayerDiscriminator`
-    writes it, which REPA-E copies (loss/discriminator.py): a 4x4 stride-2
-    convolution to `width` channels, then `layers - 1` more stride-2 ones and
-    one stride-1 one, each doubling the width up to 8x, batch normalized,
-    every activation a 0.2 leaky ReLU, and a final 4x4 convolution to one
-    logit per patch; every convolution pads by one. A fresh one draws its
-    kernels normal at 0.02 as taming's `weights_init` does; REPA-E's recipe
-    starts from a pretrained one (`variables_from_torch`). Returns the
-    logits, `[B, h, w, 1]`. Its batch norms read `batch`'s rows.
+    """pix2pix's PatchGAN, written as taming-transformers' `NLayerDiscriminator`, which REPA-E copies.
+
+    REPA-E's copy is loss/discriminator.py. The network is a 4x4 stride-2
+    convolution to `width` channels, then `layers - 1` more stride-2 convolutions
+    and one stride-1 convolution, each doubling the width up to 8x and batch
+    normalized, every activation a 0.2 leaky ReLU, and a final 4x4 convolution to
+    one logit per patch; every convolution pads by one. A fresh network draws its
+    kernels from a normal with standard deviation 0.02, as taming's
+    `weights_init` does, while REPA-E's recipe starts from a pretrained one
+    (`variables_from_torch`). It returns the logits, `[B, h, w, 1]`. Its batch
+    norms take their statistics over `batch`'s rows.
     """
 
     width: int = 64
@@ -103,9 +105,11 @@ class PatchDiscriminator(nn.Module):
         return conv(1, 1, f"conv_{self.layers + 1}")(hidden)
 
     def variables_from_torch(self, state: Mapping[str, np.ndarray]) -> Variables:
-        """The variables of `NLayerDiscriminator(ndf=width, n_layers=layers)`'s
-        torch state dict, kernels moved from OIHW to HWIO. Its batch norms'
-        running statistics are not read, as no step of REPA-E reads them."""
+        """Return the variables of a torch `NLayerDiscriminator(ndf=width, n_layers=layers)` state dict.
+
+        Kernels are moved from OIHW to HWIO. The batch norms' running statistics are
+        not read, because no step of REPA-E reads them.
+        """
         params: dict[str, dict[str, jax.Array]] = {}
 
         def put(key: str, module: str, name: str) -> None:
@@ -203,15 +207,17 @@ class EndToEnd:
         return tuned, {**variables, "autoencoder": tuned.params}
 
     def normalized(self, latents: jax.Array, statistics: Variables) -> jax.Array:
-        """`latents` under the running statistics: the batch norm in eval mode."""
+        """Return `latents` normalized by the running statistics, as the batch norm does in eval mode."""
         return (latents - statistics["mean"]) / jnp.sqrt(statistics["var"] + self.epsilon)
 
     def batch_normalized(self, latents: jax.Array, statistics: Variables, batch: Batch
                          ) -> tuple[jax.Array, Variables]:
-        """`latents` under their own statistics over every axis but the
-        channels, and the running statistics after them: torch's
-        `BatchNorm2d` in training mode, whose running variance is unbiased.
-        The statistics are `batch`'s rows' (`Objective.row_mean`)."""
+        """Return `latents` normalized by their own statistics, and the updated running statistics.
+
+        The statistics are taken over every axis but the channels, over `batch`'s
+        rows (`Objective.row_mean`). This is torch's `BatchNorm2d` in training mode,
+        whose running variance is unbiased.
+        """
         mean, var = _moments(latents, batch)
         count = Objective.row_mean(latents[..., 0], batch).mass
         following = {"mean": (1 - self.momentum) * statistics["mean"] + self.momentum * mean,
@@ -222,14 +228,15 @@ class EndToEnd:
     def regularizer(self, images: jax.Array, reconstruction: jax.Array, moments: jax.Array, *,
                     perceptual: Variables | None, discriminator: Variables | None,
                     step: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array, dict[str, jax.Array]]:
-        """The autoencoder's own loss, the discriminator's, and their terms.
+        """Return the autoencoder's own loss, the discriminator's loss, and their terms.
 
         `perceptual` is the LPIPS network's variables and `discriminator` the
-        PatchGAN's, each None where its weight is 0. The generator term reads
-        the discriminator frozen and the discriminator's hinge loss reads the
-        images and the reconstruction frozen, so each loss trains only its
-        own network, on what the step began with. Every mean is over
-        `batch`'s rows (`Objective.row_mean`)."""
+        PatchGAN's, each None when its weight is 0. The generator term reads the
+        discriminator frozen, and the discriminator's hinge loss reads the images and
+        the reconstruction frozen, so each loss trains only its own network, from
+        the values the step began with. Every mean is over `batch`'s rows
+        (`Objective.row_mean`).
+        """
         def mean_of(values: jax.Array) -> jax.Array:
             return Objective.row_mean(values, batch).mean()[0]
 

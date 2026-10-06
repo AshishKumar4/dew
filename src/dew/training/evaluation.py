@@ -34,12 +34,12 @@ class Evaluation:
     """The result of one evaluation, with its previews kept on process 0.
 
     Every process holds the same `scores`, row counts and RNG identity
-    (`event_key`). Each score's name starts with the split, as in
-    `val/loss`. `coordinated_batches` is the number of batches every process
-    scored and `records` the real rows those batches held, every record of
-    the split once. `elapsed_seconds` is process 0's wall time, including
-    closing the batch iterator. The metric accumulators and the validation
-    batches are not kept.
+    (`event_key`). Each score's name starts with the split, as in `val/loss`.
+    `coordinated_batches` is the number of batches every process scored, and
+    `records` the number of real rows in them, which covers every record of the
+    split once. `elapsed_seconds` is process 0's wall time, including closing the
+    batch iterator. The metric accumulators and the validation batches are not
+    kept.
     """
 
     step: int
@@ -68,40 +68,36 @@ class Evaluation:
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
             schedule_step: int | jax.Array | None = None, loss: bool = False,
             training: Mapping[str, jax.Array] | None = None) -> Evaluation:
-        """Evaluate `variables` on the batches every process can read, without
-        an optimizer or a tracker.
+        """Evaluate `variables` on the batches every process can read, without an optimizer or a tracker.
 
-        Every process calls this with the same objective, metrics and
-        numerical settings. `batches` is called with this process's share of
-        the split (`DataPartition.of(mesh)`) and returns a fresh iterator,
-        which this call opens and closes; you can pass `Dataset.val`
-        directly. Every batch carries `VALID_ROWS`, all True where the reader
-        marked none, and the objective's loss and the metrics count only the
-        real rows. A process whose share runs out before its peers' scores a
-        copy of its last batch with every row a repeat, so every process
-        scores the same number of batches and the pass reads every record of
-        every share. With no `metrics`, no
-        `loss` and no preview, no iterator is opened and the objective does
-        no work, and a preview alone reads at most the first batch. Only
-        process 0's `preview` flag counts, and the preview is made once per
-        call.
+        Every process calls this with the same objective, metrics and numerical
+        settings. `batches` is called with this process's share of the split
+        (`DataPartition.of(mesh)`) and returns a fresh iterator, which this call
+        opens and closes; you can pass `Dataset.val` directly. Every batch holds
+        `VALID_ROWS` (all True when the reader marked none), and the objective's loss
+        and the metrics count only the real rows. A process whose share runs out
+        before the others' scores a copy of its last batch in which every row is a
+        repeat, so every process scores the same number of batches and the pass
+        reads every record of every share. With no `metrics`, no `loss` and no
+        preview, no iterator is opened and the objective does no work, and a preview
+        alone reads at most the first batch. Only process 0's `preview` flag counts,
+        and the preview is made once per call.
 
-        `variables` is the complete Flax variables tree. `averaged`, when
-        given, is the complete set of averaged weights the objective sees as
-        `Step.ema`, not an optimizer state; to evaluate those weights
-        directly, pass `state.averaged` as `variables`. `step` keys the
-        evaluation's RNG and labels the result. `schedule_step` is the step
-        the objective's schedules read and defaults to `step`. When training
-        attempts were rejected, pass the count of accepted microbatches
-        (`TrainState.microstep`, as `fit` does) so the schedule follows only
-        the work training accepted.
+        `variables` is the complete Flax variables tree. `averaged`, when given, is
+        the complete set of averaged weights the objective sees as `Step.ema`, not an
+        optimizer state; to evaluate those weights directly, pass `state.averaged` as
+        `variables`. `step` keys the evaluation's RNG and labels the result.
+        `schedule_step` is the step the objective's schedules read, and defaults to
+        `step`. When training attempts were rejected, pass the number of accepted
+        microbatches (`TrainState.microstep`, as `fit` does) so the schedule follows
+        only the work training accepted.
 
-        The scores are broadcast to every process. Previews stay on process 0,
-        and there is at most one objective preview, however long the
-        validation split is. Reporting the result is the caller's job, and
-        callers in a process pool must agree on any reporting failure before
-        they enter their next collective. A device failure in flight still
-        requires ending the distributed runtime.
+        The scores are broadcast to every process. Previews stay on process 0, and
+        there is at most one objective preview, however long the validation split
+        is. Reporting the result is up to the caller. In a process pool, the callers
+        must agree on whether reporting failed before they enter their next
+        collective, and a device failure in flight still requires ending the
+        distributed runtime.
         """
         from dew.nn.inputs import request_key
         key = request_key(key)
