@@ -2,7 +2,7 @@
 
 A row of token ids is corrupted by masking each position with the process's
 probability at a drawn time. The model reads the whole corrupted row, its
-states attending both ways (`dew.nn.protocols.Ordered` with `causal` False),
+states attending both ways (`dew.nn.protocols.TokenModel` with `causal` False),
 and predicts the original tokens through its head (`AffineHead`). The loss
 is the cross entropy at the masked positions, under a distribution that
 gives the mask token no mass (MDLM's SUBS parameterization), weighted by
@@ -38,7 +38,7 @@ from dew.coordination import agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
-from dew.nn.protocols import AffineHead, HiddenStates, Ordered
+from dew.nn.protocols import AffineHead, HiddenStates, TokenModel
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -99,7 +99,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
         `model` gives its final states and its head (`HiddenStates`,
-        `AffineHead`), and its states attend both ways (`Ordered` with
+        `AffineHead`), and its states attend both ways (`TokenModel` with
         `causal` False), as `CausalTransformer(causal=False)`'s do. `solver`
         and `steps` set how generation unmasks, in the preview and in the
         task `pipeline` returns, and `samples` is how many rows the preview
@@ -121,10 +121,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             raise TypeError(
                 f"masked diffusion scores a model's final states through its head, and a "
                 f"{type(model).__name__} gives no {' or '.join(lacking)}")
-        if not isinstance(model, Ordered) or model.causal:
+        if not isinstance(model, TokenModel) or model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so its states attend "
-                "both ways (Ordered with causal False), as CausalTransformer(causal=False)'s do")
+                "both ways (TokenModel with causal False), as CausalTransformer(causal=False)'s do")
         self.model = model
         self.process = process
         self.seq_len = seq_len

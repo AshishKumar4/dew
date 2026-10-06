@@ -48,7 +48,7 @@ from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, lay
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import AffineHead, HiddenStates, Indexed, Ordered, Predicting, StreamedPrediction
+from dew.nn.protocols import AffineHead, DecoderTraining, HiddenStates, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -128,7 +128,7 @@ def _check_reads(model: nn.Module) -> None:
 
     The loss reads the final states and contracts them with the head
     (`HiddenStates`, `AffineHead`), and a state may see only the tokens up
-    to its own, so a model that says its states attend both ways (`Ordered`)
+    to its own, so a model that says its states attend both ways (`TokenModel`)
     is refused.
     """
     lacking = [read.__name__ for read in (HiddenStates, AffineHead) if not isinstance(model, read)]
@@ -136,13 +136,13 @@ def _check_reads(model: nn.Module) -> None:
         raise TypeError(
             f"LMObjective scores a model's final states through its head, and a "
             f"{type(model).__name__} gives no {' or '.join(lacking)}")
-    if isinstance(model, Ordered) and not model.causal:
+    if isinstance(model, TokenModel) and not model.causal:
         raise ValueError("LMObjective requires a causal model for next-token likelihoods")
 
 
 def _streamed_depths(model: nn.Module) -> bool:
-    """Say whether the prediction depths carry their own residual streams (`StreamedPrediction`)."""
-    return isinstance(model, StreamedPrediction) and model.mtp_hyper_connections is not None
+    """Say whether the prediction depths carry their own residual streams (`DecoderTraining`)."""
+    return isinstance(model, DecoderTraining) and model.mtp_hyper_connections is not None
 
 
 def _check_terms(model: nn.Module, *, aux_loss_alpha: float | None, mtp_weight: float | None,
@@ -159,7 +159,7 @@ def _check_terms(model: nn.Module, *, aux_loss_alpha: float | None, mtp_weight: 
             f"aux_loss_alpha scales the balance loss, so it is positive, "
             f"got {aux_loss_alpha}; None adds no balance loss")
     if mtp_weight is not None:
-        depths = model.num_nextn_predict_layers if isinstance(model, Predicting) else 0
+        depths = model.num_nextn_predict_layers if isinstance(model, DecoderTraining) else 0
         if depths < 1:
             raise ValueError(
                 "mtp_weight scales the prediction depths' cross entropy, so "
@@ -188,7 +188,7 @@ def _check_indexer(model: nn.Module, indexer: IndexerTraining,
     The warm-up moves the indexer alone, so any term of the main loss asked
     for beside it would weight leaves the optimizer does not touch.
     """
-    mixers = model.indexed_mixers if isinstance(model, Indexed) else ()
+    mixers = model.indexed_mixers if isinstance(model, DecoderTraining) else ()
     if not mixers:
         raise ValueError(
             "indexer training needs an mla mixer with the indexer's "
