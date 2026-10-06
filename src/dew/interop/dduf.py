@@ -18,7 +18,7 @@ import shutil
 import tempfile
 from pathlib import Path, PurePosixPath
 
-from dew.telemetry.instrumentation import dew_cache_dir
+from dew.cache import dew_cache_dir
 
 _CHUNK = 1 << 24
 
