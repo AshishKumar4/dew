@@ -6,8 +6,6 @@ registered family needs for that file's registry-wide parametrization to
 run. A test here asserts what a capability does, not which classes have it.
 """
 
-from functools import partial
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -81,25 +79,15 @@ def test_an_autoencoder_whose_latent_is_no_kl_draw_refuses_by_name(autoencoder):
         autoencoder.decode_raw(autoencoder.params, jnp.zeros((1, 2, 2, 4)))
 
 
-def denoises(architecture: str) -> bool:
-    """Whether the registered `architecture`'s tiny inputs are a batch of
-    samples and one time per row, a denoiser's."""
-    inputs = tiny_inputs(architecture, jax.random.PRNGKey(0))
-    args = inputs[0] if isinstance(inputs[0], tuple) else inputs
-    return len(args) >= 2 and args[0].ndim >= 4 and jnp.shape(args[1]) == args[0].shape[:1]
-
-
-DENOISERS = [architecture for architecture in sorted(models) if denoises(architecture)]
-TIME_SCALED = [architecture for architecture in DENOISERS
-               if isinstance(build_model(architecture), TimeScaled)]
-
-
 def denoiser(architecture: str, rng):
     """The registered `architecture` at a tiny size in float32, its sample,
-    its time, and the rest of its tiny inputs, positional and keyword."""
+    time and the rest of its tiny inputs; None where those are not a batch
+    of samples and one time per row, a denoiser's."""
     inputs = tiny_inputs(architecture, rng)
-    (sample, time, *rest), conditions = inputs if isinstance(inputs[0], tuple) else (inputs, {})
-    return build_model(architecture, "float32"), sample, time, tuple(rest), conditions
+    (sample, *args), conditions = inputs if isinstance(inputs[0], tuple) else (inputs, {})
+    if not args or sample.ndim < 4 or jnp.shape(args[0]) != sample.shape[:1]:
+        return None
+    return build_model(architecture, "float32"), sample, args[0], tuple(args[1:]), conditions
 
 
 def perturbed(variables, rng):
@@ -111,12 +99,22 @@ def perturbed(variables, rng):
     return {**variables, "params": jax.tree.unflatten(tree, noisy)}
 
 
-@pytest.mark.parametrize("architecture", DENOISERS)
-def test_a_denoiser_runs_unconditionally_unless_it_requires_text(architecture, rng):
-    """An unconditional run builds and calls its denoiser on the sample and
-    time alone. A denoiser declaring `RequiresText` refuses that call,
-    naming the keyword its text arrives under, and runs on that keyword's
-    text; one declaring none runs."""
+@pytest.mark.parametrize("architecture", [architecture for architecture in sorted(models)
+                                          if denoiser(architecture, jax.random.PRNGKey(0))])
+def test_a_denoiser_reads_the_text_interval_and_time_it_declares(architecture, rng):
+    """What the diffusion recipe relies on, held to every registered denoiser's declarations.
+
+    An unconditional run builds and calls its denoiser on the sample and
+    time alone: one declaring `RequiresText` refuses that, naming the keyword
+    its text arrives under, and runs on that keyword's text; every other
+    runs. An interval process hands its model each step's `duration`: cloned
+    with `interval` set, an `IntervalModel` embeds it, a missing one as the
+    zero duration, and cloned without refuses one, as every other denoiser
+    does. MeanFlow and sCM slow a `TimeScaled` denoiser's time features
+    through `time_scale`, which is the time's unit: at 16 on t and d it
+    computes bit for bit what it computes at 2 on 8t and 8d, powers of two
+    keeping both sides exact.
+    """
     model, sample, time, rest, conditions = denoiser(architecture, rng)
     if isinstance(model, RequiresText):
         variables = model.init(rng, sample, time, *rest, **conditions)
@@ -126,51 +124,27 @@ def test_a_denoiser_runs_unconditionally_unless_it_requires_text(architecture, r
         denoised = model.apply(variables, sample, time, **{model.text_keyword: text})
     else:
         denoised = model.apply(model.init(rng, sample, time), sample, time)
-    assert denoised.shape == sample.shape
-    assert bool(jnp.all(jnp.isfinite(denoised)))
+    assert denoised.shape == sample.shape and bool(jnp.all(jnp.isfinite(denoised)))
 
+    def built(model, scale=None):
+        model = model if scale is None else model.clone(time_scale=scale)
+        variables = perturbed(model.init(rng, sample, time, *rest, **conditions), rng)
+        return lambda at, **duration: model.apply(variables, sample, at, *rest, **duration, **conditions)
 
-@pytest.mark.parametrize("architecture", DENOISERS)
-def test_a_denoiser_takes_an_interval_duration_only_where_it_declares_one(architecture, rng):
-    """An interval process (`Process.interval`) hands its model each step's
-    `duration`. Cloned with `interval` set, a denoiser declaring
-    `IntervalModel` embeds it, a missing one as the zero duration; cloned
-    without, it refuses one, as a denoiser declaring none does."""
-    model, sample, time, rest, conditions = denoiser(architecture, rng)
     duration = jnp.full_like(time, 0.25)
-    if not isinstance(model, IntervalModel):
-        variables = model.init(rng, sample, time, *rest, **conditions)
-        with pytest.raises(TypeError, match="duration"):
-            model.apply(variables, sample, time, *rest, duration=duration, **conditions)
-        return
-    spanning = model.clone(interval=True)
-    variables = perturbed(spanning.init(rng, sample, time, *rest, **conditions), rng)
-    call = partial(spanning.apply, variables, sample, time, *rest, **conditions)
-    np.testing.assert_array_equal(call(), call(duration=jnp.zeros_like(time)))
-    assert not np.array_equal(call(), call(duration=duration))
-    instantaneous = model.clone(interval=False)
-    with pytest.raises(ValueError, match="duration"):
-        instantaneous.apply(instantaneous.init(rng, sample, time, *rest, **conditions), sample, time, *rest,
-                            duration=duration, **conditions)
-
-
-@pytest.mark.parametrize("architecture", TIME_SCALED)
-def test_a_time_scaled_denoiser_reads_its_time_in_units_of_its_scale(architecture, rng):
-    """MeanFlow and sCM differentiate the model in time, and a run slows
-    its time features through `time_scale` (`SMOOTH_TIME_SCALE`). The scale
-    is the time's unit: at 16 on time t and duration d, a `TimeScaled`
-    denoiser computes bit for bit what it computes at 2 on 8t and 8d.
-    Powers of two keep both sides exact."""
-    model, sample, time, rest, conditions = denoiser(architecture, rng)
     if isinstance(model, IntervalModel):
+        with pytest.raises(ValueError, match="duration"):
+            built(model.clone(interval=False))(time, duration=duration)
         model = model.clone(interval=True)
-    spanned = isinstance(model, IntervalModel) and model.interval
-    time, duration = 0.75 * time, 0.25 * time
-    outputs = []
-    for scale, unit in ((16.0, 1.0), (2.0, 8.0)):
-        scaled = model.clone(time_scale=scale)
-        variables = perturbed(scaled.init(rng, sample, time, *rest, **conditions), rng)
-        given = {"duration": unit * duration} if spanned else {}
-        outputs.append(scaled.apply(variables, sample, unit * time, *rest, **given, **conditions))
-    assert not np.array_equal(outputs[0], jnp.zeros_like(outputs[0]))
-    np.testing.assert_array_equal(*outputs)
+        call = built(model)
+        np.testing.assert_array_equal(call(time), call(time, duration=jnp.zeros_like(time)))
+        assert not np.array_equal(call(time), call(time, duration=duration))
+    else:
+        with pytest.raises(TypeError, match="duration"):
+            built(model)(time, duration=duration)
+    if isinstance(model, TimeScaled):
+        spanned = isinstance(model, IntervalModel)
+        fast, slow = (built(model, scale)(unit * time, **({"duration": unit * duration} if spanned else {}))
+                      for scale, unit in ((16.0, 1.0), (2.0, 8.0)))
+        assert not np.array_equal(fast, jnp.zeros_like(fast))
+        np.testing.assert_array_equal(fast, slow)
