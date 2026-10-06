@@ -121,6 +121,102 @@ def test_qwen2_moe_reads_qkv_bias_without_biasing_the_output():
     assert config['attention_bias'] is False and config['o_proj_bias'] is False
 
 
+GRANITEMOE = FIXTURES / 'granitemoe-tiny'
+
+
+def test_granitemoe_released_config_keeps_all_four_multipliers():
+    config = translate_config(fixture_config('powermoe-3b'))
+    assert config['embedding_multiplier'] == 12.0 and config['residual_multiplier'] == 0.22
+    assert config['logits_scaling'] == 6.0 and config['attention_scale'] == 0.015625
+    assert config['mixture'] == {'experts': 40, 'top_k': 8}
+    assert (config['num_layers'], config['num_heads'], config['num_kv_heads']) == (32, 24, 8)
+    assert config['mlp'] == 'swiglu' and config['tie_embeddings']
+
+
+@pytest.mark.network
+def test_granitemoe_pinned_config_reads_as_the_committed_release():
+    from huggingface_hub import hf_hub_download
+
+    source = json.loads((FIXTURES / 'powermoe-3b/source.json').read_text())
+    config = json.loads(Path(hf_hub_download(source['repo'], 'config.json',
+                                           revision=source['revision'])).read_text())
+    assert config == fixture_config('powermoe-3b')
+    assert translate_config(config)['residual_multiplier'] == 0.22
+
+
+@pytest.mark.parametrize('changes, field', (
+    ({'activation_function': 'gelu'}, 'activation_function'),
+    ({'router_jitter_noise': 0.1}, 'router_jitter_noise'),
+))
+def test_granitemoe_refuses_fields_that_disagree_with_the_reference(changes, field):
+    with pytest.raises(ValueError, match=field):
+        translate_config({**fixture_config('powermoe-3b'), **changes})
+
+
+def test_granitemoe_logits_match_the_reference():
+    model, variables = fp32_decoder(GRANITEMOE)
+    ids = np.load(GRANITEMOE / 'input_ids.npy')
+    reference = np.load(GRANITEMOE / 'logits.npy')
+    truth = np.load(GRANITEMOE / 'logits_f64.npy')
+    logits = np.asarray(model.apply(variables, ids))
+    assert_as_exact_as_the_reference(logits, reference, truth, 'Granite MoE logits')
+    np.testing.assert_array_equal(logits.argmax(-1), reference.argmax(-1))
+    print('Granite MoE RMS ratio', distance(logits, truth) / distance(reference, truth))
+
+
+def test_granitemoe_prefill_and_steps_match_the_reference():
+    model, variables = fp32_decoder(GRANITEMOE)
+    ids = np.load(GRANITEMOE / 'input_ids.npy')
+    state = model.apply(variables, ids.shape[0], method='init_cache', mutable=['cache'])[1]
+    out, state = model.apply({**variables, **state}, ids[:, :4], decode=True, mutable=['cache'])
+    pieces = [np.asarray(out)]
+    for index in range(4, ids.shape[1]):
+        out, state = model.apply({**variables, **state}, ids[:, index:index + 1],
+                                 decode=True, mutable=['cache'])
+        pieces.append(np.asarray(out))
+    assert_as_exact_as_the_reference(np.concatenate(pieces, axis=1),
+        np.load(GRANITEMOE / 'logits.npy'), np.load(GRANITEMOE / 'logits_f64.npy'), 'Granite MoE cache')
+
+
+def test_granitemoe_padded_routing_matches_the_reference():
+    model, variables = fp32_decoder(GRANITEMOE)
+    arrays = np.load(GRANITEMOE / 'padded.npz')
+    logits = np.asarray(model.apply(
+        variables, arrays['input_ids'], positions=arrays['position_ids'],
+        attention_mask=arrays['attention_mask']))
+    valid = arrays['attention_mask']
+    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
+                                     arrays['logits_f64'][valid], 'Granite MoE padded')
+    print('Granite MoE padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
+          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
+
+
+def test_granitemoe_export_keeps_packed_experts_and_tied_head(tmp_path):
+    from safetensors.numpy import load_file
+
+    loaded = Pretrained.load(str(GRANITEMOE), dtype='float32', attention_impl='reference')
+    loaded.save(tmp_path / 'export')
+    tensors = load_file(str(tmp_path / 'export/model.safetensors'))
+    assert 'model.layers.0.block_sparse_moe.input_linear.weight' in tensors
+    assert 'lm_head.weight' not in tensors
+    again = Pretrained.load(str(tmp_path / 'export'), dtype='float32', attention_impl='reference')
+    for path, leaf in flat_tree(loaded.variables).items():
+        np.testing.assert_array_equal(leaf, flat_tree(again.variables)[path])
+    assert json.loads((tmp_path / 'export/config.json').read_text()) == fixture_config('granitemoe-tiny')
+
+
+def test_granitemoe_runs_a_backward_update():
+    model, variables = fp32_decoder(GRANITEMOE)
+    ids = jnp.asarray(np.load(GRANITEMOE / 'input_ids.npy'))
+
+    def loss(params):
+        return jnp.mean(jnp.square(model.apply({'params': params}, ids)))
+
+    before, gradients = jax.value_and_grad(loss)(variables['params'])
+    updated = jax.tree_util.tree_map(lambda p, g: p - 1e-3 * g, variables['params'], gradients)
+    assert np.isfinite(float(before)) and float(loss(updated)) < float(before)
+
+
 MINIMAX_M2 = FIXTURES / 'minimax-m2-tiny'
 
 

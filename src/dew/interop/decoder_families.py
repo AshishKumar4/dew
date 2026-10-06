@@ -64,6 +64,10 @@ from dew.interop.families.kimi import (
     _kimi_linear_prepare,
 )
 from dew.interop.families.llama import (
+    _GRANITEMOE_NAMES,
+    _GRANITEMOE_PACKED,
+    _granitemoe_config,
+    _granitemoe_path,
     _llama_config,
     _ministral_config,
     _mistral_config,
@@ -548,6 +552,20 @@ ENTRIES = (
         "Qwen2ForCausalLM",
         _qwen3_export,
         preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('granitemoe',),
+        _granitemoe_config,
+        lambda fields: bool(fields.mixture is not None and not fields.qk_norm
+                            and (fields.embedding_multiplier != 1.0 or fields.residual_multiplier != 1.0
+                                 or fields.logits_scaling != 1.0 or fields.attention_scale is not None)),
+        'granitemoe',
+        'GraniteMoeForCausalLM',
+        lambda model: {},
+        weight_path=_granitemoe_path,
+        export_path=partial(_renamed_name, _GRANITEMOE_NAMES),
+        packed=_GRANITEMOE_PACKED,
+        preserve_source_layout=True,
     ),
     DecoderFamily(
         ("mixtral",),
