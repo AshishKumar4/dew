@@ -43,7 +43,15 @@ from dew.registry import models, objectives, trainings
 from dew.sampling.solvers import Consistency
 
 from .few_step import SMOOTH_TIME_SCALE
-from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, Training, _own_loss, teacher_variables
+from .objective import (
+    FAKE_SCORE,
+    TEACHER,
+    DiffusionObjective,
+    Training,
+    _own_loss,
+    _unadapted,
+    teacher_variables,
+)
 
 if TYPE_CHECKING:
     from .config import DiffusionRunConfig
@@ -318,6 +326,10 @@ class ConsistencyDistillationObjective(DiffusionObjective):
     sCM's loss differentiates the student with respect to time, so the
     student's time embedding must be smooth in time. A run config sets
     `simple_dit(time_scale=0.002)` for this, in place of the default 16.
+
+    The teacher and the fake score run through the student's model, so a
+    LoRA-adapted student, whose model asks every tree for its factors, is
+    refused.
     """
 
     def __init__(
@@ -336,6 +348,7 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
         _own_loss("rCM", kwargs)
+        _unadapted("rCM", model, "teacher and fake score")
         kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)

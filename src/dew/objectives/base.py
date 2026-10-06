@@ -357,6 +357,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
     _ema_is_reference: ClassVar[bool] = False
+    # The name an objective that trains other networks beside its model nests
+    # the model under in every collection, as PPO nests its policy beside the
+    # critic; None when the saved tree is the model's.
+    _model_part: ClassVar[str | None] = None
     artifact: type | None = None
     """The artifact type `evaluate` returns, or None when it returns nothing."""
     shown: Mapping[str, Shown] = {}
@@ -562,6 +566,26 @@ class Objective(ABC, Generic[Loss, Effects]):
         if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.variables
         return state.averaged
+
+    @classmethod
+    def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
+                         mesh: MeshSpec | None = None, layout: Layout | None = None,
+                         param_dtype: DTypeLike | None = None,
+                         parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))
+                         ) -> Variables:
+        """Return the model's variables from a run of this objective, as every run loader reads them.
+
+        The arguments are `Checkpoints.variables`'. An objective whose average
+        is its frozen reference gives the trained weights whatever `ema` asks,
+        and one that nests the model beside other networks gives the model's
+        own part, its trained and frozen collections together.
+        """
+        from dew.checkpoints import Checkpoints
+
+        variables = Checkpoints(directory).variables(
+            step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
+            param_dtype=param_dtype, parameter_roots=parameter_roots)
+        return variables if cls._model_part is None else part(variables, cls._model_part)
 
     def inference_record(self) -> JSON:
         """Return the registered model and task settings that let a saved step be rebuilt.

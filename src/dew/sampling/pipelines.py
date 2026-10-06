@@ -247,7 +247,6 @@ class TextToImage:
         `param_dtype` sets the dtype the parameters are stored in; None keeps
         the checkpoint's dtypes exactly.
         """
-        from dew.checkpoints import Checkpoints
         from dew.config import ModelConfig
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
@@ -272,9 +271,8 @@ class TextToImage:
                 for keyword, condition in conditions.items()}}
             if autoencoder_record is not None:
                 autoencoder_record = _computing(autoencoder_record, compute)
-        averaged = False if objectives[text(record['objective'], 'objective')]._ema_is_reference else ema
-        params = Checkpoints(directory).variables(
-            ema=averaged, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
+        params = objectives[text(record['objective'], 'objective')]._saved_variables(
+            directory, ema=ema, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
             parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
         inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
         end_to_end = record.get('end_to_end')

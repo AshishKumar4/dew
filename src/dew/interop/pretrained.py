@@ -348,7 +348,6 @@ class Pretrained:
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None) -> Self:
         """Return a trained run's selected checkpoint, rebuilt from the run's own inference record."""
-        from dew.checkpoints import Checkpoints
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
         from dew.records import record, text
@@ -357,8 +356,7 @@ class Pretrained:
         model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         model = model_config.build()
         kind = text(declaration['objective'], 'objective')
-        averaged = False if objectives[kind]._ema_is_reference else ema
-        variables = Checkpoints(str(directory)).variables(step=step, ema=averaged)
+        variables = objectives[kind]._saved_variables(str(directory), step=step, ema=ema)
         # The run's policy and budget, in the format the export's readers read.
         sampling = declaration.get('sampling')
         budget = declaration.get('sample_tokens')

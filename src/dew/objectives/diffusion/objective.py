@@ -77,6 +77,16 @@ LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
 """What trains beside the model under `params` and the model never reads."""
 
 
+def _unadapted(name: str, model: nn.Module, held: str) -> None:
+    """Refuse an adapted `model` for an objective that applies `held`, whole
+    trees with no factors for the adapter's branch, through it."""
+    from dew.lora import _Adapted
+
+    if isinstance(type(model), _Adapted):
+        raise ValueError(f"{name} applies its {held} through the student's model, and a held tree holds no "
+                         f"factors for an adapter's branch: train {name} without a LoRA")
+
+
 def _own_loss(name: str, kwargs: dict) -> None:
     """Refuse the denoising loss's extras, which an objective with its own
     loss would leave unused."""
