@@ -44,7 +44,16 @@ decide.systemone({
 #   "urgent": {"type": "noul", "noul": 0.91}}, "usage": {"input_tokens": ..., "output_tokens": 0}}
 ```
 
-The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. Dew ships no HTTP server; `systemone` is the function such a server would call.
+The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, as Clef's does, for a backbone that reads them; `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
+
+Dew ships no HTTP server of its own, but `systemone` is all one needs. `examples/serve_decisions.py` serves it with Starlette in about forty lines, at Jev's `POST /v1/systemone`, with Jev's 422 for a request it refuses and an optional bearer key:
+
+```bash
+uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew"
+python examples/serve_decisions.py --model convaiinnovations/laya --port 8000
+```
+
+llama.cpp (release b11445) serves decision models natively at the same `POST /v1/systemone`, with images as `data:` URLs: its converter reads Laya's checkpoint layout (ModernBERT with Laya's head) and Clef's (a Qwen 3.5 backbone with `joint_head.safetensors`). vLLM (v0.31.0) does not: its pooling heads reduce a row to one vector and at most one linear layer, with no per-request positions or attention masks, so a decision head would have to be rewritten as a vLLM plugin.
 
 ## Confidence and calibration
 

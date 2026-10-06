@@ -1,6 +1,9 @@
 """`Decide`: a decision model answering requests, in Dew's types and in Jev's wire form."""
 
+import base64
+import binascii
 import functools
+import io
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
@@ -12,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from etils import epath
 from jax.typing import DTypeLike
+from PIL import Image
 
 from dew import records
 from dew.artifacts import Decisions
@@ -422,7 +426,8 @@ class Decide:
                       else Abstention(default=float(min_confidence)))
         return replace(self, calibration=replace(self.calibration, abstention=abstention))
 
-    def systemone(self, request: Mapping[str, object], *, details: bool = False) -> dict[str, JSON]:
+    def systemone(self, request: Mapping[str, object], *, details: bool = False,
+                  strict: bool = False) -> dict[str, JSON]:
         """Answer a Jev request body with a Jev response body.
 
         The request holds `state` and `questions` in Jev's wire format, and
@@ -433,8 +438,15 @@ class Decide:
         four places. With `details`, a Noul also reports its confidence, an answer
         reports whether it abstained when the calibration gates, and `usage` reports
         how much of the state it kept.
+
+        Beyond Jev's fields a request may carry `images`, as Clef's does: a list of
+        images, each a PIL image, encoded image bytes, or a base64 string, bare or as
+        a `data:` URL. `strict` answers as Jev's own endpoint does: the request's
+        extension fields are dropped and the response holds Jev's fields alone.
         """
-        unknown = set(request) - {"state", "questions", "model"}
+        if strict and details:
+            raise ValueError("strict answers hold Jev's fields alone, so they carry no details")
+        unknown = set(request) - {"state", "questions", "model", *EXTENSIONS}
         if unknown:
             raise ValueError(f"a request holds state, questions and model, not {sorted(unknown)}")
         if "state" not in request:
@@ -443,6 +455,8 @@ class Decide:
                      for name, wire in record(request.get("questions"), "questions").items()}
         if not questions:
             raise ValueError("a request needs at least one question")
+        if not strict and decoded_images(request.get("images")):
+            raise ValueError("images need a backbone with a vision encoder, which this task does not have")
         answers, usage = self.batch([(json_value(request["state"], "state"), questions)])[0]
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
@@ -453,6 +467,46 @@ class Decide:
                 "answers": {name: _wire(questions[name], answer, details=details, gated=gated)
                             for name, answer in answers.items()},
                 "usage": reported}
+
+
+EXTENSIONS = ("images",)
+"""The request fields `Decide.systemone` reads beyond Jev's, which `strict` drops."""
+
+
+def decoded_images(images: object) -> list[Image.Image]:
+    """The images of a request's `images` field, None or a list of PIL images,
+    encoded image bytes, or base64 strings, bare or as `data:` URLs."""
+    if images is None:
+        return []
+    if not isinstance(images, list):
+        raise ValueError("a request's images are a list")
+    decoded = []
+    for index, image in enumerate(images):
+        match image:
+            case Image.Image():
+                decoded.append(image)
+            case bytes():
+                decoded.append(_opened(image, index))
+            case str():
+                payload = image.split(",", 1)[1] if image.startswith("data:") else image
+                try:
+                    raw = base64.b64decode(payload, validate=True)
+                except binascii.Error as error:
+                    raise ValueError(f"images[{index}] is not base64: {error}") from error
+                decoded.append(_opened(raw, index))
+            case _:
+                raise ValueError(f"images[{index}] is a PIL image, image bytes or a base64 string, "
+                                 f"not {type(image).__name__}")
+    return decoded
+
+
+def _opened(raw: bytes, index: int) -> Image.Image:
+    try:
+        image = Image.open(io.BytesIO(raw))
+        image.load()
+    except (OSError, Image.DecompressionBombError) as error:
+        raise ValueError(f"images[{index}] is not an image Pillow can read: {error}") from error
+    return image
 
 
 def measured[Totals](metric: Metric[Totals], decisions: Decisions) -> float:
