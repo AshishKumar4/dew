@@ -61,7 +61,8 @@ What lands in tests/fixtures/hf:
   weights in fp32, which the network test compares against.
 - One directory per released config the translation is tested on
   (gemma3-1b, gemma-2b, gemma-2-2b, mistral-7b-v0.3, mixtral-8x7b,
-  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b, llada-8b, dream-7b):
+  qwen2-0.5b, qwen3-30b-a3b, olmo-3-7b, llama-3.1-8b, llada-8b, dream-7b,
+  and kimi-k3-dspark, the speculative drafter the qwen3 family refuses):
   config.json and the repo it came from in source.json, no weights. Google's
   and Meta's gated repos come from unsloth's mirrors, minus the mirror's marker keys.
 """
@@ -101,6 +102,8 @@ from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
 from transformers.models.llama4.modeling_llama4 import (
     Llama4MultiModalProjector, Llama4VisionModel,
 )
+from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
+from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
     Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig,
 )
@@ -122,6 +125,10 @@ PROMPT = (
 )
 PROMPT_TOKENS = 48
 TOP_K = 32
+NEMOTRON_H_CONFIGS = (
+    ("nemotron-h-4b", "nvidia/NVIDIA-Nemotron-3-Nano-4B-BF16", "dfaf35de3e30f1867dd8dbc38a7fc9fb52d3914f"),
+    ("nemotron-h-30b-a3b", "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-BF16", "bf77c3174f68ad409e1c2aa60daeb46e32d1c606"),
+)
 
 
 def tiny_qwen3() -> Qwen3ForCausalLM:
@@ -132,6 +139,40 @@ def tiny_qwen3() -> Qwen3ForCausalLM:
         rms_norm_eps=1e-6, attention_bias=False, hidden_act="silu"))
     torch.manual_seed(0)
     return Qwen3ForCausalLM(config)
+
+
+def write_nemotron_h() -> None:
+    """Two grouped SSD blocks, two ReLU² blocks and positionless GQA.
+
+    Four-token chunks cross two boundaries on the twelve-token probe. The
+    dt floor is active, the SSD projections have biases, and expand does
+    not determine the inner width. Float64 widens the reference's explicit
+    fp32 casts in the SSD, norms, softmax and head as well as its parameters.
+    """
+    from diffusers_wan_reference import float64
+    import transformers
+
+    torch.manual_seed(0)
+    model = NemotronHForCausalLM(NemotronHConfig(
+        vocab_size=64, hidden_size=16,
+        layers_block_type=["linear_attention", "mlp", "full_attention", "linear_attention", "mlp"],
+        num_attention_heads=4, num_key_value_heads=2, head_dim=8, intermediate_size=32,
+        mamba_num_heads=4, mamba_head_dim=8, ssm_state_size=4, n_groups=2,
+        conv_kernel=4, chunk_size=4, time_step_min=0.7, expand=3, use_bias=True,
+        mlp_hidden_act="relu2", layer_norm_epsilon=3e-5, max_position_embeddings=64,
+        tie_word_embeddings=False, use_mamba_kernels=False))
+    write_tiny("nemotron-h-tiny", model, seed=2024)
+    directory = FIXTURES / "nemotron-h-tiny"
+    ids = torch.from_numpy(np.load(directory / "input_ids.npy")).long()
+    with float64(), torch.no_grad():
+        truth = model.double()(input_ids=ids, use_cache=False).logits.double().numpy()
+    np.save(directory / "logits_f64.npy", truth)
+    (directory / "source.json").write_text(json.dumps({
+        "transformers": {"version": transformers.__version__,
+                         "revision": "93c8b7b485963a10800c91f55304db6be211c2bd"},
+        "seed": 2024,
+    }, indent=1) + "\n")
+    (directory / "model.safetensors").chmod(0o644)
 
 
 def tiny_llama() -> LlamaForCausalLM:
@@ -1063,7 +1104,7 @@ def write_real_reference(directory: Path) -> None:
           f"top {TOP_K}, argmax[:8]={np.argmax(logits, axis=-1)[:8].tolist()}")
 
 
-def write_released_config(name: str, repo: str) -> None:
+def write_released_config(name: str, repo: str, revision: str | None = None) -> None:
     """The real config.json of a released checkpoint, and the repo it came
     from in source.json. Only the config is downloaded, never the weights.
 
@@ -1074,11 +1115,12 @@ def write_released_config(name: str, repo: str) -> None:
     """
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download(repo, "config.json")).read_text())
+    config = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
     for key in [key for key in config if key.startswith("unsloth")]:
         del config[key]
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    (directory / "source.json").write_text(json.dumps({"repo": repo}) + "\n")
+    source = {"repo": repo, **({"revision": revision} if revision is not None else {})}
+    (directory / "source.json").write_text(json.dumps(source) + "\n")
     layers = config.get('num_hidden_layers', config.get('n_layers', config.get('num_layers')))
     print(f"{directory / 'config.json'}: {repo}, "
           f"{layers} layers, {len(config)} fields")
@@ -1088,9 +1130,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-real", action="store_true",
                         help="only the tiny fixtures, no 1.5 GB download")
+    parser.add_argument("--nemotron-h-only", action="store_true",
+                        help="only the Nemotron-H tiny fixture and two pinned released configs")
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+    write_nemotron_h()
+    for name, repo, revision in NEMOTRON_H_CONFIGS:
+        write_released_config(name, repo, revision)
+    if args.nemotron_h_only:
+        return
     write_tiny("qwen3-tiny", tiny_qwen3())
     write_tiny("gemma3-tiny", tiny_gemma3())
     write_tiny("gemma-tiny", tiny_gemma())
@@ -1106,6 +1155,7 @@ def main() -> None:
     write_tiny("olmo3-yarn-tiny", tiny_olmo3_yarn())
     write_released_config("olmo-3-7b", "allenai/Olmo-3-1025-7B")
     write_released_config("qwen3-30b-a3b", "Qwen/Qwen3-30B-A3B")
+    write_released_config("kimi-k3-dspark", "RadixArk/Kimi-K3-DSpark")
     write_released_config("qwen2-0.5b", "Qwen/Qwen2-0.5B")
     write_released_config("mixtral-8x7b", "mistralai/Mixtral-8x7B-v0.1")
     write_released_config("mistral-7b-v0.3", "mistralai/Mistral-7B-v0.3")

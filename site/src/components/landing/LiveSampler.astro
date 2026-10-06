@@ -101,6 +101,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 		let compiled = false;
 		let running = false;
 		let stopping = false;
+		let failure: string | undefined;
 		let started = 0;
 		let ticker: number | undefined;
 		onKernelClose((message) => {
@@ -163,6 +164,10 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				}
 			}
 			if (stopping) return;
+			if (message.type === 'error' && message.ename === 'StalePage') {
+				failure = message.evalue;
+				return;
+			}
 			if (message.type === 'error') log.open = true;
 			if (message.type !== 'clear') log.hidden = false;
 			renderOutput(output, message);
@@ -178,6 +183,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			}
 			running = true;
 			stopping = false;
+			failure = undefined;
 			run.textContent = 'Stop';
 			output.replaceChildren();
 			log.hidden = true;
@@ -205,7 +211,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				untick();
 				if (stopping || done.status === 'aborted') show('idle', 'Stopped.');
 				else if (done.status === 'ok') show('done', `The cell ran in ${seconds()} s on the live kernel.`, 1);
-				else show('error', 'The cell stopped with an error; the kernel output below says why.');
+				else show('error', failure ?? 'The cell stopped with an error; the kernel output below says why.');
 			} catch (error) {
 				untick();
 				closeKernel();

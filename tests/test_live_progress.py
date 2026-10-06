@@ -10,9 +10,11 @@ task's own, and one report per solver step, then the decode.
 import importlib.util
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
+from huggingface_hub.errors import OfflineModeIsEnabled
 from test_inference import make_run
 
 from dew.sampling import DPMSolverMultistep, TextToImage
@@ -86,3 +88,23 @@ def test_a_text_model_reports_its_load_once_and_each_generation(progress, monkey
     assert loads == ["small"]
     assert reports == [{"stage": "load", "model": "small"}, {"stage": "generate", "first": True},
                        {"stage": "generate", "first": False}]
+
+
+def test_unavailable_old_revision_requests_reload(progress, monkeypatch):
+    monkeypatch.setattr(progress, "_show", lambda *_: None)
+    load = Mock(side_effect=[object(), OfflineModeIsEnabled("offline")])
+    models = progress.ReportingModels(load, lambda value: value)
+    models("model", revision="new")
+    with pytest.raises(progress.StalePage, match=r"This page was updated.*Reload") as caught:
+        models("model", revision="old")
+    assert caught.value._render_traceback_() == [str(caught.value)]
+    assert ("model", "old") not in models.loaded
+
+
+def test_unavailable_other_model_keeps_offline_error(progress, monkeypatch):
+    monkeypatch.setattr(progress, "_show", lambda *_: None)
+    error = OfflineModeIsEnabled("offline")
+    models = progress.ReportingModels(Mock(side_effect=error), lambda value: value)
+    with pytest.raises(OfflineModeIsEnabled) as caught:
+        models("other", revision="missing")
+    assert caught.value is error

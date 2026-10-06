@@ -230,13 +230,16 @@ class Shift(Objective):
 
     def inference_record(self):
         return {"objective": "shift"}
+
+    def pipeline(self, state, *, ema=None) -> Scalar:
+        return Scalar(float(self._pipeline_weights(state, ema)["params"]["w"]))
 '''
 
 
 def test_dew_pipeline_loads_a_plugin_objectives_saved_task(tmp_path):
     """A plugin objective declares its task the way Dew's do, and a run of
     it trained in one process loads as that task in another that has not
-    imported the plugin."""
+    imported the plugin, equal to the task `pipeline` returns in place."""
     _install(tmp_path, "toyplugin", PLUGIN_OBJECTIVE)
     run = tmp_path / "run"
     train = ("import jax, numpy as np, optax\n"
@@ -249,7 +252,7 @@ def test_dew_pipeline_loads_a_plugin_objectives_saved_task(tmp_path):
              f"                  checkpoints=Checkpoints({str(run)!r}))\n"
              "state = trainer.fit(data, steps=3, log_every=3, checkpoint_every=3)\n"
              "trainer.checkpoints.wait()\n"
-             "print(float(state.variables['params']['w']))\n")
+             "print(trainer.objective.pipeline(state).value)\n")
     trained = _run(tmp_path, train)
     assert trained.returncode == 0, trained.stderr[-2000:]
     load = ("import sys\n"

@@ -248,9 +248,10 @@ class DiffusionRunConfig(RunConfig):
     """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
 
     objective: str = "diffusion"
-    """The objective `build` returns: the name `mode` is registered under.
+    """The name of the objective `build` returns, which is the name `mode` is registered under.
 
-    It follows `mode`, so a saved record names what trained.
+    It is set from `mode` when the config is created, so a saved record names what
+    trained.
     """
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
@@ -294,14 +295,15 @@ class DiffusionRunConfig(RunConfig):
     unset.
     """
     mode: TrainingSpec = dataclasses.field(default_factory=Denoising)
-    """How the run trains: the denoising loss, or a loss of its own in its place.
+    """How the run trains, with the denoising loss or with another loss in its place.
 
-    `Denoising` is the denoising loss, with EDM2's learned weighting or
+    `Denoising` is the denoising loss, optionally with EDM2's learned weighting or
     representation alignment. `FlowGRPO`, `MeanFlowTraining`, `ShortcutTraining`,
     `ConsistencyDistillation`, `GuidanceDistillation` and `AdversarialDistillation`
-    train on their own losses. Each mode refuses a preset or guidance its loss
-    cannot train or sample with, and `objective` is the name it is registered
-    under. On the command line it is `mode:mean-flow-training --mode.omega 2`.
+    train on their own losses. Each mode refuses a preset or guidance that its loss
+    cannot train or sample with, and `objective` is set to the name the mode is
+    registered under. On the command line, pick one with
+    `mode:mean-flow-training --mode.omega 2`.
     """
     val_metrics: tuple[str, ...] = ("clip",)
     """Names in the metrics registry, scored on every validation pass.
@@ -478,10 +480,10 @@ class DiffusionRunConfig(RunConfig):
         return self.mode.objective(self, model, process, inputs, autoencoder=autoencoder, variables=variables)
 
     def rollout(self, objective: DiffusionObjective):
-        """Return the trainer's rollout for `objective`.
+        """Return the mode's rollout for `objective`, which the trainer runs.
 
-        That is the mode's: Flow-GRPO's rollout, or None for a loss that trains on
-        each batch as it comes.
+        `FlowGRPO` returns its rollout, and a mode whose loss trains on each batch as it
+        comes returns None.
         """
         return self.mode.rollout(objective)
 
