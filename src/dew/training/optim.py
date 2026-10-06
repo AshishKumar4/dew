@@ -21,7 +21,8 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import functools
-from collections.abc import Mapping, Sequence
+import inspect
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import jax
@@ -405,19 +406,40 @@ def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, *,
-               nesterov: bool = False, decay: optax.GradientTransformation | None = None):
-    """optax.adam's chain (optax.adamw's with `decay`) over bf16 moments."""
-    return optax.chain(
-        bf16_moments(b1, b2, eps, eps_root, nesterov),
-        *([] if decay is None else [decay]),
-        optax.scale_by_learning_rate(learning_rate))
+def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float) -> optax.GradientTransformation:
+    """`solver` after torch's `Adam(weight_decay=...)`, which adds
+    `weight_decay * param` to the gradient before the moments read it.
+
+    That is an L2 penalty on the loss, so the moments rescale the decay with
+    the rest of the gradient, where adamw decays the weights after
+    (torch/optim/adam.py, `_single_tensor_adam`). A zero decay returns
+    `solver` itself, so its state keeps optax's layout.
+    """
+    if not weight_decay:
+        return solver
+    return optax.chain(optax.add_decayed_weights(weight_decay), solver)
+
+
+def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
+          *, nesterov: bool = False):
+    """optax.adam, with torch's coupled weight decay (`_coupled_decay`)."""
+    return _coupled_decay(optax.adam(learning_rate, b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
+                         weight_decay)
+
+
+def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, *,
+               nesterov: bool = False):
+    """optax.adam's chain over bf16 moments, with torch's coupled weight decay (`_coupled_decay`)."""
+    return _coupled_decay(optax.chain(bf16_moments(b1, b2, eps, eps_root, nesterov),
+                                     optax.scale_by_learning_rate(learning_rate)), weight_decay)
 
 
 def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
                 weight_decay=1e-4, mask=None, *, nesterov: bool = False):
-    return _bf16_adam(learning_rate, b1, b2, eps, eps_root, nesterov=nesterov,
-                      decay=optax.add_decayed_weights(weight_decay, mask))
+    """optax.adamw's chain over bf16 moments."""
+    return optax.chain(bf16_moments(b1, b2, eps, eps_root, nesterov),
+                       optax.add_decayed_weights(weight_decay, mask),
+                       optax.scale_by_learning_rate(learning_rate))
 
 
 class PowerProfilesState(NamedTuple):
@@ -476,7 +498,7 @@ BF16_STATE_OPTIMIZERS = {'adam': _bf16_adam, 'adamw': _bf16_adamw}
 
 
 OPTIMIZER_MAP = {
-    'adam': optax.adam,
+    'adam': _adam,
     'adamw': optax.adamw,
     'lamb': optax.lamb,
     'muon': _muon_groups,
@@ -484,25 +506,62 @@ OPTIMIZER_MAP = {
 }
 
 
+def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
+    """Shorten each update so that the parameter it moves lands within `[lower, upper]`.
+
+    torch recipes clamp parameters in place after `optimizer.step()`, as
+    DCLS's `clamp_parameters` does its kernel positions. Written as an
+    update, `clip(param + update) - param`, the clamp runs inside the
+    optimizer chain, so a group's projection applies to its parameters alone
+    and lands on the same values to within one rounding of the subtraction.
+    optax's `projections.projection_box` clamps a parameter tree outside the
+    chain, where it would reach every group at once.
+    """
+    if not lower < upper:
+        raise ValueError(f"the bounds run from a lower to a higher value, got [{lower}, {upper}]")
+
+    def init_fn(params) -> optax.EmptyState:
+        del params
+        return optax.EmptyState()
+
+    def update_fn(updates, state, params=None):
+        if params is None:
+            raise ValueError("a bounded group reads the parameters, so its update needs them")
+        kept = jax.tree.map(lambda update, param: jnp.clip(param + update, lower, upper) - param,
+                            updates, params)
+        return kept, state
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
 @dataclasses.dataclass(frozen=True)
 class ParamGroup:
     """A group of parameters the optimizer updates with their own learning
-    rate and weight decay.
+    rate, momentum, weight decay and bounds.
 
     `patterns` are `fnmatch` patterns matched against a parameter's path,
     which is its dict keys joined by '/' (`layers_3/self_attn/q_proj/kernel`);
     `*` also matches '/'. A parameter belongs to the first group in
     `OptimConfig.param_groups` that has a pattern it matches, as in
     lm-engine, and a parameter that matches no group raises `ValueError`.
-    The group's learning rate is the schedule's rate times
-    `learning_rate_multiplier`. `weight_decay` replaces the config's weight
-    decay; None keeps it.
+
+    The group's learning rate is its own `schedule` (the config's rate when
+    None) times `learning_rate_multiplier`. `b1` schedules the first-moment
+    decay of adam, adamw and lamb, as torch's `OneCycleLR(cycle_momentum=True)`
+    cycles Adam's beta1; None keeps the optimizer's own. `weight_decay`
+    replaces the config's weight decay; None keeps it. For 'adam' that decay
+    is torch's coupled L2 (`_coupled_decay`), and for 'adamw' the decoupled
+    one. `bounds` clamps each parameter into `[lower, upper]` after every
+    update (`_keep_within`).
     """
 
     name: str
     patterns: tuple[str, ...]
     learning_rate_multiplier: float = 1.0
     weight_decay: float | None = None
+    schedule: ScheduleBase | None = None
+    b1: ScheduleBase | None = None
+    bounds: tuple[float, float] | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "patterns", tuple(self.patterns))
@@ -512,6 +571,39 @@ class ParamGroup:
             raise ValueError(
                 f"param group {self.name!r} scales the learning rate by a positive "
                 f"number, got {self.learning_rate_multiplier}")
+        if self.bounds is not None:
+            lower, upper = self.bounds
+            object.__setattr__(self, "bounds", (lower, upper))
+            if not lower < upper:
+                raise ValueError(f"param group {self.name!r} bounds its parameters from a lower to a "
+                                 f"higher value, got {self.bounds}")
+
+    def solver(self, make: Callable[..., optax.GradientTransformation],
+               learning_rate: float | optax.Schedule, steps: int,
+               opts: Mapping[str, object]) -> optax.GradientTransformation:
+        """Build this group's optimizer: `make(learning_rate, **opts)` with the
+        group's `b1` schedule and `bounds`, over a run of `steps` updates.
+
+        A `b1` schedule replaces any `b1` in `opts`, and needs a `make` that
+        names a `b1` argument (adam, adamw, lamb; not muon).
+        """
+        if self.b1 is None:
+            solver = make(learning_rate, **opts)
+        else:
+            parameters = inspect.signature(make).parameters
+            if 'b1' not in parameters:
+                raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
+                                 f"takes no b1 (adam, adamw and lamb do)")
+            fixed = {name: value for name, value in opts.items() if name != 'b1'}
+            # optax rebuilds the optimizer each update from the values it
+            # injects. Only the rate and b1 vary; every other argument, the
+            # defaults included, stays the Python value the factory branches on.
+            static = tuple(name for name in parameters if name not in ('learning_rate', 'b1'))
+            solver = optax.inject_hyperparams(make, static_args=static)(
+                learning_rate, b1=self.b1.schedule(steps), **fixed)
+        if self.bounds is not None:
+            solver = optax.chain(solver, _keep_within(*self.bounds))
+        return solver
 
     @classmethod
     def mup(cls, width_multiplier: float) -> tuple[ParamGroup, ...]:
@@ -603,17 +695,43 @@ def linear_schedule(peak: float, warmup_steps: int, decay_start: int | None,
     ], [warmup_steps, start])
 
 
+@dataclasses.dataclass(frozen=True)
 class ScheduleBase:
-    """The base of the learning-rate schedule records, each of which holds its
-    own fields and builds an optax schedule.
+    """The base of the schedule records, each of which holds its own fields
+    and builds an optax schedule.
 
     Subclasses are registered under `dew.registry.schedules`, so a run's
     record names the schedule's kind and holds only the fields that schedule
-    reads.
+    reads. A subclass builds its values in `values`; `schedule` reads them.
     """
 
+    every: int = dataclasses.field(default=1, kw_only=True)
+    """The updates each of the schedule's own steps lasts.
+
+    torch recipes step a scheduler once an epoch, and with `every` set to the
+    updates of an epoch this one holds each value through an epoch as torch's
+    does. A run of `steps` updates is then `steps // every` of the
+    schedule's own steps, and every field that counts steps (`warmup_steps`,
+    `decay_steps`) counts those.
+    """
+
+    def __post_init__(self):
+        if self.every < 1:
+            raise ValueError(f"a schedule advances once every 1 or more updates, not {self.every}")
+
     def schedule(self, steps: int) -> optax.Schedule:
-        """Return the learning rate at each update of a run of `steps` updates, as an optax schedule."""
+        """Return the value at each update of a run of `steps` updates, as an optax schedule."""
+        if self.every == 1:
+            return self.values(steps)
+        own = steps // self.every
+        if own < 1:
+            raise ValueError(f"a run of {steps} updates never advances a schedule that steps once "
+                             f"every {self.every}")
+        values, every = self.values(own), self.every
+        return lambda count: values(jnp.asarray(count) // every)
+
+    def values(self, steps: int) -> optax.Schedule:
+        """Return the value at each of the schedule's own steps, over `steps` of them."""
         raise NotImplementedError
 
 
@@ -632,7 +750,7 @@ class Cosine(ScheduleBase):
     init: float = 0.0
     decay_steps: int | None = None
 
-    def schedule(self, steps: int) -> optax.Schedule:
+    def values(self, steps: int) -> optax.Schedule:
         return optax.warmup_cosine_decay_schedule(
             init_value=self.init, peak_value=self.peak, warmup_steps=self.warmup_steps,
             decay_steps=steps if self.decay_steps is None else self.decay_steps,
@@ -667,7 +785,7 @@ class Power(ScheduleBase):
     c: float = 1.0
     tail: PowerTail | None = None
 
-    def schedule(self, steps: int) -> optax.Schedule:
+    def values(self, steps: int) -> optax.Schedule:
         tail = self.tail
         if tail is None:
             return power_schedule(self.peak, self.warmup_steps, self.a, self.b, self.c)
@@ -692,10 +810,85 @@ class Linear(ScheduleBase):
     decay_steps: int | None = None
     end: float = 0.0
 
-    def schedule(self, steps: int) -> optax.Schedule:
+    def values(self, steps: int) -> optax.Schedule:
         return linear_schedule(self.peak, self.warmup_steps, self.decay_start,
                                steps if self.decay_steps is None else self.decay_steps,
                                end_value=self.end)
+
+
+@schedules("one_cycle")
+@dataclasses.dataclass(frozen=True)
+class OneCycle(ScheduleBase):
+    """torch's `OneCycleLR` with its default two phases and cosine annealing.
+
+    The value follows a half cosine from `init` to `peak` at step
+    `warmup_fraction * steps - 1`, then another to `end` at the run's last
+    step, `steps - 1`, and holds `end` after it, where torch raises. `init`
+    is torch's `max_lr / div_factor` (`peak / 25` when None) and `end` its
+    `init / final_div_factor` (`init / 1e4` when None). Adam's momentum cycle
+    under `cycle_momentum=True` is `OneCycle(peak=0.85, init=0.95, end=0.95)`
+    as a group's `b1`.
+
+    optax's `cosine_onecycle_schedule` places its phase boundaries at
+    `pct_start * steps` and `steps`, one step later than torch's
+    (torch/optim/lr_scheduler.py, `OneCycleLR.__init__`), so its rate peaks
+    one step late and it cannot reproduce a torch run.
+    """
+
+    peak: float
+    init: float | None = None
+    end: float | None = None
+    warmup_fraction: float = 0.3
+
+    def values(self, steps: int) -> optax.Schedule:
+        init = self.peak / 25 if self.init is None else self.init
+        end = init / 1e4 if self.end is None else self.end
+        # torch's phase ends, kept as floats as torch keeps them.
+        rise, last = self.warmup_fraction * steps - 1, steps - 1
+        if not 0 < rise < last:
+            raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
+                             f"{self.warmup_fraction} has no rise or no fall; give it more steps")
+
+        def anneal(start: float, stop: float, done: jax.Array) -> jax.Array:
+            return stop + (start - stop) / 2 * (jnp.cos(jnp.pi * done) + 1)
+
+        def value(count) -> jax.Array:
+            step = jnp.minimum(jnp.asarray(count, jnp.float32), last)
+            return jnp.where(step <= rise, anneal(init, self.peak, step / rise),
+                             anneal(self.peak, end, (step - rise) / (last - rise)))
+
+        return value
+
+
+@schedules("exponential")
+@dataclasses.dataclass(frozen=True)
+class Exponential(ScheduleBase):
+    """A geometric decay from `offset + init` to `offset + end` over
+    `decay_steps` steps (the run's when None), then constant.
+
+    Up to `decay_steps`, the value at step t is
+    `offset + init * (end / init) ** (t / decay_steps)`. That is torch's
+    `ExponentialLR` with `gamma = (end / init) ** (1 / decay_steps)`, stepped
+    `decay_steps` times and then no more, plus `offset`. It is
+    `optax.exponential_decay` with `end` as its bound. SNN-delays anneals
+    DCLS's kernel width this way, the raw width decaying and a constant
+    added to it.
+    """
+
+    init: float
+    end: float
+    decay_steps: int | None = None
+    offset: float = 0.0
+
+    def values(self, steps: int) -> optax.Schedule:
+        span = steps if self.decay_steps is None else self.decay_steps
+        if span <= 0 or self.init <= 0 or self.end <= 0:
+            raise ValueError(f"an exponential decay needs positive steps, init and end, got "
+                             f"{span}, {self.init} and {self.end}")
+        decay = optax.exponential_decay(self.init, span, self.end / self.init, end_value=self.end)
+        if not self.offset:
+            return decay
+        return lambda count: self.offset + decay(count)
 
 
 def learning_rate_schedule(config: OptimConfig, steps: int):
@@ -704,4 +897,5 @@ def learning_rate_schedule(config: OptimConfig, steps: int):
     return config.learning_rate if config.schedule is None else config.schedule.schedule(steps)
 
 
-__all__ = ["Cosine", "Linear", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "ScheduleBase"]
+__all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",
+           "PowerTail", "ScheduleBase"]

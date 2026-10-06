@@ -1061,6 +1061,23 @@ def test_a_distribution_whose_requirement_names_a_url_is_refused(tmp_path, monke
 
 
 # ---------------------------------------------------------------------------
+# tools/torch_optim_reference.py
+# ---------------------------------------------------------------------------
+
+def test_torch_optim_fixture_is_what_the_generator_writes(tmp_path):
+    """The stored gradients and initial parameters exactly; torch's schedule
+    values and Adam steps within float32 rounding of a parameter of order 1."""
+    pytest.importorskip("torch")
+    load("torch_optim_reference").main(["--out", str(tmp_path)])
+    committed = FIXTURES / "torch_optim"
+    assert_fixture_files(tmp_path, committed, "torch_optim_reference")
+    with np.load(committed / "reference.npz") as stored:
+        computed = [name for name in stored.files if not name.startswith(("initial/", "grads/"))]
+    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz",
+                          dict.fromkeys(computed, 1e-6))
+
+
+# ---------------------------------------------------------------------------
 # tools/lint_slop.py
 # ---------------------------------------------------------------------------
 
