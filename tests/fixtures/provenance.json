@@ -1,5 +1,13 @@
 {
  "references": {
+  "laya/tiny/logits.npz": {
+   "tool": "tools/laya_reference.py",
+   "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "laya/real/logits.npz": {
+   "tool": "tools/laya_reference.py",
+   "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
   "hf/diffusion-gemma-window-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -3401,6 +3409,11 @@
   }
  },
  "inputs": [
+  {
+   "tool": "tools/laya_reference.py",
+   "what": "a toy Laya checkpoint in Laya's own layout, its encoder, head and tokenizer",
+   "files": ["laya/tiny/model.safetensors"]
+  },
   {
    "tool": "tools/hf_reference.py",
    "what": "the windowed DiffusionGemma weights, prompt and canvas its references read",
