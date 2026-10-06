@@ -20,7 +20,7 @@ from flax import linen as nn
 
 from dew import Checkpoints, Trainer
 from dew.data import Dataset
-from dew.objectives.base import Aux, Ratio, Objective
+from dew.objectives.base import Aux, Objective
 
 
 class Regression(Objective):
@@ -33,7 +33,7 @@ class Regression(Objective):
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
         errors = (prediction - batch["y"]) ** 2
-        return Ratio(jnp.sum(errors), jnp.asarray(errors.size)), Aux(metrics={})
+        return self.row_mean(errors, batch), Aux(metrics={})
 
 
 class Batches:

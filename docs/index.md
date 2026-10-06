@@ -12,7 +12,7 @@ import optax
 from flax import linen as nn
 
 from dew import Dataset, Trainer
-from dew.objectives.base import Aux, Ratio, Objective
+from dew.objectives.base import Aux, Objective
 
 
 class Regression(Objective):
@@ -24,7 +24,7 @@ class Regression(Objective):
 
     def loss(self, variables, batch, step):
         errors = (self.model.apply(variables, batch["x"]) - batch["y"]) ** 2
-        return Ratio(errors.sum(), jnp.asarray(errors.size)), Aux(metrics={})
+        return self.row_mean(errors, batch), Aux(metrics={})
 
 
 x = np.linspace(-1, 1, 32, dtype=np.float32).reshape(32, 1)

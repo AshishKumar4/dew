@@ -179,6 +179,75 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
                                   np.asarray(objective.model.apply(state.variables, tokens)))
 
 
+@pytest.mark.parametrize("kind", ["dpo", "ppo"])
+def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_path):
+    """A LoRA run of an objective whose average is its frozen reference
+    (DPO), or that nests the policy beside a critic (PPO), loads the policy
+    it trained: the adapters `Adapter.from_run` and `Pretrained.from_run`
+    rebuild write the files the trained adapter writes, byte for byte, and
+    the loaded task and bundle hold the base draw bitwise under `frozen`
+    and compute what the trained policy computes."""
+    from dew.inference import TextGeneration
+    from dew.interop import Pretrained
+    from dew.lora import Adapter, LoRA
+    from dew.objectives.base import FROZEN, part
+    from dew.objectives.rl import DPOObjective, PPOObjective, ValueHead
+
+    base = model()
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
+        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+    count = max(2, jax.device_count())
+    if kind == "dpo":
+        objective = DPOObjective(adapter.model, seq_len=2, variables=adapter.variables)
+        pairs = np.tile(np.asarray([[[1, 2, 3], [1, 2, 4]]], np.int32), (count, 1, 1))
+        batch = {"input_ids": pairs, "completion_mask": np.ones_like(pairs, np.float32)}
+    else:
+        objective = PPOObjective(adapter.model, seq_len=2, critic=ValueHead(base.clone()), beta=0.1,
+                                 variables=adapter.variables)
+    trainer = Trainer(objective, optax.sgd(1.0), key=0)
+    if kind == "ppo":
+        # One packed chain per row, its last id sampled.
+        ids = np.tile(np.asarray([[1, 2, 3]], np.int32), (count, 1))
+        mask = np.tile(np.asarray([[0, 0, 1]], np.float32), (count, 1))
+        batch = {"input_ids": ids, "text_segment_ids": np.ones_like(ids),
+                 "text_positions": np.tile(np.arange(3, dtype=np.int32), (count, 1)),
+                 "response_mask": mask, "advantages": mask}
+        before = trainer.initial_state()
+        batch["old_log_probs"] = np.asarray(objective.actor.packed_log_probs(
+            part(before.variables, "policy"), batch))
+        batch["behavior_log_probs"] = batch["old_log_probs"]
+        values = np.asarray(objective.values(before.variables, batch))
+        batch.update(old_values=values, returns=values + mask)
+    data = Dataset(train=lambda partition: iter([batch, batch]), val=None, records=2 * count, batch=count)
+    state = trainer.fit(data, steps=2, log_every=100, checkpoint_every=None)
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(int(state.step), state, None, artifact=objective.inference_record())
+    checkpoints.wait()
+    trained = part(state.variables, "policy") if kind == "ppo" else state.variables
+    assert any(np.abs(np.asarray(leaf)).max() > 0 for path, leaf in jax.tree_util.tree_leaves_with_path(
+        trained["params"]) if "lora_B" in jax.tree_util.keystr(path))
+    adapter.save(trained, tmp_path / "in-process")
+    rebuilt = Adapter.from_run(tmp_path / "run")
+    rebuilt.save(rebuilt.variables, tmp_path / "from-run")
+    bundle = Pretrained.from_run(tmp_path / "run")
+    assert bundle.adapter is not None
+    bundle.adapter.save(bundle.variables, tmp_path / "bundle")
+    for name in ("adapter_config.json", "adapter_model.safetensors"):
+        written = (tmp_path / "in-process" / name).read_bytes()
+        assert (tmp_path / "from-run" / name).read_bytes() == written
+        assert (tmp_path / "bundle" / name).read_bytes() == written
+    tokens = jnp.arange(1, 9)[None, :]
+    expected = np.asarray(adapter.model.apply(trained, tokens))
+    task = TextGeneration.from_run(str(tmp_path / "run"))
+    for loaded in (rebuilt, bundle):
+        for got, want in zip(jax.tree.leaves(loaded.variables[FROZEN]),
+                             jax.tree.leaves(adapter.variables[FROZEN]), strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    # The task folds `frozen` back into `params` as it binds.
+    for loaded in (rebuilt, bundle, task):
+        np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, tokens)), expected)
+
+
 def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
     import flax.linen as nn
 
