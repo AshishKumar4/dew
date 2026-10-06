@@ -165,6 +165,31 @@ class Mixture:
             dtype=dtype, precision=precision)
 
 
+UNGATED = ('gelu', 'gelu_exact', 'relu', 'relu2')
+"""The activations an ungated feed-forward takes, by `ungated_activation`'s names."""
+
+
+def ungated_activation(activation: str, x: jax.Array) -> jax.Array:
+    """`x` through one of the `UNGATED` activations, in `x`'s dtype.
+
+    `gelu` is the tanh form and `gelu_exact` the erf form, both computed in at
+    least fp32. The erf form uses Torch's `1 + erf` arithmetic, which the
+    converted checkpoints were trained with; `jax.nn.gelu(approximate=False)`
+    goes through erfc and rounds the negative tail differently. `relu2` is the
+    squared relu.
+    """
+    if activation == 'relu':
+        return nn.relu(x)
+    if activation == 'relu2':
+        return jnp.square(nn.relu(x))
+    work = x.astype(at_least_fp32(x.dtype))
+    if activation == 'gelu_exact':
+        return (.5 * work * (1 + jax.lax.erf(work * math.sqrt(.5)))).astype(x.dtype)
+    if activation == 'gelu':
+        return nn.gelu(work).astype(x.dtype)
+    raise ValueError(f"the ungated activations are {UNGATED}, got {activation!r}")
+
+
 @logical_axes({
     ("gate_proj",): ("embed", "mlp"),
     ("up_proj",): ("embed", "mlp"),
@@ -176,11 +201,8 @@ class GatedMLP(nn.Module):
     `activation` picks act: swiglu is silu, geglu is the tanh approximation of
     gelu (HF's gelu_pytorch_tanh), and geglu_exact is the erf form (HF's gelu).
     A `Situ` is Kimi K3's SiTU, which transforms both halves
-    (`dew.nn.moe.gated_product`). `gelu`, `gelu_exact`, `relu` and `relu2` build the
-    ungated MLP with two projections. The ungated `gelu_exact` uses Torch's
-    `1 + erf` arithmetic, which the converted checkpoints were trained with;
-    `jax.nn.gelu(approximate=False)` goes through erfc and rounds the negative
-    tail differently.
+    (`dew.nn.moe.gated_product`). The `UNGATED` activations build the ungated
+    MLP with two projections (`ungated_activation`).
 
     `activation_sparsity` is Gemma 3n's gaussian top-k on the gate
     (`dew.nn.gemma3n.gaussian_topk`). `swiglu_limit` is the clamp that
@@ -203,7 +225,7 @@ class GatedMLP(nn.Module):
         dense = functools.partial(
             nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
-        if self.activation not in ('gelu', 'gelu_exact', 'relu', 'relu2'):
+        if self.activation not in UNGATED:
             if self.has_variable('params', 'gate_up_proj'):
                 self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
             else:
@@ -218,20 +240,9 @@ class GatedMLP(nn.Module):
     def __call__(self, x):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
-        if self.activation in ('gelu', 'gelu_exact', 'relu', 'relu2'):
+        if isinstance(self.activation, str) and self.activation in UNGATED:
             up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
-            if self.activation == 'relu':
-                hidden = nn.relu(up)
-            elif self.activation == 'relu2':
-                hidden = jnp.square(nn.relu(up))
-            elif self.activation == 'gelu_exact':
-                # Torch's GELU uses 1 + erf. Flax's erfc(-x) rounds its
-                # negative tail differently before this trained projection.
-                work = up.astype(at_least_fp32(up.dtype))
-                hidden = (.5 * work * (1 + jax.lax.erf(work * math.sqrt(.5)))).astype(up.dtype)
-            else:
-                hidden = nn.gelu(up.astype(at_least_fp32(up.dtype))).astype(up.dtype)
-            return checkpoint_name(self.down_proj(hidden), 'down_proj')
+            return checkpoint_name(self.down_proj(ungated_activation(self.activation, up)), 'down_proj')
         if self.has_variable('params', 'gate_up_proj'):
             gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
         else:
@@ -474,6 +485,7 @@ class DecoderBlock(nn.Module):
     engram_index: int | None = None
     prediction_slot: int | None = None  # records its streams' mean for DSpark
     prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_slot` records
+    attention_norm: bool = True  # False: the attention reads its input unnormed (ModernBERT's first block)
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
     dtype: Dtype | None = None
@@ -490,7 +502,7 @@ class DecoderBlock(nn.Module):
                 or self.altup is not None or self.residual_site is not None
                 or self.laurel_rank is not None or self.parallel is not None):
             raise ValueError('parallel_residual requires a plain pre-norm attention and feed-forward block')
-        if self.wiring.pre_norms:
+        if self.wiring.pre_norms and self.attention_norm:
             self.input_layernorm = norm(name='input_layernorm')
         self.self_attn = self.mixer(name='self_attn')
         if self.wiring.pre_norms and self.feedforward is not None and not self.wiring.shared_parallel_norm:
@@ -622,7 +634,7 @@ class DecoderBlock(nn.Module):
         """
         state = self._enter(x, train, attention_metadata)
         state, read, site = self._read(state, "attention")
-        normed = self.input_layernorm(read) if self.wiring.pre_norms else read
+        normed = self.input_layernorm(read) if self.wiring.pre_norms and self.attention_norm else read
         mixed = self._mix(
             normed, decode, positions, segment_ids, kv_store, attention_metadata, prediction_phase, train
         )

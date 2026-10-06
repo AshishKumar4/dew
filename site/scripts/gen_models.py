@@ -70,6 +70,7 @@ DECODERS = {
     "dream": ("Dream", "Diffusion language models"),
     "Dream": ("Dream", "Diffusion language models"),
     "diffusion_gemma_text": ("Diffusion Gemma", "Diffusion language models"),
+    "modernbert": ("ModernBERT", "Encoders"),
 }
 WRAPPERS = {
     "gemma3": ("Gemma 3", "Images"),

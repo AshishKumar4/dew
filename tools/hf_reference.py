@@ -422,6 +422,82 @@ def write_granitemoe() -> None:
                           '13fcb5a98001438bed01cf1ac4b423751dc4c2ea')
 
 
+MODERNBERT_CONFIGS = (
+    ('modernbert-base', 'answerdotai/ModernBERT-base', '8949b909ec900327062f0ebf497f51aef5e6f0c8',
+     'config.json'),
+    ('laya-encoder', 'convaiinnovations/laya', '7b928d828b7b0e022f929d9bd2e44165aa270148',
+     'encoder/config.json'),
+)
+
+
+def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
+    """ModernBertForMaskedLM's logits and ModernBertModel's states, fp32 and float64.
+
+    Four layers give the global, local, local, global pattern, and a local
+    span of 6 (three keys either side) is shorter than the 12-token probe, so
+    a window applied on one side only, or not at all, shows in the states.
+    Beside the plain rows: right-padded rows with their validity mask, and
+    rows packing two documents, whose reference is each document run alone
+    at positions from zero.
+    """
+    from diffusers_wan_reference import float64
+    from transformers import ModernBertConfig, ModernBertForMaskedLM
+
+    torch.manual_seed(0)
+    model = ModernBertForMaskedLM(ModernBertConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=24, num_hidden_layers=4,
+        num_attention_heads=2, global_attn_every_n_layers=3, local_attention=6,
+        global_rope_theta=160000.0, local_rope_theta=10000.0, norm_eps=3e-5,
+        max_position_embeddings=64, pad_token_id=0, bos_token_id=1, eos_token_id=2,
+        cls_token_id=1, sep_token_id=2))
+    model.config._attn_implementation = 'eager'
+    write_tiny(name, model)
+    directory = FIXTURES / name
+    ids = np.load(directory / 'input_ids.npy')
+    mask = np.ones_like(ids, bool)
+    mask[1, -3:] = False
+    padded = np.where(mask, ids, 0)
+    documents = np.where(np.arange(ids.shape[1]) < 5, 1, 2)[None].repeat(ids.shape[0], 0)
+    np.save(directory / 'padded_ids.npy', padded)
+    np.save(directory / 'attention_mask.npy', mask)
+    np.save(directory / 'segment_ids.npy', documents.astype(np.int32))
+
+    def states(dtype_scope):
+        with dtype_scope, torch.no_grad():
+            encoder = model.model
+            plain = encoder(torch.from_numpy(ids).long()).last_hidden_state
+            masked = encoder(torch.from_numpy(padded).long(),
+                             attention_mask=torch.from_numpy(mask)).last_hidden_state
+            packed = torch.cat([encoder(torch.from_numpy(ids[:, :5]).long()).last_hidden_state,
+                                encoder(torch.from_numpy(ids[:, 5:]).long()).last_hidden_state], dim=1)
+            logits = model(torch.from_numpy(ids).long()).logits
+        return {'hidden': plain, 'padded_hidden': masked, 'packed_hidden': packed, 'logits': logits}
+
+    import contextlib
+
+    model.eval()
+    for key, value in states(contextlib.nullcontext()).items():
+        np.save(directory / f'{key}.npy', value.float().numpy())
+    # The reference's own bf16 run, which a bf16 forward is held to, on a
+    # copy: a round trip through bf16 would round the float64 run's weights.
+    import copy
+
+    with torch.no_grad():
+        narrow = copy.deepcopy(model).to(torch.bfloat16)
+        np.save(directory / 'hidden_bf16.npy',
+                narrow.model(torch.from_numpy(ids).long()).last_hidden_state.float().numpy())
+    with float64():
+        model.double()
+        # The inverse frequencies are buffers built at construction, in float32.
+        rotary = model.model.rotary_emb
+        for layer_type in rotary.layer_types:
+            inverse, _ = rotary.compute_default_rope_parameters(model.config, layer_type=layer_type)
+            setattr(rotary, f'{layer_type}_inv_freq', inverse.double())
+        truths = states(contextlib.nullcontext())
+    for key, value in truths.items():
+        np.save(directory / f'{key}_f64.npy', value.double().numpy())
+
+
 def tiny_qwen3() -> Qwen3ForCausalLM:
     config = Qwen3Config.from_dict(dict(
         hidden_size=64, num_hidden_layers=2, num_attention_heads=4,
@@ -1357,6 +1433,66 @@ def write_diffusion_denoiser_tiny() -> None:
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
+def write_diffusion_window_tiny() -> None:
+    """One DiffusionGemma denoise step past its sliding window: a sliding then
+    a full layer at a window of 4, a prompt of 6 and a canvas of 6, so the
+    decoder's sliding layer reads only the last 3 cached prompt keys while
+    every canvas key reads every other (modeling_diffusion_gemma.py:1399-1401).
+    The fp32 and float64 reference logits, the latter for the float64 rule.
+    """
+    from diffusers_wan_reference import float64
+    from safetensors.torch import save_file
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
+        DiffusionGemmaConfig, DiffusionGemmaTextConfig,
+    )
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
+        DiffusionGemmaForBlockDiffusion,
+    )
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
+
+    fields = {**DIFFUSION_DENOISER_TEXT, "sliding_window": 4,
+              "layer_types": ["sliding_attention", "full_attention"]}
+    text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items() if key != "model_type"})
+    vision = Gemma4VisionConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1,
+        num_attention_heads=2, num_key_value_heads=2, head_dim=16, patch_size=8,
+        pooling_kernel_size=2, position_embedding_size=64)
+    torch.manual_seed(0)
+    model = DiffusionGemmaForBlockDiffusion(DiffusionGemmaConfig(
+        text_config=text, vision_config=vision, canvas_length=6, tie_word_embeddings=False))
+    state = model.state_dict()
+    for name in list(state):
+        if name.startswith("model.decoder.layers.") or name in (
+                "model.decoder.embed_tokens.weight", "model.decoder.norm.weight"):
+            state[name].copy_(state[name.replace("model.decoder.", "model.encoder.language_model.", 1)])
+    model.load_state_dict(state)
+    model = model.float().eval()
+    # The experts' loop, since the grouped matmul has no float64 kernel.
+    for module in model.modules():
+        if hasattr(module, "experts") and hasattr(module.experts, "config"):
+            module.experts.config._experts_implementation = "eager"
+    directory = FIXTURES / "diffusion-gemma-window-tiny"
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file({name: tensor for name, tensor in model.state_dict().items()
+               if name.startswith(("model.encoder.language_model.", "model.decoder.")) or name == "lm_head.weight"},
+              directory / "model.safetensors")
+    (directory / "config.json").write_text(json.dumps(fields, indent=1) + "\n")
+    prompt = np.array([[2, 5, 7, 9, 11, 13]], np.int32)
+    canvas = np.array([[3, 4, 5, 6, 8, 10]], np.int32)
+
+    def logits():
+        with torch.no_grad():
+            return model(input_ids=torch.from_numpy(prompt).long(),
+                         decoder_input_ids=torch.from_numpy(canvas).long()).logits
+
+    np.save(directory / "prompt.npy", prompt)
+    np.save(directory / "canvas.npy", canvas)
+    np.save(directory / "logits.npy", logits().to(torch.float32).numpy())
+    with float64():
+        model.double()
+        np.save(directory / "logits_f64.npy", logits().double().numpy())
+
+
 def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False) -> None:
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
@@ -1431,7 +1567,8 @@ def write_real_reference(directory: Path) -> None:
           f"top {TOP_K}, argmax[:8]={np.argmax(logits, axis=-1)[:8].tolist()}")
 
 
-def write_released_config(name: str, repo: str, revision: str | None = None) -> None:
+def write_released_config(name: str, repo: str, revision: str | None = None,
+                          filename: str = "config.json") -> None:
     """The real config.json of a released checkpoint, and the repo it came
     from in source.json. Only the config is downloaded, never the weights.
 
@@ -1442,11 +1579,12 @@ def write_released_config(name: str, repo: str, revision: str | None = None) -> 
     """
     directory = FIXTURES / name
     directory.mkdir(parents=True, exist_ok=True)
-    config = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
+    config = json.loads(Path(hf_hub_download(repo, filename, revision=revision)).read_text())
     for key in [key for key in config if key.startswith("unsloth")]:
         del config[key]
     (directory / "config.json").write_text(json.dumps(config, indent=1) + "\n")
-    source = {"repo": repo, **({"revision": revision} if revision is not None else {})}
+    source = {"repo": repo, **({"revision": revision} if revision is not None else {}),
+              **({"filename": filename} if filename != "config.json" else {})}
     (directory / "source.json").write_text(json.dumps(source) + "\n")
     layers = config.get('num_hidden_layers', config.get('n_layers', config.get('num_layers')))
     print(f"{directory / 'config.json'}: {repo}, "
@@ -1467,6 +1605,8 @@ def main() -> None:
                         help='only Qwen2-MoE and its pinned released config')
     parser.add_argument('--granitemoe-only', action='store_true',
                         help='only Granite MoE and its pinned PowerMoE config')
+    parser.add_argument('--encoder-family', choices=('modernbert',),
+                        help='only this encoder fixture and its pinned released configs')
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
@@ -1500,6 +1640,11 @@ def main() -> None:
         return
     if args.granitemoe_only:
         write_granitemoe()
+        return
+    if args.encoder_family == 'modernbert':
+        write_modernbert_tiny()
+        for config in MODERNBERT_CONFIGS:
+            write_released_config(*config)
         return
     write_nemotron_h()
     write_nemotron_h(moe=True)

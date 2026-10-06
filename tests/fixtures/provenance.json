@@ -156,6 +156,58 @@
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}],
    "note": "--granitemoe-only; PowerMoE embedding/residual/attention/logit multipliers, packed input_linear/output_linear and nested router names."
   },
+  "laya/tiny/logits.npz": {
+   "tool": "tools/laya_reference.py",
+   "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "laya/real/logits.npz": {
+   "tool": "tools/laya_reference.py",
+   "sources": [{"repo": "NandhaKishorM/laya", "version": "a4a8921afebfd852bba0000475cfb6ab737a124c", "runs": "laya"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/diffusion-gemma-window-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/diffusion-gemma-window-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/hidden.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/hidden_bf16.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/hidden_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/padded_hidden.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/padded_hidden_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/packed_hidden.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/modernbert-tiny/packed_hidden_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
   "attention_bf16.npz": {
    "tool": "tools/numerics_reference.py",
    "sources": [
@@ -3540,6 +3592,21 @@
    "tool": "tools/hf_reference.py",
    "what": "GPT-J weights, probe token ids and padded validity masks",
    "files": ["hf/gptj-tiny/model.safetensors", "hf/gptj-tiny/input_ids.npy", "hf/gptj-tiny/padded_ids.npy", "hf/gptj-tiny/attention_mask.npy"]
+  },
+  {
+   "tool": "tools/laya_reference.py",
+   "what": "a toy Laya checkpoint in Laya's own layout, its encoder, head and tokenizer",
+   "files": ["laya/tiny/model.safetensors"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "the windowed DiffusionGemma weights, prompt and canvas its references read",
+   "files": ["hf/diffusion-gemma-window-tiny/model.safetensors", "hf/diffusion-gemma-window-tiny/prompt.npy", "hf/diffusion-gemma-window-tiny/canvas.npy"]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "the ModernBERT weights, token ids, validity mask and document ids its references read",
+   "files": ["hf/modernbert-tiny/model.safetensors", "hf/modernbert-tiny/input_ids.npy", "hf/modernbert-tiny/padded_ids.npy", "hf/modernbert-tiny/attention_mask.npy", "hf/modernbert-tiny/segment_ids.npy"]
   },
   {
    "tool": "tools/modelopt_nvfp4_reference.py",
