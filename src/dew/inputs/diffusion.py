@@ -354,45 +354,22 @@ def _residual_states(decoder, ids):
                          decode=False, positions=None, segment_ids=None, per_layer_input=None)
 
 
-@encoders("qwen_image_text")
 @dataclass(eq=False)
-class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
-    """The text conditioning of a Qwen-Image 2.1 checkpoint: its Qwen3-VL
-    encoder's language model over the pipeline's text-to-image template.
+class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
+    """What the conditioners of a language-model or UMT5 text tower share: the
+    tower and its tokenizer, loaded from the pipeline's directory `checkpoint`
+    at a prompt budget of `tokens`, which the record keeps, and the tokenizer's
+    files, copied from its `assets` folder as they came: they are read, never
+    trained."""
 
-    `QwenImage21Pipeline._get_qwen_prompt_embeds` formats each prompt into
-    its template, reads the last decoder layer's output before the final
-    norm, and drops the system turn's tokens. A prompt with no image puts the
-    encoder's three rotary axes at one position, so its interleaved sections
-    rotate as the plain one-axis table `decoder` applies.
-
-    Rows are padded on the right to the system turn plus `tokens`. The
-    encoder is causal, so a real token never reads a later pad and its state
-    is the one the pipeline's left padding gives; the condition's `mask`
-    marks those tokens and the pads carry zeros, as the pipeline's stacking
-    writes them. An empty prompt is the single space the pipeline encodes in
-    its place. A prompt past the budget is refused rather than cut, since
-    the template's closing turn would go with it.
-    """
-
-    decoder: CausalTransformer
+    tower: CausalTransformer | T5EncoderTransformer
     tokenizer: PreTrainedTokenizerBase
     params: Variables
     checkpoint: str
-    height: int
-    width: int
-    tokens: int = 512
-    param_dtype: str = "float32"
+    tokens: int = field(default=512, kw_only=True)
+    param_dtype: str = field(default="float32", kw_only=True)
     keyword: ClassVar[str] = "conditioning"
-    drop: int = field(init=False)
-    """The system turn's token count, which the pipeline derives the same way."""
-
-    SYSTEM: ClassVar[str] = "Comprehend and analyze the provided prompt."
-    USER: ClassVar[tuple[str, str]] = ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")
-
-    def __post_init__(self):
-        system = [{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]}]
-        self.drop = len(self.tokenizer.apply_chat_template(system, tokenize=True, return_dict=False))
+    assets: ClassVar[str] = "tokenizer"
 
     @classmethod
     def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
@@ -405,6 +382,51 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl,
                                           tokens=tokens, params=params, mesh=mesh, layout=layout)
+
+    def captions(self, tokens):
+        return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
+
+    def to_json(self):
+        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.tower.dtype),
+                "param_dtype": self.param_dtype, "tokens": self.tokens}
+
+    def save_assets(self, destination: Path) -> None:
+        shutil.copytree(Path(self.checkpoint) / self.assets, destination / self.assets, dirs_exist_ok=True)
+
+
+@encoders("qwen_image_text")
+@dataclass(eq=False)
+class QwenImageConditioner(_LanguageText):
+    """The text conditioning of a Qwen-Image 2.1 checkpoint: its Qwen3-VL
+    encoder's language model over the pipeline's text-to-image template.
+
+    `QwenImage21Pipeline._get_qwen_prompt_embeds` formats each prompt into
+    its template, reads the last decoder layer's output before the final
+    norm, and drops the system turn's tokens. A prompt with no image puts the
+    encoder's three rotary axes at one position, so its interleaved sections
+    rotate as the plain one-axis table `tower` applies.
+
+    Rows are padded on the right to the system turn plus `tokens`. The
+    encoder is causal, so a real token never reads a later pad and its state
+    is the one the pipeline's left padding gives; the condition's `mask`
+    marks those tokens and the pads carry zeros, as the pipeline's stacking
+    writes them. An empty prompt is the single space the pipeline encodes in
+    its place. A prompt past the budget is refused rather than cut, since
+    the template's closing turn would go with it.
+    """
+
+    height: int
+    width: int
+    drop: int = field(init=False)
+    """The system turn's token count, which the pipeline derives the same way."""
+
+    SYSTEM: ClassVar[str] = "Comprehend and analyze the provided prompt."
+    USER: ClassVar[tuple[str, str]] = ("<|im_start|>user\n", "<|im_end|>\n<|im_start|>assistant\n")
+    assets = "processor"
+
+    def __post_init__(self):
+        system = [{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]}]
+        self.drop = len(self.tokenizer.apply_chat_template(system, tokenize=True, return_dict=False))
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         system = f"<|im_start|>system\n{self.SYSTEM}<|im_end|>\n"
@@ -421,9 +443,8 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
                 "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
 
     def encode(self, params, tokens) -> DenoisingCondition:
-        states = jnp.asarray(self.decoder.apply({"params": params["text_encoder"]["params"]},
-                                                jnp.asarray(tokens["input_ids"]),
-                                                method=_residual_states))
+        states = jnp.asarray(self.tower.apply({"params": params["text_encoder"]["params"]},
+                                              jnp.asarray(tokens["input_ids"]), method=_residual_states))
         valid = jnp.asarray(tokens["attention_mask"], bool)[:, self.drop:]
         context = jnp.where(valid[..., None], states[:, self.drop:], 0)
         return DenoisingCondition(context, mask=valid)
@@ -433,20 +454,10 @@ class QwenImageConditioner(ConditionEncoder[str | Mapping[str, object]]):
                                             skip_special_tokens=True)
         return tuple(text.removeprefix("user\n").removesuffix("\nassistant\n") for text in texts)
 
-    def to_json(self):
-        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.decoder.dtype),
-                "param_dtype": self.param_dtype, "tokens": self.tokens}
-
-    def save_assets(self, destination: Path) -> None:
-        """Copy the processor's files as they came: they are read, never trained."""
-        shutil.copytree(Path(self.checkpoint) / "processor", destination / "processor",
-                        dirs_exist_ok=True)
-
-
 
 @encoders("hidden_states_text")
 @dataclass(eq=False)
-class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
+class HiddenStatesConditioner(_LanguageText):
     """Text conditioning read off a language model's hidden states: FLUX.2's
     and Z-Image's.
 
@@ -465,21 +476,14 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
     cut, since the template's closing turn would go with it.
     """
 
-    decoder: CausalTransformer
-    tokenizer: PreTrainedTokenizerBase
-    params: Variables
-    checkpoint: str
     height: int
     width: int
     template: Literal["mistral3", "qwen3"]
     layers: tuple[int, ...]
     thinking: bool = False
-    tokens: int = 512
     guidance: float | None = None
     """The distilled guidance FLUX.2 [dev] embeds, its pipeline's default;
     None for a transformer that embeds none."""
-    param_dtype: str = "float32"
-    keyword: ClassVar[str] = "conditioning"
 
     SYSTEM: ClassVar[str] = (
         "You are an AI that reasons about image descriptions. You give structured responses "
@@ -495,18 +499,6 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return ([{"role": "system", "content": [{"type": "text", "text": self.SYSTEM}]},
                  {"role": "user", "content": [{"type": "text", "text": prompt.replace("[IMG]", "")}]}],
                 {"add_generation_prompt": False})
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
-                        param_dtype: str = "float32", revision: str | None = None,
-                        attention_impl: str = "auto", tokens: int = 512,
-                        params: Variables | None = None, mesh: MeshSpec | None = None,
-                        layout: Layout | None = None):
-        from dew.interop.pretrained import load_diffusion_conditioner
-
-        return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
-                                          revision=revision, attention_impl=attention_impl,
-                                          tokens=tokens, params=params, mesh=mesh, layout=layout)
 
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
         rows, guidance = [], []
@@ -531,7 +523,7 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
     def encode(self, params, tokens) -> DenoisingCondition:
         from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
 
-        _, kept = self.decoder.apply(
+        _, kept = self.tower.apply(
             {"params": params["text_encoder"]["params"]}, jnp.asarray(tokens["input_ids"]),
             attention_mask=jnp.asarray(tokens["attention_mask"], bool), method="hidden_states",
             capture_intermediates=layer_outputs, mutable=[INTERMEDIATES])
@@ -540,73 +532,36 @@ class HiddenStatesConditioner(ConditionEncoder[str | Mapping[str, object]]):
         return DenoisingCondition(jnp.concatenate(states, axis=-1),
                                   mask=jnp.asarray(tokens["attention_mask"], bool), guidance=guidance)
 
-    def captions(self, tokens):
-        return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
-
-    def to_json(self):
-        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.decoder.dtype),
-                "param_dtype": self.param_dtype, "tokens": self.tokens}
-
-    def save_assets(self, destination: Path) -> None:
-        """Copy the tokenizer's files as they came: they are read, never trained."""
-        shutil.copytree(Path(self.checkpoint) / "tokenizer", destination / "tokenizer", dirs_exist_ok=True)
-
-def wan_prompt(text: str) -> str:
-    """`prompt_clean` of Diffusers' Wan pipelines: ftfy's repairs, HTML
-    entities unescaped twice, then every run of whitespace one space.
-
-    The source collapses with the `regex` module's `\\s`, Unicode's
-    White_Space; the standard library's also takes U+001C to U+001F, which
-    ftfy has already removed as control characters, so the two agree here.
-    """
-    try:
-        import ftfy
-    except ImportError as missing:  # the wan extra's one package
-        raise ValueError("Wan's pipelines clean each prompt with ftfy; install it with "
-                         "`pip install 'dewml[wan]'`") from missing
-    text = html.unescape(html.unescape(ftfy.fix_text(text))).strip()
-    return re.sub(r"\s+", " ", text).strip()
-
 
 @encoders("wan_text")
 @dataclass(eq=False)
-class WanConditioner(ConditionEncoder[str | Mapping[str, object]]):
+class WanConditioner(_LanguageText):
     """The text conditioning of a Wan 2.1 checkpoint: its UMT5 encoder's last
     hidden states.
 
-    `WanPipeline._get_t5_prompt_embeds` cleans each prompt (`wan_prompt`),
-    tokenizes it with its end-of-sequence token, padded and cut to `tokens`,
-    runs the encoder under the padding mask, keeps each row's states up to
-    its own token count and fills the rest of the row with zeros. Its
-    transformer reads every position, the zeros included, so the condition
-    carries no mask.
+    `WanPipeline._get_t5_prompt_embeds` cleans each prompt as its
+    `prompt_clean` does: ftfy's repairs, HTML entities unescaped twice, then
+    every run of whitespace one space. The source collapses with the `regex`
+    module's `\\s`, Unicode's White_Space; the standard library's also takes
+    U+001C to U+001F, which ftfy has already removed as control characters,
+    so the two agree here. It tokenizes the prompt with its end-of-sequence
+    token, padded and cut to `tokens`, runs the encoder under the padding
+    mask, keeps each row's states up to its own token count and fills the
+    rest of the row with zeros. Its transformer reads every position, the
+    zeros included, so the condition carries no mask.
     """
 
-    tower: T5EncoderTransformer
-    tokenizer: PreTrainedTokenizerBase
-    params: Variables
-    checkpoint: str
-    tokens: int = 512
-    param_dtype: str = "float32"
-    keyword: ClassVar[str] = "conditioning"
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str, *, dtype: str | None = "bfloat16",
-                        param_dtype: str = "float32", revision: str | None = None,
-                        attention_impl: str = "auto", tokens: int = 512,
-                        params: Variables | None = None, mesh: MeshSpec | None = None,
-                        layout: Layout | None = None):
-        from dew.interop.pretrained import load_diffusion_conditioner
-
-        return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
-                                          revision=revision, attention_impl=attention_impl,
-                                          tokens=tokens, params=params, mesh=mesh, layout=layout)
-
     def tokenize(self, texts: Sequence[str | Mapping[str, object]]):
+        try:
+            import ftfy
+        except ImportError as missing:  # the wan extra's one package
+            raise ValueError("Wan's pipelines clean each prompt with ftfy; install it with "
+                             "`pip install 'dewml[wan]'`") from missing
         rows = []
         for prompt in texts:
             record: Mapping[str, object] = {"text": prompt} if isinstance(prompt, str) else prompt
-            rows.append(wan_prompt(_prompt(record, "text", "")))
+            text = html.unescape(html.unescape(ftfy.fix_text(_prompt(record, "text", "")))).strip()
+            rows.append(re.sub(r"\s+", " ", text).strip())
         encoded = self.tokenizer(rows, padding="max_length", max_length=self.tokens, truncation=True,
                                  add_special_tokens=True, return_tensors="np")
         return {"input_ids": np.asarray(encoded.input_ids, np.int32),
@@ -619,17 +574,6 @@ class WanConditioner(ConditionEncoder[str | Mapping[str, object]]):
         lengths = jnp.sum(mask != 0, axis=1)
         kept = jnp.arange(states.shape[1])[None, :, None] < lengths[:, None, None]
         return DenoisingCondition(jnp.where(kept, states, 0))
-
-    def captions(self, tokens):
-        return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
-
-    def to_json(self):
-        return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.tower.dtype),
-                "param_dtype": self.param_dtype, "tokens": self.tokens}
-
-    def save_assets(self, destination: Path) -> None:
-        """Copy the tokenizer's files as they came: they are read, never trained."""
-        shutil.copytree(Path(self.checkpoint) / "tokenizer", destination / "tokenizer", dirs_exist_ok=True)
 
 
 @lru_cache(maxsize=32)

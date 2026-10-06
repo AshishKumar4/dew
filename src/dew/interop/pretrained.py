@@ -36,7 +36,7 @@ from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.pipeline import place
 from dew.inference.tasks import Processor as TaskProcessor
-from dew.inputs import Condition, Field, InputSpec
+from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.inputs.diffusion import (
     Composition,
     DiffusionConditioner,
@@ -1197,8 +1197,7 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     return replace(loaded, revision=None if os.path.isdir(checkpoint) else directory.name)
 
 
-def load_diffusion_conditioner[C: (DiffusionConditioner, QwenImageConditioner, HiddenStatesConditioner,
-                                   WanConditioner)](
+def load_diffusion_conditioner[C: ConditionEncoder](
         checkpoint: str, kind: type[C], *, dtype: str | None = "bfloat16", param_dtype: str = "float32",
         revision: str | None = None, attention_impl: str = "auto", tokens: int | None = None,
         params: Variables | None = None, mesh: MeshSpec | None = None, layout: Layout | None = None) -> C:
