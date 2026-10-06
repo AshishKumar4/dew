@@ -27,8 +27,10 @@ from dataclasses import dataclass, field
 import jax
 import optax
 import tyro
+from benchmark_cases import Case
+from benchmark_models import batches
+from benchmark_step import parameter_count
 
-from benchmark_step import Case, batches, parameter_count
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.objectives.lm import LMObjective
 from dew.registry import models, with_precision

@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import widened
 from sharded import assert_sharded
 
 from dew.interop import Pretrained
@@ -160,12 +161,6 @@ def scanned_pair(build):
     ids = jax.random.randint(jax.random.key(1), (2, 12), 0, VOCAB)
     variables = plain.init(jax.random.key(0), ids)
     return plain, scanned, variables, ids
-
-
-def widened(tree):
-    """`tree` as float64 host arrays, its integer leaves as they are."""
-    return jax.tree.map(lambda leaf: np.asarray(
-        leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
 def judged(single, double, candidate) -> tuple[float, str]:
