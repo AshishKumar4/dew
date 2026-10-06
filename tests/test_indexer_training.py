@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -506,17 +507,6 @@ def test_a_model_without_an_indexer_is_refused():
         IndexerTraining("dense")
 
 
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-
-    def log(self, scalars, step):
-        self.scalars.append(dict(scalars))
-
-    def artifact(self, value, step):
-        pass
-
-
 class Data:
     def __init__(self, batches):
         self._batches = batches
@@ -560,7 +550,7 @@ def test_the_warmup_trains_through_the_trainer():
     moved = jax.tree.leaves(jax.tree.map(lambda a, b: jnp.any(a != b),
                                          initial.variables["params"], state.variables["params"]))
     assert all(bool(x) for x in moved)
-    kls = [entry["train/indexer_kl"] for entry in tracker.scalars if "train/indexer_kl" in entry]
+    kls = [entry["train/indexer_kl"] for _, entry in tracker.scalars if "train/indexer_kl" in entry]
     assert len(kls) == 3 and all(np.isfinite(kls)) and kls[-1] < kls[0], kls
     assert state.variables[FROZEN]["layers_0"]["self_attn"]["kv_b_proj"]["kernel"].sharding.spec == (
         state.variables["params"]["layers_0"]["self_attn"][INDEXER]["wq_b"]["kernel"].sharding.spec)
