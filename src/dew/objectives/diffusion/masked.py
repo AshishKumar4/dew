@@ -142,16 +142,16 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def inference_record(self):
-        from dew.config import ModelConfig, _to_json
+        from dew.config import ModelConfig
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import objectives
+        from dew.registry import objectives, to_record
         if not any(member is type(self) for member in objectives.values()):
             return None
-        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
                 'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': self.process.to_json(), 'solver': _to_json(self.solver, type(self.solver)),
+                'process': self.process.to_json(), 'solver': to_record(self.solver, type(self.solver)),
                 'sampling_steps': self.steps}
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
@@ -183,10 +183,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
             variables, batch, step.key, train=True)
-        nelbo = Ratio(jnp.sum(losses * weights), jnp.sum(real, dtype=jnp.float32))
+        nelbo = Ratio(self.row_mean(losses * weights, batch).total,
+                      self.row_mean(real.astype(jnp.float32), batch).total)
         correct = (predicted == tokens).astype(losses.dtype)
+        accuracy, _ = self.accuracy(correct, batch, counted).mean()
         return nelbo, Aux(metrics={
-            "masked_accuracy": jnp.sum(correct * counted) / jnp.maximum(jnp.sum(counted), 1.0),
+            "masked_accuracy": accuracy,
             "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
         })
 
@@ -258,12 +260,13 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             method=type(self.model).hidden_states,
         )
         head = self.model.apply(params, params["params"], method=type(self.model).head_weight)
+        bias = self.model.apply(params, params['params'], method=type(self.model).vocabulary_bias)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         losses, predicted, _ = chunked_cross_entropy(
             hidden, head, tokens, self.head_chunks,
             softcap=self.model.final_logit_softcap, precision=self.model.precision,
-            excluded=self.process.mask_id)
+            excluded=self.process.mask_id, bias=bias)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 

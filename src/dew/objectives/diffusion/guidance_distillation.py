@@ -24,7 +24,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Ratio, Step, Variables
+from dew.objectives.base import Aux, Step, Variables
 from dew.registry import objectives, trainings
 
 from .objective import TEACHER, DiffusionObjective, Training, _own_loss
@@ -165,7 +165,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         assert isinstance(output, jax.Array)
         losses = optax.l2_loss(output, target)
         weighted = losses * expand(self.process.weight(t), losses)
-        return Ratio(jnp.sum(weighted), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+        return self.row_mean(weighted, batch), Aux(metrics={})
 
 
 __all__ = ["GuidanceDistillationObjective", "guided_target", "with_guidance"]

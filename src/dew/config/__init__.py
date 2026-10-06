@@ -31,13 +31,13 @@ import jax
 import optax
 import tyro
 from etils import epath
-from flax import linen as nn
 
 import dew.data  # registers the datasets a config names
 import dew.io
 import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.artifacts import agree_process_phase, agreed
+from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.data import Dataset, DatasetSpec, Ramp
@@ -46,17 +46,7 @@ from dew.lora import LoRA, _Adapted, adapted
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
-from dew.registry import (
-    _declared_type,
-    _recorded,
-    _table_of,
-    datasets,
-    from_record,
-    models,
-    schedules,
-    with_precision,
-)
-from dew.telemetry.instrumentation import default_compilation_cache_dir, dew_cache_dir
+from dew.registry import _declared_type, datasets, from_record, models, schedules, to_record, with_precision
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
@@ -201,7 +191,7 @@ class ModelConfig:
             elif callable(value) and value is field.default:
                 continue
             else:
-                fields[field.name] = _to_json(value, _declared_type(model_type, field.name))
+                fields[field.name] = to_record(value, _declared_type(model_type, field.name))
         return cls(architecture, fields, adapter=adapter, quantization=quantization, dtype=compute,
                    param_dtype=storage, matmul_precision=precision, attention_impl=attention)
 
@@ -364,9 +354,9 @@ def _best_argument():
             return [policy]
         return [
             json.dumps(
-                [_to_json(entry, Best) for entry in policy]
+                [to_record(entry, Best) for entry in policy]
                 if isinstance(policy, tuple)
-                else _to_json(policy, Best)
+                else to_record(policy, Best)
             )
         ]
 
@@ -385,7 +375,7 @@ def _keep_argument():
         else int(given[0]),
         is_instance=lambda keep: isinstance(keep, (int, Keep)),
         str_from_instance=lambda keep: [
-            json.dumps(_to_json(keep, Keep)) if isinstance(keep, Keep) else str(keep)
+            json.dumps(to_record(keep, Keep)) if isinstance(keep, Keep) else str(keep)
         ],
     )
 
@@ -598,64 +588,6 @@ def _artifact_name(name: str) -> str:
     return re.sub(r"[^\w.-]", "-", name)
 
 
-def _to_json(value, annotation) -> JSON:
-    """Return `value` as JSON: a dict, a list, or a scalar json.dump can write.
-    `annotation` is the declared field type, so the write side names the same
-    registry and member types the read side rebuilds from."""
-    if isinstance(value, datetime.timedelta):
-        return recorded_duration(value)
-    if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
-        return registry.dtype_name(value)
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        held = _table_of(annotation)
-        if held is not None and not any(type(value) is member
-                                      for member in held.values()):
-            raise ValueError(
-                f"{type(value).__qualname__} is not a registered {held.kind}; a "
-                f"run config can only record members that load back, so register "
-                f"it once with `@dew.registry.{held.kind}s(\"{type(value).__name__.lower()}\")`")
-        if held is None:
-            held = _table_of(type(value))
-        fields = {f.name: _to_json(getattr(value, f.name), _declared_type(type(value), f.name))
-                  for f in dataclasses.fields(value) if _recorded(f)
-                  and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
-        if held is None:
-            return fields
-        return {"name": held.name_of(type(value)), "fields": fields}
-    if isinstance(value, (list, tuple)):
-        entries = registry.entry_types(annotation, len(value))
-        return [_to_json(entry_value, entry)
-                for entry_value, entry in zip(value, entries, strict=True)]
-    if isinstance(value, Mapping):
-        entries = registry.entry_types(annotation, len(value))
-        return {_key(key): _to_json(entry_value, entry)
-                for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    raise TypeError(
-        f"{type(value).__name__} is not something a run record can carry; a "
-        f"config field holds JSON scalars, sequences, mappings, and the "
-        f"registered values this writes as their name and fields")
-
-
-def _key(key: object) -> str:
-    """Return one mapping key as JSON names it, since JSON has only string keys.
-
-    A tree path is its parts joined the way every message in this tree joins
-    them, `params/layers_0/self_attn/q_proj`, which is the spelling
-    `_rebuild` splits back into the tuple the field declares. A key that is
-    neither a name nor a path of them has no spelling a record reads back,
-    so it is refused here rather than written as its repr.
-    """
-    if isinstance(key, tuple):
-        return "/".join(_key(part) for part in key)
-    if not isinstance(key, (str, int, float)):
-        raise TypeError(
-            f"{key!r} is not a key a run record can carry; a config mapping is keyed "
-            f"by a name, a number, or a tree path of names")
-    return str(key)
-
-
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration; recipes subclass it to add their objective's settings."""
@@ -684,7 +616,7 @@ class RunConfig:
 
         A registered member is written as its name and its fields.
         """
-        return {field.name: _to_json(getattr(self, field.name),
+        return {field.name: to_record(getattr(self, field.name),
                                      _declared_type(type(self), field.name))
                 for field in dataclasses.fields(self)}
 

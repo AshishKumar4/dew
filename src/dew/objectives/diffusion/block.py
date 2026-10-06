@@ -113,15 +113,15 @@ def _cache_geometry(valid: jax.Array, selected: jax.Array, prompt_length: int, c
     return positions, encoder_mask, packed_positions, decoder_mask, key_positions
 
 
-def _row_mean(losses: jax.Array, mask: jax.Array) -> Ratio:
-    """Average the masked losses within each row, then sum the rows.
+def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
+    """Average the masked losses within each row, then sum the rows (`Objective.row_mean`).
 
     The mass is the row count, so accumulation weighs rows equally however
     many tokens each one counted.
     """
     mass = mask.sum(axis=-1)
-    row_losses = jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1)
-    return Ratio(row_losses.sum(), jnp.asarray(losses.shape[0], jnp.int32))
+    return Objective.row_mean(jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1),
+                              batch)
 
 
 @objectives("block_diffusion")
@@ -217,13 +217,13 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.processor = processor
 
     def inference_record(self):
-        from dew.config import ModelConfig, _to_json
+        from dew.config import ModelConfig
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import recorded_tokenizer
-        from dew.registry import objectives
+        from dew.registry import objectives, to_record
         if not any(member is type(self) for member in objectives.values()):
             return None
-        model = _to_json(ModelConfig.from_model(self.model), ModelConfig)
+        model = to_record(ModelConfig.from_model(self.model), ModelConfig)
         return {'objective': objectives.name_of(type(self)), 'model': model,
                 'seq_len': self.sequence_length, 'sample_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
@@ -305,12 +305,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, _ = self._token_losses(
             variables, batch, step.key, train=True)
         canvas_stats, encoder_stats = (
-            _row_mean(canvas_losses, target_mask),
-            _row_mean(encoder_losses, encoder_target_mask),
+            _row_losses(canvas_losses, target_mask, batch),
+            _row_losses(encoder_losses, encoder_target_mask, batch),
         )
         support = (
-            self.decoder_loss_weight * target_mask.sum()
-            + self.encoder_loss_weight * encoder_target_mask.sum()
+            self.decoder_loss_weight * self.row_mean(target_mask, batch).total
+            + self.encoder_loss_weight * self.row_mean(encoder_target_mask, batch).total
         )
         stats = BlockSFTStatistics(canvas_stats, encoder_stats, support)
         return stats, Aux(metrics={"canvas_ce": canvas_stats.mean()[0],
@@ -443,6 +443,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # The head as stored, so what the losses keep for their backward is
         # the table itself and not a transposed copy of it.
         head, stored = model.apply(params, params["params"], method=type(model).head_table)
+        bias = model.apply(params, params['params'], method=type(model).vocabulary_bias)
         vocab_major = bool(stored)
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         encoder_kwargs = prepared.kwargs()
@@ -467,7 +468,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # before the head and nothing of that pass is kept for the backward.
         first = jax.lax.stop_gradient(constrain(head_logits(
             jax.lax.stop_gradient(denoise(zero_logits)), head, softcap=softcap,
-            precision=precision, vocab_major=vocab_major), LOGITS))
+            precision=precision, vocab_major=vocab_major, bias=bias), LOGITS))
         use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
         states = denoise(sc_logits)
@@ -477,11 +478,11 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             target_mask &= text_slots[:, self.prompt_length:]
         canvas_losses, predicted, _ = chunked_cross_entropy(
             states, head, response, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major, predict=not train)
+            vocab_major=vocab_major, predict=not train, bias=bias)
         shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
         encoder_losses, _, _ = chunked_cross_entropy(
             encoder_states, head, shifted, self.head_chunks, softcap=softcap, precision=precision,
-            vocab_major=vocab_major, predict=False)
+            vocab_major=vocab_major, predict=False, bias=bias)
         correct = None if predicted is None else predicted == response
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct
 

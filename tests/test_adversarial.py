@@ -58,8 +58,7 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
                     "cls": {"u": jnp.asarray(HEAD["cls.u"])}}
         logits, updated = Head(kernel_size=(1, 9)).apply(
             {"params": params, SPECTRAL: spectral}, jnp.asarray(HEAD["x"]), jnp.asarray(HEAD["c"]),
-            update=True,
-            mutable=[SPECTRAL])
+            update=True, batch={}, mutable=[SPECTRAL])
         np.testing.assert_allclose(np.asarray(logits), HEAD["logits"], rtol=1e-10, atol=1e-12)
         assert not np.allclose(np.asarray(updated[SPECTRAL]["cls"]["u"]), HEAD["cls.u"])
 

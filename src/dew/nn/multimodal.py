@@ -405,6 +405,10 @@ class MultimodalTransformer(nn.Module):
         """Return the decoder's shared fp32 head matrix, for an objective's chunked scoring."""
         return self.language_model.head_weight(params["language_model"])
 
+    def vocabulary_bias(self, params):
+        """The decoder's vocabulary bias, for the same affine head its forward scores."""
+        return self.language_model.vocabulary_bias(params['language_model'])
+
     @nn.compact
     def init_cache(self, batch_size: int):
         """Allocate the language model's cache and the next-position counter, without running the towers."""

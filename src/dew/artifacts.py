@@ -76,9 +76,20 @@ class TokenScores:
     """Per-token top-1 correctness, from the same logits that produced the losses."""
 
 
+@struct.dataclass
+class Decisions:
+    """A decision model's probabilities `[N, K]` over each row's options, the
+    real options `[N, K]`, the right option `[N]` of each row, and which rows
+    `[N]` ask a score, whose options are ordered levels."""
+    probabilities: jax.Array
+    options: jax.Array
+    labels: jax.Array
+    ordinal: jax.Array
+
+
 # Scoring and preview hooks each return one artifact or a tuple. Metrics
 # pick exactly one scoring artifact by type; previews never satisfy metrics.
-Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores
+Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores | Decisions
 Artifacts = Artifact | tuple[Artifact, ...]
 
 
@@ -441,6 +452,7 @@ def end_pool_on_failure(grace: float = FAILURE_GRACE_SECONDS) -> None:
 
 
 __all__ = [
+    "Decisions",
     "ImageGrid",
     "PeerFailure",
     "Representations",

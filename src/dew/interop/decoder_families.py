@@ -3,7 +3,9 @@
 from functools import partial
 
 from dew.interop import mamba2
+from dew.interop.families.bloom import _BLOOM_NAMES, _bloom_config, _bloom_export, _bloom_path
 from dew.interop.families.deepseek import (
+    _MINIMAX_M2_NAMES,
     _deepseek_config,
     _deepseek_v2_mixture,
     _deepseek_v4_config,
@@ -11,8 +13,17 @@ from dew.interop.families.deepseek import (
     _deepseek_v4_prepare,
     _kimi_k25_config,
     _kimi_k25_path,
+    _minimax_m2_config,
 )
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
+from dew.interop.families.falcon import (
+    _FALCON_NAMES,
+    _falcon_config,
+    _falcon_export,
+    _falcon_export_weights,
+    _falcon_path,
+    _falcon_prepare,
+)
 from dew.interop.families.gemma import (
     _gemma2_config,
     _gemma2_export,
@@ -38,10 +49,19 @@ from dew.interop.families.glm import (
 from dew.interop.families.gpt2 import (
     _GPT2_NAMES,
     _GPT2_PACKED,
+    _GPT_NEO_NAMES,
+    _GPTJ_NAMES,
     _gpt2_config,
     _gpt2_export,
     _gpt2_path,
     _gpt2_prepare,
+    _gpt_neo_config,
+    _gpt_neo_export,
+    _gptj_config,
+    _gptj_export,
+    _gptj_export_weights,
+    _gptj_path,
+    _gptj_prepare,
 )
 from dew.interop.families.gpt_neox import (
     _GPT_NEOX_NAMES,
@@ -62,6 +82,10 @@ from dew.interop.families.kimi import (
     _kimi_linear_prepare,
 )
 from dew.interop.families.llama import (
+    _GRANITEMOE_NAMES,
+    _GRANITEMOE_PACKED,
+    _granitemoe_config,
+    _granitemoe_path,
     _llama_config,
     _ministral_config,
     _mistral_config,
@@ -78,6 +102,14 @@ from dew.interop.families.masked_diffusion import (
     _llada_path,
     _mask_token_export,
 )
+from dew.interop.families.modernbert import (
+    _MODERNBERT_PACKED,
+    _modernbert_config,
+    _modernbert_export,
+    _modernbert_export_path,
+    _modernbert_path,
+    _modernbert_prepare,
+)
 from dew.interop.families.nemotron_h import (
     PACKED as _NEMOTRON_H_PACKED,
     config_from_hf as _nemotron_h_config,
@@ -87,8 +119,10 @@ from dew.interop.families.nemotron_h import (
 )
 from dew.interop.families.olmo import _olmo3_config
 from dew.interop.families.opt import _OPT_NAMES, _opt_config, _opt_export
+from dew.interop.families.phi import _PHI_NAMES, _phi_config, _phi_export
 from dew.interop.families.qwen import (
     _qwen2_config,
+    _qwen2_moe_config,
     _qwen3_config,
     _qwen3_export,
     _qwen3_moe_config,
@@ -103,6 +137,7 @@ from dew.interop.hf_decoders import (
     _GEMMA,
     _QWEN35,
     DecoderFamily,
+    _decoder_tensors,
     _every_layer_windowed,
     _kind_mixers,
     _renamed_name,
@@ -117,6 +152,69 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mla import MLAMixer
 
 ENTRIES = (
+    DecoderFamily(
+        ('bloom',), _bloom_config,
+        lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
+        'bloom', 'BloomForCausalLM', _bloom_export,
+        weight_path=_bloom_path, export_path=partial(_renamed_name, _BLOOM_NAMES),
+        prepare=partial(_gpt_neox_prepare, attention_name='self_attention'),
+        export_weights=partial(_gpt_neox_export_weights, attention_name='self_attention'),
+        preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    ),
+    DecoderFamily(
+        ('gpt_neo',), _gpt_neo_config,
+        lambda fields: fields.position_embedding == 'learned' and fields.attention_scale == 1.0
+                       and fields.attention_bias is False and fields.o_proj_bias is True,
+        'gpt_neo', 'GPTNeoForCausalLM', _gpt_neo_export,
+        weight_path=partial(_renamed_path, _GPT_NEO_NAMES),
+        export_path=partial(_renamed_name, _GPT_NEO_NAMES), preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+    ),
+    DecoderFamily(
+        ('phi',), _phi_config,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and fields.attention_bias,
+        'phi', 'PhiForCausalLM', _phi_export,
+        weight_path=partial(_renamed_path, _PHI_NAMES), export_path=partial(_renamed_name, _PHI_NAMES),
+        export_weights=_decoder_tensors, preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('gptj',), _gptj_config,
+        lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
+        'gptj', 'GPTJForCausalLM', _gptj_export,
+        weight_path=_gptj_path, export_path=partial(_renamed_name, _GPTJ_NAMES),
+        prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+    ),
+    DecoderFamily(
+        ('falcon',), _falcon_config,
+        lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
+                       and fields.partial_rotary_factor is None,
+        'falcon', 'FalconForCausalLM', _falcon_export,
+        weight_path=_falcon_path, export_path=partial(_renamed_name, _FALCON_NAMES),
+        prepare=_falcon_prepare, export_weights=_falcon_export_weights, preserve_source_layout=False,
+        tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    ),
+    DecoderFamily(
+        ('minimax_m2',),
+        _minimax_m2_config,
+        lambda fields: bool(fields.qk_norm and fields.qk_norm_scope == 'projection'
+                            and fields.pre_norms and fields.mixture is not None),
+        'minimax_m2',
+        'MiniMaxM2ForCausalLM',
+        lambda model: {},
+        weight_path=partial(_renamed_path, _MINIMAX_M2_NAMES),
+        export_path=partial(_renamed_name, _MINIMAX_M2_NAMES),
+        preserve_source_layout=True,
+    ),
+    DecoderFamily(
+        ('modernbert',), _modernbert_config,
+        lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
+        'modernbert', 'ModernBertForMaskedLM', _modernbert_export,
+        weight_path=_modernbert_path, export_path=_modernbert_export_path,
+        prepare=_modernbert_prepare, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
+        tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
+    ),
     DecoderFamily(
         ("nemotron_h",),
         _nemotron_h_config,
@@ -514,6 +612,18 @@ ENTRIES = (
         preserve_source_layout=False,
     ),
     DecoderFamily(
+        ('qwen2_moe',),
+        _qwen2_moe_config,
+        lambda fields: bool(not fields.qk_norm and fields.mixture is not None
+                            and fields.mixture.shared_gate),
+        'qwen2_moe',
+        'Qwen2MoeForCausalLM',
+        lambda model: {},
+        weight_path=_qwen35_moe_path,
+        packed=_FUSED_EXPERTS,
+        preserve_source_layout=True,
+    ),
+    DecoderFamily(
         ("qwen2",),
         _qwen2_config,
         lambda fields: bool(fields.attention_bias and fields.o_proj_bias is False),
@@ -521,6 +631,20 @@ ENTRIES = (
         "Qwen2ForCausalLM",
         _qwen3_export,
         preserve_source_layout=False,
+    ),
+    DecoderFamily(
+        ('granitemoe',),
+        _granitemoe_config,
+        lambda fields: bool(fields.mixture is not None and not fields.qk_norm
+                            and (fields.embedding_multiplier != 1.0 or fields.residual_multiplier != 1.0
+                                 or fields.logits_scaling != 1.0 or fields.attention_scale is not None)),
+        'granitemoe',
+        'GraniteMoeForCausalLM',
+        lambda model: {},
+        weight_path=_granitemoe_path,
+        export_path=partial(_renamed_name, _GRANITEMOE_NAMES),
+        packed=_GRANITEMOE_PACKED,
+        preserve_source_layout=True,
     ),
     DecoderFamily(
         ("mixtral",),

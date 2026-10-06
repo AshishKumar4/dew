@@ -1,7 +1,7 @@
 // A live Jupyter kernel from live.dewml.dev, for the "Run live" buttons.
 //
 // Opening a session renders a Turnstile check, asks the Worker for a session,
-// and connects its WebSocket; the protocol is described in site/live/container/server.py.
+// and connects its WebSocket; the protocol is described in site/live/container/shared_bridge.py.
 
 import { live } from '../live.mjs';
 
