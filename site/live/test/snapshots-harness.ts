@@ -34,6 +34,6 @@ export default {
 		}
 		await preparer.fail();
 		try { await registry.refresh(B); } catch {}
-		return Response.json({ previous: await registry.current(A), replacement: await registry.current(B) });
+		return Response.json({ previous: await registry.current(A), replacement: await registry.current(B), status: await registry.status() });
 	},
 };

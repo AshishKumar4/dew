@@ -27,6 +27,9 @@ test('a failed offline smoke does not replace the previous generation', async ()
 	const result = await scenario('failure');
 	assert.equal(result.previous.commit, 'a'.repeat(40));
 	assert.equal(result.replacement, null);
+	assert.equal(result.status.rebuild, null);
+	assert.equal(result.status.failure.commit, 'b'.repeat(40));
+	assert.match(result.status.failure.message, /offline smoke failed/);
 });
 test('an expired or different-commit generation is not eligible for restoration', async () => {
 	const result = await scenario('expiry');
