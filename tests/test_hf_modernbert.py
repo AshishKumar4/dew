@@ -130,10 +130,9 @@ def test_modernbert_trains_through_its_unnormed_first_block_and_head():
     assert float(loss(changed)) < float(value)
 
 
-def test_a_prediction_head_refuses_the_bare_head_matrix():
+def test_a_prediction_head_has_no_bare_head_matrix():
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
-    with pytest.raises(ValueError, match='prediction head'):
-        loaded.model.head_table(loaded.variables['params'])
+    assert loaded.model.apply(loaded.variables, method='output_table') is None
 
 
 def test_the_released_configs_read_as_modernbert():

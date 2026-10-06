@@ -33,12 +33,12 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
-from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.diffusion.block import BlockDenoiser
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
-from dew.nn.rope import LongRopeScaling
+from dew.nn.protocols import Serving
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
@@ -89,6 +89,14 @@ class Bounded(Protocol):
 
     @property
     def max_seq_len(self) -> int | None: ...
+
+
+@runtime_checkable
+class Decoding(Protocol):
+    """A decoder that continues its rows token by token: `init_cache` opens the
+    cache its decode calls (`decode=True`) write, a position a call."""
+
+    def init_cache(self, batch_size: int) -> None: ...
 
 
 @runtime_checkable
@@ -412,7 +420,7 @@ def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: Deco
         axis=tuple(range(1, logical.ndim))) + 1
     state = DecoderState(updated["cache"], drawn, positions,
                          None if states is None else states[rows, slot])
-    if isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling):
+    if rebuild_position(model) is not None:
         if cache is not None or logical is not None or inputs.conditioning:
             raise ValueError('LongRoPE cache rebuilding requires a fresh text prompt '
                              'without custom coordinates')
@@ -486,6 +494,13 @@ def prediction_depths(model: nn.Module) -> int:
     return model.num_nextn_predict_layers if isinstance(model, Predicting) else 0
 
 
+def rebuild_position(model: nn.Module) -> int | None:
+    """The position past which the model's cached keys go stale, so a row
+    crossing it recomputes its prefix (LongRoPE's switch of factors), or
+    None where the model's cache stays valid (`Serving`)."""
+    return model.cache_rebuild_position if isinstance(model, Serving) else None
+
+
 def _refuse_exchange(model: nn.Module) -> None:
     """Refuse a model whose sparse layers exchange tokens between expert shards.
 
@@ -532,12 +547,11 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
                 capture_intermediates=False, **positions)
 
         history, lengths = state.tokens, state.lengths
-        if (isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling)
-                and history is not None and lengths is not None):
+        original = rebuild_position(model)
+        if original is not None and history is not None and lengths is not None:
             slots = lengths[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
-            original = model.rope_scaling.original_max_position_embeddings
             crossing = (lengths <= original) & (following > original)
             ordinary = append()
 
@@ -675,6 +689,12 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
 def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
                   max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
     """Shared host validation; return validity without placing unused device inputs."""
+    if isinstance(model, BlockDenoiser):
+        raise TypeError(f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not a "
+                        "token at a time; generate with BlockGeneration")
+    if not isinstance(model, Decoding):
+        raise TypeError(f"{type(model).__name__} opens no decode cache (Decoding.init_cache), so it cannot "
+                        "continue a prompt token by token")
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
