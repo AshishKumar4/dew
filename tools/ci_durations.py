@@ -5,8 +5,11 @@ pytest-split balances the shards on `tests/test_durations.json`, a map from
 each test's node id to its seconds. A test the file does not name counts as
 the average, so the file only needs refreshing when the suite's weight moves:
 
-    gh run download <run id> --repo AshishKumar4/dew --dir /tmp/ci-run
-    python tools/ci_durations.py /tmp/ci-run/pytest-report-3.14-*/pytest-report.xml
+    gh run download <run id> --repo AshishKumar4/dew --dir <dir> --pattern 'pytest-report-*'
+    python tools/ci_durations.py <dir>/pytest-report-*/pytest-report.xml
+
+A test that several reports name (main runs both Pythons) weighs its mean,
+so the chunks balance on each.
 """
 
 import argparse
@@ -28,16 +31,18 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("reports", nargs="+", type=Path)
     args = parser.parse_args()
-    durations = {}
+    durations: dict[str, list[float]] = {}
     for report in args.reports:
         for case in ET.parse(report).getroot().iter("testcase"):
             # A failure's or a skip's time is not the test's weight: a timeout
             # would outweigh a shard, and a skip weighs nothing on this lane.
             if any(case.find(kind) is not None for kind in ("failure", "error", "skipped")):
                 continue
-            durations[node_id(case.get("classname", ""), case.get("name", ""))] = float(case.get("time", 0))
-    OUT.write_text(json.dumps(dict(sorted(durations.items())), indent=0) + "\n")
-    print(f"{len(durations)} tests, {sum(durations.values()):.0f} s, written to {OUT}")
+            durations.setdefault(node_id(case.get("classname", ""), case.get("name", "")), []).append(
+                float(case.get("time", 0)))
+    weights = {name: round(sum(times) / len(times), 3) for name, times in sorted(durations.items())}
+    OUT.write_text(json.dumps(weights, indent=0) + "\n")
+    print(f"{len(weights)} tests, {sum(weights.values()):.0f} s, written to {OUT}")
 
 
 if __name__ == "__main__":
