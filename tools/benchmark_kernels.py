@@ -25,15 +25,17 @@ import argparse
 import json
 import time
 
-import benchmark_step
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+from benchmark_cases import Case
+from benchmark_models import batches, build_trainer
 
 from dew.config import OptimConfig
 from dew.nn.moe import expert_projection
 from dew.telemetry.profile import capture_options
+from dew.training.distributed import DevicePrefetchIterator
 
 VOCAB = 50304
 SEQUENCE = 1024
@@ -104,7 +106,7 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
 def lm_dense_tree() -> dict[str, jax.Array]:
     """The lm-dense model's parameters as one flat tree, initialized."""
     case = case_for("lm-dense", 1, None)
-    model = benchmark_step.build_trainer(case).objective.model
+    model = build_trainer(case).objective.model
     variables = jax.eval_shape(lambda: model.init(jax.random.key(0),
                                                   jnp.zeros((1, 8), jnp.int32)))
     leaves = jax.tree.leaves(variables["params"])
@@ -140,7 +142,7 @@ def adam(args: argparse.Namespace) -> dict[str, object]:
             "state_bytes": sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(state))}
 
 
-def case_for(path: str, batch: int, args: argparse.Namespace | None) -> benchmark_step.Case:
+def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
     def decoder(layers: int, width: int, heads: int, mlp: int) -> dict[str, object]:
         return {"vocab_size": VOCAB, "emb_features": width, "num_layers": layers,
                 "num_heads": heads, "mlp_features": mlp, "max_seq_len": SEQUENCE}
@@ -150,7 +152,7 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> benchmar
         # DiT-L/2's width and depth on 64x64 inputs, 1024 tokens a sample.
         config: dict[str, object] = {"patch_size": 2, "emb_features": 1024, "num_layers": 24,
                                      "num_heads": 16, "mlp_ratio": 4, "remat": remat != "none"}
-        return benchmark_step.Case("simple_dit", config, dtype="bfloat16", batch_size=batch,
+        return Case("simple_dit", config, dtype="bfloat16", batch_size=batch,
                                    image_size=64)
     if path == "lm-dense":
         config = decoder(24, 1024, 16, 2816)
@@ -160,7 +162,7 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> benchmar
             mixture["implementation"] = args.implementation
         config = {**decoder(12, 768, 12, 2048), "mixture": mixture}
     config["remat"] = None if remat in (None, "none") else remat
-    return benchmark_step.Case("causal_transformer", config, dtype="bfloat16",
+    return Case("causal_transformer", config, dtype="bfloat16",
                                batch_size=batch, seq_len=SEQUENCE)
 
 
@@ -173,10 +175,9 @@ def step(args: argparse.Namespace) -> dict[str, object]:
         import dew.nn.backbones.dit as dit
         dit.remat_block = functools.partial(dit.remat_block, policy=None)
     case = case_for(args.path, args.batch, args)
-    trainer = benchmark_step.build_trainer(case, optimizer=OptimConfig(
+    trainer = build_trainer(case, optimizer=OptimConfig(
         optimizer="adam", learning_rate=1e-4, state_dtype=args.state_dtype).build(1000))
-    source = benchmark_step.DevicePrefetchIterator(
-        benchmark_step.batches(case, trainer.device_mesh), trainer.device_mesh)
+    source = DevicePrefetchIterator(batches(case, trainer.device_mesh), trainer.device_mesh)
     with source:
         abstract = jax.eval_shape(trainer.initial_state)
         state = jax.jit(trainer.initial_state, out_shardings=trainer.shardings(abstract))()
