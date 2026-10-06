@@ -261,13 +261,15 @@ two before the model reads them."""
 
 
 VALID_ROWS = "valid_rows"
-"""The field every evaluation batch carries: one bool a row, True for a real
-record and False for a repeat. A split's last batch is filled out to the
-batch's rows with repeats of its own rows, and a process whose share ran out
-before its peers' scores a copy of its last batch with every row a repeat, so
-a pass is whole batches on every process and counts each record once. A
-loss weights its rows by it, and its batch-wide terms are taken over the
-real rows; training batches never carry it."""
+"""The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
+
+A split's last batch is padded to full size with repeats of its own rows, and
+a process whose share runs out before the others' scores a copy of its last
+batch in which every row is a repeat. That way a pass is whole batches on
+every process and counts each record once. A loss weights its rows by this
+field, and its batch-wide terms are taken over the real rows only. Training
+batches never have it.
+"""
 
 
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
@@ -506,12 +508,12 @@ class Objective(ABC, Generic[Loss, Effects]):
                  rows: int | tuple[int, ...] = 0) -> Ratio:
         """Return the mean of `values` over `axis`, as the `Ratio` of their sum and count.
 
-        `rows` is the axis of `values`, or the consecutive axes, that index
-        `batch`'s rows. The sum runs over `axis` (every axis by default) and
-        the count is the entries summed. Under an evaluation batch's
-        `VALID_ROWS` a repeat row weighs zero in both, so a loss and every
-        batch-wide term taken through this count each real record once;
-        without it this is `jnp.sum` and the size, as training reads it.
+        `rows` is the axis of `values`, or the consecutive axes, that index `batch`'s
+        rows. The sum runs over `axis` (every axis by default), and the count is the
+        number of entries summed. When the batch is an evaluation batch with
+        `VALID_ROWS`, a repeat row has zero weight in both, so a loss and every
+        batch-wide term computed through this count each real record once. Without
+        `VALID_ROWS`, as in training, this is `jnp.sum` and the size.
         """
         dtype = jnp.promote_types(values.dtype, jnp.float32)
         axes = (tuple(range(values.ndim)) if axis is None

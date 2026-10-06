@@ -138,7 +138,7 @@ DataPartition(index=0, count=1, readers=1, reader=0)
 Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
 ```
 
-`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, its last batch filled out with repeats that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
+`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, with its last batch padded by repeated rows that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
 
 `train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass; `val` is `None` when there is no validation data. Each iterator reads the share of every global batch that its `DataPartition` names. The partition splits each batch into `count` disjoint shares; `index` is the share to read; `readers` is the number of processes that read that share alike; and `reader` is which of those processes this one is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row.
 
