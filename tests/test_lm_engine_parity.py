@@ -170,7 +170,7 @@ def test_mup_groups_and_adamw_steps_match_lm_engine(reference):
         assert node == membership[source], (path, node, membership[source])
 
     config = OptimConfig(
-        optimizer="adamw", optimizer_opts={"b1": 0.9, "b2": 0.95, "eps": 1e-10},
+        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-10},
         schedule=Power(peak=0.01, warmup_steps=2, a=0.05, b=-0.51, c=16.0),
         weight_decay=0.1, param_groups=groups)
     with float64():
