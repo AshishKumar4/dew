@@ -1724,6 +1724,23 @@ slots and 32 requests a second, a token gap's p50 is 11.7 ms paged against
 fits. The served tokens part from the two forwards' in the same 27 of 64
 rows at 32 slots as with the dense cache, all at bf16 near-ties.
 
+Where the paged step's time goes, measured on an A100 40 GB at integration
+`a906f011`. Qwen3-0.6B, two rounds alternating, 20 traced decode steps a
+case. At 128 slots the paged cache served 11407-11417 tokens a second
+closed loop against the dense cache's 14607-14628 (0.78), and at 32 slots
+7269-7278 against 7974-7983 (0.91). At 128 slots the decode step is on the
+device for 8.21 ms paged against 6.41 dense. cuDNN's paged attention kernel
+accounts for 1.67 ms of the 1.80 ms difference (5.12 against 3.45 ms
+dense). The paged write's scatter and a pad fusion add 0.41 ms more (0.31 +
+0.23 against the dense scatter's 0.13), and the dense step's cache copies
+and a concatenate (0.23 + 0.08 ms), which the paged step has none of, take
+back 0.31. The GEMMs are the same (1.65 ms). The
+page pools' layout costs nothing: cuDNN reads `[pages, page_size, heads,
+dim]`, and XLA already assigns the donated pools that layout. Holding them
+in it from the start (`perf/paged-layout`, not adopted) left the step at
+8.207 ms and the generations bitwise equal. A one-layer program compiled
+alone does transpose the pools, so a probe of one layer misleads here.
+
 Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag), the paged
 write put a dropped token's keys at another head's kept slot (jax 0.11.2, an
 RTX 4080). The write is a scatter into the pool's page and offset axes past
