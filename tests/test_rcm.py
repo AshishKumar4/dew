@@ -148,7 +148,9 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     """The teacher is a saved run; the student and fake score start from
     it. Past the warmup one step in two trains the student and the other
     the fake score, each leaving the other's gradient zero, and the saved
-    student's task samples as the objective's own."""
+    student's task samples as the objective's own. A run that trains a LoRA
+    on the student distills the same teacher, whose model and the fake
+    score's are the run's without the adapter."""
     import dataclasses
 
     import optax
@@ -158,6 +160,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import TFDSImages
     from dew.diffusion.presets import Flow
+    from dew.lora import LoRA
     from dew.objectives.base import Step
     from dew.objectives.diffusion import (
         ConsistencyDistillation,
@@ -199,6 +202,12 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     ).save(str(fast))
     with pytest.raises(ValueError, match="time_scale=16"):
         dataclasses.replace(teacher_run, mode=ConsistencyDistillation(teacher=str(fast))).build()
+    # A teacher whose time features turn slower still is as smooth to differentiate.
+    slow = tmp_path / "slow"
+    slow.mkdir()
+    dataclasses.replace(teacher_run, model=dataclasses.replace(
+        teacher_run.model, config={**teacher_run.model.config, "time_scale": 0.001})).save(str(slow))
+    ConsistencyDistillation(teacher=str(slow)).check_teacher(None)
 
     config = dataclasses.replace(teacher_run, mode=ConsistencyDistillation(
         teacher=str(tmp_path / "teacher"), teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,
@@ -237,6 +246,14 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     expected = task.pipeline(distilled, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(TextToImage.from_run(str(tmp_path / "student"))(["a red bird"], key=9)
                                   .host().images, expected)
+
+    adapted = dataclasses.replace(config, lora=LoRA(rank=2, modules=("ada_proj", "final_proj"))).build()
+    assert isinstance(adapted, ConsistencyDistillationObjective)
+    assert adapted.teacher == adapted.fake_score == task.model
+    trainer = Trainer(adapted, optax.adam(1e-3), key=jax.random.PRNGKey(5))
+    tuned = trainer.initial_state()
+    tuned, *_ = trainer.compile(tuned, batch)(tuned, batch)
+    assert all(np.all(np.isfinite(np.asarray(leaf))) for leaf in jax.tree.leaves(tuned.variables["params"]))
 
 
 TRAINING = np.load(Path(__file__).resolve().parent / "fixtures" / "rcm" / "training.npz")
@@ -296,7 +313,7 @@ def distilled(monkeypatch, optimizer, prefix=""):
             student_update_freq=config["student_update_freq"],
             max_simulation_steps=config["max_simulation_steps_fake"], student_times=(mean_g, std_g),
             critic_times=(mean_d, std_d), **discrete_fields(prefix)),
-        teacher=teacher, ema_decay=power_decay(config["ema_rate"]))
+        teacher=Weighted(), teacher_variables=teacher, ema_decay=power_decay(config["ema_rate"]))
     drawn = {name: jnp.asarray(TRAINING[f"{prefix}draws/{name}"]) for name in _Draws._fields}
     monkeypatch.setattr(ConsistencyDistillationObjective, "_draws", lambda self, step, count, shape: _Draws(
         **{name: value[step.step] for name, value in drawn.items()}))
@@ -380,6 +397,66 @@ def test_training_at_rcms_published_optimizer_is_rcms_up_to_optax_rounding(monke
     theirs = distance(TRAINING["published/student/weights"], truth)
     assert distance(student, truth) <= 2 * theirs + slack, (distance(student, truth), theirs, slack)
     assert config["iterations"] == 10
+
+
+class Projected(nn.Module):
+    """A velocity network of two projections, which an adapter targets."""
+
+    @nn.compact
+    def __call__(self, x, time):
+        hidden = jnp.tanh(nn.Dense(8, name="hidden")(x + (time / 1000).reshape(-1, 1, 1, 1)))
+        return nn.Dense(x.shape[-1], name="out")(hidden)
+
+
+def test_a_lora_student_distills_beside_its_whole_teacher_and_fake_score():
+    """rCM's teacher and fake score run through the teacher's model, never
+    the student's, so a LoRA-adapted student distills. It starts as the
+    teacher with its B factors zero, so its student and critic losses are
+    the whole student's, bit for bit. Its updates move its factors and the
+    fake score's whole weights, and the teacher's weights it froze stay as
+    they were."""
+    from dew.diffusion import presets
+    from dew.inputs import Field, InputSpec
+    from dew.lora import LoRA
+    from dew.objectives.base import FROZEN, Step
+    from dew.objectives.diffusion import ConsistencyDistillation, ConsistencyDistillationObjective
+    from dew.objectives.diffusion.objective import FAKE_SCORE
+    from dew.training import Trainer
+
+    model, inputs = Projected(), InputSpec(Field("image", (4, 4, 3)))
+    teacher = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))
+    # The step donates the state, whose teacher and frozen leaves are these buffers.
+    held = jax.tree.map(np.asarray, teacher["params"])
+    adapter = LoRA(rank=2, modules=("hidden", "out")).apply(model, teacher, key=1)
+    distillation = ConsistencyDistillation(teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,
+                                           max_simulation_steps=2)
+
+    def objective(student, **kwargs):
+        return ConsistencyDistillationObjective(student, presets.Flow()(), inputs, distillation,
+                                                teacher=model, teacher_variables=teacher, ema_decay=None,
+                                                **kwargs)
+
+    tasks = objective(model), objective(adapter.model, variables={**adapter.variables, "encoders": {}})
+    starts = [task.init(jax.random.PRNGKey(2)) for task in tasks]
+    student = {path for path, _ in jax.tree_util.tree_flatten_with_path(starts[1]["params"])[0]
+               if path[0].key != FAKE_SCORE}
+    assert {path[-1].key for path in student} == {"lora_A", "lora_B"}
+    batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (8, 4, 4, 3), 0, 256), np.uint8)}
+    for iteration in (1, 2):
+        step = Step(jnp.asarray(iteration), jax.random.PRNGKey(3), None)
+        np.testing.assert_array_equal(*(task.loss(start, batch, step)[0].total
+                                        for task, start in zip(tasks, starts, strict=True)))
+
+    trainer = Trainer(tasks[1], optax.adam(1e-2), key=jax.random.PRNGKey(4))
+    state = trainer.initial_state()
+    run = trainer.compile(state, batch)
+    for _ in range(3):
+        state, *_ = run(state, batch)
+    params = state.variables["params"]
+    for got, want in zip(jax.tree.leaves(state.variables[FROZEN]), jax.tree.leaves(held), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert np.any(np.asarray(params["out"]["lora_B"]) != 0)
+    assert not np.array_equal(np.asarray(params[FAKE_SCORE]["out"]["kernel"]), held["out"]["kernel"])
 
 
 def test_a_reverse_only_kernel_takes_forward_mode_through_its_reference():

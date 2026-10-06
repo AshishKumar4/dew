@@ -119,9 +119,10 @@ def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
 
 SMOOTH_TIME_SCALE = 0.002
 """The Fourier time scale a model trained through a derivative in time takes
-when its config names none. On a 2-D two-class toy (RTX 4080), one-step
-class accuracy at simple_dit's default 16 against 0.002 was MeanFlow 23%
-against 99%, an sCM student 11% against 98.6%."""
+when its config names none, and the fastest an sCM teacher's may turn
+(`ConsistencyDistillation.check_teacher`). On a 2-D two-class toy (RTX
+4080), one-step class accuracy at simple_dit's default 16 against 0.002 was
+MeanFlow 23% against 99%, an sCM student 11% against 98.6%."""
 
 
 @trainings("mean_flow")
@@ -149,7 +150,8 @@ class MeanFlowTraining(Training):
         object.__setattr__(self, "guidance_interval", (start, stop))
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> MeanFlowObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> MeanFlowObjective:
         return MeanFlowObjective(model, process, inputs, self, autoencoder=autoencoder, variables=variables,
                                  unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
                                  solver=run.solver, guidance=None, steps=run.sampling_steps)
@@ -175,7 +177,8 @@ class ShortcutTraining(Training):
             raise ValueError(f"sections is a power of two, not {self.sections}")
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None, variables: Variables | None) -> ShortcutObjective:
+                  base: nn.Module, autoencoder: AutoEncoder | None,
+                  variables: Variables | None) -> ShortcutObjective:
         return ShortcutObjective(model, process, inputs, self, autoencoder=autoencoder, variables=variables,
                                  unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
                                  solver=run.solver, guidance=None, steps=run.sampling_steps)

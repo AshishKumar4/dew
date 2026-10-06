@@ -74,7 +74,7 @@ class GuidanceDistillation(Training):
             raise ValueError("guidance distillation distills a teacher; name its run directory")
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None,
+                  base: nn.Module, autoencoder: AutoEncoder | None,
                   variables: Variables | None) -> GuidanceDistillationObjective:
         """Return the student objective over the teacher run's objective and its variables.
 
@@ -133,17 +133,11 @@ class GuidanceDistillationObjective(DiffusionObjective):
                 *(program._replace(trained=False) for program in self.teacher.program_key()))
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
-        count = len(super().program_key())
-        super().substitute(modules[:count])
-        self.teacher.substitute(modules[count:])
+        self.model, *teacher = modules
+        self.teacher.substitute(teacher)
 
     def held_variables(self) -> Variables:
         return {**super().held_variables(), TEACHER: self.teacher_variables}
-
-    def init(self, key, variables: Variables | None = None) -> Variables:
-        state = dict(super().init(key, variables))
-        state.setdefault(TEACHER, self.teacher_variables)
-        return state
 
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)
