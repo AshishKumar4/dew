@@ -494,22 +494,23 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
 
 
-def test_a_repae_step_s_loss_and_terms_are_train_repae_s(repae_step):
+def test_a_repae_step_s_loss_and_terms_are_train_repae_s(repae_step, repae_step_f64):
     """The loss is half the SiT's plus the VAE's and the discriminator's,
     within 1e-6 of the reference's float64 run: the reference computes the
     three apart and never their sum in float32, so no float32 reference
-    measures the sum. Each term is held to the reference by the float64
-    rule: the generator's hinge is a mean of logits of both signs, whose
-    float32 rounding is large beside its value (the reference's own is
-    2.6e-5 relative)."""
+    measures the sum. Each term is one number, too few for the float32
+    rule's RMS to settle: the hinges are means of logits of both signs, and
+    the discriminator's ratio, under 2 here, was 3.47 on CI's eastus runner.
+    So each term is held in float64, Dew's float64 run within the float64
+    rounding of the step's computation of the reference's."""
     np.testing.assert_allclose(
         float(repae_step.value),
         0.5 * STEPPED["loss/sit_f64"] + STEPPED["loss/vae_f64"] + STEPPED["loss/discriminator_f64"],
         rtol=1e-6)
     for term in ("alignment", "autoencoder_alignment", "reconstruction", "kl", "perceptual", "generator",
                  "discriminator"):
-        assert_as_exact_as_the_reference(np.asarray(repae_step.aux.metrics[term]), STEPPED[f"loss/{term}"],
-                                         STEPPED[f"loss/{term}_f64"], term)
+        assert_computes_the_oracle(np.asarray(repae_step_f64.aux.metrics[term]), STEPPED[f"loss/{term}_f64"],
+                                   term, roundings=repae_step_f64.roundings)
 
 
 def test_each_network_steps_on_its_own_optimizer_as_repa_e_s_three_do(repae_step):
