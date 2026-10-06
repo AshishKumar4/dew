@@ -219,6 +219,7 @@ class SourceQuantization:
     input_scale_dtype: Literal['unrounded', 'float8_e4m3fn'] | None = None
     input_format: Literal['compressed-tensors', 'modelopt'] = 'compressed-tensors'
     input_suffix: Literal['.input_global_scale', '.input_scale'] = '.input_global_scale'
+    input_kind: Callable[[str], Literal['nvfp4', 'fp8', 'none']] = lambda name: 'nvfp4'
 
     def tensor_names(self, tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
@@ -1284,16 +1285,56 @@ def compressed_tensors(quantization: Mapping[str, object],
 MODELOPT_PARTS = ('.weight_scale', '.weight_scale_2', '.input_scale')
 """ModelOpt's E4M3 block scales, fp32 global weight multiplier and fp32 input multiplier."""
 
+MODELOPT_ALGOS = ('NVFP4', 'W4A16_NVFP4', 'FP8')
+"""The per-layer algorithms ModelOpt's published mixed table dispatches."""
 
-def _modelopt_names(tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
+_MODELOPT_FP8_WEIGHTS = {
+    'format': 'float-quantized', 'config_groups': {'fp8': {'weights': {
+        'num_bits': 8, 'type': 'float', 'strategy': 'tensor', 'symmetric': True, 'dynamic': False}}}}
+"""ModelOpt's tensor-scaled FP8 weights use the existing compressed-tensors FP8 codec."""
+
+
+def _modelopt_algo(name: str, method: str, layers: Mapping[str, str]) -> str:
+    stem = name.removesuffix('.weight')
+    if method != 'MIXED_PRECISION':
+        return method
+    while stem:
+        if stem in layers:
+            return layers[stem]
+        stem = stem.rsplit('.', 1)[0] if '.' in stem else ''
+    raise ValueError(f"{name} has no algorithm in ModelOpt quantized_layers")
+
+
+def _modelopt_input_kind(name: str, method: str,
+                         layers: Mapping[str, str]) -> Literal['nvfp4', 'fp8', 'none']:
+    algo = _modelopt_algo(name, method, layers)
+    if algo == 'FP8':
+        return 'fp8'
+    return 'none' if algo == 'W4A16_NVFP4' else 'nvfp4'
+
+
+def _modelopt_layer_parts(name: str, algo: str) -> tuple[str, ...]:
+    stem = name.removesuffix('.weight')
+    parts = (stem + '.weight_scale',)
+    if algo != 'FP8':
+        parts += (stem + '.weight_scale_2',)
+    if algo != 'W4A16_NVFP4':
+        parts += (stem + '.input_scale',)
+    return parts
+
+
+def _modelopt_names(tensors: Mapping[str, np.ndarray], *, method: str = 'NVFP4',
+                    layers: Mapping[str, str] = {}) -> tuple[str, ...]:
     stems = sorted({name.removesuffix(suffix) for name in tensors
                     for suffix in MODELOPT_PARTS if name.endswith(suffix)})
     for stem in stems:
-        parts = ('.weight', *MODELOPT_PARTS)
-        missing = [stem + part for part in parts if stem + part not in tensors]
+        name = stem + '.weight'
+        algo = _modelopt_algo(name, method, layers)
+        parts = (name, *_modelopt_layer_parts(name, algo))
+        missing = [part for part in parts if part not in tensors]
         if missing:
             raise ValueError(f"{stem}.weight is ModelOpt NVFP4 and the checkpoint holds no {missing}")
-        if stem == 'lm_head':
+        if stem == 'lm_head' and algo != 'W4A16_NVFP4':
             raise ValueError("ModelOpt lm_head input quantization is not computed by the chunked loss head")
         if any(stem + part in tensors for part in ('.pre_quant_scale', '.input_pre_quant_scale')):
             raise ValueError(f"{stem} has ModelOpt pre_quant_scale, "
@@ -1305,54 +1346,74 @@ def _modelopt_parts(name: str) -> tuple[str, ...]:
     return tuple(name.removesuffix('.weight') + suffix for suffix in MODELOPT_PARTS)
 
 
-def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+def _modelopt_decode(tensors: Mapping[str, np.ndarray], name: str, *, method: str = 'NVFP4',
+                     layers: Mapping[str, str] = {}) -> np.ndarray:
     """ModelOpt 0.47.0's NVFP4QTensor.dequantize: block scale times global, then codes, then bf16."""
     packed = np.asarray(tensors[name])
-    scale, overall, inputs = (np.asarray(tensors[part]) for part in _modelopt_parts(name))
-    if (packed.dtype != np.uint8 or packed.ndim != 2 or packed.shape[1] % 8
-            or scale.dtype != np.dtype(E4M3) or scale.shape != (packed.shape[0], packed.shape[1] // 8)
-            or overall.dtype != np.float32 or overall.size != 1
-            or inputs.dtype != np.float32 or inputs.size != 1):
+    algo = _modelopt_algo(name, method, layers)
+    parts = _modelopt_layer_parts(name, algo)
+    if algo == 'FP8':
+        scale = np.asarray(tensors[parts[0]])
+        if packed.dtype != np.dtype(E4M3) or packed.ndim != 2 or scale.dtype != np.float32 or scale.size != 1:
+            raise ValueError(f"{name} must be ModelOpt per-tensor E4M3 FP8 with a scalar float32 scale")
+        # Reuse the existing per-tensor FP8 codec with the author's scale
+        # rounding in FP8QTensor.dequantize: scale and product both bf16.
+        codec = compressed_tensors(_MODELOPT_FP8_WEIGHTS)
+        return codec.decode({name: packed, parts[0]: scale.astype(ml_dtypes.bfloat16)}, name)
+    scale, overall = (np.asarray(tensors[part]) for part in parts[:2])
+    if (packed.dtype != np.uint8 or packed.ndim not in (2, 3) or packed.shape[-1] % 8
+            or scale.dtype != np.dtype(E4M3) or scale.shape != (*packed.shape[:-1], packed.shape[-1] // 8)
+            or overall.dtype != np.float32 or overall.size not in (1, packed.shape[0])):
         raise ValueError(f"{name} must be ModelOpt U8 E2M1 pairs with one E4M3 scale per 16 inputs "
                          "and scalar float32 weight_scale_2/input_scale")
     if (not np.isfinite(scale.astype(np.float32)).all()
             or not np.isfinite(overall).all() or (overall < 0).any()):
         raise ValueError(f"{name} ModelOpt scales must be finite and nonnegative")
-    values = _E2M1_BYTES[packed].reshape(packed.shape[0], -1, 16)
+    values = _E2M1_BYTES[packed].reshape(*packed.shape[:-1], -1, 16)
     # The author's Python reader maps code 8 to +0; packed bytes remain in
     # the export grid so an untrained save can still keep that source code.
     values = np.where(values == 0, np.float32(0), values)
-    effective = scale.astype(np.float32) * overall.reshape(())
-    return (values * effective[..., None]).reshape(packed.shape[0], -1).astype(
+    global_shape = () if overall.size == 1 else (packed.shape[0], *(1 for _ in scale.shape[1:]))
+    effective = scale.astype(np.float32) * overall.reshape(global_shape)
+    return (values * effective[..., None]).reshape(*packed.shape[:-1], packed.shape[-1] * 2).astype(
         ml_dtypes.bfloat16).astype(np.float32)
 
 
-def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, np.ndarray] | None
+def _modelopt_encode(name: str, weight: np.ndarray, *, grid: Mapping[str, np.ndarray] | None,
+                     method: str = 'NVFP4', layers: Mapping[str, str] = {}
                      ) -> dict[str, np.ndarray]:
-    parts = _modelopt_parts(name)
-    scale, overall, inputs, original = _gridded(grid, name, (*parts, name))
-    effective = np.repeat(scale.astype(np.float32) * overall.reshape(()), 16, axis=-1)
+    algo = _modelopt_algo(name, method, layers)
+    parts = _modelopt_layer_parts(name, algo)
+    held = _gridded(grid, name, (*parts, name))
+    if algo == 'FP8':
+        codec = compressed_tensors(_MODELOPT_FP8_WEIGHTS, grid={parts[0]: held[0]})
+        return {**codec.encode(name, weight), parts[1]: held[1]}
+    scale, overall, original = held[0], held[1], held[-1]
+    global_shape = () if overall.size == 1 else (weight.shape[0], *(1 for _ in scale.shape[1:]))
+    effective = np.repeat(scale.astype(np.float32) * overall.reshape(global_shape), 16, axis=-1)
     if np.any((effective == 0) & (weight != 0)):
         raise ValueError(f"{name} has a zero ModelOpt weight scale and trained values outside its grid")
     quotients = np.divide(weight.astype(np.float32), effective, out=np.zeros_like(effective),
                           where=effective != 0)
     packed = encode_e2m1(np.clip(quotients, -6, 6), ties='even')
-    low_zero = ((original & 15) == 8) & (weight[:, 0::2] == 0)
-    high_zero = ((original >> 4) == 8) & (weight[:, 1::2] == 0)
+    low_zero = ((original & 15) == 8) & (weight[..., 0::2] == 0)
+    high_zero = ((original >> 4) == 8) & (weight[..., 1::2] == 0)
     packed = np.where(low_zero, (packed & 0xf0) | 8, packed)
     packed = np.where(high_zero, (packed & 0x0f) | 0x80, packed).astype(np.uint8)
-    return {name: packed, **dict(zip(parts, (scale, overall, inputs), strict=True))}
+    return {name: packed, **dict(zip(parts, held[:-1], strict=True))}
 
 
 def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, object],
                    grid: Mapping[str, np.ndarray] | None) -> SourceQuantization:
-    """Dense ModelOpt NVFP4 W4A4, held to the author's exporter and own sm89 fake quantizer.
+    """ModelOpt's per-layer dispatch, held to the author's exporter and quantizers.
 
-    Mixed FP8/NVFP4 and per-expert input scales need other input rules and
-    remain refused. Each accepted source Linear owns its input multiplier;
-    the checkpoint Qwix provider reads it after the weight codec binds it.
+    FP8 and NVFP4 own their stored input multipliers; W4A16_NVFP4 stores
+    only quantized weights even when generic config_groups advertise an
+    input quantizer. Per-expert activation quantizers remain refused.
+    The checkpoint Qwix provider reads each accepted Linear's input rule.
     """
-    if quantization.get('quant_algo') != 'NVFP4':
+    method = quantization.get('quant_algo')
+    if method not in ('NVFP4', 'MIXED_PRECISION'):
         raise ValueError(f"quant_method 'modelopt' quant_algo {quantization.get('quant_algo')!r} needs "
                          "other input activations; this loader reads dense NVFP4 W4A4")
     if quantization.get('kv_cache_quant_algo') is not None or quantization.get('kv_cache_scheme') is not None:
@@ -1361,9 +1422,36 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
     architecture = text if isinstance(text, Mapping) else config
     for key in ('num_experts', 'num_local_experts', 'n_routed_experts', 'num_routed_experts'):
         experts = architecture.get(key)
-        if isinstance(experts, int) and experts > 1:
+        if method == 'NVFP4' and isinstance(experts, int) and experts > 1:
             raise ValueError("ModelOpt per-expert input activations need a provider "
                              "this loader does not compute")
+    layers: dict[str, str] = {}
+    if method == 'MIXED_PRECISION':
+        if not isinstance(quantization.get('quantized_layers'), Mapping):
+            raise ValueError("ModelOpt MIXED_PRECISION quantized_layers must declare every algorithm")
+        declared = records.record(quantization['quantized_layers'], 'ModelOpt quantized_layers')
+        if not declared:
+            raise ValueError("ModelOpt MIXED_PRECISION quantized_layers must declare every algorithm")
+        for name, entry in declared.items():
+            entry = records.record(entry, f'ModelOpt quantized_layers.{name}')
+            algo = entry.get('quant_algo')
+            if algo not in MODELOPT_ALGOS:
+                raise ValueError(f"ModelOpt {name} quant_algo {algo!r} has no input rule in this loader")
+            if algo in ('NVFP4', 'W4A16_NVFP4') and entry.get('group_size', 16) != 16:
+                raise ValueError(f"ModelOpt {name} group_size must be 16")
+            if algo == 'NVFP4' and '.experts' in str(name):
+                raise ValueError(f"ModelOpt {name} per-expert input activations are not computed")
+            layers[str(name)] = str(algo)
+        # config_groups can advertise W4A4 for a W4A16_NVFP4 layer. The
+        # published per-layer table is the deployment dispatch contract.
+        return SourceQuantization(
+            partial(_modelopt_names, method=str(method), layers=layers),
+            lambda name: _modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)),
+            partial(_modelopt_decode, method=str(method), layers=layers),
+            partial(_modelopt_encode, grid=grid, method=str(method), layers=layers),
+            grid=lambda name: (*_modelopt_layer_parts(name, _modelopt_algo(name, str(method), layers)), name),
+            input_scale_dtype='float8_e4m3fn', input_format='modelopt', input_suffix='.input_scale',
+            input_kind=partial(_modelopt_input_kind, method=str(method), layers=layers))
     groups = records.record(quantization.get('config_groups'), 'ModelOpt config_groups')
     expected = {'num_bits': 4, 'type': 'float', 'group_size': 16, 'dynamic': False}
     if not groups:

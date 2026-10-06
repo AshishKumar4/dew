@@ -202,6 +202,44 @@ class NVFP4Input:
             raise ValueError("ModelOpt NVFP4 always rounds its local scales to E4M3")
 
 
+@dataclasses.dataclass(frozen=True)
+class FP8Input:
+    """One ModelOpt static E4M3 input multiplier, amax/448 in its exported files."""
+
+    scale: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.scale) or self.scale <= 0:
+            raise ValueError(f"ModelOpt FP8 input_scale must be positive and finite, got {self.scale}")
+
+
+def fp8_input_qdq(x: jax.Array, spec: FP8Input) -> jax.Array:
+    """ModelOpt's static FP8 input QDQ using Qwix's E4M3 codes and stored scale.
+
+    tensor_quant.py:_fp8_eager widens before scaling and returns the input
+    dtype. The reference reconstructs amax from the file's amax/448,
+    computes 448/amax and its reciprocal in fp32, casts directly to E4M3
+    RN, and dequantizes by that reciprocal. Keeping both divisions holds
+    the scale's last bits to the author's fake quantizer. Backward is Dew's STE.
+    """
+    from dew.nn.fake_quant import straight_through
+
+    qarray = _qwix("qwix._src.core.qarray")
+    values = jax.lax.stop_gradient(x).astype(jnp.float32)
+    amax = jnp.full(values.shape, spec.scale, jnp.float32) * jnp.float32(448)
+    safe = jnp.where(amax <= jnp.float32(2 ** -24), 1, amax)
+    # torch's scalar/tensor reverse divide is reciprocal then multiply.
+    multiplier = _nvfp4_divide(jnp.ones_like(values), safe) * jnp.float32(448)
+    scale = _nvfp4_divide(jnp.ones_like(values), multiplier)
+    # The composed GPU forward must round this product before the FP8 cast.
+    quotients = jax.lax.optimization_barrier(values * multiplier)
+    quantized = qarray.quantize_with_scale_zero_point(
+        quotients, jnp.float8_e4m3fn, jnp.ones_like(scale), None)
+    quantized = quantized.replace(scale=scale)
+    rounded = qarray.dequantize(quantized)
+    return straight_through(x, rounded)
+
+
 def _nvfp4_divide(numerator: jax.Array, denominator: jax.Array) -> jax.Array:
     """CT's correctly rounded fp32 quotient, including on XLA's approximate GPU divider.
 
@@ -332,7 +370,7 @@ def _modelopt_input_qdq(x: jax.Array, spec: NVFP4Input, qarray: ModuleType) -> j
     return straight_through(x, jnp.where(rounded == 0, jnp.zeros_like(rounded), rounded))
 
 
-def checkpoint_input_quantization(model: nn.Module, inputs: Mapping[str, NVFP4Input]) -> nn.Module:
+def checkpoint_input_quantization(model: nn.Module, inputs: Mapping[str, NVFP4Input | FP8Input]) -> nn.Module:
     """Wrap the checkpoint's Linear scopes through the existing Qwix provider path.
 
     The weights already hold the source reader's decoded values. Input QDQ
@@ -350,7 +388,8 @@ def checkpoint_input_quantization(model: nn.Module, inputs: Mapping[str, NVFP4In
             if rule is not None:
                 if dimension_numbers[0][0] != (lhs.ndim - 1,):
                     raise ValueError("checkpoint NVFP4 input QDQ requires the Linear's trailing input axis")
-                lhs = nvfp4_input_qdq(lhs, by_pattern[rule.module_path])
+                spec = by_pattern[rule.module_path]
+                lhs = fp8_input_qdq(lhs, spec) if isinstance(spec, FP8Input) else nvfp4_input_qdq(lhs, spec)
             return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
                                        preferred_element_type=preferred_element_type,
                                        out_sharding=out_sharding)
