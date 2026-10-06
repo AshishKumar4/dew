@@ -38,9 +38,8 @@ type InputTree = (ModelInputs | jax.Array | np.ndarray | None
 # an absent input.
 type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
 
-# How a token field continues into a response (`ModelInputs.extended`): from
-# the prompt's `[B, S, ...]` value, its `[B, S]` real slots and the
-# response's width, the `[B, W, ...]` values of the response's slots.
+# A token field's `[B, W, ...]` response values from its `[B, S, ...]` prompt
+# values, the prompt's `[B, S]` real slots and the width (`ModelInputs.extended`).
 type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
 
 PredictionPhase = Literal["ordinary", "extend", "draft"]
@@ -217,14 +216,11 @@ class ModelInputs:
 
     def extended(self, tokens: jax.Array, *, rules: Mapping[str, FieldExtension] | None = None
                  ) -> ModelInputs:
-        """These inputs with a response's `[B, W]` `tokens` after the prompt's slots.
+        """These inputs with a response's `[B, W]` `tokens` after the prompt's slots,
+        each token field continued by its rule in `rules` or `RESPONSE_FIELDS`.
 
-        Each token field continues past the prompt's last real token by its
-        rule in `RESPONSE_FIELDS`, or by the one `rules` names for it, which
-        also replaces a built-in one. A field with neither raises ValueError
-        rather than take a guessed value, as does a response of another batch.
-        A field absent from the prompt stays absent, and the conditioning is
-        the rows' own and stays as it is. Works inside JIT.
+        A field with no rule raises ValueError rather than take a guessed
+        value; the conditioning stays as it is. Works inside JIT.
         """
         if tokens.ndim != 2 or tokens.shape[0] != self.tokens.shape[0]:
             raise ValueError(f"a response is [{self.tokens.shape[0]}, W] token ids, got {tokens.shape}")
@@ -341,20 +337,18 @@ def _last_real(value: jax.Array, valid: jax.Array) -> jax.Array:
 
 
 def _response_validity(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
-    """A response's slots are real in each row that holds a real prompt token."""
+    """Real in each row with a real prompt token."""
     return jnp.broadcast_to(valid.any(axis=1)[:, None], (valid.shape[0], width))
 
 
 def _response_positions(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
-    """Logical positions count on from the last real token's, which a
-    document reset may have brought below the slot's index."""
+    """On from the last real token's position, which a document reset may have lowered."""
     return _last_real(value, valid)[:, None] + jnp.arange(1, width + 1)[None]
 
 
 def _response_coordinates(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
-    """Multi-axis rotary coordinates continue one past the largest real
-    coordinate on any axis, on every axis: a response is text, which moves
-    along all of them together (Qwen's M-RoPE)."""
+    """One past the largest real coordinate, on every axis: text moves along
+    all of them together (Qwen's M-RoPE)."""
     keep = valid.reshape(valid.shape + (1,) * (value.ndim - 2))
     last = jnp.max(jnp.where(keep, value, -1), axis=tuple(range(1, value.ndim)))
     coordinates = last[:, None] + jnp.arange(1, width + 1)[None]
@@ -363,12 +357,12 @@ def _response_coordinates(value: jax.Array, valid: jax.Array, width: int) -> jax
 
 
 def _response_document(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
-    """A response continues the document its prompt's last real token is in."""
+    """The last real token's document."""
     return jnp.broadcast_to(_last_real(value, valid)[:, None], (value.shape[0], width))
 
 
 def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
-    """A response's slots are text: they read no media feature and sit in no image group (-1)."""
+    """Text: no media feature, no image group (-1)."""
     return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
 
 
@@ -381,8 +375,7 @@ RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
     "audio_indices": _response_text,
     "image_groups": _response_text,
 }
-"""How each token field Dew's processors write continues into a response
-(`ModelInputs.extended`). A field not named here has no default."""
+"""How each token field Dew's processors write continues into a response."""
 
 
 def validity_sites(tree: InputTree) -> list[ModelInputs]:

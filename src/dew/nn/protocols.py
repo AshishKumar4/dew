@@ -12,16 +12,15 @@ through Flax's own `apply`, with `rngs` and `mutable` passed to `apply`:
     table = model.apply(variables, method='output_table')
 
 `Logits` and `HiddenStates` are token models' full-sequence reads, with no
-cache: a call writes no `cache` collection, `Ordered` says whether those
-states attend causally, and `MaskToken` names the id masked diffusion
-corrupts tokens to. `DenoisingModel` is the call every image and video
+cache: a call writes no `cache` collection, and `TokenModel` says whether
+those states attend causally and names the id masked diffusion corrupts
+tokens to. `DenoisingModel` is the call every image and video
 denoiser already has, the raw network that `dew.diffusion.process.Denoiser`
 wraps into a prediction a solver steps with. `AffineHead` and
 `LogitsFromHidden` let a loss score the vocabulary without a second trunk
 pass: `output_table` gives the matrix a tiled loss contracts in place of the
 logits, and `logits_from_hidden` is the exact head for a head no matrix alone
-gives. `HardVocabularyEmbedder` is a media embedder's: the range of the text
-vocabulary it embeds itself.
+gives.
 `DenoisingModel` is an annotation only: every Flax module has a `__call__`, so
 an `isinstance` check on it would hold for any model. `RequiresText`,
 `IntervalModel` and `TimeScaled` are what a denoiser declares about the
@@ -54,11 +53,9 @@ if TYPE_CHECKING:
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "CacheCapacity", "CacheRebuilding", "DenoisingModel", "HardVocabularyEmbedder",
-           "HiddenStates", "Indexed", "IntervalModel", "Logits", "LogitsFromHidden", "MaskToken",
-           "MixedAdmission", "ModelKwarg", "Ordered", "OutputTable", "PackedProjections", "Predicting",
-           "ProjectionGroup", "ProjectionSites", "ReadsTrain", "Recomputing", "RequiresText",
-           "StreamedPrediction", "TimeScaled", "TritonGemm", "declared_groups"]
+__all__ = ["AffineHead", "CacheCapacity", "DecoderTraining", "DenoisingModel", "HiddenStates",
+           "IntervalModel", "Logits", "LogitsFromHidden", "ModelKwarg", "OutputTable", "ProjectionGroup",
+           "Recomputing", "RequiresText", "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
 
 
 @struct.dataclass
@@ -97,18 +94,13 @@ class HiddenStates(Protocol):
 
 
 @runtime_checkable
-class Ordered(Protocol):
-    """A token model that says whether its `hidden_states` attend causally,
-    each position to itself and the ones before it, or to the whole sequence."""
+class TokenModel(Protocol):
+    """Whether a token model's `hidden_states` attend causally (each position
+    to itself and the ones before it) or to the whole sequence, and the
+    vocabulary id masked diffusion corrupts tokens to, None without one."""
 
     @property
     def causal(self) -> bool: ...
-
-
-@runtime_checkable
-class MaskToken(Protocol):
-    """A token model that names the vocabulary id a masked-diffusion objective
-    corrupts tokens to, or None for one trained without it."""
 
     @property
     def mask_token_id(self) -> int | None: ...
@@ -132,17 +124,6 @@ class AffineHead(Protocol):
     """
 
     def output_table(self) -> OutputTable | None: ...
-
-
-@runtime_checkable
-class HardVocabularyEmbedder(Protocol):
-    """A media embedder that also embeds a range of the text vocabulary, the
-    hard tokens the decoder's own table does not hold, as Gemma 3n's vision
-    and audio embedders do (modeling_gemma3n.py, Gemma3nMultimodalEmbedder)."""
-
-    def embed_hard(self, ids: jax.Array) -> jax.Array: ...
-
-    def merge_hard_embeddings(self, token_embeddings: jax.Array, ids: jax.Array) -> jax.Array: ...
 
 
 @runtime_checkable
@@ -203,58 +184,41 @@ def declared_groups(*modules: nn.Module) -> tuple[ProjectionGroup, ...]:
 
 
 @runtime_checkable
-class PackedProjections(Protocol):
-    """A decoder's packed groups that `variables` hold, packed or as every
-    member; the packer checks the members concatenate. A model that does
-    not decode autoregressively names none."""
+class Serving(Protocol):
+    """What a server reads off a decoder. `inference_projection_groups` names
+    the packed groups `variables` hold, packed or as every member (the packer
+    checks the members concatenate; a model that does not decode
+    autoregressively names none). `cache_rebuild_position` is where cached
+    keys go stale and the prefix is recomputed (LongRoPE's long factors,
+    Phi-3), or None. `mixed_admission_refusal` says why its layers would not
+    run a mixed call (`dew.nn.inputs.Admitted`) as separate decode and
+    prefill calls would, or None."""
 
     def inference_projection_groups(self, variables: Mapping[str, Mapping]
                                     ) -> tuple[ProjectionGroup, ...]: ...
 
-
-@runtime_checkable
-class MixedAdmission(Protocol):
-    """Why a decoder's layers would not run a server's mixed call
-    (`dew.nn.inputs.Admitted`) as separate decode and prefill calls would,
-    or None. A model without it keeps the two forwards."""
+    @property
+    def cache_rebuild_position(self) -> int | None: ...
 
     def mixed_admission_refusal(self) -> str | None: ...
 
 
 @runtime_checkable
-class CacheRebuilding(Protocol):
-    """The position past which a decoder's cached keys go stale and its
-    prefix is recomputed (LongRoPE's long factors, Phi-3), or None."""
-
-    @property
-    def cache_rebuild_position(self) -> int | None: ...
-
-
-@runtime_checkable
-class Indexed(Protocol):
-    """The MLA mixers a decoder declares with DeepSeek's lightning indexer."""
-
-    @property
-    def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
-
-
-@runtime_checkable
-class Predicting(Protocol):
-    """A decoder's multi-token prediction depth count (arXiv 2412.19437,
-    section 2.2); `apply`'s `method='mtp_hidden_states'` and `'mtp_logits'`
-    read the depths from the trunk's states and the tokens."""
+class DecoderTraining(Protocol):
+    """What a decoder trains beside its next token: its multi-token prediction
+    depths (arXiv 2412.19437, section 2.2; `apply`'s `method='mtp_hidden_states'`
+    and `'mtp_logits'`), which with `mtp_hyper_connections` set read the
+    residual streams a forward sows under `prediction_inputs/states`, and the
+    MLA mixers it declares with DeepSeek's lightning indexer."""
 
     @property
     def num_nextn_predict_layers(self) -> int: ...
 
-
-@runtime_checkable
-class StreamedPrediction(Protocol):
-    """A decoder whose depths, with `mtp_hyper_connections` set, read the
-    residual streams a forward sows under `prediction_inputs/states`."""
-
     @property
     def mtp_hyper_connections(self) -> HyperConnections | None: ...
+
+    @property
+    def indexed_mixers(self) -> tuple[MLAMixer, ...]: ...
 
 
 @runtime_checkable
@@ -263,14 +227,6 @@ class TritonGemm(Protocol):
 
     @property
     def keeps_triton_gemm(self) -> bool: ...
-
-
-@runtime_checkable
-class ReadsTrain(Protocol):
-    """A token mixer whose call takes `train`, for a dropout of its own."""
-
-    @property
-    def reads_train(self) -> bool: ...
 
 
 @runtime_checkable

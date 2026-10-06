@@ -8,7 +8,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -34,7 +34,7 @@ from ..hyper_connections import (
 from ..inputs import LayerInputs, PredictionPhase
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import scaled
-from ..protocols import ProjectionGroup, ReadsTrain, declared_groups
+from ..protocols import ProjectionGroup, declared_groups
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
@@ -50,6 +50,14 @@ def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
                                  use_fast_variance=False, dtype=dtype)
     return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
                              scale_after_cast=scale_after_cast, dtype=dtype)
+
+
+@runtime_checkable
+class ReadsTrain(Protocol):
+    """A token mixer whose call takes `train`, for a dropout of its own."""
+
+    @property
+    def reads_train(self) -> bool: ...
 
 
 @dataclasses.dataclass(frozen=True)
