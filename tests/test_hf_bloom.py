@@ -95,8 +95,10 @@ def test_bloom_trains_through_its_embedding_norm_and_biased_block():
     assert float(loss(changed)) < float(value)
 
 
-def test_bloom_released_config_retains_the_block_fields():
-    model = translate_config(json.loads((RELEASE / 'config.json').read_text())).value
+@pytest.mark.parametrize('name', ['bloom-560m', 'bloomz-560m'])
+def test_bloom_released_config_retains_the_block_fields(name):
+    release = DIRECTORY.parent / name
+    model = translate_config(json.loads((release / 'config.json').read_text())).value
     assert (model.emb_features, model.num_heads, model.num_layers) == (1024, 16, 24)
     assert model.position_embedding == 'alibi' and model.embedding_norm
     assert model.norm_type == 'layer' and model.norm_bias and model.mlp_bias
@@ -104,11 +106,13 @@ def test_bloom_released_config_retains_the_block_fields():
 
 
 @pytest.mark.network
-def test_bloom_released_config_is_pinned():
+@pytest.mark.parametrize('name', ['bloom-560m', 'bloomz-560m'])
+def test_bloom_released_config_is_pinned(name):
     from huggingface_hub import hf_hub_download
 
-    source = json.loads((RELEASE / 'source.json').read_text())
+    release = DIRECTORY.parent / name
+    source = json.loads((release / 'source.json').read_text())
     filename = hf_hub_download(source['repo'], 'config.json', revision=source['revision'])
     downloaded = json.loads(Path(filename).read_text())
-    assert downloaded == json.loads((RELEASE / 'config.json').read_text())
-    assert translate_config(downloaded) == translate_config(json.loads((RELEASE / 'config.json').read_text()))
+    assert downloaded == json.loads((release / 'config.json').read_text())
+    assert translate_config(downloaded) == translate_config(json.loads((release / 'config.json').read_text()))
