@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Self
+from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -12,13 +12,25 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
-from dew.nn.protocols import HardVocabularyEmbedder, OutputTable, ProjectionGroup
+from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 from dew.registry import models
 
 if TYPE_CHECKING:
+    from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
+
+
+@runtime_checkable
+class HardVocabularyEmbedder(Protocol):
+    """A media embedder that also embeds a range of the text vocabulary, the
+    hard tokens the decoder's own table does not hold, as Gemma 3n's vision
+    and audio embedders do (modeling_gemma3n.py, Gemma3nMultimodalEmbedder)."""
+
+    def embed_hard(self, ids: jax.Array) -> jax.Array: ...
+
+    def merge_hard_embeddings(self, token_embeddings: jax.Array, ids: jax.Array) -> jax.Array: ...
 
 
 @struct.dataclass
@@ -471,6 +483,13 @@ class MultimodalTransformer(nn.Module):
     @property
     def cache_rebuild_position(self) -> int | None:
         return self.language_model.cache_rebuild_position
+
+    def mixed_admission_refusal(self) -> str | None:
+        return "media fuse into a prefill's embeddings, which a mixed call does not carry"
+
+    @property
+    def mtp_hyper_connections(self) -> HyperConnections | None:
+        return self.language_model.mtp_hyper_connections
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
