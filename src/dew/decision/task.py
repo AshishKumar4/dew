@@ -439,7 +439,7 @@ class Decide:
                               labels=jnp.asarray([[held.label] for held in scored]),
                               ordinal=jnp.asarray([[held.kind == Score.kind] for held in scored]),
                               scored=jnp.ones((len(scored), 1), bool))
-        return {metric.name: measured(metric, decisions) for metric in chosen}
+        return {metric.name: metric.finalize(metric(decisions, {})) for metric in chosen}
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
         scored = []
@@ -561,11 +561,6 @@ def _opened(raw: bytes, index: int) -> Image.Image:
     except (OSError, Image.DecompressionBombError) as error:
         raise ValueError(f"images[{index}] is not an image Pillow can read: {error}") from error
     return image
-
-
-def measured[Totals](metric: Metric[Totals], decisions: Decisions) -> float:
-    """Return `metric` over one whole pass of `decisions`, reduced as a validation pass reduces it."""
-    return metric.finalize(metric(decisions, {}))
 
 
 def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
