@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import Artifact, Decisions
-from dew.decision.metrics import decisions_of
+from dew.decision.metrics import Answered
 from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
 from dew.registry import metrics
 
@@ -52,13 +52,12 @@ class ScoringRule(ABC):
     __rmul__ = __mul__
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
-        artifact = decisions_of(artifact)
-        logits = np.log(np.clip(np.asarray(artifact.probabilities, np.float64), 1e-300, None))
-        labels = np.asarray(artifact.labels)
-        options = np.asarray(artifact.options, bool)
-        target = np.eye(options.shape[1])[labels]
-        charged = np.asarray(self.charge(jnp.asarray(logits), jnp.asarray(target), jnp.asarray(options),
-                                         jnp.asarray(artifact.ordinal)), np.float64)
+        answered = Answered.of(artifact)
+        logits = np.log(np.clip(answered.probabilities, 1e-300, None))
+        target = np.eye(answered.options.shape[-1])[answered.labels]
+        charged = np.asarray(self.charge(jnp.asarray(logits), jnp.asarray(target),
+                                         jnp.asarray(answered.options), jnp.asarray(answered.ordinal)),
+                             np.float64)
         return float(charged.sum()), float(charged.size)
 
     def merge(self, accumulated: tuple[float, float],
@@ -132,7 +131,7 @@ class RankedProbability(ScoringRule):
 
     def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
         total, _ = super().__call__(artifact, batch)
-        return total, float(np.sum(np.asarray(decisions_of(artifact).ordinal)))
+        return total, float(np.sum(Answered.of(artifact).ordinal))
 
 
 @dataclass(frozen=True)

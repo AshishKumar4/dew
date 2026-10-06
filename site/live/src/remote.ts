@@ -102,13 +102,14 @@ export class RemoteJob extends DurableObject<Env> {
 			try {
 				await send({ type: 'job', id, commit: plan.commit });
 				const checkout = await (await container.exec(['sh', '-c',
-					'git fetch --depth=1 origin "$1" && git reset --hard "$1" && /opt/bootstrap/bin/uv pip install --python .venv/bin/python --no-deps -e .',
+					'hostname localhost && git fetch --depth=1 origin "$1" && git reset --hard "$1" && /opt/bootstrap/bin/uv pip install --python .venv/bin/python --no-deps -e .',
 					'checkout', plan.commit], { cwd: '/workspace' })).output();
 				if (checkout.exitCode !== 0) throw new Error(new TextDecoder().decode(checkout.stderr));
 				const process = await container.exec(['timeout', '-k', '10', '2300', ...command], {
 					cwd: '/workspace', stdout: 'pipe', stderr: 'pipe',
 					env: { PATH: '/workspace/.venv/bin:/opt/bootstrap/bin:/usr/local/bin:/usr/bin:/bin',
 						PYTHONUNBUFFERED: '1', JAX_PLATFORMS: 'cpu', CUDA_VISIBLE_DEVICES: '',
+						GLOO_SOCKET_IFNAME: 'lo',
 						JAX_COMPILATION_CACHE_DIR: '/root/.cache/dew/xla' },
 				});
 				const pump = async (source: ReadableStream | null, type: string) => {
@@ -156,10 +157,14 @@ export class RemoteJob extends DurableObject<Env> {
 	override async alarm(): Promise<void> { await this.expire(); }
 }
 
-export async function remoteRun(request: Request, env: Env): Promise<Response> {
+export function operatorAuthorized(request: Request, env: Env): boolean {
 	const expected = new TextEncoder().encode(`Bearer ${env.RUNNER_SECRET}`);
 	const supplied = new TextEncoder().encode(request.headers.get('Authorization') ?? '');
-	if (!env.RUNNER_SECRET || expected.length !== supplied.length || !crypto.subtle.timingSafeEqual(expected, supplied)) {
+	return Boolean(env.RUNNER_SECRET) && expected.length === supplied.length && crypto.subtle.timingSafeEqual(expected, supplied);
+}
+
+export async function remoteRun(request: Request, env: Env): Promise<Response> {
+	if (!operatorAuthorized(request, env)) {
 		return new Response('Forbidden', { status: 403 });
 	}
 	const reader = request.body?.getReader();

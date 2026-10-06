@@ -2,14 +2,16 @@
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.decision import DecisionInputs, LayaCheckpoint, MarkerLayout, Question, kind_of
+from dew.decision import DecisionInputs, Encoded, LayaCheckpoint, MarkerLayout, Question
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 TINY = FIXTURES / "tiny"
@@ -41,18 +43,23 @@ def test_the_marker_layout_lays_out_what_laya_does(parallel):
     expected = json.loads((TINY / "layouts.json").read_text())
     for key, _, encoded in rows(checkpoint, parallel=parallel):
         assert list(encoded.tokens) == expected[key]["ids"], key
-        assert list(encoded.markers) == expected[key]["markers"], key
+        assert markers(encoded) == expected[key]["markers"], key
         if parallel:
             assert list(encoded.positions or ()) == expected[key]["positions"], key
             assert list(encoded.slots or ()) == expected[key]["slots"], key
 
 
+def markers(encoded: Encoded) -> list[int]:
+    """The marker of each option of the row's one question."""
+    return [start for start, _ in encoded.questions[0].options]
+
+
 def logits(checkpoint: LayaCheckpoint, *, parallel: bool) -> dict[str, np.ndarray]:
     """Each question's option logits, one row per question as Laya runs them."""
     found = {}
-    for key, question, encoded in rows(checkpoint, parallel=parallel):
-        inputs = DecisionInputs.collate([encoded], [kind_of(question)], checkpoint.specials.pad)
-        found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[0]
+    for key, _, encoded in rows(checkpoint, parallel=parallel):
+        inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
+        found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[0, 0]
     return found
 
 
@@ -70,18 +77,16 @@ def test_laya_logits_match_laya_under_the_float64_rule(parallel):
             np.concatenate([reference[f"{key}/f64"] for key in keys]), "Laya logits")
 
 
-def test_the_rule_catches_a_head_that_ignores_the_question_type(monkeypatch):
+def test_the_rule_catches_a_head_that_ignores_the_question_type():
     """The type embedding is the only place a choice and a noul differ in
     the head; dropping it moves the logits past the rule."""
-    from dew.decision import head
-
     checkpoint = LayaCheckpoint.load(TINY, attention_impl="xla")
-    monkeypatch.setattr(head, "kind_of", lambda question: 0)
     with np.load(TINY / "logits.npz") as reference:
         found = {}
-        for key, question, encoded in rows(checkpoint, parallel=False):
-            inputs = DecisionInputs.collate([encoded], [head.kind_of(question)], checkpoint.specials.pad)
-            found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[0]
+        for key, _, encoded in rows(checkpoint, parallel=False):
+            inputs = DecisionInputs.collate([encoded], checkpoint.specials.pad)
+            one_type = replace(inputs, kinds=jnp.zeros_like(inputs.kinds))
+            found[key] = np.asarray(checkpoint.model.logits(checkpoint.variables, one_type))[0, 0]
         keys = sorted(found)
         with pytest.raises(AssertionError, match=r"allowed 2\.0"):
             assert_as_exact_as_the_reference(
@@ -97,10 +102,9 @@ def test_padded_rows_score_as_they_do_alone():
     score -inf."""
     checkpoint = LayaCheckpoint.load(TINY, attention_impl="xla")
     laid = list(rows(checkpoint, parallel=False))
-    inputs = DecisionInputs.collate([encoded for _, _, encoded in laid],
-                                    [kind_of(question) for _, question, _ in laid], checkpoint.specials.pad)
-    batched = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))
-    widths = [len(encoded.markers) for _, _, encoded in laid]
+    inputs = DecisionInputs.collate([encoded for _, _, encoded in laid], checkpoint.specials.pad)
+    batched = np.asarray(checkpoint.model.logits(checkpoint.variables, inputs))[:, 0]
+    widths = [len(markers(encoded)) for _, _, encoded in laid]
     assert all(np.all(np.isneginf(batched[row, width:])) for row, width in enumerate(widths))
     with np.load(TINY / "logits.npz") as reference:
         assert_as_exact_as_the_reference(
