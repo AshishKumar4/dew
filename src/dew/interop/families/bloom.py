@@ -4,7 +4,8 @@ from collections.abc import Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import DEFAULT_MAX_SEQ_LEN, DecoderFields, Renames, _refuse, _renamed_path
+from dew.interop.decoder_config import DEFAULT_MAX_SEQ_LEN, DecoderFields, _refuse
+from dew.interop.decoder_paths import Renames, _renamed_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 

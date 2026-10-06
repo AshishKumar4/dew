@@ -5,8 +5,9 @@ from collections.abc import Mapping
 import numpy as np
 
 from dew import records
+from dew.interop.decoder_config import DecoderFields, _base_config, _refuse
+from dew.interop.decoder_paths import Renames, _renamed_path
 from dew.interop.families.gpt_neox import _gpt_neox_export_weights, _gpt_neox_prepare
-from dew.interop.hf_decoders import DecoderFields, Renames, _base_config, _refuse, _renamed_path
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 

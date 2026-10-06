@@ -17,7 +17,7 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_config import (
     _SERIALIZED_ENCODER_FIELDS,
     _SERIALIZED_TEXT_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
@@ -27,7 +27,6 @@ from dew.interop.hf_decoders import (
     MixtureFields,
     Ramp,
     _base_config,
-    _dew_path,
     _record_float,
     _record_int,
     _refuse,
@@ -37,6 +36,7 @@ from dew.interop.hf_decoders import (
     _yarn_record,
     translate_config,
 )
+from dew.interop.decoder_paths import _dew_path
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dspark import DSpark

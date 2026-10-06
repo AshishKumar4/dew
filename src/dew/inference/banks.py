@@ -302,13 +302,8 @@ class SafetensorsBanks(LayerBanks):
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
-        from dew.interop.hf_decoders import (
-            DecoderFamily,
-            _check_tree,
-            families,
-            translate_config,
-            translate_weights,
-        )
+        from dew.interop.decoder_family import _check_tree
+        from dew.interop.hf_decoders import DecoderFamily, families, translate_config, translate_weights
         from dew.interop.safetensors_io import read_weights
         from dew.registry import dtype_name, models, with_precision
 

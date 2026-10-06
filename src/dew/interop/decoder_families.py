@@ -3,6 +3,10 @@
 from functools import partial
 
 from dew.interop import mamba2
+from dew.interop.decoder_config import _GEMMA, _QWEN35
+from dew.interop.decoder_export import _decoder_tensors
+from dew.interop.decoder_family import DecoderFamily, _every_layer_windowed, _kind_mixers
+from dew.interop.decoder_paths import _FUSED_EXPERTS, _renamed_name, _renamed_path
 from dew.interop.families.bloom import _BLOOM_NAMES, _bloom_config, _bloom_export, _bloom_path
 from dew.interop.families.deepseek import (
     _MINIMAX_M2_NAMES,
@@ -131,17 +135,6 @@ from dew.interop.families.qwen import (
     _qwen35_moe_config,
     _qwen35_moe_path,
     _qwen35_path,
-)
-from dew.interop.hf_decoders import (
-    _FUSED_EXPERTS,
-    _GEMMA,
-    _QWEN35,
-    DecoderFamily,
-    _decoder_tensors,
-    _every_layer_windowed,
-    _kind_mixers,
-    _renamed_name,
-    _renamed_path,
 )
 from dew.nn.deepseek_v4 import DeepseekV4Mixer
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer

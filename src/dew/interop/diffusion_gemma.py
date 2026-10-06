@@ -19,7 +19,8 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew.diffusion.block import BlockProcess
 from dew.interop.config_records import NativeFields
-from dew.interop.hf_decoders import _export_config, translate_config, translate_denoiser_weights
+from dew.interop.decoder_export import _export_config
+from dew.interop.hf_decoders import translate_config, translate_denoiser_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner

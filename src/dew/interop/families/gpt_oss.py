@@ -10,8 +10,9 @@ from collections.abc import Mapping
 from dataclasses import asdict
 
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import DecoderFields, _base_config, _refuse, _Ropes
+from dew.interop.decoder_paths import _dew_path, _hf_name
 from dew.interop.families.deepseek import _deepseek_rope
-from dew.interop.hf_decoders import DecoderFields, _base_config, _dew_path, _hf_name, _refuse, _Ropes
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 

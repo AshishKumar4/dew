@@ -6,7 +6,9 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import DecoderFields, Packed, Renames, _decoder_tensors, _refuse, _renamed_path
+from dew.interop.decoder_config import DecoderFields, _refuse
+from dew.interop.decoder_export import _decoder_tensors
+from dew.interop.decoder_paths import Packed, Renames, _renamed_path
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind

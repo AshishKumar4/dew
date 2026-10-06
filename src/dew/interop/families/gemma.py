@@ -17,17 +17,13 @@ from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.hf_decoders import (
-    _MOE_SHARED,
+from dew.interop.decoder_config import (
     DecoderFields,
     MixtureFields,
     _base_config,
-    _decoder_tensors,
-    _dew_path,
     _fixed_fields,
     _fixed_mixture,
     _hf_activation,
-    _hf_name,
     _kinds,
     _kinds_of,
     _refuse,
@@ -36,6 +32,8 @@ from dew.interop.hf_decoders import (
     _Ropes,
     _specified_layer_types,
 )
+from dew.interop.decoder_export import _decoder_tensors
+from dew.interop.decoder_paths import _MOE_SHARED, _dew_path, _hf_name
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture

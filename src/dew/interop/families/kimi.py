@@ -60,7 +60,7 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_config import (
     _ACTIVATIONS,
     _CODEC_FIELDS,
     _IGNORED_FIELDS,
@@ -71,12 +71,12 @@ from dew.interop.hf_decoders import (
     KindFields,
     MixtureFields,
     SituFields,
-    _dew_path,
     _record_float,
     _record_int,
     _refuse,
     _refuse_encoder_fields,
 )
+from dew.interop.decoder_paths import _dew_path
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture

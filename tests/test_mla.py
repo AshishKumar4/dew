@@ -23,7 +23,8 @@ import optax
 import pytest
 from jax.sharding import PartitionSpec as P
 
-from dew.interop.hf_decoders import _yarn_record, translate_weights
+from dew.interop.decoder_config import _yarn_record
+from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import mixers

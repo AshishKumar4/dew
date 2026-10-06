@@ -3,7 +3,8 @@
 from collections.abc import Mapping
 
 from dew import records
-from dew.interop.hf_decoders import DecoderFields, Renames, _base_config, _refuse
+from dew.interop.decoder_config import DecoderFields, _base_config, _refuse
+from dew.interop.decoder_paths import Renames
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 

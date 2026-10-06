@@ -12,17 +12,8 @@ from collections.abc import Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
-    _MOE_SHARED,
-    DecoderFields,
-    KindFields,
-    MixtureFields,
-    Packed,
-    _base_config,
-    _dew_path,
-    _refuse,
-    _rope,
-)
+from dew.interop.decoder_config import DecoderFields, KindFields, MixtureFields, _base_config, _refuse, _rope
+from dew.interop.decoder_paths import _MOE_SHARED, Packed, _dew_path
 from dew.nn import llama4 as llama4_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture

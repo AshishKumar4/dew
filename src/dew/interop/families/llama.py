@@ -13,17 +13,9 @@ from collections.abc import Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
+from dew.interop.decoder_config import DecoderFields, _base_config, _refuse, _softmax_top_k
+from dew.interop.decoder_paths import _FUSED_EXPERTS, Packed, _dew_path, _renamed
 from dew.interop.families.qwen import _qwen35_moe_path
-from dew.interop.hf_decoders import (
-    _FUSED_EXPERTS,
-    DecoderFields,
-    Packed,
-    _base_config,
-    _dew_path,
-    _refuse,
-    _renamed,
-    _softmax_top_k,
-)
 from dew.nn.backbones.decoder_block import Mixture
 
 

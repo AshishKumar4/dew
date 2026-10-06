@@ -15,6 +15,21 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
+from dew.interop.decoder_config import (
+    _NO_AUDIO,
+    DEFAULT_MAX_SEQ_LEN,
+    DecoderFields,
+    KindFields,
+    WrapperFields,
+    _base_config,
+    _record_float,
+    _record_int,
+    _refuse,
+    _Ropes,
+    _yarn_record,
+)
+from dew.interop.decoder_family import DecoderFamily, _kind_mixers
+from dew.interop.decoder_paths import _dew_path
 from dew.interop.families.deepseek import (
     _DSPARK_LEAVES,
     _V4_LAYER_NAMES,
@@ -22,22 +37,6 @@ from dew.interop.families.deepseek import (
     _deepseek_v4_prepare,
     _dspark,
     _dspark_path,
-)
-from dew.interop.hf_decoders import (
-    _NO_AUDIO,
-    DEFAULT_MAX_SEQ_LEN,
-    DecoderFamily,
-    DecoderFields,
-    KindFields,
-    WrapperFields,
-    _base_config,
-    _dew_path,
-    _kind_mixers,
-    _record_float,
-    _record_int,
-    _refuse,
-    _Ropes,
-    _yarn_record,
 )
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind

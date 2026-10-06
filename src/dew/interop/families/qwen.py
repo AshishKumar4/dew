@@ -13,14 +13,12 @@ from collections.abc import Callable, Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_config import (
     _LINEAR_FIELDS,
-    _MOE_SHARED,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
     MixtureFields,
     _base_config,
-    _dew_path,
     _kinds_of,
     _record_int,
     _refuse,
@@ -29,6 +27,7 @@ from dew.interop.hf_decoders import (
     _softmax_top_k,
     _specified_layer_types,
 )
+from dew.interop.decoder_paths import _MOE_SHARED, _dew_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind

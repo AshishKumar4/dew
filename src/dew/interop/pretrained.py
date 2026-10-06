@@ -49,6 +49,9 @@ from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify, 
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.components import bind_component
 from dew.interop.config_records import NativeFields
+from dew.interop.decoder_config import _kinds_of
+from dew.interop.decoder_export import _export_config, _layout_tensors, _refuse_lossy_export
+from dew.interop.decoder_family import _check_tree
 from dew.interop.generation_config import (
     audit_masked,
     eos_ids,
@@ -70,6 +73,7 @@ from dew.interop.weights import ParamTree
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
@@ -94,7 +98,7 @@ if TYPE_CHECKING:
 
 
 def _stacked_expert(path: tuple[str, ...]) -> tuple[tuple[str, ...], int | None]:
-    """Return the leaf `hf_decoders._stack_experts` stacked a per-expert
+    """Return the leaf `decoder_paths._stack_experts` stacked a per-expert
     `experts/K/projection/kernel` path into, and K."""
     if (len(path) >= 4 and path[-4] == "experts" and path[-3].isdigit()
             and path[-1] == "kernel"):
@@ -555,14 +559,14 @@ class Pretrained:
             # The decoder export's own encoder, so this and `PretrainedDecoder.from_model`
             # leave the same weights. A quantized source keeps its packed format
             # by going back over its source names, below.
-            return decoders.export_decoder_weights(self.model, values, decoders._export_config(self.model))
+            return decoders.export_decoder_weights(self.model, values, _export_config(self.model))
         elif self.weight_layouts:
             # Source names and geometry first; the packed format goes back over them.
             text = self.model.language_model if isinstance(self.model, MultimodalTransformer) else self.model
             scalar_mode = text.layer_scalar if isinstance(text, CausalTransformer) else None
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
-                return decoders._layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
+                return _layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
             tensors = {**self.retained_tensors,
                        **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
@@ -647,8 +651,8 @@ class PretrainedDecoder(Pretrained):
         `Pretrained.load` reads back includes its processor. `generation_config` is
         what generation_config.json records, `GENERATION_DEFAULTS` when None.
         """
-        config = decoders._export_config(model)
-        decoders._refuse_lossy_export(model, config)
+        config = _export_config(model)
+        _refuse_lossy_export(model, config)
         built = {entry.name: getattr(model, entry.name) for entry in dataclasses.fields(model)
                  if entry.init and entry.name not in ("parent", "name")}
         return cls(model, variables, None, config, None, built,
@@ -1811,8 +1815,8 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         text_fields["final_logit_softcap"] = None
         text_fields["mixer"] = {"name": "attention", "fields": {"bidirectional_images": True}}
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        kinds = decoders._kinds_of(text_fields).copy()
-        sliding = NativeFields(decoders.LayerKind, {
+        kinds = _kinds_of(text_fields).copy()
+        sliding = NativeFields(LayerKind, {
             **kinds.get("sliding_attention", {}),
             "mixer": {"name": "attention", "fields": {"bidirectional_images": True}}})
         kinds["sliding_attention"] = sliding
@@ -1823,8 +1827,8 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
-        kinds = decoders._kinds_of(text_fields).copy()
-        full = NativeFields(decoders.LayerKind, {
+        kinds = _kinds_of(text_fields).copy()
+        full = NativeFields(LayerKind, {
             **kinds.get("full_attention", {}),
             "mixer": {"name": "attention", "fields": {
                       "mrope_section": [sections[0], sections[1], sections[2]]}}})
@@ -2152,7 +2156,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
-    decoders._check_tree(variables, model)
+    _check_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
     # derived-export family binds too; `save` picks its writer by

@@ -11,17 +11,10 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from dew import records
+from dew.interop.decoder_config import DEFAULT_MAX_SEQ_LEN, DecoderFields, _base_config, _refuse, _Ropes
+from dew.interop.decoder_paths import Renames, _renamed_path
 from dew.interop.families.gemma import _gemma4_config, _parallel_experts
 from dew.interop.families.qwen import _qwen2_config
-from dew.interop.hf_decoders import (
-    DEFAULT_MAX_SEQ_LEN,
-    DecoderFields,
-    Renames,
-    _base_config,
-    _refuse,
-    _renamed_path,
-    _Ropes,
-)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 

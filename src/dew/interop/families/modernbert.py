@@ -18,19 +18,16 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_config import (
     _ACTIVATIONS,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFields,
-    Packed,
-    Renames,
     _hf_activation,
     _kinds,
     _refuse,
-    _renamed_name,
-    _renamed_path,
     _rope,
 )
+from dew.interop.decoder_paths import Packed, Renames, _renamed_name, _renamed_path
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 _ENCODER = 'ModernBertModel'
