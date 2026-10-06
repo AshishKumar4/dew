@@ -23,6 +23,7 @@ from dew.nn.attention import (
     SPLASH_LANES,
     SPLASH_MIN_LENGTH,
     VALUE_BLOCK,
+    NormalAttention,
     attention_kernel,
     cudnn_runs,
     folded_attention,
@@ -658,3 +659,23 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
     assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
                                      "decode kernel")
 
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
+def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
+    """A key the mask drops leaves the output unchanged when its value moves,
+    which the unmasked call does not, and an all-True mask is the unmasked
+    call bitwise."""
+    module = NormalAttention(16, heads=2, dim_head=8, attention_impl=implementation)
+    rng = np.random.default_rng(0)
+    queries = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
+    context = jnp.asarray(rng.normal(size=(2, 7, 16)), jnp.float32)
+    moved = context.at[:, 3].add(10.0)
+    params = module.init(jax.random.key(0), queries, context)
+    kept = jnp.ones((2, 1, 5, 7), bool)
+    dropped = kept.at[..., 3].set(False)
+    np.testing.assert_array_equal(module.apply(params, queries, context, mask=dropped),
+                                  module.apply(params, queries, moved, mask=dropped))
+    assert not np.array_equal(module.apply(params, queries, context), module.apply(params, queries, moved))
+    np.testing.assert_array_equal(module.apply(params, queries, context, mask=kept),
+                                  module.apply(params, queries, context))

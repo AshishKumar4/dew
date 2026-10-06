@@ -19,11 +19,16 @@ from datetime import datetime
 from typing import TYPE_CHECKING
 
 import jax
-from jax._src.distributed import global_state
 from jax.experimental import multihost_utils
 
 from dew.cache import enable_compilation_cache
-from dew.coordination import broadcast_from_process_zero, end_pool_on_failure
+from dew.coordination import (
+    broadcast_from_process_zero,
+    end_pool_on_failure,
+    pool_formed,
+    pool_size,
+    preemption_service,
+)
 from dew.pool import (
     PREEMPTED_EXIT,
     PROCESS_COUNT,
@@ -192,7 +197,7 @@ def _joined() -> None:
     # only a peer waiting in a collective justifies; a pool of one
     # process keeps Python's own exit. The count is the pool's as it
     # formed: jax.process_count() would open the backend.
-    if global_state.num_processes > 1:
+    if pool_size() > 1:
         end_pool_on_failure()
     # XLA reads its flags when the backend opens, which the first
     # line below does. The watchdog is the CUDA plugin's, and a TPU
@@ -272,7 +277,7 @@ class PreemptionNotice:
     """
 
     def __init__(self):
-        self._pool = global_state.client is not None
+        self._pool = pool_formed()
         self._signalled = False
         self._previous: Callable[[int, types.FrameType | None], object] | int | None = None
         self._installed = False
@@ -302,7 +307,7 @@ class PreemptionNotice:
         """
         if not self._pool:
             return self._signalled
-        if global_state.preemption_sync_manager is None:
+        if not preemption_service():
             return False
         return multihost_utils.reached_preemption_sync_point(step)
 

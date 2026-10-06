@@ -44,7 +44,25 @@ decide.systemone({
 #   "urgent": {"type": "noul", "noul": 0.91}}, "usage": {"input_tokens": ..., "output_tokens": 0}}
 ```
 
-The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. Dew ships no HTTP server; `systemone` is the function such a server would call.
+The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, as Clef's does, for a backbone that reads them; `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
+
+Dew ships no HTTP server of its own, but `systemone` is all one needs. `examples/serve_decisions.py` serves it with Starlette in about forty lines, at Jev's `POST /v1/systemone`, with Jev's 422 for a request it refuses and an optional bearer key:
+
+```bash
+uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew"
+python examples/serve_decisions.py --model convaiinnovations/laya --port 8000
+```
+
+llama.cpp (release b11445) serves decision models natively at the same `POST /v1/systemone`, with images as `data:` URLs: its converter reads Laya's checkpoint layout (ModernBERT with Laya's head) and Clef's (a Qwen 3.5 backbone with `joint_head.safetensors`). `decide.save_pretrained(directory)` writes a ModernBERT task in Laya's layout, temperatures included, which `Decide.from_pretrained` reads back and llama.cpp converts:
+
+```bash
+python convert_hf_to_gguf.py directory --outfile laya.gguf
+llama-server -m laya.gguf -ub 4096
+```
+
+Laya's release written this way converts to the same GGUF tensors as the release itself. On the five requests Dew's tests ask, llama.cpp's server counts the same tokens and gives the same choices as Dew, with every probability within 0.0014 of Dew's. The temperatures are written as Laya's agent applies them, held within [0.5, 5], because llama.cpp applies what it reads: the release ships 0.1 for choices of eleven options or more, which Laya's agent and Dew raise to 0.5. A calibration's binning map or abstention thresholds have no place in that layout, so a task carrying them is refused.
+
+vLLM (v0.31.0) cannot serve these: its pooling heads reduce a row to one vector and at most one linear layer, with no per-request positions or attention masks, so a decision head would have to be rewritten as a vLLM plugin.
 
 ## Confidence and calibration
 
@@ -69,21 +87,24 @@ from dew.interop import Pretrained
 from dew.lora import LoRA
 
 qwen = Pretrained.load("Qwen/Qwen3-0.6B").adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
-table = DecisionTable(path="mteb/banking77", label="label_text", question="intent",
-                      instructions="Which banking request is this?")
-train, held_out = table.examples()
+banking77 = DecisionTable(path="mteb/banking77", label="label_text", question="intent",
+                          instructions="Which banking request is this?")
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-data = objective.dataset(train, batch=32, validation=held_out)
+data = objective.dataset(banking77, batch=32)  # a tenth held out, for validation and calibration
 state = Trainer(objective, optax.adamw(1e-4), key=0).fit(
     data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
 
-decide = objective.pipeline(state).calibrated(held_out)
+decide = objective.pipeline(state).calibrated(data.val)
 ```
+
+Examples need not come from a table: `objective.dataset` takes any labelled examples, `Example`s or mappings with a `state`, `questions` (as `Question`s or in Jev's wire form) and `answers`, an answer naming its option by key or index.
 
 <!-- BANKING77 results (Laya zero-shot, Laya fine-tuned, Qwen3-0.6B + LoRA; accuracy and ECE) go here when the Colab runs finish. -->
 
-A bidirectional backbone reads Laya's layout. A causal one reads `StateFirstLayout`, which puts the state first and each marker after its option, so every marker has read the state, the question and its option. The backbone and the head are applied as separate modules over one variables tree, so a LoRA backbone trains its factors and the head while the base weights stay fixed.
+Any model that gives its final states is a backbone (`dew.nn.protocols.HiddenStates`). A bidirectional backbone reads Laya's layout. A causal one reads `StateFirstLayout`, which puts the state first and each marker after its option, so every marker has read the state, the question and its option. The backbone and the head are applied as separate modules over one variables tree, so a LoRA backbone trains its factors and the head while the base weights stay fixed.
+
+The head is a value too. Laya's `DecisionHead` scores one question per row at its markers. Clef's `JointSchemaHead`, with its `JointLayout`, reads every question of a request in one row and decides them together: it pools each question's instructions and each option's tokens, adds a lexical prior from the backbone's output table, and lets the questions attend to each other. `ClefHead.load` reads Clef's released head; Dew's layout and head reproduce Clef's own code (`tests/test_decision_clef.py`).
 
 The loss is a proper scoring rule: its expected value is smallest when the forecast is the true distribution, so it rewards honest probabilities. The rules are `LogLoss`, `Brier`, `Spherical` and `RankedProbability` (for score questions, whose levels are ordered), and they can be added and scaled. `label_smoothing` spreads part of the target over every option. During training a choice's options are reshuffled every time a row is read, so the model cannot learn their positions, and `none_of_the_above=p` adds a "none of the above" option to a share of rows, half of which lose their right answer to it. The same rules, with `Accuracy`, `ECE` and `AURC`, score the validation pass.
 

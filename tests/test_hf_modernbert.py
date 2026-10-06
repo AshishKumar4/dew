@@ -100,6 +100,18 @@ def test_modernbert_export_is_same_weight_transformers_and_a_bitwise_reload(tmp_
     np.testing.assert_array_equal(restored.model.apply(restored.variables, ids), actual)
 
 
+def test_modernbert_export_keeps_the_original_keys_older_readers_take():
+    """llama.cpp's converter (b11445) reads the norm epsilon from `layer_norm_eps`
+    alone and the window pattern from `global_attn_every_n_layers`, which
+    transformers 5 no longer writes."""
+    from dew.interop.pretrained import PretrainedDecoder
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    config = PretrainedDecoder.from_model(loaded.model, loaded.variables).config
+    assert config['layer_norm_eps'] == config['norm_eps'] == 3e-05
+    assert config['global_attn_every_n_layers'] == 3
+
+
 def test_modernbert_trains_through_its_unnormed_first_block_and_head():
     import optax
 

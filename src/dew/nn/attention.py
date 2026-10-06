@@ -1901,6 +1901,8 @@ class NormalAttention(nn.Module):
     `use_bias` is the projections' bias; `qkv_bias`, when given, the
     query, key and value projections' alone, as timm's ViT attention
     (U-ViT's) has them without one and its output projection with one.
+    `mask`, boolean and broadcasting to `[B, H, S, S_context]`, keeps the keys
+    each query may read.
     """
     query_dim: int
     heads: int = 4
@@ -1940,7 +1942,7 @@ class NormalAttention(nn.Module):
         )
 
     @nn.compact
-    def __call__(self, x, context=None, freqs_cis=None):
+    def __call__(self, x, context=None, freqs_cis=None, mask=None):
         orig_x_shape = x.shape
         if len(x.shape) == 4:
             x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
@@ -1966,7 +1968,7 @@ class NormalAttention(nn.Module):
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=self.attention_impl,
+            implementation=self.attention_impl, mask=mask,
         )
         proj = self.proj_attn(constrain(hidden_states, HEADS))
         return proj.reshape(orig_x_shape)

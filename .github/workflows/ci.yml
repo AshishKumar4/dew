@@ -28,7 +28,7 @@ env:
   # Every optional dependency a test file imports, so no test skips for want of
   # one: the test job fails a shard where one does (`Refuse a test skipped on
   # a missing import`).
-  EXTRAS: test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile,torchax,gguf
+  EXTRAS: test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
 
 jobs:
   lint:
