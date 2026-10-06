@@ -10,10 +10,22 @@ const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 export class SharedHost extends DurableObject<Env> {
 	private starting: Promise<void> | undefined;
 
-	async configure(generation: SnapshotGeneration): Promise<void> {
+	async configure(generation: SnapshotGeneration, keepWarm = false): Promise<void> {
 		const stored = await this.ctx.storage.get<SnapshotGeneration>('generation');
 		if (stored && stored.snapshot.id !== generation.snapshot.id) throw new Error('a host cannot change its generation');
 		await this.ctx.storage.put('generation', generation);
+		await this.ctx.storage.put('keepWarm', keepWarm);
+	}
+
+	async warm(): Promise<void> {
+		if (this.ctx.container?.running && !this.starting && !(await this.available())) await this.ctx.container.destroy();
+		await this.ready();
+	}
+
+	async retire(): Promise<void> {
+		if ((await this.ctx.storage.get<string[]>('sessions'))?.length) throw new Error('a model host still has active contexts');
+		if (this.ctx.container?.running) await this.ctx.container.destroy();
+		await this.ctx.storage.deleteAlarm();
 	}
 
 	async available(): Promise<boolean> {
@@ -55,7 +67,9 @@ export class SharedHost extends DurableObject<Env> {
 
 	private async request(session: string, suffix: '' | 'ws' | 'status' | 'close' = '', websocket?: Request): Promise<Response> {
 		if (!/^[0-9a-f-]{36}$/.test(session)) throw new Error('invalid context id');
-		if (suffix === '' || suffix === 'ws') await this.ready();
+		if (suffix === '' || suffix === 'ws') {
+			if (!(await this.available())) return new Response('this model host is not ready', { status: 503 });
+		}
 		else if (!this.ctx.container?.running) return new Response(null, { status: suffix === 'close' ? 204 : 404 });
 		const request = new Request(`http://container/contexts/${session}${suffix ? '/' + suffix : ''}`, websocket);
 		request.headers.set('Authorization', `Bearer ${await this.ctx.storage.get<string>('secret')}`);
@@ -103,7 +117,7 @@ export class SharedHost extends DurableObject<Env> {
 		const sessions = (await this.ctx.storage.get<string[]>('sessions')) ?? [];
 		const used = (await this.ctx.storage.get<number>('used')) ?? 0;
 		const { warmSeconds } = limitsOf(this.env);
-		if (sessions.length === 0 && Date.now() > used + warmSeconds * 1000) {
+		if (!(await this.ctx.storage.get<boolean>('keepWarm')) && sessions.length === 0 && Date.now() > used + warmSeconds * 1000) {
 			await container.destroy();
 			return;
 		}
