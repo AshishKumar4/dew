@@ -338,8 +338,8 @@ def test_an_unconditional_unet_takes_a_step():
 def test_joint_stream_models_refuse_an_unconditional_run():
     """SimpleMMDiT and HierarchicalMMDiT run the text as a second stream
     through every block's joint attention, so with no text there is no
-    sequence to project; `build` raises a ValueError naming the architecture
-    before the first attention softmax over an empty slice."""
+    sequence to project. They declare `RequiresText`, and `build` raises a
+    ValueError before the first attention softmax over an empty slice."""
     from dew.config import ModelConfig
 
     base = DiffusionRunConfig(text=None)

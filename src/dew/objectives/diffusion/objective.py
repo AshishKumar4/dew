@@ -40,6 +40,7 @@ from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.mp import Uncertainty
+from dew.nn.protocols import RequiresText
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -341,6 +342,10 @@ class DiffusionObjective(Objective[Ratio]):
                                  "training encodes its captions; load it with its text encoder")
         if process is None or inputs is None:
             raise ValueError("a denoiser needs its `process` and `inputs`; a loaded pipeline carries both")
+        if isinstance(model, RequiresText) and model.text_keyword not in inputs.conditions:
+            raise ValueError(f"{type(model).__name__} reads text as {model.text_keyword!r} on every call "
+                             "and cannot run unconditionally; the inputs condition on "
+                             f"{sorted(inputs.conditions)}")
         autoencoder = None if autoencoder is OMITTED else autoencoder
         variables = None if variables is OMITTED else variables
         steps = _DEFAULT_STEPS if steps is None else steps

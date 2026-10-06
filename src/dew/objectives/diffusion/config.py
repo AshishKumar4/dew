@@ -23,6 +23,7 @@ from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import FROZEN, Variables
 from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, solvers, trainings
@@ -64,12 +65,6 @@ else:
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
 # a stage that names one restates it.
 ATTENTION = {"heads": 8}
-
-# Architectures that run the text as a second stream through every block's
-# joint attention. With no text there is no sequence to project, so `build`
-# raises for an unconditional run on one of these before the first attention
-# softmax over an empty slice.
-TEXT_STREAM_MODELS = ("simple_mmdit", "hierarchical_mmdit")
 
 # The default unet has attention everywhere but the full-resolution stage,
 # where it costs the most. Every other architecture takes its own kwargs as
@@ -385,20 +380,29 @@ class DiffusionRunConfig(RunConfig):
         """
         fields = dict(self.model.fields())
         declared = {field.name for field in dataclasses.fields(models[self.model.architecture])}
-        if "interval" in declared and self.preset is not None:
-            # An interval process's model reads the interval's duration.
-            built = self.preset()
-            fields["interval"] = isinstance(built, Process) and built.interval
-        if isinstance(self.mode, MeanFlowTraining) and "time_scale" in declared \
-                and "time_scale" not in self.model.config:
-            # MeanFlow's loss differentiates the model in time; the default
-            # time embedding is far too fast in it to learn from.
-            fields["time_scale"] = SMOOTH_TIME_SCALE
         if "output_channels" in declared:
             sample = self.sample_field()
             fields["output_channels"] = (sample.shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
         return fields
+
+    def scratch_model(self, autoencoder: AutoEncoder | None) -> nn.Module:
+        """Return the registry's model over `model_fields`, as this run's process and loss read it.
+
+        An `IntervalModel` embeds the interval's duration exactly when the preset's
+        process is an interval one. MeanFlow's loss differentiates the model in time, and
+        a `TimeScaled` model's default time features are far too fast in it to learn
+        from, so under MeanFlow one turns them at `SMOOTH_TIME_SCALE` unless
+        `model.config` names a scale.
+        """
+        model = models.build(self.model.architecture, self.model_fields(autoencoder))
+        if isinstance(model, IntervalModel) and self.preset is not None:
+            built = self.preset()
+            model = model.clone(interval=isinstance(built, Process) and built.interval)
+        if isinstance(self.mode, MeanFlowTraining) and isinstance(model, TimeScaled) \
+                and "time_scale" not in self.model.config:
+            model = model.clone(time_scale=SMOOTH_TIME_SCALE)
+        return model
 
     @property
     def context(self) -> TextCondition | AudioCondition | None:
@@ -512,11 +516,6 @@ class DiffusionRunConfig(RunConfig):
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
         autoencoder."""
-        if self.context is None and self.model.architecture in TEXT_STREAM_MODELS:
-            raise ValueError(
-                f"an unconditional run needs a model that attends without text, and "
-                f"{self.model.architecture!r} runs the text as a second stream through "
-                "every block")
         autoencoder = (None if self.autoencoder is None else self.autoencoder.build(
             params=None if variables is None else self._autoencoder_params(variables)))
         conditions = {}
@@ -529,8 +528,7 @@ class DiffusionRunConfig(RunConfig):
                 # __post_init__ holds audio to a VideoDataset.
                 assert self.audio is not None and isinstance(self.data, VideoDataset)
                 conditions[keyword] = self.audio.build(self.data, params=params, dtype=self.model.dtype)
-        model = models.build(self.model.architecture, self.model_fields(autoencoder))
-        return model, conditions, autoencoder
+        return self.scratch_model(autoencoder), conditions, autoencoder
 
     def _autoencoder_params(self, variables: Variables) -> Variables:
         """The autoencoder's weights in a saved tree: frozen beside the
