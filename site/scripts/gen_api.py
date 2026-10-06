@@ -64,7 +64,7 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Decision models", ["dew.decision"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.telemetry.profile"]),
+    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.telemetry.profile"]),
 ]
 PAGES = [module for _, modules in GROUPS for module in modules]
 
