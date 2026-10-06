@@ -50,7 +50,7 @@ export class GatewayLab extends DurableObject<Env> {
 			stage = 'shared startup';
 			const secret = crypto.randomUUID();
 			const launch = await container.exec(['sh', '-c',
-				'nohup sh /opt/live/start-shared.sh > /run/dew/shared.log 2>&1 </dev/null &'],
+				'mkdir -p /run/dew; umask 077; nohup sh /opt/live/start-shared.sh > /run/dew/shared.log 2>&1 </dev/null &'],
 				{ env: { DEW_SHARED_SECRET: secret } });
 			if (await launch.exitCode !== 0) throw new Error('shared startup failed');
 			const deadline = Date.now() + 180_000;
