@@ -76,11 +76,10 @@ def test_the_published_run_reads_back_as_it_was_written():
     publishes it, is a current record: it loads and writes back unchanged.
     A record change that refuses it or rewrites it fails here, and the fix
     is to re-export the published run in the same change, since the site,
-    the quick start and the live sampler all load it. A field added since the
-    export writes its default, and is listed here."""
+    the quick start and the live sampler all load it."""
     held = json.loads(PUBLISHED.read_text())
-    added = {"optim": {**held["optim"], "b1": None, "b2": None}}
-    assert json.loads(json.dumps(DiffusionRunConfig.from_dict(held).to_dict())) == {**held, **added}
+    since_the_export = {**held, "optim": {**held["optim"], "b1": None, "b2": None}}
+    assert json.loads(json.dumps(DiffusionRunConfig.from_dict(held).to_dict())) == since_the_export
 
 
 @pytest.mark.network
