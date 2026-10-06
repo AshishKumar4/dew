@@ -22,6 +22,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import PartitionSpec as P
+from recording import RecordingTracker
 
 from dew.interop.hf_decoders import _yarn_record, translate_weights
 from dew.nn.attention import scaled_dot_product_attention
@@ -385,17 +386,6 @@ def deepseek_stack() -> CausalTransformer:
                  "bias": True, "expert_features": 16, "shared_features": 16})
 
 
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-
-    def log(self, scalars, step):
-        self.scalars.append(dict(scalars))
-
-    def artifact(self, value, step):
-        pass
-
-
 def token_batches():
     rng = np.random.default_rng(0)
     while True:
@@ -430,7 +420,7 @@ def test_the_deepseek_stack_fits_on_the_mesh(fsdp, expert):
     assert dict(trainer.device_mesh.shape) == {
         "data": 8 // (fsdp * expert), "expert": expert, "fsdp": fsdp,
         "tensor": 1, "sequence": 1, "stage": 1}
-    losses = [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
+    losses = [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert len(losses) == 2 and all(np.isfinite(losses)), losses
     assert losses[1] < losses[0], losses
     bias = state.variables["moe"]["layers_1"]["mlp"]["gate"]["e_score_correction_bias"]

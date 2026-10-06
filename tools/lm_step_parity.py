@@ -16,22 +16,26 @@ for fp32 matmuls on an Ampere or later card.
 
 import argparse
 import json
+import sys
 from dataclasses import asdict, dataclass
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.objectives.lm import LMObjective, TEXT_KEY
 import dew.nn.backbones  # noqa: F401  (registers the kind)
+from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.registry import models, with_precision
 from dew.training import MeshSpec, Trainer
 
-# tools/benchmark_step.py's small causal_transformer preset.
-CONFIG: dict[str, int] = dict(vocab_size=50304, emb_features=768, num_layers=3, num_heads=12,
-                              mlp_features=4 * 768, max_seq_len=512)
-BATCH, SEQ = 16, 512
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from benchmark_cases import small_cases
+
+_CASE = next(case for case in small_cases('bfloat16') if case.architecture == 'causal_transformer')
+CONFIG = _CASE.config
+BATCH, SEQ = _CASE.batch_size, _CASE.seq_len
 
 
 @dataclass(frozen=True)
@@ -42,7 +46,7 @@ class Record:
     token_accuracy: list[float]
 
 
-def run(config: dict[str, int], batch: int, seq: int, steps: int,
+def run(config: dict[str, object], batch: int, seq: int, steps: int,
         precision: str | None = None) -> Record:
     fields = with_precision("causal_transformer", config,
                             dtype="bfloat16", attention_impl="reference")
@@ -57,7 +61,10 @@ def run(config: dict[str, int], batch: int, seq: int, steps: int,
 
     # The benchmark's fixed batch, byte for byte the same on both sides.
     generator = np.random.default_rng(0)
-    tokens = generator.integers(0, config["vocab_size"], size=(batch, seq + 1)).astype(np.int32)
+    vocab = config["vocab_size"]
+    if not isinstance(vocab, int):
+        raise ValueError("the decoder preset needs an integer vocabulary size")
+    tokens = generator.integers(0, vocab, size=(batch, seq + 1)).astype(np.int32)
     data = {TEXT_KEY: jnp.asarray(tokens)}
 
     step = trainer.compile(state, data)

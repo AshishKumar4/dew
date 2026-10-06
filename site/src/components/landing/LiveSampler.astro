@@ -1,8 +1,6 @@
 ---
-// Sample from the text-to-image model on a live kernel: the kernel runs the setup
-// cell itself before it reports ready (shown here, folded, for reading), and the
-// reader edits and runs the sampling cell. The live client loads when Run is
-// first pressed.
+// The live cell calls the shared native Dew model through its lightweight client.
+// The folded example runs directly in a reader's own Dew environment.
 //
 // The figure beside the editor keeps its size through a run: a status line and
 // a bar say which stage the run is in (the bot check, the kernel starting and
@@ -11,7 +9,7 @@
 // step as a display output whose text is {"dew-progress": {"step": k,
 // "steps": n}} with a small PNG preview, and the decode as {"dew-progress":
 // {"stage": "decode"}}; any other image is the cell's result.
-import { Code } from '@astrojs/starlight/components';
+import EditableExample from './EditableExample.astro';
 import PythonEditor from './PythonEditor.astro';
 import { live } from '../../live.mjs';
 
@@ -22,6 +20,8 @@ interface Props {
 }
 const { setup, cell, colab } = Astro.props;
 const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
+const native = `${setup.trimEnd()}\n\n${cell.replace('from model_client import CFG, DPMSolverMultistep, from_pretrained\n\n', '').trimEnd()}`
+	.replace(/result\.pil\(\)\[0\]$/, 'result.pil()[0].save("dew-sample.png")');
 ---
 
 <div class="live-sampler" data-live-sampler>
@@ -43,9 +43,10 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			<PythonEditor code={cell.trimEnd()} kind="image" rows={cell.trimEnd().split('\n').length + 1} label="The sampling cell" />
 		</div>
 		<details class="sampler-setup">
-			<summary>Setup: loads dewml/hybrid-dit-176m</summary>
-			<Code code={setup.trimEnd()} lang="python" />
+			<summary>Native Dew sampler for your own environment</summary>
+			<EditableExample code={native} title="Native text-to-image sampler" filename="dew-sample.py" />
 		</details>
+		<p class="framework-note">Run live uses the shared Dew model through a lightweight Python client. The native example above runs with Dew installed in your own environment.</p>
 	</div>
 
 	<figure class="sampler-stage" data-stage="idle">

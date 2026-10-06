@@ -77,7 +77,7 @@ test('Run sends the editor cell and shows the returned image', async () => {
 	});
 
 	await page.goto(`http://127.0.0.1:${server.address().port}/sample/`);
-	const editor = page.locator('[data-live-sampler] textarea');
+	const editor = page.locator('[data-live-sampler] textarea[data-cell]');
 	const cell = `${await editor.inputValue()}\n# edited`;
 	await editor.fill(cell);
 	await page.locator('[data-run]').click();
@@ -91,7 +91,7 @@ test('Run sends the editor cell and shows the returned image', async () => {
 	assert.deepEqual(errors, []);
 });
 
-test('homepage text and diffusion cells share one kernel without overlapping', async () => {
+test('homepage text and diffusion cells share one kernel without overlapping', { timeout: 10_000 }, async () => {
 	const page = await browser.newPage({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' });
 	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
 		contentType: 'text/javascript',
@@ -103,7 +103,9 @@ test('homepage text and diffusion cells share one kernel without overlapping', a
 		return route.fulfill({ json: { socket: SOCKET, warm: true } });
 	});
 	const sent = [];
+	const closed = Promise.withResolvers();
 	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.onClose(() => closed.resolve());
 		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
 		socket.onMessage((raw) => {
 			const message = JSON.parse(String(raw));
@@ -139,6 +141,8 @@ test('homepage text and diffusion cells share one kernel without overlapping', a
 	assert.equal(requests, 1);
 	assert.equal(sent.length, 2);
 	assert.equal(sent[0], edited);
+	await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
+	await closed.promise;
 	await page.close();
 });
 
@@ -179,6 +183,31 @@ test('editable Python highlighting follows edits, scrolling and theme', async ()
 	await input.evaluate((element) => { element.scrollLeft = 100; element.dispatchEvent(new Event('scroll')); });
 	assert.equal(await editor.locator('[data-highlight]').evaluate((element) => element.scrollLeft), await input.evaluate((element) => element.scrollLeft));
 	assert.deepEqual(errors, []);
+	await page.close();
+});
+
+test('standalone examples copy and save the edited cell and reset its original text', async () => {
+	const page = await browser.newPage({ permissions: ['clipboard-read', 'clipboard-write'] });
+	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	const examples = page.locator('[data-example-editor]');
+	assert.ok(await examples.count() >= 11);
+	const editor = examples.first();
+	const text = editor.locator('textarea');
+	const original = await text.inputValue();
+	const edited = `${original}\n# edited`;
+	await text.fill(edited);
+	await editor.locator('[data-example-copy]').click();
+	await editor.getByRole('button', { name: 'Copied', exact: true }).waitFor();
+	assert.equal(await page.evaluate(() => navigator.clipboard.readText()), edited);
+	const saved = page.waitForEvent('download');
+	await editor.locator('[data-example-download]').click();
+	const download = await saved;
+	assert.equal(download.suggestedFilename(), 'train.py');
+	const chunks = [];
+	for await (const chunk of await download.createReadStream()) chunks.push(chunk);
+	assert.equal(Buffer.concat(chunks).toString(), edited);
+	await editor.locator('[data-example-reset]').click();
+	assert.equal(await text.inputValue(), original);
 	await page.close();
 });
 
