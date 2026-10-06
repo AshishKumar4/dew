@@ -34,6 +34,7 @@ import datetime
 import functools
 import importlib
 import importlib.metadata
+import inspect
 import operator
 import re
 import sys
@@ -263,13 +264,18 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         Pass a whole parsed config as the positional `record`. Its values are
         converted to the member's declared types here, so a caller does not
         need to know the member's fields to unpack the config. Keyword fields
-        override the record's.
+        override the record's. A function member's fields are its parameters,
+        converted to their annotations the same way, so a parameter typed
+        with what another table's functions return takes a record naming one
+        of them.
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
         held = _record_class(member)
         if held is not None:
             given = _declared(held, given, dtypes=True)
+        elif not isinstance(member, type):
+            given = _arguments(member, given, dtypes=True)
         return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
@@ -374,15 +380,18 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
 
     The class is the witness: what comes back is an instance of it or a
     `ValueError` naming what the record built instead, so a caller reads a
-    value of the type it asked for rather than one it has to narrow again.
+    value of the type it asked for rather than one it has to narrow again. A
+    container annotation, `tuple[ParamGroup, ...]` or `Mapping[str, ...]`,
+    builds every entry and witnesses the container.
     `dtypes` is the one policy the two readers differ in: a module field
     takes a `dtype` as the dtype its name says (True), and a run record
     keeps the name it wrote (`RunConfig.from_dict`, False).
     """
     built = _rebuilt(annotation, value, dtypes=dtypes)
-    if not isinstance(built, annotation):
+    witness: type[ValueT] = typing.get_origin(annotation) or annotation
+    if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
-                         f"not the {annotation.__name__} the field declares")
+                         f"not the {witness.__name__} the field declares")
     return built
 
 
@@ -465,7 +474,8 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     run record alike. A registered member is the record that names it,
     `{"name": ..., "fields": {...}}` (`to_record` writes it), where
     the field declares the table's members or a class the member derives
-    from; a dataclass is the record of its fields. Containers are walked, so
+    from, or a function of a shared table declared to return such a class;
+    a dataclass is the record of its fields. Containers are walked, so
     a mapping of records and a tuple of records build their values too, a
     JSON list becomes the tuple a field declares, and a mapping's key
     becomes the tuple path its key type declares. `dtypes` is as
@@ -500,12 +510,14 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if isinstance(value, Mapping):
         if isinstance(annotation, type) and annotation is not object:
             # A field typed with a base class takes a record of any shared
-            # member derived from it, or of the class itself; `object`
-            # declares nothing, and its record stays the record it is.
+            # member derived from it or returning it, or of the class itself;
+            # `object` declares nothing, and its record stays the record it is.
             member, fields = _nested(annotation, value)
             held = _record_class(member)
             if held is not None:
                 return _construct(held, fields, dtypes=dtypes)
+            if not isinstance(member, type):
+                return configured(member(**_arguments(member, fields, dtypes=dtypes)))
         if typing.get_origin(annotation) in _MAPPINGS:
             keys, entries = typing.get_args(annotation)
             return {_key(keys, str(name)): _rebuilt(entries, entry, dtypes=dtypes, name=str(name))
@@ -557,6 +569,57 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> di
             for name, value in fields.items()}
 
 
+def _arguments(function: Callable[..., Configured], fields: Mapping[str, object], *,
+               dtypes: bool) -> dict[str, Configured]:
+    """The record's fields as the parameters of the registered `function`,
+    each walked against its own annotation, as `_declared` walks a
+    dataclass's. A field the function does not take, or a parameter without
+    a default that the record lacks, raises; a function taking `**kwargs`
+    takes any field."""
+    parameters = inspect.signature(function).parameters.values()
+    named = [parameter for parameter in parameters
+             if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)]
+    names = sorted(parameter.name for parameter in named)
+    open_ended = any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters)
+    unknown = [] if open_ended else sorted(set(fields) - set(names))
+    missing = [parameter.name for parameter in named
+               if parameter.name not in fields and parameter.default is parameter.empty]
+    if unknown or missing:
+        raise ValueError(f"{function.__name__} does not match the record: unknown fields {unknown}, "
+                         f"missing fields {missing}; its parameters are {names}")
+    return {name: _rebuilt(_parameter_type(function, name), configured(value), dtypes=dtypes, name=name)
+            for name, value in fields.items()}
+
+
+def _parameter_type(function: Callable[..., Configured], name: str) -> Annotation:
+    """Resolve the annotation of one parameter of `function`, or its return
+    for `name="return"`, without evaluating the others. None where it has no
+    annotation. An annotation naming what the function's module does not
+    import at runtime raises, since a record cannot be read against it."""
+    # A classmethod registered as `table("name")(Class.reader)` is a bound
+    # method; its annotations and module are its function's.
+    underlying = function.__func__ if isinstance(function, types.MethodType) else function
+    if not isinstance(underlying, types.FunctionType):
+        return None
+    annotations = get_annotations(underlying, format=Format.FORWARDREF)
+    if name not in annotations:
+        return None
+    selected = types.SimpleNamespace(__annotations__={name: annotations[name]})
+    try:
+        return typing.get_type_hints(selected, globalns=dict(underlying.__globals__))[name]
+    except NameError as error:
+        raise ValueError(f"{function.__name__}'s annotation of {name} names what {underlying.__module__} "
+                         f"does not import at runtime ({error}); a record is read against it, so "
+                         f"import it there") from error
+
+
+def _returns(member: Callable[..., Configured], held: type) -> bool:
+    """Whether the function `member` is declared to return `held` or a class
+    derived from it."""
+    returned = _parameter_type(member, "return")
+    return isinstance(returned, type) and issubclass(returned, held)
+
+
 def _recorded(field: dataclasses.Field) -> bool:
     """Return whether a field is part of a record: one the constructor takes,
     not marked `metadata={"record": False}`."""
@@ -586,15 +649,19 @@ def _named(table: Registry, record: object) -> tuple[str, Mapping[str, object]]:
     return record["name"], record["fields"]
 
 
-def _nested(held: type, record: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
-    """The class and fields a record builds for a field typed `held`: the
-    shared member a name/fields record names, where that member is `held`
-    or derives from it, or else `held` and the record as its own fields."""
+def _nested(held: type,
+            record: Mapping[str, object]) -> tuple[Callable[..., Configured], Mapping[str, object]]:
+    """The member and fields a record builds for a field typed `held`: the
+    shared member a name/fields record names, where that member is `held`,
+    derives from it, or is a function declared to return it, or else `held`
+    and the record as its own fields."""
     if set(record) == {"name", "fields"} and isinstance(record["name"], str) and isinstance(
             record["fields"], Mapping):
         for table in Registry.shared():
             member = table.get(record["name"])
-            if isinstance(member, type) and issubclass(member, held):
+            if member is None:
+                continue
+            if issubclass(member, held) if isinstance(member, type) else _returns(member, held):
                 return member, record["fields"]
     return held, record
 
@@ -693,11 +760,14 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     the name the model holds.
 
     `dtype` is the compute dtype; `param_dtype` is where the parameters are
-    stored and `matmul_precision` what every matmul asks XLA for. Those two
-    reach the model only where it declares the field (`param_dtype`,
-    `precision`), so a model that declares neither takes neither and a run
-    that names neither writes neither. Unset, parameters stay float32 and the
-    model keeps its own precision.
+    stored and `matmul_precision` what every matmul asks XLA for. Each is
+    written into the field the model declares for it (`dtype`, `param_dtype`,
+    `precision`), and a run that names neither of the last two writes
+    neither. Unset, parameters stay float32 and the model keeps its own
+    precision. A setting the model declares no field for raises ValueError
+    naming the model and the field, since the run would not compute as it
+    says; a composite that declares no `dtype` takes the run's dtype when a
+    registered part in its config declares one (`with_precision`).
 
     The UNets keep per-stage attention settings in `attention_configs`,
     which do not inherit the model dtype and default `force_fp32_for_softmax`
@@ -710,6 +780,16 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     """
     member = models[name]
     declared = {f.name for f in dataclasses.fields(member) if f.init}
+    named = {"dtype": dtype, "param_dtype": param_dtype, "precision": matmul_precision}
+    unreached = [field for field, value in named.items() if value is not None and field not in declared
+                 and not (field == "dtype" and any(_part_takes_dtype(configured(part))
+                                                    for part in config.values()))]
+    if unreached:
+        settings = ", ".join(f"{_PRECISION_FLAGS[field]} {named[field]}" for field in unreached)
+        raise ValueError(
+            f"the model {name!r} declares no {' or '.join(unreached)} field, so the run's {settings} "
+            f"would not reach it; set {', '.join(_PRECISION_FLAGS[field] for field in unreached)} "
+            f"to None")
     written: PrecisionFields = {}
     if "dtype" in declared:
         written["dtype"] = dtype
@@ -784,21 +864,31 @@ def with_precision(name: str, config: Mapping[str, object], *,
     return {key: _with_part_dtype(configured(value), dtype) for key, value in fields.items()}
 
 
+def _part_takes_dtype(value: Configured) -> bool:
+    """Whether a composite's field is a registered model, recorded or built,
+    that declares a compute dtype."""
+    from flax import linen as nn
+
+    if isinstance(value, nn.Module):
+        return type(value) in models.values() and "dtype" in {f.name for f in dataclasses.fields(value)}
+    if not isinstance(value, Mapping) or set(value) != {"name", "fields"}:
+        return False
+    name, fields = value["name"], value["fields"]
+    return (isinstance(name, str) and name in models and isinstance(fields, Mapping)
+            and "dtype" in {field.name for field in dataclasses.fields(models[name])})
+
+
 def _with_part_dtype(value: Configured, dtype: str) -> Configured:
     """A composite's part with the run's compute dtype, where the part is a
     registered model, recorded or built, that declares one."""
     from flax import linen as nn
 
-    if isinstance(value, nn.Module):
-        owns = type(value) in models.values() and "dtype" in {f.name for f in dataclasses.fields(value)}
-        return value.clone(dtype=resolve_dtype(dtype)) if owns else value
-    if not isinstance(value, Mapping) or set(value) != {"name", "fields"}:
+    if not _part_takes_dtype(value):
         return value
-    name, fields = value["name"], value["fields"]
-    if (isinstance(name, str) and name in models and isinstance(fields, Mapping)
-            and "dtype" in {field.name for field in dataclasses.fields(models[name])}):
-        return {"name": name, "fields": {**fields, "dtype": dtype}}
-    return value
+    if isinstance(value, nn.Module):
+        return value.clone(dtype=resolve_dtype(dtype))
+    assert isinstance(value, Mapping) and isinstance(value["fields"], Mapping)
+    return {"name": value["name"], "fields": {**value["fields"], "dtype": dtype}}
 
 
 # Every table's record is `{"name": ..., "fields": {...}}`, which
@@ -818,8 +908,10 @@ trainings: Registry[type[Training], Training] = Registry("training").share()
 
 __all__ = [
     "PLUGINS",
+    "Record",
     "Registry",
     "datasets",
+    "dtype_name",
     "encoders",
     "from_record",
     "metrics",
