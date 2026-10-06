@@ -15,6 +15,7 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew.interop.weights import translate_parameters
+from dew.nn.activations import activation
 from dew.nn.attention import RMSNorm
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
@@ -172,15 +173,11 @@ class Gemma4VisionMLP(nn.Module):
         self.down_proj = dense(self.hidden_size, name="down_proj")
 
     def __call__(self, hidden_states):
-        if self.hidden_act == "gelu_pytorch_tanh":
-            act = functools.partial(jax.nn.gelu, approximate=True)
-        elif self.hidden_act == "gelu":
-            act = functools.partial(jax.nn.gelu, approximate=False)
-        else:
+        if self.hidden_act not in ("gelu_pytorch_tanh", "gelu"):
             raise ValueError(
                 f"hidden_act {self.hidden_act!r} is not expressible: this MLP "
                 "runs gelu_pytorch_tanh or gelu")
-        return self.down_proj(act(self.gate_proj(hidden_states))
+        return self.down_proj(activation(self.hidden_act)(self.gate_proj(hidden_states))
                               * self.up_proj(hidden_states))
 
 

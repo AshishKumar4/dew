@@ -388,7 +388,7 @@ def test_an_exact_gelu_reads_fp32_and_keeps_only_its_bf16_input_for_the_backward
 
     def walk(jaxpr, remat_inputs=None):
         for equation in jaxpr.eqns:
-            if equation.primitive.name == "erfc":
+            if equation.primitive.name == "erf":
                 found.append((equation.invars[0].aval.dtype, remat_inputs))
             inputs = ([variable.aval.dtype for variable in equation.invars]
                       if equation.primitive.name in ("checkpoint", "remat2") else remat_inputs)
@@ -399,7 +399,7 @@ def test_an_exact_gelu_reads_fp32_and_keeps_only_its_bf16_input_for_the_backward
 
     walk(jax.make_jaxpr(jax.value_and_grad(loss))(params).jaxpr)
     assert found and all(dtype == jnp.float32 for dtype, _ in found), found
-    # The backward recomputes erfc in a remat that reads the bf16 activation
+    # The backward recomputes erf in a remat that reads the bf16 activation
     # and its bf16 cotangent, nothing wider.
     recomputed = [inputs for _, inputs in found if inputs is not None]
     assert recomputed and all(dtype == jnp.bfloat16 for inputs in recomputed for dtype in inputs), found
