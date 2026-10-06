@@ -151,7 +151,7 @@ class WeightLayout:
 
     `expert_index` is the expert a per-expert source tensor holds. The
     loader stacks those tensors onto an expert dimension
-    (`hf_decoders._stack_experts`), so one stacked leaf answers for every
+    (`decoder_paths._stack_experts`), so one stacked leaf answers for every
     expert of a layer and the index says which slice this tensor is.
 
     `dtype` is the width the source stores this tensor in where that is
