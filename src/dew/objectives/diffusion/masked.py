@@ -23,7 +23,6 @@ compilation rather than a constant embedded in the executable.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
@@ -169,31 +168,17 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
         })
 
-    def evaluate(self, params, batch, step: Step) -> TokenScores:
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
         """Return the negative ELBO of every token in the batch.
 
         One noise level and one masking are drawn from the pass's key, as in
-        training. Dropout is off, and the averaged weights are used when the
-        run keeps them. Every real token counts: a masked token scores its
-        weighted cross entropy, a visible one scores zero, and a packed
-        window's padding has no weight. So `perplexity` over a validation
-        pass is the exponential of the ELBO bound per token, the number MDLM
-        reports."""
-        params = self.evaluation_variables(params, step)
-        losses, weights, correct = self._scored(params, batch, step.key)
-        return TokenScores(losses=losses, weights=weights, correct=correct)
-
-    @functools.cached_property
-    def _scored(self):
-        """Compile the evaluation's corruption and scores once per objective.
-        Run op by op, the model's forward would dispatch every operation of
-        every validation batch from the host, and jax's eager shard_map
-        refuses the chunked head's map over the data axis alone."""
-        def scored(params, batch, key):
-            tokens, losses, weights, _, predicted, real = self._token_losses(params, batch, key, train=False)
-            return losses * weights, real.astype(losses.dtype), predicted == tokens
-
-        return jax.jit(scored)
+        training, with dropout off. Every real token counts: a masked token
+        scores its weighted cross entropy, a visible one scores zero, and a
+        packed window's padding has no weight. So `perplexity` over a
+        validation pass is the exponential of the ELBO bound per token, the
+        number MDLM reports."""
+        tokens, losses, weights, _, predicted, real = self._token_losses(params, batch, key, train=False)
+        return TokenScores(losses * weights, real.astype(losses.dtype), predicted == tokens)
 
     def _token_losses(self, params, batch, key, *, train: bool):
         """Corrupt the batch once and score it.
