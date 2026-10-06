@@ -445,6 +445,32 @@ def test_layout_parity_orders_preserve_the_tiny_nemotron_function():
                           float(reordered.sum()), float(truth.sum()))
 
 
+def test_layout_parity_routes_declaring_rows_to_orders_in_default_mode(monkeypatch, tmp_path):
+    tool = load('layout_parity')
+    called = []
+
+    def ordered(models, layouts, **kwargs):
+        called.extend(models)
+        assert jax.config.jax_enable_x64
+        return [{'model': models[0], 'layout': layouts[0], 'status': 'works', 'orders': 52}]
+
+    monkeypatch.setattr(tool, 'run_orders', ordered)
+    gradient = {'weight': np.array([1.0])}
+    reference = tool.Reference(losses=[2.0], gradient=gradient, flops_per_device=None,
+                               floors={'weight': 1e-6}, loss_floor=1e-6)
+    monkeypatch.setattr(tool, 'computed_reference', lambda *args: reference)
+    monkeypatch.setattr(tool, 'trained', lambda *args, **kwargs: (
+        [2.0], gradient, {'flops_per_device': None, 'mesh': {'data': 1}}))
+    before = jax.config.jax_enable_x64
+    rows = tool.run(['nemotron_h_moe', 'dense'], ['sequence4'], dtype='float32', steps=1, anchor=False,
+                    mixture={}, objective={}, references=tool.References(), devices=4,
+                    speak=lambda line: None, keep=lambda rows: None, orders_out=tmp_path)
+    assert called == ['nemotron_h_moe']
+    assert rows[0]['orders'] == 52 and rows[1]['status'] == 'works'
+    assert 'orders' not in rows[1]
+    assert jax.config.jax_enable_x64 == before
+
+
 def test_layout_parity_judges_a_leaf_below_the_steps_rounding_against_the_whole_gradient():
     """A gradient whose terms cancel, such as a scale just ahead of a
     normalisation that undoes it, is rounding noise, and relative to its own

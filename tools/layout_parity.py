@@ -148,13 +148,13 @@ def _fixture(name: str) -> dict[str, Any]:
 
 
 def _nemotron_h_moe() -> dict[str, Any]:
-    """The fp32 MoE row, checked in the explicit K-order mode.
+    """The fp32 MoE row declares K-order judgment in its zoo entry.
 
     At f7f85cef1b8c83a85c74ed93be22928c3d400801 its sequence4 gradient was
     0.720 of the K-order bound over 52 exact residual orders, and expert4
     was 0.596. Float64 invariance drift was at most 1.121e-14; no expert
-    gate_proj exists. The two-layout Colab CPU job took 172 seconds, so
-    this multi-draw check stays explicit rather than adding it to CI.
+    gate_proj exists. The two-layout Colab CPU job took 172 seconds. This
+    multi-draw comparison belongs in Colab, not on the shared workstation.
     Reproduce with `--models nemotron_h_moe --layouts sequence4 expert4
     --dtype float32 --steps 1 --devices 4 --rounding-orders --out DIR`,
     JAX_PLATFORMS=cpu, JAX_ENABLE_X64=1 and four virtual CPU devices.
@@ -264,7 +264,7 @@ def zoo() -> dict[str, Any]:
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
         "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
-        "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), **lm),
+        "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), orders=True, **lm),
         "window": Case("causal_transformer", window, **lm),
         "mla": Case("causal_transformer", mla, **lm),
         "mamba2": Case("causal_transformer", mamba2, **lm),
@@ -1033,7 +1033,7 @@ def prepared(models: Sequence[str], *, dtype: str, steps: int, anchor: bool, mix
 def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int, anchor: bool,
         mixture: dict[str, Any], objective: dict[str, Any], references: References,
         speak: Callable[[str], None], keep: Callable[[list[dict[str, Any]]], None],
-        devices: int | None = None) -> list[dict[str, Any]]:
+        devices: int | None = None, orders_out: Path | None = None) -> list[dict[str, Any]]:
     """Every layout of every model, one row each, `keep` handed the rows so
     far after each, each layout over the process's first `devices` devices
     (every device by default). A reference and a layout run as agreed
@@ -1049,6 +1049,13 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
     rows = []
     for model in models:
         case, reference = model_case(model, dtype, mixture, objective)
+        if case.orders:
+            with jax.enable_x64(new_val=True):
+                rows.extend(run_orders(
+                    [model], layouts, dtype=dtype, devices=devices, mixture=mixture, objective=objective,
+                    out=Path('out/layout-parity-orders') if orders_out is None else orders_out, speak=speak))
+            keep(rows)
+            continue
         batch = bench.global_batch(case)
         try:
             judge = agreed(f"reference of {model}", lambda: references.reference(reference, batch, steps))
@@ -1191,7 +1198,8 @@ def main(models: Annotated[tuple[str, ...], tyro.conf.arg(help="zoo() names")] =
     rows = run(models, layouts, dtype=dtype, steps=steps, anchor=anchor, mixture=json.loads(mixture),
                objective=json.loads(objective), references=store,
                speak=lambda line: print(line, flush=True) if speaker else None, keep=keep,
-               devices=devices)
+               devices=devices,
+               orders_out=None if out is None else out.parent / f'{out.stem}-orders')
     if speaker:
         print("\n".join(summary(rows)), flush=True)
     raise SystemExit(verdict(rows))
