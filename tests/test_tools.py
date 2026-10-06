@@ -495,12 +495,12 @@ def test_layout_parity_anchors_an_objective_that_draws_per_row_on_its_own_draws(
     the anchor alone; the anchor built only decoders, and computed no step for
     these (765a6f97)."""
     tool = load("layout_parity")
-    import benchmark_step
+    import benchmark_models
 
     case = dataclasses.replace(tool.zoo()[model], dtype="float32")
     # As the tool runs: the reference and the anchor both under x64.
     with jax.enable_x64(new_val=True):
-        batch = benchmark_step.global_batch(case)
+        batch = benchmark_models.global_batch(case)
         reference = tool.computed_reference(case, batch, 1)
         loss, gradient = tool.anchor_step(case, batch)
 
@@ -516,10 +516,10 @@ def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output
     DiT, UNet and MMDiT layout was judged on its output layer alone. The
     tool draws every all-zero leaf, so each one carries a gradient."""
     tool = load("layout_parity")
-    import benchmark_step
+    import benchmark_models
 
     case = dataclasses.replace(tool.zoo()["dit"], dtype="float32")
-    _, gradient, _ = tool.trained(case, {}, benchmark_step.global_batch(case), steps=1, one_device=True)
+    _, gradient, _ = tool.trained(case, {}, benchmark_models.global_batch(case), steps=1, one_device=True)
 
     silent = [leaf for leaf, values in gradient.items() if not np.any(values)]
     assert not silent, f"{len(silent)} of {len(gradient)} leaves get no gradient: {silent[:4]}"
@@ -605,10 +605,10 @@ def test_layout_parity_reads_a_prepared_reference_and_computes_none(tmp_path, mo
     computes none, and refuses one it would have to compute. A reference of
     other steps is another reference."""
     tool = load("layout_parity")
-    import benchmark_step
+    import benchmark_models
 
     case = tool.zoo()["dense"]
-    batch = benchmark_step.global_batch(case)
+    batch = benchmark_models.global_batch(case)
     computed = tool.Reference(losses=[6.2, 6.1], gradient={"['w']": np.array([1.0, -2.5, 3e-9])},
                               flops_per_device=1.5e9, floors={"['w']": 2e-7}, loss_floor=4e-7)
     monkeypatch.setattr(tool, "computed_reference", lambda *arguments: computed)
@@ -1093,6 +1093,35 @@ def test_the_slop_gate_reports_a_broad_suppress_as_it_reports_an_empty_handler()
               "try:\n    step()\nexcept Exception:\n    pass\n")
     module = lint.Module(Path("snippet.py"), "src/dew/snippet.py", source, ast.parse(source))
     assert sorted(finding.line for finding in lint.swallowed(module)) == [2, 8]
+
+
+def test_numpys_object_dtype_in_a_call_is_not_an_alias_of_object():
+    """#46: `np.asarray(rows, object)[keep]` is NumPy's object dtype under an
+    index, not a type alias resolving to `object`; `Rows = dict[str, object]`
+    still is one."""
+    lint = load("lint_slop")
+    source = ("import numpy as np\n"
+              "held = np.asarray(rows, object)[keep]\n"
+              "Rows = dict[str, object]\n")
+    module = lint.Module(Path("snippet.py"), "src/dew/snippet.py", source, ast.parse(source))
+    assert [(finding.line, finding.code) for finding in lint.contracts(module)] == [(3, "SLOP002")]
+
+
+def test_a_plugin_package_checks_its_own_source_with_dews_rules(tmp_path):
+    """#46: `--root` and `--package` point the gate at another checkout, whose
+    `src/<package>` gets the contract rules and whose own modules SLOP008
+    will not see patched."""
+    lint = load("lint_slop")
+    (tmp_path / "src" / "sparx").mkdir(parents=True)
+    (tmp_path / "src" / "sparx" / "graph.py").write_text(
+        "def edges(table: dict[str, object]):\n    return table\n")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_graph.py").write_text(
+        "def test_edges(monkeypatch):\n    monkeypatch.setattr('sparx.graph.edges', len)\n")
+    modules = list(lint.collect(["src/sparx", "tests"], tmp_path, "sparx"))
+    found = sorted((module.relative, finding.code) for module in modules for finding in lint.check(module))
+    assert found == [("src/sparx/graph.py", "SLOP002"), ("tests/test_graph.py", "SLOP008")]
+    assert lint.main(["--root", str(tmp_path), "--package", "sparx"]) == 1
 
 
 # ---------------------------------------------------------------------------

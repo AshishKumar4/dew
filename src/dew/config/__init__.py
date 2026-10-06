@@ -41,7 +41,7 @@ from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import Search, Space, _read, _write, override, random_search
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
-from dew.data.dataset import json_list_argument, ramped
+from dew.data.dataset import Reader, ramped, record_argument
 from dew.lora import LoRA, _Adapted, adapted
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
@@ -101,14 +101,19 @@ class ModelConfig:
     quantization: Quantization | None = None
     """The quantized training the model was wrapped in, which `build` wraps it in again."""
     dtype: registry.DtypeName | None = "bfloat16"
-    """The compute dtype; parameter storage is set separately."""
-    param_dtype: registry.DtypeName | None = None
-    """The parameter storage dtype, where the model declares that field.
+    """The compute dtype; parameter storage is set separately.
 
-    Unset stores float32, the model's own default.
+    A model that declares no `dtype` field, and holds no registered part that
+    does, refuses any value but None (`dew.registry.precision_fields`).
+    """
+    param_dtype: registry.DtypeName | None = None
+    """The parameter storage dtype, written into the model's `param_dtype` field.
+
+    Unset stores float32, the model's own default. A model that declares no
+    such field refuses any other value.
     """
     matmul_precision: Literal["default", "high", "highest"] | None = None
-    """The precision every matmul in the model asks XLA for, where the model declares a `precision` field.
+    """The precision every matmul in the model asks XLA for, written into its `precision` field.
 
     `default` is the backend's fastest algorithm; `high` and `highest` trade
     throughput for mantissa bits (on Ampere and later, tf32 and fp32 against
@@ -116,7 +121,8 @@ class ModelConfig:
     decoder's vocabulary head at `default` rounds its logits and their gradient to
     bf16, as torch autocast does. `high` and `highest` keep that head in fp32,
     which is the setting to use when comparing parallel layouts in bf16
-    (`dew.nn.precision.head_product`).
+    (`dew.nn.precision.head_product`). A model that declares no `precision`
+    field refuses any value but None.
     """
     attention_impl: AttentionImpl = "auto"
     """The attention kernel.
@@ -236,7 +242,7 @@ class OptimConfig:
     """The weight decay passed to the optimizer; for 'adam' it is torch's coupled L2
     penalty, added to the gradient before the moments read it, for 'adamw' the
     decoupled decay."""
-    param_groups: Annotated[tuple[ParamGroup, ...], json_list_argument(ParamGroup)] = ()
+    param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
     """Per-group learning rates, momentum schedules, weight decay and bounds; the first
     matching group wins.
 
@@ -683,7 +689,8 @@ class RunConfig:
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
-              summary: Mapping[str, object] | None = None) -> TrainState:
+              summary: Mapping[str, object] | None = None,
+              validation: Mapping[str, Reader] | None = None) -> TrainState:
         """Train `objective` on `data` as this config describes; every recipe calls this after building both.
 
         The run lives under `name` in `trainer.checkpoint_dir`, and process zero writes
@@ -704,7 +711,11 @@ class RunConfig:
         `lora` is not applied here: the recipe attaches it to the model and variables
         it builds the objective from. `rollout` is the trainer's rollout, which turns
         each prefetched batch into the one the step trains on, as an on-policy
-        objective samples it.
+        objective samples it. `validation` names the splits each evaluation
+        scores in place of `dataset.val`, as `Trainer.fit` takes them: a held-out
+        split and a test set are logged as `val/...` and `test/...`. With no
+        `trainer.best`, the first split's loss ranks the checkpoints; a `Best`
+        over a metric names its split.
         """
         if dataset.batch != self.trainer.batch_size:
             raise ValueError(
@@ -754,7 +765,7 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 metrics=metrics, preview=trainer.wandb is not None,
-                best=trainer.best_policies(),
+                best=trainer.best_policies(), validation=validation,
             )
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
@@ -798,4 +809,4 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb"]

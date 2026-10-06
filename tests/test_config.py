@@ -161,14 +161,12 @@ def test_the_run_stores_its_parameters_and_names_its_matmul_precision(monkeypatc
         "dtype", "attention_impl", "param_dtype", "precision"}
 
 
-def test_a_model_takes_the_precision_settings_it_declares_and_no_others():
-    """A run names storage and precision whatever it trains; each reaches the
-    model only where the model has a field for it. `causal_transformer`
-    declares `precision` and no `param_dtype`, so it takes the one and not
-    the other, and a record keeps neither: the config writes them again."""
+def test_a_model_takes_the_precision_settings_it_declares():
+    """A run's storage and matmul precision reach the model through the
+    fields it declares, and a record keeps neither: the config writes them
+    again."""
     fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
-    config = ModelConfig("causal_transformer", fields, dtype="float32",
-                         param_dtype="bfloat16", matmul_precision="high")
+    config = ModelConfig("causal_transformer", fields, dtype="float32", matmul_precision="high")
 
     built = config.fields()
 
@@ -177,6 +175,55 @@ def test_a_model_takes_the_precision_settings_it_declares_and_no_others():
     assert config.build().precision == "high"
     assert ModelConfig("causal_transformer", fields).fields().keys() == {
         *fields, "dtype", "attention_impl"}
+
+
+def test_a_precision_setting_the_model_declares_no_field_for_is_refused():
+    """`causal_transformer` declares `precision` and no `param_dtype`, so a
+    run that names a storage dtype for it would store float32 regardless."""
+    fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
+    config = ModelConfig("causal_transformer", fields, dtype="float32",
+                         param_dtype="bfloat16", matmul_precision="high")
+
+    with pytest.raises(ValueError, match=r"the model 'causal_transformer' declares no param_dtype field, "
+                                         r"so the run's --model.param-dtype bfloat16 would not reach it"):
+        config.fields()
+
+
+class Unprecise(nn.Module):
+    """A model that declares none of the precision fields, as a plugin's may."""
+
+    features: int = 4
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(self.features)(x)
+
+
+def test_a_model_without_precision_fields_refuses_every_setting_and_builds_without_them(monkeypatch):
+    monkeypatch.setitem(models._members, "unprecise", Unprecise)
+
+    with pytest.raises(ValueError, match=r"'unprecise' declares no dtype field.*set --model.dtype to None"):
+        ModelConfig("unprecise", {}).fields()
+    with pytest.raises(ValueError, match=r"declares no dtype or precision field, so the run's "
+                                         r"--model.dtype float32, --model.matmul-precision highest"):
+        ModelConfig("unprecise", {}, dtype="float32", matmul_precision="highest").fields()
+    assert isinstance(ModelConfig("unprecise", {"features": 2}, dtype=None).build(), Unprecise)
+
+
+def test_a_composite_takes_the_dtype_through_its_parts_and_refuses_what_none_declares():
+    """DiffusionGemma declares no dtype, and hands the run's to the decoder
+    in its config, which declares one; nothing in it stores parameters at
+    another dtype."""
+    text = {"name": "causal_transformer", "fields": {"vocab_size": 64, "emb_features": 32,
+                                                     "num_layers": 1, "num_heads": 2}}
+    fields = {"text": text, "canvas_length": 4}
+
+    written = ModelConfig("diffusion_gemma", fields, dtype="float32").fields()
+    assert written["text"]["fields"]["dtype"] == "float32"
+    with pytest.raises(ValueError, match="'diffusion_gemma' declares no param_dtype field"):
+        ModelConfig("diffusion_gemma", fields, dtype="float32", param_dtype="bfloat16").fields()
+    with pytest.raises(ValueError, match="'diffusion_gemma' declares no dtype field"):
+        ModelConfig("diffusion_gemma", {"canvas_length": 4}, dtype="float32").fields()
 
 
 def test_a_model_config_that_carries_a_precision_setting_the_run_names_is_refused():
@@ -367,6 +414,25 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Experiment_Name: batch" in output
     assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
+
+
+def test_train_scores_every_named_validation_split(tmp_path):
+    """#36 item 5: a held-out split and a test set, scored together at each
+    evaluation and logged under their own names."""
+    run = RunConfig(trainer=TrainerConfig(
+        name="splits", checkpoint_dir=str(tmp_path / "runs"), steps=2, batch_size=8,
+        eval_every=1, checkpoint_every=None))
+    held = next(batches())
+    splits = {"val": lambda partition: iter([held]),
+              "test": lambda partition: iter([{"x": held["x"], "y": held["y"] + 1}])}
+    run.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="splits",
+              validation=splits)
+    rows = [json.loads(line) for line in
+            (tmp_path / "runs" / "splits" / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    val, test = ({row["step"]: row["scalars"][f"{split}/loss"]
+                  for row in rows if f"{split}/loss" in row["scalars"]} for split in ("val", "test"))
+    assert sorted(val) == sorted(test) == [1, 2]
+    assert all(test[step] > val[step] for step in val), "the shifted test targets score a higher loss"
 
 
 @pytest.mark.mesh(devices=2)

@@ -42,11 +42,12 @@ count, GPU busy fraction and time by kernel category. Under
 """
 
 import argparse
+import dataclasses
 import json
 import math
 import os
+import sys
 import time
-from dataclasses import dataclass
 
 # Triton and gcc use the system temporary directory while torch.compile runs.
 # This workstation's /tmp is a quota-limited tmpfs. Keep compiler scratch and
@@ -65,10 +66,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, small_cases
+
 BF16 = torch.bfloat16
 F32 = torch.float32
-TEXT_TOKENS = 77
-TEXT_FEATURES = 768
 SIGMA_DATA = 0.5
 P_MEAN, P_STD = -0.4, 1.0
 UNCONDITIONAL_PROB = 0.12
@@ -81,37 +83,31 @@ PEAK_BF16_SPEC = 97.5e12
 # Presets: Dew's small preset and the larger compute-dominated cases
 # ----------------------------------------------------------------------------
 
-@dataclass
-class Case:
-    model: str
-    config: dict
-    batch_size: int
-    image_size: int = 64
-    seq_len: int = 0
-
-
 def preset(model: str, size: str) -> Case:
+    if model not in ('causal_transformer', 'simple_dit', 'unet'):
+        raise ValueError(model)
+    if size == 'small':
+        case = next(case for case in small_cases('bfloat16') if case.architecture == model)
+        # The torch CLI reports 64px even for its token-only case.
+        case = dataclasses.replace(case, image_size=64)
+        if model == 'unet':
+            # The torch port takes heads per level; Dew takes attention records.
+            attention = case.config['attention_configs']
+            if not isinstance(attention, list):
+                raise ValueError('the UNet preset needs attention records per level')
+            heads = [None if stage is None else stage['heads'] for stage in attention]
+            config = {'attention_heads' if name == 'attention_configs' else name:
+                      heads if name == 'attention_configs' else value for name, value in case.config.items()}
+            case = dataclasses.replace(case, config=config)
+        return case
     if model == 'causal_transformer':
-        if size == 'small':
-            return Case(model, dict(vocab_size=50304, emb_features=768, num_layers=3, num_heads=12,
-                                    mlp_features=3072, max_seq_len=512),
-                        batch_size=16, seq_len=512)
         return Case(model, dict(vocab_size=50304, emb_features=768, num_layers=12, num_heads=12,
                                 mlp_features=3072, max_seq_len=1024),
-                    batch_size=8, seq_len=1024)
+                    batch_size=8, seq_len=1024, image_size=64)
     if model == 'simple_dit':
-        if size == 'small':
-            return Case(model, dict(patch_size=4, emb_features=384, num_layers=6, num_heads=6, mlp_ratio=4),
-                        batch_size=16)
         return Case(model, dict(patch_size=4, emb_features=768, num_layers=12, num_heads=12, mlp_ratio=4),
-                    batch_size=32)
-    if model == 'unet':
-        if size != 'small':
-            raise ValueError('the unet has no large preset')
-        return Case(model, dict(emb_features=256, feature_depths=[64, 128, 256],
-                                attention_heads=[None, 4, 4], num_res_blocks=2, num_middle_res_blocks=1),
-                    batch_size=16)
-    raise ValueError(model)
+                    batch_size=32, image_size=64)
+    raise ValueError('the unet has no large preset')
 
 
 # ----------------------------------------------------------------------------
@@ -655,9 +651,9 @@ def diffusion_loss(model, batch):
 
 def build(case: Case, args):
     attention = AttentionCore(args.attention, args.sdpa_backend)
-    if case.model == 'causal_transformer':
+    if case.architecture == 'causal_transformer':
         model = CausalTransformer(case.config, attention, head_dtype=getattr(torch, args.head_dtype))
-    elif case.model == 'simple_dit':
+    elif case.architecture == 'simple_dit':
         model = SimpleDiT(case.config, attention, case.image_size)
     else:
         # UNet attention stages run with force_fp32_for_softmax=False in the small preset
@@ -668,7 +664,10 @@ def build(case: Case, args):
 def make_batch(case: Case, seed=0):
     rng = np.random.default_rng(seed)
     if case.seq_len:
-        text = rng.integers(0, case.config['vocab_size'], size=(case.batch_size, case.seq_len + 1)).astype(np.int32)
+        vocab = case.config['vocab_size']
+        if not isinstance(vocab, int):
+            raise ValueError('the decoder preset needs an integer vocabulary size')
+        text = rng.integers(0, vocab, size=(case.batch_size, case.seq_len + 1)).astype(np.int32)
         return {'text': torch.from_numpy(text)}
     shape = (case.batch_size, case.image_size, case.image_size, 3)
     image = rng.integers(0, 256, size=shape).astype(np.float32)
@@ -758,18 +757,21 @@ def analytic_flops(case: Case):
     The UNet formula is the sum over its convolutions and denses of
     6 x MACs per forward (forward + 2 backward), taken from the module graph."""
     cfg, B = case.config, case.batch_size
-    if case.model == 'causal_transformer':
-        d, L, H, S, V = cfg['emb_features'], cfg['num_layers'], cfg['num_heads'], case.seq_len, cfg['vocab_size']
+    if case.architecture == 'causal_transformer':
+        d, L, S, V = cfg['emb_features'], cfg['num_layers'], case.seq_len, cfg['vocab_size']
         Fh = cfg['mlp_features']
+        assert isinstance(d, int) and isinstance(L, int) and isinstance(V, int) and isinstance(Fh, int)
         per_layer = 4 * d * d + 3 * d * Fh
         T = B * S
         return dict(matmul=6 * (L * per_layer + d * V) * T, attention=12 * L * B * S * S * d,
                     head=6 * d * V * T, tokens=T)
-    if case.model == 'simple_dit':
+    if case.architecture == 'simple_dit':
         d, L, p = cfg['emb_features'], cfg['num_layers'], cfg['patch_size']
+        assert isinstance(d, int) and isinstance(L, int) and isinstance(p, int)
         S = (case.image_size // p) ** 2
         T = B * S
         r = cfg['mlp_ratio']
+        assert isinstance(r, (int, float))
         per_layer = 4 * d * d + 2 * d * r * d
         # patch embed and text projection take inputs without gradients: forward + weight
         # gradient only (4x); everything else is forward + two backward matmuls (6x)
@@ -876,9 +878,9 @@ def main():
 
     case = preset(args.model, args.size)
     if args.batch_size:
-        case.batch_size = args.batch_size
+        case = dataclasses.replace(case, batch_size=args.batch_size)
     if args.vocab_size is not None:
-        if case.model != 'causal_transformer':
+        if case.architecture != 'causal_transformer':
             raise ValueError('--vocab-size applies only to causal_transformer')
         case.config['vocab_size'] = args.vocab_size
     model = build(case, args)
@@ -895,7 +897,7 @@ def main():
         device_batch = {k: v.cuda() for k, v in host_batch.items()}
 
     def loss_fn(batch):
-        if case.model == 'causal_transformer':
+        if case.architecture == 'causal_transformer':
             return lm_loss(model, batch, metrics=not args.no_metrics)
         return diffusion_loss(model, batch)
 
@@ -923,15 +925,15 @@ def main():
 
     warmup_s, wall, per_step, gaps, (loss, aux, finite) = _timed(step, args.warmup, args.steps)
 
-    flops = unet_flops(model, case) if case.model == 'unet' else analytic_flops(case)
+    flops = unet_flops(model, case) if case.architecture == 'unet' else analytic_flops(case)
     total_flops = flops['matmul'] + flops['attention']
     step_s = wall / args.steps
     row = dict(
         framework='torch', torch=torch.__version__, cuda=torch.version.cuda,
         cudnn=torch.backends.cudnn.version(), device=torch.cuda.get_device_name(0),
-        model=case.model, size=args.size, mode=args.mode, attention=args.attention,
+        model=case.architecture, size=args.size, mode=args.mode, attention=args.attention,
         sdpa_backend=args.sdpa_backend if args.attention == 'sdpa' else None,
-        head_dtype=args.head_dtype if case.model == 'causal_transformer' else None,
+        head_dtype=args.head_dtype if case.architecture == 'causal_transformer' else None,
         ema=ema is not None, metrics=not args.no_metrics, optimizer=not args.no_optimizer,
         tf32=not args.no_tf32, h2d=args.h2d, batch_size=case.batch_size,
         seq_len=case.seq_len, image_size=case.image_size,

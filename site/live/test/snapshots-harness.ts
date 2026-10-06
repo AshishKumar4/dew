@@ -1,6 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import { SnapshotRegistry } from '../src/snapshots';
-export { SnapshotRegistry };
+export class Registry extends SnapshotRegistry {
+	async runAlarm() { await this.alarm(); }
+}
 
 export class Preparer extends DurableObject {
 	async prepare(commit: string) {
@@ -14,7 +16,7 @@ export class Preparer extends DurableObject {
 	async calls() { return (await this.ctx.storage.get<number>('calls')) ?? 0; }
 }
 
-interface Env { REGISTRY: DurableObjectNamespace<SnapshotRegistry>; PREPARER: DurableObjectNamespace<Preparer>; }
+interface Env { REGISTRY: DurableObjectNamespace<Registry>; PREPARER: DurableObjectNamespace<Preparer>; }
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 export default {
@@ -22,6 +24,22 @@ export default {
 		const scenario = new URL(request.url).pathname.slice(1);
 		const registry = env.REGISTRY.get(env.REGISTRY.idFromName(scenario));
 		const preparer = env.PREPARER.get(env.PREPARER.idFromName('trusted'));
+		if (scenario === 'queued') {
+			const reply = await registry.ensure(A);
+			return Response.json({ reply, status: await registry.status(), calls: await preparer.calls(), now: Date.now() });
+		}
+		if (scenario === 'hash-alarm') {
+			await registry.ensure('c'.repeat(64));
+			await registry.runAlarm();
+			return Response.json({ generation: await registry.current('c'.repeat(64)), calls: await preparer.calls() });
+		}
+		if (scenario === 'alarm-failure') {
+			await registry.refresh(A);
+			await preparer.fail();
+			await registry.ensure(B);
+			await registry.runAlarm();
+			return Response.json({ status: await registry.status(), now: Date.now() });
+		}
 		if (scenario === 'concurrent') {
 			const replies = await Promise.all(Array.from({ length: 10 }, () => registry.refresh(A)));
 			return Response.json({ replies, calls: await preparer.calls(), active: await registry.current(A) });

@@ -6,15 +6,17 @@ import importlib.util
 import itertools
 import json
 import sys
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 import pytest
 from diffusion_stubs import RES, StubText
 
-from dew.config import RunConfig
+from dew.config import RunConfig, ScheduleSpec
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
-from dew.data.dataset import tokenized
+from dew.data.dataset import record_argument, tokenized
 from dew.diffusion.presets import Flow
 from dew.registry import datasets, encoders
 from dew.sampling import Heun
@@ -277,3 +279,26 @@ def test_param_groups_on_the_command_line_read_their_schedules_as_records():
         ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
                    bounds=(0.0, 24.0)),
         ParamGroup("rest", ("*",), b1=OneCycle(peak=0.85, init=0.95, end=0.95)))
+
+
+@dataclasses.dataclass(frozen=True)
+class _Schedules(RunConfig):
+    """A recipe with a named set of schedules, as sparx's surrogate and delay widths."""
+
+    schedules: Annotated[Mapping[str, ScheduleSpec], record_argument(Mapping[str, ScheduleSpec])] = \
+        dataclasses.field(default_factory=dict)
+
+
+def test_a_mapping_of_registered_records_reads_from_one_flag_and_round_trips_its_record():
+    """#45: each schedule is the record that names it, read from one JSON
+    object on the command line and written back by the run's record."""
+    from dew.training.optim import Exponential, Linear
+
+    given = {"sigma": {"name": "linear", "fields": {"peak": 0.5, "warmup_steps": 0, "end": 0.1}},
+             "delay": {"name": "exponential", "fields": {"init": 10.0, "end": 1.0, "every": 4}}}
+    config = parse(_Schedules, ["--schedules", json.dumps(given)])
+
+    assert config.schedules == {"sigma": Linear(peak=0.5, warmup_steps=0, end=0.1),
+                                "delay": Exponential(init=10.0, end=1.0, every=4)}
+    assert _Schedules.from_dict(json.loads(json.dumps(config.to_dict()))) == config
+    assert parse(_Schedules, []).schedules == {}
