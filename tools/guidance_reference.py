@@ -27,6 +27,14 @@ Each runs in float64 and in float32; what lands per case is the initial
 state, the settings and both results.
 
     PYTHONPATH=src python tools/guidance_reference.py
+
+    PYTHONPATH=src python tools/guidance_reference.py apg-ensemble OUTPUT.npz
+    PYTHONPATH=src python tools/guidance_reference.py apg-projection OUTPUT.npz
+
+The ensemble mode leaves the existing fixtures alone, checks every APG
+array regenerates bit for bit, and records plain APG over 1024 independent
+initial states. Spatial orders leave this pointwise case's fp32 result
+unchanged, so more states are what resolve its RMS error.
 """
 
 from __future__ import annotations
@@ -35,6 +43,7 @@ import ast
 import itertools
 import json
 import math
+import sys
 import types
 import urllib.request
 from pathlib import Path
@@ -71,6 +80,7 @@ INTERVAL_CASES = {
     "tail": {"num_steps": 10, "guidance_interval": [7, 9], "G": 2.5},
 }
 CONDITIONAL, UNCONDITIONAL = 0.5, 0.35
+APG_SAMPLES = 1024
 
 
 def extracted(url: str, names: tuple[str, ...], scope: dict) -> dict:
@@ -147,6 +157,48 @@ def apg_walk(published: type, case: dict, x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+def apg_ensemble(destination: Path) -> None:
+    """Plain APG has no order-dependent reductions. Independent initial
+    states instead resolve its RMS rounding error against the same reference."""
+    published = guider()
+    with np.load(FIXTURE / "apg.npz") as stored:
+        original = torch.from_numpy(stored["x_T"])
+        for name, case in APG_CASES.items():
+            for dtype, suffix in ((torch.float64, ""), (torch.float32, "32")):
+                assert np.array_equal(apg_walk(published, case, original.to(dtype)).numpy(),
+                                      stored[f"{name}.result{suffix}"]), name
+    x = torch.randn(APG_SAMPLES, *SHAPE[1:], generator=torch.Generator().manual_seed(23))
+    case = APG_CASES["plain"]
+    np.savez_compressed(destination, x_T=x.numpy(), case=np.asarray(json.dumps(case)),
+                        label=np.asarray(LABEL),
+                        result=apg_walk(published, case, x.double()).numpy(),
+                        result32=apg_walk(published, case, x).numpy())
+
+
+def apg_projection(destination: Path) -> None:
+    """Diffusers' projection on fixed conditional and unconditional raw
+    predictions, without a norm clip or a solver's prediction conversion."""
+    published = guider()
+    generator = torch.Generator().manual_seed(29)
+    conditional = 1.0 + 0.1 * torch.randn(1024, *SHAPE[1:], generator=generator)
+    unconditional = 0.3 * conditional + 0.03 * torch.randn(conditional.shape, generator=generator)
+    arrays = {}
+    for name, scale, blank_scale in (("ordinary", 1.0, 1.0), ("large", 1e30, 1e30),
+                                     ("tiny", 1e-20, 1e-20), ("different_scales", 1.0, 1e30)):
+        conditioned, blank = conditional * scale, unconditional * blank_scale
+        arrays.update({f"{name}.conditional": conditioned.numpy(), f"{name}.unconditional": blank.numpy()})
+        for dtype, suffix in ((torch.float64, ""), (torch.float32, "32")):
+            guidance = published(guidance_scale=6.0, adaptive_projected_guidance_rescale=0.0, eta=0.0)
+            guidance.set_state(0, 1, 1000)
+            guidance.prepare_inputs({})
+            result = guidance.forward(conditioned.to(dtype), blank.to(dtype)).pred
+            arrays[f"{name}.result{suffix}"] = result.numpy()
+    if destination.is_file():
+        with np.load(destination) as stored:
+            assert all(np.array_equal(stored[name], arrays[name]) for name in stored.files)
+    np.savez_compressed(destination, **arrays)
+
+
 class Denoiser:
     """EDM's closed-form D(x; sigma) at a strength: the main network and its
     weaker guide differ in it."""
@@ -203,4 +255,11 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "apg-ensemble":
+        apg_ensemble(Path(sys.argv[2]))
+    elif len(sys.argv) == 3 and sys.argv[1] == "apg-projection":
+        apg_projection(Path(sys.argv[2]))
+    elif len(sys.argv) == 1:
+        main()
+    else:
+        raise SystemExit(__doc__)
