@@ -29,6 +29,7 @@ import orbax.checkpoint as ocp
 import pytest
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
+from recording import RecordingTracker
 from rich.console import Console
 from steady_state import steady_state
 
@@ -137,18 +138,6 @@ def make_trainer(tmp_path=None, objective=None, optimizer=None, keep=3, **kwargs
         checkpoints=checkpoints,
         **kwargs,
     )
-
-
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-        self.artifacts = []
-
-    def log(self, scalars, step):
-        self.scalars.append((step, dict(scalars)))
-
-    def artifact(self, value, step):
-        self.artifacts.append((step, value))
 
 
 # --------------------------------------------------------------------------
@@ -2127,7 +2116,6 @@ def test_sm89_step_matches_the_measured_head_without_a_latency_cliff(tmp_path, t
         samples[int(reference)].append(row["p50_ms"])
     measured, baseline = (float(np.median(values)) for values in samples)
     assert measured < baseline * 1.04, (tokens, measured, baseline)
-
 
 
 @pytest.mark.mesh

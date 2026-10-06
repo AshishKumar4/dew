@@ -18,6 +18,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
@@ -254,7 +255,6 @@ def test_cross_entropy_is_computed_in_float32_under_bfloat16():
     assert objective.model.apply(params, inputs).dtype == jnp.float32
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(params))
     assert loss.dtype == jnp.float32 and aux.metrics["ce"].dtype == jnp.float32
-
 
 
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
@@ -506,18 +506,6 @@ def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
     wrong = np.mean(np.exp([0.0, 2.0]))
     assert expected != pytest.approx(wrong)
     assert metric.finalize(metric.merge(*values)) == pytest.approx(expected)
-
-
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-        self.artifacts = []
-
-    def log(self, scalars, step):
-        self.scalars.append((step, dict(scalars)))
-
-    def artifact(self, value, step):
-        self.artifacts.append((step, value))
 
 
 def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():

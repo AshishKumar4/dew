@@ -17,6 +17,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
+from recording import RecordingTracker
 from sharded import assert_sharded
 
 from dew.data import Dataset
@@ -130,7 +131,6 @@ def test_fsdp_beside_tensor_computes_each_matmul_of_the_step_once():
 
     one = flops(MeshSpec(), jax.devices()[:1])
     assert flops(MeshSpec(fsdp=2, tensor=2), jax.devices()[:4]) == pytest.approx(one, rel=1e-6)
-
 
 
 def test_tensor_parallelism_computes_latent_attentions_down_projections_once():
@@ -344,17 +344,6 @@ def token_batches():
         yield batch
 
 
-class RecordingTracker:
-    def __init__(self):
-        self.scalars = []
-
-    def log(self, scalars, step):
-        self.scalars.append(dict(scalars))
-
-    def artifact(self, value, step):
-        pass
-
-
 def run_losses(mesh, layout, steps):
     tracker = RecordingTracker()
     trainer = Trainer(
@@ -363,7 +352,7 @@ def run_losses(mesh, layout, steps):
     state = trainer.fit(Dataset(train=lambda partition: token_batches(), val=None, records=None, batch=BATCH),
                         steps=steps, log_every=1)
     assert_sharded(state.variables["params"], trainer.device_mesh)
-    return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
+    return [entry["train/loss"] for _, entry in tracker.scalars if "train/loss" in entry]
 
 
 def dense_layout():
