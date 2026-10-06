@@ -12,13 +12,15 @@ through Flax's own `apply`, with `rngs` and `mutable` passed to `apply`:
     table = model.apply(variables, method='output_table')
 
 `Logits` and `HiddenStates` are token models' full-sequence reads, with no
-cache: a call writes no `cache` collection. `Denoiser` is the call every image
-and video denoiser already has. `AffineHead` and `LogitsFromHidden` let a
-loss score the vocabulary without a second trunk pass: `output_table` gives
-the matrix a tiled loss contracts in place of the logits, and
-`logits_from_hidden` is the exact head for a head no matrix alone gives.
-`Denoiser` is an annotation only: every Flax module has a `__call__`, so an
-`isinstance` check on it would hold for any model.
+cache: a call writes no `cache` collection. `DenoisingModel` is the call every
+image and video denoiser already has, the raw network that
+`dew.diffusion.process.Denoiser` wraps into a prediction a solver steps
+with. `AffineHead` and `LogitsFromHidden` let a loss score the vocabulary
+without a second trunk pass: `output_table` gives the matrix a tiled loss
+contracts in place of the logits, and `logits_from_hidden` is the exact head
+for a head no matrix alone gives.
+`DenoisingModel` is an annotation only: every Flax module has a `__call__`, so
+an `isinstance` check on it would hold for any model.
 
 The keywords a model takes past its tokens are `ModelKwarg` values:
 `ModelInputs.kwargs()` gives a request's token fields and conditioning, and
@@ -27,7 +29,7 @@ callers add flags and absent values.
 
 from __future__ import annotations
 
-from typing import Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import jax
 from flax import struct
@@ -35,7 +37,11 @@ from flax.typing import PrecisionLike
 
 from dew.nn.inputs import ModelKwarg
 
-__all__ = ["AffineHead", "Denoiser", "HiddenStates", "Logits", "LogitsFromHidden", "ModelKwarg",
+if TYPE_CHECKING:
+    from dew.diffusion.process import DenoisingCondition
+    from dew.nn.dit import TextContext
+
+__all__ = ["AffineHead", "DenoisingModel", "HiddenStates", "Logits", "LogitsFromHidden", "ModelKwarg",
            "OutputTable"]
 
 
@@ -74,11 +80,12 @@ class HiddenStates(Protocol):
                       **fields: ModelKwarg) -> jax.Array: ...
 
 
-class Denoiser(Protocol):
-    """A diffusion model's prediction for `sample` at `time`, given its conditions."""
+class DenoisingModel(Protocol):
+    """A diffusion network's output for `sample` at `time`, given its conditions:
+    arrays, encoded text (`TextContext`) or a process's `DenoisingCondition`."""
 
     def __call__(self, sample: jax.Array, time: jax.Array, *, train: bool = False,
-                 **conditions: ModelKwarg) -> jax.Array: ...
+                 **conditions: ModelKwarg | TextContext | DenoisingCondition) -> jax.Array: ...
 
 
 @runtime_checkable
