@@ -22,9 +22,9 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import tyro
 
+from dew.config import OptimConfig
 from dew.data import ByteTokenizer, DataPartition, Dataset, Loading, TFDSImages
 from dew.data.dataset import mapped, tokenized, train_stream
 from dew.data.images import ImageTransform, class_names
@@ -128,7 +128,8 @@ def main(config: Config):
                                        pad_token_id=257, self_cond_prob=0.5)
     data = flowers_data(config)
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
-    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate).build(config.steps),
+                      key=jax.random.key(0),
                       checkpoints=checkpoints)
     stream = data.train(DataPartition())
     try:

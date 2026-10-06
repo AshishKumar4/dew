@@ -74,7 +74,7 @@ Trainer(objective, optimizer, *, key,
         step=None, rollout=None, profile=None)
 ```
 
-`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
+`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
 
 `accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, and keep float64 when it is enabled in JAX. A TPU has no float64 (XLA rewrites it into pairs of float32, which are not IEEE doubles), so a trainer whose parameters are stored in float64 on a TPU mesh is refused when it places the state. Each finalized gradient enters Optax in its parameter's dtype, and partially accumulated gradients keep the wider working dtype.
 
@@ -104,6 +104,8 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 ### Initialize, restore, and compile
 
 `initial_state()` constructs an unplaced initial `TrainState`. `place()` returns `(state, shardings, position)`, restoring from the configured checkpointer when available. Eager and placed initialization can differ in low floating-point bits across backends; compare the actual path used by your run.
+
+An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need `initial_state`, `place` or `compile` before `fit`, pass `OptimConfig(...).build(steps)` to `Trainer` instead, where `steps` is the run's length in optimizer updates.
 
 `compile(state, batch)` returns `compiled(state, batch) -> (state, loss, metrics, loss_finite, accepted)`. The scaler is part of `TrainState`. `loss_finite` and `accepted` are separate, because a finite scalar loss can come with a nonfinite gradient that is rejected. The callable consumes the state it is given (`donate_argnums=0`), and the returned state takes over its buffers, so write `new = compiled(old, batch)` and keep no reference to the old state. The batch is not donated, because the loader still owns it.
 

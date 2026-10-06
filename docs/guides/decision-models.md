@@ -44,7 +44,7 @@ decide.systemone({
 #   "urgent": {"type": "noul", "noul": 0.91}}, "usage": {"input_tokens": ..., "output_tokens": 0}}
 ```
 
-The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, as Clef's does, for a backbone that reads them; `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
+The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, as Clef's does, PIL images or encoded images, bare or as `data:` URLs, which a task whose backbone reads images lays out with the state, as a Clef release does (`decide(state, questions, images=[...])` takes them too); `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
 
 Dew ships no HTTP server of its own, but `systemone` is all one needs. `examples/serve_decisions.py` serves it with Starlette in about forty lines, at Jev's `POST /v1/systemone`, with Jev's 422 for a request it refuses and an optional bearer key:
 
@@ -79,9 +79,8 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 `DecisionObjective` trains a decision head over any backbone that has hidden states. The backbone can be Laya's own checkpoint (head and layout included), a pretrained language model, adapted with LoRA or partly frozen, or a model built from scratch:
 
 ```python
-import optax
-
 from dew import Trainer
+from dew.config import OptimConfig
 from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, DecisionTable, LogLoss
 from dew.interop import Pretrained
 from dew.lora import LoRA
@@ -92,7 +91,7 @@ banking77 = DecisionTable(path="mteb/banking77", label="label_text", question="i
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
 data = objective.dataset(banking77, batch=32)  # a tenth held out, for validation and calibration
-state = Trainer(objective, optax.adamw(1e-4), key=0).fit(
+state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
     data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
 
 decide = objective.pipeline(state).calibrated(data.val)
@@ -102,9 +101,13 @@ Examples need not come from a table: `objective.dataset` takes any labelled exam
 
 <!-- BANKING77 results (Laya zero-shot, Laya fine-tuned, Qwen3-0.6B + LoRA; accuracy and ECE) go here when the Colab runs finish. -->
 
-Any model that gives its final states is a backbone (`dew.nn.protocols.HiddenStates`). A bidirectional backbone reads Laya's layout. A causal one reads `StateFirstLayout`, which puts the state first and each marker after its option, so every marker has read the state, the question and its option. The backbone and the head are applied as separate modules over one variables tree, so a LoRA backbone trains its factors and the head while the base weights stay fixed.
+Any model that gives its final states is a backbone (`dew.nn.protocols.HiddenStates`): a `CausalTransformer`, causal or bidirectional as ModernBERT is, the text path of a multimodal model such as Qwen 3.5, or DiffusionGemma, whose encoder reads each clean row once whole. A bidirectional backbone reads Laya's layout. A causal one reads `StateFirstLayout`, which puts the state first and each marker after its option, so every marker has read the state, the question and its option. The backbone and the head are applied as separate modules over one variables tree, so a LoRA backbone trains its factors and the head while the base weights stay fixed.
 
-The head is a value too. Laya's `DecisionHead` scores one question per row at its markers. Clef's `JointSchemaHead`, with its `JointLayout`, reads every question of a request in one row and decides them together: it pools each question's instructions and each option's tokens, adds a lexical prior from the backbone's output table, and lets the questions attend to each other. `ClefHead.load` reads Clef's released head; Dew's layout and head reproduce Clef's own code (`tests/test_decision_clef.py`).
+The head is a value too. Laya's `DecisionHead` scores one question per row at its markers. Clef's `JointSchemaHead`, with its `JointLayout`, reads every question of a request in one row and decides them together: it pools each question's instructions and each option's tokens, adds a lexical prior from the backbone's output table, and lets the questions attend to each other. `Decide.from_pretrained("Cloudflare/clef-flash")` reads a Clef release, its Qwen 3.5 backbone with the head beside it and the backbone's processor, and answers as Clef's own model does, images included, which the processor lays out before the state (`tests/test_decision_clef.py` holds the layout, the head and the two together to Clef's code, with and without images). Clef reports an answer's top probability as its confidence, where `systemone` reports Jev's; `replace(decide, confidence=TopProbability())` answers with Clef's. A release fine-tunes like Laya's, its head and layout coming with it. Training pads every row to the layout's `max_len`, and Clef's is the 16384 tokens it serves, so set one that fits the data:
+
+```python
+objective = DecisionObjective(Decide.from_pretrained("Cloudflare/clef-flash"), layout=JointLayout(max_len=2048))
+```
 
 The loss is a proper scoring rule: its expected value is smallest when the forecast is the true distribution, so it rewards honest probabilities. The rules are `LogLoss`, `Brier`, `Spherical` and `RankedProbability` (for score questions, whose levels are ordered), and they can be added and scaled. `label_smoothing` spreads part of the target over every option. During training a choice's options are reshuffled every time a row is read, so the model cannot learn their positions, and `none_of_the_above=p` adds a "none of the above" option to a share of rows, half of which lose their right answer to it. The same rules, with `Accuracy`, `ECE` and `AURC`, score the validation pass.
 

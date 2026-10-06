@@ -20,11 +20,11 @@ import json
 from dataclasses import dataclass, replace
 from typing import Literal
 
-import optax
 import tyro
 
 from dew import Trainer
 from dew.checkpoints import Checkpoints
+from dew.config import OptimConfig
 from dew.decision import (
     AURC,
     ECE,
@@ -86,7 +86,8 @@ def main(options: Options) -> None:
 
     data = objective.dataset(train, batch=options.batch, validation=held_out[:options.batch * 8])
     checkpoints = Checkpoints(options.run, keep=1)
-    state = Trainer(objective, optax.adamw(options.learning_rate), key=0, checkpoints=checkpoints).fit(
+    state = Trainer(objective, OptimConfig(learning_rate=options.learning_rate), key=0,
+                    checkpoints=checkpoints).fit(
         data, steps=data.epoch_steps(options.epochs), eval_every=options.eval_every,
         checkpoint_every=datetime.timedelta(minutes=10), metrics=[Accuracy(), ECE(), AURC(), LogLoss()])
     checkpoints.wait()
