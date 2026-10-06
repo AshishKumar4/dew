@@ -1884,39 +1884,29 @@ class CausalTransformer(nn.Module):
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
 
-    # What a task, a server and the trainer read off the decoder
-    # (`dew.nn.protocols`): the same decoder at another cache capacity or
-    # remat rung, and what its declared layers say about serving it.
+    # The serving and training hooks (`dew.nn.protocols`).
 
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
-        """This decoder with `capacity` cache slots per row (`CacheCapacity`).
-
-        `max_seq_len` is the only channel its layers read a cache size from
-        (`dew.nn.attention.open_kv_cache`). A learned position table it sizes
-        keeps its rows, which the parameters fix.
-        """
+        """`max_seq_len` is the cache size its layers read (`open_kv_cache`);
+        a learned position table it sized keeps its rows."""
         if self.position_embedding == 'learned' and self.position_embedding_size is None:
             return self.clone(max_seq_len=capacity, position_embedding_size=self.max_seq_len)
         return self.clone(max_seq_len=capacity)
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
-        """Its remat as a checkpoint's rung records it (`Recomputing`, `remat_record`)."""
         return remat_record(self.remat)
 
     @nn.nowrap
     def recompute_more(self) -> Self | None:
-        """This decoder one rung up `DECODER_REMAT`, or None at its top or
-        under a policy the ladder does not name (`Recomputing`)."""
+        """One rung up `DECODER_REMAT`; None at its top or off it."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
         return self.clone(remat=DECODER_REMAT[DECODER_REMAT.index(self.remat) + 1])
 
     @nn.nowrap
     def restore_recompute(self, record: JSON) -> Self:
-        """This decoder at `record`'s rung of `DECODER_REMAT` where that is
-        above its own, and as it is otherwise (`Recomputing`)."""
         records = [remat_record(remat) for remat in DECODER_REMAT]
         here = remat_record(self.remat)
         if here in records and record in records and records.index(record) > records.index(here):
@@ -1925,10 +1915,8 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
-        """The groups its layers, prediction depths and drafter read packed
-        and `variables` hold (`PackedProjections`). Binding `variables` builds
-        the layers without tracing a forward. An encoder (`causal` False)
-        serves no decode step and names none."""
+        """Its layers', depths' and drafter's groups, bound without tracing a
+        forward; an encoder serves no decode step and names none."""
         if not self.causal:
             return ()
         bound = self.bind(variables)
@@ -1937,17 +1925,13 @@ class CausalTransformer(nn.Module):
 
     @property
     def cache_rebuild_position(self) -> int | None:
-        """The position past which LongRoPE's long factors replace the short
-        ones its cached keys were rotated with, or None (`CacheRebuilding`)."""
         scaling = self.rope_scaling
         return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
 
     @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
-        """Why its layers would not run a server's mixed call as the separate
-        decode and prefill calls would, or None (`MixedAdmission`): a cache
-        rebuilt per request, a reader beyond the token, or a layer whose
-        mixer kind does not declare `mixed_step`."""
+        """A cache rebuilt per request, a reader beyond the token, or a layer
+        whose mixer kind declares no `mixed_step`."""
         position = self.cache_rebuild_position
         if position is not None:
             return (f'LongRoPE crossing position {position} requires separate admission so each '
@@ -1973,12 +1957,10 @@ class CausalTransformer(nn.Module):
 
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
-        """Its MLA mixers that carry the indexer (`Indexed`)."""
         return tuple(mixer for mixer in self.declared_mixers if isinstance(mixer, MLAMixer) and mixer.indexed)
 
     @property
     def keeps_triton_gemm(self) -> bool:
-        """Whether a mixer it names keeps XLA's Triton GEMM fusions (`TritonGemm`)."""
         return any(mixer.keeps_triton_gemm for mixer in self.declared_mixers)
 
 
