@@ -25,7 +25,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal
+from typing import Literal, Self
 
 import flax.core
 import jax
@@ -35,6 +35,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew.records import JSON
 from dew.registry import from_record, mixers, models
 
 from ..activations import ungated_activation
@@ -61,9 +62,10 @@ from ..inputs import AttentionMetadata, LayerInputs, PredictionPhase
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
-from ..mla import INDEXER_COLLECTION
+from ..mla import INDEXER_COLLECTION, MLAMixer
 from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, head_dot_general, head_product, scaled
+from ..protocols import ProjectionGroup, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
     RESIDUAL,
@@ -76,6 +78,7 @@ from ..sharding import (
     row_axes,
 )
 from .decoder_block import (
+    DECODER_REMAT,
     BlockWiring,
     DecoderBlock,
     GatedMLP,
@@ -84,6 +87,7 @@ from .decoder_block import (
     RematPolicy,
     decoder_norm,
     remat_policy,
+    remat_record,
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
@@ -2368,6 +2372,103 @@ class CausalTransformer(nn.Module):
         allocates the cache, and the calls after it write to it.
         """
         self(jnp.zeros((batch_size, 1), jnp.int32), decode=True)
+
+    # What a task, a server and the trainer read off the decoder
+    # (`dew.nn.protocols`): the same decoder at another cache capacity or
+    # remat rung, and what its declared layers say about serving it.
+
+    @nn.nowrap
+    def with_cache_capacity(self, capacity: int) -> Self:
+        """This decoder with `capacity` cache slots per row (`CacheCapacity`).
+
+        `max_seq_len` is the only channel its layers read a cache size from
+        (`dew.nn.attention.open_kv_cache`). A learned position table it sizes
+        keeps its rows, which the parameters fix.
+        """
+        if self.position_embedding == 'learned' and self.position_embedding_size is None:
+            return self.clone(max_seq_len=capacity, position_embedding_size=self.max_seq_len)
+        return self.clone(max_seq_len=capacity)
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        """Its remat as a checkpoint's rung records it (`Recomputing`, `remat_record`)."""
+        return remat_record(self.remat)
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        """This decoder one rung up `DECODER_REMAT`, or None at its top or
+        under a policy the ladder does not name (`Recomputing`)."""
+        if self.remat not in DECODER_REMAT[:-1]:
+            return None
+        return self.clone(remat=DECODER_REMAT[DECODER_REMAT.index(self.remat) + 1])
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        """This decoder at `record`'s rung of `DECODER_REMAT` where that is
+        above its own, and as it is otherwise (`Recomputing`)."""
+        records = [remat_record(remat) for remat in DECODER_REMAT]
+        here = remat_record(self.remat)
+        if here in records and record in records and records.index(record) > records.index(here):
+            return self.clone(remat=DECODER_REMAT[records.index(record)])
+        return self
+
+    @nn.nowrap
+    def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
+        """The groups its layers, prediction depths and drafter read packed
+        and `variables` hold (`PackedProjections`). Binding `variables` builds
+        the layers without tracing a forward. An encoder (`causal` False)
+        serves no decode step and names none."""
+        if not self.causal:
+            return ()
+        bound = self.bind(variables)
+        return declared_groups(*bound.layers, *bound.mtp,
+                               *(bound.dspark_stages if self.dspark is not None else ()))
+
+    @property
+    def cache_rebuild_position(self) -> int | None:
+        """The position past which LongRoPE's long factors replace the short
+        ones its cached keys were rotated with, or None (`CacheRebuilding`)."""
+        scaling = self.rope_scaling
+        return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
+
+    @nn.nowrap
+    def mixed_admission_refusal(self) -> str | None:
+        """Why its layers would not run a server's mixed call as the separate
+        decode and prefill calls would, or None (`MixedAdmission`): a cache
+        rebuilt per request, a reader beyond the token, or a layer whose
+        mixer kind does not declare `mixed_step`."""
+        position = self.cache_rebuild_position
+        if position is not None:
+            return (f'LongRoPE crossing position {position} requires separate admission so each '
+                    'request keeps its own table and rebuild history')
+        if self.num_nextn_predict_layers:
+            return "it runs prediction depths"
+        if self.dspark is not None:
+            return "its block drafter keeps a cache of its own, which a mixed step does not run"
+        if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
+            return "a learned position embedding, n-gram or hash routing reads beyond the token"
+        default = self.mixer if self.mixer is not None else AttentionMixer()
+        for index, layer_type in enumerate(self.per_layer_types):
+            mixer = self.kind_of(layer_type).mixer or default
+            if not mixer.mixed_step:
+                return f"layer {index}'s cache is {type(mixer).__name__}'s, which a mixed step does not run"
+        return None
+
+    @property
+    def declared_mixers(self) -> tuple[MixerBase, ...]:
+        """The mixer values it names: its own, then each layer kind's."""
+        return tuple(mixer for mixer in (self.mixer, *(kind.mixer for kind in (self.kinds or {}).values()))
+                     if mixer is not None)
+
+    @property
+    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+        """Its MLA mixers that carry the indexer (`Indexed`)."""
+        return tuple(mixer for mixer in self.declared_mixers if isinstance(mixer, MLAMixer) and mixer.indexed)
+
+    @property
+    def keeps_triton_gemm(self) -> bool:
+        """Whether a mixer it names keeps XLA's Triton GEMM fusions (`TritonGemm`)."""
+        return any(mixer.keeps_triton_gemm for mixer in self.declared_mixers)
 
 
 __all__ = ["CausalTransformer", "DecoderBank", "PipelineStage", "StackView"]
