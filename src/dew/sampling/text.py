@@ -535,6 +535,9 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
             slots = lengths[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
             history = write_cache(history, tokens, jnp.where(valid, slots, -1))
             following = lengths + jnp.sum(valid, axis=1, dtype=jnp.int32)
+            original = model.rope_scaling.original_max_position_embeddings
+            crossing = (lengths <= original) & (following > original)
+            ordinary = append()
 
             def rebuild():
                 """Recompute the prefix at its new table, Phi-3's intended policy.
@@ -553,12 +556,16 @@ def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -
                     decode=True, mutable=['cache'], method='states_and_logits')
                 states, logits = answer
                 rows = jnp.arange(tokens.shape[0])[:, None]
-                return (states[rows, slots], logits[rows, slots]), updated
+                rebuilt = (states[rows, slots], logits[rows, slots]), updated
 
-            original = model.rope_scaling.original_max_position_embeddings
+                def replaced(fresh, held):
+                    selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))
+                    return jnp.where(selected, fresh, held)
+
+                return jax.tree.map(replaced, rebuilt, ordinary)
+
             answer, updated = jax.lax.cond(
-                (jnp.max(lengths) <= original) & (jnp.max(following) > original),
-                rebuild, append)
+                jnp.any(crossing), rebuild, lambda: ordinary)
             lengths = following
         else:
             answer, updated = append()
