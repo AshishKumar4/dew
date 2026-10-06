@@ -34,7 +34,7 @@ export default {
 			return Response.json({ refused, accepted: commandOf(['python', '-c', 'print("hello")']) });
 		}
 		const fleet = env.RUNNER_FLEET.get(env.RUNNER_FLEET.idFromName('global'));
-		const jobs = (await Promise.all(Array.from({ length: 20 }, () => fleet.acquire(1000)))).filter(Boolean) as string[];
+		const jobs = (await Promise.all(Array.from({ length: scenario === 'cap' ? 400 : 3 }, () => fleet.acquire(1000)))).filter(Boolean) as string[];
 		if (scenario === 'cap') return Response.json({ jobs });
 		try { await fleet.acquire(1000 + 40 * 60_000); } catch {}
 		return Response.json({ jobs, expired: await Promise.all(jobs.map((id) =>
