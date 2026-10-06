@@ -1,9 +1,11 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { SnapshotGeneration } from './snapshots';
 
-export async function prepareSnapshot(container: Container, commit: string, sourceCommit: string): Promise<SnapshotGeneration> {
+export async function prepareSnapshot(container: Container, commit: string, sourceCommit: string,
+	phase: (name: string) => Promise<void> = async () => {}): Promise<SnapshotGeneration> {
 	if (![commit, sourceCommit].every((value) => /^[0-9a-f]{40}$/.test(value))) throw new Error('preparation must be pinned');
 	const started = Date.now();
+	await phase('install and warm');
 	container.start({ image: 'cloudflare/debian-trixie', instance: 'standard-4',
 		enableInternet: true, entrypoint: ['sleep', 'infinity'] });
 	await container.setInactivityTimeout(15 * 60_000);
@@ -15,10 +17,12 @@ export async function prepareSnapshot(container: Container, commit: string, sour
 	if (prepared.exitCode !== 0) throw new Error(`trusted preparation failed: ${new TextDecoder().decode(prepared.stderr).slice(-4000)}`);
 	const prepareSeconds = (Date.now() - started) / 1000;
 	const snapshotStart = Date.now();
+	await phase('snapshot');
 	const snapshot = await container.snapshotContainer({ name: 'dew-warm-pinned' });
 	const snapshotSeconds = (Date.now() - snapshotStart) / 1000;
 	await container.destroy();
 	const smokeStart = Date.now();
+	await phase('offline restore');
 	const relaySecret = crypto.randomUUID();
 	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false,
 		entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: relaySecret } });
@@ -36,8 +40,10 @@ export async function prepareSnapshot(container: Container, commit: string, sour
 	const credential = new ReadableStream<Uint8Array>({ start(controller) {
 		controller.enqueue(new TextEncoder().encode(relaySecret)); controller.close();
 	} });
+	await phase('browser relay smoke');
 	const browser = await (await container.exec(['/opt/venv/bin/python', '/opt/live/smoke-shared.py'], { stdin: credential })).output();
 	if (browser.exitCode !== 0) throw new Error(`offline relay smoke failed: ${new TextDecoder().decode(browser.stderr).slice(-4000)}`);
+	await phase('isolated context smoke');
 	const smoke = await (await container.exec(['/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', '1'])).output();
 	if (smoke.exitCode !== 0) throw new Error(`offline context smoke failed: ${new TextDecoder().decode(smoke.stderr).slice(-4000)}`);
 	return { commit: sourceCommit, snapshot, created: Date.now(), prepareSeconds, snapshotSeconds,
@@ -47,6 +53,10 @@ export async function prepareSnapshot(container: Container, commit: string, sour
 export class SnapshotPreparer extends DurableObject<Env> {
 	private busy = false;
 
+	async status(): Promise<{ phase: string; at: number } | null> {
+		return (await this.ctx.storage.get<{ phase: string; at: number }>('phase')) ?? null;
+	}
+
 	async prepare(commit: string): Promise<SnapshotGeneration> {
 		if (commit !== this.env.SNAPSHOT_COMMIT) throw new Error('requested preparation is not the pinned deploy');
 		const container = this.ctx.container;
@@ -54,7 +64,10 @@ export class SnapshotPreparer extends DurableObject<Env> {
 		this.busy = true;
 		try {
 			await this.ctx.storage.setAlarm(Date.now() + 15 * 60_000);
-			return await prepareSnapshot(container, commit, commit);
+			const result = await prepareSnapshot(container, commit, commit,
+				async (phase) => { await this.ctx.storage.put('phase', { phase, at: Date.now() }); });
+			await this.ctx.storage.put('phase', { phase: 'complete', at: Date.now() });
+			return result;
 		} finally {
 			this.busy = false;
 			if (container.running) await container.destroy();

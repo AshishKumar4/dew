@@ -29,6 +29,19 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		return (await this.ctx.storage.get<SnapshotGeneration>('active')) ?? null;
 	}
 
+	async status(): Promise<{
+		generation: SnapshotGeneration | null;
+		rebuild: { until: number } | null;
+		failure: { at: number; commit: string; message: string } | null;
+	}> {
+		const rebuild = await this.ctx.storage.get<{ until: number }>('rebuild');
+		return {
+			generation: await this.previous(),
+			rebuild: rebuild ? { until: rebuild.until } : null,
+			failure: (await this.ctx.storage.get<{ at: number; commit: string; message: string }>('failure')) ?? null,
+		};
+	}
+
 	async ensure(commit = this.env.SNAPSHOT_COMMIT): Promise<{
 		generation: SnapshotGeneration | null; rebuilding: boolean;
 	}> {
@@ -66,13 +79,17 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 				const lease = await storage.get<{ token: string }>('rebuild');
 				if (lease?.token !== token) throw new Error('snapshot preparation lost its lease');
 				await storage.put('active', candidate);
+				await storage.delete('failure');
 				await storage.delete('rebuild');
 				await storage.setAlarm(candidate.created + 7 * 24 * 60 * 60_000);
 			});
 			return { rebuilding: false, generation: candidate };
 		} catch (error) {
 			await this.ctx.storage.transaction(async (storage) => {
-				if ((await storage.get<{ token: string }>('rebuild'))?.token === token) await storage.delete('rebuild');
+				if ((await storage.get<{ token: string }>('rebuild'))?.token === token) {
+					await storage.delete('rebuild');
+					await storage.put('failure', { at: Date.now(), commit, message: String(error).slice(-6000) });
+				}
 			});
 			throw error;
 		}
