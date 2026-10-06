@@ -1,10 +1,9 @@
-"""Router parity readings the MoE tests share.
+"""Router parity readings and the two-process expert-exchange launch the MoE
+tests share. The routers stay with their tests: V2's softmax and best-expert
+group score and V3's sigmoid, two-best group score and bias differ."""
 
-The routers stay with their tests: V2 scores by softmax and the best expert of
-a group without renormalising, V3 by sigmoid and a group's two best with the
-selection bias. What they share is how a reference's choice is read and how
-its gate weight becomes a `Router` tree.
-"""
+import subprocess
+import sys
 
 import jax.numpy as jnp
 import numpy as np
@@ -29,3 +28,13 @@ def router_variables(tensors, bias=False):
             tensors["mlp.gate.e_score_correction_bias"])}
     return variables
 
+
+def exchange_worker(script, out, processes, process_id, coordinator):
+    """One rank of an expert-exchange script, as run_pool's `start`: one CPU
+    device, its own session, and the rank, coordinator and report as argv."""
+    from test_multiprocess import worker_env
+
+    return subprocess.Popen(
+        [sys.executable, str(script), str(process_id), coordinator, str(out)],
+        env=worker_env(1), stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        text=True, start_new_session=True)
