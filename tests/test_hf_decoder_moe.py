@@ -92,6 +92,19 @@ def test_minimax_m2_prefill_and_token_steps_match_the_corrected_reference():
         np.load(MINIMAX_M2 / 'logits.npy'), np.load(MINIMAX_M2 / 'logits_f64.npy'), 'MiniMax-M2 cache')
 
 
+def test_minimax_m2_padded_routing_matches_the_corrected_reference():
+    model, variables = fp32_decoder(MINIMAX_M2)
+    arrays = np.load(MINIMAX_M2 / 'padded.npz')
+    logits = np.asarray(model.apply(
+        variables, arrays['input_ids'], positions=arrays['position_ids'],
+        attention_mask=arrays['attention_mask']))
+    valid = arrays['attention_mask']
+    assert_as_exact_as_the_reference(logits[valid], arrays['logits'][valid],
+                                     arrays['logits_f64'][valid], 'MiniMax-M2 padded')
+    print('MiniMax-M2 padded RMS ratio', distance(logits[valid], arrays['logits_f64'][valid])
+          / distance(arrays['logits'][valid], arrays['logits_f64'][valid]))
+
+
 def test_minimax_m2_export_keeps_source_weights_and_router_state(tmp_path):
     loaded = Pretrained.load(str(MINIMAX_M2), dtype='float32', attention_impl='reference')
     loaded.save(tmp_path / 'export')
