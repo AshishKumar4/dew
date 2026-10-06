@@ -26,7 +26,7 @@ def main():
     body = json.dumps({"revision": args.revision, "python": args.python, "command": command}).encode()
     url = config["endpoint"].rstrip("/") + "/v1/remote/run"
     headers = {"Authorization": "Bearer " + config["token"], "Content-Type": "application/json",
-               "User-Agent": "Dew-Remote-Operator/1.0"}
+               "User-Agent": "Dew-Gateway-Operator/1.0"}
     deadline = time.monotonic() + 40 * 60
     while True:
         try:
