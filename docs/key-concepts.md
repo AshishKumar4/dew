@@ -18,9 +18,9 @@ This trains a small decoder on one repeated sentence and generates from it. It d
 ```python
 import jax
 import numpy as np
-import optax
 
 from dew import Dataset, Trainer
+from dew.config import OptimConfig
 from dew.data import ByteTokenizer
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
@@ -36,7 +36,7 @@ model = CausalTransformer(
     emb_features=64, num_layers=2, num_heads=4,
     mlp_features=256, max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-trainer = Trainer(objective, optax.adamw(3e-3),
+trainer = Trainer(objective, OptimConfig(learning_rate=3e-3),
                   key=jax.random.key(0))
 state = trainer.fit(data, steps=100, log_every=25)
 

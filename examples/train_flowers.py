@@ -9,12 +9,12 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import tyro
 from PIL import Image
 
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.artifacts import uint8_pixels
+from dew.config import OptimConfig
 from dew.data import Loading, TFDSImages
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
@@ -53,7 +53,7 @@ def main(config: Config):
     )
     trainer = Trainer(
         objective,
-        optax.adamw(2e-4),
+        OptimConfig(learning_rate=2e-4),
         key=jax.random.key(0),
         checkpoints=Checkpoints(str(config.output / "checkpoints")),
     )
