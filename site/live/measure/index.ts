@@ -67,7 +67,10 @@ export class GatewayLab extends DurableObject<Env> {
 				controller.enqueue(new TextEncoder().encode(secret)); controller.close();
 			} });
 			const browser = await (await container.exec(['/opt/venv/bin/python', '/opt/live/smoke-shared.py'], { stdin: credential })).output();
-			if (browser.exitCode !== 0) return { stage, ...this.decode(browser) };
+			if (browser.exitCode !== 0) {
+				const logs = await (await container.exec(['sh', '-c', 'tail -c 16000 /run/dew/shared.log /run/dew/gateway.log /run/dew/model.log 2>/dev/null'])).output();
+				return { stage, ...this.decode(browser), logs: this.decode(logs).stdout };
+			}
 			stage = 'native shared inference';
 			const result = await (await container.exec(['/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', count])).output();
 			return { stage, seconds: (Date.now() - started) / 1000, commit: this.env.SOURCE_COMMIT,
