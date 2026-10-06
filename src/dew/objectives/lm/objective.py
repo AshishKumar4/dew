@@ -70,13 +70,7 @@ from dew.objectives.base import (
     merge_totals,
     thaw,
 )
-from dew.objectives.lm.chunked import (
-    affine_head,
-    chunked_cross_entropy,
-    chunked_tile,
-    head_logits,
-    support_log_probs,
-)
+from dew.objectives.lm.chunked import chunked_tile, head_cross_entropy, model_logits, support_log_probs
 from dew.records import JSON
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
@@ -774,11 +768,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         qk = gathered.get("qk") if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(layer_output(gathered[INTERMEDIATES], index) for index in layers)
-        head = affine_head(self.model, params)
-        losses, predicted, log_z = chunked_cross_entropy(
-            hidden, head.matrix, targets, self.head_chunks, tile=self.head_tile,
-            vocab_major=head.vocab_major, bias=head.bias, softcap=head.softcap,
-            precision=head.precision, predict=self.token_accuracy if predict is None else predict)
+        losses, predicted, log_z = head_cross_entropy(
+            self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile,
+            predict=self.token_accuracy if predict is None else predict)
         weights = self._row_weights(prepared, targets, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -800,10 +792,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 if indexer:
                     kls = {**(kls or {}), **depth_sown.get(INDEXER_COLLECTION, {})}
             for depth, state in enumerate(states, start=1):
-                depth_losses, _, _ = chunked_cross_entropy(
-                    state, head.matrix, targets[:, depth:], self.head_chunks, tile=self.head_tile,
-                    vocab_major=head.vocab_major, bias=head.bias, softcap=head.softcap,
-                    precision=head.precision, predict=False)
+                depth_losses, _, _ = head_cross_entropy(
+                    self.model, params, state, targets[:, depth:], self.head_chunks,
+                    tile=self.head_tile, predict=False)
                 depth_scores.append((depth_losses, self._depth_weights(
                     prepared, targets, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
@@ -909,15 +900,19 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         log_probs = -scores.losses
         if temperature == 1.0 and support is None:
             return log_probs
-        head = affine_head(self.model, thaw(params))
+        params = thaw(params)
         targets = tokens[:, 1:]
         if temperature != 1.0:
-            losses, _, _ = chunked_cross_entropy(
-                scores.hidden, head.matrix, targets, self.head_chunks, tile=self.head_tile,
-                vocab_major=head.vocab_major, bias=head.bias, softcap=head.softcap,
-                precision=head.precision, predict=False, temperature=temperature)
+            losses, _, _ = head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
+                                              tile=self.head_tile, predict=False, temperature=temperature)
             log_probs = -losses
         if support is not None:
+            head = self.model.apply(params, method="output_table")
+            if head is None:
+                raise ValueError(
+                    "a sampler's support is rescored against the rows of the head's matrix, and no "
+                    "matrix alone is this model's head (a prediction head, or an adapter's factors "
+                    "on it)")
             ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
             # The id at column c is the target the state at c - 1 predicts.
             filtered, present = support_log_probs(
@@ -1054,10 +1049,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
         assert isinstance(statistics, Ratio)
-        head = affine_head(self.model, thaw(params))
-        logits = constrain(head_logits(
-            scores.hidden, head.matrix, softcap=head.softcap, precision=head.precision,
-            vocab_major=head.vocab_major, bias=head.bias), LOGITS)
+        logits = constrain(model_logits(self.model, thaw(params), scores.hidden), LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()

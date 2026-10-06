@@ -43,7 +43,6 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import at_least_fp32, head_product, rounded_operand, rounded_to, rounds_to_bf16
-from dew.nn.protocols import OutputTable
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -109,20 +108,16 @@ def _biased_logits(logits, bias):
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
 
 
-def affine_head(model, variables) -> OutputTable:
-    """`model`'s head over `variables` as the matrix the functions here contract (`AffineHead`).
-
-    A model whose final states reach the vocabulary through more than one
-    matrix, past a prediction head or an adapter's factors on it, is refused:
-    its logits come from no table a tile can slice.
-    """
+def model_logits(model, variables, hidden) -> jax.Array:
+    """`model`'s logits of its final states `hidden` over `variables`: the
+    matrix `AffineHead.output_table` gives, contracted as the chunked head
+    contracts it (`head_logits`), or the model's exact head
+    (`LogitsFromHidden`) where no matrix alone is the head."""
     table = model.apply(variables, method="output_table")
     if table is None:
-        raise ValueError(
-            f"a prediction head or an adapter's factors sit between this {type(model).__name__}'s "
-            f"final states and its vocabulary, so no matrix alone gives its logits, and the head "
-            f"is scored one vocabulary tile at a time")
-    return table
+        return model.apply(variables, hidden, method="logits_from_hidden")
+    return head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
+                       vocab_major=table.vocab_major, bias=table.bias)
 
 
 def head_logits(hidden, head_weight, *, softcap: float | None,
@@ -622,6 +617,31 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
         return head(hidden, table, targets, left_out, cap, bias)
     return _sharded_head(mesh, hidden, table, targets, left_out, cap, bias, head, column_logits,
                          predict=predict)
+
+
+def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
+                       tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
+                       temperature: float = 1.0, excluded: int | None = None):
+    """`chunked_cross_entropy` of `hidden` against `model`'s head over `variables`.
+
+    The head is the matrix `AffineHead.output_table` gives, its bias,
+    softcap and precision included. Where no matrix alone is the head (a
+    prediction head past the final states, an adapter's factors on it), the
+    model's exact logits (`LogitsFromHidden`) are scored whole: that holds
+    the fp32 `[..., vocab]` logits for the backward pass, a vocabulary-sized
+    row per token, which the tiled head never does.
+    """
+    table = model.apply(variables, method="output_table")
+    if table is not None:
+        return chunked_cross_entropy(
+            hidden, table.matrix, targets, chunks, softcap=table.softcap, precision=table.precision,
+            tile=tile, vocab_major=table.vocab_major, predict=predict, temperature=temperature,
+            excluded=excluded, bias=table.bias)
+    logits = model.apply(variables, hidden, method="logits_from_hidden").astype(jnp.float32) / temperature
+    logits = _without(logits, 0, None if excluded is None else jnp.asarray(excluded, jnp.int32))
+    log_z = jax.nn.logsumexp(logits, axis=-1)
+    picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+    return log_z - picked, jnp.argmax(logits, axis=-1) if predict else None, log_z
 
 
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits, *, predict: bool):

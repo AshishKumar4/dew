@@ -53,7 +53,7 @@ from dew.objectives.base import (
     Variables,
     thaw,
 )
-from dew.objectives.lm.chunked import affine_head, chunked_cross_entropy
+from dew.objectives.lm.chunked import head_cross_entropy
 from dew.objectives.lm.objective import _batch_text
 from dew.records import JSON
 from dew.registry import objectives
@@ -241,13 +241,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
                                   method="hidden_states", mutable=False, capture_intermediates=False,
                                   **prepared.kwargs())
-        head = affine_head(self.model, params)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
-        losses, predicted, _ = chunked_cross_entropy(
-            hidden, head.matrix, tokens, self.head_chunks, vocab_major=head.vocab_major,
-            softcap=head.softcap, precision=head.precision, excluded=self.process.mask_id,
-            bias=head.bias)
+        losses, predicted, _ = head_cross_entropy(self.model, params, hidden, tokens, self.head_chunks,
+                                                  excluded=self.process.mask_id)
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 

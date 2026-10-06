@@ -196,15 +196,34 @@ def test_adapter_gradients_of_the_token_loss_match_peft(decoder, loaded, referen
             np.testing.assert_allclose(exported[key.removeprefix("grad/")], reference[key], atol=1e-4, rtol=0)
 
 
-def test_an_adapted_head_is_refused_rather_than_scored_without_its_factors(decoder, reference):
-    """The LM objective scores tiles of the head's matrix, which an adapted head's branch is not in."""
-    adapter = LoRA(rank=2, modules=("lm_head",)).apply(decoder.model, decoder.variables, key=0,
-                                                         layouts=decoder.layouts)
-    tokens = jnp.asarray(reference["input_ids"])
-    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables)
-    with pytest.raises(ValueError, match="no matrix alone gives its logits"):
-        objective.loss(objective.init(jax.random.key(0)), {"text": tokens},
-                       Step(jnp.int32(0), jax.random.key(1), None))
+def test_an_adapted_head_trains_on_its_exact_logits(decoder, reference):
+    """No matrix alone is a head with factors on it, so the LM objective
+    scores the model's exact logits whole: the loss is the cross entropy of
+    the adapted forward's logits, and SGD through the Trainer moves every
+    factor, lowers the loss and leaves the frozen base bitwise."""
+    adapter = LoRA(rank=2, modules=("q_proj", "lm_head")).apply(decoder.model, decoder.variables, key=0,
+                                                                  layouts=decoder.layouts)
+    tokens = np.asarray(reference["input_ids"])
+    rows = 2 * jax.device_count()
+    objective = LMObjective(adapter.model, tokens.shape[1] - 1, variables=adapter.variables, ema_decay=None)
+    batch, step = {"text": jnp.asarray(tokens)}, Step(jnp.int32(0), jax.random.key(1), None)
+    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30))
+    initial = trainer.initial_state()
+    logits = adapter.model.apply(initial.variables, batch["text"][:, :-1])
+    first = objective.scalar_loss(initial.variables, batch, step)[0]
+    np.testing.assert_allclose(first, optax.softmax_cross_entropy_with_integer_labels(
+        logits, batch["text"][:, 1:]).mean(), rtol=1e-5)
+
+    data = Dataset(train=lambda partition: iter([{"text": tokens[np.arange(rows) % 2]}] * 3), val=None,
+                   records=rows, batch=rows)
+    state = trainer.fit(data, steps=3, log_every=3)
+    assert objective.scalar_loss(state.variables, batch, step)[0] < first
+    leaves = {name: [jax.tree.leaves(tree.variables[name]) for tree in (initial, state)]
+              for name in (FROZEN, "params")}
+    for before, after in zip(*leaves[FROZEN], strict=True):
+        np.testing.assert_array_equal(before, after)
+    assert all(np.any(before != after) for before, after in zip(*leaves["params"], strict=True))
 
 
 def test_one_trainer_step_moves_the_adapter_and_nothing_else(decoder, loaded, reference, tmp_path):
