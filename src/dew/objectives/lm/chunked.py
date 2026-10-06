@@ -1,7 +1,7 @@
 """Cross entropy that never holds the whole logits tensor.
 
-The forward walks the vocabulary in `chunks` tiles, keeping two numbers per
-token, four with the argmax, rather than a row of `vocab`: float32, or the
+The forward walks the vocabulary in `chunks` tiles, keeping four numbers per
+token, six with the argmax, rather than a row of `vocab`: float32, or the
 states' own dtype where it is wider (`dew.nn.precision.at_least_fp32`), as
 every accumulation here is. It is
 exact: logsumexp over a concatenation is `logaddexp` of the parts', the target
@@ -9,12 +9,22 @@ logit lives in exactly one chunk, and a strict comparison over chunks taken in v
 the lowest index among equals, which is `jnp.argmax`'s rule on the whole row.
 
 The backward recomputes each `[token_tile, vocab_tile]` block of logits from
-the states, the head and the saved log partition, so neither the logits nor
+the states, the head and the saved row normalizer, so neither the logits nor
 their cotangent is ever wider than one tile. The full-width head gradient is
 an output, not a temporary. The two-dimensional recomputing VJP is Tokamax's
 (`linear_softmax_cross_entropy_loss/chunked_xla.py`, `21c5828`); the fp32
 projection, the softcap, the tie rule and the differentiable log partition are
 this loss's own.
+
+The normalizer is each row's maximum and its sum of exponentials scaled to
+it, not log Z, whose rounding, |log Z| ulps, would reach every probability and
+the vocabulary bias's gradient, their sum. The forward walks the backward's
+column tiles, as XLA rounds a product of another width otherwise. At
+Qwen3-0.6B's head (2,048 bf16 tokens, 1,024 features, 151,936 fp32 columns,
+four chunks) on one RTX 4080 under the trainer's compiler options, forward
+and backward took 43.1 ms against 44.4 with the forward in whole chunks at a
+(1024, 8192) tile, and 35.6 against 36.3 at (4096, 8192), holding 0.18 and
+0.41 GiB of temporaries against 0.18 and 0.42.
 
 First-order reverse mode only: there is no JVP rule. On one RTX 4080, fp32,
 1,024 tokens by 2,816 features by 262,144 columns in four chunks, the default
@@ -131,9 +141,18 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
     return rounded_to(logits, jnp.bfloat16) if precision is BF16 else logits
 
 
-def _row_terms(logits, predict: bool) -> tuple[jax.Array, tuple[jax.Array, jax.Array] | None]:
-    """Each row's logsumexp, and with `predict` its maximum and the first
-    column that holds it, from one reduction over the row.
+def _rescaled(maximum, total, larger):
+    """A sum of exponentials moved from its own maximum to the larger one;
+    unchanged where they agree, so two sums whose maximum is -inf add rather
+    than turn NaN."""
+    return jnp.where(maximum == larger, total, total * jnp.exp(maximum - larger))
+
+
+def _row_terms(logits, predict: bool) -> tuple[
+        jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array]]:
+    """Each row's logsumexp, with `predict` its maximum and the first
+    column that holds it, and its maximum and the sum of exponentials scaled
+    to it, from one reduction over the row.
 
     The running maximum, the sum of exponentials scaled to it and the
     maximum's column ride together through `jax.lax.reduce`, so the row is
@@ -141,13 +160,9 @@ def _row_terms(logits, predict: bool) -> tuple[jax.Array, tuple[jax.Array, jax.A
     RTX 4080 (jax 0.11.2), fp32 logits of 4096 x 151936 take 3.9 ms against
     `jax.nn.logsumexp` and `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against
     5.0, with the same columns and logsumexps 1.9e-6 apart."""
-    def rescaled(maximum, total, larger):
-        # A sum moved from its own maximum to the larger one; unchanged where they agree.
-        return jnp.where(maximum == larger, total, total * jnp.exp(maximum - larger))
-
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
-        total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
+        total = _rescaled(first[0], first[1], larger) + _rescaled(second[0], second[1], larger)
         if not predict:
             return larger, total
         keep = (first[0] > second[0]) | ((first[0] == second[0]) & (first[2] < second[2]))
@@ -161,16 +176,19 @@ def _row_terms(logits, predict: bool) -> tuple[jax.Array, tuple[jax.Array, jax.A
         operands.append(jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis))
         initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
     terms = jax.lax.reduce(tuple(operands), tuple(initial), combine, (axis,))
-    return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None)
+    return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
 
 
 class _ChunkTerms(NamedTuple):
-    """One tile's logsumexp and target logit, and its best logit and column
-    when a prediction is asked for."""
+    """One tile's logsumexp and target logit, its best logit and column when
+    a prediction is asked for, and its maximum and the sum of exponentials
+    scaled to it."""
     lse: jax.Array
     picked: jax.Array
     best: jax.Array | None
     column: jax.Array | None
+    peak: jax.Array
+    mass: jax.Array
 
 
 def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
@@ -183,10 +201,10 @@ def _chunk_terms(hidden, head_chunk, targets, start: int, stop: int,
     inside = (targets >= start) & (targets < stop)
     column = jnp.clip(targets - start, 0, stop - start - 1)
     picked = jnp.where(inside, jnp.take_along_axis(logits, column[:, None], axis=-1)[:, 0], 0.0)
-    lse, top = _row_terms(logits, predict)
+    lse, top, normalizer = _row_terms(logits, predict)
     if top is None:
-        return _ChunkTerms(lse, picked, None, None)
-    return _ChunkTerms(lse, picked, top[0], top[1] + start)
+        return _ChunkTerms(lse, picked, None, None, *normalizer)
+    return _ChunkTerms(lse, picked, top[0], top[1] + start, *normalizer)
 
 
 def _over_tiles(carry, count: int, width: int, body: Callable):
@@ -202,15 +220,15 @@ def _over_tiles(carry, count: int, width: int, body: Callable):
     return carry
 
 
-def _forward(hidden, table, targets, excluded, chunks: int, token_tile: int,
+def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int],
              softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float, bias=None):
     """Losses, top-1 columns (None unless `predict`) and log partitions, a
-    token tile at a time."""
+    token tile at a time, and apart from them each row's maximum and the sum
+    of its exponentials scaled to it."""
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
-    bounds = vocabulary_chunks(table.shape[0], chunks)
-    width = bounds[0][1]
+    token_tile, width = tile[0], min(tile[1], vocabulary_chunks(table.shape[0], chunks)[0][1])
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     # Once, not per token tile: every tile multiplies the same rounded table,
@@ -226,45 +244,46 @@ def _forward(hidden, table, targets, excluded, chunks: int, token_tile: int,
                 states, jax.lax.dynamic_slice_in_dim(table, first, count),
                 picked_targets, first, first + count, softcap, precision, predict, temperature, excluded,
                 None if bias is None else jax.lax.dynamic_slice_in_dim(bias, first, count))
-            total = jnp.logaddexp(carry[0], terms.lse)
-            target_logit = carry[1] + terms.picked
+            peak = jnp.maximum(carry[2], terms.peak)
+            merged = (jnp.logaddexp(carry[0], terms.lse), carry[1] + terms.picked, peak,
+                      _rescaled(carry[2], carry[3], peak) + _rescaled(terms.peak, terms.mass, peak))
             if terms.best is None or terms.column is None:
-                return total, target_logit
-            better = terms.best > carry[2]
-            return (total, target_logit, jnp.where(better, terms.best, carry[2]),
-                    jnp.where(better, terms.column, carry[3]))
+                return merged
+            better = terms.best > carry[4]
+            return (*merged, jnp.where(better, terms.best, carry[4]),
+                    jnp.where(better, terms.column, carry[5]))
 
-        initial = (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), work))
+        initial = (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), work)) * 2
         if predict:
             initial += (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), jnp.int32))
-        total, target_logit, *best = _over_tiles(initial, table.shape[0], width, columns)
-        values = (total - target_logit, total, *best[1:])
+        total, target_logit, *rest = _over_tiles(initial, table.shape[0], width, columns)
+        values = (total - target_logit, total, *rest[:2], *rest[3:])
         return tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                      for out, value in zip(outputs, values, strict=True))
 
     count = labels.shape[0]
-    outputs = (jnp.zeros((count,), work), jnp.zeros((count,), work))
+    outputs = (jnp.zeros((count,), work),) * 4
     if predict:
         outputs += (jnp.zeros((count,), jnp.int32),)
-    losses, log_z, *predicted = (value.reshape(targets.shape) for value in
-                                 _over_tiles(outputs, count, token_tile, tokens))
-    return losses, predicted[0] if predict else None, log_z
+    losses, log_z, peak, mass, *predicted = (value.reshape(targets.shape) for value in
+                                             _over_tiles(outputs, count, token_tile, tokens))
+    return (losses, predicted[0] if predict else None, log_z), (peak, mass)
 
 
 def _bounded_head_impl(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int],
                        softcap, precision: jax.lax.PrecisionLike, predict: bool, temperature: float, bias):
     """Run `_forward` behind a backward that recomputes its logits."""
-    return _forward(hidden, table, targets, excluded, chunks, tile[0], softcap, precision, predict,
-                    temperature, bias)
+    return _forward(hidden, table, targets, excluded, chunks, tile, softcap, precision, predict,
+                    temperature, bias)[0]
 
 
 def _bounded_head_fwd(hidden, table, targets, excluded, chunks, tile, softcap, precision, predict,
                       temperature, bias):
-    outputs = _forward(hidden, table, targets, excluded, chunks, tile[0], softcap, precision, predict,
-                       temperature, bias)
-    # The residuals are the inputs and one number per token. Everything the
+    outputs, normalizer = _forward(hidden, table, targets, excluded, chunks, tile, softcap, precision,
+                                   predict, temperature, bias)
+    # The residuals are the inputs and two numbers per token. Everything the
     # backward needs beyond them is a recomputed tile.
-    return outputs, (hidden, table, targets, excluded, outputs[2], softcap, bias)
+    return outputs, (hidden, table, targets, excluded, normalizer, softcap, bias)
 
 
 def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, cotangents):
@@ -276,17 +295,19 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
     `(d_states, d_matrix, d_cap)`, where `d_matrix` accumulates one
     vocabulary tile's head gradient in fp32 before it is stored.
     """
-    del chunks, predict  # The backward tiles by column, and argmax has no gradient.
-    hidden, table, targets, excluded, log_z, softcap, bias = residuals
-    # The logits are recomputed from operands that hold the forward's
-    # values, so they are the forward's logits.
+    del predict  # Argmax has no gradient.
+    hidden, table, targets, excluded, normalizer, softcap, bias = residuals
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
     loss_cotangent, _, partition_cotangent = cotangents
-    token_tile, vocab_tile = tile
+    # The logits are recomputed from operands that hold the forward's values,
+    # in the forward's column tiles, so they are the logits its normalizer
+    # summed: XLA rounds a product of another width otherwise.
+    token_tile, vocab_tile = tile[0], min(tile[1], vocabulary_chunks(table.shape[0], chunks)[0][1])
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
-    labels, partitions = targets.reshape(-1), log_z.reshape(-1)
+    labels = targets.reshape(-1)
+    peaks, masses = (value.reshape(-1) for value in normalizer)
     d_loss = loss_cotangent.reshape(-1)
     d_partition = partition_cotangent.reshape(-1)
     count = labels.shape[0]
@@ -305,17 +326,19 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, residuals, 
             d_states, d_matrix, d_cap, d_offset = carry
             states = rounded_operand(jax.lax.dynamic_slice_in_dim(
                 flat, start, size).astype(work), operands)
-            token_z = jax.lax.dynamic_slice_in_dim(partitions, start, size)
+            token_peak = jax.lax.dynamic_slice_in_dim(peaks, start, size)
+            token_mass = jax.lax.dynamic_slice_in_dim(masses, start, size)
             token_loss = jax.lax.dynamic_slice_in_dim(d_loss, start, size)
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
             logits, pullback = jax.vjp(
                 lambda raw, cap: _capped(raw, cap, temperature),
                 _biased_logits(_tile_logits(states, matrix, precision), bias_tile), softcap)
-            # log Z is the whole row's, so a tile's share of the softmax needs
-            # no renormalisation, and a target outside the tile one-hots to
-            # zero rather than to a wrapped column.
-            probabilities = jnp.exp(_without(logits, first, excluded) - token_z[:, None])
+            # The maximum and the sum are the whole row's, so a tile's share of
+            # the softmax needs no renormalisation, and a target outside the
+            # tile one-hots to zero rather than to a wrapped column.
+            probabilities = (jnp.exp(_without(logits, first, excluded) - token_peak[:, None])
+                             / token_mass[:, None])
             selected = jax.nn.one_hot(
                 jax.lax.dynamic_slice_in_dim(labels, start, size) - first, width,
                 dtype=work)
@@ -380,7 +403,7 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     labels = targets.reshape(-1)
     raw = _biased_logits(_tile_logits(flat, table.astype(operands), precision), bias)
     logits = _without(_capped(raw, softcap, temperature), 0, excluded)
-    log_z, top = _row_terms(logits, predict)
+    log_z, top, _ = _row_terms(logits, predict)
     # A target outside the vocabulary picks no column, as in `_chunk_terms`:
     # the vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
@@ -395,8 +418,8 @@ def _whole_head_impl(hidden, table, targets, excluded, softcap, chunks, precisio
                      temperature, bias):
     """With nothing to differentiate, the tiled forward: no backward needs
     the whole logits, so an evaluation or a scoring pass stays bounded."""
-    return _forward(hidden, table, targets, excluded, chunks, 1024, softcap, precision, predict,
-                    temperature, bias)
+    return _forward(hidden, table, targets, excluded, chunks, (1024, table.shape[0]), softcap, precision,
+                    predict, temperature, bias)[0]
 
 
 def _whole_head_fwd(hidden, table, targets, excluded, softcap, chunks, precision, predict, temperature, bias):
@@ -515,9 +538,10 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
 
     `softcap` is the backbone's `final_logit_softcap`. It is elementwise, so
     capping a tile and capping the row agree. `tile` is a `(tokens, columns)`
-    block: the forward walks tokens in the first, the backward walks both and
-    holds nothing wider, so it is the only knob on the backward's
-    temporaries. The default is measured; a tile wider than the input is one
+    block: both passes walk tokens in the first and columns in the second
+    or a chunk, whichever is narrower, and the backward holds nothing
+    wider, so it is the only knob on the backward's temporaries. The
+    default is measured; a tile wider than the input is one
     tile. A `tile` of None keeps the whole fp32 logits for the backward
     instead of recomputing them, which is faster wherever they fit: on one
     A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
