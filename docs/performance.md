@@ -1116,6 +1116,33 @@ selection and scheduling. I tested no flag that relaxes precision, and none
 would be adopted, because an adopted change has to keep a fixed-seed 20-step
 loss trajectory within 1e-5.
 
+On a CPU with two core types, such as the i9-12900K's P-cores and E-cores,
+XLA:CPU's float32 bytes can differ from one process to the next
+([openxla/xla#50022](https://github.com/openxla/xla/issues/50022)). Some
+convolutions and dots reach oneDNN's sgemm. It splits the rows into blocks
+by the caches of the core that ran the process's first contraction, and the
+result depends on the blocks. A dense layer's kernel gradient over four
+tokens, `[4, 2048]^T @ [4, 32]`, ran as one 2048-row block when the first
+contraction was on a P-core, and as 1032 + 1016 rows when it was on an
+E-core. The two processes disagreed in the last bits, though each one
+repeated its own result exactly. No XLA flag pins the blocking:
+`--xla_cpu_use_onednn=false`, `--xla_cpu_use_xnnpack=false`,
+`--xla_cpu_use_thunk_runtime=false` and
+`--xla_cpu_multi_thread_eigen=false` each still give both results.
+`ONEDNN_MAX_CPU_ISA=SSE41`, set before JAX starts, does: both orders gave the
+same bytes. I timed it on one thread of a P-core, two processes per setting:
+
+| dot | default | `ONEDNN_MAX_CPU_ISA=SSE41` |
+|---|---|---|
+| that gradient | 41-51 µs | 48-64 µs |
+| Qwen3-0.6B's MLP up-projection, [512, 1024] @ [1024, 3072] | 28.6-29.4 ms | 29.0-31.8 ms |
+
+The up-projection never reaches oneDNN's gemm, so the variable leaves it
+alone, and the differences are within the spread between two processes.
+Dew does not set the variable. To compare bytes across processes on such a
+machine, set it, or pin every process to one core type (`taskset -c 0-15`
+for the 12900K's P-cores).
+
 ## UNet batch scaling
 
 These numbers show where the unet, the architecture whose step is least
