@@ -37,7 +37,7 @@ export class LiveKernel extends DurableObject<Env> {
 		if (await this.ctx.storage.get<boolean>('ended')) return new Response('this session is over', { status: 410 });
 		try {
 			const image = await this.ensureRunning(session);
-			return this.env.SHARED.get(this.env.SHARED.idFromName(image)).relay(session, request);
+			return this.env.SHARED.get(this.env.SHARED.idFromName(image)).fetch(request);
 		} catch (error) {
 			return new Response(`the shared kernel did not start: ${error instanceof Error ? error.message : String(error)}`, { status: 503 });
 		}
