@@ -32,6 +32,7 @@ import logging
 import math
 import sys
 import threading
+import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
@@ -265,28 +266,29 @@ def json_argument[Options: DataclassInstance](
     )
 
 
-def json_list_argument[Entry: DataclassInstance](
-        entry: type[Entry]) -> tyro.constructors.PrimitiveConstructorSpec[tuple[Entry, ...]]:
-    """A tuple of `entry` records written as one JSON list on the command
-    line, `[{"field": ...}, ...]`, since a flag per field cannot spell a list
-    of records whose length the command line decides.
+def record_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
+    """A field typed `annotation` written as one JSON value on the command
+    line, the record a run holds: a tuple of records as a list,
+    `[{"field": ...}, ...]`, and a mapping of registered records as an
+    object, `{"sigma": {"name": "linear", "fields": {...}}}`, since a flag per
+    field cannot spell a collection whose length or keys the command line
+    decides.
 
-    Each entry is read and written as a run record holds it, so a field that
-    holds a registered value, such as a `ParamGroup`'s schedule, is the record
-    that names it, `{"name": ..., "fields": {...}}`."""
+    The value is read with `from_record` and written with `to_record`, so a
+    flag, a default and `run.json` hold the same record. Use it as the
+    field's metadata: `Annotated[Mapping[str, ScheduleSpec],
+    record_argument(Mapping[str, ScheduleSpec])]`."""
     from dew.registry import from_record, to_record
 
-    def written(given: tuple[Entry, ...]) -> list[str]:
-        return [json.dumps([to_record(value, entry) for value in given])]
-
+    container = typing.get_origin(annotation) or annotation
+    if container is Mapping:
+        container = dict
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
         metavar="JSON",
-        instance_from_str=lambda given: tuple(
-            from_record(entry, record, dtypes=False) for record in json.loads(given[0])),
-        is_instance=lambda given: isinstance(given, tuple) and all(
-            isinstance(value, entry) for value in given),
-        str_from_instance=written,
+        instance_from_str=lambda given: from_record(annotation, json.loads(given[0]), dtypes=False),
+        is_instance=lambda given: isinstance(given, container),
+        str_from_instance=lambda given: [json.dumps(to_record(given, annotation))],
     )
 
 
@@ -1661,12 +1663,15 @@ __all__ = [
     "PhasedStream",
     "Ramp",
     "RampedStream",
+    "Reader",
     "Records",
     "Resumable",
     "SourceSlice",
     "Stage",
     "Stoppable",
+    "Tokenize",
     "mapped",
+    "record_argument",
     "tokenized",
     "train_stream",
 ]

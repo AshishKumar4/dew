@@ -14,6 +14,7 @@ interface SnapshotEnv {
 	PREPARER: DurableObjectNamespace<DurableObject & {
 		prepare(commit: string): Promise<SnapshotGeneration>;
 	}>;
+	POOL?: DurableObjectNamespace<DurableObject & { configure(generation: SnapshotGeneration): Promise<void> }>;
 }
 
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
@@ -104,6 +105,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 				await storage.delete('rebuild');
 				await storage.setAlarm(candidate.created + 7 * 24 * 60 * 60_000);
 			});
+			if (this.env.POOL) await this.env.POOL.get(this.env.POOL.idFromName('global')).configure(candidate);
 			return { rebuilding: false, generation: candidate };
 		} catch (error) {
 			await this.ctx.storage.transaction(async (storage) => {
