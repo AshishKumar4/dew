@@ -133,23 +133,21 @@ def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
     sliced partial rotary of `rotary_freqs(partial_rotary_type='default')`.
     `scale` multiplies the whole head inside the arithmetic, at least fp32,
     so a query's attention scale narrows once, with the product.
+
+    The halves rotate as `x1 cos - x2 sin` and `x2 cos + x1 sin`, which is
+    `x cos + rotate_half(x) sin` without the rotated copy. On a TPU v6e the
+    copy's slice-and-negate ran as separate passes: without it Qwen3-0.6B's
+    training step at 8 x 1024 took 140.6 against 145.6 ms, and Qwen3-1.7B's
+    at 4 x 1024 150.0 against 153.8 (docs/performance.md).
     """
-    cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
-    sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
-    if cos.ndim == 3:
-        cos = cos[:, :, None, :]
-        sin = sin[:, :, None, :]
+    if freqs_cos.ndim == 3:
+        cos, sin = freqs_cos[:, :, None, :], freqs_sin[:, :, None, :]
     else:
-        cos = cos[None, :, None, :]
-        sin = sin[None, :, None, :]
+        cos, sin = freqs_cos[None, :, None, :], freqs_sin[None, :, None, :]
     wide = x.astype(at_least_fp32(x.dtype))
-    rotated_dims = cos.shape[-1]
-    wide, passed = wide[..., :rotated_dims], wide[..., rotated_dims:]
-    x1, x2 = jnp.split(wide, 2, axis=-1)
-    rotated = jnp.concatenate([-x2, x1], axis=-1)
-    out = wide * cos + rotated * sin
-    if passed.shape[-1]:
-        out = jnp.concatenate([out, passed], axis=-1)
+    pairs = cos.shape[-1]
+    x1, x2, passed = wide[..., :pairs], wide[..., pairs:2 * pairs], wide[..., 2 * pairs:]
+    out = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, passed], axis=-1)
     return (out if scale is None else out * scale).astype(x.dtype)
 
 
