@@ -47,11 +47,18 @@ class MLPMixer(MixerBase):
     mixture: Mixture | None = None
 
     def __post_init__(self):
-        if isinstance(self.mixture, Mapping):
-            from dew.nn.backbones.decoder_block import Mixture
-            from dew.registry import from_record
+        from dew.nn.backbones.decoder_block import Mixture
+        from dew.registry import from_record
 
+        if isinstance(self.mixture, Mapping):
             object.__setattr__(self, 'mixture', from_record(Mixture, self.mixture))
+        mixture = self.mixture
+        if mixture is not None and not isinstance(mixture, Mixture):
+            raise ValueError('MLPMixer mixture is a Mixture, its record, or None')
+        if mixture is not None and (mixture.layers is not None or mixture.hash_layers is not None
+                                    or mixture.media_bias):
+            raise ValueError('MLPMixer uses the layer-kind pattern; mixture layers, hash_layers and '
+                             'media_bias need a decoder feed-forward slot')
 
     def build(self, ctx: MixerContext):
         # decoder_block imports the mixer registry while its classes are being defined.

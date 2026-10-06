@@ -143,7 +143,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                                    "routed_scaling_factor"),
             groups=integer("n_group", 1), groups_per_token=integer("topk_group", 1), bias=True,
             expert_features=integer("moe_intermediate_size", 7688),
-            shared_features=integer("moe_shared_expert_intermediate_size", 7688),
+            shared_features=integer("moe_shared_expert_intermediate_size", 7688) or mlp.intermediate_size,
             latent_features=None if latent is None else records.integer(latent, "moe_latent_size"))
         kinds["moe"] = LayerKind(mixer=MLPMixer(
             intermediate_size=mixture.expert_features or mlp.intermediate_size,
