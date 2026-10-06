@@ -155,14 +155,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     corrupted, but only one valid canvas, chosen uniformly, contributes the
     diffusion cross entropy.
 
-    `processor` is what `pipeline` uses to turn text into ids and decode
-    them, unless it is given another one. A run records its tokenizer.
-
-    `variables` is the tree training starts from: the SFT source's, or an
-    adapter's split of it. A split (`dew.objectives.base.freeze`) is kept,
-    so the optimizer updates only what the split leaves in `params`. `model`
-    may be the loaded source itself, which supplies its model, variables and
-    processor. With no variables, training starts from a fresh init.
+    `model` may be the loaded SFT source, and `variables` and `processor`
+    override its own (`Objective.bind_model`).
 
     Both cross entropies score the final states through the bounded head
     (`dew.objectives.lm.chunked.head_cross_entropy`), `head_chunks`

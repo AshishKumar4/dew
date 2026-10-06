@@ -103,15 +103,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         draws. `decode` turns a row of ids into the text the artifact shows;
         with None, the artifact shows the ids alone.
 
-        `variables` is the tree training starts from: a released
-        masked-diffusion checkpoint as `Pretrained.load` returns it, so a run
-        continues from LLaDA's or Dream's weights, or an adapter's split of
-        one, kept as given. None starts from a fresh init. `model` may be the
-        loaded source itself, which supplies its model, variables and
-        processor.
-
-        `processor` is what `pipeline` uses to turn text into ids and decode
-        them, unless it is given another one. A run records its tokenizer."""
+        `model` may be a loaded source, such as a released LLaDA or Dream
+        checkpoint, and `variables` and `processor` override its own
+        (`Objective.bind_model`)."""
         model = self.bind_model(model, variables=variables, processor=processor)
         lacking = [read.__name__ for read in (HiddenStates, AffineHead) if not isinstance(model, read)]
         if lacking:
