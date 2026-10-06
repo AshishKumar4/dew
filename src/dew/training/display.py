@@ -294,8 +294,6 @@ class TrainingDisplay:
         if self.live is not None:
             return
         counts = f"{evaluation.records} records in {evaluation.elapsed_seconds:.2f} s"
-        if evaluation.uneven_shards:
-            counts += ", uneven shards"
         self.note(f"eval {self.label(evaluation.split)} at step {evaluation.step}: "
                   f"{self.scores(evaluation).plain} ({counts})", style=LABEL)
 

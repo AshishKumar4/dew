@@ -52,7 +52,8 @@ networks an 8-pixel image is too small for."""
 def test_the_regularizer_is_repa_es():
     total, hinge, terms = EndToEnd(**L1_KL).regularizer(
         jnp.asarray(CASE["images"], jnp.float32), jnp.asarray(CASE["reconstruction"], jnp.float32),
-        jnp.asarray(CASE["moments"], jnp.float32), perceptual=None, discriminator=None, step=jnp.asarray(0))
+        jnp.asarray(CASE["moments"], jnp.float32), perceptual=None, discriminator=None, step=jnp.asarray(0),
+        batch={})
     assert float(hinge) == 0 and set(terms) == {"reconstruction", "kl"}
     # float32 sums of a few hundred O(1) terms: 1e-5 relative is rounding.
     np.testing.assert_allclose(float(terms["kl"]), float(CASE["kl"]), rtol=1e-5)
@@ -64,7 +65,7 @@ def test_the_latent_batch_norm_is_repa_es():
     its own and moves the running ones; evaluation then reads those."""
     end_to_end = EndToEnd()
     latents = jnp.asarray(CASE["latents"], jnp.float32)
-    trained, statistics = end_to_end.batch_normalized(latents, end_to_end.initial_statistics(0.1, 0.8, 4))
+    trained, statistics = end_to_end.batch_normalized(latents, end_to_end.initial_statistics(0.1, 0.8, 4), {})
     np.testing.assert_allclose(np.asarray(trained), CASE["trained"], rtol=0, atol=2e-6)
     np.testing.assert_allclose(np.asarray(statistics["mean"]), CASE["running_mean"], rtol=1e-6)
     np.testing.assert_allclose(np.asarray(statistics["var"]), CASE["running_var"], rtol=1e-6)
@@ -467,7 +468,7 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
     # rounding, the reference's batch norm being that function in float64.
     statistics = aux.variables[LATENT_STATS]
     tuned = task._end_to_end_latents({**variables, "params": params}, unit_range(batch["image"]),
-                                     jax.random.split(step.key, 5)[0], step.step)
+                                     jax.random.split(step.key, 5)[0], step.step, batch)
     for name in ("mean", "var"):
         np.testing.assert_array_equal(np.asarray(tuned.statistics[name]), np.asarray(statistics[name]))
     assert_as_exact_as_the_reference(np.asarray(tuned.raw), STEPPED["latents/sample"],

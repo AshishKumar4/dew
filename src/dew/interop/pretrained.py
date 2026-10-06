@@ -180,6 +180,7 @@ def _wrapper_layouts(tensors, record, variables):
     the loader built, so an export writes the names the source shipped.
     """
     from dew.nn import vision
+    from dew.nn.vision.common import projector_weight_path
 
     tower_kind = record["tower"]["name"]
     audio_encoder = None if record["audio"] is None else towers.from_record(record["audio"])
@@ -198,7 +199,7 @@ def _wrapper_layouts(tensors, record, variables):
         paths: tuple[tuple[str, ...], ...] = ()
         transpose = None
         if group == "projector":
-            path = vision.projector_weight_path(record["projector"]["name"], local)
+            path = projector_weight_path(record["projector"]["name"], local)
             paths = (("params", "projector", *path),)
             if path[-1] == "kernel" and local != "mm_input_projection_weight":
                 transpose = (1, 0)
@@ -213,7 +214,7 @@ def _wrapper_layouts(tensors, record, variables):
                 if path[-1] == "kernel":
                     transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
         elif group == "audio_projector":
-            path = vision.projector_weight_path(record["audio_projector"]["name"], local)
+            path = projector_weight_path(record["audio_projector"]["name"], local)
             paths = (("params", "audio_projector", *path),)
             if path[-1] == "kernel":
                 transpose = (1, 0)

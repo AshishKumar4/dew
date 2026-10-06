@@ -59,12 +59,15 @@ def decoder(**fields):
                              mlp_features=32, max_seq_len=32, **fields)
 
 
-@pytest.fixture(scope="module")
-def windows(tmp_path_factory):
-    """TokenWindows over a byte corpus, what the LM recipe trains on."""
-    corpus = tmp_path_factory.mktemp("corpus")
+def corpus_windows(corpus: Path) -> TokenWindows:
+    """TokenWindows over a byte corpus written to `corpus`, what the LM recipe trains on."""
     TokenCorpus.write(["the quick brown fox jumps over the lazy dog " * 8] * 4, corpus, val_fraction=0.25)
     return TokenWindows(path=str(corpus), seq_len=SEQ_LEN, val_batches=None)
+
+
+@pytest.fixture(scope="module")
+def windows(tmp_path_factory):
+    return corpus_windows(tmp_path_factory.mktemp("corpus"))
 
 
 def diffusion(preset=None, **training) -> DiffusionRunConfig:
@@ -82,7 +85,8 @@ def with_teacher(kind):
     its teacher the recipe's own objective at initialization."""
     config = diffusion()
     base = config.build()
-    teacher = {"params": base.init(jax.random.key(0))["params"]}
+    drawn = base.init(jax.random.key(0))
+    teacher = base.model_variables(drawn)
     shared = (base.model, base.process, base.inputs)
     built = {
         "ladd": lambda: AdversarialDistillationObjective(
@@ -91,7 +95,7 @@ def with_teacher(kind):
         "rcm": lambda: ConsistencyDistillationObjective(*shared, ConsistencyDistillation(), teacher=teacher,
                                                         guidance=None, steps=2),
         "guidance_distillation": lambda: GuidanceDistillationObjective(
-            *shared, teacher=base, teacher_variables=teacher, steps=2),
+            *shared, teacher=base, teacher_variables=drawn, steps=2),
     }[kind]()
     return built, first(config.data, built)
 
@@ -142,7 +146,7 @@ def cases(windows):
 
     def block():
         canvas, prompt = 4, 8
-        model = DiffusionGemma(text=decoder(causal=False, layer_scalar="frozen"), canvas_length=canvas)
+        model = DiffusionGemma(text=decoder(layer_scalar="frozen"), canvas_length=canvas)
         response = windows.seq_len + 1 - prompt
         return (BlockDiffusionObjective(model, prompt_length=prompt, num_canvases=response // canvas,
                                         canvas_size=canvas), first(windows))

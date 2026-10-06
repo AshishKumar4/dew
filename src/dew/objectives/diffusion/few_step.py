@@ -32,7 +32,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.objectives.base import Aux, Ratio, Step, Variables
+from dew.objectives.base import Aux, Step, Variables
 from dew.registry import objectives, trainings
 from dew.sampling.solvers import Euler
 
@@ -274,7 +274,7 @@ class MeanFlowObjective(DiffusionObjective):
         guided = jnp.where(expand(dropped, v), v, guided)
         u, target = mean_flow_target(velocity(conditions, train=True), z, t, r, guided)
         losses = adaptive_loss(u, target, self.mean_flow.norm_p, self.mean_flow.norm_eps)
-        return Ratio(jnp.sum(losses), jnp.asarray(count, jnp.float32)), Aux(metrics={})
+        return self.row_mean(losses, batch), Aux(metrics={})
 
 
 # The noise a shortcut model's path keeps at the data end, the reference's
@@ -367,7 +367,7 @@ class ShortcutObjective(DiffusionObjective):
         target = jnp.concatenate([bootstrapped, v[rows:]])
         u = velocity(self.model_variables(variables), conditions, train=True)(x, sigma, sigma - step_size)
         losses = jnp.square(u - target)
-        return Ratio(jnp.sum(losses), jnp.asarray(losses.size, jnp.float32)), Aux(metrics={})
+        return self.row_mean(losses, batch), Aux(metrics={})
 
 
 __all__ = ["MeanFlowObjective", "ShortcutObjective", "adaptive_loss", "guided_velocity", "intervals",

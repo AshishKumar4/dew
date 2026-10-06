@@ -80,8 +80,7 @@ class VGG16(nn.Module):
 
 
 class LPIPSNetwork(nn.Module):
-    """LPIPS between two `[B, H, W, 3]` image batches in [-1, 1], one
-    distance per image."""
+    """Computes LPIPS between two `[B, H, W, 3]` image batches in [-1, 1], one distance per image."""
 
     @nn.compact
     def __call__(self, images: jax.Array, references: jax.Array) -> jax.Array:
@@ -97,7 +96,7 @@ class LPIPSNetwork(nn.Module):
 
     @staticmethod
     def published() -> tuple[LPIPSNetwork, Variables]:
-        """The network and the published weights, downloaded on first use."""
+        """Return the network and the published weights, downloading them on first use."""
         return LPIPSNetwork(), _published_variables()
 
 
