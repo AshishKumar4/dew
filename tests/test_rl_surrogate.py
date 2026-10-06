@@ -41,6 +41,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from rl_support import clipped_surrogate, token_mean
 
 from dew.rl import surrogate
 
@@ -57,20 +58,6 @@ ADVANTAGES = jnp.asarray(REFERENCE["advantages"])
 CLIP = {"epsilon_low": float(REFERENCE["epsilon_low"]),
             "epsilon_high": float(REFERENCE["epsilon_high"]),
             "dual_clip": float(REFERENCE["dual_clip"])}
-
-
-def token_mean(x, mask):
-    """verl's token-mean aggregation, `agg_loss(loss_agg_mode="token-mean")`,
-    which is how GRPO reduces these terms: masked values out before the
-    multiply, so a nan behind the mask stays out, over the exact token count."""
-    weights = mask.astype(x.dtype)
-    return jnp.sum(jnp.where(weights != 0, x, 0) * weights) / jnp.sum(weights)
-
-
-def clipped_surrogate(log_ratio, advantages, mask, module=surrogate, **clip):
-    """The token-mean reduction of the dual-clipped policy terms."""
-    terms, aux = module.clipped_surrogate_terms(log_ratio, advantages, mask, **clip)
-    return token_mean(terms, mask), aux
 
 
 def difference(computed, name):

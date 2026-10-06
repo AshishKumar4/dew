@@ -152,7 +152,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     import dataclasses
 
     import optax
-    from test_diffusion_run_sources import batch_for
+    from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig

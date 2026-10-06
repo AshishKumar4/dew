@@ -12,45 +12,22 @@ through the objective's own head.
 import json
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
+from affine_run import FEATURES, Regression
+from rl_support import TinyHead
 
-from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import SampledRollout
 from dew.rl import group_advantage, rloo_advantage
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, Trainer
 
-FEATURES = 3
 VOCAB = 8
 PROMPT_WIDTH = 8
 NEW_TOKENS = 4
 GROUPS = 2
-
-
-class Affine(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(2)(x)
-
-
-class Regression(Objective):
-    """Squared error of an affine map, for the loop-level tests."""
-
-    def __init__(self):
-        self.model = Affine()
-        self.ema = EMASpec(decay=optax.constant_schedule(1.0))
-
-    def init(self, key, variables=None):
-        return self.model.init(key, jnp.zeros((1, FEATURES)))
-
-    def loss(self, variables, batch, step):
-        prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
 
 
 class Counting:
@@ -102,7 +79,7 @@ def leaves(state):
 def make_trainer(tmp_path=None, **kwargs):
     checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path / "run"))
     return Trainer(
-        Regression(),
+        Regression(ema_decay=1.0),
         optax.sgd(0.1),
         key=jax.random.key(0),
         layout=Layout(min_shard=1, tolerance=1.0),
@@ -227,36 +204,6 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
     assert [tick["rollout/reward/mean"] for tick in ticks] == [1.5, 3.5]
 
 
-class TinyHead(nn.Module):
-    """A position-wise map with the backbone's scoring contract, standing in
-    for the causal stack: int32 ids in, float32 logits out, the head split
-    off behind `hidden_states` and `head_weight`."""
-
-    vocab_size: int
-    final_logit_softcap = None
-    precision = None
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False):
-        x = nn.Embed(self.vocab_size, 8)(tokens)
-        h = nn.LayerNorm()(x)
-        return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
-
-    @nn.compact
-    def init_cache(self, batch_size):
-        """A placeholder cache: the trunk mixes nothing across positions, so
-        incremental decoding keeps no state, but `generate` threads one."""
-        self.variable("cache", "index", lambda: jnp.zeros((batch_size,), jnp.int32))
-
-    def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None):
-        return self.lm_head(
-            self.hidden_states(tokens, train=train)).astype(jnp.float32)
-
-    def head_weight(self, params):
-        return params["lm_head"]["kernel"].astype(jnp.float32)
 # --- SampledRollout ------------------------------------------------------------
 
 

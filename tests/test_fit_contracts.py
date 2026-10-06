@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_trainer import RecordingTracker
+from recording import RecordingTracker
 
 from dew.artifacts import Representations
 from dew.data import DataPartition, Dataset

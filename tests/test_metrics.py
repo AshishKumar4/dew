@@ -21,8 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
-from test_chunked_cross_entropy import equations
+from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.eval import (

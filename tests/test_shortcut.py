@@ -92,7 +92,7 @@ def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
 
 
 def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
-    from test_diffusion_run_sources import batch_for
+    from diffusion_stubs import batch_for
 
     from dew.config import ModelConfig
     from dew.data import TFDSImages

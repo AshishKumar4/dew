@@ -12,42 +12,15 @@ import json
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import optax
 import pytest
-from flax import linen as nn
+from rl_support import TinyHead
 
 from dew.data import ChatMessages, Loading, PreferencePairs, Prompts
 from dew.training import Layout
 from recipes.chain import Recipe, Stage
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
-
-
-class TinyHead(nn.Module):
-    """A position-wise map with the backbone's scoring contract: int32 ids
-    in, float32 logits out, the head split off behind `hidden_states` and
-    `head_weight`."""
-
-    vocab_size: int
-    final_logit_softcap = None
-    precision = None
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False, **packing):
-        x = nn.Embed(self.vocab_size, 8)(tokens)
-        h = nn.LayerNorm()(x)
-        return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
-
-    def __call__(self, tokens, train: bool = False):
-        return self.lm_head(
-            self.hidden_states(tokens, train=train)).astype(jnp.float32)
-
-    def head_weight(self, params):
-        return params["lm_head"]["kernel"].astype(jnp.float32)
 
 
 def chat_parquet(tmp_path):
