@@ -111,12 +111,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         `processor` is what `pipeline` uses to turn text into ids and decode
         them, unless it is given another one. A run records its tokenizer."""
-        from dew.nn.backbones.causal_transformer import CausalTransformer
-
         model = self.bind_model(model, variables=variables, processor=processor)
-        if not isinstance(model, CausalTransformer):
-            raise TypeError(f"masked diffusion trains a CausalTransformer, and this source's model "
-                            f"is a {type(model).__name__}")
         if model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so it needs "
