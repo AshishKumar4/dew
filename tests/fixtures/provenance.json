@@ -2720,7 +2720,7 @@
      "runs": "fetched"
     }
    ],
-   "note": "src/models (vision_transformer, predictor, utils) with src/masks/utils.py and src/utils/tensors.py fetched at the commit, SHA-256 checked; image mode, mask-token predictor, every MLP's GELU swapped for tanh; float32 and float64 (widened, float64 sincos tables) forward and gradients. Torch 2.14.0+cpu."
+   "note": "src/models (vision_transformer, predictor, utils) with src/masks/utils.py and src/utils/tensors.py fetched at the commit, SHA-256 checked; image mode, mask-token predictor, V-JEPA's own exact GELU; float32 and float64 (widened, float64 sincos tables) forward and gradients. Torch 2.14.0+cpu."
   },
   "jit": {
    "tool": "tools/jit_reference.py",

@@ -5,6 +5,8 @@ let opening: Promise<LiveSession> | undefined;
 let busy = false;
 const closed = new Set<(message: string) => void>();
 
+window.addEventListener('pagehide', closeKernel);
+
 // The two editable examples share one kernel and never interrupt each other's cells.
 export function reserveKernel(): () => void {
 	if (busy) throw new Error('Another cell is running. Wait for it to finish or stop it.');
