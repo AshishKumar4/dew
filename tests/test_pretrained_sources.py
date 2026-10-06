@@ -414,30 +414,22 @@ def leaf_dtypes(variables):
     return {np.dtype(leaf.dtype) for leaf in jax.tree.leaves(variables["params"])}
 
 
-@pytest.mark.parametrize("stated, stored", [
-    ({}, ml_dtypes.bfloat16),                       # the first floating tensor's
-    ({"dtype": "float16"}, np.float16),             # config.json's, which wins
-])
-def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path, stated, stored):
-    """transformers' dtype='auto' rule: config.json's dtype, else the
-    dtype of the first floating tensor."""
-    loaded = pretrained.Pretrained.load(bf16_source(tmp_path, **stated), dtype="float32",
+def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path):
+    """config.json's dtype wins over the bfloat16 tensors, as transformers' dtype='auto' reads it."""
+    loaded = pretrained.Pretrained.load(bf16_source(tmp_path, dtype="float16"), dtype="float32",
                                         param_dtype="auto", attention_impl="xla")
 
-    assert leaf_dtypes(loaded.variables) == {np.dtype(stored)}
+    assert leaf_dtypes(loaded.variables) == {np.dtype(np.float16)}
 
 
 def test_auto_storage_skips_payloads_that_are_no_parameter_storage():
-    """Packed, integer and wider payloads ahead of the first float32,
-    bfloat16 or float16 tensor do not decide the storage; a stated dtype
-    wins, `dtype` over `torch_dtype`, and neither is refused by name."""
+    """A stated dtype wins, `dtype` over `torch_dtype`; else the first float32, bfloat16 or float16 tensor."""
     from dew.interop.weights import auto_storage_dtype
 
-    tensors = {"packed": np.zeros(2, np.uint8), "fp8": np.zeros(2, ml_dtypes.float8_e4m3fn),
-               "scale": np.zeros(2, ml_dtypes.float8_e8m0fnu), "fp4": np.zeros(2, ml_dtypes.float4_e2m1fn),
-               "index": np.zeros(2, np.int32), "wide": np.zeros(2, np.float64),
-               "first": np.zeros(2, ml_dtypes.bfloat16), "then": np.zeros(2, np.float16)}
-
+    skipped = {"packed": np.uint8, "fp8": ml_dtypes.float8_e4m3fn, "scale": ml_dtypes.float8_e8m0fnu,
+               "fp4": ml_dtypes.float4_e2m1fn, "index": np.int32, "wide": np.float64}
+    tensors = {name: np.zeros(2, dtype) for name, dtype in
+               {**skipped, "first": ml_dtypes.bfloat16, "then": np.float16}.items()}
     assert auto_storage_dtype({}, tensors) == "bfloat16"
     assert auto_storage_dtype({}, dict(reversed(tensors.items()))) == "float16"
     assert auto_storage_dtype({"dtype": "float32", "torch_dtype": "float16"}, tensors) == "float32"
@@ -445,7 +437,7 @@ def test_auto_storage_skips_payloads_that_are_no_parameter_storage():
     with pytest.raises(ValueError, match="'float64' is not one of"):
         auto_storage_dtype({"dtype": "float64"}, tensors)
     with pytest.raises(ValueError, match="found neither a stated dtype nor a float32"):
-        auto_storage_dtype({}, {name: tensors[name] for name in ("packed", "fp8", "index", "wide")})
+        auto_storage_dtype({}, {name: np.zeros(2, dtype) for name, dtype in skipped.items()})
 
 
 def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
