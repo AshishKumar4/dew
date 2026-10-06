@@ -13,16 +13,15 @@ sincos embedding that stays with each token carries all the position
 information.
 
 The image encoder and predictor compute what V-JEPA's do (facebookresearch/jepa,
-image mode, mask-token predictor) with one difference: their MLPs use the
-tanh GELU where V-JEPA's use exact (erf) GELU. Exact GELU
-(`ModulatedBlock.gelu_approximate=False`) made a training step 3.2% slower
-on an RTX 4080, and Dew loads no published I-JEPA or V-JEPA weights that
-would need it.
+image mode, mask-token predictor), its exact (erf) GELU in every MLP
+included (`ModulatedBlock.gelu_approximate=False`, torch's 1 + erf form).
+On an A100, a training step of a ViT-S/16 encoder at 224 with a 6-layer
+predictor, bf16, batch 64, took 26.68/26.72 ms with it against 27.86 with
+the tanh GELU and 29.57/29.59 with jax's erfc form (ABAB, 50 steps after 5
+of warmup, equal peak memory; Colab job dew-gpu-c20-gelu-a100-job-1).
 """
 
-# tests/test_jepa_source.py checks these modules against V-JEPA's own code with
-# the GELU swapped. The 3.2% was a ViT-S/16 encoder at 224 with a 6-layer
-# predictor, bf16, batch 64: 36.35-36.51 ms against 35.24-35.30.
+# tests/test_jepa_source.py checks these modules against V-JEPA's own code.
 
 from typing import ClassVar, Literal
 
@@ -53,6 +52,7 @@ class TokenStack(_JepaStackOptions):
                 num_heads=self.num_heads,
                 mixer='ssm' if kind == 'ssm' else 'attention',
                 modulated=False,
+                gelu_approximate=False,
                 **self._block_options(),
                 ssm_state_dim=self.ssm_state_dim,
                 bidirectional_ssm=self.bidirectional_ssm,

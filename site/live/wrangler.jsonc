@@ -34,6 +34,7 @@
 			{ "name": "KERNEL", "class_name": "LiveKernel" },
 			{ "name": "COORDINATOR", "class_name": "Coordinator" },
 			{ "name": "SHARED", "class_name": "SharedHost" },
+			{ "name": "POOL", "class_name": "ModelPool" },
 			{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
 			{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
 			{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
@@ -51,7 +52,8 @@
 		{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
 		{ "tag": "v3", "deleted_classes": ["Kernel"] },
 		{ "tag": "v4", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] },
-		{ "tag": "v5", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] }
+		{ "tag": "v5", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] },
+		{ "tag": "v6", "new_sqlite_classes": ["ModelPool"] }
 	],
 	// Requests to the API per visitor IP; sessions have their own limits below.
 	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
@@ -91,7 +93,8 @@
 				{ "tag": "v4", "new_sqlite_classes": ["SnapshotLab"] },
 				{ "tag": "v5", "deleted_classes": ["SnapshotLab"] },
 				{ "tag": "v6", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] },
-				{ "tag": "v7", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] }
+				{ "tag": "v7", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] },
+				{ "tag": "v8", "new_sqlite_classes": ["ModelPool"] }
 			],
 			"routes": [{ "pattern": "live-preview.dewml.dev", "custom_domain": true }],
 			"containers": [
@@ -117,6 +120,7 @@
 					{ "name": "KERNEL", "class_name": "LiveKernel" },
 					{ "name": "COORDINATOR", "class_name": "Coordinator" },
 					{ "name": "SHARED", "class_name": "SharedHost" },
+			{ "name": "POOL", "class_name": "ModelPool" },
 					{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
 					{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
 					{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
