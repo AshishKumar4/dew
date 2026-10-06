@@ -65,8 +65,8 @@ def test_gptj_reference_catches_interleaved_pairs_read_as_rotate_half():
         assert_as_exact_as_the_reference(wrong, np.load(DIRECTORY / 'logits.npy'),
                                          np.load(DIRECTORY / 'logits_f64.npy'), 'GPT-J wrong pairing')
     np.testing.assert_array_equal(
-        translate_weights(tensors, config, 'gptj')['params']['lm_head']['bias'],
-        loaded.variables['params']['lm_head']['bias'])
+        translate_weights(tensors, config, 'gptj')['params']['head_bias'],
+        loaded.variables['params']['head_bias'])
 
 
 def test_gptj_affine_head_scores_through_the_public_objective():
@@ -93,7 +93,7 @@ def test_gptj_affine_head_trains_through_the_public_objective():
         return objective.token_scores({'params': params}, ids).losses.mean()
 
     value, gradient = jax.value_and_grad(loss)(loaded.variables['params'])
-    assert np.linalg.norm(gradient['lm_head']['bias']) > 0
+    assert np.linalg.norm(gradient['head_bias']) > 0
     changed = jax.tree.map(lambda parameter, grad: parameter - 1e-3 * grad,
                            loaded.variables['params'], gradient)
     assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradient))
@@ -103,7 +103,7 @@ def test_gptj_affine_head_trains_through_the_public_objective():
 def test_gptj_released_config_retains_parallel_residual_and_partial_rotary():
     model = translate_config(json.loads((ROOT / 'gpt-j-6b' / 'config.json').read_text())).value
     assert (model.emb_features, model.num_heads, model.num_layers) == (4096, 16, 28)
-    assert model.parallel_residual and model.shared_parallel_norm and model.lm_head_bias
+    assert model.parallel_residual and model.shared_parallel_norm and model.head_bias
     assert model.partial_rotary_factor == .25 and model.partial_rotary_type == 'default'
 
 
