@@ -321,8 +321,8 @@ class SafetensorsBanks(LayerBanks):
                              "this family's preparation can materialize checkpoint weights")
         tensors = read_weights(folder)
         if param_dtype == "auto":
-            from dew.interop.pretrained import _checkpoint_dtype
-            storage = _checkpoint_dtype(self.config, tensors)
+            from dew.interop.weights import auto_storage_dtype
+            storage = auto_storage_dtype(self.config, tensors)
         else:
             storage = dtype_name(param_dtype)
         self._variables: Variables = translate_weights(

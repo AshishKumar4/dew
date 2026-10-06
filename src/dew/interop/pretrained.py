@@ -23,7 +23,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 from flax import linen as nn
 from jax.typing import DTypeLike
@@ -67,7 +66,7 @@ from dew.interop.processors import (
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import SourceLeaf, WeightLayout
-from dew.interop.weights import ParamTree
+from dew.interop.weights import ParamTree, auto_storage_dtype
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -938,31 +937,6 @@ AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 
 
-def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
-    """Return the storage dtype a checkpoint states, for param_dtype 'auto'.
-
-    transformers' dtype='auto' rule (modeling_utils.py `_get_dtype`, 5.16.1):
-    config.json's `dtype` (`torch_dtype` before 5.0), else the dtype of the
-    first floating tensor. Packed FP8 or FP4 payloads are no storage dtype,
-    so the first tensor stored in one is what a quantized checkpoint without
-    a stated dtype resolves to. A diffusers pipeline states none, so its
-    denoiser's tensors decide.
-    """
-    stated = config.get("dtype", config.get("torch_dtype"))
-    if stated is not None:
-        storage = dtype_name(resolve_dtype(records.text(stated, "dtype")))
-        if storage is None:
-            raise ValueError(f"dtype={stated!r} names no floating parameter storage")
-        return storage
-    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
-                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
-    for tensor in tensors.values():
-        if tensor.dtype in storable:
-            return storable[tensor.dtype]
-    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
-                     "float16 tensor in the checkpoint")
-
-
 def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
                      attention_impl: str, param_dtype: str, streaming: bool) -> PretrainedPipeline | None:
@@ -984,7 +958,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
         if storage == AUTO:
             from dew.interop import diffusion
             denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
-            storage = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
+            storage = auto_storage_dtype({}, diffusion.component_tensors(directory, denoiser))
         loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
                                         param_dtype=storage, lazy=streaming)
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
@@ -1229,7 +1203,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
     if param_dtype == AUTO:
-        param_dtype = _checkpoint_dtype(config, tensors)
+        param_dtype = auto_storage_dtype(config, tensors)
     tensors, quantized_tensors, scale_dtype, grid = _decoded(tensors, config, param_dtype)
     export_adapter = None
     if family == "diffusion_gemma":
