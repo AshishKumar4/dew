@@ -26,6 +26,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
+from sharded import assert_sharded
 
 from dew.nn.attention import (
     NormalAttention,
@@ -536,6 +537,7 @@ def one_step(spec, batch, tolerance=0.02, model=tiny):
     trainer = Trainer(LMObjective(model(), SEQ_LEN), optax.sgd(1.0), key=jax.random.key(0),
                       mesh=spec, layout=Layout(min_shard=TINY_SHARD, tolerance=tolerance))
     state, _, _ = trainer.place()
+    assert_sharded(state.variables["params"], trainer.device_mesh)
     placed = shard_batch(trainer.device_mesh, batch)
     state, loss, _, _, _ = trainer.compile(state, placed)(state, placed)
     assert trainer.program is not None

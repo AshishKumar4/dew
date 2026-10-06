@@ -28,6 +28,7 @@ import optax
 import pytest
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
+from sharded import assert_sharded
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, Mixture
@@ -926,7 +927,8 @@ def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False):
 def run_losses(trainer, steps):
     """Per-step losses of a fit, as the tracker receives them."""
     trainer.tracker = tracker = RecordingTracker()
-    trainer.fit(Data(token_batches), steps=steps, log_every=1)
+    state = trainer.fit(Data(token_batches), steps=steps, log_every=1)
+    assert_sharded(state.variables["params"], trainer.device_mesh)
     return [entry["train/loss"] for entry in tracker.scalars if "train/loss" in entry]
 
 

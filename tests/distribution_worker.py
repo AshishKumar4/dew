@@ -87,6 +87,7 @@ def main() -> None:
     import jax
     import optax
     from jax.experimental import multihost_utils
+    from sharded import split_axes
 
     from dew.checkpoints import Checkpoints
     from dew.data import DataPartition, Dataset
@@ -166,6 +167,7 @@ def main() -> None:
             "devices": jax.device_count(),
             "mesh": {axis: int(size) for axis, size in mesh.shape.items()},
             "fsdp_groups": fsdp_group_processes(mesh),
+            "split_axes": sorted(split_axes(state.variables["params"])),
             "partition": {"count": partition.count, "readers": partition.readers},
             "placed_whole": bool(np.array_equal(np.asarray(gathered), wide)),
             "losses": losses.losses,
