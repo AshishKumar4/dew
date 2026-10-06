@@ -52,7 +52,6 @@ from dew.objectives.base import (
     Ratio,
     Step,
     Variables,
-    freeze,
     merge,
     thaw,
     under,
@@ -97,24 +96,20 @@ LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
 
 def _own_loss(name: str, kwargs: dict) -> None:
     """Refuse the denoising loss's extras, which an objective with its own
-    loss would leave unused."""
+    loss would leave unused, and sample unguided unless `kwargs` guide."""
     unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
     if unused:
         raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
+    kwargs.setdefault("guidance", None)
 
 
-def _from_teacher(variables: Variables, teacher: Variables) -> Variables:
-    """`variables` with the model's own leaves copied from `teacher`'s, each
-    in a buffer of its own, since the step donates them. A split keeps each
-    leaf where it was: an adapter's factors under `params` and the weights it
-    freezes under `FROZEN`."""
-    copied = merge(thaw(variables), {collection: jax.tree.map(jnp.copy, tree)
-                                     for collection, tree in teacher.items()})
-    if FROZEN not in variables:
-        return copied
-    frozen = {("params", *(entry.key for entry in path))
-              for path, _ in jax.tree_util.tree_leaves_with_path(variables[FROZEN])}
-    return freeze(copied, lambda path: path not in frozen)
+def _from_teacher(variables: Variables, teacher: Variables) -> dict[str, Any]:
+    """`variables` with the model's leaves copied from `teacher`'s, in buffers the step may donate, the
+    weights under `FROZEN` in an adapter's split, which freezes all but its factors."""
+    copied = dict(jax.tree.map(jnp.copy, dict(teacher)))
+    if FROZEN in variables:
+        copied[FROZEN] = copied.pop("params")
+    return dict(merge(variables, copied))
 
 
 def _without_loss_heads(variables: Variables) -> Variables:
@@ -326,8 +321,7 @@ class DiffusionObjective(Objective[Ratio]):
         published task drops both.
 
         `end_to_end` trains the autoencoder together with the model, as REPA-E does
-        (`EndToEnd`). It needs `alignment` and a KL autoencoder, whose latent is a draw
-        from the posterior `AutoEncoder.moments` gives. The autoencoder's
+        (`EndToEnd`). It needs `alignment` and a KL autoencoder. The autoencoder's
         weights then train under `params` as `AUTOENCODER`, and a batch norm
         normalizes its latents, with the running statistics in the `LATENT_STATS`
         collection. A published task includes the tuned autoencoder, with those
@@ -350,9 +344,8 @@ class DiffusionObjective(Objective[Ratio]):
         if process is None or inputs is None:
             raise ValueError("a denoiser needs its `process` and `inputs`; a loaded pipeline carries both")
         if isinstance(model, RequiresText) and model.text_keyword not in inputs.conditions:
-            raise ValueError(f"{type(model).__name__} reads text as {model.text_keyword!r} on every call "
-                             "and cannot run unconditionally; the inputs condition on "
-                             f"{sorted(inputs.conditions)}")
+            raise ValueError(f"{type(model).__name__} reads text as {model.text_keyword!r} on every call and "
+                             f"cannot run unconditionally; its inputs give {sorted(inputs.conditions)}")
         autoencoder = None if autoencoder is OMITTED else autoencoder
         variables = None if variables is OMITTED else variables
         steps = _DEFAULT_STEPS if steps is None else steps
@@ -455,22 +448,17 @@ class DiffusionObjective(Objective[Ratio]):
         return self._fixed_blank(like)
 
     def held_variables(self) -> Variables:
-        """Return every array `init` starts from instead of drawing: the starting tree, or the frozen towers,
-        with the frozen networks the loss reads that the starting tree does not hold.
+        """Return every array `init` starts from instead of drawing: the starting tree, or the frozen towers.
 
         A text tower and a VAE are released weights of hundreds of megabytes, which a
         trace without arguments would compile into the state executable as
-        constants. A saved run's tree holds its representation encoder and
-        perceptual network; a pipeline's holds neither, and they ride beside it.
-        This is one mapping, so an objective that starts from more than the towers
-        extends both this and `init`.
+        constants. The loss's frozen networks ride beside a starting tree without
+        them, a pipeline's. This is one mapping, so an objective that starts from more
+        than the towers extends both this and `init`.
         """
-        if self.variables is not None:
-            held: dict[str, Any] = dict(self.variables)
-        else:
-            held = {"encoders": self.encoder_params()}
-            if self.autoencoder is not None:
-                held["autoencoder"] = self.autoencoder.params
+        held: dict[str, Any] = dict(self.variables or {"encoders": self.encoder_params()})
+        if self.variables is None and self.autoencoder is not None:
+            held["autoencoder"] = self.autoencoder.params
         if self.alignment is not None and REPRESENTATION not in held:
             held[REPRESENTATION] = self.alignment.variables
         if self.end_to_end is not None and self.end_to_end.perceptual_weight and PERCEPTUAL not in held:
@@ -511,8 +499,8 @@ class DiffusionObjective(Objective[Ratio]):
         for frozen in ("autoencoder", REPRESENTATION, PERCEPTUAL, DISCRIMINATOR, TEACHER):
             # The frozen weights are state, like the encoders'. They ride in
             # as an argument to the compiled step for the layout to place.
-            # A caller holding only some towers takes the rest as built,
-            # and a pretrained discriminator and a teacher ride in the same way.
+            # A caller holding only some towers takes the rest as built, and
+            # a pretrained discriminator and a teacher ride in the same way.
             value = held[frozen] if frozen in held else self.held_variables().get(frozen)
             if value is not None:
                 state[frozen] = value
@@ -589,10 +577,7 @@ class DiffusionObjective(Objective[Ratio]):
         return self.encode(params["encoders"], tokens)
 
     def clean_samples(self, variables, batch, key) -> jax.Array:
-        """Return the batch's samples in [-1, 1], or their latents drawn with `key` under an autoencoder.
-
-        They are what a loss corrupts; each loss splits its own `key` from its step's.
-        """
+        """Return the batch's samples in [-1, 1], or under an autoencoder their latents drawn with `key`."""
         samples = unit_range(batch[self.inputs.sample.key])
         if self.autoencoder is None:
             return samples
@@ -826,9 +811,7 @@ class Training(ABC):
                   variables: Variables | None) -> DiffusionObjective:
         """Return this mode's objective over the run's model, process, inputs, autoencoder and variables.
 
-        `model` is the model the objective trains, with the run's adapter when it trains
-        a LoRA, and `base` is the run's model without one, which a teacher of the run's
-        architecture runs. It samples as the run says.
+        `base` is `model` without the run's adapter, for a teacher. It samples as the run says.
         """
 
     def check(self, run: DiffusionRunConfig) -> None:
@@ -880,8 +863,7 @@ class Denoising(Training):
     def check(self, run: DiffusionRunConfig) -> None:
         super().check(run)
         if self.alignment is not None and self.alignment.end_to_end is not None and run.autoencoder is None:
-            raise ValueError("end-to-end tuning trains the run's own `autoencoder`, which a run from scratch "
-                             "sets and a pretrained pipeline does not")
+            raise ValueError("end-to-end tuning trains a run's own `autoencoder`; a pipeline sets none")
 
 
 def teacher_variables(directory: str, variables: Variables | None) -> Variables:

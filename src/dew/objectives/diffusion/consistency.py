@@ -264,38 +264,33 @@ class ConsistencyDistillation(Training):
     def check_teacher(self, autoencoder: AutoEncoder | None) -> None:
         """Refuse sCM from a teacher whose time features turn too fast to differentiate in time.
 
-        The student starts from the teacher's variables, including its Fourier table, so
-        it trains at the teacher's time scale whatever this run's model config says, and
+        The student starts from the teacher's variables, its Fourier table included, and
         a `TimeScaled` model's derivative in time grows with its `time_scale`. For
         continuous consistency with a positive `consistency_weight`, this raises
-        ValueError when the teacher run's model turns its time features faster than
-        `SMOOTH_TIME_SCALE`, the scale sCM's student was measured to learn at.
+        ValueError when the teacher run's model turns faster than `SMOOTH_TIME_SCALE`.
         """
         from .config import DiffusionRunConfig
 
         if self.consistency != "continuous" or self.consistency_weight <= 0:
             return
         teacher = DiffusionRunConfig.load(self.teacher)
-        if teacher.pretrained is not None:
-            # A pipeline's denoiser is its source's, which `model` does not build.
+        if teacher.pretrained is not None:  # a pipeline's denoiser is its source's, not `model`'s
             return
         model = teacher.scratch_model(autoencoder)
         if isinstance(model, TimeScaled) and not abs(model.time_scale) <= SMOOTH_TIME_SCALE:
-            raise ValueError(
-                f"sCM differentiates the student in time, and the student starts from a teacher whose time "
-                f"features turn at time_scale={model.time_scale}, faster than the {SMOOTH_TIME_SCALE} it "
-                f"learns at; train the teacher with time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only "
-                "(consistency_weight=0)")
+            raise ValueError(f"sCM differentiates the student in time, and its teacher's time features turn "
+                             f"at time_scale={model.time_scale}, faster than {SMOOTH_TIME_SCALE}; train the "
+                             f"teacher at time_scale={SMOOTH_TIME_SCALE}, or distill with dmd only "
+                             "(consistency_weight=0)")
 
 
 @objectives("rcm")
 class ConsistencyDistillationObjective(DiffusionObjective):
     """Trains rCM: sCM distillation of a flow teacher, regularized by DMD2.
 
-    `teacher` is the teacher's model and `teacher_variables` its variables,
-    held frozen under `TEACHER`. The student and the fake score start from
-    them, and the fake score runs through the teacher's model
-    (`fake_score`). `consistency_weight` is sCM's loss scale (100, as
+    `teacher` and `teacher_variables` are the teacher's model, which the fake
+    score runs too, and its variables; the student and the fake score start
+    from them. `consistency_weight` is sCM's loss scale (100, as
     in rCM; 0 trains DMD2 alone), `dmd_weight` is DMD2's (1; 0 trains sCM
     alone), and `teacher_guidance` is the teacher's classifier-free guidance
     scale in both losses.
@@ -351,7 +346,6 @@ class ConsistencyDistillationObjective(DiffusionObjective):
             raise ValueError("rCM distills a velocity model on the unshifted linear path; build the "
                              "process with presets.Flow()")
         _own_loss("rCM", kwargs)
-        kwargs.setdefault("guidance", None)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 3)
         super().__init__(model, process, inputs, **kwargs)
@@ -418,13 +412,12 @@ class ConsistencyDistillationObjective(DiffusionObjective):
         return {**super().held_variables(), TEACHER: self.teacher_variables}
 
     def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
-        """Start the student and the fake score as the teacher the tree holds,
-        unless it holds a fake score already."""
+        """Start the student and the fake score as the tree's teacher, unless it holds a fake score."""
         state = super().complete_variables(key, tree)
         if FAKE_SCORE in state["params"]:
             return state
         teacher = state[TEACHER]
-        state = dict(_from_teacher(state, teacher))
+        state = _from_teacher(state, teacher)
         for collection, held in teacher.items():
             state[collection] = {**state[collection], FAKE_SCORE: jax.tree.map(jnp.copy, held)}
         return state
