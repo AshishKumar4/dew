@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from moe_support import by_expert, router_variables
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -30,12 +31,6 @@ def fixture() -> dict:
         return {key: np.asarray(value) for key, value in data.items()}
 
 
-def by_expert(indices, weights):
-    order = np.argsort(np.asarray(indices), axis=-1)
-    return (np.take_along_axis(np.asarray(indices), order, axis=-1),
-            np.take_along_axis(np.asarray(weights), order, axis=-1))
-
-
 def v2_router(normalize_weights: bool = CONFIG["norm_topk_prob"],
               group_score: str = "max") -> Router:
     return Router(num_experts=CONFIG["n_routed_experts"], in_features=CONFIG["hidden_size"],
@@ -44,10 +39,6 @@ def v2_router(normalize_weights: bool = CONFIG["norm_topk_prob"],
                   routed_scaling_factor=CONFIG["routed_scaling_factor"],
                   expert_groups=CONFIG["n_group"], groups_per_token=CONFIG["topk_group"],
                   group_score=group_score)
-
-
-def router_variables(tensors) -> dict:
-    return {"params": {"kernel": jnp.asarray(tensors["mlp.gate.weight"].T)}}
 
 
 def test_router_reproduces_the_deepseek_v2_group_limited_choice():
