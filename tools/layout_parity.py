@@ -899,7 +899,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
         (model_out / 'metadata.json').write_text(json.dumps({
             'model': model, 'dtype': dtype, 'orders': ORDERS, 'seed': 2024,
             'layouts': list(layouts), 'device_kind': jax.devices()[0].device_kind,
-            'source': _source_stamp(), 'x64_initialization': False,
+            'source': source_digest(), 'x64_initialization': False,
         }, indent=1))
         np.save(model_out / 'orders.npy', drawn)
         ref_distances, layout_distances = {}, {name: {} for name in layouts}
