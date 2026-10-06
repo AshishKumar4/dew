@@ -26,7 +26,7 @@ from flax import linen as nn
 from flax.core import freeze
 from jax.typing import ArrayLike, DTypeLike
 
-from dew.artifacts import agree_process_phase
+from dew.coordination import agree_process_phase
 from dew.diffusion.block import BlockProcess, CanvasGeneration
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.nn.backbones.causal_transformer import CausalTransformer

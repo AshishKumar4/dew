@@ -32,7 +32,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.artifacts import agreed, collective_host, stop_at_exit
+from dew.coordination import agreed, collective_host, stop_at_exit
 from dew.nn.inputs import key_seed, request_key
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON

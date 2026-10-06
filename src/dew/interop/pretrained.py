@@ -30,7 +30,7 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
-from dew.artifacts import agreed
+from dew.coordination import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration

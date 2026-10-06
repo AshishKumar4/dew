@@ -38,7 +38,8 @@ import numpy as np
 import optax
 from flax import linen as nn, struct
 
-from dew.artifacts import TextSamples, TokenScores, agreed, collective_host
+from dew.artifacts import TextSamples, TokenScores
+from dew.coordination import agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, recorded_tokenizer

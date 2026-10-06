@@ -696,18 +696,18 @@ def test_a_peer_start_failure_keeps_the_cleanup_note(tmp_path, monkeypatch):
     stop that itself fails must land on the error being raised, not on the
     cleanup failure."""
     _capture_env(monkeypatch)
-    import dew.artifacts as artifacts_module
+    import dew.coordination as coordination
     import dew.telemetry.profile as telemetry_profile
     from dew.telemetry.profile import Profiler
 
-    # The window's phases are agreed through `dew.artifacts.agreed`, so the
+    # The window's phases are agreed through `dew.coordination.agreed`, so the
     # peer's failure is injected at the agreement that helper calls.
     def refused(error, phase):
         if phase == "profiling window start":
             raise RuntimeError("peer reported a broken window")
         return 1
 
-    monkeypatch.setattr(artifacts_module, "agree_process_phase", refused)
+    monkeypatch.setattr(coordination, "agree_process_phase", refused)
 
     real_stop = Profiler.stop
 

@@ -12,7 +12,7 @@ import numpy as np
 from flax import linen as nn
 from jax.experimental import multihost_utils
 
-from dew.artifacts import agreed
+from dew.coordination import agreed
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Shown, Step, Variables, joined, part
