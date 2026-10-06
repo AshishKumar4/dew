@@ -20,7 +20,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
+from flax.typing import Dtype, PrecisionLike, VariableDict
 
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import RMSNorm
@@ -28,6 +28,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
 from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
+from dew.nn.protocols import OutputTable
 from dew.registry import models
 
 if TYPE_CHECKING:
@@ -84,9 +85,10 @@ class DiffusionGemma(nn.Module):
 
     ``encode`` appends clean tokens to the cache. ``__call__`` refines a canvas
     against that frozen cache and feeds the previous logits through
-    self-conditioning. Each method is a separate apply. The encoder and the
-    decoder share one scope, so their parameters are identical and no second
-    tree is stored.
+    self-conditioning. ``hidden_states`` and ``logits`` read clean tokens
+    through the same causal encoder over the whole sequence, with no cache.
+    Each method is a separate apply. The encoder and the decoder share one
+    scope, so their parameters are identical and no second tree is stored.
     """
 
     text: CausalTransformer
@@ -118,6 +120,87 @@ class DiffusionGemma(nn.Module):
     @property
     def max_seq_len(self) -> int:
         return self.text.max_seq_len
+
+    @property
+    def emb_features(self) -> int:
+        return self.text.emb_features
+
+    @property
+    def dtype(self) -> Dtype | None:
+        return self.text.dtype
+
+    @property
+    def precision(self) -> PrecisionLike:
+        return self.text.precision
+
+    @property
+    def final_logit_softcap(self) -> float | None:
+        return self.text.final_logit_softcap
+
+    @property
+    def causal(self) -> bool:
+        """Whether `hidden_states` attend causally: they are the encoder's,
+        which `setup` holds causal."""
+        return self.text.causal
+
+    @property
+    def mask_token_id(self) -> int | None:
+        return self.text.mask_token_id
+
+    def with_trainable_layer_scalars(self) -> DiffusionGemma:
+        """Return this model with its layer scalars as parameters, the model the published SFT trains.
+
+        A source whose scalars are constants ("frozen") is read by it through
+        `trainable_variables`. A model without layer scalars is refused.
+        """
+        if self.text.layer_scalar not in ("frozen", "trainable"):
+            raise ValueError(f"layer_scalar is {self.text.layer_scalar!r}, so this model has no layer "
+                             f"scalars to train; the published SFT trains a 'frozen' or 'trainable' one")
+        return self.clone(text=self.text.clone(layer_scalar="trainable"))
+
+    def trainable_variables(self, variables: VariableDict) -> VariableDict:
+        """Return this model's `variables` as `with_trainable_layer_scalars()` reads them.
+
+        Google's release makes each layer's scalar a parameter, and
+        Transformers declares the same tensor a buffer, which a "frozen"
+        model keeps under `constants`. Each moves to its layer under `params`,
+        constants it leaves empty are dropped, and no array is copied. A
+        "trainable" model's tree is returned as it is. A frozen model's tree
+        that already holds a trainable scalar is refused.
+        """
+        if self.text.layer_scalar == "trainable":
+            return variables
+        if self.text.layer_scalar != "frozen":
+            raise ValueError(f"layer_scalar is {self.text.layer_scalar!r}, so this model's tree holds "
+                             f"no layer scalars to move")
+        values = dict(variables)
+        params = dict(values["params"])
+        text = dict(params["text"])
+        constants = dict(values["constants"])
+        text_constants = dict(constants["text"])
+        for index in range(self.text.num_layers):
+            layer = f"layers_{index}"
+            fixed = dict(text_constants[layer])
+            learned = dict(text[layer])
+            if "layer_scalar" in learned:
+                raise ValueError("frozen source unexpectedly contains a trainable layer_scalar")
+            learned["layer_scalar"] = fixed.pop("layer_scalar")
+            text[layer] = learned
+            if fixed:
+                text_constants[layer] = fixed
+            else:
+                del text_constants[layer]
+        params["text"] = text
+        values["params"] = params
+        if text_constants:
+            constants["text"] = text_constants
+        else:
+            del constants["text"]
+        if constants:
+            values["constants"] = constants
+        else:
+            del values["constants"]
+        return values
 
     def init_cache(self, batch_size: int):
         self.text.init_cache(batch_size)
@@ -165,14 +248,22 @@ class DiffusionGemma(nn.Module):
         exist at once.
         """
         read = self.text.hidden_states if states else self.text
+        tokens, embeddings = self._clean_inputs(tokens, image_indices, conditioning, train)
+        return read(tokens, decode=True, train=train, positions=positions,
+                    segment_ids=segment_ids, input_embeddings=embeddings,
+                    attention_mask=attention_mask,
+                    image_groups=image_groups, rotary_positions=rotary_positions,
+                    attention_pairwise_mask=attention_pairwise_mask,
+                    attention_key_positions=attention_key_positions)
+
+    def _clean_inputs(self, tokens, image_indices, conditioning: Mapping[str, jax.Array] | None,
+                      train: bool) -> tuple[jax.Array, jax.Array | None]:
+        """The token ids the encoder reads clean text as, and with media the
+        embeddings that replace theirs, image slots filled from the conditioner."""
         if not conditioning:
             if image_indices is not None:
                 raise ValueError("image_indices require conditioning payloads")
-            return read(tokens, decode=True, train=train, positions=positions,
-                        segment_ids=segment_ids, attention_mask=attention_mask,
-                        image_groups=image_groups, rotary_positions=rotary_positions,
-                        attention_pairwise_mask=attention_pairwise_mask,
-                        attention_key_positions=attention_key_positions)
+            return tokens, None
         if self.conditioner is None or image_indices is None:
             raise ValueError("image conditioning requires a vision conditioner and image_indices")
         safe = jnp.where(image_indices >= 0, 0, tokens)
@@ -180,12 +271,27 @@ class DiffusionGemma(nn.Module):
         embedded = (embedded * jnp.asarray(math.sqrt(self.text.emb_features),
                      self.text.embed_tokens.embedding.dtype)).astype(embedded.dtype)
         fused = self.conditioner.fuse(safe, embedded, image_indices, conditioning, train=train)
-        return read(fused.tokens, decode=True, train=train, positions=positions,
-                    segment_ids=segment_ids, input_embeddings=fused.embeddings,
-                    attention_mask=attention_mask,
-                    image_groups=image_groups, rotary_positions=rotary_positions,
-                    attention_pairwise_mask=attention_pairwise_mask,
-                    attention_key_positions=attention_key_positions)
+        return fused.tokens, fused.embeddings
+
+    def hidden_states(self, tokens, *, train: bool = False, image_indices=None,
+                      conditioning: Mapping[str, jax.Array] | None = None, **fields):
+        """Return the causal encoder's final normalized states over clean `tokens`, writing no cache.
+
+        The encoder reads the text tree and fuses media as `encode` does, but
+        over the whole sequence at once and without the cache `encode` fills
+        for a canvas to attend to: the read a loss or a probe takes of clean
+        text. `fields` go to `CausalTransformer.hidden_states`.
+        """
+        tokens, embeddings = self._clean_inputs(tokens, image_indices, conditioning, train)
+        return self.text.hidden_states(tokens, train=train, input_embeddings=embeddings, **fields)
+
+    def logits(self, tokens, *, train: bool = False, **fields):
+        """Return the causal encoder's fp32 logits over clean `tokens`, writing no cache (`hidden_states`)."""
+        return self.text.logits_from_hidden(self.hidden_states(tokens, train=train, **fields))
+
+    def logits_from_hidden(self, hidden):
+        """Return the logits of final states `hidden`, through the head the encoder and the decoder share."""
+        return self.text.logits_from_hidden(hidden)
 
     def head_weight(self, params):
         """Return the `[D, vocab]` head the encoder and the decoder score with, in its stored dtype.
@@ -202,6 +308,11 @@ class DiffusionGemma(nn.Module):
 
         It is read from the text tree of `params` by `CausalTransformer.head_table`."""
         return self.text.head_table(params["text"])
+
+    def output_table(self) -> OutputTable | None:
+        """Return the shared head as the matrix final states contract, or
+        None where none does (`CausalTransformer.output_table`)."""
+        return self.text.output_table()
 
     def __call__(self, tokens, *, self_conditioning_logits=None,
                  self_conditioning_mask=None, train: bool = False, positions=None,
