@@ -30,7 +30,7 @@ from ..hyper_connections import (
 )
 from ..inputs import LayerInputs, PredictionPhase
 from ..mixers.attention import CausalSelfAttention
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, gated_product
+from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import at_least_fp32, scaled
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
@@ -139,6 +139,30 @@ class Mixture:
                 "a parallel mixture routes with Gemma 4's router, which has no "
                 "score function, scaling, groups, balancing bias, input scaling "
                 "or shared branch to set")
+
+    def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
+              dense: Callable[..., nn.Module], norm: Callable[..., nn.Module] | None = None,
+              swiglu_limit: float | None = None, init_std: float | None = None,
+              output_init_std: float | None = None, dtype: Dtype | None = None,
+              precision: PrecisionLike = None) -> Callable[..., SparseMLP]:
+        """Build the routed feed-forward used by decoder blocks and independent MLP mixers."""
+        if self.parallel:
+            raise ValueError('a parallel mixture uses Gemma4Experts beside a dense feed-forward')
+        return functools.partial(
+            SparseMLP, num_experts=self.experts, top_k=self.top_k,
+            hidden_features=hidden_features if self.expert_features is None else self.expert_features,
+            out_features=out_features, activation=activation,
+            implementation=self.implementation, dispatch=self.dispatch, capacity_factor=self.capacity_factor,
+            score_function=self.score_function, normalize_weights=self.norm_topk_prob,
+            routed_scaling_factor=self.scaling, expert_groups=self.groups,
+            groups_per_token=self.groups_per_token,
+            group_score=self.group_score, expert_bias=self.bias, media_bias=self.media_bias,
+            scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
+            shared=None if not self.shared_features else functools.partial(
+                dense, hidden_features=self.shared_features),
+            shared_gate=self.shared_gate, init_std=init_std, output_init_std=output_init_std,
+            latent_features=self.latent_features, latent_norm=norm if self.latent_norm else None,
+            dtype=dtype, precision=precision)
 
 
 @logical_axes({
@@ -411,7 +435,8 @@ class DecoderBlock(nn.Module):
 
     `engram` first writes the layer's n-gram lookup into the streams, reading
     the metadata's `engram_ids` at `engram_index`. A DSpark target layer
-    (`prediction_slot`) sows the mean of the streams its attention reads as
+    (`prediction_slot`) sows the mean of the streams its attention reads, or
+    of those it hands on when `prediction_site` is 'output', as
     `prediction_inputs/draft_context`.
     """
     # Upstream references. Mamba-2's mixer-only block: modeling_mamba2.py:608-632.
@@ -444,7 +469,8 @@ class DecoderBlock(nn.Module):
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
-    prediction_slot: int | None = None  # records its input's stream mean for DSpark
+    prediction_slot: int | None = None  # records its streams' mean for DSpark
+    prediction_site: Literal['input', 'output'] = 'input'  # where `prediction_slot` records
     dropout_rate: float = 0.0
     remat: RematPolicy | None = None
     dtype: Dtype | None = None
@@ -645,13 +671,10 @@ class DecoderBlock(nn.Module):
                 streams = self.engram_layer(
                     streams, attention_metadata.engram_ids[:, :, self.engram_index],
                     None if attention_metadata.media is None else ~attention_metadata.media)
-            if (self.prediction_slot is not None and not self.is_initializing()
-                    and self.is_mutable_collection('prediction_inputs')):
-                # DSpark reads each target layer's attention input, after its
-                # engram, averaged over the streams (V4.1 inference/model.py:1264-1266).
-                mean = jnp.mean(streams, axis=2)
-                self.sow('prediction_inputs', 'draft_context', mean,
-                         reduce_fn=lambda _, value: value, init_fn=lambda: mean)
+            if self.prediction_site == 'input':
+                # V4.1's DSpark reads each target layer's attention input,
+                # after its engram (V4.1 inference/model.py:1264-1266).
+                self._record_prediction(streams)
             return _Streams(constrain(streams, STREAMS), pre)
         if self.residual_site is not None:
             return _Depth(residual[:, :, :-1], residual[:, :, -1], self.residual_site.finished)
@@ -717,6 +740,10 @@ class DecoderBlock(nn.Module):
         if isinstance(state, _Streams):
             spec = self.hyper_connections
             assert spec is not None
+            if self.prediction_site == 'output':
+                # V4-Flash-0731's DSpark reads each target layer's output
+                # (V4-Flash-0731 inference/model.py:918-921).
+                self._record_prediction(state.streams)
             if not spec.single_pass:
                 return state.streams
             assert state.pre is not None
@@ -740,6 +767,15 @@ class DecoderBlock(nn.Module):
         if self.wiring.layer_scalar:
             x = x * self.output_scalar.astype(x.dtype)
         return x
+
+    def _record_prediction(self, streams):
+        """Sow a DSpark target layer's streams averaged over the copies, when
+        the caller collects `prediction_inputs`."""
+        if (self.prediction_slot is not None and not self.is_initializing()
+                and self.is_mutable_collection('prediction_inputs')):
+            mean = jnp.mean(streams, axis=2)
+            self.sow('prediction_inputs', 'draft_context', mean,
+                     reduce_fn=lambda _, value: value, init_fn=lambda: mean)
 
     def _mix(self, x, decode: bool, positions, segment_ids, kv_store, attention_metadata,
              prediction_phase: PredictionPhase, train: bool):

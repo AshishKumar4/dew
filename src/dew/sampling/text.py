@@ -127,7 +127,7 @@ class Routed(Protocol):
 
 @runtime_checkable
 class BlockDrafting(Protocol):
-    """A decoder that may carry a block drafter: DeepSeek-V4.1's DSpark,
+    """A decoder that may carry a block drafter: DeepSeek's DSpark (V4.1, V4-Flash-0731),
     which drafts a whole block per pass from the context its target layers
     record instead of chaining prediction depths."""
 

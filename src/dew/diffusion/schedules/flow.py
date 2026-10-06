@@ -6,6 +6,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 
+from .common import times
 from .continuous import ContinuousNoiseScheduler
 
 Density = Literal["logit_normal", "mode", "cosmap", "uniform"]
@@ -73,15 +74,15 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler):
         return u
 
     def rates(self, t):
-        t = self.shift_timesteps(jnp.asarray(t, jnp.float32))
+        t = self.shift_timesteps(times(t))
         return 1 - t, t
 
     def weight(self, t):
-        return jnp.ones_like(jnp.asarray(t, jnp.float32))
+        return jnp.ones_like(times(t))
 
     def model_time(self, t):
         # Trained flow checkpoints are conditioned on the shifted time times
         # 1000. The factor is part of the training convention, not of the
         # embedder: SimpleDiT's Fourier embedding takes an input of order one
         # either way.
-        return self.shift_timesteps(jnp.asarray(t, jnp.float32)) * 1000
+        return self.shift_timesteps(times(t)) * 1000

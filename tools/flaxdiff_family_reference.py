@@ -40,6 +40,13 @@ The video models take three-frame clips in `published` and two in
 Run with the Dew test environment, on CPU:
 
     python tools/flaxdiff_family_reference.py OUTPUT.npz
+
+    python tools/flaxdiff_family_reference.py orders OUTPUT.npz
+
+The orders mode reads the committed family fixture and records 52 spatial
+channel orders of its RMS-normalized UNet variant, with its output and every
+gradient returned to the original order. The float64 reference checks that
+each order computes the same function.
 """
 
 import hashlib
@@ -206,13 +213,61 @@ def first_convolution_on_one_cpu():
         os.sched_setaffinity(int(tid), allowed)
 
 
+def channel_orders(destination: Path) -> None:
+    """The UNet variant's reference rounding under exact spatial channel orders."""
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from reference_error import ORDERS, distance
+    from residual_orders import orders
+    from test_flaxdiff_family_source import unet_channels
+
+    first_convolution_on_one_cpu()
+    fixture = Path(__file__).resolve().parents[1] / "tests/fixtures/flaxdiff_family/family.npz"
+    with np.load(fixture) as loaded:
+        arrays = dict(loaded)
+    case = "unet/variant"
+    record = {name.removeprefix(f"{case}/"): value for name, value in arrays.items()
+              if name.startswith(f"{case}/")}
+    params = {name.removeprefix("param."): value.view(ml_dtypes.bfloat16).astype(np.float32)
+              for name, value in record.items() if name.startswith("param.")}
+    inputs = {name: record[name] for name in ("image", "text", "times")}
+    drawn = orders(CASES[case][2]["feature_depths"][0], ORDERS, SEED)
+    names = ["grad_image", "grad_text", *(f"grad_param.{name}" for name in sorted(params))]
+    truth = np.concatenate([record[f"fp64.{name}"].ravel() for name in names])
+    distances = {"output": [], "gradients": []}
+    for k, order in enumerate(drawn):
+        moved = unflatten_dict({tuple(name.split("/")): unet_channels(name, value, order)
+                                for name, value in params.items()})
+        found = walk(case, moved, inputs, record["probe"], wide=False)
+        with jax.enable_x64(new_val=True):
+            wide = walk(case, moved, inputs, record["probe"], wide=True)
+        for result in (found, wide):
+            for name in params:
+                key = f"grad_param.{name}"
+                result[key] = unet_channels(name, result[key], np.argsort(order))
+        for name, value in wide.items():
+            oracle = record[f"fp64.{name}"]
+            assert np.max(np.abs(value - oracle)) <= 1e-12 * np.max(np.abs(oracle)), name
+        if k == 0:
+            assert all(np.array_equal(value, record[f"fp32.{name}"]) for name, value in found.items())
+            assert all(np.array_equal(value, record[f"fp64.{name}"]) for name, value in wide.items())
+        distances["output"].append(distance(found["output"], record["fp64.output"]))
+        gradient = np.concatenate([found[name].ravel() for name in names])
+        distances["gradients"].append(distance(gradient, truth))
+        print(f"order {k}: {distances['output'][-1]:.3e} output, {distances['gradients'][-1]:.3e} gradients",
+              flush=True)
+    np.savez_compressed(destination, orders=drawn.astype(np.uint8), **distances)
+
+
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) != 2 and not (len(sys.argv) == 3 and sys.argv[1] == "orders"):
         raise SystemExit(__doc__)
     # One thread and no XNNPACK, before JAX's first call: a reduction split
     # over threads can sum in another order from call to call.
     os.environ["XLA_FLAGS"] = (os.environ.get("XLA_FLAGS", "") + " --xla_cpu_use_xnnpack=false"
                                " --xla_cpu_multi_thread_eigen=false intra_op_parallelism_threads=1")
+    if sys.argv[1] == "orders":
+        channel_orders(Path(sys.argv[2]))
+        return
     first_convolution_on_one_cpu()
     arrays: dict[str, np.ndarray] = {}
     rng = np.random.default_rng(SEED)
