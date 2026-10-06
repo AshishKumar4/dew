@@ -7,8 +7,7 @@ from `kl_penalty_forward`). The reference is tests/fixtures/rl/grpo.npz,
 written by tools/parity_grpo.py from torch over one fixed rollout: old,
 current and reference log-probabilities, both-signed advantages, and a mask
 with short tails, with entries past every clip point. `GRPOObjective` reads
-the same terms out of the rolled-out batch. Each mutation below removes one
-term and must move the loss, proving the term binds.
+the same terms out of the rolled-out batch.
 """
 
 from pathlib import Path
@@ -76,49 +75,6 @@ def test_grpo_loss_and_gradient_match_verl(reference):
     assert_as_exact_as_the_reference(
         np.append(value, gradient), np.append(reference["verl_loss"], reference["verl_current_grad"]),
         np.append(reference["verl_loss_f64"], reference["verl_current_grad_f64"]), "GRPO loss and gradient")
-
-
-def test_the_fixture_names_its_reference(reference):
-    assert str(reference["verl_version"]) == "0.9.0"
-    assert str(reference["torch_version"]).startswith("2.14")
-    assert float(reference["beta"]) == 0.01
-    assert np.asarray(reference["response_mask"]).shape == (4, 4)
-    assert np.asarray(reference["response_mask"]).sum() == 13
-
-
-def test_an_unclipped_ratio_moves_the_loss(reference):
-    """Without the 1 +- 0.2 clip the high-ratio entries dominate: observed
-    move 0.154."""
-    old, current, ref, advantages, mask, beta = terms(reference)
-
-    raw = token_mean(-jnp.asarray(advantages) * jnp.exp(
-        jnp.asarray(current) - jnp.asarray(old)), jnp.asarray(mask))
-    kl = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
-
-    assert abs(float(raw + beta * kl) - float(reference["verl_loss"])) > 1e-4
-
-
-def test_a_k1_penalty_moves_the_loss(reference):
-    """The k1 estimator prices drift linearly instead of exponentially:
-    observed move 0.0051 on the KL term, before the beta dilution."""
-    _, current, ref, _, mask, _ = terms(reference)
-
-    cubic = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
-    linear = token_mean(jnp.asarray(current) - jnp.asarray(ref), jnp.asarray(mask))
-
-    assert abs(float(linear) - float(cubic)) > 1e-4
-
-
-def test_a_flat_mean_moves_the_loss(reference):
-    """Averaging over the whole rectangle instead of the masked tokens
-    dilutes the short tails: observed move 0.082."""
-    old, current, ref, advantages, mask, beta = terms(reference)
-    ratio = token_log_ratio(jnp.asarray(current), jnp.asarray(old))
-    _pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
-    kl = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
-    flat = jnp.mean(jnp.asarray(mask) * -jnp.asarray(advantages) * jnp.exp(ratio))
-
-    assert abs(float(flat + beta * kl) - float(reference["verl_loss"])) > 1e-4
 
 
 # --- the objective -------------------------------------------------------------

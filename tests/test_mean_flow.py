@@ -175,12 +175,11 @@ def test_a_meanflow_run_samples_unguided():
         DiffusionRunConfig(preset=presets.MeanFlow(), mode=MeanFlowTraining())
 
 
-@pytest.mark.parametrize("extra", [{"uncertainty": 8}])
-def test_meanflow_refuses_the_denoising_losss_extras(extra):
+def test_meanflow_refuses_the_denoising_losss_extras():
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
     with pytest.raises(ValueError, match="own loss"):
         MeanFlowObjective(model, presets.MeanFlow()(), InputSpec(Field("image", (4, 4, 3))),
-                          MeanFlowTraining(), **extra)
+                          MeanFlowTraining(), uncertainty=8)
 
 
 def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():
