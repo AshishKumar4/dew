@@ -20,7 +20,7 @@ import optax
 
 from dew.artifacts import Representations
 from dew.eval.common import metric_device
-from dew.objectives.base import Shown, mean_of_totals, merge_totals
+from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
 from dew.registry import metrics
 
 type ProbeParams = dict[str, jax.Array]
@@ -78,7 +78,8 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
 
     (params, _), _ = jax.lax.scan(step, (params, optimizer.init(params)), None, length=steps)
     predicted = jnp.argmax(test_x @ params["w"] + params["b"], axis=-1)
-    return jnp.mean(predicted == test_y)
+    accuracy, _ = Objective.accuracy((predicted == test_y).astype(jnp.float32), {}).mean()
+    return accuracy
 
 
 def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
@@ -94,7 +95,8 @@ def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
     similarity = test_x @ fit_x.T
     neighbours = jnp.argsort(-similarity, axis=-1)[:, :min(k, fit_x.shape[0])]
     votes = jnp.sum(jax.nn.one_hot(fit_y[neighbours], num_classes), axis=1)
-    return jnp.mean(jnp.argmax(votes, axis=-1) == test_y)
+    accuracy, _ = Objective.accuracy((jnp.argmax(votes, axis=-1) == test_y).astype(jnp.float32), {}).mean()
+    return accuracy
 
 
 @metrics("linear_probe")
