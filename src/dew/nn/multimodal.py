@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Mapping
+from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -10,8 +12,25 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
-from dew.nn.vision import Gemma3nProjectorModule, Gemma3nVision, ProjectorBase, TowerBase
+from dew.nn.protocols import OutputTable, ProjectionGroup
+from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 from dew.registry import models
+
+if TYPE_CHECKING:
+    from dew.nn.hyper_connections import HyperConnections
+    from dew.nn.mla import MLAMixer
+    from dew.records import JSON
+
+
+@runtime_checkable
+class HardVocabularyEmbedder(Protocol):
+    """A media embedder that also embeds a range of the text vocabulary, the
+    hard tokens the decoder's own table does not hold, as Gemma 3n's vision
+    and audio embedders do (modeling_gemma3n.py, Gemma3nMultimodalEmbedder)."""
+
+    def embed_hard(self, ids: jax.Array) -> jax.Array: ...
+
+    def merge_hard_embeddings(self, token_embeddings: jax.Array, ids: jax.Array) -> jax.Array: ...
 
 
 @struct.dataclass
@@ -124,7 +143,7 @@ class AudioConditioner(nn.Module):
                               mask.reshape(batch * clips, features.shape[2]))
         projected = self.audio_projector(encoding.features)
         if self.soft_tokens is not None:
-            if not isinstance(self.audio_projector, Gemma3nProjectorModule) or self.padding_id is None:
+            if not isinstance(self.audio_projector, HardVocabularyEmbedder) or self.padding_id is None:
                 raise ValueError("fixed audio slots require the Gemma 3n embedder and its padding token")
             padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(
                 projected.dtype
@@ -224,6 +243,10 @@ class MultimodalTransformer(nn.Module):
         return self.language_model.causal
 
     @property
+    def mask_token_id(self) -> int | None:
+        return self.language_model.mask_token_id
+
+    @property
     def num_nextn_predict_layers(self) -> int:
         return self.language_model.num_nextn_predict_layers
 
@@ -259,7 +282,7 @@ class MultimodalTransformer(nn.Module):
             if self.audio is not None:
                 embedders.append(self.audio_conditioner.audio_projector)
             for embedder in embedders:
-                if not isinstance(embedder, Gemma3nProjectorModule):
+                if not isinstance(embedder, HardVocabularyEmbedder):
                     raise TypeError("Gemma 3n media embedders carry the hard vocabulary")
                 embeddings = embedder.merge_hard_embeddings(embeddings, tokens)
         if conditioning is not None and image_indices is not None:
@@ -288,9 +311,8 @@ class MultimodalTransformer(nn.Module):
 
     def mtp_logits(self, hidden, tokens, **kwargs):
         """Return the shared language head's logits for each media-aware prediction depth."""
-        return [
-            self.language_model._logits(state) for state in self.mtp_hidden_states(hidden, tokens, **kwargs)
-        ]
+        return [self.language_model.logits_from_hidden(state)
+                for state in self.mtp_hidden_states(hidden, tokens, **kwargs)]
 
     def mtp_step(self, hidden, tokens, *, image_indices=None, conditioning=None,
                  input_embeddings=None, **kwargs):
@@ -384,12 +406,22 @@ class MultimodalTransformer(nn.Module):
                                    segment_ids=segment_ids, image_indices=image_indices,
                                    conditioning=conditioning, attention_mask=attention_mask,
                                    image_groups=image_groups, rotary_positions=rotary_positions)
-        return self.language_model._logits(hidden)
+        return self.language_model.logits_from_hidden(hidden)
+
+    def logits(self, tokens, *, train: bool = False, **fields):
+        """Return the `[B, S, vocab]` fp32 logits of the whole sequence, media
+        fused as `hidden_states` fuses them from `fields`. Without `decode`
+        the call writes no cache."""
+        return self.language_model.logits_from_hidden(self.hidden_states(tokens, train=train, **fields))
+
+    def logits_from_hidden(self, hidden):
+        """Return the decoder's logits of final states `hidden`."""
+        return self.language_model.logits_from_hidden(hidden)
 
     def states_and_logits(self, tokens, **kwargs):
         """Return the final hidden states and their logits from one media-aware forward pass."""
         hidden = self.hidden_states(tokens, **kwargs)
-        return hidden, self.language_model._logits(hidden)
+        return hidden, self.language_model.logits_from_hidden(hidden)
 
     def states_and_logits_at(self, tokens, slots, **kwargs):
         """Return the final hidden states, and the logits of one slot per row.
@@ -399,7 +431,7 @@ class MultimodalTransformer(nn.Module):
         long request's transient memory, so this scores only `slots`.
         """
         hidden = self.hidden_states(tokens, **kwargs)
-        return hidden, self.language_model._logits(hidden[jnp.arange(hidden.shape[0]), slots])
+        return hidden, self.language_model.logits_from_hidden(hidden[jnp.arange(hidden.shape[0]), slots])
 
     def head_weight(self, params):
         """Return the decoder's shared fp32 head matrix, for an objective's chunked scoring."""
@@ -409,11 +441,63 @@ class MultimodalTransformer(nn.Module):
         """The decoder's vocabulary bias, for the same affine head its forward scores."""
         return self.language_model.vocabulary_bias(params['language_model'])
 
+    def output_table(self) -> OutputTable | None:
+        """Return the decoder's head as the matrix its final states contract,
+        or None where none does (`CausalTransformer.output_table`)."""
+        return self.language_model.output_table()
+
     @nn.compact
     def init_cache(self, batch_size: int):
         """Allocate the language model's cache and the next-position counter, without running the towers."""
         self.variable("cache", "next_position", jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
+
+    # The serving and training hooks (`dew.nn.protocols`), its language
+    # model's; a clone keeps the towers and every variable's path.
+
+    @nn.nowrap
+    def with_cache_capacity(self, capacity: int) -> Self:
+        return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
+
+    @nn.nowrap
+    def recompute_record(self) -> JSON:
+        return self.language_model.recompute_record()
+
+    @nn.nowrap
+    def recompute_more(self) -> Self | None:
+        language_model = self.language_model.recompute_more()
+        return None if language_model is None else self.clone(language_model=language_model)
+
+    @nn.nowrap
+    def restore_recompute(self, record: JSON) -> Self:
+        return self.clone(language_model=self.language_model.restore_recompute(record))
+
+    @nn.nowrap
+    def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
+        """The towers run once per prefill and keep their layout."""
+        text = {collection: tree["language_model"] for collection, tree in variables.items()
+                if "language_model" in tree}
+        return tuple(dataclasses.replace(group, path=("language_model", *group.path))
+                     for group in self.language_model.inference_projection_groups(text))
+
+    @property
+    def cache_rebuild_position(self) -> int | None:
+        return self.language_model.cache_rebuild_position
+
+    def mixed_admission_refusal(self) -> str | None:
+        return "media fuse into a prefill's embeddings, which a mixed call does not carry"
+
+    @property
+    def mtp_hyper_connections(self) -> HyperConnections | None:
+        return self.language_model.mtp_hyper_connections
+
+    @property
+    def indexed_mixers(self) -> tuple[MLAMixer, ...]:
+        return self.language_model.indexed_mixers
+
+    @property
+    def keeps_triton_gemm(self) -> bool:
+        return self.language_model.keeps_triton_gemm
 
 
 __all__ = ["MultimodalTransformer"]

@@ -8,13 +8,15 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple
+from typing import Literal, NamedTuple, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+
+from dew.records import JSON
 
 from ..activations import UNGATED, ungated_activation
 from ..attention import RMSNorm
@@ -30,9 +32,9 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, PredictionPhase
-from ..mixers.attention import CausalSelfAttention
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
 from ..precision import scaled
+from ..protocols import ProjectionGroup, declared_groups
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
 
 STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
@@ -48,6 +50,14 @@ def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
                                  use_fast_variance=False, dtype=dtype)
     return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
                              scale_after_cast=scale_after_cast, dtype=dtype)
+
+
+@runtime_checkable
+class ReadsTrain(Protocol):
+    """A token mixer whose call takes `train`, for a dropout of its own."""
+
+    @property
+    def reads_train(self) -> bool: ...
 
 
 @dataclasses.dataclass(frozen=True)
@@ -233,6 +243,16 @@ class GatedMLP(nn.Module):
             gate = gaussian_topk(gate, self.activation_sparsity)
         return checkpoint_name(self.down_proj(gated_product(self.activation)(gate, up)), 'down_proj')
 
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """Its gate and up projections packed as `gate_up_proj` (`ProjectionSites`),
+        which `setup` reads in their place, where it is gated and its variables
+        hold them."""
+        if self.activation in UNGATED:
+            return ()
+        group = ProjectionGroup(tuple(self.path), 'gate_up_proj', ('gate_proj', 'up_proj'),
+                                (self.hidden_features,) * 2)
+        return (group,) if group.held(self.variables.get('params', {})) else ()
+
 
 @dataclasses.dataclass(frozen=True)
 class BlockWiring:
@@ -356,6 +376,22 @@ def remat_policy(
                            offload=tuple(value.get('offload', ())))
     raise ValueError(
         f"remat is a RematPolicy, its name, its record, or None, not {value!r}")
+
+
+DECODER_REMAT: tuple[RematPolicy | None, ...] = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
+"""What a decoder recomputes in its backward pass when its step does not fit,
+weakest first; each rung is slower and holds less (docs/performance.md). A
+decoder's own remat is where it starts, and it moves up one rung at a time
+(`CausalTransformer.recompute_more`), never past a policy the ladder names."""
+
+
+def remat_record(remat: RematPolicy | None) -> JSON:
+    """`remat` as a record stores it: a policy's name in `REMAT_POLICIES` if
+    it has one, its two lists otherwise, and None for no remat."""
+    if remat is None:
+        return None
+    names = [name for name, policy in REMAT_POLICIES.items() if policy == remat]
+    return names[0] if names else {'save': list(remat.save), 'offload': list(remat.offload)}
 
 
 @logical_axes({
@@ -557,6 +593,10 @@ class DecoderBlock(nn.Module):
                                  "one engram layer's bucket ids, so it needs both")
             self.engram_layer = self.engram(name='engram')
         self.dropout = nn.Dropout(rate=self.dropout_rate)
+
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """The packed groups its mixer and its feed-forward declare (`ProjectionSites`)."""
+        return declared_groups(self.self_attn, *([self.mlp] if self.feedforward is not None else []))
 
     def __call__(self, x, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, kv_store=None,
@@ -782,7 +822,7 @@ class DecoderBlock(nn.Module):
             segment_ids=segment_ids,
             **(
                 {"train": train}
-                if isinstance(self.self_attn, CausalSelfAttention) and self.self_attn.attention_dropout_rate
+                if isinstance(self.self_attn, ReadsTrain) and self.self_attn.reads_train
                 else {}
             ),
             **({} if kv_store is None else {"kv_store": kv_store}),
@@ -884,6 +924,10 @@ class MTPBlock(nn.Module):
             dtype=self.dtype, precision=self.precision, name='block')
         self.final_norm = norm(name='final_norm')
 
+    def projection_groups(self) -> tuple[ProjectionGroup, ...]:
+        """The packed groups its block declares (`ProjectionSites`)."""
+        return self.block.projection_groups()
+
     def __call__(self, hidden, embeds, train: bool = False, positions=None,
                  segment_ids=None, attention_metadata=None, decode: bool = False,
                  prediction_phase: PredictionPhase = "ordinary"):
@@ -913,4 +957,5 @@ class MTPBlock(nn.Module):
         return normalized, normalized if self.hyper_connections is None else streams
 
 
-__all__ = ["BlockWiring", "DecoderBlock", "GatedMLP", "MTPBlock", "Mixture", "RematPolicy", "remat_policy"]
+__all__ = ["DECODER_REMAT", "BlockWiring", "DecoderBlock", "GatedMLP", "MTPBlock", "Mixture", "RematPolicy",
+           "remat_policy", "remat_record"]

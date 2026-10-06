@@ -38,6 +38,10 @@ type InputTree = (ModelInputs | jax.Array | np.ndarray | None
 # an absent input.
 type ModelKwarg = jax.Array | Mapping[str, jax.Array] | bool | None
 
+# A token field's `[B, W, ...]` response values from its `[B, S, ...]` prompt
+# values, the prompt's `[B, S]` real slots and the width (`ModelInputs.extended`).
+type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
+
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 BATCH_AXES = (DATA_AXIS, EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS)
 """The mesh axes a request's rows split over: every axis but sequence and stage."""
@@ -210,6 +214,29 @@ class ModelInputs:
             prepared["conditioning"] = self.conditioning
         return prepared
 
+    def extended(self, tokens: jax.Array, *, rules: Mapping[str, FieldExtension] | None = None
+                 ) -> ModelInputs:
+        """These inputs with a response's `[B, W]` `tokens` after the prompt's slots,
+        each token field continued by its rule in `rules` or `RESPONSE_FIELDS`.
+
+        A field with no rule raises ValueError rather than take a guessed
+        value; the conditioning stays as it is. Works inside JIT.
+        """
+        if tokens.ndim != 2 or tokens.shape[0] != self.tokens.shape[0]:
+            raise ValueError(f"a response is [{self.tokens.shape[0]}, W] token ids, got {tokens.shape}")
+        known = {**RESPONSE_FIELDS, **(rules or {})}
+        unruled = sorted(set(self.token_fields) - set(known))
+        if unruled:
+            raise ValueError(f"token fields {unruled} have no rule for a response's slots; "
+                             "name one in `rules`")
+        valid = jnp.asarray(self.token_fields.get(VALIDITY_FIELD, jnp.ones(self.tokens.shape, bool)), bool)
+        width = tokens.shape[1]
+        return replace(
+            self, tokens=jnp.concatenate([self.tokens, tokens.astype(self.tokens.dtype)], axis=1),
+            token_fields={name: jnp.concatenate([value, known[name](value, valid, width).astype(value.dtype)],
+                                                axis=1)
+                          for name, value in self.token_fields.items()})
+
 
 @struct.dataclass
 class AttentionMetadata:
@@ -301,6 +328,54 @@ def generation_signature(inputs: InputTree, controls: tuple) -> np.ndarray:
 
 VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
+
+
+def _last_real(value: jax.Array, valid: jax.Array) -> jax.Array:
+    """Each row's value at its last real slot, or at slot 0 in a row with none."""
+    last = jnp.max(jnp.where(valid, jnp.arange(valid.shape[1])[None, :], 0), axis=1)
+    return value[jnp.arange(value.shape[0]), last]
+
+
+def _response_validity(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
+    """Real in each row with a real prompt token."""
+    return jnp.broadcast_to(valid.any(axis=1)[:, None], (valid.shape[0], width))
+
+
+def _response_positions(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
+    """On from the last real token's position, which a document reset may have lowered."""
+    return _last_real(value, valid)[:, None] + jnp.arange(1, width + 1)[None]
+
+
+def _response_coordinates(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
+    """One past the largest real coordinate, on every axis: text moves along
+    all of them together (Qwen's M-RoPE)."""
+    keep = valid.reshape(valid.shape + (1,) * (value.ndim - 2))
+    last = jnp.max(jnp.where(keep, value, -1), axis=tuple(range(1, value.ndim)))
+    coordinates = last[:, None] + jnp.arange(1, width + 1)[None]
+    return jnp.broadcast_to(coordinates.reshape((value.shape[0], width) + (1,) * (value.ndim - 2)),
+                            (value.shape[0], width, *value.shape[2:]))
+
+
+def _response_document(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
+    """The last real token's document."""
+    return jnp.broadcast_to(_last_real(value, valid)[:, None], (value.shape[0], width))
+
+
+def _response_text(value: jax.Array, valid: jax.Array, width: int) -> jax.Array:
+    """Text: no media feature, no image group (-1)."""
+    return jnp.full((value.shape[0], width, *value.shape[2:]), -1, value.dtype)
+
+
+RESPONSE_FIELDS: Mapping[str, FieldExtension] = {
+    VALIDITY_FIELD: _response_validity,
+    "positions": _response_positions,
+    "rotary_positions": _response_coordinates,
+    "segment_ids": _response_document,
+    "image_indices": _response_text,
+    "audio_indices": _response_text,
+    "image_groups": _response_text,
+}
+"""How each token field Dew's processors write continues into a response."""
 
 
 def validity_sites(tree: InputTree) -> list[ModelInputs]:
@@ -638,4 +713,5 @@ class Request:
         return replace(padded, token_fields={**padded.token_fields, VALIDITY_FIELD: valid})
 
 
-__all__ = ["AttentionMetadata", "LayerInputs", "ModelInputs", "ModelKwarg", "RowPlan"]
+__all__ = ["RESPONSE_FIELDS", "AttentionMetadata", "FieldExtension", "LayerInputs", "ModelInputs",
+           "ModelKwarg", "RowPlan"]
