@@ -31,12 +31,13 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 
 	async status(): Promise<{
 		generation: SnapshotGeneration | null;
-		rebuild: { token: string; until: number } | null;
+		rebuild: { until: number } | null;
 		failure: { at: number; commit: string; message: string } | null;
 	}> {
+		const rebuild = await this.ctx.storage.get<{ until: number }>('rebuild');
 		return {
 			generation: await this.previous(),
-			rebuild: (await this.ctx.storage.get<{ token: string; until: number }>('rebuild')) ?? null,
+			rebuild: rebuild ? { until: rebuild.until } : null,
 			failure: (await this.ctx.storage.get<{ at: number; commit: string; message: string }>('failure')) ?? null,
 		};
 	}
