@@ -74,7 +74,7 @@ Trainer(objective, optimizer, *, key,
         step=None, rollout=None, profile=None)
 ```
 
-`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
+`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
 
 `accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, and keep float64 when it is enabled in JAX. A TPU has no float64 (XLA rewrites it into pairs of float32, which are not IEEE doubles), so a trainer whose parameters are stored in float64 on a TPU mesh is refused when it places the state. Each finalized gradient enters Optax in its parameter's dtype, and partially accumulated gradients keep the wider working dtype.
 

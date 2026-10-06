@@ -649,6 +649,17 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
 PREFETCH_DEPTH = 2
 
 
+def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
+    """Return the bytes a device holds of the batches `fit` places while a step runs.
+
+    These are the batches next to the one the step reads: the `PREFETCH_DEPTH` it
+    queues and the one it is placing, each laid out as `shardings` places `batch`.
+    """
+    shares = jax.tree.map(lambda leaf, sharding: math.prod(sharding.shard_shape(np.shape(leaf)))
+                          * np.dtype(leaf.dtype).itemsize, batch, shardings)
+    return (PREFETCH_DEPTH + 1) * sum(jax.tree.leaves(shares))
+
+
 class DevicePrefetchIterator:
     """Reads batches on a worker thread and places them on the mesh ahead of the step.
 
