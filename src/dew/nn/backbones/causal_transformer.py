@@ -61,7 +61,7 @@ from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mla import INDEXER_COLLECTION
-from ..moe import GatedActivation, Situ, SparseMLP
+from ..moe import GatedActivation, Situ
 from ..precision import at_least_fp32, head_dot_general, head_product, scaled
 from ..rope import RopeScaling, YarnScaling
 from ..sharding import (
@@ -1231,35 +1231,11 @@ class CausalTransformer(nn.Module):
             # The branch rides beside every sparse layer's dense feed-forward.
             routed = None
         else:
-            routed = functools.partial(
-                SparseMLP,
-                num_experts=mixture.experts,
-                top_k=mixture.top_k,
-                hidden_features=expert_features,
-                out_features=self.emb_features,
-                activation=self.mlp,
-                implementation=mixture.implementation,
-                dispatch=mixture.dispatch,
-                capacity_factor=mixture.capacity_factor,
-                score_function=mixture.score_function,
-                normalize_weights=mixture.norm_topk_prob,
-                routed_scaling_factor=mixture.scaling,
-                expert_groups=mixture.groups,
-                groups_per_token=mixture.groups_per_token,
-                group_score=mixture.group_score,
-                expert_bias=mixture.bias,
-                media_bias=mixture.media_bias,
-                scale_inputs=mixture.scale_inputs,
-                swiglu_limit=self.swiglu_limit,
-                # The shared branch is the dense feed-forward at the mixture's
-                # shared width, a factory the sparse layer builds like a slot.
-                shared=None if not mixture.shared_features else functools.partial(
-                    gated_mlp, hidden_features=mixture.shared_features),
-                shared_gate=mixture.shared_gate,
-                init_std=init_std,
-                output_init_std=output_init_std,
-                latent_features=mixture.latent_features,
-                latent_norm=None if not mixture.latent_norm else functools.partial(
+            routed = mixture.build(
+                out_features=self.emb_features, hidden_features=self.hidden_features, activation=self.mlp,
+                dense=gated_mlp, swiglu_limit=self.swiglu_limit,
+                init_std=init_std, output_init_std=output_init_std,
+                norm=functools.partial(
                     RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
                     scale_after_cast=self.scale_after_cast, dtype=self.dtype),
                 dtype=self.dtype,

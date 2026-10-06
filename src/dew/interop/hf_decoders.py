@@ -1541,10 +1541,9 @@ def _stack_experts(params: LazyTree) -> None:
         nested = block.get('block') if isinstance(block, dict) else None
         if depth.startswith(('mtp_', 'dspark_')) and isinstance(nested, dict):
             blocks.append((depth, nested))
-    for layer, block in blocks:
-        mlp = block.get('mlp')
-        if not isinstance(mlp, dict):
-            continue
+    slots = [(f'{layer}.{name}', slot) for layer, block in blocks for name, slot in block.items()
+             if name in ('mlp', 'self_attn') and isinstance(slot, dict)]
+    for layer, mlp in slots:
         experts = mlp.get('experts')
         if not isinstance(experts, dict):
             continue
