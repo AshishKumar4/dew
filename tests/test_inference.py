@@ -737,6 +737,20 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
     assert all(isinstance(row, str) for row in direct.decode(drawn))
 
 
+def test_a_causal_language_model_run_loads_as_neither_a_block_nor_a_masked_task(tmp_path):
+    """A task loads a run's model by what the task runs on it, and names
+    what is missing: a causal language model has no canvas to refine or
+    clean tokens to commit (`BlockDenoiser`), and none of its positions
+    reads the masked ones after it (`TokenModel`)."""
+    from dew.inference import tasks
+
+    make_lm_run(tmp_path)
+    with pytest.raises(TypeError, match=r"block denoiser \(BlockDenoiser\).* has no canvas_length, encode"):
+        tasks.BlockGeneration.from_run(str(tmp_path))
+    with pytest.raises(ValueError, match="bidirectional model, and this CausalTransformer is causal"):
+        tasks.MaskedGeneration.from_run(str(tmp_path))
+
+
 @pytest.mark.parametrize("kind", ["jepa", "unregistered"])
 def test_saved_non_generation_objectives_fail_at_the_front_door(tmp_path, kind):
     """A run loads as the task its objective declares (`saved_task`): JEPA

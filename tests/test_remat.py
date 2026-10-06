@@ -239,26 +239,66 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     recomputation through 'minimal' to 'full', a diffusion backbone from
     False through 'dots' to 'full', and neither leaves a policy the ladder
     does not name."""
-    from types import SimpleNamespace
-
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.objectives.base import ProgramModule
     from dew.training.trainer import recompute_more
 
-    decoder = SimpleNamespace(tile_head=lambda: None, model=CausalTransformer(
+    class Holding:
+        """An objective that trains one module and has no head to tile."""
+
+        def __init__(self, model):
+            self.model = model
+
+        def tile_head(self):
+            return None
+
+        def program_key(self):
+            return (ProgramModule(self.model, None, trained=True),)
+
+        def substitute(self, modules):
+            (self.model,) = modules
+
+    decoder = Holding(CausalTransformer(
         vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=8))
     climbed = []
     while recompute_more(decoder):
         climbed.append(decoder.model.remat)
     assert climbed == [REMAT_POLICIES['minimal'], REMAT_POLICIES['full']]
 
-    diffusion = SimpleNamespace(tile_head=lambda: None, model=BUILDERS['simple_dit'](remat=True))
+    diffusion = Holding(BUILDERS['simple_dit'](remat=True))
     assert recompute_more(diffusion) and diffusion.model.remat == 'full'
     assert not recompute_more(diffusion)
 
-    custom = SimpleNamespace(tile_head=lambda: None,
-                             model=decoder.model.clone(remat='save_qkv_proj'))
+    custom = Holding(decoder.model.clone(remat='save_qkv_proj'))
     assert not recompute_more(custom) and custom.model.remat == REMAT_POLICIES['save_qkv_proj']
+
+
+def test_a_distillation_recomputes_more_in_its_student_alone_and_resumes_there():
+    """The ladder climbs the modules a step trains (`ProgramModule.trained`):
+    a frozen teacher runs no backward pass, so it keeps its own remat, and
+    the rung a checkpoint records is the student's, which a fresh objective
+    climbs back to."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.lm import LMObjective
+    from dew.training.trainer import climb_to, recompute_more, recompute_record
+
+    def distillation():
+        decoder = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                                    max_seq_len=8)
+        return DistillationObjective(LMObjective(decoder, seq_len=4), LMObjective(decoder, seq_len=4))
+
+    objective = distillation()
+    while recompute_more(objective):
+        pass
+    (student, _), (teacher, _) = ((entry.module, entry.trained) for entry in objective.program_key())
+    assert student.remat == REMAT_POLICIES['full'] and teacher.remat is None
+    assert recompute_record(objective) == 'full'
+    resumed = distillation()
+    climb_to(resumed, {'remat': recompute_record(objective)})
+    assert [entry.module.remat for entry in resumed.program_key()] == [REMAT_POLICIES['full'], None]
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs GPU allocator memory statistics")
@@ -359,7 +399,7 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
 
     def headroom(executable, devices, held=0):
         rung = (trainer.objective.head_tile is not None,
-                trainer_module.remat_record(trainer.objective.model.remat))
+                trainer_module.recompute_record(trainer.objective))
         compiled.append(rung)
         return 0 if rung[1] == 'minimal' else -1
 
@@ -392,7 +432,7 @@ def recording_runs(monkeypatch, fits):
     def headroom(executable, devices, held=0):
         trainer = current[-1]
         rung = (trainer.objective.head_tile is not None,
-                trainer_module.remat_record(trainer.objective.model.remat))
+                trainer_module.recompute_record(trainer.objective))
         compiled.append(rung)
         return 0 if fits.get(rung, True) else -1
 
@@ -462,7 +502,7 @@ def refusing_trainer(monkeypatch, refused, error="RESOURCE_EXHAUSTED: Ran out of
 
     def compile(self, compiler_options=None):
         rung = (trainer.objective.head_tile is not None,
-                trainer_module.remat_record(trainer.objective.model.remat))
+                trainer_module.recompute_record(trainer.objective))
         attempts.append(rung)
         if rung in refused:
             raise jax.errors.JaxRuntimeError(error)

@@ -28,11 +28,10 @@ from jax.typing import ArrayLike, DTypeLike
 
 from dew.cache import persist_compilations
 from dew.coordination import agree_process_phase
-from dew.diffusion.block import BlockProcess, CanvasGeneration
-from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
+from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
+from dew.nn.protocols import CacheCapacity, TokenModel
 from dew.objectives.base import Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
@@ -227,25 +226,17 @@ def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
 
 @functools.cache
 def _sized(model: nn.Module, capacity: int | None) -> nn.Module:
-    """Return `model` with a decode cache of `capacity` slots, one clone per capacity.
+    """Return `model` with a decode cache of `capacity` slots, one model per capacity.
 
-    A model's `max_seq_len` is the only channel its layers read a cache size
-    from (`dew.nn.attention.open_kv_cache`), so a per-request capacity is a
-    model per capacity. The clones are kept because the model is a static
-    argument of the compiled generation: one object per capacity is one
-    compile per capacity rather than one per call. A wrapper that declares
-    its language model's size (`MultimodalTransformer`) has that model
-    sized: read only as the wrapper's own field, Qwen3.5-0.8B served at 384
-    slots held caches of 8192.
+    A `CacheCapacity` model gives the same model at another cache size, a
+    wrapper sizing the decoder it holds; any other model keeps its own cache.
+    The models are kept because the model is a static argument of the
+    compiled generation: one object per capacity is one compile per
+    capacity rather than one per call.
     """
-    if capacity is None:
+    if capacity is None or not isinstance(model, CacheCapacity):
         return model
-    fields = {field.name for field in dataclasses.fields(model)}
-    if "max_seq_len" in fields:
-        return model.clone(max_seq_len=capacity)
-    if "language_model" in fields:
-        return model.clone(language_model=_sized(model.language_model, capacity))
-    return model
+    return model.with_cache_capacity(capacity)
 
 
 def _requested(generated: Generation, budget: int, padding: int) -> Generation:
@@ -556,17 +547,18 @@ class TextGeneration:
 
 @dataclass(frozen=True)
 class BlockGeneration:
-    """Generates block-diffusion canvases from a DiffusionGemma and its weights.
+    """Generates block-diffusion canvases from a block denoiser and its weights.
 
     A call runs prefill, refinement and the commits of clean tokens as one
     device computation. It returns a `CanvasGeneration`, which has no
     autoregressive likelihoods. When a call passes none, it uses the task's
     `process` (the published sampler configuration), its `max_new_tokens`
     budget and its `n` continuations per prompt. The `n` continuations of a
-    prompt come back as `n` consecutive rows, in prompt order.
+    prompt come back as `n` consecutive rows, in prompt order. The model
+    is a `dew.diffusion.block.BlockDenoiser`, as DiffusionGemma is.
     """
 
-    model: DiffusionGemma
+    model: nn.Module
     variables: Variables
     process: BlockProcess
     processor: Processor | None = None
@@ -589,12 +581,12 @@ class BlockGeneration:
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> BlockGeneration:
         """Load the block-diffusion run in `directory` as a task.
 
-        The task rebuilds the DiffusionGemma that the run's `run.json`
+        The task rebuilds the block denoiser that the run's `run.json`
         records, over the weights of the latest checkpoint (or of `step`),
         and samples with the run's saved `BlockProcess` over the canvas the
         model declares. The run's preview budget becomes the task's
-        `max_new_tokens`. A run whose model is not a DiffusionGemma raises
-        `TypeError`.
+        `max_new_tokens`. A run whose model is not a `BlockDenoiser` raises
+        `TypeError` naming the operations it lacks.
 
         The arguments work as in `TextGeneration.from_run`: `ema` selects
         the averaged weights, `mesh` and `layout` place them, and the two
@@ -604,8 +596,7 @@ class BlockGeneration:
         from dew.registry import objectives
         record, model_config, processor = _saved_run(directory, dtype, step)
         model = model_config.build()
-        if not isinstance(model, DiffusionGemma):
-            raise TypeError("block checkpoint must declare DiffusionGemma")
+        refuse_non_denoiser(model)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         return cls(model, variables, BlockProcess.from_json(named_fields(record['process'], 'process')),
@@ -687,9 +678,10 @@ class MaskedGeneration:
         The task rebuilds the bidirectional model that the run's `run.json`
         records, over the weights of the latest checkpoint (or of `step`),
         and refines responses with MDLM over the run's own mask token, using
-        the solver and step count the run saved. The model must be a
-        `CausalTransformer` with `causal=False` and a `mask_token_id` that
-        matches the saved process, or loading raises `ValueError`.
+        the solver and step count the run saved. The model must score the
+        whole row with every position reading the others (`Logits`, and
+        `TokenModel` with `causal` False) and name a mask token (`TokenModel.mask_token_id`)
+        that matches the saved process, or loading raises `ValueError`.
 
         The arguments work as in `TextGeneration.from_run`, and the run's
         preview budget becomes the response length a call omits.
@@ -700,11 +692,11 @@ class MaskedGeneration:
         record, model_config, processor = _saved_run(directory, dtype, step)
         budget = _saved_budget(record)
         model = model_config.build()
-        if not isinstance(model, CausalTransformer) or model.causal or type(model.mask_token_id) is not int:
-            raise ValueError(
-                "a saved masked run requires a CausalTransformer with causal=False and a mask_token_id"
-            )
-        mask_id = model.mask_token_id
+        refuse_causal(model)
+        mask_id = model.mask_token_id if isinstance(model, TokenModel) else None
+        if type(mask_id) is not int:
+            raise ValueError(f"a saved masked run requires a model that names its mask token "
+                             f"(TokenModel.mask_token_id), and this {type(model).__name__} names none")
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         process = DiscreteProcess.from_json(named_fields(record['process'], 'process'))

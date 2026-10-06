@@ -40,8 +40,8 @@ def sampled(softcap=None, temperature=0.7):
     assert (drawn.lengths == NEW).all(), "the fixture wants full-length draws"
     tokens = jnp.asarray(drawn.tokens)
     hidden = obj.token_scores(params, tokens).hidden
-    head = model.apply(params, params["params"], method=type(model).head_weight)
-    logits = head_logits(hidden, head, softcap=softcap, precision=None)
+    table = model.apply(params, method="output_table")
+    logits = head_logits(hidden, table.matrix, softcap=softcap, precision=None, vocab_major=table.vocab_major)
     flat = logits.reshape(-1, VOCAB)
     for transform in sampling.transforms():
         flat = transform(None, flat)

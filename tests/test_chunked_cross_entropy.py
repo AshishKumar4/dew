@@ -51,13 +51,13 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
     with jax.default_matmul_precision('default'):
         logits = model.apply(variables, ids)
         states = model.apply(variables, ids, method='hidden_states')
-        matrix = model.apply(variables, variables['params'], method='head_weight')
-        stored, vocab_major = model.apply(variables, variables['params'], method='head_table')
-        actual = chunked.head_logits(states, stored, softcap=None, precision=None,
-                                     vocab_major=vocab_major, bias=bias)
+        table = model.apply(variables, method='output_table')
+        actual = chunked.head_logits(states, table.matrix, softcap=None, precision=None,
+                                     vocab_major=table.vocab_major, bias=table.bias)
         np.testing.assert_array_equal(actual, logits)
         for tile in (None, (2, 11)):
-            losses, predicted, _ = chunked_cross_entropy(states, matrix, ids, 4, tile=tile, bias=bias)
+            losses, predicted, _ = chunked_cross_entropy(states, table.matrix, ids, 4, tile=tile, bias=bias,
+                                                         vocab_major=table.vocab_major)
             expected = optax.softmax_cross_entropy_with_integer_labels(logits, ids)
             assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
             np.testing.assert_array_equal(predicted, logits.argmax(-1))
@@ -360,9 +360,9 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     expected = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
 
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    head = model.apply(variables, variables['params'],
-                       method=CausalTransformer.head_weight)
-    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
+    table = model.apply(variables, method='output_table')
+    losses, predicted, _ = chunked_cross_entropy(hidden, table.matrix, targets, chunks,
+                                                 vocab_major=table.vocab_major)
 
     assert hidden.dtype == dtype
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
@@ -393,8 +393,8 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     def full(params):
         hidden = model.apply({'params': params}, ids,
                              method=CausalTransformer.hidden_states)
-        head = model.apply({'params': params}, params,
-                           method=CausalTransformer.head_weight)
+        table = model.apply({'params': params}, method='output_table')
+        head = table.matrix.T if table.vocab_major else table.matrix
         operands = (rounded_operand(value.astype(jnp.float32), jnp.bfloat16)
                     for value in (hidden, head))
         logits = rounded_to(jnp.einsum('btd,dv->btv', *operands, precision=jax.lax.Precision.HIGHEST),
@@ -405,9 +405,9 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     def chunked(params):
         hidden = model.apply({'params': params}, ids,
                              method=CausalTransformer.hidden_states)
-        head = model.apply({'params': params}, params,
-                           method=CausalTransformer.head_weight)
-        return jnp.mean(chunked_cross_entropy(hidden, head, targets, 4)[0])
+        table = model.apply({'params': params}, method='output_table')
+        return jnp.mean(chunked_cross_entropy(hidden, table.matrix, targets, 4,
+                                              vocab_major=table.vocab_major)[0])
 
     expected = jax.grad(full)(variables['params'])
     got = jax.grad(chunked)(variables['params'])
@@ -660,10 +660,9 @@ def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
     def tiled(tree):
         states = model.apply({"params": tree}, ids,
                              method=CausalTransformer.hidden_states)
-        matrix = model.apply({"params": tree}, tree,
-                             method=CausalTransformer.head_weight)
+        table = model.apply({"params": tree}, method="output_table")
         losses, _, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, softcap=30.)
+            states, table.matrix, targets, 4, softcap=30., vocab_major=table.vocab_major)
         return jnp.mean(losses + 0.02 * jnp.square(log_z))
 
     expected, got = jax.grad(full)(params), jax.grad(tiled)(params)
