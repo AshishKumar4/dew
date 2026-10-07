@@ -252,7 +252,7 @@ def json_argument[Options: DataclassInstance](
     tfds decoder tree. Their types are imported on use, so a flag per field
     would need annotations this process has not resolved and has no spelling
     for the objects anyway. The whole value is one argument instead, the way
-    `--model.config` is one JSON object.
+    a model field holding records is one JSON value.
     """
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,

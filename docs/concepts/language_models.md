@@ -166,7 +166,7 @@ That rounding costs nothing measurable in training. The comparison ran 2000 step
 
 The rounding does show in layout parity. With the logits' gradient rounded once, a bf16 run on 4 RTX 3090s read 1.75 times its layout-parity bound at a dense model's final norm and 5758 times it at an MoE's expert gate_proj, against 0.47 and 0.41 with the gradient kept in float32. So a run that compares layouts in bf16, or resumes onto a different mesh and expects the same numbers, should set `matmul_precision="highest"`, which keeps the head in float32. `tools/layout_parity.py` sets it for bf16 decoders. An LM run recorded before this change resumes with the new rounding, which is within the rerun spread above but not bitwise the same as before.
 
-`token_accuracy=False` (`--no-token-accuracy` on the recipe) skips the argmax over every logit, which costs 0.77 ms of the head's 8.0 ms on a TPU v6e. Chunking the head with `head_chunks` can lower peak memory but adds work, and the backend compiler may rewrite it; the saving depends on vocabulary size, sequence length, batch size and the compiled executable.
+`token_accuracy=False` (`--objective.no-token-accuracy` on the recipe) skips the argmax over every logit, which costs 0.77 ms of the head's 8.0 ms on a TPU v6e. Chunking the head with `head_chunks` can lower peak memory but adds work, and the backend compiler may rewrite it; the saving depends on vocabulary size, sequence length, batch size and the compiled executable.
 
 With bf16 compute, Dew keeps the residual stream and every norm and sublayer output in bf16, each rounded where transformers rounds a bf16 tensor, as MaxText and Megatron (with `fp32_residual_connection=False`) do. `torch.autocast` keeps the residual stream and the norms in float32 and rounds at each matmul's input. To compare at Dew's rounding points, the torch run uses autocast with the embedding output and every RMSNorm output cast to bf16 and the rotary table left in float32 (`tools/reference_runs/torch_lm.py --precision autocast-bf16-residual`). At those rounding points the first step's loss depends on the attention kernel as much as on the framework. The table shows the first batch of a Qwen3-0.6B fine-tune (4 x 1024 tokens, one A100, `tools/reference_runs/step0_attention.py`):
 
@@ -485,14 +485,14 @@ Trained 1 steps in 0:00:03: first step after 3.18 s
 Optimizer updates: 1
 ```
 
-`recipes/lm/train.py --objective block_diffusion` runs the same objective; there is no separate recipe. It trains on complete token-window rows, and `data.seq_len + 1` must equal `block_prompt_tokens` plus a whole number of training canvases. `block_canvas_size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings.
+`recipes/lm/train.py --objective block_diffusion` runs the same objective; there is no separate recipe. It trains on complete token-window rows, and `data.seq_len + 1` must equal `--objective.prompt-length` plus a whole number of training canvases. `--objective.canvas-size` defaults to the checkpoint's canvas length. Packed documents are rejected, because their context boundaries differ. Block SFT logs `canvas_ce` and `encoder_ce`. It does not report autoregressive perplexity or use the autoregressive preview settings.
 
 ```bash
 python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-windows \
-    --data.seq-len 511 --block-prompt-tokens 256 \
+    --data.seq-len 511 --objective block_diffusion --objective.prompt-length 256 \
     --pretrained google/diffusiongemma-26B-A4B-it \
-    --tokenizer google/diffusiongemma-26B-A4B-it --objective block_diffusion \
-    --sample-tokens 0 --ema-decay None --optim.learning-rate 0.00015
+    --tokenizer google/diffusiongemma-26B-A4B-it \
+    --sample-tokens 0 --optim.learning-rate 0.00015
 ```
 
 The token files must use the checkpoint's tokenizer and hold the clean prompt prefix followed by the response canvases you intend. Trainer checkpoints keep the optimizer and iterator state, and `Pretrained.save` writes a complete inference checkpoint in the source format.

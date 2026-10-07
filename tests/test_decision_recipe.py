@@ -2,6 +2,7 @@
 
 import csv
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -37,14 +38,19 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(recipe, tmp_pa
     # The command line `laya-train --data tickets.csv` is, with this run's sizes.
     config = recipe.DecisionRunConfig.cli([
         "--data.path", str(table), "--data.held-out", "0.5", "--data.question", "team",
-        "--data.loading.workers", "0", "--pretrained", str(TINY), "--brier", "0.5",
+        "--data.loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
+            {"class": "dew.decision.scoring:Combined",
+             "fields": {"terms": [[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}),
         "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"])
-    assert isinstance(config.data, DecisionTable) and config.loss().name == "log_loss+0.5*brier"
+    assert isinstance(config.data, DecisionTable)
     recipe.main(config)
     run = tmp_path / "runs" / "tickets"
+    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
+    assert next(record["value"]["summary"]["loss"] for record in records
+                if record["type"] == "RunRecord") == "log_loss+0.5*brier"
     assert (run / "decide.json").is_file()
     decide = Decide.from_run(str(run))
     answer = decide("I was billed twice", {"team": Choice("Which team?", ["billing", "technical", "sales"])})

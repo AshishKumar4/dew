@@ -1,4 +1,4 @@
-"""dew: run programs on accelerator clusters, prepare data and act on run directories.
+"""dew: train runs, run programs on accelerator clusters, prepare data and act on run directories.
 
 dew tpu creates, sets up and reaches Cloud TPUs; `dew tpu --help` lists its commands.
 """
@@ -10,10 +10,12 @@ dew tpu creates, sets up and reaches Cloud TPUs; `dew tpu --help` lists its comm
 from __future__ import annotations
 
 import dataclasses
+import importlib
 import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Annotated
 
 import tyro
 
@@ -83,7 +85,58 @@ class Tokenize:
         return 0
 
 
-COMMANDS = {"export": Export, "launch": Launch, "tokenize": Tokenize}
+@dataclasses.dataclass(frozen=True)
+class Train:
+    """Train a run: the one a Python file builds, or the one a run's `run.json` records."""
+
+    run: Positional[str]
+    """A Python file whose `run` is a `RunConfig` or a function returning one, or a `run.json`."""
+    set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
+    """`path=value`, once a field: the run's field at the dotted path, read as its
+    flag reads it (`--set trainer.steps=2000 --set model.num_layers=12`)."""
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules a `run.json` may import."""
+
+    def run_command(self) -> int:
+        from dew import registry
+        from dew.config import RunConfig
+        from dew.config.sweep import assigned
+        from dew.training import prepare_process
+
+        path = Path(self.run)
+        trust = self.trust
+        if path.suffix == ".json":
+            record = json.loads(path.read_text())
+        else:
+            # The file imports as the module its name names, as `python -m`
+            # imports one beside it, so a record names what it defines by that
+            # module, which the run trusts: `dew train run.json --trust <name>`.
+            sys.path.insert(0, str(path.resolve().parent))
+            built = importlib.import_module(path.stem).run
+            built = built() if callable(built) else built
+            if type(built) is not RunConfig:
+                raise TypeError(f"{self.run}'s run is {built!r}; dew train trains a RunConfig, and a "
+                                "recipe's own config trains through its recipe")
+            record, trust = built.to_dict(), (*trust, path.stem)
+        # What trains is what the record reads back as, so its run.json trains the same run.
+        registry.import_trusted(record, trust)
+        run = assigned(RunConfig.from_dict(record), self.set)
+        objective = run.objective
+        if objective is None or run.lora is not None:
+            raise ValueError("dew train builds the objective the run names around its whole model; "
+                             "name an objective, and train an adapter through a recipe")
+        # The record names the run's directory, so its run.json trains the same run again.
+        name = run.trainer.name or path.stem
+        run = dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, name=name))
+        trainer = run.trainer
+        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
+                        layout=trainer.layout)
+        run.train(objective.build(model=run.model.build()), run.data.load(batch=trainer.batch_size),
+                  name=name)
+        return 0
+
+
+COMMANDS = {"export": Export, "launch": Launch, "tokenize": Tokenize, "train": Train}
 
 
 def main(argv: Sequence[str] | None = None) -> int:

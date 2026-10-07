@@ -23,13 +23,14 @@ import dataclasses
 import datetime
 import functools
 import hashlib
+import inspect
 import json
 import os
 import re
 import sys
 import types
 import typing
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, Union
@@ -54,9 +55,11 @@ from dew.registry import (
     Annotation,
     Configured,
     _declared_type,
+    _parameter_type,
     datasets,
     from_record,
     models,
+    objectives,
     schedules,
     to_record,
 )
@@ -93,6 +96,8 @@ command line. The registry knows which architecture takes which field and
 narrows each one where it builds it, so the values are read there."""
 
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
+
     # tyro reads the runtime annotation, a Union of the aliased specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
@@ -155,10 +160,35 @@ class ModelConfig:
         return model if self.adapter is None else adapted(model, self.adapter)
 
 
-def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
-    """A dataclass of `member`'s own fields, one flag each, defaulting to
-    `given` over the class's defaults, and those class defaults.
+@dataclasses.dataclass(frozen=True)
+class ObjectiveConfig:
+    """An objective's class and the arguments the run gives it.
 
+    `name` is an alias or an import path, held as the path. `fields` are the
+    constructor arguments the run states, which the command line sets one
+    flag each (`--objective.ema_decay 0.999`); what the objective is built
+    around, the model and what a recipe reads off its data, `build` takes
+    from the caller.
+    """
+
+    name: str
+    fields: JsonDict = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", registry.import_path(objectives[self.name]))
+
+    def build(self, **derived: Configured) -> Objective:
+        """Build the objective from its fields and the arguments the caller `derived`."""
+        return objectives.build(self.name, self.fields, **derived)
+
+
+def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
+    """A dataclass of `member`'s own fields, one flag each, defaulting to
+    `given` over the member's defaults, and those defaults.
+
+    A model's fields are its dataclass fields. An objective's are its
+    constructor's arguments, but for those it takes positionally without a
+    default: those are what its caller builds and passes, the model first.
     Scalars, literals and tuples of them are typed as declared; dtypes read
     their names and precision its level. Any other field (a sequence of
     records, a nested model) takes one JSON value, the record `build` reads.
@@ -166,16 +196,12 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mappi
     field whose default no record carries (a callable, say) gets no flag and
     keeps that default."""
     flags, defaults = [], {}
-    for field in dataclasses.fields(member):
-        if not field.init or field.name in ("parent", "name"):
-            continue
-        declared = (field.default if field.default is not dataclasses.MISSING
-                    else field.default_factory() if callable(field.default_factory) else None)
-        annotation = registry.resolve_alias(_declared_type(member, field.name))
-        if field.name in ("dtype", "param_dtype"):
+    for name, declared, annotation in _member_fields(member):
+        annotation = registry.resolve_alias(annotation)
+        if name in ("dtype", "param_dtype"):
             typed = registry.DtypeName | None
-            declared = None if declared is None else registry.dtype_name(declared)
-        elif field.name == "precision":
+            declared = registry.dtype_name(registry.resolve_dtype(declared))
+        elif name == "precision":
             typed = Literal["default", "high", "highest"] | None
             declared = None if declared is None else str(declared).lower().removeprefix("precision.")
         elif annotation is not None and _scalar(annotation):
@@ -186,11 +212,55 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mappi
                 declared = json.loads(json.dumps(to_record(declared, annotation)))
             except (TypeError, ValueError):
                 continue  # a field no record carries keeps its class default
-        defaults[field.name] = declared
-        value = given.get(field.name, declared)
+        defaults[name] = declared
+        value = given.get(name, declared)
         copied = functools.partial(copy.deepcopy, value)
-        flags.append((field.name, typed, dataclasses.field(default_factory=copied)))
+        flags.append((name, typed, dataclasses.field(default_factory=copied)))
     return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), defaults
+
+
+def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
+    """Each field `_member_flags` flags: its name, its default (None for none)
+    and its annotation (None where its module cannot resolve it)."""
+    if isinstance(member, type) and dataclasses.is_dataclass(member):
+        for field in dataclasses.fields(member):
+            if field.init and field.name not in ("parent", "name"):
+                default = (field.default if field.default is not dataclasses.MISSING else
+                           field.default_factory() if callable(field.default_factory) else None)
+                yield field.name, default, _declared_type(member, field.name)
+        return
+    for parameter in inspect.signature(member).parameters.values():
+        default = None if parameter.default is parameter.empty else parameter.default
+        built = parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty
+        if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY) and not built:
+            try:
+                annotation = _parameter_type(member, parameter.name)
+            except ValueError:
+                annotation = None
+            yield parameter.name, default, annotation
+
+
+def _chosen(given: list[str], field: str) -> str | None:
+    """Pop `--<field> <name>` or `--<field>=<name>` off `given` and return the name, or None."""
+    index = next((index for index, arg in enumerate(given)
+                  if arg == f"--{field}" or arg.startswith(f"--{field}=")), None)
+    if index is None:
+        return None
+    return given.pop(index).removeprefix(f"--{field}").removeprefix("=") or given.pop(index)
+
+
+def _given[C: (ModelConfig, ObjectiveConfig)](start: C, parsed: "DataclassInstance",
+                                              declared: Mapping[str, object]) -> C:
+    """`start` with the fields its flags `parsed`: those it started from, and
+    those the command line set to something other than the class's default.
+    A field it started from that takes no flag is kept as it was. A tuple is
+    held as the list its record reads back as."""
+    def listed(value: JSON | tuple[JSON, ...]) -> JSON:
+        return [listed(entry) for entry in value] if isinstance(value, tuple) else value
+
+    chosen = {key: listed(value) for key, value in vars(parsed).items()
+              if key in start.fields or value != declared[key]}
+    return dataclasses.replace(start, fields={**start.fields, **chosen})
 
 
 def _scalar(annotation: Annotation) -> bool:
@@ -611,9 +681,9 @@ class RunConfig:
     data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
-    objective: str | None = None
-    """The objective's class: an alias on the command line, held and recorded
-    as its import path, which `train` writes from the objective it trains."""
+    objective: ObjectiveConfig | None = None
+    """The objective's class and the arguments the run states, which `train`
+    names from the objective it trains when the run leaves it unset."""
     lora: Annotated[LoRA, tyro.conf.subcommand("lora")] | None = None
     """The low-rank adapter the run trains instead of the whole model.
 
@@ -623,14 +693,6 @@ class RunConfig:
     initialized from the run's key. The objective then trains only the adapter's
     factors, and the run's record stores the model with the adapter attached.
     """
-
-    def __post_init__(self) -> None:
-        if self.objective is not None:
-            try:
-                trained = registry.objectives[self.objective]
-            except KeyError as error:
-                raise ValueError(f"--objective: {error.args[0]}") from None
-            object.__setattr__(self, "objective", registry.import_path(trained))
 
     def to_dict(self) -> dict[str, JSON]:
         """Return a JSON-safe record of the run.
@@ -673,44 +735,65 @@ class RunConfig:
         field the class declares is a flag, `--model.<field>`, typed by its
         annotation (`ModelConfig`). Naming the class the run defaults to keeps
         the default's fields; naming another starts from that class's own and
-        the default's compute dtype.
+        the default's compute dtype. `--objective` picks the objective's class
+        the same way, each argument it takes a flag, `--objective.<argument>`
+        (`ObjectiveConfig`).
         """
         given = list(sys.argv[1:] if args is None else args)
         for field, subcommand in cls._FLAG_SELECTED.items():
             flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
             if flags and not any(arg.startswith(f"{field}:") for arg in given):
                 given.insert(flags[0], f"{field}:{subcommand}")
-        factory = cls.__dataclass_fields__["model"].default_factory
-        start = default.model if default is not None else factory() if callable(factory) else ModelConfig()
-        if not isinstance(start, ModelConfig):
-            raise TypeError(f"{cls.__name__}.model defaults to {start!r}, not a ModelConfig")
-        chosen = next((index for index, arg in enumerate(given)
-                       if arg == "--model" or arg.startswith("--model=")), None)
-        if chosen is not None:
-            name = given.pop(chosen).removeprefix("--model").removeprefix("=") or given.pop(chosen)
-            if registry.import_path(models[name]) != start.name:
-                # Another class starts from its own fields and the run's
-                # compute dtype, where it declares one.
-                kept = {"dtype": start.fields["dtype"]} if "dtype" in start.fields and "dtype" in {
-                    field.name for field in dataclasses.fields(models[name])} else {}
-                start = ModelConfig(name, kept)
-        member = models[start.name]
-        flags, declared = _model_flags(member, start.fields)
-        # The run parses with its model as those flags, and validates once
-        # it holds the model they name.
+        model, objective = cls._started(default, "model"), cls._started(default, "objective")
+        if not isinstance(model, ModelConfig) or not isinstance(objective, ObjectiveConfig | None):
+            raise TypeError(f"{cls.__name__} starts from the model {model!r} and the objective "
+                            f"{objective!r}, not a ModelConfig and an ObjectiveConfig")
+        name = _chosen(given, "model")
+        if name is not None and registry.import_path(models[name]) != model.name:
+            # Another class starts from its own fields and the run's
+            # compute dtype, where it declares one.
+            kept = {"dtype": model.fields["dtype"]} if "dtype" in model.fields and "dtype" in {
+                field.name for field in dataclasses.fields(models[name])} else {}
+            model = ModelConfig(name, kept)
+        name = _chosen(given, "objective")
+        if name is not None and (objective is None
+                                 or registry.import_path(objectives[name]) != objective.name):
+            objective = ObjectiveConfig(name)
+        model_flags, model_declared = _member_flags(models[model.name], model.fields)
+        if objective is None:
+            objective_flags, objective_declared = tyro.conf.Suppress[None], {}
+            objective_default = dataclasses.field(default=None)
+        else:
+            objective_flags, objective_declared = _member_flags(objectives[objective.name], objective.fields)
+            objective_default = dataclasses.field(default_factory=objective_flags)
+        # The run parses with its model and objective as those flags, and
+        # validates once it holds the classes they name.
         parser = dataclasses.make_dataclass(
-            cls.__name__, [("model", flags, dataclasses.field(default_factory=flags))], bases=(cls,),
-            frozen=True, namespace={"__post_init__": lambda self: None})
+            cls.__name__, [("model", model_flags, dataclasses.field(default_factory=model_flags)),
+                           ("objective", objective_flags, objective_default)],
+            bases=(cls,), frozen=True, namespace={"__post_init__": lambda self: None})
         held = None if default is None else parser(
             **{field.name: getattr(default, field.name) for field in dataclasses.fields(cls)
-               if field.name != "model"}, model=flags())
+               if field.name not in ("model", "objective")})
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
         if parsed is None:
             raise ValueError("the command line built no run config")
-        chosen_fields = {key: value for key, value in dataclasses.asdict(parsed.model).items()
-                         if key in start.fields or value != declared[key]}
         return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
-                      if field.name != "model"}, model=dataclasses.replace(start, fields=chosen_fields))
+                      if field.name not in ("model", "objective")},
+                   model=_given(model, parsed.model, model_declared),
+                   objective=None if objective is None else _given(objective, parsed.objective,
+                                                                   objective_declared))
+
+    @classmethod
+    def _started(cls, default: Self | None, field: str) -> ModelConfig | ObjectiveConfig | None:
+        """The value the command line starts `field` from: `default`'s, or the class's default."""
+        declared = cls.__dataclass_fields__[field]
+        value = (getattr(default, field) if default is not None else
+                 declared.default_factory() if callable(declared.default_factory) else declared.default)
+        if not isinstance(value, ModelConfig | ObjectiveConfig | None):
+            raise TypeError(f"{cls.__name__}.{field} starts from {value!r}, not a ModelConfig or an "
+                            "ObjectiveConfig")
+        return value
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
@@ -721,12 +804,20 @@ class RunConfig:
         return cls.from_dict(record)
 
     def _naming(self, objective: Objective[Loss, Effects]) -> Self:
-        """Return this config with `objective` named the way the record spells it.
+        """Return this config with `objective`'s class as its record names it.
 
-        The record names the objective's class by its import path, so it says
-        what was trained and loads in a process that imported nothing.
+        The record names the class by its import path, so it says what was
+        trained and loads in a process that imported nothing. Arguments the
+        run states belong to the class it names, so a run that states them
+        for another class than the one it trains is refused.
         """
-        return dataclasses.replace(self, objective=registry.import_path(type(objective)))
+        trained = registry.import_path(type(objective))
+        stated = ObjectiveConfig(trained) if self.objective is None else self.objective
+        if stated.name != trained:
+            if stated.fields:
+                raise ValueError(f"the run states the arguments of {stated.name} and trains {trained}")
+            stated = ObjectiveConfig(trained)
+        return dataclasses.replace(self, objective=stated)
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
@@ -850,4 +941,5 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "OptimConfig", "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "ModelConfig", "ObjectiveConfig", "OptimConfig", "RunConfig", "ScheduleSpec",
+           "TrainerConfig", "Wandb"]
