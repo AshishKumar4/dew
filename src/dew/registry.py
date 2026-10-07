@@ -461,7 +461,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     return configured(value)
 
 
-def _class_record(value: Mapping[str, object] | Mapping[str | tuple[str, ...], object]
+def _class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
                   ) -> tuple[str, Mapping[str, object]] | None:
     """The class a class record, `{"class": ..., "fields": {...}}`, names and
     its fields (a record with no fields may leave them out); None for a
