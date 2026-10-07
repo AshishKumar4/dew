@@ -190,7 +190,7 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mappi
         elif _scalar(annotation):
             typed = annotation if declared is not None else annotation | None
         else:
-            typed = Annotated[Configured, _JSON_FLAG]
+            typed = Annotated[JSON, _JSON_FLAG]
             try:
                 declared = json.loads(json.dumps(to_record(declared, annotation)))
             except (TypeError, ValueError):
