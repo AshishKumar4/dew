@@ -14,7 +14,7 @@ checkpoints, and `ClefCheckpoint` Cloudflare/clef's, whose head `ClefHead` reads
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
 from dew.decision.clef import ClefCheckpoint, ClefHead
-from dew.decision.data import DecisionTable, Example, Weighted
+from dew.decision.data import DecisionMixture, DecisionTable, Example, Weighted
 from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
@@ -75,6 +75,7 @@ __all__ = [
     "Decide",
     "DecisionHead",
     "DecisionInputs",
+    "DecisionMixture",
     "DecisionModel",
     "DecisionObjective",
     "DecisionTable",

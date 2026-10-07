@@ -6,30 +6,19 @@ class does not declare is refused.
 """
 
 import dataclasses
-import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
 from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.decision.config import DecisionRunConfig
 from dew.objectives.diffusion import DiffusionRunConfig
+from dew.objectives.jepa import JepaRunConfig
 from dew.objectives.lm.config import LMRunConfig
 from dew.training.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
-
-
-def recipe_config(name: str, cls: str) -> type:
-    """A run config a recipe file declares, loaded as `recipe_<name>`."""
-    module = sys.modules.get(f"recipe_{name}")
-    if module is None:
-        spec = importlib.util.spec_from_file_location(f"recipe_{name}", ROOT / "recipes" / name / "train.py")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-    return getattr(module, cls)
 
 
 def written(config) -> dict:
@@ -37,15 +26,22 @@ def written(config) -> dict:
     return json.loads(json.dumps(config.to_dict()))
 
 
-@pytest.mark.parametrize("config", ["run", "diffusion", "lm", "recipe_lm", "recipe_jepa"])
-def test_a_run_config_reads_back_from_its_own_record(config):
-    if config == "recipe_jepa":
-        # A JEPA run validates through probes it has no classes for by default.
-        value = recipe_config("jepa", "JepaRunConfig")(trainer=TrainerConfig(eval_every=None))
-    else:
-        value = {"run": RunConfig, "diffusion": DiffusionRunConfig, "lm": LMRunConfig,
-                 "recipe_lm": recipe_config("lm", "LmRunConfig")}[config]()
-    assert type(value).from_dict(written(value)) == value
+@pytest.mark.parametrize("config", ["run", "diffusion", "lm", "jepa", "decision"])
+def test_a_run_config_reads_back_as_its_class_from_its_own_record(config):
+    """`run.json` names the run's class, so a reader that knows only
+    `RunConfig` rebuilds a run of any kind as the kind it is."""
+    # A JEPA run validates through probes it has no classes for by default.
+    value = {"run": RunConfig(), "diffusion": DiffusionRunConfig(), "lm": LMRunConfig(),
+             "jepa": JepaRunConfig(trainer=TrainerConfig(eval_every=None)),
+             "decision": DecisionRunConfig()}[config]
+    assert RunConfig.read(json.loads(json.dumps(value.record()))) == value
+
+
+def test_a_record_naming_a_class_that_is_no_run_is_refused():
+    with pytest.raises(ValueError, match="which is no DiffusionRunConfig"):
+        DiffusionRunConfig.read(LMRunConfig().record())
+    with pytest.raises(ValueError, match="is its class and its fields"):
+        RunConfig.read(written(RunConfig()))
 
 
 def test_a_record_keeps_what_it_states_and_defaults_what_it_lacks():
@@ -79,7 +75,7 @@ def test_the_published_run_reads_back_as_it_was_written():
     is to re-export the published run in the same change, since the site,
     the quick start and the live sampler all load it."""
     held = json.loads(PUBLISHED.read_text())
-    assert json.loads(json.dumps(DiffusionRunConfig.from_dict(held).to_dict())) == held
+    assert json.loads(json.dumps(RunConfig.read(held).record())) == held
 
 
 @pytest.mark.network

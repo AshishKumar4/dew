@@ -95,7 +95,7 @@ uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 
 The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
-tokamax is not a dependency. With it installed, `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it with `uv pip install tokamax -c https://raw.githubusercontent.com/AshishKumar4/dew/main/constraints.txt`. The constraints file matters because tokamax 0.0.14, its latest release, pins `typeguard==2.13.3`, which tyro excludes; the constraints name the tokamax commit that dropped that pin.
+tokamax is not a dependency. With it installed, `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it with `uv pip install 'tokamax>=0.0.15'`. Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one breaks every recipe's command line.
 
 ## Development install
 

@@ -27,7 +27,7 @@ import pytest
 from flax import linen as nn
 
 import dew.data
-from dew.data import Corpus, DataPartition, DataPhase, Loading, PackedTokens, Ramp
+from dew.data import Corpus, DataPartition, DataPhase, Loading, Ramp, TokenWindows
 from dew.data.dataset import (
     CAPTION,
     Dataset,
@@ -356,7 +356,7 @@ def test_a_packed_step_is_the_same_windows_at_every_process_count(tmp_path):
     processes read it. Packed behind the shard, as the loader once was, each
     process packed its own documents and no two counts agreed."""
     corpus = packed_corpus(tmp_path / "corpus")
-    open_stream = PackedTokens(path=corpus, seq_len=8, val_batches=None, packing_bins=2,
+    open_stream = TokenWindows(pack=True, path=corpus, seq_len=8, val_batches=None, packing_bins=2,
                                loading=READ).load(batch=4).train
 
     whole = pooled(open_stream, 1, 5, rows=windows_of)
@@ -371,7 +371,7 @@ def test_a_packed_position_written_by_two_processes_resumes_on_one(tmp_path):
     processes that stopped at step two hand one process, or four, the steps
     the run would have taken next."""
     corpus = packed_corpus(tmp_path / "corpus")
-    open_stream = PackedTokens(path=corpus, seq_len=8, val_batches=None, packing_bins=2,
+    open_stream = TokenWindows(pack=True, path=corpus, seq_len=8, val_batches=None, packing_bins=2,
                                loading=READ).load(batch=4).train
     whole = pooled(open_stream, 1, 6, rows=windows_of)
 
@@ -389,7 +389,7 @@ def test_a_packed_pass_covers_every_document_once_at_every_process_count(tmp_pat
     for every count, and the processes of a pool cover the split between
     them without overlapping."""
     corpus = packed_corpus(tmp_path / "corpus", documents=24)
-    pass_over = PackedTokens(path=corpus, seq_len=8, val_batches=None, packing_bins=2,
+    pass_over = TokenWindows(pack=True, path=corpus, seq_len=8, val_batches=None, packing_bins=2,
                              loading=READ).load(batch=4).val
     assert pass_over is not None
     whole = [row for batch in pass_over(DataPartition()) for row in windows_of([batch])[0]]
@@ -406,7 +406,7 @@ def weighted_packed(tmp_path, weights, **overrides):
     in the second, each document one value repeated three times."""
     first = document_dir(tmp_path / "first", [[index + 1] * 3 for index in range(40)])
     second = document_dir(tmp_path / "second", [[index + 101] * 3 for index in range(24)])
-    spec = PackedTokens(path={first: weights[0], second: weights[1]}, seq_len=8,
+    spec = TokenWindows(pack=True, path={first: weights[0], second: weights[1]}, seq_len=8,
                         val_batches=None, packing_bins=2, loading=READ, **overrides)
     return spec, first, second
 
@@ -448,7 +448,7 @@ def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):
     the validation pass reads each held-out window at most once."""
     spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     loaded = spec.load(batch=2)
-    alone = [PackedTokens(path=path, seq_len=8, val_batches=None, packing_bins=2,
+    alone = [TokenWindows(pack=True, path=path, seq_len=8, val_batches=None, packing_bins=2,
                           loading=READ).load(batch=2).records for path in (first, second)]
     assert loaded.records == 2 * max(alone)
     scored = [row for batch in loaded.val(DataPartition()) for row in windows_of([batch])[0]]
@@ -468,8 +468,8 @@ def test_corpora_from_different_tokenizers_are_not_mixed(tmp_path):
 # Mixture phases
 # --------------------------------------------------------------------------
 
-def phased_packed(first: str, second: str, *phases: tuple[object, int | None]) -> PackedTokens:
-    return PackedTokens(phases=tuple(DataPhase(path, until) for path, until in phases),
+def phased_packed(first: str, second: str, *phases: tuple[object, int | None]) -> TokenWindows:
+    return TokenWindows(pack=True, phases=tuple(DataPhase(path, until) for path, until in phases),
                         seq_len=8, val_batches=None, packing_bins=2, loading=READ)
 
 
@@ -502,7 +502,7 @@ def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     passed, is the same run with a switch ahead of it, at any process count."""
     _spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
-    plain = PackedTokens(path=first, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
+    plain = TokenWindows(pack=True, path=first, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
     stopped = plain.load(batch=4).train(DataPartition())
     packed_rows(stopped, 2)
     state = stopped.get_state()
@@ -545,7 +545,7 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
                     phased_packed(first, second, (second, 3), (both, None))):
         with pytest.raises(ValueError, match="cannot change under it"):
             changed.load(batch=4).train(DataPartition()).set_state(state)
-    plain = PackedTokens(path=both, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
+    plain = TokenWindows(pack=True, path=both, seq_len=8, val_batches=None, packing_bins=2, loading=READ)
     with pytest.raises(ValueError, match="phased run"):
         plain.load(batch=4).train(DataPartition()).set_state(state)
 

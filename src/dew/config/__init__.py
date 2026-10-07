@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import types
 import typing
@@ -43,7 +44,7 @@ import dew.io
 from dew import registry
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
-from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.config.sweep import RandomSearch, Search, Space, _read, _write
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import Reader, ramped, record_argument
@@ -59,8 +60,10 @@ from dew.registry import (
     from_record,
     models,
     objectives,
+    parameters,
     schedules,
     to_record,
+    wants_tuple,
 )
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
@@ -202,26 +205,31 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
     field whose default no record carries (a callable, say) gets no flag and
     keeps that default."""
     flags, defaults = [], {}
-    for name, declared, annotation in _member_fields(member):
-        annotation = registry.resolve_alias(annotation)
-        if name in ("dtype", "param_dtype"):
-            typed = registry.DtypeName | None
-            declared = registry.dtype_name(registry.resolve_dtype(declared))
-        elif name == "precision":
-            typed = Literal["default", "high", "highest"] | None
-            declared = None if declared is None else str(declared).lower().removeprefix("precision.")
-        elif annotation is not None and _scalar(annotation):
-            typed = annotation if declared is not None else annotation | None
-        else:
-            typed = Annotated[JSON, _JSON_FLAG]
-            try:
-                declared = json.loads(json.dumps(to_record(declared, annotation)))
-            except (TypeError, ValueError):
-                continue  # a field no record carries keeps its class default
-        defaults[name] = declared
-        value = given.get(name, declared)
-        copied = functools.partial(copy.deepcopy, value)
-        flags.append((name, typed, dataclasses.field(default_factory=copied)))
+    # One record: a module two defaults share is written once.
+    with registry.recording():
+        for name, declared, annotation in _member_fields(member):
+            annotation = registry.resolve_alias(annotation)
+            if name in ("dtype", "param_dtype"):
+                typed = registry.DtypeName | None
+                declared = registry.dtype_name(registry.resolve_dtype(declared))
+            elif name == "precision":
+                typed = Literal["default", "high", "highest"] | None
+                declared = None if declared is None else str(declared).lower().removeprefix("precision.")
+            elif annotation is not None and _scalar(annotation):
+                typed = annotation if declared is not None else annotation | None
+            else:
+                typed = Annotated[JSON, _JSON_FLAG]
+                try:
+                    # The record itself, not a copy: a module a later default
+                    # shares turns this one into its defining record.
+                    declared = to_record(declared, annotation)
+                    json.dumps(declared)
+                except (TypeError, ValueError):
+                    continue  # a field no record carries keeps its class default
+            defaults[name] = declared
+            value = given.get(name, declared)
+            copied = functools.partial(copy.deepcopy, value)
+            flags.append((name, typed, dataclasses.field(default_factory=copied)))
     return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), defaults
 
 
@@ -680,8 +688,79 @@ def _artifact_name(name: str) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
+class Prepared:
+    """What a run trains, as its class builds it (`RunConfig.prepare`).
+
+    `run` is the run as it records itself, with what building resolved (a
+    pinned source, the model's fields as built). `train` trains it under a
+    name: `run.train` over the objective and the data the class built.
+    `after` runs on the state training ends on and the run's directory, as a
+    decision run fits its calibration on its held-out rows and saves it there.
+    """
+
+    run: "RunConfig"
+    train: Callable[[str], TrainState]
+    after: Callable[[TrainState, str], None] | None = None
+
+
+def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
+    """The record `node` holds under `key`. A field declaring a base or a
+    union records its value's class beside its fields, and this is the fields."""
+    held = node[key]
+    held = held["fields"] if isinstance(held, dict) and "class" in held else held
+    if not isinstance(held, dict):
+        raise KeyError(f"{key} holds {held!r}, not a record of fields")
+    return held
+
+
+def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
+    """The keys of `path`'s value in `config`'s record, and the annotation it is read by."""
+    *groups, field = path.split(".")
+    held: object = config
+    for group in groups:
+        if not (dataclasses.is_dataclass(held) and group in _names(held)):
+            raise KeyError(f"{path} names no group of the run record")
+        held = getattr(held, group)
+    if isinstance(held, ModelConfig | ObjectiveConfig) and field not in _names(held):
+        member = models[held.name] if isinstance(held, ModelConfig) else objectives[held.name]
+        # A flag's annotation types the value, as `--model.<field>` reads it;
+        # an argument without a flag (the loss a `Supervised` is given) takes JSON.
+        annotation = _declared_type(_member_flags(member, held.fields)[0], field)
+        if annotation is None and field not in parameters(member)[0]:
+            raise KeyError(f"{path} names no argument of {held.name}")
+        return [*groups, "fields", field], annotation
+    if not (dataclasses.is_dataclass(held) and field in _names(held)):
+        raise KeyError(f"{path} names no field of the run record")
+    return [*groups, field], _declared_type(type(held), field)
+
+
+def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
+    """The fields a dataclass declares."""
+    return {field.name for field in dataclasses.fields(held)}
+
+
+def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
+    """`text` as the flag of `annotation` reads it (`RunConfig.assigned`), a
+    tuple as the list its record holds."""
+    if annotation is not None and _scalar(annotation):
+        holder = dataclasses.make_dataclass("Set", [("value", tyro.conf.Positional[annotation])])
+        given = shlex.split(text) if wants_tuple(annotation) else [text]
+        return json.loads(json.dumps(tyro.cli(holder, args=given, prog=f"--set {path}").value))
+    try:
+        return _flag_json(text)
+    except json.JSONDecodeError:
+        return text
+
+
+
+_RANDOM_SEARCH = RandomSearch()
+
+
+@dataclasses.dataclass(frozen=True)
 class RunConfig:
-    """A whole run's configuration; recipes subclass it to add their objective's settings."""
+    """A whole run's configuration. A kind of run subclasses it with its own
+    settings and builds what it trains from them (`prepare`); `run` trains it.
+    """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora"}
     """The optional settings `cli` turns on by their own flags, each with the
@@ -710,9 +789,9 @@ class RunConfig:
         A value of a subclass of the field's type is written as its class's
         import path and its fields.
         """
-        return {field.name: to_record(getattr(self, field.name),
-                                     _declared_type(type(self), field.name))
-                for field in dataclasses.fields(self)}
+        with registry.recording():
+            return {field.name: to_record(getattr(self, field.name), _declared_type(type(self), field.name))
+                    for field in dataclasses.fields(self)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -720,17 +799,59 @@ class RunConfig:
         record lacks takes its default; an unknown field raises."""
         return from_record(cls, values, dtypes=False)
 
+    def override(self, point: Mapping[str, JSON]) -> Self:
+        """This config with each dotted path in `point` replaced, through its record.
+
+        A path walks the run's fields and the fields of the values they hold.
+        Under `model` or `objective`, a name the config does not declare is an
+        argument of the class it names, as `--model.num_layers` is on the
+        command line. A path the run does not declare raises, rather than
+        training the unchanged config.
+        """
+        config = self
+        for path, value in point.items():
+            record = config.to_dict()
+            *groups, field = _placed(config, path)[0]
+            node = record
+            for group in groups:
+                node = _within(node, group)
+            node[field] = value
+            config = type(config).from_dict(record)
+        return config
+
+    def assigned(self, assignments: Sequence[str]) -> Self:
+        """This config with each `path=value` in `assignments` set (`override`).
+
+        The value is read as the field's annotation reads a flag: a number, a
+        string, a literal or a tuple of them as its type parses it on the
+        command line, None for an optional field, and anything else (a record,
+        a list of records) as JSON, or as the text itself when it is not JSON.
+        """
+        config = self
+        for assignment in assignments:
+            path, equals, text = assignment.partition("=")
+            if not equals:
+                raise ValueError(f"{assignment!r} sets no value; write path=value, as trainer.steps=2000")
+            config = config.override({path: _parsed(path, text, _placed(config, path)[1])})
+        return config
+
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
 
-        The path goes through `epath`, the same filesystem layer Orbax writes the
+        The file is the run's class record, its class's import path and its
+        fields (`to_dict`), so `load` rebuilds the run as the class it is. The
+        path goes through `epath`, the same filesystem layer Orbax writes the
         checkpoints with, so a `gs://` run directory gets the record too.
         """
         path = epath.Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         target = path / RUN_FILE
-        target.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
+        target.write_text(json.dumps(self.record(), indent=2, sort_keys=True))
         return str(target)
+
+    def record(self) -> dict[str, JSON]:
+        """The run's class record: its class's import path and its fields (`to_dict`)."""
+        return {"class": registry.import_path(type(self)), "fields": self.to_dict()}
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -807,11 +928,55 @@ class RunConfig:
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
-        """Read the config a run in `directory` was built from, as this class.
+        """Read the run a directory's `run.json` records, or the file itself,
+        as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
-        record = json.loads((epath.Path(directory) / RUN_FILE).read_text())
+        path = epath.Path(directory)
+        record = (path if str(directory).endswith(".json") else path / RUN_FILE).read_text()
+        return cls.read(json.loads(record), trust=trust)
+
+    @classmethod
+    def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
+        """The run a class record (`record`) names, as its class, which must be
+        this one or derive from it."""
         registry.import_trusted(record, trust)
-        return cls.from_dict(record)
+        named = registry._class_record(record)
+        if named is None:
+            raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
+        run_class = registry.imported(named[0])
+        if not (isinstance(run_class, type) and issubclass(run_class, cls)):
+            raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
+        return run_class.from_dict(named[1])
+
+    def prepare(self) -> Prepared:
+        """Build what this run trains: the objective its record names around
+        its model, on its data. A kind of run with settings of its own builds
+        from them in its own `prepare`."""
+        if self.objective is None or self.lora is not None:
+            raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
+                             "name an objective, and train an adapter as a kind of run that attaches one")
+        objective = self.objective.build(model=self.model.build())
+        dataset = self.data.load(batch=self.trainer.batch_size)
+        return Prepared(self, lambda name: self.train(objective, dataset, name=name))
+
+    def run(self) -> TrainState:
+        """Prepare the process, build what this run trains (`prepare`) and train it.
+
+        The run trains under `trainer.name`, or `<objective>-<data>/date-<time>`."""
+        from dew.training import prepare_process, run_timestamp
+
+        trainer = self.trainer
+        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
+                        layout=trainer.layout)
+        prepared = self.prepare()
+        stated = prepared.run.objective
+        name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
+                                f"{datasets.label(registry.import_path(type(prepared.run.data)))}/"
+                                f"date-{run_timestamp()}")
+        state = prepared.train(name)
+        if prepared.after is not None:
+            prepared.after(state, os.path.join(trainer.checkpoint_dir, name))
+        return state
 
     def _naming(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config with `objective`'s class as its record names it.
@@ -866,7 +1031,9 @@ class RunConfig:
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
             _quantize(objective, self.trainer.quantization)
-        self = self._naming(objective)
+        # The record names the run's directory, so its run.json trains the same run again.
+        self = dataclasses.replace(self._naming(objective),
+                                   trainer=dataclasses.replace(self.trainer, name=name))
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
@@ -923,7 +1090,7 @@ class RunConfig:
             _closed(tracker, sys.exception())
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
-              tracker: Tracker, search: Search = random_search, seed: int = 0) -> list[TrialFinished]:
+              tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:
         """Train `trials` trials of this config over `space` and return the ledger.
 
         Each trial draws a point from `space` and trains under the run name
@@ -940,9 +1107,9 @@ class RunConfig:
                              "resume from each other")
         finished = _read(path, space)
         for index in range(len(finished), trials):
-            point = search(space, finished, seed)
+            point = search(space, finished)
             name = f"{self.trainer.name}/trial-{index}"
-            value = train(override(self, {**point, "trainer.name": name}))
+            value = train(self.override({**point, "trainer.name": name}))
             trial = TrialFinished(index, name, point, value)
             finished.append(trial)
             _write(path, space, finished)
@@ -951,5 +1118,5 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "ObjectiveConfig", "OptimConfig", "RunConfig", "ScheduleSpec",
-           "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared", "RunConfig",
+           "ScheduleSpec", "TrainerConfig", "Wandb"]
