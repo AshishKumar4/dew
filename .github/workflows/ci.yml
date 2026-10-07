@@ -147,14 +147,14 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # A shard's share is about eleven minutes; a hung test fails its shard
+    # A shard's share is about fifteen minutes of tests; a hung test fails its shard
     # instead of holding a runner for the default six hours.
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        # A ci/** branch runs the compatibility floor alone, 13 jobs with
-        # lint, so two branch runs fit GitHub's 20 concurrent jobs; main
+        # A ci/** branch runs the compatibility floor alone: 16 shards with
+        # lint, package and Tutorials fit GitHub's 20 concurrent jobs; main
         # runs both Pythons.
         python-version: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ci/') && '["3.12"]' || '["3.14", "3.12"]') }}
         # pytest-split cuts the collected order into chunks of equal time by
@@ -162,8 +162,8 @@ jobs:
         # a run's reports. Contiguous chunks keep a module's tests, and the
         # fixtures and compilations they share, in one process: splitting
         # modules across every shard cost 60% more test time (run 35945550831).
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-    name: test (${{ matrix.python-version }}, ${{ matrix.shard }}/12)
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+    name: test (${{ matrix.python-version }}, ${{ matrix.shard }}/16)
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
@@ -194,7 +194,7 @@ jobs:
         /usr/bin/time -v env JAX_PLATFORMS=cpu PYTHONFAULTHANDLER=1 pytest -m "not network" -vv \
           --ignore=tests/test_gen_api.py \
           --capture=tee-sys -ra --junitxml=pytest-report.xml \
-          --splits 12 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks \
+          --splits 16 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks \
           --durations-path tests/test_durations.json
     - name: Save the compilation cache
       if: always() && github.ref == 'refs/heads/main'
