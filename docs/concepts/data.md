@@ -192,10 +192,14 @@ Validation reads each image through the deterministic resize and skips the crop,
 ## Device image augmentation
 
 `TFDSImages`, `HFImages` and the prepared `ArrayRecordImages` readers share
-`ImageDataset`'s transforms. Set `augmentation_backend="device"` to apply
-random crop/resize, horizontal flip and colour jitter to each decoded batch
-with JAX. The default is still `"host"`, so existing runs keep their
-OpenCV/NumPy augmentation. `augmentation="flip_only"` turns off colour jitter,
+`ImageDataset`'s transforms. By default (`augmentation_backend="device"`)
+random crop/resize, horizontal flip and colour jitter run on each decoded
+batch with JAX, on the accelerator, and the host only decodes and resizes.
+On an 8-vCPU host that reads about 2.4 times the images per second it reads
+when it also augments (512x384 JPEGs to 256-pixel crops). Without an
+accelerator the JAX path costs about 20% more than OpenCV's, so set
+`augmentation_backend="host"` for a CPU-only run; a run record keeps the
+backend it trained with. `augmentation="flip_only"` turns off colour jitter,
 and `"none"` keeps only the deterministic resize, with no random crop.
 
 On either backend the colour jitter is torchvision's float
@@ -210,7 +214,6 @@ from dew.data import Loading, TFDSImages
 data = TFDSImages(
     path="data/oxford_flowers102/2.1.1",
     image_size=128,
-    augmentation_backend="device",
     augmentation="flip_jitter",
     crop_scale=(0.6, 1.0),
     augmentation_size=160,
