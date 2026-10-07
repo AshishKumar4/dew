@@ -111,7 +111,7 @@ dew tpu train dew-16 --zone us-central2-b --job byte-demo --dry-run -- \
     --data.path /home/you/dew-tokens --data.seq-len 16 \
     --data.loading.workers 0 --data.loading.threads 1 \
     --data.loading.read-buffer 2 --data.val-batches 2 \
-    --model.config '{"emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_features": 32}' \
+    --model.emb-features 16 --model.num-layers 1 --model.num-heads 2 --model.mlp-features 32 \
     --trainer.batch-size 32 --trainer.steps 2 --trainer.log-every 1 \
     --trainer.eval-every 2 --trainer.checkpoint-every 2 \
     --trainer.checkpoint-dir /home/you/dew-checkpoints \
