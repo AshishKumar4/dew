@@ -29,6 +29,7 @@ typed-decisions' authors check theirs.
 """
 
 import argparse
+import csv
 import gzip
 import hashlib
 import json
@@ -183,6 +184,10 @@ def hub_rows(reference: str, columns: Sequence[str]) -> Iterator[str]:
         import pyarrow.parquet as pq
 
         rows = pq.read_table(local).to_pylist()
+    elif path.endswith(".csv"):
+        csv.field_size_limit(2**31 - 1)  # an email body can pass csv's default of 131,072 characters
+        with open(local, newline="") as file:
+            rows = list(csv.DictReader(file))
     else:
         with open(local) as file:
             rows = [json.loads(line) for line in file if line.strip()]

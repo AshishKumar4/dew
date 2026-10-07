@@ -114,7 +114,7 @@ def _scored(entries: list[tuple[np.ndarray, np.ndarray, int]]) -> dict:
             "brier": float(np.mean(brier)), "ece": ece(confidence, correct)}
 
 
-def open_jev(engine: Engine, split: str) -> dict:
+def open_jev(engine: Engine, split: str, limit: int | None = None) -> dict:
     """Open-Jev's `test` or `ood` split, each example's questions asked in one request, against its targets.
 
     The examples are grouped as the recipes train on them (`sources.OpenJev`);
@@ -126,7 +126,7 @@ def open_jev(engine: Engine, split: str) -> dict:
 
     rows = defaultdict(list)
     started = time.time()
-    for example in OpenJev().read(split):
+    for example in OpenJev().read(split)[:limit]:
         request = {"state": example.state,
                    "questions": {name: question.wire() for name, question in example.questions.items()}}
         answers = engine(request)["answers"]
@@ -186,13 +186,14 @@ def main() -> None:
     parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--laya", type=Path, help="a checkout of NandhaKishorM/laya at LAYA_COMMIT")
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--limit", type=int, help="ask only the first this many Open-Jev examples")
     options = parser.parse_args()
     if options.suite == "uniform":
         scores = typed_decisions(uniform)
     elif options.suite == "typed-decisions":
         scores = typed_decisions(http(options.url))
     elif options.suite.startswith("open-jev"):
-        scores = open_jev(http(options.url), options.suite.removeprefix("open-jev-"))
+        scores = open_jev(http(options.url), options.suite.removeprefix("open-jev-"), options.limit)
     else:
         scores = battery(http(options.url), options.laya)
     options.out.write_text(json.dumps(scores, indent=1) + "\n")
