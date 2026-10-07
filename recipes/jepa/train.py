@@ -97,7 +97,7 @@ def run_summary(config: JepaRunConfig, encoder_fields: Mapping[str, object]) -> 
     """Flat view of the run, for the tracker."""
     return {
         **encoder_fields,
-        "architecture": config.model.label,
+        "architecture": models.label(config.model.name),
         "dataset": datasets.alias_of(type(config.data)),
         "image_size": sample_field(config).shape[-2],
         "batch_size": config.trainer.batch_size,
