@@ -87,6 +87,27 @@ def test_the_plan_weighs_a_split_file_by_its_groups_and_the_rest_by_armadas_pace
     assert ci.weights(files, timings, "3.14")["tests/test_split.py"] == 30.0
 
 
+def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
+    """The plan weighs a file by what a task spends on it, its import and
+    collection included, so a task's rows add up to its wall time, split in
+    proportion to their tests' own times."""
+    (tmp_path / "tests").mkdir(exist_ok=True)
+    (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
+    (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    out = tmp_path / "verdict.json"
+    began = time.monotonic()
+    ci.task("3.12", ["tests/test_short.py", "tests/test_long.py"], "", out, 60.0)
+    wall = time.monotonic() - began
+    rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
+    short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
+    assert 1.2 < short + long <= wall
+    assert long / short == pytest.approx(3.0, rel=0.25)
+
+
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
     """A hang is graded: the task interrupts pytest at its deadline, short of
     armada's own timeout, kills its process group where the interrupt is not

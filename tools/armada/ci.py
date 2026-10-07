@@ -31,6 +31,7 @@ import signal
 import subprocess
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -124,7 +125,13 @@ def shown(output: str) -> str:
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, grace: float = 60.0) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
-    killing them `grace` seconds after that."""
+    killing them `grace` seconds after that.
+
+    A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
+    the plan weighs a file by what it costs a container (its import, its collection, the
+    container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
+    at 300 seconds ran a median of 392."""
+    began = time.monotonic()
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
     grouping = ["--splits", split.split("/")[1], "--group", split.split("/")[0], "--splitting-algorithm",
@@ -166,6 +173,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     rows = []
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
+                   for name in tests}
+    wall = time.monotonic() - began
+    pace = wall / sum(own_seconds.values()) if sum(own_seconds.values()) > 0 else 0.0
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
@@ -177,7 +188,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             red.append(f"pytest exited {done.returncode} with no report of {name}")
         if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
-        seconds = sum(float(case.get("time") or 0) for case in own)
+        seconds = own_seconds[name] * pace if pace else wall / len(tests)
         rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
                      **({} if split else {"timings": {name: seconds}})})
