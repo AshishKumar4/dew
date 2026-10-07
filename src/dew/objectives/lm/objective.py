@@ -1227,11 +1227,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             if settings is None or settings.max_new_tokens <= 0:
                 return None
             weights = self.evaluation_variables(params, step)
-            return self.policy(weights, settings.sampling), settings.max_new_tokens
+            return self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens
 
         def generate(prepared):
-            policy, max_new_tokens = prepared
-            return policy(self._prompt, max_new_tokens, key=step.key).host().tokens, self._prompt
+            policy, prompt, max_new_tokens = prepared
+            return policy(prompt, max_new_tokens, key=step.key).host().tokens, prompt
 
         return _text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 

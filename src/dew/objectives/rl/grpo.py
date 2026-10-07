@@ -106,7 +106,7 @@ class GRPOObjective(LMObjective):
     `beta` is the KL strength, and at 0.0 no frozen reference is allocated.
     `epsilon_low`, `epsilon_high` and `dual_clip` are the clip points.
     `model` and `seq_len` are as in `LMObjective`, with `seq_len` one less
-    than the row width. An `ema_decay` argument is refused, and so is
+    than the row width. An `ema_decay` other than None is refused, and so is
     `loss_role`, because the response mask already says which targets count.
 
     `policy_loss` picks the surrogate:
@@ -167,7 +167,7 @@ class GRPOObjective(LMObjective):
                  sampling_temperature: float = 1.0, **kwargs):
         if beta < 0:
             raise ValueError(f"beta scales the KL penalty, so it is non-negative, got {beta}")
-        if "ema_decay" in kwargs:
+        if kwargs.get("ema_decay") is not None:
             raise ValueError(
                 "the GRPO reference is frozen at unit decay, so ema_decay is refused")
         if kwargs.get("loss_role") is not None:
