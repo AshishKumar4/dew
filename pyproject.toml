@@ -88,7 +88,7 @@ test = [
     # declare flatbuffers. This version wrote the committed export fixture.
     "flatbuffers==25.12.19",
     "pytest-xdist",
-    # CI's shards: splits the suite by tests/test_durations.json.
+    # CI on armada (tools/armada/ci.py) splits a heavy file by tests/test_durations.json.
     "pytest-split>=0.11",
     "safetensors",
     "torch",

@@ -1508,7 +1508,6 @@
 "tests/test_device_image_augmentation.py::test_the_jitter_is_torchvisions_colorjitter_in_every_order[3]": 0.086,
 "tests/test_device_image_augmentation.py::test_the_jitter_is_torchvisions_colorjitter_in_every_order[4]": 0.084,
 "tests/test_device_image_augmentation.py::test_the_jitter_is_torchvisions_colorjitter_in_every_order[5]": 0.086,
-"tests/test_dew_remote.py::test_the_remote_cli_streams_output_and_returns_the_remote_exit_code": 0.005,
 "tests/test_diffusion_corpora.py::test_a_corpus_is_a_subcommand_and_its_record_reads_back_without_the_recipe": 0.542,
 "tests/test_diffusion_corpora.py::test_the_default_corpus_is_flowers_with_flower_captions": 0.122,
 "tests/test_diffusion_corpora.py::test_the_experiment_names_the_corpus_a_run_read": 0.267,

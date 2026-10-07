@@ -12,6 +12,7 @@ import pytest
 
 from dew.artifacts import Decisions
 from dew.checkpoints import Checkpoints
+from dew.data import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import (
     AURC,
@@ -35,7 +36,7 @@ from dew.decision import (
 )
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import FROZEN
+from dew.objectives.base import FROZEN, VALID_ROWS
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -218,6 +219,28 @@ def test_lora_trains_its_factors_and_the_head_over_a_fixed_base_and_reloads_from
     first, second = live("charged twice!", asked), reloaded("charged twice!", asked)
     for answer, again in zip(first.values(), second.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+
+def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metrics():
+    """The validation pass fills a part-full batch with repeats it marks, so
+    one held-out row under a batch of eight is scored once: the pass's loss
+    and accuracy are that row's alone."""
+    from dew.objectives.base import Step
+    from dew.training.evaluation import Evaluation
+
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    data = objective.dataset(EXAMPLES, batch=8, validation=EXAMPLES[:1])
+    variables = objective.init(jax.random.key(0))
+    result = Evaluation.run(objective, variables, data.val, key=0, metrics=(Accuracy(),), loss=True)
+    alone = objective.dataset(EXAMPLES, batch=1, validation=EXAMPLES[:1])
+    (row,) = list(alone.val(DataPartition()))
+    row = {name: value for name, value in row.items() if name != VALID_ROWS}
+    loss, _ = objective.scalar_loss(variables, row, Step(jnp.asarray(0), jax.random.key(0), None))
+    decisions = objective.evaluate(variables, row, Step(jnp.asarray(0), jax.random.key(0), None))
+    assert result.records == 1
+    assert result.scores["val/loss"] == pytest.approx(float(loss), rel=1e-6)
+    right = np.argmax(decisions.probabilities[0, 0]) == row["labels"][0, 0]
+    assert result.scores["val/accuracy"] == float(right)
 
 
 def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
