@@ -26,6 +26,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sys
 import types
 import typing
@@ -43,7 +44,7 @@ import dew.io
 from dew import registry
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
-from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.config.sweep import RandomSearch, Search, Space, _read, _write
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import Reader, ramped, record_argument
@@ -59,8 +60,10 @@ from dew.registry import (
     from_record,
     models,
     objectives,
+    parameters,
     schedules,
     to_record,
+    wants_tuple,
 )
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
@@ -700,6 +703,59 @@ class Prepared:
     after: Callable[[TrainState, str], None] | None = None
 
 
+def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
+    """The record `node` holds under `key`. A field declaring a base or a
+    union records its value's class beside its fields, and this is the fields."""
+    held = node[key]
+    held = held["fields"] if isinstance(held, dict) and "class" in held else held
+    if not isinstance(held, dict):
+        raise KeyError(f"{key} holds {held!r}, not a record of fields")
+    return held
+
+
+def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
+    """The keys of `path`'s value in `config`'s record, and the annotation it is read by."""
+    *groups, field = path.split(".")
+    held: object = config
+    for group in groups:
+        if not (dataclasses.is_dataclass(held) and group in _names(held)):
+            raise KeyError(f"{path} names no group of the run record")
+        held = getattr(held, group)
+    if isinstance(held, ModelConfig | ObjectiveConfig) and field not in _names(held):
+        member = models[held.name] if isinstance(held, ModelConfig) else objectives[held.name]
+        # A flag's annotation types the value, as `--model.<field>` reads it;
+        # an argument without a flag (the loss a `Supervised` is given) takes JSON.
+        annotation = _declared_type(_member_flags(member, held.fields)[0], field)
+        if annotation is None and field not in parameters(member)[0]:
+            raise KeyError(f"{path} names no argument of {held.name}")
+        return [*groups, "fields", field], annotation
+    if not (dataclasses.is_dataclass(held) and field in _names(held)):
+        raise KeyError(f"{path} names no field of the run record")
+    return [*groups, field], _declared_type(type(held), field)
+
+
+def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
+    """The fields a dataclass declares."""
+    return {field.name for field in dataclasses.fields(held)}
+
+
+def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
+    """`text` as the flag of `annotation` reads it (`RunConfig.assigned`), a
+    tuple as the list its record holds."""
+    if annotation is not None and _scalar(annotation):
+        holder = dataclasses.make_dataclass("Set", [("value", tyro.conf.Positional[annotation])])
+        given = shlex.split(text) if wants_tuple(annotation) else [text]
+        return json.loads(json.dumps(tyro.cli(holder, args=given, prog=f"--set {path}").value))
+    try:
+        return _flag_json(text)
+    except json.JSONDecodeError:
+        return text
+
+
+
+_RANDOM_SEARCH = RandomSearch()
+
+
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration. A kind of run subclasses it with its own
@@ -742,6 +798,42 @@ class RunConfig:
         """Read back what `to_dict` wrote, for subclasses too. A field the
         record lacks takes its default; an unknown field raises."""
         return from_record(cls, values, dtypes=False)
+
+    def override(self, point: Mapping[str, JSON]) -> Self:
+        """This config with each dotted path in `point` replaced, through its record.
+
+        A path walks the run's fields and the fields of the values they hold.
+        Under `model` or `objective`, a name the config does not declare is an
+        argument of the class it names, as `--model.num_layers` is on the
+        command line. A path the run does not declare raises, rather than
+        training the unchanged config.
+        """
+        config = self
+        for path, value in point.items():
+            record = config.to_dict()
+            *groups, field = _placed(config, path)[0]
+            node = record
+            for group in groups:
+                node = _within(node, group)
+            node[field] = value
+            config = type(config).from_dict(record)
+        return config
+
+    def assigned(self, assignments: Sequence[str]) -> Self:
+        """This config with each `path=value` in `assignments` set (`override`).
+
+        The value is read as the field's annotation reads a flag: a number, a
+        string, a literal or a tuple of them as its type parses it on the
+        command line, None for an optional field, and anything else (a record,
+        a list of records) as JSON, or as the text itself when it is not JSON.
+        """
+        config = self
+        for assignment in assignments:
+            path, equals, text = assignment.partition("=")
+            if not equals:
+                raise ValueError(f"{assignment!r} sets no value; write path=value, as trainer.steps=2000")
+            config = config.override({path: _parsed(path, text, _placed(config, path)[1])})
+        return config
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
@@ -998,7 +1090,7 @@ class RunConfig:
             _closed(tracker, sys.exception())
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
-              tracker: Tracker, search: Search = random_search, seed: int = 0) -> list[TrialFinished]:
+              tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:
         """Train `trials` trials of this config over `space` and return the ledger.
 
         Each trial draws a point from `space` and trains under the run name
@@ -1015,9 +1107,9 @@ class RunConfig:
                              "resume from each other")
         finished = _read(path, space)
         for index in range(len(finished), trials):
-            point = search(space, finished, seed)
+            point = search(space, finished)
             name = f"{self.trainer.name}/trial-{index}"
-            value = train(override(self, {**point, "trainer.name": name}))
+            value = train(self.override({**point, "trainer.name": name}))
             trial = TrialFinished(index, name, point, value)
             finished.append(trial)
             _write(path, space, finished)
