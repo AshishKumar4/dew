@@ -16,6 +16,66 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
     --learning-rate <lr> --out <json>
 ```
 
+## The performance gate, 2026-10-07
+
+CI checks correctness, and `tools/perf_gate.py` checks speed. It runs one fixed
+battery on two Dew trees on one machine, in alternating rounds (base then head,
+then head then base). The battery is the training step of a 359.8M dense
+decoder and a 321.8M MoE decoder at 4 x 1024 tokens and SimpleDiT-B at batch
+32, Qwen3-0.6B served at 32 and 128 slots, causal attention forward and backward
+(cudnn and xla, 2048 tokens, 128-wide heads), the Oxford Flowers input pipeline,
+and the save and restore of lm-dense's training state. Each row runs in a
+process of its own, with the tree's own copy of the tool where it has one. A row
+regresses when the head's median is worse than the base's by more than either
+tree's spread across rounds (at least 2%), and the two trees' ranges do not
+overlap. `report` writes the table and exits 1 on a regression. Every commit
+promoted to main that touches `src` passes the gate on a Colab A100 first, and
+its table is kept in `tools/measurements/perf_gate/<head>-vs-<base>.md`:
+
+```
+python tools/perf_gate.py run --base main=<tree> --head head=<tree> --rounds 3 \
+    --model <Qwen3-0.6B snapshot> --flowers <TFDS oxford_flowers102 dir> --out gate.json
+python tools/perf_gate.py report gate.json --table gate.md
+```
+
+A row that one tree cannot run is reported as not compared, not gated. The
+serving tool, for example, needs a newer PRNG API than main had on 2026-09-30.
+The 32-slot serving row is host-bound, and its median across rounds spread 33%
+on the A100's VM, so a serving sample is the best of five repeats, since noise
+only slows it. The gate's CPU rows stay off armada. A small decoder's CPU
+training step ran 458-735 ms across six containers on one commit, a 1.6x
+spread, and within one container it varied by 1.6-10% between processes, too
+wide to gate a regression of a few percent.
+
+The first runs, on Colab A100 40 GB VMs, three rounds each. Against main a week
+earlier (`94f7d773`), `6329435e` was faster in every row both trees ran. The
+step rows of the week-old tree ran its own, older `benchmark_step.py`, so some of
+that may be the tool. The checkpoint rows ran in a separate session:
+
+| row | `94f7d773` | `6329435e` | change |
+|---|---:|---:|---:|
+| step lm-dense 4 x 1024 (ms) | 82.58-82.87 | 71.55-71.92 | -13.4% |
+| step lm-moe 4 x 1024 (ms) | 57.15-57.18 | 51.68-51.70 | -9.6% |
+| step SimpleDiT-B batch 32 (ms) | 41.25-41.36 | 38.92-38.98 | -5.6% |
+| attention cudnn fwd+bwd (ms) | 9.89-10.36 | 10.02-11.24 | level |
+| attention xla fwd+bwd (ms) | 36.67-36.69 | 36.73-36.87 | level |
+| checkpoint save (ms, median) | 10518 | 6213 | -40.9% |
+| checkpoint restore (ms, median) | 3504 | 2638 | -24.7% |
+
+`85c07cfb`, the next promotion, against `6329435e` in one session, was level in
+every row:
+
+| row | `6329435e` | `85c07cfb` |
+|---|---:|---:|
+| step lm-dense 4 x 1024 (ms) | 71.83-72.02 | 71.76-71.94 |
+| step lm-moe 4 x 1024 (ms) | 51.76-51.82 | 51.67-51.75 |
+| step SimpleDiT-B batch 32 (ms) | 39.03-39.08 | 38.95-39.12 |
+| serve 128 slots (tokens/s, median of 3) | 12858-14327 | 14194-14423 |
+| attention cudnn fwd+bwd (ms) | 11.05-11.58 | 10.39-11.59 |
+| attention xla fwd+bwd (ms) | 36.85-37.20 | 36.83-37.42 |
+| checkpoint save (ms) | 5812-6402 | 6024-6394 |
+| checkpoint restore (ms) | 2582-2618 | 2613-2720 |
+
 ## Training scoreboard, 2026-10-03
 
 I ran Dew and `torch.compile` on the same models with the same batch, bf16
