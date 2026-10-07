@@ -34,7 +34,7 @@ from collections.abc import Mapping
 
 import tyro
 
-from dew.config import ModelConfig, OptimConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.data import DataPhase, PackedTokens
 from dew.training.optim import ParamGroup, Power, PowerTail
 
@@ -140,8 +140,8 @@ def run_config(args: RigelArgs):
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
         trainer=TrainerConfig(batch_size=args.batch_size, steps=args.steps,
                               eval_every=None, checkpoint_every=5_000),
-        tokenizer=args.tokenizer, ema_decay=None, sample_tokens=0,
-        aux_loss_alpha=0.001, seq_aux=False, router_z_loss=0.0001)
+        objective=ObjectiveConfig("lm", {"aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}),
+        tokenizer=args.tokenizer, sample_tokens=0)
 
 
 if __name__ == "__main__":

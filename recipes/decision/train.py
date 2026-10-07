@@ -13,8 +13,10 @@ adapter in place of the whole model:
         --lora.modules q_proj v_proj --data.path PolyAI/banking77 --data.validation-split test \\
         --data.question intent --trainer.batch-size 32 --trainer.steps 2000
 
-The loss is the log loss plus `--brier`, `--spherical` and
-`--ranked-probability` times their rules. A tenth of the rows, at most 400,
+The loss is the log loss unless the objective names another rule, or a
+weighted sum of rules (`--objective.loss '{"class": "dew.decision.scoring:Combined",
+"fields": {"terms": [[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}'`).
+A tenth of the rows, at most 400,
 are held out (`--data.held-out`); validation scores them, and after
 training they fit the temperatures the task divides its logits by, saved
 into the run, so `Decide.from_run` and `dew.pipeline` answer calibrated.
@@ -25,22 +27,9 @@ A question type's temperature needs ten held-out answers and a bucket's
 import json
 from dataclasses import dataclass, field, replace
 
-from dew.config import ModelConfig, OptimConfig, RunConfig
+from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig
 from dew.data.text import HFTokenizer
-from dew.decision import (
-    AURC,
-    ECE,
-    Accuracy,
-    Brier,
-    Decide,
-    DecisionObjective,
-    DecisionTable,
-    LayaCheckpoint,
-    LogLoss,
-    RankedProbability,
-    ScoringRule,
-    Spherical,
-)
+from dew.decision import AURC, ECE, Accuracy, Decide, DecisionTable, LayaCheckpoint, LogLoss
 from dew.interop import Pretrained
 from dew.training import TrainState, prepare_process, run_timestamp
 
@@ -49,7 +38,9 @@ from dew.training import TrainState, prepare_process, run_timestamp
 class DecisionRunConfig(RunConfig):
     """A run, plus the decision objective's own knobs."""
 
-    objective: str = "decision"
+    objective: ObjectiveConfig = field(default_factory=lambda: ObjectiveConfig("decision"))
+    """The decision objective and its arguments: its scoring rule (`loss`),
+    label smoothing, option shuffling and none-of-the-above rate."""
     data: DecisionTable = field(default_factory=DecisionTable)
     optim: OptimConfig = field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
     model: ModelConfig = field(
@@ -59,12 +50,6 @@ class DecisionRunConfig(RunConfig):
     subfolder: str | None = None
     """The checkpoint's folder inside a repository that bundles several, such as `multilingual`."""
     revision: str | None = None
-    brier: float = 0.0
-    spherical: float = 0.0
-    ranked_probability: float = 0.0
-    label_smoothing: float = 0.0
-    shuffle_options: bool = True
-    none_of_the_above: float = 0.0
     calibrate: bool = True
     """Fit the task's temperatures on the held-out rows after training."""
     max_len: int | None = None
@@ -73,15 +58,6 @@ class DecisionRunConfig(RunConfig):
     """The tokens the question and its options share; None keeps the
     checkpoint's (Laya's 192). A question of many options wants more, or
     its options are cut to a few tokens each."""
-
-    def loss(self) -> ScoringRule:
-        """The log loss, plus each other rule at its weight."""
-        rule: ScoringRule = LogLoss()
-        for weight, other in ((self.brier, Brier()), (self.spherical, Spherical()),
-                              (self.ranked_probability, RankedProbability())):
-            if weight > 0:
-                rule = rule + weight * other
-        return rule
 
 
 def backbone(config: DecisionRunConfig) -> Decide | Pretrained:
@@ -119,10 +95,7 @@ def main(config: DecisionRunConfig) -> TrainState:
     elif config.max_len or config.head_max_len:
         raise ValueError("--max-len and --head-max-len resize a Laya checkpoint's layout; "
                          "another backbone takes the default layout")
-    objective = DecisionObjective(start, loss=config.loss(), tokenizer=tokenizer, layout=layout,
-                                  label_smoothing=config.label_smoothing,
-                                  shuffle_options=config.shuffle_options,
-                                  none_of_the_above=config.none_of_the_above)
+    objective = config.objective.build(backbone=start, tokenizer=tokenizer, layout=layout)
     train, held_out = config.data.examples()
     data = objective.dataset(train, batch=config.trainer.batch_size, validation=held_out or None,
                              seed=config.data.seed, loading=config.data.loading)

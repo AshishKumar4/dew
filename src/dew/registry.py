@@ -201,16 +201,15 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         is built here from its record. For example,
         `models.build("m", attention={"heads": 8})` and
         `models.build("m", attention=Attention(heads=8))` build the same model.
-        Keyword fields override the record's. A function member's fields are
-        its parameters, converted to their annotations the same way.
+        Keyword fields override the record's. The fields of a function, or of a
+        class that is not a dataclass, are its parameters, converted to their
+        annotations the same way.
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
         held = _record_class(member)
-        if held is not None:
-            given = _declared(held, given, dtypes=True)
-        elif not isinstance(member, type):
-            given = _arguments(member, given, dtypes=True)
+        given = (_declared(held, given, dtypes=True) if held is not None
+                 else _arguments(member, given, dtypes=True))
         return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
@@ -498,12 +497,10 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
 
 def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
     """What `member` builds from a record of its fields: a dataclass's fields
-    as it declares them, a function's as its parameters."""
+    as it declares them, a function's or another class's as its parameters."""
     held = _record_class(member)
     if held is not None:
         return _construct(held, fields, dtypes=dtypes)
-    if isinstance(member, type):
-        raise ValueError(f"{member.__qualname__} is not a dataclass, and a record names the fields of one")
     return configured(member(**_arguments(member, fields, dtypes=dtypes)))
 
 
@@ -578,11 +575,13 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> di
 
 def _arguments(function: Callable[..., Configured], fields: Mapping[str, object], *,
                dtypes: bool) -> dict[str, Configured]:
-    """The record's fields as the parameters of the registered `function`,
-    each walked against its own annotation, as `_declared` walks a
-    dataclass's. A field the function does not take, or a parameter without
-    a default that the record lacks, raises; a function taking `**kwargs`
-    takes any field."""
+    """The record's fields as the parameters of the registered `function`, or
+    of a class's constructor, each walked against its own annotation, as
+    `_declared` walks a dataclass's. A field the function does not take, or a
+    parameter without a default that the record lacks, raises; a function
+    taking `**kwargs` takes any field. A record or a JSON list is read
+    against its parameter's annotation and a dtype's name is the dtype; any
+    other value, a scalar or a value the caller built, is taken as given."""
     parameters = inspect.signature(function).parameters.values()
     named = [parameter for parameter in parameters
              if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)]
@@ -594,7 +593,8 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
     if unknown or missing:
         raise ValueError(f"{function.__name__} does not match the record: unknown fields {unknown}, "
                          f"missing fields {missing}; its parameters are {names}")
-    return {name: _rebuilt(_parameter_type(function, name), configured(value), dtypes=dtypes, name=name)
+    return {name: _rebuilt(_parameter_type(function, name), value, dtypes=dtypes, name=name)
+            if isinstance(value, (Mapping, list)) or (dtypes and name == "dtype") else value
             for name, value in fields.items()}
 
 
@@ -604,8 +604,10 @@ def _parameter_type(function: Callable[..., Configured], name: str) -> Annotatio
     annotation. An annotation naming what the function's module does not
     import at runtime raises, since a record cannot be read against it."""
     # A classmethod a record names, `Class.reader`, is a bound method; its
-    # annotations and module are its function's.
-    underlying = function.__func__ if isinstance(function, types.MethodType) else function
+    # annotations and module are its function's, and a class's are its
+    # constructor's.
+    underlying = (function.__init__ if isinstance(function, type)
+                  else function.__func__ if isinstance(function, types.MethodType) else function)
     if not isinstance(underlying, types.FunctionType):
         return None
     annotations = get_annotations(underlying, format=Format.FORWARDREF)
@@ -876,6 +878,7 @@ objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
     "ppo": "dew.objectives.rl.ppo:PPOObjective",
     "rcm": "dew.objectives.diffusion.consistency:ConsistencyDistillationObjective",
     "shortcut": "dew.objectives.diffusion.few_step:ShortcutObjective",
+    "supervised": "dew.objectives.supervised:Supervised",
 })
 mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "attention": "dew.nn.mixers.attention:AttentionMixer",
