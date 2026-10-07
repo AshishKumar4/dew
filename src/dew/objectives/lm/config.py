@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data import PackedTokens, TokenWindows
 from dew.data.text import HFTokenizer, tokenizer_for
-from dew.registry import models, objectives
+from dew.registry import models, objectives, resolve_dtype
 from dew.sampling.text import Sampling
 
 from .objective import Perplexity, Samples
@@ -183,8 +183,7 @@ class LMRunConfig(RunConfig):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
         name, revision = split_revision(self.pretrained)
-        dtype = self.model.fields.get("dtype")
-        loaded = Pretrained.load(name, **({} if dtype is None else {"dtype": str(dtype)}),
+        loaded = Pretrained.load(name, dtype=resolve_dtype(self.model.fields.get("dtype")),
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
                                  max_seq_len=reach, revision=revision)
         if not same_vocabulary(written, loaded, name):
