@@ -3,13 +3,13 @@
 A row of token ids is corrupted by masking each position with the process's
 probability at a drawn time. The model reads the whole corrupted row, its
 states attending both ways (`dew.nn.protocols.TokenModel` with `causal` False),
-and predicts the original tokens through its head (`AffineHead`). The loss
+and predicts the original tokens through its head. The loss
 is the cross entropy at the masked positions, under a distribution that
 gives the mask token no mass (MDLM's SUBS parameterization), weighted by
 the process's NELBO weight and averaged over every position of the batch.
 That average is the continuous-time negative ELBO the paper trains. The
 cross entropy is the LM objective's chunked one, which holds one vocabulary
-slice of logits at a time.
+slice of logits at a time where the head is a matrix.
 
 Evaluation scores every row's corruption loss as `TokenScores`, so
 perplexity-style metrics read the negative ELBO; the preview hook alone
@@ -38,7 +38,7 @@ from dew.coordination import agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
-from dew.nn.protocols import AffineHead, HiddenStates, TokenModel
+from dew.nn.protocols import Logits, TokenModel
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -53,7 +53,7 @@ from dew.objectives.base import (
     Variables,
     thaw,
 )
-from dew.objectives.lm.chunked import head_cross_entropy
+from dew.objectives.lm.chunked import head_cross_entropy, logits_cross_entropy, reads_states
 from dew.objectives.lm.objective import _batch_text
 from dew.records import JSON
 from dew.registry import objectives
@@ -98,9 +98,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
-        `model` gives its final states and its head (`HiddenStates`,
-        `AffineHead`), and its states attend both ways (`TokenModel` with
-        `causal` False), as `CausalTransformer(causal=False)`'s do. `solver`
+        `model` gives its logits, from its final states through its head or
+        from its tokens (`chunked.reads_states`, `Logits`), and its states
+        attend both ways (`TokenModel` with `causal` False), as
+        `CausalTransformer(causal=False)`'s do. `solver`
         and `steps` set how generation unmasks, in the preview and in the
         task `pipeline` returns, and `samples` is how many rows the preview
         draws. `decode` turns a row of ids into the text the artifact shows;
@@ -116,15 +117,15 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         `processor` is what `pipeline` uses to turn text into ids and decode
         them, unless it is given another one. A run records its tokenizer."""
         model = self.bind_model(model, variables=variables, processor=processor)
-        lacking = [read.__name__ for read in (HiddenStates, AffineHead) if not isinstance(model, read)]
-        if lacking:
-            raise TypeError(
-                f"masked diffusion scores a model's final states through its head, and a "
-                f"{type(model).__name__} gives no {' or '.join(lacking)}")
         if not isinstance(model, TokenModel) or model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so its states attend "
                 "both ways (TokenModel with causal False), as CausalTransformer(causal=False)'s do")
+        if not reads_states(model) and not isinstance(model, Logits):
+            raise TypeError(
+                f"masked diffusion scores a model's logits, and a {type(model).__name__} gives none: no "
+                f"head over its final states (HiddenStates with AffineHead or LogitsFromHidden) and "
+                f"no Logits")
         self.model = model
         self.process = process
         self.seq_len = seq_len
@@ -238,13 +239,16 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         is_masked = is_masked & real
         masked = jnp.where(is_masked, masked, tokens)
 
-        hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
-                                  method="hidden_states", mutable=False, capture_intermediates=False,
-                                  **prepared.kwargs())
+        over_states = reads_states(self.model)
+        read = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
+                                method="hidden_states" if over_states else "logits", mutable=False,
+                                capture_intermediates=False, **prepared.kwargs())
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
-        losses, predicted, _ = head_cross_entropy(self.model, params, hidden, tokens, self.head_chunks,
-                                                  excluded=self.process.mask_id)
+        mask_id = self.process.mask_id
+        losses, predicted, _ = (
+            head_cross_entropy(self.model, params, read, tokens, self.head_chunks, excluded=mask_id)
+            if over_states else logits_cross_entropy(read, tokens, excluded=mask_id))
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 
