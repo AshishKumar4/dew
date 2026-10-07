@@ -269,7 +269,8 @@ def _distributed() -> State:
     """jax.distributed's state in this process: its client, the pool's size
     as it formed and its preemption service.
 
-    JAX exports none of them; its own multihost_utils and orbax read this
+    JAX exports whether the pool formed (`jax.distributed.is_initialized`)
+    and none of the rest; its own multihost_utils and orbax read this
     object, and Dew reads it here alone. orbax names no public accessor
     (`orbax.checkpoint.multihost`, once imported, has none), and a jax that
     keeps the state elsewhere is refused, naming its version, not read wrong.
@@ -288,11 +289,6 @@ def _client():
     if client is None:
         raise RuntimeError("this process is in no pool: jax.distributed.initialize has not run")
     return client
-
-
-def pool_formed() -> bool:
-    """Whether this process joined a pool through jax.distributed."""
-    return _distributed().client is not None
 
 
 def pool_size() -> int:
