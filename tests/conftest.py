@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 
@@ -48,6 +49,22 @@ def own_rung_records(monkeypatch, tmp_path_factory):
         return directory[0]
 
     monkeypatch.setattr(rungs, "rung_records", records)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def release_compilations():
+    """Each test file's compiled executables are released when it ends.
+
+    XLA:CPU maps every executable's code into the process, and JAX keeps an
+    executable for as long as its jit cache does. A run that goes on through
+    many files reached 65,391 mappings, past the 65,530 a Linux kernel allows
+    by default, and the next compile failed with "Failed to materialize
+    symbols". Ubuntu 24.04 allows 1,048,576, so GitHub's runners never saw
+    it; Debian and most kernels do.
+    """
+    yield
+    jax.clear_caches()
+    gc.collect()
 
 
 @pytest.fixture

@@ -1,0 +1,20 @@
+{
+  "name": "dew",
+  "environment": {
+    "base": "cloudflare/debian-trixie",
+    "setup": "tools/armada/setup.sh",
+    "install": "tools/armada/install.sh",
+    "key": ["pyproject.toml", "constraints.txt"],
+    "smoke": ".venv-3.12/bin/python -c 'import dew' && .venv-3.14/bin/python -c 'import dew'"
+  },
+  "history": "commit",
+  "env": { "JAX_PLATFORMS": "cpu", "PYTHONFAULTHANDLER": "1" },
+  "pool": 220,
+  "target": 300,
+  "plan": { "command": ["python3", "tools/armada/ci.py", "plan", "--target={target}", "--timings={timings}"] },
+  "task": {
+    "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
+                "--out={out}"],
+    "timeout": 1800
+  }
+}

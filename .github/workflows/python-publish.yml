@@ -3,7 +3,7 @@ name: Publish to PyPI
 # Releases only. Pushes to main must not ship untested code to PyPI.
 #
 # A release publishes only what passed on its own commit: the whole CI
-# (lint, package and every test shard) runs here on the release's commit,
+# (lint, package and the suite on armada) runs here on the release's commit,
 # the wheel and sdist are built from it, and that same artifact is installed
 # into an empty environment, compiled, run through its `dew` entry point and
 # trained on before the publish job, which needs all three, uploads it.
@@ -23,6 +23,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+    # The test job reaches armada with ARMADA_URL and ARMADA_TOKEN.
+    secrets: inherit
 
   build:
     needs: ci
