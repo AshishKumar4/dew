@@ -46,7 +46,8 @@ def pipelines(tmp_path_factory):
 
 def precision() -> ModelConfig:
     """The default model record at float32 on the XLA kernel."""
-    return dataclasses.replace(DiffusionRunConfig().model, dtype="float32", attention_impl="xla")
+    model = DiffusionRunConfig().model
+    return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
 
 
 def value(objective, params, batch) -> float:
