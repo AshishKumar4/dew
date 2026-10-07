@@ -32,6 +32,7 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
+from dew.registry import metrics
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
@@ -82,6 +83,8 @@ class FlowGRPOObjective(DiffusionObjective):
     `sde` configures both the rollout and the rescoring. `variables` is the
     whole variables tree the policy starts from, as `DiffusionObjective`
     takes it: the model's collections, `encoders` and any `autoencoder`.
+    `reward`, `groups`, `rollout_steps` and `train_steps` are the rollout
+    `rollout` builds; a rollout over another reward is a `FlowRollout` of its own.
     """
 
     # The loss is a policy-gradient surrogate, shown without a direction.
@@ -95,7 +98,11 @@ class FlowGRPOObjective(DiffusionObjective):
                  clip_range: float = 1e-4, adv_clip_max: float = 5.0,
                  autoencoder: AutoEncoder | None = None,
                  guidance: CFG | None = _DEFAULT_GUIDANCE, solver: Solver = _DEFAULT_SOLVER,
-                 steps: int = 41, variables: Variables | None = None):
+                 steps: int = 41, variables: Variables | None = None, reward: str = "clip_score",
+                 groups: int = 4, rollout_steps: int = 11, train_steps: int | None = None):
+        if ":" not in reward and reward not in metrics:
+            raise ValueError(f"reward names {reward!r}, which no metric alias names; the aliases are "
+                             f"{sorted(metrics)}, or name a metric by its import path")
         if not math.isfinite(beta) or beta < 0:
             raise ValueError("beta must be finite and non-negative")
         if not math.isfinite(clip_range) or not 0 <= clip_range < 1:
@@ -116,6 +123,27 @@ class FlowGRPOObjective(DiffusionObjective):
         self.beta = beta
         self.clip_range = clip_range
         self.adv_clip_max = adv_clip_max
+        self.reward, self.groups = reward, groups
+        self.rollout_steps, self.train_steps = rollout_steps, train_steps
+
+    def rollout(self) -> FlowRollout:
+        """The trainer's rollout over this objective: `groups` samples of each
+        prompt over `rollout_steps` time points, the first `train_steps`
+        transitions trained, each scored by the image metric `reward` names
+        against its own prompt, higher being better (`clip_score`)."""
+        from dew.artifacts import ImageGrid
+        from dew.eval.common import ImageMetric
+
+        metric = metrics[self.reward]()
+        if not isinstance(metric, ImageMetric):
+            raise ValueError(f"reward {self.reward!r} is a {type(metric).__name__}, and Flow-GRPO "
+                             "scores each sample with an image metric's per-sample measure")
+
+        def reward(images, batch):
+            return np.asarray(metric.fn(ImageGrid(images), batch))
+
+        return FlowRollout(self, reward, groups=self.groups, steps=self.rollout_steps,
+                           train_steps=self.train_steps)
 
     def _walk(self, params: Variables, batch: Batch) -> Walk:
         """The walk of the denoiser this batch's conditions select, guided as

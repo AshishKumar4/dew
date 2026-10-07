@@ -25,7 +25,6 @@ from flax import linen as nn
 
 from dew.nn.blocks import torch_bicubic_resize
 from dew.objectives.base import Batch, Objective, Variables
-from dew.objectives.diffusion.end_to_end import EndToEnd
 
 ALIGNMENT = "alignment_projector"
 """The projector's key in `params`, beside the model's own modules."""
@@ -82,11 +81,15 @@ class Alignment:
     """Aligns the model's hidden tokens at `layer` with a frozen encoder's features.
 
     `encoder` is a Flax module that maps pixels `[B, S, S, 3]` to patch
-    features `[B, N, D]` or `[B, h, w, D]`. The pixels are resized to
-    `resolution` (None keeps the data's size) and normalized by `mean` and
-    `std`. `variables` are the encoder's weights, held frozen under
-    `REPRESENTATION`. `layer` names the submodule of the model whose output
-    is aligned (`dit_block_7` for REPA's depth 8 on `simple_dit`). That
+    features `[B, N, D]` or `[B, h, w, D]`, any module a record names, as a
+    model is named. Its weights are the starting tree's `REPRESENTATION`
+    when it holds them, else `source`'s: a transformers `Dinov2Model`
+    checkpoint (`repo`, `repo@revision` or a directory), by default REPA's
+    DINOv2-B/14, which a run's record pins to a commit. With `encoder` None
+    the encoder is the source's own, read at `resolution` pixels. The pixels
+    are resized to `resolution` (None keeps the data's size) and normalized
+    by `mean` and `std`. `layer` names the submodule of the model whose
+    output is aligned (`dit_block_7`, REPA's depth 8 on `simple_dit`). That
     output must be a `[B, N, width]` token sequence in raster order over the
     same grid as the encoder's patches.
 
@@ -94,28 +97,47 @@ class Alignment:
     projector. `projector="conv"` with `kernel_size` and a `spatial_norm`
     gamma (0.6 in iREPA's training script) is iREPA's, which z-scores each
     feature over the tokens after subtracting gamma times its spatial mean.
-    The pixel statistics default to ImageNet's, which DINOv2 uses. With
-    `resolution` None the encoder gets the data's size; REPA's DINOv2 reads
-    224 pixels of a 256 image (`resolution=224`). The loss adds
-    `weight / 2` times the alignment term, because Dew's L2 halves the
-    denoising error that REPA adds the term to.
+    The pixel statistics default to ImageNet's, which DINOv2 uses; REPA's
+    DINOv2 reads 224 pixels of a 256 image. The loss adds `weight / 2` times
+    the alignment term, because Dew's L2 halves the denoising error that
+    REPA adds the term to.
     """
 
-    encoder: nn.Module
-    variables: Variables
-    layer: str
+    layer: str = "dit_block_7"
+    encoder: nn.Module | None = None
+    source: str | None = "facebook/dinov2-base"
     weight: float = 0.5
     projector: Literal["mlp", "conv"] = "mlp"
     width: int = 2048
     kernel_size: int = 3
     spatial_norm: float | None = None
-    resolution: int | None = None
+    resolution: int | None = 224
     mean: tuple[float, float, float] = IMAGENET_MEAN
     std: tuple[float, float, float] = IMAGENET_STD
 
     def __post_init__(self):
         if self.projector not in ("mlp", "conv"):
             raise ValueError(f"projector is mlp or conv, not {self.projector!r}")
+
+    def network(self, held: Variables | None) -> tuple[Alignment, Variables]:
+        """This alignment with its encoder, and the encoder's weights: `held`, a
+        starting tree's `REPRESENTATION`, when given, else `source`'s."""
+        if self.encoder is not None and held is not None:
+            return self, held
+        if self.source is None:
+            raise ValueError(f"the alignment's encoder takes its weights from the starting tree's "
+                             f"{REPRESENTATION!r}, which holds none, or from a source; name one")
+        from dew.interop.pretrained import split_revision
+        from dew.nn.autoencoders.rae import load_dinov2
+
+        name, revision = split_revision(self.source)
+        module, params, _ = load_dinov2(name, revision=revision,
+                                        params=None if held is None else held["params"])
+        if self.encoder is not None:
+            module = self.encoder
+        elif self.resolution is not None:
+            module = module.clone(input_size=self.resolution)
+        return dataclasses.replace(self, encoder=module), {"params": params}
 
     def targets(self, variables: Variables, images: jax.Array) -> jax.Array:
         """Return the encoder's `[B, N, D]` features of `images` in [-1, 1], with no gradient.
@@ -127,6 +149,7 @@ class Alignment:
         pixels = (pixels - jnp.asarray(self.mean)) / jnp.asarray(self.std)
         if self.resolution is not None and self.resolution != pixels.shape[1]:
             pixels = torch_bicubic_resize(pixels, self.resolution, self.resolution)
+        assert self.encoder is not None, "`network` gives the alignment its encoder"
         features = self.encoder.apply(variables, pixels)
         if not isinstance(features, jax.Array):
             raise TypeError("a representation encoder must return one array of patch features")
@@ -169,46 +192,3 @@ class Alignment:
 
 
 __all__ = ["ALIGNMENT", "REPRESENTATION", "Alignment", "Projector", "spatial_zscore"]
-
-
-@dataclasses.dataclass(frozen=True)
-class RepresentationAlignment:
-    """Alignment of the model's hidden tokens with a frozen DINOv2's patch features.
-
-    This is REPA (Yu et al. 2025) or iREPA (Singh et al. 2026), optionally with the
-    autoencoder tuned end to end through it, as in REPA-E (Leng et al. 2025).
-
-    `encoder` is a transformers `Dinov2Model` checkpoint given as `repo`,
-    `repo@revision` or a directory, by default REPA's DINOv2-B/14, read at
-    `resolution` pixels; a run's record pins it to a commit. `layer` names the
-    model's submodule whose output is aligned: REPA aligns after the eighth block,
-    which is `dit_block_7` on `simple_dit`. The other fields are `Alignment`'s, and
-    `end_to_end` is REPA-E's `EndToEnd`, which needs a KL `autoencoder`.
-    """
-
-    encoder: str = "facebook/dinov2-base"
-    layer: str = "dit_block_7"
-    weight: float = 0.5
-    projector: Literal["mlp", "conv"] = "mlp"
-    width: int = 2048
-    kernel_size: int = 3
-    spatial_norm: float | None = None
-    resolution: int = 224
-    end_to_end: EndToEnd | None = None
-
-    def build(self, variables: Variables | None = None) -> Alignment:
-        """Return the alignment over the encoder's weights.
-
-        It uses the `representation` subtree of `variables` when the tree holds one, as a
-        saved run's does, and the checkpoint's weights otherwise.
-        """
-        from dew.interop.pretrained import split_revision
-        from dew.nn.autoencoders.rae import load_dinov2
-
-        name, revision = split_revision(self.encoder)
-        supplied = (variables or {}).get(REPRESENTATION, {}).get("params")
-        module, params, _ = load_dinov2(name, revision=revision, params=supplied)
-        return Alignment(module.clone(input_size=self.resolution), {"params": params}, self.layer,
-                         weight=self.weight, projector=self.projector, width=self.width,
-                         kernel_size=self.kernel_size, spatial_norm=self.spatial_norm,
-                         resolution=self.resolution)

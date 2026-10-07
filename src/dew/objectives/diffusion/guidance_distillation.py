@@ -10,7 +10,6 @@ this module follows the paper's equation.
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Sequence
 from dataclasses import replace
 
@@ -19,13 +18,15 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 
+from dew.diffusion.presets import Preset
 from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
+from dew.lora import unadapted
 from dew.objectives.base import Aux, ProgramModule, Step, Variables
 
-from .objective import TEACHER, DiffusionObjective, Distillation, _own_loss
+from .objective import TEACHER, DiffusionObjective, _own_loss, teacher_weights
 
 
 def with_guidance(conditions: dict, scale: jax.Array) -> dict:
@@ -42,69 +43,48 @@ def guided_target(conditional: jax.Array, unconditional: jax.Array, scale: jax.A
     return unconditional + expand(scale, conditional) * (conditional - unconditional)
 
 
-@dataclasses.dataclass(frozen=True)
-class GuidanceDistillation(Distillation):
-    """Distillation of a saved run's classifier-free guidance into this run's model.
-
-    The student reads the guidance scale through its conditioning's guidance input
-    (`GuidanceDistillationObjective`), so sampling runs one branch. `scales` is the
-    range each row's scale is drawn from.
-    """
-
-    guided = False
-
-    scales: tuple[float, float] = (1.0, 8.0)
-
-    def __post_init__(self) -> None:
-        low, high = (float(value) for value in self.scales)
-        object.__setattr__(self, "scales", (low, high))
-
-    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
-        """Return the student objective over the teacher run's objective and its variables.
-
-        The teacher's variables are the copy a saved student tree holds when `variables` is
-        given, and otherwise the weights the teacher run published.
-        """
-        from dew.checkpoints import Checkpoints
-
-        from .config import DiffusionRunConfig
-
-        held = (variables[TEACHER] if variables is not None else Checkpoints(self.teacher).variables(
-            ema=None, step=None, mesh=None, layout=None, param_dtype=None))
-        teacher = DiffusionRunConfig.load(self.teacher).build(variables=held)
-        return GuidanceDistillationObjective(teacher=teacher, teacher_variables=held, scales=self.scales,
-                                             variables=variables, **run)
-
-
 class GuidanceDistillationObjective(DiffusionObjective):
-    """Distills `teacher`'s classifier-free guidance into this model.
+    """Distills a teacher's classifier-free guidance into this model.
 
-    `teacher` is the teacher's objective, and `teacher_variables` is its whole
-    variables tree, held frozen under `TEACHER`. The teacher reads its own
-    conditioning of the batch, the conditioning its run trained on. Each row
-    draws a scale uniformly from `scales`. The student reads that scale as its
-    conditioning record's `guidance`, and regresses its raw output onto the
-    teacher's guided raw output at that scale, both on the same noised
-    sample, under the process's weighting. The two must share the process's
-    schedule and prediction and the data's latent geometry, and the student's
-    conditioning must have a guidance input, as a guidance-embedded Flux's
-    does.
+    The teacher is the run in the directory `teacher_run`, rebuilt from its
+    record, or, without one, the model `teacher` (by default this one without
+    its adapter) over this objective's process and inputs. Its whole
+    variables tree is held frozen under `TEACHER`: the starting tree's when it
+    holds one, as a saved student's does, else the one the teacher run
+    published. The teacher reads its own conditioning of the batch, the
+    conditioning its run trained on. Each row draws a scale uniformly from
+    `scales`. The student reads that scale as its conditioning record's
+    `guidance`, and regresses its raw output onto the teacher's guided raw
+    output at that scale, both on the same noised sample, under the process's
+    weighting. The two must share the process's schedule and prediction and
+    the data's latent geometry, and the student's conditioning must have a
+    guidance input, as a guidance-embedded Flux's does. Sampling is unguided.
     """
 
-    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *,
-                 teacher: DiffusionObjective, teacher_variables: Variables,
+    def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
+                 teacher: nn.Module | None = None, teacher_run: str | None = None,
                  scales: tuple[float, float] = (1.0, 8.0), **kwargs):
-        if (type(teacher.process.schedule) is not type(process.schedule)
-                or type(teacher.process.prediction) is not type(process.prediction)):
-            raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
-                             "two share the process's schedule and prediction")
         _own_loss("guidance distillation", kwargs)
         super().__init__(model, process, inputs, **kwargs)
-        if teacher.latent_shape != self.latent_shape:
-            raise ValueError(f"the teacher denoises {teacher.latent_shape} and the student "
+        held = teacher_weights(self.variables, teacher_run, whole=True)
+        if teacher_run is None:
+            built = DiffusionObjective(unadapted(self.model) if teacher is None else teacher, self.process,
+                                       self.inputs, autoencoder=self.autoencoder, ema_decay=None)
+        elif teacher is not None:
+            raise ValueError("the teacher run names its own model; give the run or the model")
+        else:
+            from .config import DiffusionRunConfig
+
+            built = DiffusionRunConfig.load(teacher_run).build(variables=held)
+        if (type(built.process.schedule) is not type(self.process.schedule)
+                or type(built.process.prediction) is not type(self.process.prediction)):
+            raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
+                             "two share the process's schedule and prediction")
+        if built.latent_shape != self.latent_shape:
+            raise ValueError(f"the teacher denoises {built.latent_shape} and the student "
                              f"{self.latent_shape}; they share one latent geometry")
-        self.teacher = teacher
-        self.teacher_variables = teacher_variables
+        self.teacher = built
+        self.teacher_variables = held
         self.scales = scales
 
     def program_key(self) -> tuple[ProgramModule, ...]:

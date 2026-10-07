@@ -23,7 +23,6 @@ import dataclasses
 import datetime
 import functools
 import hashlib
-import inspect
 import json
 import os
 import re
@@ -178,7 +177,12 @@ class ObjectiveConfig:
         object.__setattr__(self, "name", registry.import_path(objectives[self.name]))
 
     def build(self, **derived: Configured) -> Objective:
-        """Build the objective from its fields and the arguments the caller `derived`."""
+        """Build the objective from its fields and the arguments the caller
+        `derived`; an argument both give is refused, since the caller's would
+        silently replace what the run states."""
+        stated = sorted(set(self.fields) & set(derived))
+        if stated:
+            raise ValueError(f"the run derives {stated} for {self.name}; leave them out of its arguments")
         return objectives.build(self.name, self.fields, **derived)
 
 
@@ -229,15 +233,14 @@ def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]
                            field.default_factory() if callable(field.default_factory) else None)
                 yield field.name, default, _declared_type(member, field.name)
         return
-    for parameter in inspect.signature(member).parameters.values():
-        default = None if parameter.default is parameter.empty else parameter.default
-        built = parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty
-        if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY) and not built:
-            try:
-                annotation = _parameter_type(member, parameter.name)
-            except ValueError:
-                annotation = None
-            yield parameter.name, default, annotation
+    for name, (parameter, owner) in registry.parameters(member)[0].items():
+        if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:
+            continue  # what the caller builds, the model first
+        try:
+            annotation = _parameter_type(owner, name)
+        except ValueError:
+            annotation = None
+        yield name, None if parameter.default is parameter.empty else parameter.default, annotation
 
 
 def _chosen(given: list[str], field: str) -> str | None:
@@ -279,9 +282,14 @@ def _scalar(annotation: Annotation) -> bool:
 
 
 _JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
-    nargs=1, metavar="JSON", instance_from_str=lambda given: json.loads(given[0]),
+    nargs=1, metavar="JSON", instance_from_str=lambda given: _flag_json(given[0]),
     is_instance=lambda given: True, str_from_instance=lambda given: [json.dumps(given)])
 """A model field tyro cannot type, written as the JSON record `build` reads."""
+
+
+def _flag_json(text: str) -> JSON:
+    """A JSON flag's value: its JSON, or None for `None`, as every optional flag spells it."""
+    return None if text == "None" else json.loads(text)
 
 
 @dataclasses.dataclass(frozen=True)

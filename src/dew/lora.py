@@ -882,6 +882,17 @@ def _named(layouts: Mapping[str, WeightLayout], wanted: Sequence[str]) -> dict[s
     return matched
 
 
+def unadapted(model: nn.Module) -> nn.Module:
+    """`model` without its adapter: its base class over the same fields. A
+    model no adapter wraps is itself."""
+    model_type = type(model)
+    if not isinstance(model_type, _Adapted):
+        return model
+    return model_type._dew_lora_base(**{field.name: getattr(model, field.name)
+                                        for field in dataclasses.fields(model)
+                                        if field.init and field.name not in ("parent", "name")})
+
+
 @runtime_checkable
 class _Adapted(Protocol):
     """Marks a module class an adapter already wrapped.
@@ -898,4 +909,4 @@ class _Adapted(Protocol):
     def _dew_lora_record(cls) -> dict: ...
 
 
-__all__ = ["Adapter", "LoRA", "PeftConfig", "Target"]
+__all__ = ["Adapter", "LoRA", "PeftConfig", "Target", "unadapted"]

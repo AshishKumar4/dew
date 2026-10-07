@@ -16,8 +16,7 @@ uses; the preview hook limits itself to the display count.
 
 from __future__ import annotations
 
-import dataclasses
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from collections.abc import Mapping, Sequence
 from functools import cached_property
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol, runtime_checkable
@@ -37,6 +36,7 @@ from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec, unit_range
+from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.mp import Uncertainty
@@ -57,7 +57,7 @@ from dew.objectives.base import (
     thaw,
     under,
 )
-from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment, RepresentationAlignment
+from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.records import JSON
 from dew.sampling.guidance import CFG, Guidance
@@ -67,8 +67,6 @@ from dew.sampling.solvers import DDIM, Consistency, Solver
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
-    from dew.objectives.diffusion.config import DiffusionRunConfig
-    from dew.objectives.rl.flow import FlowRollout
 
 # Samples a validation batch draws, conditioned or not.
 VALIDATION_SAMPLES = 4
@@ -96,11 +94,29 @@ LOSS_HEADS = (UNCERTAINTY, ALIGNMENT, AUTOENCODER, FAKE_SCORE, DISCRIMINATOR)
 
 def _own_loss(name: str, kwargs: dict) -> None:
     """Refuse the denoising loss's extras, which an objective with its own
-    loss would leave unused, and sample unguided unless `kwargs` guide."""
-    unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end") if kwargs.get(key) is not None)
+    loss would leave unused, and a guidance: its model samples unguided, the
+    few steps it learns or the guidance it was trained with standing in."""
+    unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end", "guidance")
+                    if kwargs.get(key) is not None)
     if unused:
-        raise ValueError(f"{name} trains on its own loss, which reads none of {unused}")
-    kwargs.setdefault("guidance", None)
+        raise ValueError(f"{name} trains on its own loss and samples unguided, which reads none of {unused}")
+    kwargs["guidance"] = None
+
+
+def teacher_weights(variables: Variables | None, run: str | None, *, whole: bool = False) -> Variables:
+    """A distillation's frozen teacher: the starting tree's `TEACHER` when it
+    holds one, as a saved distilled run's does, else the weights the teacher's
+    run directory `run` published, the model's alone unless `whole`."""
+    if variables is not None and TEACHER in variables:
+        return variables[TEACHER]
+    if run is None:
+        raise ValueError(f"the teacher's weights come from the starting tree's {TEACHER!r}, which holds "
+                         f"none, or from the teacher's run; name its directory (teacher_run=)")
+    from dew.checkpoints import Checkpoints
+
+    restored = Checkpoints(run).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+    return restored if whole else _without_loss_heads(
+        {name: tree for name, tree in restored.items() if name not in ("encoders", "autoencoder")})
 
 
 def _without_loss_heads(variables: Variables) -> Variables:
@@ -192,6 +208,7 @@ class TunedLatents(NamedTuple):
 _DEFAULT_SOLVER = DDIM()
 _DEFAULT_GUIDANCE = CFG(3.0)
 _DEFAULT_STEPS = 200
+_CONSISTENCY = Consistency()
 
 
 class _SourceSolver(Protocol):
@@ -307,8 +324,9 @@ class DiffusionObjective(Objective[Ratio]):
         `alignment` adds REPA's or iREPA's representation alignment (`Alignment`)
         between the model's hidden tokens at one layer and a frozen encoder's
         features of the clean sample. Its projector trains under `params` as
-        `ALIGNMENT`, the encoder's weights stay frozen under `REPRESENTATION`, and a
-        published task drops both.
+        `ALIGNMENT`, the encoder's weights stay frozen under `REPRESENTATION`, taken
+        from `variables` when it holds them and from the alignment's source
+        otherwise, and a published task drops both.
 
         `end_to_end` trains the autoencoder together with the model, as REPA-E does
         (`EndToEnd`). It needs `alignment` and a KL autoencoder. The autoencoder's
@@ -346,7 +364,8 @@ class DiffusionObjective(Objective[Ratio]):
         self.variables = variables
         self._condition_precision = jax.config.jax_default_matmul_precision
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
-        self.alignment = alignment
+        self.alignment, self.representation = (None, None) if alignment is None else alignment.network(
+            None if variables is None else variables.get(REPRESENTATION))
         self.end_to_end = end_to_end
         if end_to_end is not None:
             if alignment is None or autoencoder is None or inputs.mask is not None:
@@ -403,7 +422,7 @@ class DiffusionObjective(Objective[Ratio]):
         return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
 
     def encoder_params(self) -> dict:
-        if self.variables is not None:
+        if self.variables is not None and "encoders" in self.variables:
             return dict(self.variables["encoders"])
         return {keyword: condition.encoder.params
                 for keyword, condition in self.inputs.conditions.items()}
@@ -446,11 +465,14 @@ class DiffusionObjective(Objective[Ratio]):
         This is one mapping, so an objective that starts from more than the towers
         extends both this and `init`.
         """
-        held: dict[str, Any] = dict(self.variables or {"encoders": self.encoder_params()})
-        if self.variables is None and self.autoencoder is not None:
-            held["autoencoder"] = self.autoencoder.params
-        if self.alignment is not None and REPRESENTATION not in held:
-            held[REPRESENTATION] = self.alignment.variables
+        held: dict[str, Any] = dict(self.variables or {})
+        if "params" not in held:
+            # Parts a draw goes beside: the towers they leave out are the built ones.
+            held.setdefault("encoders", self.encoder_params())
+            if self.autoencoder is not None:
+                held.setdefault("autoencoder", self.autoencoder.params)
+        if self.representation is not None:
+            held.setdefault(REPRESENTATION, self.representation)
         if self.end_to_end is not None and self.end_to_end.perceptual_weight and PERCEPTUAL not in held:
             from dew.eval.lpips import LPIPSNetwork
 
@@ -781,126 +803,34 @@ class DiffusionObjective(Objective[Ratio]):
         return self.artifact(samples, captions)
 
 
-class Training(ABC):
-    """How a diffusion run trains: the denoising loss, or a loss of its own in its place.
-
-    A run holds one (`DiffusionRunConfig.mode`), aliased in
-    `dew.registry.trainings` under the alias of the objective it builds. `preset_class` is the preset
-    the objective's loss trains under, None for any, and `guided` is whether
-    validation samples with the run's guidance, which a few-step student or a
-    model with its guidance trained in does not.
-    """
-
-    preset_class: ClassVar[type[Preset] | None] = None
-    guided: ClassVar[bool] = True
-
-    @abstractmethod
-    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
-        """Return this mode's objective over `variables` and `run`: the run's model, process, inputs,
-        autoencoder, EMA decay, condition dropout and sampling, as `DiffusionObjective` takes them.
-
-        `base` is the run's model without its adapter, for a teacher.
-        """
-
-    def check(self, run: DiffusionRunConfig) -> None:
-        """Refuse a run this mode cannot train.
-
-        That is a run under another preset than `preset_class`, or a guided one when
-        this mode samples unguided.
-        """
-        name = type(self).__name__
-        if self.preset_class is not None and not isinstance(run.preset, self.preset_class):
-            raise ValueError(f"{name} trains on its own loss under the {self.preset_class.__name__} preset; "
-                             f"the run names {type(run.preset).__name__ if run.preset else None}")
-        if not self.guided and run.guidance is not None:
-            raise ValueError(f"{name} samples unguided; set guidance None")
-
-    def rollout(self, objective: DiffusionObjective) -> FlowRollout | None:
-        """Return the trainer's rollout over `objective`.
-
-        Without one, as here, the trainer trains on each batch as it comes.
-        """
-        return
-
-
-@dataclasses.dataclass(frozen=True)
-class Denoising(Training):
-    """The denoising loss, `DiffusionObjective`'s training mode.
-
-    `uncertainty` is the number of Fourier channels of a head that learns EDM2's
-    loss weighting; EDM2 uses 128, and None keeps the preset's fixed weighting.
-    `alignment` aligns the model's hidden tokens with a frozen DINOv2's (REPA or
-    iREPA), and its `end_to_end` also tunes the autoencoder through the alignment
-    (REPA-E).
-    """
-
-    uncertainty: int | None = None
-    alignment: RepresentationAlignment | None = None
-
-    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
-        alignment = self.alignment
-        return DiffusionObjective(variables=variables, uncertainty=self.uncertainty, **run,
-                                  alignment=None if alignment is None else alignment.build(variables),
-                                  end_to_end=None if alignment is None else alignment.end_to_end)
-
-    def check(self, run: DiffusionRunConfig) -> None:
-        super().check(run)
-        if self.alignment is not None and self.alignment.end_to_end is not None and run.autoencoder is None:
-            raise ValueError("end-to-end tuning trains a run's own `autoencoder`; a pipeline sets none")
-
-
-@dataclasses.dataclass(frozen=True)
-class Distillation(Training):
-    """A mode that distills a saved run, whose directory `teacher` names; a run without one is refused.
-
-    The teacher's model is this run's `model` without the run's adapter. An objective built in
-    code is given the teacher's model and weights directly.
-    """
-
-    teacher: str = ""
-
-    def check(self, run: DiffusionRunConfig) -> None:
-        super().check(run)
-        if not self.teacher:
-            raise ValueError(f"{type(self).__name__} distills a teacher; name its run directory")
-
-    def teacher_variables(self, variables: Variables | None) -> Variables:
-        """Return the teacher's model variables: a saved distilled tree's own copy, else the teacher
-        run's published ones."""
-        from dew.checkpoints import Checkpoints
-
-        if variables is not None:
-            return variables[TEACHER]
-        restored = Checkpoints(self.teacher).variables(ema=None, step=None, mesh=None, layout=None,
-                                                       param_dtype=None)
-        return _without_loss_heads({name: tree for name, tree in restored.items()
-                                    if name not in ("encoders", "autoencoder")})
-
-
 class FlowDistillationObjective(DiffusionObjective):
     """A few-step student of a flow teacher's model, trained on a loss of its own: rCM's and LADD's.
 
-    `teacher` is the teacher's model and `teacher_variables` its variables, frozen under `TEACHER`.
-    A tree that lacks the loss's own `network` starts the student as the teacher, in buffers the
-    step may donate, the weights under `FROZEN` in an adapter's split, which freezes all but its
-    factors, beside that network (`network_variables`). Sampling runs `Consistency`, unguided.
+    `teacher` is the teacher's model, by default the student's own without
+    its adapter. Its weights, frozen under `TEACHER`, are the starting tree's
+    when it holds them, else those the teacher's run directory `teacher_run`
+    published (`teacher_weights`). A tree that lacks the loss's own `network`
+    starts the student as the teacher, in buffers the step may donate, the
+    weights under `FROZEN` in an adapter's split, which freezes all but its
+    factors, beside that network (`network_variables`). Sampling runs
+    `Consistency`, unguided.
     """
 
     network: ClassVar[str]
     """The network the loss trains beside the student under `params`."""
 
-    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *, teacher: nn.Module,
-                 teacher_variables: Variables, **kwargs):
+    def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
+                 teacher: nn.Module | None = None, teacher_run: str | None = None,
+                 solver: Solver = _CONSISTENCY, **kwargs):
         name = type(self).__name__
-        if not (isinstance(process.schedule, FlowMatchingScheduler) and not process.interval
-                and isinstance(process.prediction, FlowMatchPredictionTransform)):
+        _own_loss(name, kwargs)
+        super().__init__(model, process, inputs, solver=solver, **kwargs)
+        if not (isinstance(self.process.schedule, FlowMatchingScheduler) and not self.process.interval
+                and isinstance(self.process.prediction, FlowMatchPredictionTransform)):
             raise ValueError(f"{name} distills a velocity model on the linear path; build the process with "
                              "presets.Flow()")
-        _own_loss(name, kwargs)
-        kwargs.setdefault("solver", Consistency())
-        super().__init__(model, process, inputs, **kwargs)
-        self.teacher = teacher
-        self.teacher_variables = teacher_variables
+        self.teacher = unadapted(self.model) if teacher is None else teacher
+        self.teacher_variables = teacher_weights(self.variables, teacher_run)
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The student, then the frozen teacher."""
