@@ -339,9 +339,7 @@ class Router(nn.Module):
 # experts (docs/performance.md). On sm80, sm86 and sm89 JAX's Pallas kernels
 # run 5x to 61x faster than XLA's ragged_dot, a product over every expert.
 # On TPU v5e/v6e XLA wins except tokamax's mosaic_tpu_v2 (1.11x-1.38x at 8
-# experts), which is not a dependency: tokamax 0.0.14 pins typeguard==2.13.3
-# where tyro needs >=4, and only constraints.txt's main-commit pin installs
-# without it. Unlisted generations run 'xla'.
+# experts), which is not a dependency. Unlisted generations run 'xla'.
 GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas',
                                 'v5e': 'xla', 'v6e': 'xla'}
 
