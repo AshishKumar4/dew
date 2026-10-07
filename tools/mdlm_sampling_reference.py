@@ -57,7 +57,7 @@ def main() -> None:
     arrays = {name: value.astype(np.float32) for name, value in (
         ("embed", generator.standard_normal((VOCAB, FEATURES))),
         ("position", generator.standard_normal((length, FEATURES))),
-        ("head", 2 * generator.standard_normal((FEATURES, VOCAB))))}
+        ("head", 0.6 * generator.standard_normal((FEATURES, VOCAB))))}
     model = mdlm_reference.stand_in(reference, Reader(**arrays))
     model.mask_index = MASK
     model.sampler, model.device = "ddpm", "cpu"
