@@ -56,7 +56,7 @@ python "$DEW_REPO/recipes/lm/train.py" data:token-windows \
     --data.loading.workers 0 --data.loading.threads 1 \
     --data.loading.read-buffer 2 --data.val-batches 2 \
     --model.dtype float32 --model.attention-impl reference \
-    --model.config '{"emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_features": 32}' \
+    --model.emb-features 16 --model.num-layers 1 --model.num-heads 2 --model.mlp-features 32 \
     --trainer.batch-size 8 --trainer.steps 2 --trainer.log-every 1 \
     --trainer.eval-every 2 --trainer.checkpoint-every 2 \
     --trainer.checkpoint-dir runs --trainer.name byte-demo \
@@ -85,16 +85,16 @@ Every recipe's configuration extends `RunConfig` with four parts:
 
 | Part | Holds | CLI example |
 | --- | --- | --- |
-| `model` (`ModelConfig`) | Architecture, constructor fields, compute dtype, parameter dtype, attention implementation. | `--model.architecture causal_transformer` |
+| `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | `--model causal_transformer --model.num-layers 12` |
 | `data` | A dataset specification and its loading settings. | `data:token-windows --data.seq-len 16` |
 | `optim` (`OptimConfig`) | Optimizer, learning rate, schedule, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, batch size, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
-A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a dataset type by its alias and makes its flags available. Put all architecture fields in one JSON object passed to `--model.config`, spelled as in Python (`num_layers`), and use only fields the chosen architecture accepts. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), so they do not go in `--model.config`.
+A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a dataset type by its alias and makes its flags available. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), not model fields.
 
 | Setting | Default | Notes |
 |---|---|---|
-| `--model.dtype` | `bfloat16` | Compute dtype. Parameters are stored in float32; `--model.param-dtype` stores them otherwise for a model that declares a `param_dtype` field, and for a `--pretrained` pipeline. A model that declares no field for a precision setting the run names refuses the run, naming the field; set that flag to `None`. |
+| `--model.dtype` | `bfloat16` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
 | `--model.attention-impl` | `auto` | `auto`, `reference`, `xla`, `cudnn` or `tpu`. The example uses `reference` so no device-specific kernel runs. |
 | `--optim.optimizer` | `adamw` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
 | `--optim.learning-rate` | `2.7e-4` | The constant rate when no schedule is named. |
@@ -137,11 +137,11 @@ A diffusion configuration adds a training `preset`, a validation `solver`, guida
 
 By default the recipe trains on Oxford Flowers with a CLIP text encoder and scores validation with a CLIP metric. Prepare Oxford Flowers first and pass it as `--data.path` ([Installation](installation.md)). The CLIP text encoder and the CLIP metric download `openai/clip-vit-large-patch14` from Hugging Face unless it is cached. An offline tracker does not prepare any of these.
 
-`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So `--model` then sets only `dtype`, `param_dtype` and `attention_impl`, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA.
+`--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So the model flags then set only `--model.dtype` and `--model.attention-impl`, the parameters load in float32, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA.
 
 `preset:none` trains with the convention the pipeline's scheduler reads, using the flow shift its sampler applies at that resolution. That shift is 3.0 for SD3, and for Flux it is exp(mu), with mu linear in the packed latent's token count. A scheduler file says how its checkpoint samples and says nothing about how it was trained, so this is a choice Dew makes for fine-tuning. A preset of the same kind replaces it, for example `preset:flow --preset.shift 1.0`. `run.json` records a Hub source as `repo@commit`.
 
-To train one of these published architectures from scratch, name it in `--model.architecture` and put its fields in `--model.config`. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
+To train one of these published architectures from scratch, name it with `--model` and set its fields with `--model.<field>` flags. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
 
 `mode:flow-grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--mode.groups` images through the flow SDE and scores them with the image metric named by `--mode.reward`. That metric has to give better images higher scores, as `clip_score` does.
 
