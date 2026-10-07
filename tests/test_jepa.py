@@ -8,6 +8,7 @@ import optax
 import pytest
 from affine_run import Data
 from recording import RecordingTracker
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.artifacts import Representations
 from dew.inputs import Field
@@ -344,12 +345,30 @@ def test_the_targets_come_from_the_ema_encoder(mask, rng):
 
 # --- collapse telemetry ----------------------------------------------------
 
-def test_representation_std_detects_collapse():
-    healthy = jax.random.normal(jax.random.PRNGKey(0), (32, 16))
-    collapsed = jnp.tile(healthy[:1], (32, 1))
+def health_in(z, dtype):
+    """`representation_health`'s two statistics in numpy at `dtype`: the
+    mean per-dimension population std, and the RMS off-diagonal entry of the
+    unbiased covariance."""
+    z = np.asarray(z, dtype)
+    centered = z - z.mean(axis=0)
+    cov = centered.T @ centered / (len(z) - 1)
+    off = cov[~np.eye(z.shape[1], dtype=bool)]
+    return np.asarray([z.std(axis=0).mean(), np.sqrt(np.mean(off ** 2))])
 
-    assert float(representation_health(healthy)["repr_std"]) > 0.5
-    assert float(representation_health(collapsed)["repr_std"]) < 1e-6
+
+def test_representation_health_is_the_float64_statistics():
+    """Both statistics against numpy's in float64, as exact as numpy's float32,
+    on embeddings whose dimensions are half redundant; a collapsed batch has
+    neither, to float32's rounding of its mean."""
+    rng = np.random.default_rng(0)
+    base = rng.normal(size=(32, 8))
+    z = np.concatenate([base, base + 0.1 * rng.normal(size=(32, 8))], axis=1).astype(np.float32)
+    health = representation_health(jnp.asarray(z))
+    dew = np.asarray([health["repr_std"], health["repr_cov_offdiag"]])
+    assert_as_exact_as_the_reference(dew, health_in(z, np.float32), health_in(z, np.float64),
+                                     "representation health")
+    collapsed = representation_health(jnp.tile(jnp.asarray(z[:1]), (32, 1)))
+    assert float(collapsed["repr_std"]) < 1e-6 and float(collapsed["repr_cov_offdiag"]) < 1e-6
 
 
 def test_collapse_telemetry_flows_through_a_degenerate_encoder(mask, rng):
@@ -375,20 +394,14 @@ def test_collapse_telemetry_flows_through_a_degenerate_encoder(mask, rng):
     assert float(healthy_aux.metrics["repr_std"]) > 1e-3
 
 
-def test_offdiagonal_covariance_rises_with_redundant_dimensions():
-    base = jax.random.normal(jax.random.PRNGKey(0), (64, 1))
-    redundant = jnp.tile(base, (1, 8))                       # every dim identical
-    independent = jax.random.normal(jax.random.PRNGKey(1), (64, 8))
-    assert (float(representation_health(redundant)["repr_cov_offdiag"])
-            > 5 * float(representation_health(independent)["repr_cov_offdiag"]))
-
-
 # --- EMA target encoder ----------------------------------------------------
 
-def test_momentum_schedule_endpoints(mask):
+def test_momentum_rises_linearly_to_its_second_value_and_stays(mask):
+    """I-JEPA's linear momentum schedule, m0 + (m1 - m0) min(t / steps, 1),
+    held to its float64 value along the way and past the end."""
     objective = make_objective(mask, momentum=(0.996, 1.0), momentum_steps=1000)
-    assert float(objective.ema.decay(0)) == pytest.approx(0.996)
-    assert float(objective.ema.decay(1000)) == pytest.approx(1.0)
+    for t in (0, 1, 250, 999, 1000, 4000):
+        assert float(objective.ema.decay(t)) == pytest.approx(0.996 + 0.004 * min(t / 1000, 1), abs=1e-7)
     assert objective.ema.select(("params", "context_encoder", "anything"))
     assert not objective.ema.select(("params", "predictor", "anything"))
 
@@ -527,10 +540,53 @@ def separable_embeddings(num_classes=4, per_class=8, dim=6, noise=0.05):
     return jnp.asarray(x[order], dtype=jnp.float32), jnp.asarray(labels[order])
 
 
-def test_probes_separate_clustered_embeddings():
-    x, y = separable_embeddings()
-    assert float(linear_probe_accuracy(x, y, num_classes=4, steps=200)) > 0.9
-    assert float(knn_probe_accuracy(x, y, num_classes=4, k=3)) > 0.9
+def overlapping_embeddings(num_classes=4, rows=96, dim=6):
+    """Four classes whose clusters overlap, so a probe scores neither every
+    held-out row nor none of them."""
+    rng = np.random.default_rng(1)
+    labels = rng.integers(num_classes, size=rows)
+    x = rng.normal(size=(num_classes, dim))[labels] + rng.normal(size=(rows, dim)) * 0.8
+    return x.astype(np.float32), labels
+
+
+def test_the_knn_probe_is_cosine_neighbours_majority():
+    """The held-out half's accuracy under the majority label of its five most
+    cosine-similar rows of the first half, as numpy computes it in float64."""
+    x, y = overlapping_embeddings()
+    fit, test = x[:48].astype(np.float64), x[48:].astype(np.float64)
+    similarity = (test / np.linalg.norm(test, axis=1, keepdims=True)) @ (
+        fit / np.linalg.norm(fit, axis=1, keepdims=True)).T
+    nearest = np.argsort(-similarity, axis=1)[:, :5]
+    votes = np.stack([np.bincount(y[:48][row], minlength=4) for row in nearest])
+    expected = np.mean(votes.argmax(axis=1) == y[48:])
+    assert 0.3 < expected < 1.0
+    accuracy = knn_probe_accuracy(jnp.asarray(x), jnp.asarray(y), num_classes=4, k=5)
+    assert float(accuracy) == pytest.approx(expected)
+
+
+def test_the_linear_probe_is_adamw_logistic_regression_on_standardized_features():
+    """Torch's float64 AdamW on the same standardized first half, at the probe's
+    rate, decay and step count, predicts the held-out half as the probe does."""
+    import torch
+
+    x, y = overlapping_embeddings()
+    fit, test = (torch.tensor(part, dtype=torch.float64) for part in (x[:48], x[48:]))
+    mean, std = fit.mean(0), fit.std(0, unbiased=False) + 1e-6
+    fit, test = (fit - mean) / std, (test - mean) / std
+    w = torch.zeros(6, 4, dtype=torch.float64, requires_grad=True)
+    b = torch.zeros(4, dtype=torch.float64, requires_grad=True)
+    optimizer = torch.optim.AdamW([w, b], lr=1e-2, weight_decay=1e-4, eps=1e-8)
+    for _ in range(100):
+        optimizer.zero_grad()
+        torch.nn.functional.cross_entropy(fit @ w + b, torch.tensor(y[:48])).backward()
+        optimizer.step()
+    logits = (test @ w + b).detach().numpy()
+    top = np.sort(logits, axis=1)
+    assert (top[:, -1] - top[:, -2]).min() > 1e-3, "a held-out row sits on the boundary"
+    expected = np.mean(logits.argmax(axis=1) == y[48:])
+    assert 0.3 < expected < 1.0
+    accuracy = linear_probe_accuracy(jnp.asarray(x), jnp.asarray(y), num_classes=4)
+    assert float(accuracy) == pytest.approx(expected)
 
 
 def test_probe_metrics_score_representations_and_average_over_the_pass():
