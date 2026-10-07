@@ -13,6 +13,7 @@ export class Host extends DurableObject {
 	async warm() { await this.ctx.storage.put('ready', true); }
 	async available() { return (await this.ctx.storage.get('ready')) === true; }
 	async allocate() { if (!(await this.available())) throw new Error('a visitor cannot start a cold host'); }
+	async has() { return true; }
 	async retire() { await this.ctx.storage.put('ready', false); }
 }
 const generation = { snapshot: { id: 'snapshot' }, commit: 'a'.repeat(40), created: Date.now(), prepareSeconds: 1, snapshotSeconds: 1, smokeSeconds: 1 };
