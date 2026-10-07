@@ -28,6 +28,8 @@ class Tiny(nn.Module):
     2^-level being the reference's level; and the class is the condition's
     second token, whose table entry is the class."""
 
+    interval = True
+
     @nn.compact
     def __call__(self, x, time, textcontext, duration=None, train=False):
         def column(value):
