@@ -281,16 +281,6 @@ def run_record(directory: str, step: int | str | None = None) -> Mapping[str, ob
     record = named_fields(record, 'checkpoint artifact')
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    model = record.get('model')
-    if isinstance(model, Mapping) and isinstance(model.get('architecture'), str):
-        from dew.registry import models
-        name = model['architecture']
-        if name not in models:
-            raise ValueError(
-                f"this run's model is recorded as {name!r}, which no registered model is named. A "
-                f"class trained before it was registered is recorded under its name in lower case: "
-                f"register it once, `@dew.registry.models({name!r})` above the class, import it, and "
-                f"load again")
     return record
 
 
@@ -703,7 +693,7 @@ class MaskedGeneration:
         if process.mask_id != mask_id:
             raise ValueError("model and process mask token disagree")
         solver = named_fields(record['solver'], 'solver')
-        unmask = solvers.build(named(solver['name'], 'solver'), named_fields(solver['fields'], 'fields'))
+        unmask = solvers.build(named(solver['class'], 'solver'), named_fields(solver['fields'], 'fields'))
         if not isinstance(unmask, Unmask):
             raise ValueError("a saved masked run requires an Unmask solver")
         return cls(model, variables, process, processor, solver=unmask,

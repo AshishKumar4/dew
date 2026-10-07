@@ -9,8 +9,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.registry import models
-
 from ..attention import RMSNorm, Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
@@ -96,7 +94,6 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
     return conv(features=model.output_channels)(x)
 
 
-@models("unet")
 class Unet(nn.Module):
     """Denoises images with a convolutional UNet of residual blocks and cross-attention stages.
 

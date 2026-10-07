@@ -182,7 +182,7 @@ def _wrapper_layouts(tensors, record, variables):
     from dew.nn import vision
     from dew.nn.vision.common import projector_weight_path
 
-    tower_kind = record["tower"]["name"]
+    tower_kind = record["tower"]["class"]
     audio_encoder = None if record["audio"] is None else towers.from_record(record["audio"])
     bindings = []
     retained = {}
@@ -199,7 +199,7 @@ def _wrapper_layouts(tensors, record, variables):
         paths: tuple[tuple[str, ...], ...] = ()
         transpose = None
         if group == "projector":
-            path = projector_weight_path(record["projector"]["name"], local)
+            path = projector_weight_path(record["projector"]["class"], local)
             paths = (("params", "projector", *path),)
             if path[-1] == "kernel" and local != "mm_input_projection_weight":
                 transpose = (1, 0)
@@ -214,7 +214,7 @@ def _wrapper_layouts(tensors, record, variables):
                 if path[-1] == "kernel":
                     transpose = (1, 0) if tensor.ndim in (2, 5) else (3, 2, 0, 1)
         elif group == "audio_projector":
-            path = projector_weight_path(record["audio_projector"]["name"], local)
+            path = projector_weight_path(record["audio_projector"]["class"], local)
             paths = (("params", "audio_projector", *path),)
             if path[-1] == "kernel":
                 transpose = (1, 0)
@@ -367,7 +367,7 @@ class Pretrained:
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
         from dew.records import record, text
-        from dew.registry import objectives
+        from dew.registry import models, objectives
         declaration = run_record(str(directory), step)
         model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         model = model_config.build()
@@ -380,16 +380,17 @@ class Pretrained:
             Sampling(**sampling), budget if isinstance(budget, int) else None)
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
-        if model_config.architecture == "causal_transformer":
+        trained = models[model_config.architecture]
+        if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
             bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
                                                    generation_config=generation)
-            if kind == 'masked_diffusion':
+            if objectives[kind] is objectives['masked_diffusion']:
                 bundle = PretrainedMaskedDecoder(
                     decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
-        elif model_config.architecture == "diffusion_gemma":
+        elif trained is models["diffusion_gemma"]:
             from dew.interop import diffusion_gemma
             block = from_record(DiffusionGemma, model)
             bundle = PretrainedBlockDecoder(
@@ -1264,7 +1265,7 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
         return {"params": params}, layouts
 
     pooled = model.additional_time_features > 0
-    built = {"name": "unet_2d_condition",
+    built = {"class": "unet_2d_condition",
              "fields": {**fields, "dtype": dtype,
                         "stages": [asdict(stage) for stage in model.stages]}}
     return _Denoiser(
@@ -1316,7 +1317,7 @@ def _transformer_denoiser(name: str, model: nn.Module, fields: Mapping[str, obje
                          patch: int, latent_input: int, sample_size: tuple[int, int], context_width: int,
                          pipeline: str, origin: Origin = "scheduler", frames: int | None = None) -> _Denoiser:
     """Build the native record with the pipeline's already resolved conditioning and geometry."""
-    built = {"name": name, "fields": {**{key: list(value) if isinstance(value, tuple) else value
+    built = {"class": name, "fields": {**{key: list(value) if isinstance(value, tuple) else value
                                          for key, value in fields.items()}, "dtype": dtype}}
     return _Denoiser(
         component="transformer", model=model, weights=weights, built=built, config=config,
@@ -1816,12 +1817,12 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        text_fields["mixer"] = {"name": "attention", "fields": {"bidirectional_images": True}}
+        text_fields["mixer"] = {"class": "attention", "fields": {"bidirectional_images": True}}
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
         kinds = decoders._kinds_of(text_fields).copy()
         sliding = NativeFields(decoders.LayerKind, {
             **kinds.get("sliding_attention", {}),
-            "mixer": {"name": "attention", "fields": {"bidirectional_images": True}}})
+            "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
     if family in _QWEN35_TYPES:
@@ -1833,7 +1834,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         kinds = decoders._kinds_of(text_fields).copy()
         full = NativeFields(decoders.LayerKind, {
             **kinds.get("full_attention", {}),
-            "mixer": {"name": "attention", "fields": {
+            "mixer": {"class": "attention", "fields": {
                       "mrope_section": [sections[0], sections[1], sections[2]]}}})
         kinds["full_attention"] = full
         text_fields["kinds"] = kinds

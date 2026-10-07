@@ -28,7 +28,6 @@ from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import pixel_shuffle, pixel_unshuffle
 from dew.nn.sharding import logical_axes
-from dew.registry import models
 
 from .joint import (
     DoubleStreamBlock,
@@ -91,7 +90,6 @@ class FluxSingleBlock(nn.Module):
                                             precision=self.precision, name="proj_fused")(joined)
 
 
-@models("flux_transformer")
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
                ("proj_out",): ("embed", None),
                ("timestep_embedder_linear_1",): (None, "embed"),

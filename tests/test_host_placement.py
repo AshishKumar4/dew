@@ -122,12 +122,12 @@ SHAPES = {
     "moe": {"num_layers": 4, "mixture": {"experts": 4, "top_k": 2, "bias": True}},
     "gated_delta_net": {"num_layers": 4, "layer_types": ("linear_attention",) * 4,
                             "kinds": {"linear_attention": {
-                                "mixer": {"name": "gated_delta_net", "fields": {}}}}},
+                                "mixer": {"class": "gated_delta_net", "fields": {}}}}},
     "latent_attention": {"num_layers": 4, "mixer": {
-        "name": "mla", "fields": {"kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
+        "class": "mla", "fields": {"kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
         "qk_nope_head_dim": 4, "v_head_dim": 8}}},
     "indexed_latent_attention": {"num_layers": 4, "mixer": {
-        "name": "mla", "fields": {"kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
+        "class": "mla", "fields": {"kv_lora_rank": 16, "q_lora_rank": 16, "qk_rope_head_dim": 4,
         "qk_nope_head_dim": 4, "v_head_dim": 8, "index_n_heads": 2, "index_head_dim": 8,
         "index_topk": 4}}},
     "untied_head": {"num_layers": 4, "tie_embeddings": False},

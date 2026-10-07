@@ -77,7 +77,6 @@ from dew.objectives.lm.chunked import (
     support_log_probs,
 )
 from dew.records import JSON
-from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -485,7 +484,6 @@ def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
 _DEFAULT_SAMPLING = Sampling()
 
 
-@objectives("lm")
 class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
 
@@ -1225,7 +1223,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             texts=tuple(decode(row.tolist()) for row in np.asarray(generated)))
 
 
-@metrics("perplexity")
 class Perplexity:
     """Reports exp of the cross entropy per counted target over a whole pass.
 

@@ -23,7 +23,6 @@ import numpy as np
 from dew.artifacts import Artifact, Decisions
 from dew.decision.metrics import Answered
 from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
-from dew.registry import metrics
 
 
 class ScoringRule(ABC):
@@ -72,7 +71,6 @@ def _probabilities(logits: jax.Array, options: jax.Array) -> jax.Array:
     return jax.nn.softmax(jnp.where(options, logits.astype(jnp.float32), -jnp.inf), axis=-1)
 
 
-@metrics("log_loss")
 @dataclass(frozen=True)
 class LogLoss(ScoringRule):
     """The cross entropy, -sum_k t_k log p_k: the logarithmic score."""
@@ -84,7 +82,6 @@ class LogLoss(ScoringRule):
         return -jnp.sum(jnp.where(target > 0, target * log_p, 0.0), axis=-1)
 
 
-@metrics("brier")
 @dataclass(frozen=True)
 class Brier(ScoringRule):
     """The quadratic score, sum_k (p_k - t_k)^2, between 0 and 2."""
@@ -96,7 +93,6 @@ class Brier(ScoringRule):
         return jnp.sum(jnp.where(options, (p - target) ** 2, 0.0), axis=-1)
 
 
-@metrics("spherical")
 @dataclass(frozen=True)
 class Spherical(ScoringRule):
     """The spherical score as a charge, 1 - (t . p) / |p|, between 0 and 1."""
@@ -108,7 +104,6 @@ class Spherical(ScoringRule):
         return 1.0 - jnp.sum(target * p, axis=-1) / jnp.linalg.norm(p, axis=-1)
 
 
-@metrics("rps")
 @dataclass(frozen=True)
 class RankedProbability(ScoringRule):
     """The ranked probability score of ordered levels.

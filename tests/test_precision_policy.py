@@ -2,7 +2,7 @@
 
 `--model.dtype` and `--model.attention-impl` are the only way in;
 `with_precision` writes them into the model config that gets built and logged,
-`Registry.build` resolves the names back into dtypes, and the attention kernel
+`Aliases.build` resolves the names back into dtypes, and the attention kernel
 raises a ValueError for a knob a fused kernel cannot honor.
 """
 

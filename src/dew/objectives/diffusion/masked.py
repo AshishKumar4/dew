@@ -53,8 +53,8 @@ from dew.objectives.base import (
 from dew.objectives.lm.chunked import head_cross_entropy, logits_cross_entropy, reads_states
 from dew.objectives.lm.objective import TEXT_KEY, _batch_text
 from dew.records import JSON
-from dew.registry import objectives
 from dew.sampling.sample import sample
+from dew.sampling.solvers import Solver
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -62,7 +62,6 @@ if TYPE_CHECKING:
 _DEFAULT_SOLVER = Unmask()
 
 
-@objectives("masked_diffusion")
 class MaskedDiffusionObjective(Objective[Ratio]):
     """Trains a masked diffusion model on the MDLM negative ELBO.
 
@@ -132,7 +131,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         from dew.registry import to_record
         return {'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': self.process.to_json(), 'solver': to_record(self.solver, type(self.solver)),
+                'process': self.process.to_json(), 'solver': to_record(self.solver, Solver),
                 'sampling_steps': self.steps}
 
     def build_task(self, variables: Variables, *,

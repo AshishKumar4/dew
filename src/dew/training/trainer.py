@@ -987,21 +987,14 @@ class Trainer(Generic[Loss, Effects]):
         loaders. Training and resuming never read it, so a model or component
         no record can describe still checkpoints: the record says why, a
         loader raises that, and the first checkpoint warns it, as it does a
-        model no registry names."""
-        from dew.registry import models
-
+        model defined where no import path reaches it (`__main__`, a function)."""
         artifact: JSON
+        reason = None
         try:
             artifact = self.objective.inference_record()
         except (KeyError, TypeError, ValueError) as error:
             reason = f"{type(self.objective).__name__}: {error}"
             artifact = {'unrecorded': reason}
-        else:
-            model = None if artifact is None else record(artifact, 'inference record').get('model')
-            name = model.get('architecture') if isinstance(model, Mapping) else None
-            reason = (None if not isinstance(name, str) or name in models else
-                      f"its model is not registered; `@dew.registry.models({name!r})` above the "
-                      f"class registers it")
         if reason is not None and reason != self._unrecorded:
             self._unrecorded = reason
             _log.warning("this run's checkpoints resume, but no loader can rebuild their model "

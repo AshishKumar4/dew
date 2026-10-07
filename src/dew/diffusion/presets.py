@@ -33,7 +33,6 @@ from dew.diffusion.transforms import (
     VPredictionTransform,
     Weighting,
 )
-from dew.registry import presets
 
 if TYPE_CHECKING:
     from dew.diffusion.discrete import DiscreteProcess
@@ -55,7 +54,7 @@ def build_process(convention: Process | Preset) -> Process:
     process = convention if isinstance(convention, Process) else convention()
     if not isinstance(process, Process):
         kind = type(convention)
-        name = presets.name_of(kind) if kind in presets.values() else kind.__name__
+        name = kind.__name__
         raise ValueError(
             f"preset {name!r} builds a {type(process).__name__}; "
             "image diffusion needs a Gaussian Process. Masked diffusion trains "
@@ -67,7 +66,6 @@ def _weighting(min_snr_gamma: float | None) -> Weighting:
     return ScheduleWeighting() if min_snr_gamma is None else MinSNR(min_snr_gamma)
 
 
-@presets("edm")
 @dataclass(frozen=True)
 class EDM:
     """Trains on log-normal sigmas with the EDM preconditioning and lambda weighting.
@@ -129,7 +127,6 @@ _LOGNORMAL = {"pixel": (-1.2, 1.2), "latent": (-0.4, 1.0)}
 """Each regime's (P_mean, P_std): Karras et al. 2022 for pixels, EDM2 for latents."""
 
 
-@presets("karras")
 @dataclass(frozen=True)
 class Karras:
     """Trains the EDM preconditioning on sigmas drawn uniformly along the rho-spaced grid it samples on."""
@@ -149,7 +146,6 @@ class Karras:
             weighting=_weighting(self.min_snr_gamma))
 
 
-@presets("cosine")
 @dataclass(frozen=True)
 class Cosine:
     """The cosine beta table with v-prediction.
@@ -211,7 +207,6 @@ class ResolutionShift:
                                   self.max_shift))
 
 
-@presets("flow")
 @dataclass(frozen=True)
 class Flow:
     """Rectified flow on the linear path with velocity prediction.
@@ -247,7 +242,6 @@ class Flow:
             weighting=_weighting(self.min_snr_gamma))
 
 
-@presets("mean_flow")
 @dataclass(frozen=True)
 class MeanFlow:
     """Rectified flow on the linear path, with a model that predicts the average velocity over an interval.
@@ -269,7 +263,6 @@ class MeanFlow:
             prediction=FlowMatchPredictionTransform(), interval=True)
 
 
-@presets("shortcut")
 @dataclass(frozen=True)
 class Shortcut:
     """Rectified flow on the linear path, with a model that predicts the velocity of one step of a given size.
@@ -285,7 +278,6 @@ class Shortcut:
                        prediction=FlowMatchPredictionTransform(), interval=True)
 
 
-@presets("jit")
 @dataclass(frozen=True)
 class JiT:
     """Rectified flow where the model predicts the clean sample and is scored in velocity space (JiT).
@@ -309,7 +301,6 @@ class JiT:
             weighting=VelocityLoss(self.t_eps))
 
 
-@presets("sqrt")
 @dataclass(frozen=True)
 class Sqrt:
     """The square-root schedule with the plain x_0 loss, from Diffusion-LM.

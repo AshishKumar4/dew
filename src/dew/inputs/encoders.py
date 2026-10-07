@@ -106,9 +106,9 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
 
 def rebuild(name: str, fields: Mapping[str, object], *,
             params: Variables | None = None) -> ConditionEncoder:
-    """Rebuild the encoder registered as `name` from its JSON fields.
+    """Rebuild the encoder an alias or import path `name`s from its JSON fields.
 
-    A run's record stores the registry name and the keyword fields `to_json`
+    A run's record stores the encoder's import path and the keyword fields `to_json`
     wrote. This function unpacks those fields into the encoder's
     `from_pretrained`, so each encoder keeps its own concrete signature.
     `checkpoint` is the one field every encoder takes, and this function
@@ -188,7 +188,6 @@ class _TextTower(ConditionEncoder[str, TextContext]):
                 **({} if self.revision is None else {"revision": self.revision})}
 
 
-@encoders("clip_text")
 @dataclass(frozen=True, eq=False)
 class CLIPText(_TextTower):
     """Encodes text with a CLIP text tower and its checkpoint's tokenizer.
@@ -221,7 +220,6 @@ class CLIPText(_TextTower):
 
 
 
-@encoders("t5")
 @dataclass(frozen=True, eq=False)
 class T5Text(_TextTower):
     """Encodes text with a T5 encoder tower and its checkpoint's tokenizer.
@@ -260,7 +258,6 @@ class T5Text(_TextTower):
 
 
 
-@encoders("char_table")
 @dataclass(frozen=True, eq=False)
 class CharTable(ConditionEncoder[str, TextContext]):
     """Encodes text as a table lookup: one id per character, one fixed random
@@ -340,7 +337,6 @@ def _last_hidden_state(model, features, *, key: str):
     return model(**{key: features}).last_hidden_state
 
 
-@encoders("hf_audio")
 @dataclass(frozen=True, eq=False)
 class HFAudio(ConditionEncoder[AudioRow, TextContext]):
     """Encodes audio as a transformers model's last hidden state, using the checkpoint's feature extractor.

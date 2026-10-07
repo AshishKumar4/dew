@@ -61,7 +61,7 @@ class Condition:
     unconditional: str | float | Mapping[str, object] = ""
 
     def to_json(self) -> dict:
-        return {"encoder": {"name": registry.encoders.name_of(type(self.encoder)),
+        return {"encoder": {"class": registry.import_path(type(self.encoder)),
                             "fields": self.encoder.to_json()},
                 "field": self.field,
                 "unconditional": self.unconditional}
@@ -69,7 +69,7 @@ class Condition:
     @classmethod
     def from_json(cls, record: Mapping, *, params: Variables | None = None) -> Condition:
         encoder = record["encoder"]
-        return cls(encoder=rebuild(encoder["name"], encoder["fields"], params=params),
+        return cls(encoder=rebuild(encoder["class"], encoder["fields"], params=params),
                    field=record["field"], unconditional=record["unconditional"])
 
 

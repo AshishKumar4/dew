@@ -45,7 +45,7 @@ from .linear import (
     recurrent_delta_rule,
     strictly_lower_inverse,
 )
-from .mixer_base import MixerBase, MixerContext, mixers
+from .mixer_base import MixerBase, MixerContext
 from .precision import at_least_fp32
 from .sharding import logical_axes
 
@@ -261,7 +261,6 @@ class KimiDeltaAttention(nn.Module):
         return self.o_proj(out)
 
 
-@mixers("kimi_delta_attention")
 @dataclasses.dataclass(frozen=True)
 class KimiDeltaAttentionMixer(MixerBase):
     """The `kimi_delta_attention` kind, by GLM-5.3-Flash's config fields:

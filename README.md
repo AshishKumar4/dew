@@ -196,7 +196,7 @@ The pattern selects the DiT's transformer blocks for int8 and leaves the
 patch-embedding convolution in its floating-point dtype. Master weights stay in
 fp32. Change `patterns` to quantize other modules.
 
-In code, you build a model from its class (`from dew.nn.backbones import SimpleDiT, CausalTransformer`). A saved run records the class by its registered name, such as `simple_dit`, and `dew.registry.models` maps that name back to the class when a recipe rebuilds the run.
+In code, you build a model from its class (`from dew.nn.backbones import SimpleDiT, CausalTransformer`). A saved run records the class by its import path, which a recipe imports to rebuild the run, and `dew.registry.models` holds short aliases such as `simple_dit` for the command line.
 
 ## Features
 
@@ -382,7 +382,7 @@ runs. Video inputs are tested on Gemma 4 and Qwen 3.5.
 Dew trains its own UNets, DiTs, MMDiTs, a video DiT and the I-JEPA and V-JEPA
 encoders from scratch, for diffusion, flow matching and masked representation
 prediction; [Supported models](https://dewml.dev/reference/models/#architectures-you-can-train-from-scratch)
-lists them by registry name.
+lists them by alias.
 
 CLIP and T5 text encoders supply conditioning, and the VAE interfaces let you train in latent space.
 
@@ -788,7 +788,7 @@ state = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0)).fit(
 print(objective.model.apply(state.variables, jnp.array([[0.0], [1.0]])))
 ```
 
-The predictions approach `1` and `3`. `init` creates the variables, `loss` returns a differentiable scalar, and `Aux` holds metrics and any updates to mutable variables. You can pass a custom objective straight to `Trainer`. You only need to register it if you want to build it by name from a configuration.
+The predictions approach `1` and `3`. `init` creates the variables, `loss` returns a differentiable scalar, and `Aux` holds metrics and any updates to mutable variables. You can pass a custom objective straight to `Trainer`, and a configuration names it by its import path.
 
 The [objective guide](docs/concepts/objectives.md) also covers BatchNorm state and EMA selection.
 

@@ -86,11 +86,11 @@ Every recipe's configuration extends `RunConfig` with four parts:
 | Part | Holds | CLI example |
 | --- | --- | --- |
 | `model` (`ModelConfig`) | Architecture, constructor fields, compute dtype, parameter dtype, attention implementation. | `--model.architecture causal_transformer` |
-| `data` | A registered dataset specification and its loading settings. | `data:token-windows --data.seq-len 16` |
+| `data` | A dataset specification and its loading settings. | `data:token-windows --data.seq-len 16` |
 | `optim` (`OptimConfig`) | Optimizer, learning rate, schedule, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, batch size, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
-A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a registered dataset type and makes its flags available. Put all architecture fields in one JSON object passed to `--model.config`, spelled as in Python (`num_layers`), and use only fields the chosen architecture accepts. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), so they do not go in `--model.config`.
+A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a dataset type by its alias and makes its flags available. Put all architecture fields in one JSON object passed to `--model.config`, spelled as in Python (`num_layers`), and use only fields the chosen architecture accepts. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), so they do not go in `--model.config`.
 
 | Setting | Default | Notes |
 |---|---|---|

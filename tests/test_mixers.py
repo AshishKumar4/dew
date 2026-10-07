@@ -2,12 +2,12 @@
 
 The backbone takes a `mixer` value from the `mixers` registry (None for
 today's grouped-query causal attention), and each kind builds its own
-`DecoderBlock` factory from the layer's context. A new kind registers its
-value and plugs in with no branch on the backbone, which `test_scale` here
-proves by being one: a second member that exists only in this file, yet
-builds, runs and refuses unknown fields through the same paths a reference
-kind will. Records (`mixer={"name": ..., "fields": ...}`) and values agree, and an unknown
-kind or field raises naming what was asked for.
+`DecoderBlock` factory from the layer's context. A new kind needs only its
+value and plugs in with no branch on the backbone, which `ScaleMixer` here
+proves by being one: a member that exists only in this file, named by its
+import path, yet builds, runs and refuses unknown fields through the same
+paths a reference kind will. Records (`mixer={"class": ..., "fields": ...}`)
+and values agree, and an unknown kind or field raises naming what was asked for.
 """
 
 import dataclasses
@@ -21,8 +21,8 @@ from model_support import TINY_DECODER
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext, mixers
-from dew.registry import models
+from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
+from dew.registry import mixers, models
 
 VOCAB = 37
 TINY = {"vocab_size": VOCAB, **TINY_DECODER}
@@ -43,7 +43,6 @@ class ScaleMixerModule(nn.Module):
         return x * self.scale
 
 
-@mixers("test_scale")
 @dataclasses.dataclass(frozen=True)
 class ScaleMixer(MixerBase):
     """The seam's proof of pluggability: a kind from outside the backbone."""
@@ -53,6 +52,9 @@ class ScaleMixer(MixerBase):
     def build(self, ctx: MixerContext):
         del ctx
         return functools.partial(ScaleMixerModule, scale=self.scale)
+
+
+SCALE = f"{__name__}:ScaleMixer"
 
 
 def test_none_and_the_attention_value_build_the_same_tree():
@@ -71,7 +73,7 @@ def test_mixer_records_and_values_compute_the_same_logits():
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)
     logits = expected.apply(params, ids)
-    record = {"name": "test_scale", "fields": {"scale": 3.0}}
+    record = {"class": SCALE, "fields": {"scale": 3.0}}
     for model in (tiny(mixer=record),
                   models.build("causal_transformer", **TINY, mixer=record)):
         assert jnp.array_equal(model.apply(params, ids), logits)
@@ -79,10 +81,10 @@ def test_mixer_records_and_values_compute_the_same_logits():
 
 
 def test_an_unknown_mixer_kind_is_refused():
-    """A record naming no registered kind is a bad config, refused as a
-    tower or projector record is."""
+    """A record naming no known kind is a bad config, refused as a tower or
+    projector record is."""
     with pytest.raises(ValueError, match="no mixer named 'nope'"):
-        tiny(mixer={"name": "nope", "fields": {}})
+        tiny(mixer={"class": "nope", "fields": {}})
 
 
 def test_a_mixer_record_without_a_kind_is_refused():
@@ -92,9 +94,9 @@ def test_a_mixer_record_without_a_kind_is_refused():
 
 def test_a_mixer_field_no_kind_declares_is_refused():
     with pytest.raises(ValueError, match="unknown fields"):
-        tiny(mixer={"name": "attention", "fields": {"scale": 3.0}})
+        tiny(mixer={"class": "attention", "fields": {"scale": 3.0}})
     with pytest.raises(ValueError, match="unknown fields"):
-        tiny(mixer={"name": "test_scale", "fields": {"kv_lora_rank": 4}})
+        tiny(mixer={"class": SCALE, "fields": {"kv_lora_rank": 4}})
 
 
 def test_something_that_is_neither_a_value_nor_a_record_is_refused():
@@ -106,22 +108,18 @@ def test_the_mixer_registry_refuses_unknown_kinds_and_fields():
     with pytest.raises(KeyError, match="no mixer named 'nope'"):
         mixers.build("nope")
     with pytest.raises(ValueError, match="unknown fields"):
-        mixers.build("test_scale", nope=1.0)
+        mixers.build(SCALE, nope=1.0)
 
 
 def test_a_kind_without_a_build_is_refused_loudly():
-    """A registered value that builds nothing raises NotImplementedError at setup."""
+    """A value that builds nothing raises NotImplementedError at setup."""
 
-    @mixers("test_empty")
     @dataclasses.dataclass(frozen=True)
     class EmptyMixer(MixerBase):
         pass
 
-    try:
-        with pytest.raises(NotImplementedError, match="builds no mixer"):
-            tiny(mixer=EmptyMixer()).init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
-    finally:
-        del mixers._members["test_empty"]
+    with pytest.raises(NotImplementedError, match="builds no mixer"):
+        tiny(mixer=EmptyMixer()).init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
 
 
 def hybrid(**overrides):
@@ -138,7 +136,7 @@ def test_a_kind_selects_the_mixer_its_layers_run():
     key = jax.random.key(0)
     per_kind = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(scale=0.0))})
     swapped = hybrid(mixer=ScaleMixer(scale=0.0),
-                     kinds={"linear": LayerKind(mixer={"name": "attention", "fields": {}})})
+                     kinds={"linear": LayerKind(mixer={"class": "attention", "fields": {}})})
     plain = hybrid()
 
     kind_logits = per_kind.apply(per_kind.init(key, ids), ids)
@@ -154,14 +152,14 @@ def test_invalid_kind_mixer_records_are_refused():
     with pytest.raises(ValueError, match="kind's mixer"):
         LayerKind(mixer="test_scale")
     with pytest.raises(ValueError, match="no mixer named 'nope'"):
-        LayerKind(mixer={"name": "nope", "fields": {}})
+        LayerKind(mixer={"class": "nope", "fields": {}})
 
 
 def test_models_build_takes_kind_mixer_records():
     """The CLI path builds per-kind mixers through `models.build`."""
     model = models.build(
         "causal_transformer", **TINY, layer_types=("full_attention", "linear"),
-        kinds={"linear": {"mixer": {"name": "test_scale", "fields": {"scale": 3.0}}}})
+        kinds={"linear": {"mixer": {"class": SCALE, "fields": {"scale": 3.0}}}})
     expected = hybrid(kinds={"linear": LayerKind(mixer=ScaleMixer(3.0))})
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
     params = expected.init(jax.random.key(0), ids)

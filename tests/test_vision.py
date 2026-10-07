@@ -129,7 +129,7 @@ def test_llama4_projector_matches_the_reference_implementation():
         - fixture["projector_ref"])) < 1e-4
 
 
-@pytest.mark.parametrize("record", [{"name": "clip", "fields": {}}, {"name": "mlp", "fields": {}}, {}])
+@pytest.mark.parametrize("record", [{"class": "clip", "fields": {}}, {"class": "mlp", "fields": {}}, {}])
 def test_an_unknown_tower_or_projector_kind_is_refused(record):
     """A record naming nothing either registry holds is refused, with the known names."""
     with pytest.raises(ValueError, match=r"no tower named|the record that names it"):

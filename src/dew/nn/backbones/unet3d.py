@@ -13,8 +13,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.registry import models
-
 from ..attention import NormalAttention, RMSNorm
 from ..dit import ROPE_THETA
 from ..precision import at_least_fp32
@@ -63,7 +61,6 @@ class TemporalBlock(nn.Module):
         return x + h
 
 
-@models("unet_3d")
 class UNet3D(Unet):
     """Denoises video (B, T, H, W, C) with the 2D `Unet` body per frame and a `TemporalBlock` per level.
 

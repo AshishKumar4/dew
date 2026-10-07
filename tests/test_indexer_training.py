@@ -239,7 +239,7 @@ def deepseek_stack(index_topk, **overrides) -> CausalTransformer:
     return CausalTransformer(**{
         "vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
         "head_dim": 16, "mlp_features": 64, "max_seq_len": SEQ,
-        "mixer": {"name": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
+        "mixer": {"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
                "index_topk": index_topk, "index_n_heads": 2, "index_head_dim": 16}},
         **overrides})
@@ -421,7 +421,7 @@ def test_the_warmup_starts_a_fresh_indexer_beside_a_dense_checkpoint():
     """A dense tree (no indexer) is what the warm-up begins from: its
     leaves land frozen, unchanged, and the indexer comes from the init.
     A tree missing anything else is refused by name."""
-    dense = deepseek_stack(None, mixer={"name": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
+    dense = deepseek_stack(None, mixer={"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                                         "qk_nope_head_dim": 8, "qk_rope_head_dim": 8,
                                         "v_head_dim": 8}})
     checkpoint = dense.init(jax.random.key(5), jnp.zeros((1, SEQ), jnp.int32))
@@ -496,7 +496,7 @@ def test_a_phase_that_disagrees_with_the_model_is_refused(phase, topk, terms):
 
 
 def test_a_model_without_an_indexer_is_refused():
-    plain = deepseek_stack(None, mixer={"name": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
+    plain = deepseek_stack(None, mixer={"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                                         "qk_nope_head_dim": 8, "qk_rope_head_dim": 8,
                                         "v_head_dim": 8}})
     with pytest.raises(ValueError, match="index_n_heads"):

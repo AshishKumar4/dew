@@ -45,7 +45,6 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.chunked import head_cross_entropy, model_logits
 from dew.records import JSON
-from dew.registry import objectives
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -125,7 +124,6 @@ def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
                               batch)
 
 
-@objectives("block_diffusion")
 class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     """Fine-tunes DiffusionGemma on clean ``text`` rows split into a prompt and canvases.
 

@@ -20,7 +20,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
 from dew.objectives.base import Variables
-from dew.registry import Record, projectors, towers
+from dew.registry import Record
 
 from .common import (
     _PROJECTOR_PATHS,
@@ -327,7 +327,6 @@ class Gemma4VisionTransformer(nn.Module):
         return pooled.astype(hidden_states.dtype)
 
 
-@towers("gemma4")
 @dataclasses.dataclass(frozen=True)
 class Gemma4Vision(TowerBase):
     """A Gemma 4 trunk's geometry, under the reference's field names."""
@@ -379,7 +378,6 @@ class Gemma4ProjectorModule(nn.Module):
         return self.projection(self.pre_norm(image_features))
 
 
-@projectors("gemma4")
 @dataclasses.dataclass(frozen=True)
 class Gemma4Projector(ProjectorBase):
     """Gemma 4's projector fields: the decoder width and the norm epsilon."""
@@ -500,7 +498,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
             f"rope_type {rope.get('rope_type')!r} is not expressible: this trunk "
             "runs the default 2D rotary")
     return {
-        "name": "gemma4", "fields": {
+        "class": "gemma4", "fields": {
         "hidden_size": hidden,
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
@@ -549,7 +547,7 @@ def translate_gemma4_projector_config(vision: Mapping[str, object],
                                       text_width: int) -> Record:
     """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon."""
     return {
-        "name": "gemma4", "fields": {
+        "class": "gemma4", "fields": {
         "text_width": int(text_width),
         "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }}

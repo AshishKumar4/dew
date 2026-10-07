@@ -9,12 +9,9 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from dew.registry import solvers
-
 from .common import _check_endpoint_domain, _push
 
 
-@solvers("ddpm")
 @dataclass(frozen=True)
 class DDPM:
     """Exact ancestral sampler for the reverse diffusion SDE.
@@ -71,7 +68,6 @@ class DDPM:
         return alpha_s * denoised + eps_coeff * eps + noise * gamma, state
 
 
-@solvers("ddim")
 @dataclass(frozen=True)
 class DDIM:
     """The DDIM update, where `eta` sets the stochasticity: 0 is deterministic, 1 is DDPM-like.
@@ -110,7 +106,6 @@ def _pndm_step(x, eps, rates_t, rates_s):
     return (alpha_s / alpha_t) * x - (alpha_s ** 2 - alpha_t ** 2) * eps / denominator
 
 
-@solvers("pndm")
 @dataclass(frozen=True)
 class PNDM:
     """PNDM as Diffusers 0.34.0's `PNDMScheduler`: Adams-Bashforth over eps with DDIM as the transfer.
@@ -179,7 +174,6 @@ class PNDM:
             index = jnp.where(count < 3, 0, 1)
         return lax.switch(index, branches, None), (outputs, count + 1)
 
-@solvers("consistency")
 @dataclass(frozen=True)
 class Consistency:
     """Multistep consistency sampling, the update of Diffusers 0.34.0's `LCMScheduler`.
@@ -202,7 +196,6 @@ class Consistency:
         return stepped, (count + 1, steps)
 
 
-@solvers("tcd")
 @dataclass(frozen=True)
 class TCD:
     """Trajectory consistency sampling, as Diffusers 0.34.0's `TCDScheduler`.

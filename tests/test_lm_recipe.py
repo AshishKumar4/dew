@@ -579,7 +579,7 @@ def test_the_masked_objective_is_reachable_by_name(tmp_path):
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
     assert run_config(recipe, tokens, "--objective", "masked_diffusion").objective == \
-        "masked_diffusion"
+        "dew.objectives.diffusion.masked:MaskedDiffusionObjective"
 
 
 def test_masked_diffusion_without_a_mask_id_is_refused():
@@ -755,7 +755,7 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     record = config.to_dict()
 
     assert record["tokenizer"] == "gpt2" and record["sample_tokens"] == 8
-    assert record["ema_decay"] is None and record["objective"] == "lm"
+    assert record["ema_decay"] is None and record["objective"] == "dew.objectives.lm.objective:LMObjective"
     assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
     assert LMRunConfig.from_dict(record) == config
     with pytest.raises(ValueError, match="trains on token files"):

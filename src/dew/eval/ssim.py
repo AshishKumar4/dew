@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
-from dew.registry import metrics
 
 from .common import ImageMetric, paired
 from .psnr import frame_batch
@@ -114,7 +113,6 @@ def structural_similarity(
     return scores if per_example else jnp.mean(scores)
 
 
-@metrics("ssim")
 class SSIM(ImageMetric):
     """Measures the mean SSIM between the sampled frames and the batch's; higher is better.
 

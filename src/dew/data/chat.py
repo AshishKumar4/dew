@@ -38,8 +38,6 @@ import grain.python as pygrain
 import numpy as np
 from jinja2 import TemplateError
 
-from dew.registry import datasets
-
 from .dataset import Batch, Dataset, DatasetSpec, Tokenize, describe, train_stream, validation_pass
 from .rows import parquet_names, parquet_rows
 from .sources.hf import HFOptions, HubOptions
@@ -651,7 +649,6 @@ def _lengths(source: ConversationSource, tokenizer: str) -> list[int]:
             for index, record in enumerate(source)]
 
 
-@datasets("chat_messages")
 @dataclasses.dataclass(frozen=True)
 class ChatMessages(DatasetSpec):
     """Renders conversations with the tokenizer's chat template and packs them

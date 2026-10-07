@@ -1,7 +1,7 @@
 """Image metrics: `FID`, `CLIPScore`, `PSNR`, `SSIM`, `LPIPS` and `CLIPDistance`.
 
-Each is a `Metric` that the trainer scores an `ImageGrid` with, registered in
-`dew.registry.metrics` under the name a run record uses for it.
+Each is a `Metric` that the trainer scores an `ImageGrid` with, with an alias
+in `dew.registry.metrics` a run config may name it by.
 
 `FID().score(generated, reference)` and `CLIPScore().score(images, prompts)`
 compute the same numbers over image sets you already have, without a trainer

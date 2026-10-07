@@ -50,9 +50,9 @@ def test_gemma3_wrapper_translates_to_three_records():
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "gemma3_text"
     assert record["text"]["emb_features"] == 64
-    assert record["tower"]["name"] == "siglip"
+    assert record["tower"]["class"] == "siglip"
     assert record["tower"]["fields"]["hidden_size"] == 32
-    assert record["projector"]["name"] == "gemma"
+    assert record["projector"]["class"] == "gemma"
     assert record["projector"]["fields"]["text_width"] == 64
     assert record["image_token_id"] == 202
     assert record["tokens_per_image"] == 1
@@ -63,8 +63,8 @@ def test_llama4_wrapper_translates_to_three_records():
     record = translate_wrapper_config(
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "llama4_text"
-    assert record["tower"]["name"] == "llama4"
-    assert record["projector"]["name"] == "llama4"
+    assert record["tower"]["class"] == "llama4"
+    assert record["projector"]["class"] == "llama4"
     assert record["image_token_id"] == 92
     assert record["tokens_per_image"] == 1
 
@@ -75,12 +75,12 @@ def test_gemma4_wrapper_translates_to_three_records():
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "gemma4_text"
     assert record["text"]["emb_features"] == 32
-    assert record["tower"]["name"] == "gemma4"
+    assert record["tower"]["class"] == "gemma4"
     assert record["tower"]["fields"]["hidden_size"] == 32
     assert record["tower"]["fields"]["pooling_kernel_size"] == 2
-    assert record["projector"]["name"] == "gemma4"
+    assert record["projector"]["class"] == "gemma4"
     assert record["projector"] == {
-        "name": "gemma4", "fields": {"text_width": 32,
+        "class": "gemma4", "fields": {"text_width": 32,
         "norm_eps": 1e-06}}
     assert record["image_token_id"] == 60
     # The pooled count follows the image resolution, so the record leaves it
@@ -93,12 +93,12 @@ def test_qwen35_wrapper_translates_to_three_records():
     record = translate_wrapper_config(
         json.loads((directory / "config.json").read_text()))
     assert record["text_model_type"] == "qwen3_5_text"
-    assert record["tower"]["name"] == "qwen3_5"
+    assert record["tower"]["class"] == "qwen3_5"
     assert record["tower"]["fields"]["spatial_merge_size"] == 2
     assert record["tower"]["fields"]["temporal_patch_size"] == 2
-    assert record["projector"]["name"] == "qwen3_5"
+    assert record["projector"]["class"] == "qwen3_5"
     assert record["projector"] == {
-        "name": "qwen3_5", "fields": {"vision_width": 32, "merge_size": 2, "out_width": 64}}
+        "class": "qwen3_5", "fields": {"vision_width": 32, "merge_size": 2, "out_width": 64}}
     assert record["image_token_id"] == 200
     assert record["tokens_per_image"] is None
 
@@ -155,7 +155,7 @@ def test_the_released_qwen35_wrapper_translates():
     record = translate_wrapper_config(config)
     assert record["tower"]["fields"]["hidden_size"] == 768
     assert record["projector"] == {
-        "name": "qwen3_5", "fields": {"vision_width": 768, "merge_size": 2,
+        "class": "qwen3_5", "fields": {"vision_width": 768, "merge_size": 2,
         "out_width": 1024}}
     assert record["image_token_id"] == 248056
 
@@ -170,14 +170,14 @@ def test_the_released_scout_wrapper_translates():
     assert record["tower"]["fields"]["image_size"] == 336
     assert record["tokens_per_image"] == 144
     assert record["projector"] == {
-        "name": "llama4", "fields": {"text_width": 5120}}
+        "class": "llama4", "fields": {"text_width": 5120}}
 
 
 def wrapper_pixels(directory, record):
     """Fixture pixels as the tower reads them: the Gemma 4 fixture stores
     processor patches, which fold back into the image row-major."""
     pixels = np.load(directory / "pixels.npy")
-    if record["tower"]["name"] != "gemma4":
+    if record["tower"]["class"] != "gemma4":
         return pixels
     batch, count, _ = pixels.shape
     grid = int(count ** 0.5)

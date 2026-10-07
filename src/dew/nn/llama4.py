@@ -32,7 +32,7 @@ from dew.nn.attention import (
 )
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache
-from dew.nn.mixer_base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import LongRopeScaling, RopeScaling, apply_rotary_interleave, rotary_freqs
 from dew.nn.sharding import logical_axes
@@ -187,7 +187,6 @@ class Llama4Attention(nn.Module):
         return self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim))
 
 
-@mixers("llama4")
 @dataclasses.dataclass(frozen=True)
 class Llama4Mixer(MixerBase):
     """The `llama4` kind: `Llama4TextAttention` under the reference's names.

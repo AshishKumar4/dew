@@ -932,7 +932,7 @@ def test_nemotron_h_routed_mixer_rebuilds_from_its_run_record(name):
     mixer = translate_config(fixture_config(name)).value.kind_of("moe").mixer
     assert isinstance(mixer, MLPMixer) and mixer.mixture is not None
     fields = dataclasses.asdict(mixer)
-    assert mixers.from_record({"name": "mlp", "fields": fields}) == mixer
+    assert mixers.from_record({"class": "mlp", "fields": fields}) == mixer
 
 
 @pytest.mark.parametrize("fields", [{"layers": (1,)}, {"hash_layers": (1,)}, {"media_bias": True}])

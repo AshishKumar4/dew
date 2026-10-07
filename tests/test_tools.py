@@ -759,7 +759,7 @@ def test_step_benchmark_small_preset_exempts_only_the_jepa_predictor():
     assert set(models) - {case.architecture for case in cases} == {"jepa_predictor"}
     (jepa,) = [case for case in cases if case.architecture == "jepa_encoder"]
     predictor = tool.build_trainer(jepa, "reference").objective.predictor
-    assert models.name_of(type(predictor)) == "jepa_predictor"
+    assert models.alias_of(type(predictor)) == "jepa_predictor"
 
 
 @pytest.mark.parametrize("architecture", ["sd3_transformer", "flux_transformer"])

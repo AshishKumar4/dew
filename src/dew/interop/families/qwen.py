@@ -223,7 +223,7 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     if 'linear_attention' in layer_types:
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
         kinds['linear_attention']['mixer'] = {
-            'name': 'gated_delta_net', 'fields': {
+            'class': 'gated_delta_net', 'fields': {
             **{field: records.integer(hf_config[field], field) for field in _LINEAR_FIELDS},
             **mixer}}
     unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})

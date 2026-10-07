@@ -1,30 +1,18 @@
-"""Registries that name the things a run is made of.
+"""Short names for the classes a run is made of, and the records that rebuild them.
 
-There is one `Registry` per kind, including model components such as mixers,
-towers and projectors. Config files, the CLI and run records refer to a member
-by name, and its registry maps that name to the class and back, so
-`models["simple_dit"]` is `SimpleDiT`. Python code builds the class directly. An
-unknown name or field raises an error.
+A record names a class by its import path, `{"class": "dew.nn.dit:SimpleDiT",
+"fields": {...}}`, and a function the same way, `{"function": "optax:adamw"}`.
+Rebuilding one imports the module and calls the class with its fields, each
+converted to the type its annotation declares, so a record loads in a process
+that imported nothing beforehand, and a class outside Dew needs nothing to be
+recorded: its import path is its name. A record Dew writes carries the path,
+so rebuilding it never depends on an alias.
 
-The registries are empty at import. Each member registers itself where it is
-defined, so importing a package fills its tables, and this module imports none
-of them. When a lookup asks for a name its table does not hold yet, the registry
-imports the Dew modules whose decorator registers that name, found by reading
-the sources. So a record loads in a process that imported nothing beforehand,
-and no other module is imported.
-
-A package outside Dew registers its members the same way, and lists a module
-whose import registers them under the `dew.plugins` entry-point group:
-
-    [project.entry-points."dew.plugins"]
-    sparx = "sparx"
-
-The plugins are loaded only for a name that Dew's own sources do not register.
-Every entry is then imported once (`entry.load()`), and the lookup tries again.
-An entry that fails to import is reported only in the error of a lookup that
-still misses after that. A plugin can also add a kind of its own. It creates a
-`Registry` and `share`s it in the module that defines the kind's base class, so
-a record whose field declares that class rebuilds the member.
+Where a person writes a record, in a config file or on the command line, the
+class may be a short alias instead, `{"class": "simple_dit"}`. Each kind's
+aliases are a static table below (`models`, `mixers`, ...) that maps a name to
+a path and imports the class only when it is read. An unknown name or field
+raises an error.
 """
 
 from __future__ import annotations
@@ -33,17 +21,14 @@ import dataclasses
 import datetime
 import functools
 import importlib
-import importlib.metadata
 import inspect
 import operator
-import re
 import sys
 import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from enum import Enum
-from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, TypedDict, TypeVar, Union, overload
+from typing import TYPE_CHECKING, Any, Literal, TypedDict, Union, overload
 
 import jax
 import jax.numpy as jnp
@@ -67,11 +52,6 @@ if TYPE_CHECKING:
     from dew.sampling.solvers import Solver
     from dew.training.optim import ScheduleBase
 
-M = TypeVar("M", bound=Callable[..., Any])
-"""What calling a member builds: the module a model name builds, the spec a
-dataset name builds. A registry is generic over both, since the table holds
-the callable and `build` hands back what it returned."""
-
 # A type annotation as a value: a class, a union of them, a subscripted
 # generic, a PEP 695 alias, or the None a field with no resolvable annotation
 # leaves behind. Every reader below takes one of these and asks it what it is.
@@ -94,180 +74,97 @@ type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
 NO_RECORD: Mapping[str, object] = types.MappingProxyType({})
 
 
-_DECORATOR = re.compile(r"""^[ \t]*@(?:dew\.)?(?:registry\.)?(\w+)\(\s*["']([^"']+)["']\s*\)[ \t]*$""", re.M)
-"""A registration as Dew's sources write it, `@models("simple_dit")` or
-`@registry.objectives("lm")`: the registry's name in this module and the
-member's."""
+
+Record = TypedDict("Record", {"class": str, "fields": Mapping[str, object]})
+"""A class as a record names it: its alias or import path and its constructor
+fields, `{"class": "mla", "fields": {...}}`."""
 
 
-@functools.cache
-def _registering_modules() -> Mapping[tuple[str, str], tuple[str, ...]]:
-    """Each `(registry, name)` Dew's sources register, and the modules that do.
-
-    The decorators are the one statement of what registers where, so this
-    reads them rather than keeping a second table: about 270 files in 20 ms,
-    once a process, and only when a lookup misses."""
-    root = Path(__file__).parent
-    found: dict[tuple[str, str], list[str]] = {}
-    for path in sorted(root.rglob("*.py")):
-        parts = path.relative_to(root.parent).with_suffix("").parts
-        module = ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
-        for attribute, name in _DECORATOR.findall(path.read_text()):
-            found.setdefault((attribute, name), []).append(module)
-    return {key: tuple(modules) for key, modules in found.items()}
+type Importable = type | types.FunctionType | types.BuiltinFunctionType | types.MethodType
+"""What a record names by import path: a class, a function, or a classmethod bound to its class."""
 
 
-PLUGINS = "dew.plugins"
-"""The entry-point group under which a package outside Dew lists the module that registers its members."""
+def import_path(member: Importable) -> str:
+    """The path a record names a class or function by, `module:Qualified.name`.
+
+    A lambda, a function defined inside another, or anything defined in
+    `__main__` has no path another process can import, so it is refused here,
+    where the record is written, rather than when it is read."""
+    function = member.__func__ if isinstance(member, types.MethodType) else member
+    module, name = function.__module__, function.__qualname__
+    if not module or module == "__main__" or "<" in name:
+        raise ValueError(f"{member!r} has no import path a record can name; define it at module level "
+                         f"in an importable module to record it")
+    return f"{module}:{name}"
 
 
-@functools.cache
-def _loaded_plugins() -> tuple[tuple[str, BaseException], ...]:
-    """Import every `dew.plugins` entry, once a process, and return those
-    that failed, each with its exception. Importing an entry is what
-    registers its members; nothing of a plugin is read without importing it."""
-    failed = []
-    for entry in sorted(importlib.metadata.entry_points(group=PLUGINS), key=lambda entry: entry.name):
+def imported(path: str) -> Callable[..., Configured]:
+    """The class or function an import path names, importing its module."""
+    module, _, name = path.partition(":")
+    if not module or not name:
+        raise ValueError(f"{path!r} is not an import path, `module:Qualified.name`")
+    # Whatever the path names, untyped until `callable` says what it is.
+    held: Any = importlib.import_module(module)
+    for part in name.split("."):
         try:
-            entry.load()
-        except Exception as error:
-            # Reported by the lookup that needed the entry, and no other.
-            failed.append((f"{entry.name} = {entry.value}", error))
-    return tuple(failed)
+            held = getattr(held, part)
+        except AttributeError:
+            raise ValueError(f"{module} has no {name}, which {path!r} names") from None
+    if not isinstance(held, (type, types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
+        raise ValueError(f"{path!r} names {held!r}, which is neither a class nor a function")
+    return held
 
 
-_SHARED: list[Registry] = []
-"""Every table a record may name a member of, in the order shared; written
-only by `Registry.share`. The tables hold different kinds, so this names
-none: a reader asks each table for a member and tests what it got."""
+class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
+    """The short names of one kind, each mapped to the import path of its class.
 
+    `models["simple_dit"]` imports and returns `SimpleDiT`, as does
+    `models["dew.nn.backbones.dit:SimpleDiT"]`: the table is static, and a
+    class outside it, Dew's or a user's, is named by its path."""
 
-class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
-    """Holds the members of one kind by name, and registers them as a decorator.
-
-    `registry[name]` returns a member. If the table does not hold the name yet,
-    it first imports the Dew modules that register it, and then the plugins. An
-    unknown name raises KeyError listing the known ones.
-
-    Records can name members only of a shared table (`share`). Dew's twelve
-    tables are shared, and a plugin shares a kind of its own the same way.
-    """
-
-    def __init__(self, kind: str):
+    def __init__(self, kind: str, paths: Mapping[str, str]):
         self.kind = kind
-        # A decorator has no base class to test the member against, and it
-        # hands back the class it decorated so a caller's checker keeps the
-        # concrete type (`DiffusionObjective`, not `Objective`). The table is
-        # untyped here and typed on the way out.
-        self._members: dict[str, Any] = {}
-
-    def __call__(self, name: str, /) -> Callable[[M], M]:
-        """Return a decorator that registers a class or function under `name`, as in `@models("simple_dit")`.
-
-        The decorator returns the member unchanged. Raises TypeError for a name
-        that is not a non-empty string, and the decorator raises ValueError
-        when the name already maps to another member.
-        """
-        if type(name) is not str or not name:
-            raise TypeError(f"a {self.kind} name is a non-empty string, not {name!r}")
-
-        def register(member: M) -> M:
-            held = self._members.get(name)
-            if held is not None and held is not member:
-                raise ValueError(
-                    f"{self.kind} {name!r} is already {held.__name__}; "
-                    f"a name maps to one {self.kind}")
-            self._members[name] = member
-            return member
-
-        return register
+        self.paths = types.MappingProxyType(dict(paths))
+        # What a lookup imported, untyped as an import is; typed on the way out.
+        self._imported: dict[str, Any] = {}
 
     def __getitem__(self, name: str) -> T:
-        if name not in self._members:
-            for module in self._registering(name):
-                importlib.import_module(module)
-        failed: tuple[tuple[str, BaseException], ...] = ()
-        if name not in self._members:
-            failed = _loaded_plugins()
-        try:
-            return self._members[name]
-        except KeyError:
-            known = set(self._members) | {held for attribute, held in _registering_modules()
-                                          if getattr(sys.modules[__name__], attribute, None) is self}
-            message = f"no {self.kind} named {name!r}; known: {', '.join(sorted(known))}"
-            if not failed:
-                raise KeyError(message) from None
-            broken = "; ".join(f"{entry} ({type(error).__name__}: {error})" for entry, error in failed)
-            raise KeyError(f"{message}. These {PLUGINS} entries failed to import, so a name they register "
-                           f"is not known: {broken}") from failed[0][1]
-
-    def _registering(self, name: str) -> tuple[str, ...]:
-        """The modules of Dew whose decorator registers `name` in this table."""
-        return tuple(module for (attribute, held), modules in _registering_modules().items()
-                     if held == name and getattr(sys.modules[__name__], attribute, None) is self
-                     for module in modules)
+        if ":" not in name and name not in self.paths:
+            raise KeyError(f"no {self.kind} named {name!r}; known: {', '.join(sorted(self.paths))}, "
+                           f"or any class by its import path")
+        if name not in self._imported:
+            self._imported[name] = imported(self.paths.get(name, name))
+        return self._imported[name]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(self._members)
+        return iter(self.paths)
 
     def __len__(self) -> int:
-        return len(self._members)
+        return len(self.paths)
 
     def __repr__(self) -> str:
-        return f"Registry({self.kind!r}, {sorted(self._members)})"
+        return f"Aliases({self.kind!r}, {sorted(self.paths)})"
 
-    def share(self) -> Registry[T, Built]:
-        """Share this table so records can name its members, and return it.
-
-        A typical use is `activations = Registry("activation").share()`. A
-        record then rebuilds a member wherever a field declares the member's
-        base class, and writes the member back by name. Share a plugin's kind
-        in the module that defines that base class, so every field typed with
-        it finds the table. A kind has one shared table; sharing the same table
-        again does nothing, and sharing a second table of that kind raises
-        ValueError.
-        """
-        for held in _SHARED:
-            if held.kind == self.kind and held is not self:
-                raise ValueError(f"a {self.kind} registry is already shared; a kind has one table")
-        if not any(held is self for held in _SHARED):
-            _SHARED.append(self)
-        return self
-
-    @staticmethod
-    def shared() -> tuple[Registry, ...]:
-        """Return every shared table, Dew's twelve first, then any a plugin shared."""
-        return tuple(_SHARED)
-
-    def name_of(self, member: Named) -> str:
-        """Return the name a member was registered under in this table.
-
-        The table is searched by identity, so `member` can be any class or
-        function, whatever the registry builds. A member this table does not
-        hold raises KeyError, with the decorator line that would register it."""
-        for name, held in self._members.items():
-            if held is member:
+    def alias_of(self, member: Importable) -> str:
+        """The alias of `member`, for a run's human-readable name; KeyError
+        for a class this kind has no alias for."""
+        path = import_path(member)
+        for name, held in self.paths.items():
+            if held == path:
                 return name
-        raise KeyError(f"{member.__name__} is not a registered {self.kind}; register it once with "
-                       f"`@dew.registry.{self.kind}s(\"{member.__name__.lower()}\")` above its class")
+        raise KeyError(f"{path} has no {self.kind} alias")
 
     def build(self, name: str, record: Mapping[str, object] = NO_RECORD, /,
               **fields: Configured) -> Built:
-        """Construct the member called `name` from a record, keyword fields, or both.
+        """Construct the member an alias or import path names, from a record, keyword fields, or both.
 
         A field the member does not declare is an error. Fields come from JSON
         as often as from code, so a field whose declared type is a value class
         is built here from its record. For example,
         `models.build("m", attention={"heads": 8})` and
         `models.build("m", attention=Attention(heads=8))` build the same model.
-
-        Pass a whole parsed config as the positional `record`. Its values are
-        converted to the member's declared types here, so a caller does not
-        need to know the member's fields to unpack the config. Keyword fields
-        override the record's. A function member's fields are its parameters,
-        converted to their annotations the same way, so a parameter typed
-        with what another table's functions return takes a record naming one
-        of them.
+        Keyword fields override the record's. A function member's fields are
+        its parameters, converted to their annotations the same way.
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
@@ -279,40 +176,23 @@ class Registry[T: Callable[..., Any], Built](Mapping[str, T]):
         return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
-        """Construct the member a `{"name": ..., "fields": {...}}` record names.
-
-        A config writes a mixer, a tower or a projector as such a record, where
-        code passes the value `build` makes. A record that names no registered
-        member raises ValueError listing the known ones.
-        """
-        name, fields = _named(self, record)
+        """Construct the member a class record names, `{"class": ..., "fields": {...}}`."""
+        named = _class_record(record)
+        if named is None:
+            raise ValueError(f"a {self.kind} is the record that names it, "
+                             f"{{'class': ..., 'fields': {{...}}}}, not {record!r}")
+        name, fields = named
+        try:
+            self[name]
+        except KeyError as error:
+            # A record naming nothing known is a bad config, not a lookup.
+            raise ValueError(error.args[0]) from None
         return self.build(name, fields)
 
     @property
     def union(self) -> type[Built] | types.UnionType:
-        """The union of the members' types, for a tyro subcommand over the table."""
-        return functools.reduce(operator.or_, self._members.values())
-
-
-class Record(TypedDict):
-    """A registered member as a record writes it: the name its table holds it
-    under and its constructor fields, `{"name": "mla", "fields": {...}}`."""
-
-    name: str
-    fields: Mapping[str, object]
-
-
-class Named(Protocol):
-    """Declares the name a registry member carries of its own.
-
-    A member is a class or a function -- the decorator takes both -- and each
-    declares `__name__`, which is what an error names a member by. The registry's table holds members as the
-    concrete type their decorator handed back, so this is the one thing read
-    off them without the caller's own type.
-    """
-
-    @property
-    def __name__(self) -> str: ...
+        """The union of the members' types, for a tyro subcommand over the kind."""
+        return functools.reduce(operator.or_, self.values())
 
 
 def _declared_type(member: type, field: str) -> Annotation:
@@ -399,11 +279,10 @@ def to_record(value, annotation) -> JSON:
     """Return `value` as the record `from_record(annotation, ...)` rebuilds it from.
 
     The record is JSON: a dict, a list, or a scalar json.dump can write. A
-    registered member is `{"name": ..., "fields": {...}}` and any other
-    dataclass the record of its fields. `annotation` is the declared field
-    type, so the write side names the same registry and member types the read
-    side rebuilds from, and a value no registry holds where the field names
-    one is refused rather than written as a record nothing reads back.
+    dataclass is the record of its fields where `annotation` names its class
+    exactly, and `{"class": <import path>, "fields": {...}}` where the field
+    declares a base, a union or nothing, so the reader knows what to build;
+    a function is `{"function": <import path>}`.
     """
     from flax import linen as nn
 
@@ -414,21 +293,14 @@ def to_record(value, annotation) -> JSON:
     if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
         return dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        held = _table_of(annotation)
-        if held is not None and not any(type(value) is member
-                                      for member in held.values()):
-            raise ValueError(
-                f"{type(value).__qualname__} is not a registered {held.kind}; a "
-                f"run config can only record members that load back, so register "
-                f"it once with `@dew.registry.{held.kind}s(\"{type(value).__name__.lower()}\")`")
-        if held is None:
-            held = _table_of(type(value))
         fields = {f.name: to_record(getattr(value, f.name), _declared_type(type(value), f.name))
                   for f in dataclasses.fields(value) if _recorded(f)
                   and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
-        if held is None:
+        if type(value) is _unwrapped(annotation):
             return fields
-        return {"name": held.name_of(type(value)), "fields": fields}
+        return {"class": import_path(type(value)), "fields": fields}
+    if isinstance(value, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
+        return {"function": import_path(value)}
     if isinstance(value, (list, tuple)):
         entries = entry_types(annotation, len(value))
         return [to_record(entry_value, entry)
@@ -441,8 +313,8 @@ def to_record(value, annotation) -> JSON:
         return value
     raise TypeError(
         f"{type(value).__name__} is not something a run record can carry; a "
-        f"config field holds JSON scalars, sequences, mappings, and the "
-        f"registered values this writes as their name and fields")
+        f"config field holds JSON scalars, sequences, mappings, dataclasses and "
+        f"functions with an import path")
 
 
 def _record_key(key: object) -> str:
@@ -471,53 +343,44 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     describes, and anything already built is left alone.
 
     This is the one walk from a record to a value, for a module field and a
-    run record alike. A registered member is the record that names it,
-    `{"name": ..., "fields": {...}}` (`to_record` writes it), where
-    the field declares the table's members or a class the member derives
-    from, or a function of a shared table declared to return such a class;
-    a dataclass is the record of its fields. Containers are walked, so
-    a mapping of records and a tuple of records build their values too, a
-    JSON list becomes the tuple a field declares, and a mapping's key
+    run record alike. A class record, `{"class": ..., "fields": {...}}`
+    (`to_record` writes it), builds the class it names, which must be the
+    field's class, derive from it, belong to its union, or be a function
+    declared to return one of those; a function record is the function; any
+    other mapping is the record of the field's own dataclass. Containers are
+    walked, so a mapping of records and a tuple of records build their values
+    too, a JSON list becomes the tuple a field declares, and a mapping's key
     becomes the tuple path its key type declares. `dtypes` is as
     `from_record` reads it, for a field or entry `name`d `dtype`.
     """
     if dtypes and name == "dtype":
         return resolve_dtype(value)
     annotation = resolve_alias(annotation)
-    # A union of a table's members takes a record naming one of them; a field
-    # typed with one class takes its own fields or a member's record below.
-    table = _table_of(annotation) if typing.get_args(annotation) else None
-    if table is not None:
-        if isinstance(value, tuple(member for member in table.values() if isinstance(member, type))):
-            return configured(value)
-        name, fields = _named(table, value)
-        member = _record_class(table[name])
-        if member is None:
-            raise ValueError(f"the {table.kind} {name!r} is not a class, and a record names "
-                             "the fields of one")
-        return _construct(member, fields, dtypes=dtypes)
+    if isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str):
+        return imported(value["function"])
     if typing.get_origin(annotation) in (Union, types.UnionType):
         if value is None:
             return value
         inner = [member for member in typing.get_args(annotation) if member is not type(None)]
         if len(inner) == 1:
             return _rebuilt(inner[0], value, dtypes=dtypes)
-        # A union of a table's members (a schedule or None) rebuilds through
-        # the table; any other union holds the value as it is.
-        members = functools.reduce(operator.or_, inner)
-        return (_rebuilt(members, value, dtypes=dtypes) if _table_of(members) is not None
-                else configured(value))
+        classes = tuple(member for member in inner if isinstance(member, type))
+        named = _class_record(value) if isinstance(value, Mapping) else None
+        if named is not None:
+            if not classes:
+                raise ValueError(f"{annotation} declares no class, so nothing builds the record {value!r}")
+            return _built(_member(named[0], classes), named[1], dtypes=dtypes)
+        return configured(value)
     if isinstance(value, Mapping):
         if isinstance(annotation, type) and annotation is not object:
-            # A field typed with a base class takes a record of any shared
-            # member derived from it or returning it, or of the class itself;
-            # `object` declares nothing, and its record stays the record it is.
-            member, fields = _nested(annotation, value)
-            held = _record_class(member)
-            if held is not None:
-                return _construct(held, fields, dtypes=dtypes)
-            if not isinstance(member, type):
-                return configured(member(**_arguments(member, fields, dtypes=dtypes)))
+            # A field typed with a class takes a record of the class itself or
+            # of any class derived from it or function returning it; `object`
+            # declares nothing, and its record stays the record it is.
+            named = _class_record(value)
+            if named is not None:
+                return _built(_member(named[0], (annotation,)), named[1], dtypes=dtypes)
+            if dataclasses.is_dataclass(annotation):
+                return _construct(annotation, value, dtypes=dtypes)
         if typing.get_origin(annotation) in _MAPPINGS:
             keys, entries = typing.get_args(annotation)
             return {_key(keys, str(name)): _rebuilt(entries, entry, dtypes=dtypes, name=str(name))
@@ -532,6 +395,49 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
                    for entry, record in zip(entry_types(annotation, len(value)), value, strict=True)]
         return tuple(rebuilt) if wants_tuple(annotation) else type(value)(rebuilt)
     return configured(value)
+
+
+def _class_record(value: Mapping[str, object] | Mapping[str | tuple[str, ...], object]
+                  ) -> tuple[str, Mapping[str, object]] | None:
+    """The class a class record, `{"class": ..., "fields": {...}}`, names and
+    its fields (a record with no fields may leave them out); None for a
+    mapping that is not one."""
+    name, fields = value.get("class"), value.get("fields", {})
+    if set(value) <= {"class", "fields"} and isinstance(name, str) and isinstance(fields, Mapping):
+        return name, fields
+    return None
+
+
+def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
+    """The class or function a record's `class` names, by import path or by
+    an alias of any kind, that is one of `held`, derives from one, or is a
+    function declared to return one."""
+    def fits(member: Callable[..., Configured]) -> bool:
+        if isinstance(member, type):
+            return issubclass(member, held)
+        return callable(member) and any(_returns(member, base) for base in held)
+
+    found = ([imported(name)] if ":" in name else
+             [imported(kind.paths[name]) for kind in KINDS if name in kind.paths])
+    fitting = [member for member in found if fits(member)]
+    if len(fitting) == 1:
+        return fitting[0]
+    wanted = " or ".join(base.__name__ for base in held)
+    if not found:
+        raise ValueError(f"no class is named {name!r}; a record names one by an alias or "
+                         f"its import path, `module:Class`")
+    raise ValueError(f"{name!r} names {', '.join(map(repr, found))}, not one {wanted}")
+
+
+def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
+    """What `member` builds from a record of its fields: a dataclass's fields
+    as it declares them, a function's as its parameters."""
+    held = _record_class(member)
+    if held is not None:
+        return _construct(held, fields, dtypes=dtypes)
+    if isinstance(member, type):
+        raise ValueError(f"{member.__qualname__} is not a dataclass, and a record names the fields of one")
+    return configured(member(**_arguments(member, fields, dtypes=dtypes)))
 
 
 def _key(annotation: Annotation, key: str) -> str | tuple[str, ...]:
@@ -596,8 +502,8 @@ def _parameter_type(function: Callable[..., Configured], name: str) -> Annotatio
     for `name="return"`, without evaluating the others. None where it has no
     annotation. An annotation naming what the function's module does not
     import at runtime raises, since a record cannot be read against it."""
-    # A classmethod registered as `table("name")(Class.reader)` is a bound
-    # method; its annotations and module are its function's.
+    # A classmethod a record names, `Class.reader`, is a bound method; its
+    # annotations and module are its function's.
     underlying = function.__func__ if isinstance(function, types.MethodType) else function
     if not isinstance(underlying, types.FunctionType):
         return None
@@ -624,46 +530,6 @@ def _recorded(field: dataclasses.Field) -> bool:
     """Return whether a field is part of a record: one the constructor takes,
     not marked `metadata={"record": False}`."""
     return field.init and field.metadata.get("record", True)
-
-
-def _table_of(annotation: Annotation) -> Registry | None:
-    """The shared table whose members the annotation names, all of them, or None."""
-    members = typing.get_args(annotation) or (annotation,)
-    for table in Registry.shared():
-        if all(any(member is held for held in table.values()) for member in members):
-            return table
-    return None
-
-
-def _named(table: Registry, record: object) -> tuple[str, Mapping[str, object]]:
-    """The name and fields of a `{"name": ..., "fields": {...}}` record of `table`."""
-    if (not isinstance(record, Mapping) or set(record) != {"name", "fields"}
-            or not isinstance(record["name"], str) or not isinstance(record["fields"], Mapping)):
-        raise ValueError(f"a {table.kind} is the record that names it, {{'name': ..., 'fields': {{...}}}}, "
-                         f"not {record!r}")
-    try:
-        table[record["name"]]
-    except KeyError as error:
-        # A record naming nothing registered is a bad config, not a lookup.
-        raise ValueError(error.args[0]) from error
-    return record["name"], record["fields"]
-
-
-def _nested(held: type,
-            record: Mapping[str, object]) -> tuple[Callable[..., Configured], Mapping[str, object]]:
-    """The member and fields a record builds for a field typed `held`: the
-    shared member a name/fields record names, where that member is `held`,
-    derives from it, or is a function declared to return it, or else `held`
-    and the record as its own fields."""
-    if set(record) == {"name", "fields"} and isinstance(record["name"], str) and isinstance(
-            record["fields"], Mapping):
-        for table in Registry.shared():
-            member = table.get(record["name"])
-            if member is None:
-                continue
-            if issubclass(member, held) if isinstance(member, type) else _returns(member, held):
-                return member, record["fields"]
-    return held, record
 
 
 def configured(value: object) -> Configured:
@@ -782,8 +648,8 @@ def precision_fields(name: str, config: Mapping[str, object], *,
     declared = {f.name for f in dataclasses.fields(member) if f.init}
     named = {"dtype": dtype, "param_dtype": param_dtype, "precision": matmul_precision}
     unreached = [field for field, value in named.items() if value is not None and field not in declared
-                 and not (field == "dtype" and any(_part_takes_dtype(configured(part))
-                                                    for part in config.values()))]
+                 and not (field == "dtype" and any(_part_takes_dtype(member, key, configured(part))
+                                                    for key, part in config.items()))]
     if unreached:
         settings = ", ".join(f"{_PRECISION_FLAGS[field]} {named[field]}" for field in unreached)
         raise ValueError(
@@ -859,61 +725,232 @@ def with_precision(name: str, config: Mapping[str, object], *,
     fields = {**config, **precision_fields(
         name, config, dtype=dtype, attention_impl=attention_impl,
         param_dtype=param_dtype, matmul_precision=matmul_precision)}
-    if dtype is None or "dtype" in {field.name for field in dataclasses.fields(models[name])}:
+    member = models[name]
+    if dtype is None or "dtype" in {field.name for field in dataclasses.fields(member)}:
         return fields
-    return {key: _with_part_dtype(configured(value), dtype) for key, value in fields.items()}
+    return {key: _with_part_dtype(member, key, configured(value), dtype) for key, value in fields.items()}
 
 
-def _part_takes_dtype(value: Configured) -> bool:
-    """Whether a composite's field is a registered model, recorded or built,
-    that declares a compute dtype."""
+def _part_type(member: type, field: str, value: Configured) -> type | None:
+    """The model class a composite's `field` holds, built, as a class record,
+    or as the record of the class the field declares; None for anything else."""
     from flax import linen as nn
 
     if isinstance(value, nn.Module):
-        return type(value) in models.values() and "dtype" in {f.name for f in dataclasses.fields(value)}
-    if not isinstance(value, Mapping) or set(value) != {"name", "fields"}:
-        return False
-    name, fields = value["name"], value["fields"]
-    return (isinstance(name, str) and name in models and isinstance(fields, Mapping)
-            and "dtype" in {field.name for field in dataclasses.fields(models[name])})
+        return type(value)
+    named = _class_record(value) if isinstance(value, Mapping) else None
+    if named is not None:
+        held = _member(named[0], (nn.Module,))
+        return held if isinstance(held, type) else None
+    declared = _unwrapped(_declared_type(member, field))
+    if isinstance(value, Mapping) and isinstance(declared, type) and issubclass(declared, nn.Module):
+        return declared
+    return None
 
 
-def _with_part_dtype(value: Configured, dtype: str) -> Configured:
+def _part_takes_dtype(member: type, field: str, value: Configured) -> bool:
+    """Whether a composite's `field` is a model, recorded or built, that
+    declares a compute dtype."""
+    held = _part_type(member, field, value)
+    return held is not None and "dtype" in {f.name for f in dataclasses.fields(held)}
+
+
+def _with_part_dtype(member: type, field: str, value: Configured, dtype: str) -> Configured:
     """A composite's part with the run's compute dtype, where the part is a
-    registered model, recorded or built, that declares one."""
+    model, recorded or built, that declares one."""
     from flax import linen as nn
 
-    if not _part_takes_dtype(value):
+    if not _part_takes_dtype(member, field, value):
         return value
     if isinstance(value, nn.Module):
         return value.clone(dtype=resolve_dtype(dtype))
-    assert isinstance(value, Mapping) and isinstance(value["fields"], Mapping)
-    return {"name": value["name"], "fields": {**value["fields"], "dtype": dtype}}
+    assert isinstance(value, Mapping)
+    named = _class_record(value)
+    if named is not None:
+        return {"class": named[0], "fields": {**named[1], "dtype": dtype}}
+    return {**{str(key): configured(entry) for key, entry in value.items()}, "dtype": dtype}
 
 
-# Every table's record is `{"name": ..., "fields": {...}}`, which
-# `Registry.from_record` and the run record's walk read alike.
-models: Registry[type[nn.Module], nn.Module] = Registry("model").share()
-presets: Registry[type[Preset], Preset] = Registry("preset").share()
-solvers: Registry[type[Solver[Any]], Solver[Any]] = Registry("solver").share()
-datasets: Registry[type[DatasetSpec], DatasetSpec] = Registry("dataset").share()
-encoders: Registry[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Registry("encoder").share()
-metrics: Registry[Callable[..., Metric], Metric] = Registry("metric").share()
-objectives: Registry[type[Objective], Objective] = Registry("objective").share()
-mixers: Registry[type[MixerBase], MixerBase] = Registry("mixer").share()
-towers: Registry[type[TowerBase], TowerBase] = Registry("tower").share()
-projectors: Registry[type[ProjectorBase], ProjectorBase] = Registry("projector").share()
-schedules: Registry[type[ScheduleBase], ScheduleBase] = Registry("schedule").share()
-trainings: Registry[type[Training], Training] = Registry("training").share()
+# Each kind's aliases, for the command line and the records a person writes.
+models: Aliases[type[nn.Module], nn.Module] = Aliases("model", {
+    "causal_transformer": "dew.nn.backbones.causal_transformer:CausalTransformer",
+    "diffusion_gemma": "dew.nn.diffusion_gemma:DiffusionGemma",
+    "edm2_unet": "dew.nn.backbones.edm2:EDM2UNet",
+    "flux2_transformer": "dew.nn.backbones.flux2:Flux2Transformer",
+    "flux_transformer": "dew.nn.backbones.flux:FluxTransformer",
+    "hierarchical_mmdit": "dew.nn.backbones.mmdit:HierarchicalMMDiT",
+    "hybrid_dit": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
+    "jepa_encoder": "dew.nn.backbones.jepa:JepaEncoder",
+    "jepa_predictor": "dew.nn.backbones.jepa:JepaPredictor",
+    "jepa_video_encoder": "dew.nn.backbones.jepa:JepaVideoEncoder",
+    "multimodal_transformer": "dew.nn.multimodal:MultimodalTransformer",
+    "qwen_image_transformer": "dew.nn.backbones.qwen_image:QwenImageTransformer",
+    "sd3_transformer": "dew.nn.backbones.sd3:SD3Transformer",
+    "simple_dit": "dew.nn.backbones.dit:SimpleDiT",
+    "simple_mmdit": "dew.nn.backbones.mmdit:SimpleMMDiT",
+    "simple_udit": "dew.nn.backbones.uvit:SimpleUDiT",
+    "unet": "dew.nn.backbones.unet:Unet",
+    "unet_2d_condition": "dew.nn.backbones.unet_condition:UNet2DCondition",
+    "unet_3d": "dew.nn.backbones.unet3d:UNet3D",
+    "uvit": "dew.nn.backbones.uvit:UViT",
+    "video_dit": "dew.nn.backbones.video_dit:VideoDiT",
+    "wan_transformer": "dew.nn.backbones.wan:WanTransformer",
+    "z_image_transformer": "dew.nn.backbones.z_image:ZImageTransformer",
+})
+presets: Aliases[type[Preset], Preset] = Aliases("preset", {
+    "cosine": "dew.diffusion.presets:Cosine",
+    "edm": "dew.diffusion.presets:EDM",
+    "flow": "dew.diffusion.presets:Flow",
+    "jit": "dew.diffusion.presets:JiT",
+    "karras": "dew.diffusion.presets:Karras",
+    "mdlm": "dew.diffusion.discrete:MDLM",
+    "mean_flow": "dew.diffusion.presets:MeanFlow",
+    "shortcut": "dew.diffusion.presets:Shortcut",
+    "sqrt": "dew.diffusion.presets:Sqrt",
+})
+solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
+    "consistency": "dew.sampling.solvers.gaussian:Consistency",
+    "ddim": "dew.sampling.solvers.gaussian:DDIM",
+    "ddpm": "dew.sampling.solvers.gaussian:DDPM",
+    "deis": "dew.sampling.solvers.dpm:DEIS",
+    "dpmsolver_multistep": "dew.sampling.solvers.dpm:DPMSolverMultistep",
+    "dpmsolver_sde": "dew.sampling.solvers.brownian:DPMSolverSDE",
+    "dpmsolver_singlestep": "dew.sampling.solvers.dpm:DPMSolverSinglestep",
+    "euler": "dew.sampling.solvers.sigma:Euler",
+    "euler_ancestral": "dew.sampling.solvers.sigma:EulerAncestral",
+    "flow_sde": "dew.sampling.flow:FlowSDE",
+    "heun": "dew.sampling.solvers.sigma:Heun",
+    "kdpm2": "dew.sampling.solvers.sigma:KDPM2",
+    "lms": "dew.sampling.solvers.sigma:LMS",
+    "multistep_dpm": "dew.sampling.solvers.sigma:MultiStepDPM",
+    "pndm": "dew.sampling.solvers.gaussian:PNDM",
+    "rk4": "dew.sampling.solvers.sigma:RK4",
+    "tcd": "dew.sampling.solvers.gaussian:TCD",
+    "unipc": "dew.sampling.solvers.unipc:UniPC",
+    "unmask": "dew.diffusion.discrete:Unmask",
+})
+datasets: Aliases[type[DatasetSpec], DatasetSpec] = Aliases("dataset", {
+    "array_record_images": "dew.data.images:ArrayRecordImages",
+    "chat_messages": "dew.data.chat:ChatMessages",
+    "decision_table": "dew.decision.data:DecisionTable",
+    "hf": "dew.data.providers:HubDataset",
+    "hf_images": "dew.data.images:HFImages",
+    "local_videos": "dew.data.video:LocalVideos",
+    "online_images": "dew.data.streaming:OnlineImages",
+    "online_videos": "dew.data.streaming:OnlineVideos",
+    "packed_tokens": "dew.data.tokens:PackedTokens",
+    "preference_pairs": "dew.data.preferences:PreferencePairs",
+    "prompts": "dew.data.prompts:Prompts",
+    "tfds": "dew.data.providers:PreparedTFDS",
+    "tfds_images": "dew.data.images:TFDSImages",
+    "token_windows": "dew.data.tokens:TokenWindows",
+})
+encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
+    "char_table": "dew.inputs.encoders:CharTable",
+    "clip_text": "dew.inputs.encoders:CLIPText",
+    "diffusion_text": "dew.inputs.diffusion:DiffusionConditioner",
+    "hf_audio": "dew.inputs.encoders:HFAudio",
+    "hidden_states_text": "dew.inputs.diffusion:HiddenStatesConditioner",
+    "qwen_image_text": "dew.inputs.diffusion:QwenImageConditioner",
+    "t5": "dew.inputs.encoders:T5Text",
+    "wan_text": "dew.inputs.diffusion:WanConditioner",
+})
+metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
+    "accuracy": "dew.decision.metrics:Accuracy",
+    "aurc": "dew.decision.metrics:AURC",
+    "brier": "dew.decision.scoring:Brier",
+    "clip": "dew.eval.images:CLIPDistance",
+    "clip_score": "dew.eval.images:CLIPScore",
+    "ece": "dew.decision.metrics:ECE",
+    "fid": "dew.eval.fid:FID",
+    "knn_probe": "dew.objectives.jepa.probes:KnnProbe",
+    "linear_probe": "dew.objectives.jepa.probes:LinearProbe",
+    "log_loss": "dew.decision.scoring:LogLoss",
+    "lpips": "dew.eval.lpips:LPIPS",
+    "perplexity": "dew.objectives.lm.objective:Perplexity",
+    "psnr": "dew.eval.psnr:PSNR",
+    "rps": "dew.decision.scoring:RankedProbability",
+    "spherical": "dew.decision.scoring:Spherical",
+    "ssim": "dew.eval.ssim:SSIM",
+})
+objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
+    "block_diffusion": "dew.objectives.diffusion.block:BlockDiffusionObjective",
+    "decision": "dew.decision.objective:DecisionObjective",
+    "diffusion": "dew.objectives.diffusion.objective:DiffusionObjective",
+    "distillation": "dew.objectives.distillation:DistillationObjective",
+    "dpo": "dew.objectives.rl.preference:DPOObjective",
+    "flow_grpo": "dew.objectives.rl.flow:FlowGRPOObjective",
+    "grpo": "dew.objectives.rl.grpo:GRPOObjective",
+    "guidance_distillation": "dew.objectives.diffusion.guidance_distillation:GuidanceDistillationObjective",
+    "jepa": "dew.objectives.jepa.objective:JepaObjective",
+    "ladd": "dew.objectives.diffusion.adversarial:AdversarialDistillationObjective",
+    "lm": "dew.objectives.lm.objective:LMObjective",
+    "masked_diffusion": "dew.objectives.diffusion.masked:MaskedDiffusionObjective",
+    "mean_flow": "dew.objectives.diffusion.few_step:MeanFlowObjective",
+    "ppo": "dew.objectives.rl.ppo:PPOObjective",
+    "rcm": "dew.objectives.diffusion.consistency:ConsistencyDistillationObjective",
+    "shortcut": "dew.objectives.diffusion.few_step:ShortcutObjective",
+})
+mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
+    "attention": "dew.nn.mixers.attention:AttentionMixer",
+    "deepseek_v4": "dew.nn.deepseek_v4:DeepseekV4Mixer",
+    "gated_delta_net": "dew.nn.mixers.gated_delta_net:GatedDeltaNetMixer",
+    "kimi_delta_attention": "dew.nn.kda:KimiDeltaAttentionMixer",
+    "kpool_sparse_attention": "dew.nn.dsa_kpool:KPoolSparseAttentionMixer",
+    "llama4": "dew.nn.llama4:Llama4Mixer",
+    "mamba2": "dew.nn.mixers.mamba2:Mamba2Mixer",
+    "mla": "dew.nn.mla:MLAMixer",
+    "mlp": "dew.nn.mixers.mlp:MLPMixer",
+})
+towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
+    "deepseek_v41": "dew.nn.vision.deepseek_v41:DeepseekV41Vision",
+    "gemma3n": "dew.nn.vision.gemma3n:Gemma3nVision",
+    "gemma3n_audio": "dew.nn.audio:Gemma3nAudio",
+    "gemma4": "dew.nn.vision.gemma4:Gemma4Vision",
+    "gemma4_audio": "dew.nn.audio:Gemma4Audio",
+    "llama4": "dew.nn.vision.llama4:Llama4Vision",
+    "qwen3_5": "dew.nn.vision.qwen35:Qwen35Vision",
+    "siglip": "dew.nn.vision.siglip:SiglipVision",
+})
+projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
+    "deepseek_v41": "dew.nn.vision.deepseek_v41:DeepseekV41Projector",
+    "gemma": "dew.nn.vision.siglip:GemmaProjector",
+    "gemma3n": "dew.nn.vision.gemma3n:Gemma3nProjector",
+    "gemma4": "dew.nn.vision.gemma4:Gemma4Projector",
+    "llama4": "dew.nn.vision.llama4:Llama4Projector",
+    "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
+})
+schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
+    "cosine": "dew.training.optim:Cosine",
+    "exponential": "dew.training.optim:Exponential",
+    "linear": "dew.training.optim:Linear",
+    "one_cycle": "dew.training.optim:OneCycle",
+    "power": "dew.training.optim:Power",
+})
+trainings: Aliases[type[Training], Training] = Aliases("training", {
+    "diffusion": "dew.objectives.diffusion.objective:Denoising",
+    "flow_grpo": "dew.objectives.diffusion.config:FlowGRPO",
+    "guidance_distillation": "dew.objectives.diffusion.guidance_distillation:GuidanceDistillation",
+    "ladd": "dew.objectives.diffusion.adversarial:AdversarialDistillation",
+    "mean_flow": "dew.objectives.diffusion.few_step:MeanFlowTraining",
+    "rcm": "dew.objectives.diffusion.consistency:ConsistencyDistillation",
+    "shortcut": "dew.objectives.diffusion.few_step:ShortcutTraining",
+})
+
+KINDS: tuple[Aliases, ...] = (models, presets, solvers, datasets, encoders, metrics, objectives, mixers,
+                              towers, projectors, schedules, trainings)
+"""Every kind, which a record's alias is looked up across."""
 
 __all__ = [
-    "PLUGINS",
+    "KINDS",
+    "Aliases",
     "Record",
-    "Registry",
     "datasets",
     "dtype_name",
     "encoders",
     "from_record",
+    "import_path",
+    "imported",
     "metrics",
     "mixers",
     "models",

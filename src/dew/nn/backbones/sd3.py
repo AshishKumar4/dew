@@ -27,7 +27,6 @@ from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
-from dew.registry import models
 
 from .joint import DoubleStreamBlock, Modulation, embedding, layer_norm, modulate
 
@@ -55,7 +54,6 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
     return jnp.concatenate([axis(columns), axis(rows)], axis=1)[None]
 
 
-@models("sd3_transformer")
 @logical_axes({("context_embedder",): (None, "embed"),
                ("proj_out",): ("embed", None),
                ("timestep_embedder_linear_1",): (None, "embed"),

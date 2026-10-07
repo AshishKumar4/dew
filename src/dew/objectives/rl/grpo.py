@@ -27,7 +27,6 @@ from dew.inputs import Field, InputSpec
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, Ratio, Shown, Variables, thaw
 from dew.objectives.lm.chunked import head_cross_entropy
-from dew.registry import objectives
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
     behavior_band_weights,
@@ -95,7 +94,6 @@ def _band(name: str, band) -> tuple[float, float] | None:
     return low, high
 
 
-@objectives("grpo")
 class GRPOObjective(LMObjective):
     """Trains a policy on sampled rollouts with the GRPO loss (arXiv:2402.03300, equation 4).
 

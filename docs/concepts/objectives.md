@@ -14,7 +14,7 @@ An `Objective` defines what a run learns. It creates the variables, computes the
 | `optimizer(tx, *, accumulation)` | No | The optimizer the trainer steps `params` with; `tx` by default |
 | `averages(update)` | No | Whether an update moves the EMA; every update by default |
 
-You pass `Trainer` an instance of the objective. Register it with `dew.registry` only when a configuration file has to find it by name.
+You pass `Trainer` an instance of the objective. A configuration file or a saved run names it by its import path.
 
 ## init
 
