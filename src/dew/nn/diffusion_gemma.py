@@ -24,7 +24,8 @@ from flax.typing import Dtype, PrecisionLike, VariableDict
 
 from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import RMSNorm
-from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
