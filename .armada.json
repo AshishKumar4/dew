@@ -10,7 +10,7 @@
   "history": "commit",
   "env": { "JAX_PLATFORMS": "cpu", "PYTHONFAULTHANDLER": "1" },
   "pool": 150,
-  "target": 300,
+  "size": "auto",
   "plan": { "command": ["python3", "tools/armada/ci.py", "plan", "--target={target}", "--timings={timings}"] },
   "task": {
     "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
