@@ -282,7 +282,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         # read the same rows, so the pool counts each share once.
         shares = np.asarray(multihost_utils.process_allgather(
             np.asarray([DataPartition.of(mesh).index, records], np.int64))).reshape(-1, 2)
-        records = int(sum(dict(shares.tolist()).values()))
+        records = sum({int(index): int(count) for index, count in shares}.values())
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
             if loss_stats is not None:
