@@ -62,8 +62,11 @@ was red on 3.14 alone."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
 COLLECT_TASKS = 4
-SKIPPED = {"tests/test_gen_api.py"}
-"""CI runs it in the lint job, under the griffe it pins."""
+SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
+"""CI runs the first in the lint job, under the griffe it pins, and the second across a gang (`MULTIHOST`)."""
+MULTIHOST = {"name": "multihost", "gang": 4, "python": "3.12", "tests": "tests/test_multihost.py",
+             "split": "", "rows": ["3.12:tests/test_multihost.py"], "weight": 1800}
+"""The multi-host pools, run on demand (`plan --multihost`): four containers of a gang, one host each."""
 DURATIONS = Path("tests/test_durations.json")
 
 
@@ -193,9 +196,11 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                 "duration_based_chunks", "--durations-path", str(DURATIONS)] if split else []
     # faulthandler prints every thread's stack when a test runs ten minutes. Unbuffered (-u), so the
     # log holds every test that finished when a task is cut short.
+    # A gang's ranks run the same tests, which name their files under one root on every host.
+    ganged = ["--basetemp=/tmp/dew-gang"] if int(os.environ.get("ARMADA_WORLD", "1")) > 1 else []
     command = [f".venv-{python}/bin/python", "-u", "-m", "pytest", "-q", "-m", "not network", "-rfE",
                "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
-               "-p", "no:cacheprovider", f"--junitxml={report}", *tests, *grouping]
+               "-p", "no:cacheprovider", f"--junitxml={report}", *ganged, *tests, *grouping]
     # pytest leads a process group of its own, so what its tests start ends with it. Its output is
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
@@ -248,7 +253,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
                      "output": "\n".join(red + ([shown(output)] if red else [])),
                      **({} if split else {"timings": {name: seconds}})})
     out.write_text(json.dumps({"rows": rows}))
-    return 0
+    # A gang's task reports rank 0's rows; another rank says its own red by its exit, which the gang's
+    # outcome takes.
+    other_rank = int(os.environ.get("ARMADA_RANK", "0")) > 0
+    return 1 if other_rank and any(entry["exitCode"] for entry in rows) else 0
 
 
 def main() -> int:
@@ -257,6 +265,7 @@ def main() -> int:
     planning = operations.add_parser("plan")
     planning.add_argument("--target", type=float, required=True)
     planning.add_argument("--timings", type=Path, required=True)
+    planning.add_argument("--multihost", action="store_true", help="plan the multi-host pools alone")
     running = operations.add_parser("task")
     running.add_argument("--python", choices=PYTHONS, required=True)
     running.add_argument("--tests", required=True)
@@ -267,7 +276,7 @@ def main() -> int:
     args = parser.parse_args()
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
-        print(json.dumps({"include": plan(args.target, timings)}))
+        print(json.dumps({"include": [MULTIHOST] if args.multihost else plan(args.target, timings)}))
         return 0
     if args.split == COLLECT:
         return collect(args.python, args.tests.split(), args.out, args.deadline)
