@@ -105,18 +105,22 @@ def _own_loss(name: str, kwargs: dict) -> None:
 
 def teacher_weights(variables: Variables | None, run: str | None, *, whole: bool = False) -> Variables:
     """A distillation's frozen teacher: the starting tree's `TEACHER` when it
-    holds one, as a saved distilled run's does, else the weights the teacher's
-    run directory `run` published, the model's alone unless `whole`."""
+    holds one, as a saved student's does; else the weights the teacher's run
+    directory `run` published; else, with no run, the model the starting tree
+    holds, which the student then starts as. The model's own collections
+    alone (`model_part`) unless `whole`."""
     if variables is not None and TEACHER in variables:
         return variables[TEACHER]
-    if run is None:
-        raise ValueError(f"the teacher's weights come from the starting tree's {TEACHER!r}, which holds "
-                         f"none, or from the teacher's run; name its directory (teacher_run=)")
-    from dew.checkpoints import Checkpoints
+    if run is not None:
+        from dew.checkpoints import Checkpoints
 
-    restored = Checkpoints(run).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
-    return restored if whole else _without_loss_heads(
-        {name: tree for name, tree in restored.items() if name not in ("encoders", "autoencoder")})
+        tree = Checkpoints(run).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+    elif variables is not None and "params" in variables:
+        tree = variables
+    else:
+        raise ValueError(f"the teacher's weights come from the starting tree's {TEACHER!r}, the teacher's "
+                         f"run (teacher_run=) or the model the starting tree holds, and none is given")
+    return thaw(tree) if whole else model_part(tree)
 
 
 def _without_loss_heads(variables: Variables) -> Variables:
@@ -128,6 +132,13 @@ def _without_loss_heads(variables: Variables) -> Variables:
                    if name in ("params", "constants") else tree)
             for name, tree in variables.items()
             if name not in (REPRESENTATION, LATENT_STATS, PERCEPTUAL, TEACHER, SPECTRAL)}
+
+
+def model_part(tree: Variables) -> Variables:
+    """The model's own collections of `tree`, a frozen split merged back: the
+    frozen towers and the loss's own heads left out."""
+    return _without_loss_heads({name: value for name, value in thaw(tree).items()
+                                if name not in ("encoders", "autoencoder")})
 
 
 def check_solver(process, solver, steps: int) -> None:
@@ -575,12 +586,8 @@ class DiffusionObjective(Objective[Ratio]):
         return kept["__call__"][0]
 
     def model_variables(self, params) -> Variables:
-        """Return the model's own collections, with a frozen split merged back.
-
-        The frozen towers and the loss's own heads are left out.
-        """
-        return _without_loss_heads({name: value for name, value in thaw(params).items()
-                                    if name not in ("encoders", "autoencoder")})
+        """Return the model's own collections (`model_part`)."""
+        return model_part(params)
 
     def encoded_conditions(self, params, batch) -> dict:
         """Encode each condition's own batch field with the tree's frozen towers."""
@@ -809,10 +816,11 @@ class FlowDistillationObjective(DiffusionObjective):
     `teacher` is the teacher's model, by default the student's own without
     its adapter. Its weights, frozen under `TEACHER`, are the starting tree's
     when it holds them, else those the teacher's run directory `teacher_run`
-    published (`teacher_weights`). A tree that lacks the loss's own `network`
-    starts the student as the teacher, in buffers the step may donate, the
-    weights under `FROZEN` in an adapter's split, which freezes all but its
-    factors, beside that network (`network_variables`). Sampling runs
+    published, else the model the starting tree holds (`teacher_weights`). A
+    tree that lacks the loss's own `network` starts the student as the
+    teacher, in buffers the step may donate, the weights under `FROZEN` in an
+    adapter's split, which freezes all but its factors, beside that network
+    (`network_variables`). Sampling runs
     `Consistency`, unguided.
     """
 
