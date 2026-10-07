@@ -197,10 +197,10 @@ class TorchCausalLM(nn.Module):
     theirs. The torch module runs in eval mode, so dropout is off whatever
     `train` says.
 
-    `hidden_states` and `head_weight` are the pair `LMObjective` scores
+    `hidden_states` and `output_table` are the pair `LMObjective` scores
     through, so the vocabulary-sized logits are never built whole. Only a
-    model whose logits are the plain head product has them (`TorchGraph`),
-    and only it has an `output_table`. The reads take plain token rows:
+    model whose logits are the plain head product (`TorchGraph`) has an
+    `output_table`. The reads take plain token rows:
     transformers' forward runs with no packing columns and no cache, so a
     packing field is refused by name and there is no cached decode.
     """
@@ -240,15 +240,6 @@ class TorchCausalLM(nn.Module):
         """The fp32 logits of the whole rows, as `__call__` returns them."""
         _refuse_packing(packing)
         return self(tokens, train=train)
-
-    def head_weight(self, params) -> jax.Array:
-        """The `[features, vocab]` output head, the transposed torch weight."""
-        if self.graph.head is None:
-            raise ValueError(
-                "this model's logits are not its output head's plain product (the head has a "
-                "bias, a scale or a cap), so LMObjective cannot score it in vocabulary chunks; "
-                "train it with a loss over model.apply's logits instead")
-        return jnp.asarray(params[self.graph.head]).T
 
     def output_table(self) -> OutputTable | None:
         """The output head's `[vocab, features]` torch weight as the bound

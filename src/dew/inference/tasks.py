@@ -555,7 +555,7 @@ class BlockGeneration:
     `process` (the published sampler configuration), its `max_new_tokens`
     budget and its `n` continuations per prompt. The `n` continuations of a
     prompt come back as `n` consecutive rows, in prompt order. The model
-    is a `dew.diffusion.block.BlockDenoiser`, as DiffusionGemma is.
+    is a `dew.nn.protocols.BlockDenoiser`, as DiffusionGemma is.
     """
 
     model: nn.Module
