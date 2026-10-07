@@ -85,18 +85,19 @@ def test_a_config_records_its_class_defaults_and_builds_with_them_as_the_class_d
 
 def released(monkeypatch, member: type, name: str, value) -> None:
     """Default `member`'s `name` to `value` from here on, as a later release
-    of the class would: in its constructor, and in the dataclass field a
-    record reads a default from."""
-    parameters = inspect.signature(member.__init__).parameters
+    of the class would: in its constructor (the one a Flax module's wraps),
+    and in the dataclass field a record reads a default from."""
+    init = inspect.unwrap(member.__init__)
+    parameters = inspect.signature(init).parameters
     if parameters[name].kind is inspect.Parameter.KEYWORD_ONLY:
-        monkeypatch.setitem(member.__init__.__kwdefaults__, name, value)
+        monkeypatch.setitem(init.__kwdefaults__, name, value)
     else:
         defaulted = [held for held, parameter in parameters.items()
                      if parameter.kind is parameter.POSITIONAL_OR_KEYWORD
                      and parameter.default is not parameter.empty]
-        defaults = list(member.__init__.__defaults__)
+        defaults = list(init.__defaults__)
         defaults[defaulted.index(name)] = value
-        monkeypatch.setattr(member.__init__, "__defaults__", tuple(defaults))
+        monkeypatch.setattr(init, "__defaults__", tuple(defaults))
     if dataclasses.is_dataclass(member):
         monkeypatch.setattr(member.__dataclass_fields__[name], "default", value)
 
