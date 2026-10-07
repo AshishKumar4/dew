@@ -157,7 +157,9 @@ def case_for(path: str, batch: int, args: argparse.Namespace | None) -> Case:
     if path == "lm-dense":
         config = decoder(24, 1024, 16, 2816)
     else:
-        mixture: dict[str, object] = {"experts": 8, "top_k": 2, "every": 2, "dispatch": "global"}
+        # Every second layer routes, Qwen3-MoE's decoder_sparse_step 2.
+        mixture: dict[str, object] = {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11],
+                                      "dispatch": "global"}
         if args is not None:
             mixture["implementation"] = args.implementation
         config = {**decoder(12, 768, 12, 2048), "mixture": mixture}
