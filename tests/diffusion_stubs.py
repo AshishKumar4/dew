@@ -70,13 +70,13 @@ def batch_for(objective, size: int) -> dict:
             **objective.inputs.tokenize([PROMPTS[row % len(PROMPTS)] for row in range(rows)])}
 
 
-def label_table(labels: dict[str, float], null: float = 0.0) -> CharTable:
-    """A character table of one feature: each name's first character reads
-    its label, and the padding id 0 reads `null`, the class a dropped
+def label_table(labels, null: float = 0.0) -> CharTable:
+    """A character table of one feature: the prompt `str(i)` reads
+    `labels[i]`, and the padding id 0 reads `null`, the class a dropped
     condition stands for."""
     table = CharTable.from_pretrained(tokens=2, features=1)
     entries = np.zeros((table.vocab, 1), np.float32)
     entries[0] = null
-    for name, label in labels.items():
-        entries[table.tokenize([name])["input_ids"][0, 1]] = label
+    for index, label in enumerate(labels):
+        entries[table.tokenize([str(index)])["input_ids"][0, 1]] = label
     return CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})

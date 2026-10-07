@@ -52,8 +52,7 @@ def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
     the float64 rule."""
     count = SETTINGS["batch_size"]
     rows = count // SETTINGS["bootstrap_every"]
-    classes = SETTINGS["num_classes"]
-    table = label_table({str(digit): digit for digit in range(classes)}, null=classes)
+    table = label_table(range(SETTINGS["num_classes"]), null=SETTINGS["num_classes"])
     inputs = InputSpec(Field("image", CASE["pixels"].shape[1:]), {"textcontext": Condition(table)})
     task = ShortcutObjective(Tiny(), presets.Shortcut()(), inputs,
                              ShortcutTraining(sections=SETTINGS["denoise_timesteps"],

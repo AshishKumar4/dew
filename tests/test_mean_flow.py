@@ -56,7 +56,7 @@ def test_the_loss_and_its_gradient_are_the_references(power, monkeypatch):
     case = np.load(FIXTURES / f"loss_p{power}.npz")
     settings = json.loads(str(case["settings"]))
     assert settings["num_classes"] == CLASSES
-    table = label_table({str(digit): digit for digit in range(CLASSES)}, null=CLASSES)
+    table = label_table(range(CLASSES), null=CLASSES)
     inputs = InputSpec(Field("image", case["pixels"].shape[1:]), {"textcontext": Condition(table)})
     task = MeanFlowObjective(
         Tiny(), presets.MeanFlow()(), inputs, MeanFlowTraining(
