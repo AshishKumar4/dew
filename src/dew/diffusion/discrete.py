@@ -37,11 +37,15 @@ from dew.nn.inputs import RESPONSE_FIELDS, ModelInputs, Request, continuation_ke
 from dew.nn.protocols import Logits, TokenModel
 from dew.objectives.base import Variables
 
-MDLM_STEPS = 64
-"""Reverse steps `generate` takes by default, the count MDLM samples with."""
+MDLM_STEPS = 128
+"""Reveal steps `generate` takes by default, MDLM's `sampling.steps` (configs/config.yaml)."""
 
 SAMPLING_EPS = 1e-3
 """The least training time, MDLM's `training.sampling_eps` (configs/config.yaml)."""
+
+NOISE_REMOVAL_TIME = 1e-5
+"""The last time MDLM's sampler reveals at, where it removes the noise left
+(`_sample(eps=1e-5)`, kuleshov-group/mdlm@c112c52, diffusion.py:658)."""
 
 
 class MaskingSchedule(ABC):
@@ -121,7 +125,10 @@ class DiscreteProcess:
         return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
 
     def times(self, steps: int) -> jax.Array:
-        return jnp.linspace(self.T, 0.0, steps, dtype=jnp.float32)
+        """MDLM's sampling grid for `steps` reveal steps: `steps + 1` times from
+        T to `NOISE_REMOVAL_TIME`, at which `sample`'s closing argmax fills what
+        is still masked, as MDLM's noise removal does."""
+        return jnp.linspace(self.T, NOISE_REMOVAL_TIME, steps + 1, dtype=jnp.float32)
 
     def noise(self, key, shape) -> jax.Array:
         """Return x_T, with every position masked.

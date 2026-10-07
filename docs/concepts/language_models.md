@@ -392,7 +392,7 @@ Trained 1000 steps in 0:00:20: first step after 1.16 s, then 51.7 step/s
 One day, Lily. She da b tfte,dAt nigl
 ```
 
-The loss is MDLM's negative ELBO per token. `process.generate` unmasks the 24 tokens after the prompt together, in 64 reverse steps by default (`steps=`), so a model this small draws fragments of its corpus rather than a sentence.
+The loss is MDLM's negative ELBO per token. `process.generate` unmasks the 24 tokens after the prompt together, in MDLM's 128 reveal steps by default (`steps=`), then fills what is still masked with the model's most likely tokens, as MDLM's noise removal does, so a model this small draws fragments of its corpus rather than a sentence.
 
 On TinyStories, with the GPT-2 tokenizer, a 4-layer, 256-wide model trained on 128-token rows at batch 64 took about five minutes for 4,000 steps on an L4. Its loss fell from 3.48 at step 1,000 to 2.78 at step 4,000, and validation perplexity reached 15.0. That perplexity is exp of the ELBO, an upper bound on the model's own perplexity, so it does not compare directly with an autoregressive decoder's. One draw of 48 tokens read:
 
@@ -420,7 +420,7 @@ The default is 64 model evaluations, including the final clean prediction; a cal
 
 A source generation control that native MDLM cannot follow is rejected by name. Neutral values are accepted, as are the shared budget, continuation count, EOS and padding metadata. MDLM does not use a KV cache, so `use_cache=False` is accepted and asking for a cache is not.
 
-Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks the live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` solver and 64 steps, so custom objective steps or solver choices set in code are not saved. Plain `Checkpoints` saves weights and training state but not these task settings, so you have to apply a custom task configuration again. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata, and for a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`.
+Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks the live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` solver and 128 steps, MDLM's own, so custom objective steps or solver choices set in code are not saved. Plain `Checkpoints` saves weights and training state but not these task settings, so you have to apply a custom task configuration again. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata, and for a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`.
 
 ## DiffusionGemma
 
