@@ -15,7 +15,9 @@ The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
 so inference rebuilds a run from what training was built from. A field the
 file lacks takes its declared default, and a field the class does not have
-raises an error.
+raises an error. The model and the objective record their classes' defaults
+too (`ModelConfig.defaults`), so a default changed since leaves the record
+building what it built.
 """
 
 import copy
