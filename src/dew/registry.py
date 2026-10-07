@@ -341,7 +341,8 @@ def to_record(value, annotation) -> JSON:
                 for entry_value, entry in zip(value, entries, strict=True)]
     if isinstance(value, Mapping):
         entries = entry_types(annotation, len(value))
-        return {_record_key(key): to_record(entry_value, entry)
+        keys = _key_type(annotation)
+        return {_record_key(key, keys): to_record(entry_value, entry)
                 for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
@@ -351,22 +352,47 @@ def to_record(value, annotation) -> JSON:
         f"functions with an import path")
 
 
-def _record_key(key: object) -> str:
+def _record_key(key: object, declared: Annotation) -> str:
     """Return one mapping key as JSON names it, since JSON has only string keys.
 
-    A tree path is its parts joined the way every message in this tree joins
-    them, `params/layers_0/self_attn/q_proj`, which is the spelling `_key`
-    splits back into the tuple the field declares. A key that is
-    neither a name nor a path of them has no spelling a record reads back,
-    so it is refused here rather than written as its repr.
+    A name is itself, a number its Python spelling, and a tree path its parts
+    joined the way every message in this tree joins them,
+    `params/layers_0/self_attn/q_proj`. The mapping's declared key type reads
+    the spelling back (`_key`), so a key it would not read back as the same
+    value of the same type, such as a number under an undeclared key type, a
+    NaN, or a path part holding `/`, is refused here rather than written.
     """
     if isinstance(key, tuple):
-        return "/".join(_record_key(part) for part in key)
-    if not isinstance(key, (str, int, float)):
+        written = "/".join(_record_key(part, None) if isinstance(part, str) else str(part) for part in key)
+    elif isinstance(key, (str, int, float)):
+        written = str(key)
+    else:
         raise TypeError(
             f"{key!r} is not a key a run record can carry; a config mapping is keyed "
-            f"by a name, a number, or a tree path of names")
-    return str(key)
+            f"by a name, a number, or a tree path of them")
+    try:
+        back = _key(declared, written)
+    except ValueError:
+        back = written
+    if not _same_key(back, key):
+        raise ValueError(f"the key {key!r} would read back as {back!r} under the mapping's key type "
+                         f"{declared}; declare the key type, or key it by a name")
+    return written
+
+
+def _same_key(read: Configured, key: Configured) -> bool:
+    """Whether a key read back is the key written: equal, and of the same type
+    part by part."""
+    if isinstance(key, tuple):
+        return (isinstance(read, tuple) and len(read) == len(key)
+                and all(_same_key(a, b) for a, b in zip(read, key, strict=True)))
+    return type(read) is type(key) and read == key
+
+
+def _key_type(annotation: Annotation) -> Annotation:
+    """A mapping annotation's declared key type; None where it declares none."""
+    annotation = _unwrapped(annotation)
+    return typing.get_args(annotation)[0] if typing.get_origin(annotation) in _MAPPINGS else None
 
 
 _MAPPINGS = (dict, Mapping, MutableMapping)
@@ -474,10 +500,36 @@ def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, d
     return configured(member(**_arguments(member, fields, dtypes=dtypes)))
 
 
-def _key(annotation: Annotation, key: str) -> str | tuple[str, ...]:
-    """One record key as the mapping declares it: a name, or the tuple path
-    `dew.config._key` joined with `/`."""
-    return tuple(key.split("/")) if wants_tuple(annotation) else key
+def _key(annotation: Annotation, key: str) -> Configured:
+    """One record key as the mapping declares its keys: a name, a number, a
+    literal, or the tuple path `_record_key` joined with `/`, each part read
+    by its own declared type. A spelling the type does not read is refused."""
+    annotation = resolve_alias(annotation)
+    if wants_tuple(annotation):
+        parts = key.split("/")
+        return tuple(_key(part_type, part) for part_type, part in zip(entry_types(annotation, len(parts)),
+                                                                       parts, strict=True))
+    if typing.get_origin(annotation) in (Union, types.UnionType):
+        for member in sorted(typing.get_args(annotation), key=lambda member: member is str):
+            try:
+                return _key(member, key)
+            except ValueError:
+                continue
+        raise ValueError(f"the record key {key!r} is none of {annotation}")
+    if typing.get_origin(annotation) is Literal:
+        held = [member for member in typing.get_args(annotation) if str(member) == key]
+        if not held:
+            raise ValueError(f"the record key {key!r} is none of {annotation}")
+        return held[0]
+    if annotation in (int, float):
+        try:
+            return annotation(key)
+        except ValueError:
+            raise ValueError(f"the record key {key!r} is not the {annotation.__name__} its mapping "
+                             f"declares") from None
+    if annotation is type(None):
+        raise ValueError(f"the record key {key!r} is not None")
+    return key
 
 
 def _record_class(member: Callable[..., Configured]) -> type | None:
