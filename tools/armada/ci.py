@@ -27,15 +27,41 @@ import heapq
 import json
 import math
 import os
+import re
 import signal
 import subprocess
 import sys
 import threading
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
 PYTHONS = ("3.12", "3.14")
-"""The compatibility floor and the newest release CI proves."""
+"""The compatibility floor, which runs every test, and the newest release CI proves."""
+NEWEST_FILES = (
+    # Annotations, which 3.14 evaluates lazily (PEP 649): records and their config (326e40fd5).
+    "tests/test_config.py", "tests/test_encoders.py", "tests/test_registry_records.py",
+    "tests/test_records.py", "tests/test_record_keys.py", "tests/test_linen_records.py",
+    "tests/test_run_records.py",
+    # The command line, through tyro's reading of those annotations.
+    "tests/test_config_cli.py", "tests/test_tpu_cli.py",
+    # Serialization.
+    "tests/test_pickle_sources.py",
+    # Data loading: providers without TensorFlow (54a52a57d, 1a276e6a5, d3cc21fe6) and a
+    # fetcher pool under 3.14's forkserver start (c9dbce717).
+    "tests/test_data.py", "tests/test_providers.py", "tests/test_hf_data.py", "tests/test_data_mixtures.py",
+    "tests/test_online_loader.py",
+    # Threads at interpreter exit, which 3.14 ends differently (13a271177, d00ed72cd), and the
+    # compilation cache's codec (23f5adffe).
+    "tests/test_iterator_lifecycle.py", "tests/test_native_rollout_server.py", "tests/test_distribution.py",
+    "tests/test_instrumentation.py",
+)
+"""The files the newest Python runs whole: those its changes broke before, and the ones around
+the same machinery. It imports every other test file (`COLLECT`). Across 34 suite runs no file
+was red on 3.14 alone."""
+COLLECT = "collect"
+"""The split of a task that imports test files without running them."""
+COLLECT_TASKS = 4
 SKIPPED = {"tests/test_gen_api.py"}
 """CI runs it in the lint job, under the griffe it pins."""
 DURATIONS = Path("tests/test_durations.json")
@@ -55,7 +81,7 @@ def weights(files: list[str], timings: dict, python: str) -> dict[str, float | N
     for name, seconds in timings.get("rows", {}).items():
         own, _, rest = name.partition(":")
         file, _, split = rest.partition("#")
-        if own == python and split:
+        if own == python and split and split != COLLECT:
             group, count = (int(part) for part in split.split("/"))
             groups.setdefault((file, count), {})[group] = seconds
     for (file, count), seconds in sorted(groups.items()):
@@ -75,9 +101,10 @@ def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on."""
-    files = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     entries = []
     for python in PYTHONS:
+        files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
         timed = weights(files, timings, python)
         weighed = {name: target if seconds is None else seconds for name, seconds in timed.items()}
         tasks: list[tuple[list[str], str]] = [
@@ -99,6 +126,12 @@ def plan(target: float, timings: dict) -> list[dict]:
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
                             "split": split, "rows": [row(python, name, split) for name in names],
                             "weight": sum(weighed[name] for name in names) / share})
+    rest = [name for name in every if name not in NEWEST_FILES]
+    for index in range(COLLECT_TASKS):
+        names = rest[index::COLLECT_TASKS]
+        entries.append({"name": f"{PYTHONS[1]}-{COLLECT}-{index + 1}", "python": PYTHONS[1],
+                        "tests": " ".join(names), "split": COLLECT,
+                        "rows": [row(PYTHONS[1], name, COLLECT) for name in names], "weight": target})
     return entries
 
 
@@ -122,9 +155,38 @@ def shown(output: str) -> str:
     return hung + output[-4000:]
 
 
+def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
+    """Import `tests` under `python` without running them and write one verdict row a file: red
+    where collecting it errs or skips on a missing import, which running it would have."""
+    began = time.monotonic()
+    command = [f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q", "-rs", "-p",
+               "no:cacheprovider", *tests]
+    done = subprocess.run(command, capture_output=True, text=True, timeout=deadline)
+    output = done.stdout + done.stderr
+    errors = dict.fromkeys(re.findall(r"ERROR collecting (tests/\S+\.py)", output), "")
+    section = r"_+ ERROR collecting (tests/\S+\.py) _+\n(.*?)(?=\n_{3,} |\n={3,} )"
+    for header in re.finditer(section, output, re.S):
+        errors[header.group(1)] = header.group(2)[-4000:]
+    for name, reason in re.findall(r"SKIPPED \[\d+\] (tests/\S+\.py):\d+: (could not import[^\n]*)", output):
+        errors.setdefault(name, f"SKIPPED on a missing import: {reason}")
+    if done.returncode not in (0, 2, 5) and not errors:
+        errors = dict.fromkeys(tests, f"pytest --collect-only exited {done.returncode}\n{output[-4000:]}")
+    seconds = (time.monotonic() - began) / len(tests)
+    rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
+             "output": errors.get(name, "")} for name in tests]
+    out.write_text(json.dumps({"rows": rows}))
+    return 0
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, grace: float = 60.0) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
-    killing them `grace` seconds after that."""
+    killing them `grace` seconds after that.
+
+    A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
+    the plan weighs a file by what it costs a container (its import, its collection, the
+    container's pace), which pytest's case times leave out. Weighed by case times, tasks planned
+    at 300 seconds ran a median of 392."""
+    began = time.monotonic()
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
     grouping = ["--splits", split.split("/")[1], "--group", split.split("/")[0], "--splitting-algorithm",
@@ -166,6 +228,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     rows = []
+    own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
+                   for name in tests}
+    wall = time.monotonic() - began
+    pace = wall / sum(own_seconds.values()) if sum(own_seconds.values()) > 0 else 0.0
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
@@ -177,7 +243,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
             red.append(f"pytest exited {done.returncode} with no report of {name}")
         if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
-        seconds = sum(float(case.get("time") or 0) for case in own)
+        seconds = own_seconds[name] * pace if pace else wall / len(tests)
         rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
                      **({} if split else {"timings": {name: seconds}})})
@@ -203,6 +269,8 @@ def main() -> int:
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps({"include": plan(args.target, timings)}))
         return 0
+    if args.split == COLLECT:
+        return collect(args.python, args.tests.split(), args.out, args.deadline)
     return task(args.python, args.tests.split(), args.split, args.out, args.deadline)
 
 
