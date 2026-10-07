@@ -33,12 +33,11 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
-from dew.diffusion.block import BlockDenoiser
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
 from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
-from dew.nn.protocols import Serving
+from dew.nn.protocols import BlockDenoiser, Serving
 from dew.objectives.base import Variables
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (

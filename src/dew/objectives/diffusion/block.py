@@ -17,18 +17,18 @@ from __future__ import annotations
 import functools
 import math
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import optax
 from flax import linen as nn, struct
-from flax.typing import VariableDict
 
 from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
+from dew.nn.protocols import BlockDenoiser, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -53,21 +53,6 @@ if TYPE_CHECKING:
     from dew.inference.tasks import Processor
     from dew.nn.backbones.causal_transformer import DecoderBank
     from dew.nn.diffusion_gemma import DiffusionGemma
-
-
-@runtime_checkable
-class _Canvases(Protocol):
-    """What the SFT reads off a model besides its head: a clean prefix
-    `encode`d into its cache, `canvas_length`-token canvases its call denoises
-    against that cache, and the layer scalars the published SFT trains, with
-    the source's tree as that model reads it (`DiffusionGemma`'s hooks)."""
-
-    @property
-    def canvas_length(self) -> int: ...
-
-    def with_trainable_layer_scalars(self) -> Self: ...
-
-    def trainable_variables(self, variables: VariableDict) -> VariableDict: ...
 
 
 @struct.dataclass
@@ -186,7 +171,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  ema_decay: float | None = None, head_chunks: int = 4,
                  processor: Processor | None | Omitted = OMITTED):
         model = self.bind_model(model, variables=variables, processor=processor)
-        if not isinstance(model, _Canvases):
+        if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
             raise TypeError(
                 f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
                 f"against it, with the layer scalars the published SFT trains, as DiffusionGemma "
