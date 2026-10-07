@@ -420,7 +420,7 @@ The default is 64 model evaluations, including the final clean prediction; a cal
 
 A source generation control that native MDLM cannot follow is rejected by name. Neutral values are accepted, as are the shared budget, continuation count, EOS and padding metadata. MDLM does not use a KV cache, so `use_cache=False` is accepted and asking for a cache is not.
 
-Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks the live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` solver and 64 steps, so custom objective steps or solver choices set in code are not saved. Plain `Checkpoints` saves weights and training state but not these task settings, so you have to apply a custom task configuration again. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata, and for a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`.
+Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks the live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` solver and 128 steps, MDLM's own, so custom objective steps or solver choices set in code are not saved. Plain `Checkpoints` saves weights and training state but not these task settings, so you have to apply a custom task configuration again. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata, and for a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`.
 
 ## DiffusionGemma
 
