@@ -51,16 +51,13 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import head_cross_entropy
-from dew.objectives.lm.objective import _batch_text
+from dew.objectives.lm.objective import TEXT_KEY, _batch_text
 from dew.records import JSON
 from dew.registry import objectives
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
-
-TEXT_KEY = "text"
-
 
 _DEFAULT_SOLVER = Unmask()
 
