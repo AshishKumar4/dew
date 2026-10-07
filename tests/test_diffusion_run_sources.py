@@ -103,9 +103,9 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     size = 16 if family != "qwen_image" else 32
     settings = {"guidance": None, "unconditional_prob": 0.25, "ema_decay": None}
     configured = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                    data=TFDSImages(image_size=size), val_metrics=(), **settings,
-                                    objective=ObjectiveConfig("diffusion",
-                                                              {"solver": Euler(), "steps": 2})).build()
+                                    data=TFDSImages(image_size=size), val_metrics=(),
+                                    objective=ObjectiveConfig("diffusion", {
+                                        "solver": Euler(), "steps": 2, **settings})).build()
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
@@ -132,8 +132,8 @@ def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     """Flux was trained as a velocity flow; the default EDM preset is not
     that convention, and a flow preset is."""
     common = {"pretrained": str(pipelines / "flux" / "pipeline"), "model": precision(),
-                  "data": TFDSImages(image_size=16), "solver": Euler(), "guidance": None,
-                  "sampling_steps": 2, "val_metrics": ()}
+              "data": TFDSImages(image_size=16), "val_metrics": (),
+              "objective": ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2})}
     with pytest.raises(ValueError, match="name a preset of its kind"):
         DiffusionRunConfig(**common).build()
     assert DiffusionRunConfig(**common, preset=Flow(shift=3.0)).build() is not None

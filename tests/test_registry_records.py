@@ -166,8 +166,8 @@ def test_a_record_constructs_nothing_its_field_does_not_declare(monkeypatch):
 
 def test_a_callable_class_outside_dew_is_built_once_its_package_is_trusted(monkeypatch):
     monkeypatch.setattr(registry, "_TRUSTED", set(registry._TRUSTED))
-    objective = supervised({"class": path("Scaled"), "fields": {"factor": 2.0}})
+    scaled = {"class": path("Scaled"), "fields": {"factor": 2.0}}
     with pytest.raises(ValueError, match="trusted package"):
-        objective.build(model=nn.Dense(2))
+        supervised(scaled)
     import_trusted({}, (__name__.partition(".")[0],))
-    assert objective.build(model=nn.Dense(2)).criterion == Scaled(2.0)
+    assert supervised(scaled).build(model=nn.Dense(2)).criterion == Scaled(2.0)

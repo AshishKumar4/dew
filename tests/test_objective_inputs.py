@@ -34,6 +34,7 @@ from dew.objectives.diffusion import (
 )
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.objectives.diffusion.config import DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.diffusion.objective import TEACHER
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
@@ -94,7 +95,10 @@ def with_teacher(kind):
         "ladd": lambda: AdversarialDistillationObjective(
             *shared, feature_layers=("dit_block_0",), cmap_dim=4, kernel_size=(1, 1),
             variables={TEACHER: teacher}, steps=2),
-        "rcm": lambda: ConsistencyDistillationObjective(*shared, variables={TEACHER: teacher}, steps=2),
+        # sCM differentiates the student in time, which needs smooth time features.
+        "rcm": lambda: ConsistencyDistillationObjective(
+            base.model.clone(time_scale=SMOOTH_TIME_SCALE), *shared[1:], variables={TEACHER: teacher},
+            steps=2),
         "guidance_distillation": lambda: GuidanceDistillationObjective(
             *shared, variables={TEACHER: drawn}, steps=2),
     }[kind]()

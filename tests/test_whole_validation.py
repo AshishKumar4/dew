@@ -27,6 +27,7 @@ from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.base import VALID_ROWS, Objective, Step
 from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
+from dew.objectives.diffusion.objective import TEACHER
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives
 from dew.sampling import Euler
@@ -57,8 +58,8 @@ def runnable(name: str, windows, tmp_path):
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2,
                                    "ema_decay": None})).build()
-    objective = GuidanceDistillationObjective(teacher.model, teacher.process, teacher.inputs, teacher=teacher,
-                                              teacher_variables=teacher.init(jax.random.key(0)), steps=2)
+    objective = GuidanceDistillationObjective(teacher.model, teacher.process, teacher.inputs,
+                                              variables={TEACHER: teacher.init(jax.random.key(0))}, steps=2)
     return objective, batch_for(teacher, 8)
 
 

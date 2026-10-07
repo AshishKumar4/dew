@@ -368,14 +368,13 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
 
     # The record a command line or a run.json carries builds the same value.
-    from_record = DiffusionRunConfig.from_dict(
-        {**config.to_dict(), "guidance": {"scale": 4.0, "interval": [0.2, 0.8], "rescale": 0.3}})
-    assert from_record.guidance == CFG(4.0, (0.2, 0.8), rescale=0.3)
-    assert from_record.build().guidance == CFG(4.0, (0.2, 0.8), rescale=0.3)
+    from_record = stating(config, guidance={"class": "dew.sampling.guidance:CFG", "fields": {
+        "scale": 4.0, "interval": [0.2, 0.8], "rescale": 0.3}})
+    assert from_record == config and from_record.build().guidance == CFG(4.0, (0.2, 0.8), rescale=0.3)
 
     unguided = stating(config, guidance=None)
     assert unguided.build().guidance is None
-    assert DiffusionRunConfig.from_dict(unguided.to_dict()).guidance is None
+    assert DiffusionRunConfig.from_dict(unguided.to_dict()) == unguided
 
 
 
