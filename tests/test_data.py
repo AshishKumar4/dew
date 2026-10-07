@@ -1412,6 +1412,23 @@ def test_from_grain_repeats_a_map_dataset_so_a_run_outlasts_the_corpus():
     assert len(_indices(stream, 6)) == 6
 
 
+def test_a_map_dataset_streams_and_resumes_as_grains_own_pipeline_reads_it():
+    """A caller's shuffled `MapDataset` reads, batch for batch, as grain's
+    own `repeat(None).batch(4)` of it, across the end of a pass, and a
+    stream resumed from a saved position reads on where grain's batches do."""
+    pipeline = _grain_points(10)
+    reference = pipeline.repeat(None).batch(4)
+    expected = [[int(i) for i in reference[index]["index"]] for index in range(6)]
+    data = Dataset.from_grain(pipeline, batch=4, **WORKERS)
+
+    stream = data.train(DataPartition())
+    assert _indices(stream, 3) == expected[:3]
+    state = stream.get_state()
+    resumed = data.train(DataPartition())
+    resumed.set_state(state)
+    assert _indices(resumed, 3) == expected[3:]
+
+
 def test_from_grain_takes_a_streamed_pipeline_and_carries_grains_own_state():
     """An IterDataset has no index, so the caller builds the one a share
     reads, it is batched where it is and it reports the position grain keeps
