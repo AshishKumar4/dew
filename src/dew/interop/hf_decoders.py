@@ -864,14 +864,6 @@ _NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
                           "audio_token_id": None, "audio_soft_tokens": None}
 
 
-def _wrapper_tokens(used: set) -> None:
-    """Mark the wrapper-level keys every multimodal repo carries as read."""
-    used.update(("architectures", "tie_word_embeddings", "torch_dtype",
-                 "transformers_version", "initializer_range", "boi_token_id",
-                 "boi_token_index", "eoi_token_id", "eoi_token_index",
-                 "image_token_id", "image_token_index"))
-
-
 def _record_int(record: Mapping[str, object], field: str, default: int | None = None) -> int:
     """Read an int field out of a record by name. A None default makes it required."""
     return records.integer(record[field] if default is None else record.get(field, default), field)
@@ -882,38 +874,40 @@ def _record_float(record: Mapping[str, object], field: str, default: float | Non
     return records.number(record[field] if default is None else record.get(field, default), field)
 
 
+def _wrapper_fields(model_type: str, used: set[str], text: DecoderFields, tower: Mapping[str, object],
+                    projector: Mapping[str, object], image: int, tokens: int | None,
+                    audio: AudioFields = _NO_AUDIO) -> WrapperFields:
+    """A wrapper's record, its text decoder typed `<model_type>_text`, with the
+    vision section and the wrapper-level keys every multimodal repo carries
+    counted as read."""
+    used.update(("vision_config", "architectures", "tie_word_embeddings", "torch_dtype",
+                 "transformers_version", "initializer_range", "boi_token_id", "boi_token_index",
+                 "eoi_token_id", "eoi_token_index", "image_token_id", "image_token_index"))
+    return {"model_type": model_type, "text_model_type": f"{model_type}_text", "text": text,
+            "tower": tower, "projector": projector, "image_token_id": image, "tokens_per_image": tokens,
+            **audio}
+
+
 def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
     tower = translate_siglip_vision_config(hf_config)
-    used.add("vision_config")
     mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
     projector = translate_gemma_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"), mm)
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
-    _wrapper_tokens(used)
-    return {
-        "model_type": "gemma3",
-        "text_model_type": "gemma3_text",
-        "text": text,
-        "tower": tower,
-        "projector": projector,
-        "image_token_id": image,
-        "tokens_per_image": _record_int(projector["fields"], "tokens_per_side") ** 2,
-        **_NO_AUDIO,
-    }
+    return _wrapper_fields("gemma3", used, text, tower, projector, image,
+                           _record_int(projector["fields"], "tokens_per_side") ** 2)
 
 
 def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Llama 4 wrapper: MetaCLIP-style tower, shuffle adapter, outer map."""
     text = _wrapper_text(hf_config, used)
     tower = translate_llama4_vision_config(hf_config)
-    used.add("vision_config")
     projector = translate_llama4_projector_config(
         records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
-    _wrapper_tokens(used)
     vision = tower["fields"]
     grid = _record_int(vision, "image_size") // _record_int(vision, "patch_size")
     ratio = _record_float(vision, "pixel_shuffle_ratio")
@@ -921,16 +915,7 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     if tokens != int(tokens):
         _refuse(f"pixel_shuffle_ratio {vision['pixel_shuffle_ratio']!r}",
                 f"it leaves {tokens} soft tokens per image, not a whole count")
-    return {
-        "model_type": "llama4",
-        "text_model_type": "llama4_text",
-        "text": text,
-        "tower": tower,
-        "projector": projector,
-        "image_token_id": image,
-        "tokens_per_image": int(tokens),
-        **_NO_AUDIO,
-    }
+    return _wrapper_fields("llama4", used, text, tower, projector, image, int(tokens))
 
 
 def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) -> AudioFields:
@@ -971,26 +956,16 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
     text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
     tower = translate_gemma4_vision_config(hf_config)
-    used.add("vision_config")
     projector = translate_gemma4_projector_config(
         tower["fields"], records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
-    _wrapper_tokens(used)
     # The soft-token count follows the image resolution, so the record leaves
     # it open and each call reads it off the tower output. The wrapper's
     # vision_soft_tokens_per_image is the processor's budget, not the count.
     used.update(("vision_soft_tokens_per_image", "video_token_id",
                  "boa_token_id", "eoa_token_id", "eoa_token_index"))
-    return {
-        "model_type": "gemma4",
-        "text_model_type": "gemma4_text",
-        "text": text,
-        "tower": tower,
-        "projector": projector,
-        "image_token_id": image,
-        "tokens_per_image": None,
-        **_wrapper_audio(hf_config, used, _record_int(text, "emb_features")),
-    }
+    return _wrapper_fields("gemma4", used, text, tower, projector, image, None,
+                           _wrapper_audio(hf_config, used, _record_int(text, "emb_features")))
 
 
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
@@ -1000,24 +975,14 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.add('language_model_only')
     text = _wrapper_text(hf_config, used)
     tower = translate_qwen35_vision_config(hf_config)
-    used.add("vision_config")
     projector = translate_qwen35_projector_config(
         hf_config, records.integer(text.get("emb_features"), "emb_features"))
     image = _wrapper_token_id(hf_config, used, "image_token_id")
-    _wrapper_tokens(used)
     # One resolution per call, so the soft-token count varies with the image
     # and the record leaves it open the way the Gemma 4 wrapper does.
     used.update(("video_token_id", "vision_start_token_id", "vision_end_token_id"))
-    return {
-        "model_type": records.text(hf_config['model_type'], 'model_type'),
-        "text_model_type": f"{hf_config['model_type']}_text",
-        "text": text,
-        "tower": tower,
-        "projector": projector,
-        "image_token_id": image,
-        "tokens_per_image": None,
-        **_NO_AUDIO,
-    }
+    return _wrapper_fields(records.text(hf_config['model_type'], 'model_type'), used, text, tower, projector,
+                           image, None)
 
 
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -1025,17 +990,13 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     text = _wrapper_text(hf_config, used)
     tower = translate_gemma3n_vision_config(hf_config)
     projector = translate_gemma3n_projector_config(hf_config, _record_int(text, "emb_features"))
-    used.add("vision_config")
     count = _record_int(tower["fields"], "msfa_output_resolution") ** 2
     if hf_config.get("vision_soft_tokens_per_image", count) != count:
         _refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
     image = _wrapper_token_id(hf_config, used, "image_token_id")
-    _wrapper_tokens(used)
     used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id"))
-    return {"model_type": "gemma3n", "text_model_type": "gemma3n_text", "text": text,
-            "tower": tower, "projector": projector, "image_token_id": image,
-            "tokens_per_image": count,
-            **_wrapper_audio(hf_config, used, _record_int(text, "emb_features"))}
+    return _wrapper_fields("gemma3n", used, text, tower, projector, image, count,
+                           _wrapper_audio(hf_config, used, _record_int(text, "emb_features")))
 
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {

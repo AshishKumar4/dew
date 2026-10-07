@@ -13,6 +13,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 from dew import records
+from dew.interop import mamba2
 from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import Packed
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -32,16 +33,12 @@ _ALIASES = {
     "use_conv_bias": "mamba_conv_bias", "chunk_size": "mamba_chunk_size",
     "time_step_min": "mamba_dt_min",
 }
-_TRUNK: Mapping[str, tuple[str, ...]] = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
-                                       "backbone.norm_f.weight": ("norm", "scale")}
+# Mamba-2's trunk and layer names, and the attention, MLP and expert layers beside them.
 _LAYER: Mapping[str, tuple[str, ...]] = {
-    "norm.weight": ("input_layernorm", "scale"),
-    "mixer.norm.weight": ("self_attn", "norm", "weight"),
-    **{f"mixer.{leaf}": ("self_attn", leaf) for leaf in ("A_log", "dt_bias", "D")},
+    **mamba2._LAYER,
     **{f"mixer.{linear}.{kind}": ("self_attn", linear, "kernel" if kind == "weight" else "bias")
-       for linear in ("in_proj", "out_proj", "q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj")
+       for linear in ("q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj")
        for kind in ("weight", "bias")},
-    **{f"mixer.conv1d.{kind}": ("self_attn", "conv1d", kind) for kind in ("weight", "bias")},
     "mixer.gate.weight": ("self_attn", "gate", "kernel"),
     "mixer.gate.e_score_correction_bias": ("self_attn", "gate", "e_score_correction_bias"),
     **{f"mixer.experts.{name}": ("self_attn", "experts", name, "kernel")
@@ -53,7 +50,6 @@ _LAYER: Mapping[str, tuple[str, ...]] = {
 }
 PACKED = tuple(Packed(f'.experts.{name}', (f'.experts.{name}',), -1, (0, 2, 1))
                for name in ('up_proj', 'down_proj'))
-_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
 _LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _LAYER.items()}
 
 
@@ -172,8 +168,8 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Map independent mixers and the router's balancing buffer to their collections."""
-    if name in _TRUNK:
-        return ("params", *_TRUNK[name])
+    if name in mamba2._TRUNK:
+        return ("params", *mamba2._TRUNK[name])
     if name == "lm_head.weight":
         return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
     parts = name.split(".")
@@ -190,11 +186,4 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
 
 def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
     """Invert the checkpoint's tensor names for source-layout exports."""
-    parts = tuple(dew_name.split("."))
-    if parts in _TRUNK_NAMES:
-        return _TRUNK_NAMES[parts]
-    if parts == ("lm_head", "kernel"):
-        return None if config.get("tie_embeddings") else "lm_head.weight"
-    if parts[0].startswith("layers_") and parts[1:] in _LAYER_NAMES:
-        return f"backbone.layers.{parts[0].removeprefix('layers_')}.{_LAYER_NAMES[parts[1:]]}"
-    raise ValueError(f"{dew_name!r} is not a Nemotron-H CausalTransformer parameter")
+    return mamba2.export_path(dew_name, config, layer_names=_LAYER_NAMES, family="Nemotron-H")
