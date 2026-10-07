@@ -50,7 +50,16 @@ from dew.data.dataset import Reader, ramped, record_argument
 from dew.lora import LoRA, _Adapted, adapted
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
-from dew.registry import _declared_type, datasets, from_record, models, schedules, to_record
+from dew.registry import (
+    Annotation,
+    Configured,
+    _declared_type,
+    datasets,
+    from_record,
+    models,
+    schedules,
+    to_record,
+)
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
@@ -149,7 +158,7 @@ class ModelConfig:
         """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
         return dataclasses.replace(self, fields=registry.with_dtype(self.name, self.fields, dtype))
 
-    def build(self, **derived: object):
+    def build(self, **derived: Configured):
         """Build the model from its fields and the ones the recipe `derived`."""
         model = models.build(self.name, {**self.fields, **derived})
         if self.quantization is not None:
@@ -157,7 +166,7 @@ class ModelConfig:
         return model if self.adapter is None else adapted(model, self.adapter)
 
 
-def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, dict[str, object]]:
+def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
     """A dataclass of `member`'s own fields, one flag each, defaulting to
     `given` over the class's defaults, and those class defaults.
 
@@ -173,15 +182,15 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, dict[
                     else field.default_factory() if callable(field.default_factory) else None)
         annotation = registry.resolve_alias(_declared_type(member, field.name))
         if field.name in ("dtype", "param_dtype"):
-            flag = registry.DtypeName | None
+            typed = registry.DtypeName | None
             declared = None if declared is None else registry.dtype_name(declared)
         elif field.name == "precision":
-            flag = Literal["default", "high", "highest"] | None
+            typed = Literal["default", "high", "highest"] | None
             declared = None if declared is None else str(declared).lower().removeprefix("precision.")
         elif _scalar(annotation):
-            flag = annotation if declared is not None else annotation | None
+            typed = annotation if declared is not None else annotation | None
         else:
-            flag = Annotated[object, _JSON_FLAG]
+            typed = Annotated[Configured, _JSON_FLAG]
             try:
                 declared = json.loads(json.dumps(to_record(declared, annotation)))
             except (TypeError, ValueError):
@@ -189,11 +198,11 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, dict[
         defaults[field.name] = declared
         value = given.get(field.name, declared)
         copied = functools.partial(copy.deepcopy, value)
-        flags.append((field.name, flag, dataclasses.field(default_factory=copied)))
+        flags.append((field.name, typed, dataclasses.field(default_factory=copied)))
     return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), defaults
 
 
-def _scalar(annotation: object) -> bool:
+def _scalar(annotation: Annotation) -> bool:
     """Whether tyro reads `annotation` as one typed flag: a bool, number,
     string, literal or enum, a tuple of those, or an optional one."""
     origin = typing.get_origin(annotation)
