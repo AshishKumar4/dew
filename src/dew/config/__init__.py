@@ -148,11 +148,6 @@ class ModelConfig:
                 fields[field.name] = to_record(value, _declared_type(model_type, field.name))
         return cls(registry.import_path(model_type), fields, adapter=adapter, quantization=quantization)
 
-    @property
-    def label(self) -> str:
-        """The model's alias, or its class's name where it has none, for a run's name."""
-        return models.label(self.name)
-
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
         return dataclasses.replace(self, fields=registry.with_dtype(self.name, self.fields, dtype))

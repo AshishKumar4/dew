@@ -213,7 +213,7 @@ def run_summary(config: LmRunConfig, fields: Mapping[str, object]) -> dict:
     """Flat view of the run, for the tracker."""
     return {
         **fields,
-        "architecture": config.model.label,
+        "architecture": models.label(config.model.name),
         "dataset": read_corpora(config.data),
         "sequence_length": config.data.seq_len,
         "tokenizer": config.tokenizer,
