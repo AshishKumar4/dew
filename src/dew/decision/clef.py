@@ -1,10 +1,10 @@
-"""Clef's released head, read into Dew's `JointSchemaHead`.
+"""Clef's released checkpoint, read into Dew's backbone and `JointSchemaHead`.
 
 Cloudflare/clef ships its Qwen 3.5 backbone as a standard Hugging Face
 checkpoint and its joint schema head beside it, as `joint_head_config.json`
 (the head's sizes) and `joint_head.safetensors` (joint_schema_model.py
 `load_release_model` at Cloudflare/clef 2f3de3dd). `ClefHead` reads those
-two files.
+two files and `ClefCheckpoint` the whole release.
 """
 
 import json
@@ -19,11 +19,16 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
+from dew.data.text import HFTokenizer
 from dew.decision.head import JointSchemaHead
 from dew.decision.laya import unpacked_attention
-from dew.decision.layout import DecisionInputs
+from dew.decision.layout import DecisionInputs, Specials
+from dew.decision.model import DecisionModel
+from dew.interop import sources
+from dew.interop.processors import Processor
 from dew.interop.safetensors_io import read_file
 from dew.interop.weights import translate_parameters
+from dew.objectives.base import Variables, joined
 
 HEAD_CONFIG = "joint_head_config.json"
 HEAD_WEIGHTS = "joint_head.safetensors"
@@ -106,3 +111,52 @@ def _shaped(head: JointSchemaHead, params: dict) -> dict:
     if missing:
         raise ValueError(f"Clef's head weights leave {sorted(map(jax.tree_util.keystr, missing))} unset")
     return jax.tree_util.tree_unflatten(jax.tree.structure(shapes), [reshaped[path] for path in flat_shapes])
+
+
+@dataclass(frozen=True)
+class ClefCheckpoint:
+    """One released Clef checkpoint: its backbone and head, their variables, and its tokenizer."""
+
+    model: DecisionModel
+    variables: Variables
+    tokenizer: HFTokenizer
+    specials: Specials
+    processor: Processor | None
+    """The backbone's processor, which prepares a request's images."""
+
+    @staticmethod
+    def exists(name_or_dir: str | Path, *, revision: str | None = None) -> bool:
+        """Return whether `name_or_dir` holds a Clef checkpoint.
+
+        A Clef checkpoint is a backbone with a `joint_head_config.json` beside it.
+        For a Hub repo id, it asks the Hub without downloading anything.
+        """
+        if Path(name_or_dir).is_dir():
+            return (Path(name_or_dir) / HEAD_CONFIG).is_file()
+        from huggingface_hub import file_exists
+
+        return file_exists(str(name_or_dir), HEAD_CONFIG, revision=revision)
+
+    @classmethod
+    def load(cls, name_or_dir: str | Path = "Cloudflare/clef-flash", *, revision: str | None = None,
+             dtype: str = "float32", param_dtype: str = "float32", attention_impl: str = "auto") -> Self:
+        """Read the checkpoint at `name_or_dir`, a Hub repo or a directory.
+
+        The backbone loads as `Pretrained.load` loads a Qwen 3.5 checkpoint, and the
+        head computes in the backbone's dtype where that is reduced.
+        """
+        from dew.interop.pretrained import Pretrained
+
+        root = sources.snapshot(str(name_or_dir), revision)
+        if not (root / HEAD_WEIGHTS).is_file():
+            from huggingface_hub import hf_hub_download
+
+            # The snapshot holds the backbone's weights alone; the head comes from the same commit.
+            hf_hub_download(str(name_or_dir), HEAD_WEIGHTS, revision=root.name)
+        bundle = Pretrained.load(root, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl)
+        _, head_dtype = DecisionModel.head_size(bundle.model)
+        head = ClefHead.load(root, dtype=head_dtype, param_dtype=param_dtype, attention_impl=attention_impl)
+        tokenizer = HFTokenizer(str(root), local_files_only=True)
+        return cls(DecisionModel(bundle.model, head.head),
+                   joined({"backbone": bundle.variables, "head": {"params": head.params}}),
+                   tokenizer, Specials.of(tokenizer), bundle.processor)

@@ -26,9 +26,9 @@ import json
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from dew import Dataset, Trainer
+from dew.config import OptimConfig
 from dew.data import ByteTokenizer, Loading, PreferencePairs
 from dew.data.chat import Role
 from dew.nn.backbones import CausalTransformer
@@ -59,7 +59,7 @@ sft_data = Dataset(train=lambda partition: itertools.repeat(sft_batch), val=None
                    records=8, batch=8)
 sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
-sft_state = Trainer(sft_objective, optax.adamw(1e-3), key=jax.random.key(1)).fit(
+sft_state = Trainer(sft_objective, OptimConfig(learning_rate=1e-3), key=jax.random.key(1)).fit(
     sft_data, steps=20, log_every=10)
 ```
 
@@ -84,7 +84,7 @@ width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = PreferencePairs(records=(json.dumps(pair),) * 8, seq_len=width,
                         loading=Loading(workers=0, threads=1, read_buffer=2)).load(batch=8)
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
-dpo_state = Trainer(dpo, optax.adam(1e-3), key=jax.random.key(2)).fit(
+dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
@@ -124,7 +124,7 @@ rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
 rollout = SampledRollout(rl_objective, reward=reward, groups=4, max_new_tokens=8,
                          sampling=Sampling(temperature=1.0, top_k=40),
                          decode=tokenizer.decode)
-rl_state = Trainer(rl_objective, optax.adamw(1e-4), key=jax.random.key(3),
+rl_state = Trainer(rl_objective, OptimConfig(learning_rate=1e-4), key=jax.random.key(3),
                    rollout=rollout).fit(rl_data, steps=4, log_every=2)
 print(int(rl_state.updates), "GRPO updates")
 ```
@@ -198,9 +198,9 @@ import json
 
 import jax
 import numpy as np
-import optax
 
 from dew import Trainer
+from dew.config import OptimConfig
 from dew.data import Loading, PreferencePairs
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
@@ -219,7 +219,7 @@ data = spec.load(batch=8)
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
-trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3).build(2), key=jax.random.key(0))
 initial = trainer.initial_state()
 # Copy the snapshot to host memory before training donates device buffers.
 reference = jax.tree.map(lambda x: np.array(x, copy=True), initial.ema)
@@ -561,8 +561,8 @@ This offline example trains a small DiT. Brightness is only a demonstration rewa
 import itertools
 import jax
 import numpy as np
-import optax
 from dew import Field, InputSpec, Trainer
+from dew.config import OptimConfig
 from dew.data import Dataset
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
@@ -580,7 +580,7 @@ def brightness(images, batch):
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
 data = Dataset(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
-trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0), rollout=rollout)
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))
 ```

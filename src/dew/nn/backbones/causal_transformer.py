@@ -236,7 +236,7 @@ class CausalTransformer(nn.Module):
     """The divisor of the logits: lm-engine's m_width (`lm_logits *
     (1 / m_width)`), and GraniteMoeHybrid's `logits_scaling`. The division is
     applied to the final states, in fp32, so every head that contracts them
-    with `head_weight` gets the same logits that `__call__` returns."""
+    (`output_table`) gets the same logits that `__call__` returns."""
     # lm-engine's init_utils.py at 45b6b57b.
     initializer_range: float | None = None
     """The std of lm-engine's initialisation; None keeps each module's own
@@ -263,7 +263,7 @@ class CausalTransformer(nn.Module):
     `hidden_states` stays the final norm's output, the encoder's."""
     head_bias: bool = False
     """A vocabulary bias added in fp32 after a tied or untied head's product, as
-    Phi's, GPT-J's and ModernBERT's decoders add one (`vocabulary_bias`)."""
+    Phi's, GPT-J's and ModernBERT's decoders add one (`output_table`'s `bias`)."""
     tie_embeddings: bool = True
     # Kimi K2.5's text-only wrapper path, modeling_kimi_k25.py:686-690.
     embedding_zero_ids: tuple[int, ...] = ()
@@ -1825,44 +1825,9 @@ class CausalTransformer(nn.Module):
             raise ValueError(f"input_embeddings are the whole {x.shape} sequence, got {prepared.shape}")
         return prepared.astype(x.dtype)
 
-    def head_weight(self, params):
-        """Return the `[D, vocab]` head matrix in its stored dtype, as the forward pass contracts it.
-
-        For a tied head this is the embedding table transposed, and otherwise
-        `lm_head`'s kernel. It is read from `params` without an fp32 copy. The
-        Gemma embedding scale applies only to input embeddings, so it is not
-        part of this matrix.
-        """
-        # The same matrix `_logits` contracts.
-        table, vocab_major = self.head_table(params)
-        return table.T if vocab_major else table
-
-    def vocabulary_bias(self, params):
-        """The vocabulary bias, or None for a bias-free head."""
-        return params['head_bias'] if self.head_bias else None
-
-    def head_table(self, params):
-        """Return the head matrix as the tree stores it, and whether its rows are the vocabulary.
-
-        For a tied head this is the `[vocab, D]` embedding table and True, and
-        otherwise `lm_head`'s `[D, vocab]` kernel and False. No operation sits
-        between the parameter and the result, so a loss that keeps the head for
-        its backward pass (`chunked_cross_entropy` with `vocab_major`) keeps the
-        parameter itself and no transposed copy.
-        """
-        if self.head_transform is not None:
-            raise ValueError(
-                "a prediction head sits between the final states and the "
-                "vocabulary, so no matrix alone gives this model's logits, and the "
-                "objectives that score through the chunked head cannot train it yet; "
-                "the model's own call scores it")
-        if self.tie_embeddings:
-            return params['embed_tokens']['embedding'], True
-        return params['lm_head']['kernel'], False
-
     def output_table(self) -> OutputTable | None:
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
-        the parameter itself, as `head_table` gives it, with `_logits`'s bias, softcap and precision.
+        the parameter itself, with `_logits`'s bias, softcap and precision.
         None where no matrix alone is the head: past a `head_transform`, or when `lm_head`'s scope
         holds more than its kernel, as `dew.lora`'s factors, which its interceptor adds."""
         head = {} if self.tie_embeddings else self.lm_head.variables["params"]

@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_trainer import Counting, Data, val_batches
+from affine_run import Counting, Data, val_batches
 
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Ranking

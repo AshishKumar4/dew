@@ -42,7 +42,7 @@ from .dataset import (
     train_stream,
     validation_pass,
 )
-from .sources.hf import HFOptions, HubOptions
+from .sources.hf import HFDatasetSource, HFOptions, HubOptions
 from .tokens import bounded
 
 Augmentation = Literal["none", "flip_only", "flip_jitter"]
@@ -100,13 +100,9 @@ def pack_dict_of_byte_arrays(unpacked: dict) -> bytes:
 
 
 def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
-    """An encoded image as RGB uint8, in the orientation its pixels are stored.
-
-    Grey is replicated and a 16-bit sample kept to its high byte. An image
-    with transparency is composited onto white, as img2dataset does for the
-    url shards the online loader streams. EXIF orientation is ignored, as
-    PIL's `Image.open` ignores it, on the reduced decodes too, which would
-    otherwise apply it.
+    """An encoded image as RGB uint8 (`as_rgb`), in the orientation its
+    pixels are stored. EXIF orientation is ignored, as PIL's `Image.open`
+    ignores it, on the reduced decodes too, which would otherwise apply it.
 
     With `at_least`, an opaque image is decoded at the largest 1/2, 1/4 or
     1/8 reduction that keeps both sides >= `at_least` (the DCT scale of a
@@ -135,16 +131,27 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
         raise ValueError(f"cv2 refused {len(encoded)} bytes of image") from error
     if image is None:
         raise ValueError(f"cv2 could not decode {len(encoded)} bytes of image")
-    if image.dtype == np.uint16:
-        image = np.right_shift(image, 8).astype(np.uint8)
-    if image.ndim == 2:
-        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
-    elif image.shape[-1] == 4:
+    if image.ndim == 3:
+        image = cv2.cvtColor(image, cv2.COLOR_BGRA2RGBA if image.shape[-1] == 4 else cv2.COLOR_BGR2RGB)
+    return as_rgb(image)
+
+
+def as_rgb(pixels: np.ndarray) -> np.ndarray:
+    """Grey, grey and alpha, RGB or RGBA pixels, 8 or 16 bits, as RGB uint8.
+
+    Grey is replicated and a 16-bit sample kept to its high byte. An image
+    with transparency is composited onto white, as img2dataset does for the
+    url shards the online loader streams.
+    """
+    if pixels.dtype == np.uint16:
+        pixels = np.right_shift(pixels, 8).astype(np.uint8)
+    pixels = pixels.reshape(*pixels.shape[:2], -1)
+    if pixels.shape[-1] in (2, 4):
         # c * a / 255 + 255 - a, rounded to nearest in integers; the exact
         # quotient is k / 255, which is never a tie.
-        alpha = image[..., 3:].astype(np.uint32)
-        image = ((image[..., :3] * alpha + 255 * (255 - alpha) + 127) // 255).astype(np.uint8)
-    return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        alpha = pixels[..., -1:].astype(np.uint32)
+        pixels = ((pixels[..., :-1] * alpha + 255 * (255 - alpha) + 127) // 255).astype(np.uint8)
+    return np.ascontiguousarray(np.broadcast_to(pixels, (*pixels.shape[:2], 3)))
 
 
 def _header(encoded: bytes) -> tuple[int, int, bool]:
@@ -461,11 +468,13 @@ class TFDSImages(ImageDataset):
     """Reads the ArrayRecords of a prepared TFDS image dataset and captions
     each record with its class name.
 
-    It reads the `image` and `label` features, as in oxford_flowers102,
-    cifar10, food101 and similar datasets. You prepare the dataset
-    separately. Reading goes through the TFDS metadata and read-only builder,
-    and the image bytes are decoded by `decode_image`, so the training
-    process runs no TensorFlow or dataset generation code.
+    It reads the `image` and `label` features, as in mnist,
+    oxford_flowers102, cifar10, food101 and similar datasets, from `path`,
+    or without one from the builder `name` in dew's own TFDS directory,
+    prepared there first if missing (`dew.data.sources.tfds.prepared`).
+    Reading goes through the TFDS metadata and read-only builder, and the
+    image bytes are decoded by `decode_image`, so the training process runs
+    no TensorFlow or dataset generation code.
 
     A record's caption is one of `caption_templates`, chosen with the
     record's rng and filled in with its class name.
@@ -473,23 +482,37 @@ class TFDSImages(ImageDataset):
 
     path: str | None = None
     """The prepared version directory, which holds dataset_info.json and the ArrayRecords."""
+    name: str | None = None
+    """The TFDS builder, such as "mnist"; with `path`, the builder its metadata must name."""
     split: str = "all"
     labels: str | None = None
     """A file of class names to use; None reads label.labels.txt in `path`."""
     caption_templates: tuple[str, ...] = ("a photo of a {}",)
 
+    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
+        if self.path or not self.name:
+            return super().load(batch=batch, tokenize=tokenize)
+        from .sources.tfds import prepared, read_only_builder
+
+        # The captions read the class names TFDS writes beside the records,
+        # so the spec reads the version directory its builder resolves to.
+        reader = read_only_builder(prepared(self.name), builder=self.name, config=None,
+                                   version=None)
+        return dataclasses.replace(self, path=str(reader.data_path)).load(
+            batch=batch, tokenize=tokenize)
+
     def source(self, split: str | None = None):
         if not self.path:
             raise ValueError(
                 "TFDSImages needs path= (--data.path) pointing to prepared TFDS "
-                "ArrayRecords. Prepare the dataset separately with "
-                "download_and_prepare(file_format='array_record'), then pass "
-                "the builder.data_dir version directory to training.")
+                "ArrayRecords, the builder.data_dir version directory that "
+                "download_and_prepare(file_format='array_record') wrote, or name= "
+                "naming a builder to read from dew's own TFDS directory.")
         import tensorflow_datasets as tfds
 
         from .sources.tfds import prepared_source
 
-        return prepared_source(self.path, split or self.split,
+        return prepared_source(self.path, split or self.split, builder=self.name,
                                decoders={"image": tfds.decode.SkipDecoding()})
 
     def record(self, element: Batch | bytes, rng):
@@ -504,6 +527,10 @@ class TFDSImages(ImageDataset):
             if self.path is None:
                 raise ValueError("TFDSImages captions need labels= or a prepared path=.")
             labels = os.path.join(self.path, "label.labels.txt")
+            if not os.path.isfile(labels):
+                # TFDS writes no names for classes it knows by count alone,
+                # such as mnist's digits, and names each by its index.
+                return element["image"], template.format(label), label
         return element["image"], template.format(class_names(labels)[label]), label
 
 
@@ -517,13 +544,15 @@ class HFImages(ImageDataset):
     provider holds, so it can also read a dataset that needs a config name,
     a revision, its own `data_files` or a token.
 
-    `image_column` is the column that holds the image. The caption comes from
-    the first of `caption_columns` that a record has. An empty tuple reads a
-    dataset without captions, such as a class-labelled one, for an
-    unconditional or class-conditional run; passing `tokenize` to `load`
-    then raises `TypeError`. If the dataset has a `label` column, it gives
-    each record's class index. Loading raises `ValueError` when the split
-    lacks the image column or has none of the caption columns.
+    `image_column` is the column that holds the image, read as RGB uint8
+    whatever mode it is stored in (`as_rgb`). If the dataset has a
+    `label` column, it gives each record's class index. The caption comes
+    from the first of `caption_columns` that a record has, and is read only
+    when `load` is given `tokenize`. Without it, a split with no caption
+    column, such as a class-labelled one, loads for an unconditional or
+    class-conditional run; with it, loading raises `ValueError` when the
+    split has none of them and `TypeError` when `caption_columns` is empty.
+    Loading raises `ValueError` when the split lacks the image column.
 
     `datasets` decodes these images itself, so a JPEG's EXIF orientation is
     applied. `decode_image` keeps the stored orientation.
@@ -536,14 +565,17 @@ class HFImages(ImageDataset):
     caption_columns: tuple[str, ...] = ("caption", "text")
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        if not self.caption_columns and tokenize is not None:
+        if tokenize is None and self.caption_columns:
+            # Without a reader the captions are dropped (`tokenized`), so
+            # none is read, and a split without them loads like one with.
+            return dataclasses.replace(self, caption_columns=()).load(batch=batch)
+        if tokenize is not None and not self.caption_columns:
             raise TypeError(
                 "HFImages with caption_columns=() reads no captions, so tokenize= has "
                 "nothing to read; name the caption column, or train without conditions")
         return super().load(batch=batch, tokenize=tokenize)
 
     def source(self, split: str | None = None):
-        from .sources.hf import HFDatasetSource
         if not self.name:
             raise ValueError("HFImages needs name= set to a hub dataset repo id")
         source = HFDatasetSource(name=self.name, split=split or self.split,
@@ -559,13 +591,13 @@ class HFImages(ImageDataset):
         if self.caption_columns and not set(self.caption_columns) & set(columns):
             raise ValueError(
                 f"caption_columns={self.caption_columns!r}, and {held}; name its caption "
-                f"column, or set caption_columns=() for a dataset without captions")
+                f"column, or load it without tokenize= for a dataset without captions")
 
     def record(self, element: Batch | bytes, rng):
         element = _fields(element, "HFImages")
         caption = record_caption(element, self.caption_columns) if self.caption_columns else ""
         label = element.get("label")
-        return element[self.image_column], caption, None if label is None else int(label)
+        return as_rgb(element[self.image_column]), caption, None if label is None else int(label)
 
 
 @datasets("array_record_images")

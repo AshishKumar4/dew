@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from test_rl_surrogate import clipped_surrogate, token_mean
+from rl_support import clipped_surrogate, token_mean
 from test_tool_episodes import (
     EOS,
     GROUPS,

@@ -8,7 +8,7 @@ Both metrics run the vendored towers in `dew.nn.text_encoders`, since
 transformers 5 ships no `FlaxCLIPModel`, and preprocess with the checkpoint's
 own PIL image processor, which transformers 5 ships. A score here is
 what the reference computes for the same pixels and tokens;
-`tests/test_metrics.py` states the tolerance and the difference observed.
+`tests/test_clip_metrics.py` states the tolerance and the difference observed.
 """
 
 import functools

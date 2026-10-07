@@ -14,9 +14,9 @@ import itertools
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from dew import Trainer
+from dew.config import OptimConfig
 from dew.data import Dataset
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
@@ -29,7 +29,7 @@ model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
                           dtype=jnp.float32, attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
-trainer = Trainer(objective, optax.adam(0.01), key=0)
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
                     metrics=(Perplexity(),))
 assert int(state.step) == 10
@@ -67,7 +67,7 @@ The built-in metrics reduce their batches as follows:
 - Paired image metrics and CLIP need as many generated rows as reference or prompt rows.
 - FID pools float64 counts, means and centered second moments for the generated and the real population, then computes one distance with unbiased covariances. It needs at least two rows in each population. Its state takes O(D²) memory however many batches it is fed, plus bounded workspace for batch features and the matrix square root. FID over a small population is not FID-50k.
 
-  With the default weights, the features and the distance reproduce pytorch-fid 0.3.0 on the weights it publishes. That includes its resize, which is bilinear to 299x299 without antialiasing, as its `F.interpolate(align_corners=False)` does. `tests/test_metrics.py` checks the features to within 1e-4 absolute and the distance to within 1e-5 relative. So the values are comparable with pytorch-fid's. They are not comparable with clean-fid's, which resizes with antialiased bicubic, or with the TF1 TTUR code's.
+  With the default weights, the features and the distance reproduce pytorch-fid 0.3.0 on the weights it publishes. That includes its resize, which is bilinear to 299x299 without antialiasing, as its `F.interpolate(align_corners=False)` does. `tests/test_fid.py` checks the features to within 1e-4 absolute and the distance to within 1e-5 relative. So the values are comparable with pytorch-fid's. They are not comparable with clean-fid's, which resizes with antialiased bicubic, or with the TF1 TTUR code's.
 
   On TPU the feature extractor puts an optimization barrier before each strided 2D convolution, because XLA's space-to-batch rewrite miscompiles that convolution at small per-device batches. The barrier adds no images to the batch, and CPU and GPU compile it away.
 
@@ -96,7 +96,7 @@ accuracy = Mean(
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
 accuracy_data = Dataset.from_records({"text": train_tokens}, batch=8,
                                     validation={"text": val_tokens})
-run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
+run = Trainer(language_model, OptimConfig(optimizer="adam", learning_rate=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
     accuracy_data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,

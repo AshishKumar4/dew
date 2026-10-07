@@ -22,7 +22,7 @@ from dew.checkpoints import Checkpoints
 from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Step, freeze
+from dew.objectives.base import FROZEN, Step, freeze, select
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
@@ -366,23 +366,10 @@ def test_a_frozen_split_moves_only_what_the_filter_keeps(source):
             variables["params"])
     np.testing.assert_allclose(loss, reference["loss"], atol=1e-5, rtol=0)
     whole = reference_variables(loaded, "gradient.safetensors")
-    assert_tree_close(gradient, _select(whole["params"], attention), 1e-4)
+    assert_tree_close(gradient, select(whole["params"], attention), 1e-4)
     trainer = Trainer(obj, optax.sgd(0.001), key=jax.random.key(int(reference["run_seed"])))
     state = trainer.fit(dataset(jax.tree.map(
         lambda value: np.concatenate([value] * (math.lcm(2, jax.device_count()) // 2), axis=0), batch)),
         steps=1, log_every=1)
     assert sorted(state.variables) == sorted(variables)
     assert "frozen" not in obj.pipeline(state, ema=False).variables
-
-
-def _select(tree, keep, path=("params",)):
-    selected = {}
-    for name, value in tree.items():
-        current = (*path, name)
-        if isinstance(value, dict):
-            child = _select(value, keep, current)
-            if child:
-                selected[name] = child
-        elif keep(current):
-            selected[name] = value
-    return selected

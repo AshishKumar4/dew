@@ -23,6 +23,7 @@ either store gives the same windows and the same packing plan.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import os
 import tempfile
@@ -32,6 +33,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 import numpy as np
+
+from dew.cache import dew_cache_dir
+
+from .hf import HFOptions, HubOptions
 
 if TYPE_CHECKING:
     from dew.data.text import ByteTokenizer, HFTokenizer
@@ -286,6 +291,57 @@ def _chunks(path: Path) -> Iterator[str]:
             carry = chunk[split + 1:]
         if carry:
             yield carry
+
+
+@dataclasses.dataclass(frozen=True)
+class HubText:
+    """A text column of a Hugging Face split, as the token directory that
+    `TokenWindows` reads.
+
+    `name`, `split` and `options` are what `datasets.load_dataset` reads, as
+    for the `hf` provider. Each row of `column` is one document, ended with
+    the tokenizer's eos id as nanoGPT ends each one, and `tokenizer` and the
+    held-out head are `TokenCorpus.write`'s, as `dew tokenize` writes them.
+
+    The split is tokenized once, into `dew_cache_dir()/tokens`, keyed by the
+    request: the name, split, column and tokenizer, and the options that
+    choose the rows (`config`, `data_dir`, `data_files`, `revision`). The
+    same request then reads that directory without `datasets`, the Hub or
+    the tokenizer, so it runs offline once anything has made it. Rows that
+    change under one request are not read again; pin `revision`. The
+    tokenizer is keyed by its name alone, so after its vocabulary changes
+    upstream, delete the directory to tokenize again.
+    """
+
+    name: str
+    split: str = "train"
+    column: str = "text"
+    tokenizer: str = "byte"
+    options: HubOptions = dataclasses.field(default_factory=HFOptions)
+
+    @property
+    def directory(self) -> Path:
+        """Where this request's tokenized corpus is kept, written or not."""
+        chosen = {"name": self.name, "split": self.split, "column": self.column,
+                  "tokenizer": self.tokenizer, "config": self.options.config,
+                  "data_dir": self.options.data_dir, "data_files": self.options.data_files,
+                  "revision": self.options.revision}
+        key = hashlib.sha256(json.dumps(chosen, sort_keys=True, default=str).encode()).hexdigest()
+        return Path(dew_cache_dir()) / "tokens" / self.name.replace("/", "--") / key[:16]
+
+    def tokenized(self) -> str:
+        """`directory`, written on first use. `TokenCorpus.write` puts each
+        file in place whole and `meta.json` last, so a directory holding it
+        is complete, and two writers write the same files."""
+        directory = self.directory
+        if not (directory / "meta.json").is_file():
+            # `datasets` refuses a column the split lacks, naming those it has.
+            table = self.options.table(self.name, self.split).select_columns([self.column])
+            # Rows a chunk at a time: one Python row at a time is 100x slower.
+            chunks = table.data.column(self.column).chunks
+            TokenCorpus.write((text for chunk in chunks for text in chunk.to_pylist() if text is not None),
+                              directory, tokenizer=self.tokenizer, pack=True)
+        return str(directory)
 
 
 class TokenBytes(_Reopened):

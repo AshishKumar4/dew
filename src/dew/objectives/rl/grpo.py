@@ -75,6 +75,17 @@ class _Terms(NamedTuple):
     proximal: bool
 
 
+def onto_ids(batch, scores: jax.Array) -> jax.Array:
+    """Move `[rows, width - 1]` scores of each prefix onto the id it predicts, as `[rows, width]`.
+
+    Entry t then scores `input_ids[t]` from its chain's prefix, and it is zero
+    where `response_mask` is, every chain start and all padding included.
+    """
+    wide = at_least_fp32(scores.dtype)
+    shifted = jnp.concatenate([jnp.zeros((scores.shape[0], 1), wide), scores.astype(wide)], axis=1)
+    return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, shifted, 0.0)
+
+
 def _band(name: str, band) -> tuple[float, float] | None:
     if band is None:
         return None
@@ -196,17 +207,13 @@ class GRPOObjective(LMObjective):
         self.sampling_temperature = sampling_temperature
 
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
-        """Return each packed id's log-probability given its own chain's prefix, as `[rows, width]`.
+        """Return each packed id's log-probability given its own chain's prefix, placed by `onto_ids`.
 
-        Entry t is `log pi(input_ids[t] | chain prefix)`, aligned with
-        `input_ids`. It is zero where `response_mask` is zero, which covers
-        every chain start and all padding. The loss and a proximal rescoring
-        both use this one function. A packed column whose shape differs from
-        `input_ids` raises `ValueError`.
+        The loss and a proximal rescoring both use this one function. A
+        packed column whose shape differs from `input_ids` raises `ValueError`.
         """
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
-        mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
         for key in (SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
             if jnp.shape(batch[key]) != ids.shape:
                 raise ValueError(f"{key} has shape {jnp.shape(batch[key])}; a packed column has "
@@ -218,9 +225,7 @@ class GRPOObjective(LMObjective):
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
-        wide = at_least_fp32(sampled.dtype)
-        scored = jnp.concatenate([jnp.zeros((ids.shape[0], 1), wide), sampled.astype(wide)], axis=1)
-        return jnp.where(mask != 0, scored, 0.0)
+        return onto_ids(batch, sampled)
 
     def _terms(self, params, batch) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.

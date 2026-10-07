@@ -96,6 +96,15 @@ class HFOptions:
             storage_options=None if self.storage_options is None
             else dict(self.storage_options))
 
+    def table(self, path: str, split: str) -> ArrowDataset:
+        """`load` of one Arrow-backed split, which is what a reader by index
+        or by column needs; a directory of splits is refused here."""
+        table = self.load(path, split, streaming=False)
+        if not isinstance(table, _hf_datasets().Dataset):
+            raise TypeError(f"{path!r} split {split!r} loaded as {type(table).__name__}, not as "
+                            f"one Arrow-backed table; name one split")
+        return table
+
 
 HubOptions = Annotated[HFOptions, json_argument(HFOptions)]
 """`HFOptions` as a dataset spec declares it. The value is the same; the
@@ -120,6 +129,18 @@ class ArrayInterface(Protocol):
 
     @property
     def __array_interface__(self) -> Mapping[str, object]: ...
+
+
+def _pixels(image: ArrayInterface) -> np.ndarray:
+    """A decoded image's pixels: grey, colour, either with alpha, or 16-bit
+    grey as stored, and any other mode as RGB(A), since a palette image's
+    array is its indices and a CMYK one's is no colour a reader knows."""
+    from PIL import Image
+
+    if isinstance(image, Image.Image) and image.mode not in ("L", "LA", "RGB", "RGBA", "I;16"):
+        transparent = "A" in image.getbands() or "transparency" in image.info
+        image = image.convert("RGBA" if transparent else "RGB")
+    return np.asarray(image)
 
 
 class HFDatasetSource:
@@ -177,14 +198,7 @@ class HFDatasetSource:
         """One table, from the dataset's name."""
         if self.name is None:
             raise ValueError("an HF source needs a dataset name or a loaded dataset")
-        datasets = _hf_datasets()
-        table = self.options.load(self.name, self.split, streaming=False)
-        if not isinstance(table, datasets.Dataset):
-            raise TypeError(
-                f"{self.name!r} split {self.split!r} loaded as {type(table).__name__}; a "
-                f"random-access source is one Arrow-backed split, so name one split, or "
-                f"read it with streaming=True")
-        return table
+        return self.options.table(self.name, self.split)
 
     def __len__(self) -> int:
         return len(self._table())
@@ -205,9 +219,8 @@ class HFDatasetSource:
         # array interface, so they convert here; strings, numbers and lists
         # travel as they are.
         row: Mapping[str, object] = self._table()[index]
-        return {key: np.asarray(value) if isinstance(value, ArrayInterface) else value
+        return {key: _pixels(value) if isinstance(value, ArrayInterface) else value
                 for key, value in row.items()}
-
 
     def __getstate__(self) -> Held:
         # grain pickles the source into every worker process. A table read

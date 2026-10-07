@@ -3,13 +3,13 @@
 A row of token ids is corrupted by masking each position with the process's
 probability at a drawn time. The model reads the whole corrupted row, its
 states attending both ways (`dew.nn.protocols.TokenModel` with `causal` False),
-and predicts the original tokens through its head (`AffineHead`). The loss
+and predicts the original tokens through its head. The loss
 is the cross entropy at the masked positions, under a distribution that
 gives the mask token no mass (MDLM's SUBS parameterization), weighted by
 the process's NELBO weight and averaged over every position of the batch.
 That average is the continuous-time negative ELBO the paper trains. The
 cross entropy is the LM objective's chunked one, which holds one vocabulary
-slice of logits at a time.
+slice of logits at a time where the head is a matrix.
 
 Evaluation scores every row's corruption loss as `TokenScores`, so
 perplexity-style metrics read the negative ELBO; the preview hook alone
@@ -23,14 +23,12 @@ compilation rather than a constant embedded in the executable.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import linen as nn
 
 from dew.artifacts import TextSamples, TokenScores
@@ -38,9 +36,8 @@ from dew.coordination import agreed, collective_host
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration
 from dew.inputs import Field, InputSpec
-from dew.nn.protocols import AffineHead, HiddenStates, TokenModel
+from dew.nn.protocols import Logits, TokenModel
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
     EMASpec,
@@ -53,17 +50,14 @@ from dew.objectives.base import (
     Variables,
     thaw,
 )
-from dew.objectives.lm.chunked import head_cross_entropy
-from dew.objectives.lm.objective import _batch_text
+from dew.objectives.lm.chunked import head_cross_entropy, logits_cross_entropy, reads_states
+from dew.objectives.lm.objective import TEXT_KEY, _batch_text
 from dew.records import JSON
 from dew.registry import objectives
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
-
-TEXT_KEY = "text"
-
 
 _DEFAULT_SOLVER = Unmask()
 
@@ -98,33 +92,28 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
-        `model` gives its final states and its head (`HiddenStates`,
-        `AffineHead`), and its states attend both ways (`TokenModel` with
-        `causal` False), as `CausalTransformer(causal=False)`'s do. `solver`
+        `model` gives its logits, from its final states through its head or
+        from its tokens (`chunked.reads_states`, `Logits`), and its states
+        attend both ways (`TokenModel` with `causal` False), as
+        `CausalTransformer(causal=False)`'s do. `solver`
         and `steps` set how generation unmasks, in the preview and in the
         task `pipeline` returns, and `samples` is how many rows the preview
         draws. `decode` turns a row of ids into the text the artifact shows;
         with None, the artifact shows the ids alone.
 
-        `variables` is the tree training starts from: a released
-        masked-diffusion checkpoint as `Pretrained.load` returns it, so a run
-        continues from LLaDA's or Dream's weights, or an adapter's split of
-        one, kept as given. None starts from a fresh init. `model` may be the
-        loaded source itself, which supplies its model, variables and
-        processor.
-
-        `processor` is what `pipeline` uses to turn text into ids and decode
-        them, unless it is given another one. A run records its tokenizer."""
+        `model` may be a loaded source, such as a released LLaDA or Dream
+        checkpoint, and `variables` and `processor` override its own
+        (`Objective.bind_model`)."""
         model = self.bind_model(model, variables=variables, processor=processor)
-        lacking = [read.__name__ for read in (HiddenStates, AffineHead) if not isinstance(model, read)]
-        if lacking:
-            raise TypeError(
-                f"masked diffusion scores a model's final states through its head, and a "
-                f"{type(model).__name__} gives no {' or '.join(lacking)}")
         if not isinstance(model, TokenModel) or model.causal:
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so its states attend "
                 "both ways (TokenModel with causal False), as CausalTransformer(causal=False)'s do")
+        if not reads_states(model) and not isinstance(model, Logits):
+            raise TypeError(
+                f"masked diffusion scores a model's logits, and a {type(model).__name__} gives none: no "
+                f"head over its final states (HiddenStates with AffineHead or LogitsFromHidden) and "
+                f"no Logits")
         self.model = model
         self.process = process
         self.seq_len = seq_len
@@ -134,9 +123,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.samples = samples
         self.decode = decode
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
-        # The EMA follows what moves; the frozen collection never does.
-        self.ema = None if ema_decay is None else EMASpec(
-            decay=optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
+        self.ema = EMASpec.constant(ema_decay)
         self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
@@ -173,31 +160,17 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
         })
 
-    def evaluate(self, params, batch, step: Step) -> TokenScores:
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
         """Return the negative ELBO of every token in the batch.
 
         One noise level and one masking are drawn from the pass's key, as in
-        training. Dropout is off, and the averaged weights are used when the
-        run keeps them. Every real token counts: a masked token scores its
-        weighted cross entropy, a visible one scores zero, and a packed
-        window's padding has no weight. So `perplexity` over a validation
-        pass is the exponential of the ELBO bound per token, the number MDLM
-        reports."""
-        params = self.evaluation_variables(params, step)
-        losses, weights, correct = self._scored(params, batch, step.key)
-        return TokenScores(losses=losses, weights=weights, correct=correct)
-
-    @functools.cached_property
-    def _scored(self):
-        """Compile the evaluation's corruption and scores once per objective.
-        Run op by op, the model's forward would dispatch every operation of
-        every validation batch from the host, and jax's eager shard_map
-        refuses the chunked head's map over the data axis alone."""
-        def scored(params, batch, key):
-            tokens, losses, weights, _, predicted, real = self._token_losses(params, batch, key, train=False)
-            return losses * weights, real.astype(losses.dtype), predicted == tokens
-
-        return jax.jit(scored)
+        training, with dropout off. Every real token counts: a masked token
+        scores its weighted cross entropy, a visible one scores zero, and a
+        packed window's padding has no weight. So `perplexity` over a
+        validation pass is the exponential of the ELBO bound per token, the
+        number MDLM reports."""
+        tokens, losses, weights, _, predicted, real = self._token_losses(params, batch, key, train=False)
+        return TokenScores(losses * weights, real.astype(losses.dtype), predicted == tokens)
 
     def _token_losses(self, params, batch, key, *, train: bool):
         """Corrupt the batch once and score it.
@@ -238,13 +211,16 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         is_masked = is_masked & real
         masked = jnp.where(is_masked, masked, tokens)
 
-        hidden = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
-                                  method="hidden_states", mutable=False, capture_intermediates=False,
-                                  **prepared.kwargs())
+        over_states = reads_states(self.model)
+        read = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
+                                method="hidden_states" if over_states else "logits", mutable=False,
+                                capture_intermediates=False, **prepared.kwargs())
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
-        losses, predicted, _ = head_cross_entropy(self.model, params, hidden, tokens, self.head_chunks,
-                                                  excluded=self.process.mask_id)
+        mask_id = self.process.mask_id
+        losses, predicted, _ = (
+            head_cross_entropy(self.model, params, read, tokens, self.head_chunks, excluded=mask_id)
+            if over_states else logits_cross_entropy(read, tokens, excluded=mask_id))
         counted = is_masked.astype(losses.dtype)
         return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
 

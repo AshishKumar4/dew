@@ -9,91 +9,24 @@ group or RLOO family from `dew.rl`, with old log-probabilities rescored
 through the objective's own head.
 """
 
-import json
-
 import jax
-import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
+from affine_run import Data, Regression
+from recording import RecordingTracker
+from rl_support import TinyHead
 
-from dew.nn.protocols import OutputTable
-from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import SampledRollout
 from dew.rl import group_advantage, rloo_advantage
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, Trainer
 
-FEATURES = 3
 VOCAB = 8
 PROMPT_WIDTH = 8
 NEW_TOKENS = 4
 GROUPS = 2
-
-
-class Affine(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(2)(x)
-
-
-class Regression(Objective):
-    """Squared error of an affine map, for the loop-level tests."""
-
-    def __init__(self):
-        self.model = Affine()
-        self.ema = EMASpec(decay=optax.constant_schedule(1.0))
-
-    def init(self, key, variables=None):
-        return self.model.init(key, jnp.zeros((1, FEATURES)))
-
-    def loss(self, variables, batch, step):
-        prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
-
-
-class Counting:
-    """A deterministic, checkpointable stream of regression batches."""
-
-    def __init__(self, batch=8):
-        self.index = 0
-        self.batch = batch
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        rng = np.random.default_rng(self.index)
-        self.index += 1
-        x = rng.normal(size=(self.batch, FEATURES)).astype(np.float32)
-        return {"x": x, "y": 2 * x[:, :2]}
-
-    def get_state(self):
-        return json.dumps({"index": self.index}).encode()
-
-    def set_state(self, state):
-        self.index = json.loads(state)["index"]
-
-
-class Data:
-    """The `Dataset` contract the trainer reads: train, val, batch, records."""
-
-    def __init__(self, train=Counting, val=None, batch=8, records=None):
-        self._train, self._val = train, val
-        self.batch, self.records = batch, records
-
-    def train(self, partition):
-        return self._train()
-
-    @property
-    def val(self):
-        return None if self._val is None else lambda partition: self._val()
-
-    @property
-    def steps_per_epoch(self):
-        return None if self.records is None else self.records // self.batch
 
 
 def leaves(state):
@@ -103,7 +36,7 @@ def leaves(state):
 def make_trainer(tmp_path=None, **kwargs):
     checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path / "run"))
     return Trainer(
-        Regression(),
+        Regression(ema_decay=1.0),
         optax.sgd(0.1),
         key=jax.random.key(0),
         layout=Layout(min_shard=1, tolerance=1.0),
@@ -125,19 +58,6 @@ class Recorder:
         return batch
 
 
-class Logging:
-    """A tracker that keeps every logged scalars mapping."""
-
-    def __init__(self):
-        self.scalars = []
-
-    def log(self, scalars, step):
-        self.scalars.append(dict(scalars))
-
-    def artifact(self, value, step):
-        pass
-
-
 # --- the loop with and without a rollout -------------------------------------
 
 def test_an_identity_rollout_leaves_the_loop_byte_identical():
@@ -147,13 +67,13 @@ def test_an_identity_rollout_leaves_the_loop_byte_identical():
     loop; the compiled step is unreachable for a direct jaxpr comparison
     because it runs under `set_mesh`, which refuses to trace."""
     assert make_trainer().rollout is None
-    plain, ident = Logging(), Logging()
+    plain, ident = RecordingTracker(), RecordingTracker()
     make_trainer(tracker=plain).fit(Data(), steps=2, log_every=1)
     make_trainer(rollout=lambda state, batch, key: batch,
                  tracker=ident).fit(Data(), steps=2, log_every=1)
 
-    assert [logged["train/loss"] for logged in plain.scalars if "train/loss" in logged] == [
-        logged["train/loss"] for logged in ident.scalars if "train/loss" in logged] != []
+    assert [logged["train/loss"] for _, logged in plain.scalars if "train/loss" in logged] == [
+        logged["train/loss"] for _, logged in ident.scalars if "train/loss" in logged] != []
 
 
 def test_changing_batches_compile_once():
@@ -199,15 +119,15 @@ def test_rollout_seconds_logs_only_with_a_rollout():
     """The log tick carries `train/rollout_seconds` when a rollout is set,
     and no such key without one. The run's final goodput line is not a step
     tick, so only ticks with a loss count."""
-    tracking = Logging()
+    tracking = RecordingTracker()
     make_trainer(rollout=Recorder(), tracker=tracking).fit(Data(), steps=2, log_every=1)
-    ticks = [logged for logged in tracking.scalars if "train/loss" in logged]
+    ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all(tick["train/rollout_seconds"] >= 0.0 for tick in ticks)
 
-    tracking = Logging()
+    tracking = RecordingTracker()
     make_trainer(tracker=tracking).fit(Data(), steps=2, log_every=1)
-    ticks = [logged for logged in tracking.scalars if "train/loss" in logged]
+    ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert len(ticks) == 2
     assert all("train/rollout_seconds" not in tick for tick in ticks)
 
@@ -222,40 +142,12 @@ def test_a_rollouts_metrics_log_as_of_its_latest_call():
             self.metrics = {"reward/mean": float(state.step) + 0.5}
             return super().__call__(state, batch, key)
 
-    tracking = Logging()
+    tracking = RecordingTracker()
     make_trainer(rollout=Counting(), tracker=tracking).fit(Data(), steps=4, log_every=2)
-    ticks = [logged for logged in tracking.scalars if "train/loss" in logged]
+    ticks = [logged for _, logged in tracking.scalars if "train/loss" in logged]
     assert [tick["rollout/reward/mean"] for tick in ticks] == [1.5, 3.5]
 
 
-class TinyHead(nn.Module):
-    """A position-wise map with the backbone's scoring contract, standing in
-    for the causal stack: int32 ids in, float32 logits out, the head split
-    off behind `hidden_states` and `output_table`."""
-
-    vocab_size: int
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False):
-        x = nn.Embed(self.vocab_size, 8)(tokens)
-        h = nn.LayerNorm()(x)
-        return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
-
-    @nn.compact
-    def init_cache(self, batch_size):
-        """A placeholder cache: the trunk mixes nothing across positions, so
-        incremental decoding keeps no state, but `generate` threads one."""
-        self.variable("cache", "index", lambda: jnp.zeros((batch_size,), jnp.int32))
-
-    def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None):
-        return self.lm_head(
-            self.hidden_states(tokens, train=train)).astype(jnp.float32)
-
-    def output_table(self):
-        return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False)
 # --- SampledRollout ------------------------------------------------------------
 
 

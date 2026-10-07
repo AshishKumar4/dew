@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_stubs import PROMPTS, batch_for
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.config import ModelConfig, TrainerConfig
@@ -32,7 +33,6 @@ from dew.sampling import Euler
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
-PROMPTS = ["a red bird", "two cats"]
 
 
 @pytest.fixture(scope="module")
@@ -47,16 +47,6 @@ def pipelines(tmp_path_factory):
 def precision() -> ModelConfig:
     """The default model record at float32 on the XLA kernel."""
     return dataclasses.replace(DiffusionRunConfig().model, dtype="float32", attention_impl="xla")
-
-
-def batch_for(objective, size: int) -> dict:
-    """One row per device, the prompts in turn: a batch the data axis divides,
-    in the channels the objective's sample field names."""
-    rows, channels = jax.device_count(), objective.inputs.sample.shape[-1]
-    pixels = np.tile(np.arange(size * size * channels, dtype=np.uint8).reshape(
-        1, size, size, channels), (rows, 1, 1, 1))
-    return {"image": pixels,
-            **objective.inputs.tokenize([PROMPTS[row % len(PROMPTS)] for row in range(rows)])}
 
 
 def value(objective, params, batch) -> float:

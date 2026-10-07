@@ -27,7 +27,6 @@ prompt once per event.
 from __future__ import annotations
 
 import dataclasses
-import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
@@ -35,7 +34,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import linen as nn, struct
 
 from dew.artifacts import TextSamples, TokenScores
@@ -48,10 +46,9 @@ from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, lay
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import AffineHead, DecoderTraining, HiddenStates, TokenModel
+from dew.nn.protocols import DecoderTraining, Logits, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
     Batch,
@@ -70,7 +67,15 @@ from dew.objectives.base import (
     merge_totals,
     thaw,
 )
-from dew.objectives.lm.chunked import chunked_tile, head_cross_entropy, model_logits, support_log_probs
+from dew.objectives.lm.chunked import (
+    chunked_tile,
+    head_cross_entropy,
+    head_table,
+    logits_cross_entropy,
+    model_logits,
+    reads_states,
+    support_log_probs,
+)
 from dew.records import JSON
 from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
@@ -120,18 +125,17 @@ class IndexerTraining:
 def _check_reads(model: nn.Module) -> None:
     """Refuse a model next-token scoring cannot read.
 
-    The loss reads the final states and contracts them with the head
-    (`HiddenStates`, `AffineHead`), and a state may see only the tokens up
-    to its own, so a model that says its states attend both ways (`TokenModel`)
-    is refused.
+    A state may see only the tokens up to its own, so a model that says its
+    states attend both ways (`TokenModel`) is refused. The loss scores the
+    final states through the head (`chunked.reads_states`), or else the
+    logits a model gives from its tokens (`Logits`).
     """
-    lacking = [read.__name__ for read in (HiddenStates, AffineHead) if not isinstance(model, read)]
-    if lacking:
-        raise TypeError(
-            f"LMObjective scores a model's final states through its head, and a "
-            f"{type(model).__name__} gives no {' or '.join(lacking)}")
     if isinstance(model, TokenModel) and not model.causal:
         raise ValueError("LMObjective requires a causal model for next-token likelihoods")
+    if not reads_states(model) and not isinstance(model, Logits):
+        raise TypeError(
+            f"LMObjective scores a model's logits, and a {type(model).__name__} gives none: no head over "
+            f"its final states (HiddenStates with AffineHead or LogitsFromHidden) and no Logits")
 
 
 def _streamed_depths(model: nn.Module) -> bool:
@@ -437,7 +441,9 @@ class Scores(NamedTuple):
     entropy, 1 where the target counts, and the log partition of each prediction's
     distribution (what PaLM's z-loss squares). `correct` is 1 where the argmax was
     the target, and None unless the objective reports `token_accuracy`. `hidden` is
-    the `[B, seq_len, D]` final states the head scored, and `layers` the states of
+    the `[B, seq_len, D]` final states the head scored, or the `[B, seq_len, vocab]`
+    logits of a model that gives them only from its tokens (`chunked.reads_states`),
+    and `layers` the states of
     the layers `token_scores` was asked for, in that order. `routing` is what the
     routers recorded, `depths` the prediction depths' (losses, weights) pairs, `qk`
     the attention layers' per-head logit maxima, and `indexer` their per-query
@@ -565,19 +571,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     loss before `router_aux_loss_coef`, which corresponds to
     `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
 
-    `variables` is the tree training starts from, as `model.init`,
-    `Pretrained.load` or `LoRA.apply` return it; None draws a fresh one. A
-    split tree (`dew.objectives.base.freeze`, or an adapter's) is kept as
-    given: the optimizer updates what is in `params`, and the rest stays
-    under `frozen`. `model` may be a loaded source in place of the model
-    (`LMObjective(qwen, seq_len=512)`), which supplies its model, variables
-    and processor; `variables` and `processor` override them.
+    `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
+    `variables` and `processor` override its own (`Objective.bind_model`).
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
-
-    `processor` is what `pipeline` uses to turn text into ids and decode
-    them, unless it is given another one.
     """
 
     artifact = TokenScores
@@ -644,10 +642,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
             "router_z_loss": router_z_loss or None})
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
-        # The EMA follows what moves; the frozen collection never does.
-        self.ema = None if ema_decay is None else EMASpec(
-            decay=optax.constant_schedule(ema_decay),
-            select=lambda path: path[0] != FROZEN)
+        self.ema = EMASpec.constant(ema_decay)
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
 
@@ -768,9 +763,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         qk = gathered.get("qk") if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(layer_output(gathered[INTERMEDIATES], index) for index in layers)
-        losses, predicted, log_z = head_cross_entropy(
-            self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile,
-            predict=self.token_accuracy if predict is None else predict)
+        predict = self.token_accuracy if predict is None else predict
+        losses, predicted, log_z = (
+            head_cross_entropy(self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile,
+                               predict=predict) if reads_states(self.model)
+            else logits_cross_entropy(hidden, targets, predict=predict))
         weights = self._row_weights(prepared, targets, roles, losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -852,7 +849,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
                        layers: Sequence[int] = ()):
-        """Run the model over `inputs` and return its final states.
+        """Run the model over `inputs` and return its final states, or the
+        logits of a model that gives them only from its tokens (`reads_states`).
 
         Beside them come whatever the open `collections` gathered, empty
         when none was opened, and under `intermediates` the outputs of
@@ -860,7 +858,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """
         opened = [*collections, INTERMEDIATES] if layers else collections
         hidden = self.model.apply(params, inputs, train=train, rngs=rngs,
-                                  method="hidden_states",
+                                  method="hidden_states" if reads_states(self.model) else "logits",
                                   mutable=opened or False,
                                   capture_intermediates=layer_outputs if layers else False,
                                   **packing)
@@ -903,11 +901,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         params = thaw(params)
         targets = tokens[:, 1:]
         if temperature != 1.0:
-            losses, _, _ = head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
-                                              tile=self.head_tile, predict=False, temperature=temperature)
+            losses, _, _ = (
+                head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
+                                   tile=self.head_tile, predict=False, temperature=temperature)
+                if reads_states(self.model)
+                else logits_cross_entropy(scores.hidden, targets, predict=False, temperature=temperature))
             log_probs = -losses
         if support is not None:
-            head = self.model.apply(params, method="output_table")
+            head = head_table(self.model, params)
             if head is None:
                 raise ValueError(
                     "a sampler's support is rescored against the rows of the head's matrix, and no "
@@ -1049,7 +1050,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers)
         assert isinstance(statistics, Ratio)
-        logits = constrain(model_logits(self.model, thaw(params), scores.hidden), LOGITS)
+        logits = constrain(model_logits(self.model, thaw(params), scores.hidden)
+                           if reads_states(self.model) else scores.hidden, LOGITS)
         return statistics, aux, Prediction(logits, scores.losses, scores.weights, scores.layers)
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
@@ -1180,10 +1182,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return {"moe": merge(moe, balanced)}
 
     def evaluate(self, params, batch, step: Step):
-        """Score the complete batch teacher-forced, using EMA when present."""
-        params = self.evaluation_variables(params, step)
-        losses, weights, correct = self._scored(params, _batch_text(batch), self._batch_roles(batch))
-        return TokenScores(losses=losses, weights=weights, correct=correct)
+        """Score the complete batch teacher-forced, using EMA when present; the
+        rows and roles are read outside the compiled scoring."""
+        prepared = {TEXT_KEY: _batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
+        return super().evaluate(params, prepared, step)
+
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+        scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True)
+        assert scores.correct is not None
+        return TokenScores(scores.losses, scores.weights, scores.correct)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
@@ -1217,16 +1224,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             prompt=decode(np.asarray(prompt)[0].tolist()),
             texts=tuple(decode(row.tolist()) for row in np.asarray(generated)))
 
-    @functools.cached_property
-    def _scored(self):
-        """Compile the teacher-forced scores once per objective."""
-        def scored(params, prepared, roles):
-            scores = self.token_scores(params, prepared, roles=roles, predict=True)
-            assert scores.correct is not None
-            return scores.losses, scores.weights, scores.correct
-
-        return jax.jit(scored)
-
 
 @metrics("perplexity")
 class Perplexity:
@@ -1246,9 +1243,7 @@ class Perplexity:
         losses = np.asarray(scores.losses, dtype=np.float64)
         return float(np.sum(losses * weights)), float(np.sum(weights))
 
-    def merge(self, accumulated: tuple[float, float],
-              contribution: tuple[float, float]) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
+    merge = staticmethod(merge_totals)
 
     def finalize(self, accumulated: tuple[float, float]) -> float:
         total, count = accumulated

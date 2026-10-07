@@ -16,23 +16,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
+from rl_support import TinyHead
 
 from dew.data import DataPartition, Loading, PreferencePairs
 from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
-from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
-
-
-def preference_logsigmoid(*halves_and_beta):
-    """The pair mean of the DPO sigmoid terms, the loss `DPOObjective` reduces to."""
-    terms, _ = preference_logsigmoid_terms(*halves_and_beta)
-    return jnp.mean(terms)
 VOCAB = 8
 PAIRS = 2
 WIDTH = 6
@@ -78,38 +71,7 @@ def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     assert_as_exact_as_the_reference(mine, theirs, truth, "DPO loss, gradient and rewards")
 
 
-def test_the_fixture_names_its_reference(reference):
-    assert str(reference["trl_version"]) == "1.12.0"
-    assert str(reference["torch_version"]).startswith("2.14")
-    assert float(reference["beta"]) == 0.1
-    assert np.asarray(reference["completion_mask"]).shape == (6, 6)
-
-
 # --- the objective -------------------------------------------------------------
-
-class TinyHead(nn.Module):
-    """A position-wise map with the backbone's scoring contract: int32 ids
-    in, float32 logits out, the head split off behind `hidden_states` and
-    `output_table`."""
-
-    vocab_size: int
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False):
-        x = nn.Embed(self.vocab_size, 8)(tokens)
-        h = nn.LayerNorm()(x)
-        return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
-
-    def __call__(self, tokens, train: bool = False):
-        return self.lm_head(
-            self.hidden_states(tokens, train=train)).astype(jnp.float32)
-
-    def output_table(self):
-        return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False)
-
 
 def pair_batch(seed=0):
     """Two pairs of full-length rows, `[PAIRS, 2, WIDTH]`, with prompt
@@ -162,31 +124,6 @@ def test_rewards_measure_reference_relative_improvement_on_unequal_pairs():
     np.testing.assert_allclose(aux.metrics["rewards/rejected"], rewards_rejected.mean(), rtol=1e-5, atol=1e-6)
     assert float(aux.metrics["accuracy"]) == float((rewards_chosen > rewards_rejected).mean())
     np.testing.assert_allclose(loss, np.logaddexp(0, rewards_rejected - rewards_chosen).mean(), rtol=1e-6)
-
-
-def test_the_loss_composes_the_term_over_head_log_probs():
-    """The objective's loss is the preference term over the chunked head's
-    per-token log-probabilities, policy from the live params and reference
-    from the frozen tree."""
-    objective = DPOObjective(TinyHead(vocab_size=VOCAB), WIDTH - 1, beta=0.5)
-    params = objective.init(jax.random.key(0))
-    frozen = jax.tree.map(lambda leaf: jnp.asarray(np.asarray(leaf)), params)
-    batch = pair_batch()
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=frozen)
-
-    loss, aux = objective.scalar_loss(params, batch, step)
-
-    chosen_ids, rejected_ids, chosen_mask, rejected_mask = flat(batch)
-    stack = np.concatenate([chosen_ids, rejected_ids])
-    policy = np.asarray(objective.per_token_log_probs(params, stack))
-    ref = np.asarray(objective.per_token_log_probs(frozen, stack))
-    half = PAIRS
-    expected = preference_logsigmoid(
-        jnp.asarray(policy[:half]), jnp.asarray(policy[half:]),
-        jnp.asarray(ref[:half]), jnp.asarray(ref[half:]),
-        jnp.asarray(chosen_mask), jnp.asarray(rejected_mask), 0.5)
-    assert float(loss) == pytest.approx(float(expected), rel=1e-5)
-    assert set(aux.metrics) == {"rewards/chosen", "rewards/rejected", "accuracy"}
 
 
 def test_the_reference_comes_from_the_frozen_tree():

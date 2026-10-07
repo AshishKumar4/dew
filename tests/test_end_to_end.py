@@ -13,10 +13,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_stubs import label_table
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, chain_roundings
 from test_lpips import drawn_weights
-from test_mean_flow import CLASSES, labelled
+from test_mean_flow import CLASSES
 
 from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
@@ -363,7 +364,8 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
         archive.extractall(tmp_path, filter="data")
     alignment = Alignment(Representation(), cast({"params": {"Conv_0": module("representation")}}), "block_0",
                           width=PROJECTOR)
-    inputs = InputSpec(Field("image", (SIDE, SIDE, 3)), {"textcontext": Condition(labelled())})
+    table = label_table(range(CLASSES), null=CLASSES)
+    inputs = InputSpec(Field("image", (SIDE, SIDE, 3)), {"textcontext": Condition(table)})
     task = DiffusionObjective(
         StandIn(), presets.Flow(density="uniform")(), inputs, guidance=None, solver=Euler(), steps=2,
         autoencoder=StableDiffusionVAE(modelname=str(tmp_path / "sd" / "vae"), dtype=dtype),
@@ -558,7 +560,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     SD VAE: a saved run's task restores the tuned autoencoder and its
     running statistics, and samples exactly as the trained objective's own
     task does."""
-    from test_diffusion_run_sources import batch_for
+    from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
