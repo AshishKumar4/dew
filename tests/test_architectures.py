@@ -25,7 +25,7 @@ from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
-from dew.config import ModelConfig
+from dew.config import ModelConfig, ObjectiveConfig
 from dew.data import TFDSImages
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
@@ -521,8 +521,8 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", {**fields, "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=8), text=None, guidance=None,
-        solver=Euler(), sampling_steps=SAMPLER_STEPS)
+        data=TFDSImages(image_size=8), text=None,
+        objective=ObjectiveConfig("diffusion", {"guidance": None, "solver": Euler(), "steps": SAMPLER_STEPS}))
 
 
 def test_a_unet_from_a_json_record_generates_what_its_value_twin_does():

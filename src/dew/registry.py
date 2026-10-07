@@ -637,6 +637,25 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
             for name, value in fields.items()}
 
 
+def argument_records(member: Callable[..., Configured], fields: Mapping[str, object]) -> dict[str, JSON]:
+    """`fields` as records of `member`'s parameters (`parameters`): each read
+    against its parameter's annotation and written back, so an alias becomes
+    its import path, a value already built becomes its record, and an
+    argument `member` does not take, or a value no record can carry (a
+    lambda), is refused here rather than where the run is built."""
+    named, open_ended = parameters(member)
+    unknown = [] if open_ended else sorted(set(fields) - set(named))
+    if unknown:
+        raise ValueError(f"{member.__name__} takes no {unknown}; its parameters are {sorted(named)}")
+    records = {}
+    for name, value in fields.items():
+        annotation = _parameter_type(named[name][1], name) if name in named else None
+        built = (_rebuilt(annotation, value, dtypes=False, name=name)
+                 if isinstance(value, (Mapping, list)) else value)
+        records[name] = to_record(built, annotation)
+    return records
+
+
 type Parameters = dict[str, tuple[inspect.Parameter, Callable[..., Configured]]]
 
 
@@ -987,6 +1006,7 @@ __all__ = [
     "KINDS",
     "Aliases",
     "Record",
+    "argument_records",
     "datasets",
     "dtype_name",
     "encoders",

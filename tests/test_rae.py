@@ -254,7 +254,7 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
     import optax
     from diffusion_stubs import STUB_TEXT
 
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.data import Dataset, TFDSImages
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
@@ -268,12 +268,10 @@ def test_a_latent_run_trains_behind_the_rae_and_samples_its_image_size(source):
         ),
         data=TFDSImages(image_size=64),
         trainer=TrainerConfig(batch_size=8, steps=2),
-        solver=Euler(),
-        sampling_steps=2,
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(
             modelname=str(source / "siglip2"), revision="main", dtype="float32"
-        ),
+        ), objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),
     )
     objective = config.build()
     assert objective.latent_shape == (8, 8, 64)

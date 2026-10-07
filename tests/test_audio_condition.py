@@ -15,7 +15,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.config import ModelConfig
+from dew.config import ModelConfig, ObjectiveConfig
 from dew.data import DataPartition, Loading, LocalVideos
 from dew.inputs import Condition, HFAudio
 from dew.objectives.base import Step
@@ -151,8 +151,8 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     config = DiffusionRunConfig(
         model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
                                         "num_heads": 2, "dtype": "float32", "attention_impl": "reference"}),
-        data=data, text=None, audio=AudioCondition(), sampling_steps=4, guidance=CFG(2.0),
-        ema_decay=None, val_metrics=())
+        data=data, text=None, audio=AudioCondition(), val_metrics=(),
+        objective=ObjectiveConfig("diffusion", {"steps": 4, "guidance": CFG(2.0), "ema_decay": None}))
     objective = config.build()
     assert objective.inputs.conditions["textcontext"].encoder.seconds == data.audio_seconds
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config

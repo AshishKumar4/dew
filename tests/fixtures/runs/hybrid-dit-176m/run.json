@@ -34,23 +34,7 @@
       "val_split": null
     }
   },
-  "ema_decay": null,
-  "guidance": {
-    "interval": [
-      0.0,
-      1.0
-    ],
-    "rescale": 0.0,
-    "scale": 5.0
-  },
   "lora": null,
-  "mode": {
-    "class": "dew.objectives.diffusion.objective:Denoising",
-    "fields": {
-      "alignment": null,
-      "uncertainty": null
-    }
-  },
   "model": {
     "adapter": null,
     "fields": {
@@ -73,7 +57,32 @@
     "quantization": null
   },
   "objective": {
-    "fields": {},
+    "fields": {
+      "ema_decay": null,
+      "guidance": {
+        "class": "dew.sampling.guidance:CFG",
+        "fields": {
+          "interval": [
+            0.0,
+            1.0
+          ],
+          "rescale": 0.0,
+          "scale": 5.0
+        }
+      },
+      "solver": {
+        "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
+        "fields": {
+          "algorithm": "dpmsolver++",
+          "euler_at_final": false,
+          "lower_order_final": true,
+          "order": 2,
+          "solver_type": "midpoint"
+        }
+      },
+      "steps": 20,
+      "unconditional_prob": 0.12
+    },
     "name": "dew.objectives.diffusion.objective:DiffusionObjective"
   },
   "optim": {
@@ -104,17 +113,6 @@
     }
   },
   "pretrained": null,
-  "sampling_steps": 20,
-  "solver": {
-    "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
-    "fields": {
-      "algorithm": "dpmsolver++",
-      "euler_at_final": false,
-      "lower_order_final": true,
-      "order": 2,
-      "solver_type": "midpoint"
-    }
-  },
   "text": {
     "checkpoint": "openai/clip-vit-large-patch14",
     "dtype": "bfloat16",
@@ -303,6 +301,5 @@
     "wandb": null,
     "xla_flags": null
   },
-  "unconditional_prob": 0.12,
   "val_metrics": []
 }

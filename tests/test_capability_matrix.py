@@ -67,20 +67,17 @@ from dew.interop import Pretrained
 from dew.lora import Adapter, LoRA
 from dew.objectives.base import Step
 from dew.objectives.diffusion import (
-    AdversarialDistillation,
     AdversarialDistillationObjective,
-    ConsistencyDistillation,
     ConsistencyDistillationObjective,
     DiffusionObjective,
     GuidanceDistillationObjective,
     MeanFlowObjective,
-    MeanFlowTraining,
     ShortcutObjective,
-    ShortcutTraining,
 )
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+from dew.objectives.diffusion.objective import TEACHER
 from dew.objectives.distillation import DistillationObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
@@ -769,29 +766,29 @@ def interval_model(family: Family):
 def mean_flow(family: Family, directory: Path) -> None:
     """MeanFlow's average velocity over an interval, through a saved run's reload."""
     objective = MeanFlowObjective(interval_model(family), presets.MeanFlow()(), family.inputs(),
-                                  MeanFlowTraining(), ema_decay=None)
+                                  ema_decay=None)
     batch = denoised_batch(objective.inputs)
     trained = assert_trains(objective, batch, directory)
     assert_reloads(objective, trained, family, lambda task: MeanFlowObjective(
-        task.model, task.process, task.inputs, MeanFlowTraining(), variables=task.variables, ema_decay=None),
+        task.model, task.process, task.inputs, variables=task.variables, ema_decay=None),
                    batch)
 
 
 def refuse_mean_flow(family: Family) -> None:
-    starting(MeanFlowObjective(loaded(family).model, presets.MeanFlow()(), family.inputs(),
-                               MeanFlowTraining(), ema_decay=None), denoised_batch(family.inputs()))
+    starting(MeanFlowObjective(loaded(family).model, presets.MeanFlow()(), family.inputs(), ema_decay=None),
+             denoised_batch(family.inputs()))
 
 
 def shortcut(family: Family, directory: Path) -> None:
     """A shortcut model's steps of two sizes, a self-consistency target among them."""
     objective = ShortcutObjective(interval_model(family), presets.Shortcut()(), family.inputs(),
-                                  ShortcutTraining(sections=4, bootstrap_every=2), ema_decay=None)
+                                  sections=4, bootstrap_every=2, ema_decay=None)
     assert_trains(objective, denoised_batch(objective.inputs), directory)
 
 
 def refuse_shortcut(family: Family) -> None:
     starting(ShortcutObjective(loaded(family).model, presets.Shortcut()(), family.inputs(),
-                               ShortcutTraining(sections=4, bootstrap_every=2), ema_decay=None),
+                               sections=4, bootstrap_every=2, ema_decay=None),
              denoised_batch(family.inputs()))
 
 
@@ -806,9 +803,8 @@ def rcm(family: Family, directory: Path) -> None:
     student = smooth(loaded(family).model)
     inputs = family.inputs()
     objective = ConsistencyDistillationObjective(
-        student, presets.Flow()(), inputs,
-        ConsistencyDistillation(student_update_freq=1, max_simulation_steps=2),
-        teacher=student, teacher_variables=teacher_of(family, student, inputs), ema_decay=None)
+        student, presets.Flow()(), inputs, student_update_freq=1, max_simulation_steps=2,
+        variables={TEACHER: teacher_of(family, student, inputs)}, ema_decay=None)
     assert_trains(objective, denoised_batch(inputs), directory)
 
 
@@ -817,10 +813,8 @@ def ladd(family: Family, directory: Path) -> None:
     student = loaded(family).model
     inputs = family.inputs()
     objective = AdversarialDistillationObjective(
-        student, presets.Flow()(), inputs,
-        AdversarialDistillation(feature_layers=FEATURE_LAYERS[family.name], cmap_dim=8,
-                                kernel_size=(3, 3)),
-        teacher=student, teacher_variables=teacher_of(family, student, inputs), ema_decay=None)
+        student, presets.Flow()(), inputs, feature_layers=FEATURE_LAYERS[family.name], cmap_dim=8,
+        kernel_size=(3, 3), variables={TEACHER: teacher_of(family, student, inputs)}, ema_decay=None)
     assert_trains(objective, denoised_batch(inputs), directory)
 
 
@@ -833,9 +827,8 @@ def refuse_ladd(family: Family) -> None:
     student = loaded(family).model
     inputs = family.inputs()
     starting(AdversarialDistillationObjective(
-        student, presets.Flow()(), inputs,
-        AdversarialDistillation(feature_layers=("dit_block_0",), cmap_dim=8, kernel_size=(3, 3)),
-        teacher=student, teacher_variables=teacher_of(family, student, inputs), ema_decay=None),
+        student, presets.Flow()(), inputs, feature_layers=("dit_block_0",), cmap_dim=8, kernel_size=(3, 3),
+        variables={TEACHER: teacher_of(family, student, inputs)}, ema_decay=None),
         denoised_batch(inputs))
 
 
@@ -846,8 +839,8 @@ def guidance_distillation(family: Family, directory: Path) -> None:
     # The teacher's own towers, as the checkpoint it comes from holds them.
     teacher = denoising(student, process=presets.Flow(), inputs=family.inputs())
     objective = GuidanceDistillationObjective(
-        student, presets.Flow()(), inputs, teacher=teacher,
-        teacher_variables=teacher.initializer(jax.random.key(11)), scales=(1.0, 4.0), ema_decay=None)
+        student, presets.Flow()(), inputs, variables={TEACHER: teacher.initializer(jax.random.key(11))},
+        scales=(1.0, 4.0), ema_decay=None)
     assert_trains(objective, denoised_batch(inputs), directory)
 
 
@@ -856,8 +849,8 @@ def refuse_guidance_distillation(family: Family) -> None:
     inputs = family.inputs()
     teacher = denoising(student, process=presets.Flow(), inputs=inputs)
     starting(GuidanceDistillationObjective(
-        student, presets.Flow()(), inputs, teacher=teacher,
-        teacher_variables=teacher.initializer(jax.random.key(11)), scales=(1.0, 4.0), ema_decay=None),
+        student, presets.Flow()(), inputs, variables={TEACHER: teacher.initializer(jax.random.key(11))},
+        scales=(1.0, 4.0), ema_decay=None),
         denoised_batch(inputs))
 
 

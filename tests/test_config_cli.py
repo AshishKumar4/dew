@@ -14,11 +14,10 @@ import numpy as np
 import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
-from dew.config import ObjectiveConfig, RunConfig, ScheduleSpec
+from dew.config import RunConfig, ScheduleSpec
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
 from dew.data.dataset import record_argument, tokenized
 from dew.diffusion.presets import Flow
-from dew.objectives.diffusion import DiffusionObjective
 from dew.registry import datasets, import_path
 from dew.sampling import Heun
 from dew.training import MeshSpec
@@ -49,12 +48,15 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
     recipe = load_recipe("diffusion")
     config = parse(recipe.DiffusionRunConfig, [
         "--data.image-size", "64", "--data.augmentation", "flip_only",
-        "preset:flow", "--preset.shift", "3.0", "solver:heun",
+        "preset:flow", "--preset.shift", "3.0", "--objective.solver", '{"class": "heun"}',
+        "--objective.guidance", '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 2.5}}',
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model", "simple_dit", "--model.scan_order", "hilbert"])
 
     assert config.data == TFDSImages(image_size=64, augmentation="flip_only")
-    assert config.preset == Flow(shift=3.0) and config.solver == Heun()
+    assert config.preset == Flow(shift=3.0)
+    assert config.objective.fields["solver"]["class"] == import_path(Heun)
+    assert config.objective.fields["guidance"]["fields"]["scale"] == 2.5
     assert config.trainer.batch_size == 8 and config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.model.fields["scan_order"] == "hilbert"
 
@@ -82,7 +84,8 @@ def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
 def test_a_recipe_config_round_trips_through_its_json_record(name):
     recipe = load_recipe(name)
     cls = {"diffusion": "DiffusionRunConfig", "lm": "LmRunConfig", "jepa": "JepaRunConfig"}[name]
-    args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6", "--guidance.scale", "2.5"],
+    args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6",
+                          "--objective.unconditional-prob", "0.2"],
             "lm": ["--data.path", "d", "--sample-tokens", "4", "--objective.ema-decay", "0.9"],
             "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
     config = parse(getattr(recipe, cls), [*args, "--trainer.steps", "5"])
@@ -166,7 +169,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
         "--trainer.log-every", "1", "--model", "simple_dit", "--model.dtype", "float32",
         "--model.patch_size", "4", "--model.emb_features", "16",
         "--model.num_layers", "1", "--model.num_heads", "2",
-        "--sampling-steps", "2"])
+        "--objective.steps", "2"])
     # A validation pass needs a consumer; psnr scores samples against the
     # batch and downloads nothing, unlike the default clip metric.
     config = dataclasses.replace(config, val_metrics=("psnr",))
@@ -174,8 +177,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     state = recipe.main(config)
 
     assert int(state.step) == 2
-    trained = dataclasses.replace(config, objective=ObjectiveConfig(import_path(DiffusionObjective)))
-    assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == trained
+    assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == config
     assert config.to_dict()["preset"] == {"class": "dew.diffusion.presets:EDM", "fields": {
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,
         "regime": "pixel", "P_mean": None, "P_std": None, "min_snr_gamma": None}}

@@ -157,17 +157,12 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.data import TFDSImages
     from dew.diffusion.presets import Flow
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN, Step
-    from dew.objectives.diffusion import (
-        ConsistencyDistillation,
-        ConsistencyDistillationObjective,
-        DiffusionRunConfig,
-        TextCondition,
-    )
+    from dew.objectives.diffusion import ConsistencyDistillationObjective, DiffusionRunConfig, TextCondition
     from dew.objectives.diffusion.objective import FAKE_SCORE, TEACHER
     from dew.sampling import Consistency, Euler, TextToImage
     from dew.training import Trainer
@@ -175,9 +170,11 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                          "time_scale": 0.002, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=4), preset=Flow(), solver=Euler(), guidance=None,
-        sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
-        text=TextCondition(encoder="char_table", checkpoint="char_table"))
+        data=TFDSImages(image_size=4), preset=Flow(), val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        objective=ObjectiveConfig("diffusion",
+                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
     teacher = teacher_run.build()
     trainer = Trainer(teacher, optax.adam(1e-2), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()
@@ -190,25 +187,23 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     checkpoints.wait()
     teacher_run.save(str(tmp_path / "teacher"))
 
-    fast = tmp_path / "fast"
-    fast.mkdir()
-    dataclasses.replace(
-        teacher_run,
-        model=dataclasses.replace(
-            teacher_run.model,
-            fields={key: value for key, value in teacher_run.model.fields.items() if key != "time_scale"},
-        ),
-    ).save(str(fast))
-    with pytest.raises(ValueError, match="time_scale=16"):
-        dataclasses.replace(teacher_run, mode=ConsistencyDistillation(teacher=str(fast))).build()
-    # A teacher whose time features turn slower still is as smooth to differentiate.
-    dataclasses.replace(teacher_run, model=dataclasses.replace(
-        teacher_run.model, fields={**teacher_run.model.fields, "time_scale": 0.001})).save(str(fast))
-    ConsistencyDistillation(teacher=str(fast)).check_teacher()
+    def distilling(**fields):
+        return dataclasses.replace(teacher_run, objective=ObjectiveConfig("rcm", {
+            "teacher_run": str(tmp_path / "teacher"), "solver": Consistency(), "steps": 3, "ema_decay": None,
+            **fields}))
 
-    config = dataclasses.replace(teacher_run, mode=ConsistencyDistillation(
-        teacher=str(tmp_path / "teacher"), teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2,
-        max_simulation_steps=2), solver=Consistency(), sampling_steps=3)
+    # The student starts from the teacher's time features, so a model whose
+    # features turn fast is refused, and a slower one is as smooth.
+    for time_scale, refused in ((16, True), (0.001, False)):
+        model = dataclasses.replace(teacher_run.model, fields={**teacher_run.model.fields,
+                                                                "time_scale": time_scale})
+        if refused:
+            with pytest.raises(ValueError, match="time_scale=16"):
+                dataclasses.replace(distilling(), model=model).build()
+        else:
+            dataclasses.replace(distilling(), model=model).build()
+
+    config = distilling(teacher_guidance=2.0, tangent_warmup=1, student_update_freq=2, max_simulation_steps=2)
     task = config.build()
     assert isinstance(task, ConsistencyDistillationObjective)
     params = task.init(jax.random.PRNGKey(0))
@@ -277,7 +272,7 @@ class Weighted(nn.Module):
 
 
 def discrete_fields(prefix: str) -> dict:
-    """rCM's dCM settings as the mode's fields, none for sCM."""
+    """rCM's dCM settings as the objective's arguments, none for sCM."""
     if not prefix:
         return {}
     settings = json.loads(str(TRAINING["dcm"]))
@@ -295,8 +290,9 @@ def distilled(monkeypatch, optimizer, prefix=""):
 
     from dew.diffusion import presets
     from dew.inputs import Condition, Field, InputSpec
-    from dew.objectives.diffusion import ConsistencyDistillation, ConsistencyDistillationObjective
+    from dew.objectives.diffusion import ConsistencyDistillationObjective
     from dew.objectives.diffusion.consistency import _Draws
+    from dew.objectives.diffusion.objective import TEACHER
     from dew.training import Trainer
     from dew.training.posthoc import power_decay
 
@@ -308,13 +304,12 @@ def distilled(monkeypatch, optimizer, prefix=""):
     (mean_g, std_g), (mean_d, std_d) = config["times"]["G"], config["times"]["D"]
     teacher = {"params": {"weights": jnp.asarray(TRAINING["teacher"])}}
     task = ConsistencyDistillationObjective(
-        Weighted(), presets.Flow()(), inputs, ConsistencyDistillation(
-            consistency_weight=config["loss_scale"], dmd_weight=config["loss_scale_dmd"],
-            teacher_guidance=config["teacher_guidance"], tangent_warmup=config["tangent_warmup"],
-            student_update_freq=config["student_update_freq"],
-            max_simulation_steps=config["max_simulation_steps_fake"], student_times=(mean_g, std_g),
-            critic_times=(mean_d, std_d), **discrete_fields(prefix)),
-        teacher=Weighted(), teacher_variables=teacher, ema_decay=power_decay(config["ema_rate"]))
+        Weighted(), presets.Flow()(), inputs, consistency_weight=config["loss_scale"],
+        dmd_weight=config["loss_scale_dmd"], teacher_guidance=config["teacher_guidance"],
+        tangent_warmup=config["tangent_warmup"], student_update_freq=config["student_update_freq"],
+        max_simulation_steps=config["max_simulation_steps_fake"], student_times=(mean_g, std_g),
+        critic_times=(mean_d, std_d), **discrete_fields(prefix), variables={TEACHER: teacher},
+        ema_decay=power_decay(config["ema_rate"]))
     drawn = {name: jnp.asarray(TRAINING[f"{prefix}draws/{name}"]) for name in _Draws._fields}
     monkeypatch.setattr(ConsistencyDistillationObjective, "_draws", lambda self, step, count, shape: _Draws(
         **{name: value[step.step] for name, value in drawn.items()}))

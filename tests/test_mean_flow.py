@@ -17,8 +17,8 @@ from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
-from dew.objectives.diffusion.few_step import MeanFlowObjective, MeanFlowTraining
-from dew.sampling import Euler, sample
+from dew.objectives.diffusion.few_step import MeanFlowObjective
+from dew.sampling import CFG, Euler, sample
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "meanflow"
 CLASSES = 10
@@ -61,11 +61,10 @@ def test_the_loss_and_its_gradient_are_the_references(power, monkeypatch):
     table = label_table(range(CLASSES), null=CLASSES)
     inputs = InputSpec(Field("image", case["pixels"].shape[1:]), {"textcontext": Condition(table)})
     task = MeanFlowObjective(
-        Tiny(), presets.MeanFlow()(), inputs, MeanFlowTraining(
-            instantaneous=settings["data_proportion"], omega=settings["omega"], kappa=settings["kappa"],
-            guidance_interval=(settings["t_start"], settings["t_end"]), norm_p=settings["norm_p"],
-            norm_eps=settings["norm_eps"]),
-        ema_decay=None, unconditional_prob=settings["class_dropout_prob"])
+        Tiny(), presets.MeanFlow()(), inputs,
+        instantaneous=settings["data_proportion"], omega=settings["omega"], kappa=settings["kappa"],
+        guidance_interval=(settings["t_start"], settings["t_end"]), norm_p=settings["norm_p"],
+        norm_eps=settings["norm_eps"], ema_decay=None, unconditional_prob=settings["class_dropout_prob"])
     drawn = tuple(jnp.asarray(case[name]) for name in ("later", "earlier", "noise", "uniform"))
     monkeypatch.setattr(MeanFlowObjective, "_draws", lambda self, key, count, shape: drawn)
     variables = task.init(jax.random.PRNGKey(0))
@@ -85,7 +84,7 @@ def objective(**fields):
     inputs = InputSpec(
         Field("image", (4, 4, 3)), {"textcontext": Condition(CharTable.from_pretrained("char_table"))}
     )
-    return MeanFlowObjective(model, presets.MeanFlow()(), inputs, MeanFlowTraining(**fields), ema_decay=None)
+    return MeanFlowObjective(model, presets.MeanFlow()(), inputs, **fields, ema_decay=None)
 
 
 def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
@@ -121,7 +120,7 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
 def test_meanflow_refuses_an_instantaneous_process():
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     with pytest.raises(ValueError, match=r"presets\.MeanFlow"):
-        MeanFlowObjective(model, presets.Flow()(), InputSpec(Field("image", (4, 4, 3))), MeanFlowTraining())
+        MeanFlowObjective(model, presets.Flow()(), InputSpec(Field("image", (4, 4, 3))))
 
 
 def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp_path):
@@ -129,9 +128,9 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.data import TFDSImages
-    from dew.objectives.diffusion import DiffusionRunConfig, MeanFlowTraining, TextCondition
+    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
     from dew.sampling import TextToImage
     from dew.training import Trainer
 
@@ -143,14 +142,12 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
         ),
         data=TFDSImages(image_size=4),
         preset=presets.MeanFlow(),
-        solver=Euler(),
-        guidance=None,
-        sampling_steps=2,
-        ema_decay=None,
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        mode=MeanFlowTraining(omega=2.0, kappa=0.5),
+        objective=ObjectiveConfig("mean_flow",
+                                  {"omega": 2.0, "kappa": 0.5, "solver": Euler(), "steps": 2,
+                                   "ema_decay": None}),
     )
     task = config.build()
     assert isinstance(task, MeanFlowObjective) and task.model.interval
@@ -169,29 +166,25 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     )
 
 
-def test_a_meanflow_run_samples_unguided():
-    from dew.objectives.diffusion import DiffusionRunConfig, MeanFlowTraining
-
-    with pytest.raises(ValueError, match="set guidance None"):
-        DiffusionRunConfig(preset=presets.MeanFlow(), mode=MeanFlowTraining())
-
-
-def test_meanflow_refuses_the_denoising_losss_extras():
+def test_meanflow_refuses_the_denoising_losss_extras_and_a_guidance():
+    """The guidance is trained in, so sampling with one would guide twice."""
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
-    with pytest.raises(ValueError, match="own loss"):
-        MeanFlowObjective(model, presets.MeanFlow()(), InputSpec(Field("image", (4, 4, 3))),
-                          MeanFlowTraining(), uncertainty=8)
+    inputs = InputSpec(Field("image", (4, 4, 3)))
+    for extra in ({"uncertainty": 8}, {"guidance": CFG(2.0)}):
+        with pytest.raises(ValueError, match="own loss and samples unguided"):
+            MeanFlowObjective(model, presets.MeanFlow()(), inputs, **extra)
 
 
 def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():
-    from dew.config import ModelConfig
+    from dew.config import ModelConfig, ObjectiveConfig
     from dew.data import TFDSImages
-    from dew.objectives.diffusion import DiffusionRunConfig, MeanFlowTraining
+    from dew.objectives.diffusion import DiffusionRunConfig
 
     def built(config):
         return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=TFDSImages(image_size=8),
-                                  preset=presets.MeanFlow(), solver=Euler(), guidance=None, text=None,
-                                  val_metrics=(), mode=MeanFlowTraining()).build().model
+                                  preset=presets.MeanFlow(), text=None,
+                                  val_metrics=(),
+                                  objective=ObjectiveConfig("mean_flow", {"solver": Euler()})).build().model
 
     assert built({"patch_size": 2}).time_scale == 0.002 and built({"patch_size": 2}).interval
     assert built({"patch_size": 2, "time_scale": 16}).time_scale == 16

@@ -42,14 +42,14 @@ LOSS_ATOL = 1e-6
 
 def test_the_repa_loss_is_the_official_one():
     """REPA's MLP projector and its -cos loop over tokens and examples."""
-    alignment = Alignment(nn.Module(), {}, "block", width=SETTINGS["width"])
+    alignment = Alignment("block", width=SETTINGS["width"])
     loss = alignment.loss(projector("mlp"), jnp.asarray(CASES["hidden"]), jnp.asarray(CASES["features"]), {})
     np.testing.assert_allclose(float(loss), float(CASES["repa"]), rtol=0, atol=LOSS_ATOL)
 
 
 def test_the_irepa_loss_is_the_official_one():
     """iREPA's 3x3 convolution projector against spatially z-scored targets."""
-    alignment = Alignment(nn.Module(), {}, "block", projector="conv", spatial_norm=SETTINGS["gamma"])
+    alignment = Alignment("block", projector="conv", spatial_norm=SETTINGS["gamma"])
     targets = spatial_zscore(jnp.asarray(CASES["features"]), SETTINGS["gamma"])
     loss = alignment.loss(projector("conv"), jnp.asarray(CASES["hidden"]), targets, {})
     np.testing.assert_allclose(float(loss), float(CASES["irepa"]), rtol=0, atol=LOSS_ATOL)
@@ -67,10 +67,11 @@ def aligned(kind: str = "mlp"):
     model = SimpleDiT(patch_size=4, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1)
     encoder = Patches()
     variables = encoder.init(jax.random.PRNGKey(9), jnp.zeros((1, 8, 8, 3)))
-    alignment = Alignment(encoder, variables, "dit_block_0", weight=0.5, projector=kind, width=8,
-                          spatial_norm=0.6 if kind == "conv" else None)
+    alignment = Alignment("dit_block_0", encoder=encoder, weight=0.5, projector=kind, width=8,
+                          spatial_norm=0.6 if kind == "conv" else None, resolution=None)
     return DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (8, 8, 3))),
-                              guidance=None, solver=Euler(), steps=2, alignment=alignment)
+                              guidance=None, solver=Euler(), steps=2, alignment=alignment,
+                              variables={REPRESENTATION: variables})
 
 
 @pytest.mark.parametrize("kind", ["mlp", "conv"])
@@ -173,13 +174,15 @@ def test_repa_trains_on_repas_composed_loss_and_its_gradient():
     settings = json.loads(str(COMPOSED["settings"]))
     patch, width = settings["patch"], settings["width"]
     encoder = Projected(patch)
-    alignment = Alignment(encoder, {"params": {"encoder": jnp.asarray(COMPOSED["encoder"])}}, "block",
-                          weight=settings["proj_coeff"], width=settings["projector"])
+    alignment = Alignment("block", encoder=encoder, weight=settings["proj_coeff"],
+                          width=settings["projector"], resolution=None)
     process = Process(FlowMatchingScheduler(density="uniform"), FlowMatchPredictionTransform())
     pixels = COMPOSED["pixels"]
     objective = DiffusionObjective(Network(patch, width), process,
                                    InputSpec(Field("image", pixels.shape[1:])), guidance=None, solver=Euler(),
-                                   steps=2, alignment=alignment, unconditional_prob=0.0, ema_decay=None)
+                                   steps=2, alignment=alignment, unconditional_prob=0.0, ema_decay=None,
+                                   variables={REPRESENTATION: {"params": {
+                                       "encoder": jnp.asarray(COMPOSED["encoder"])}}})
     variables = objective.init(jax.random.PRNGKey(0))
     projector = {name: {leaf: jnp.asarray(COMPOSED[f"projector/{name}/{leaf}"], jnp.float32)
                         for leaf in ("kernel", "bias")} for name in ("Dense_0", "Dense_1", "Dense_2")}
@@ -236,7 +239,7 @@ def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing(spatial_nor
     features, held to the published float64 run by the float64 rule."""
     from dew.inputs import unit_range
 
-    alignment = Alignment(Unchanged(), {}, "block", resolution=224, spatial_norm=spatial_norm)
+    alignment = Alignment("block", encoder=Unchanged(), resolution=224, spatial_norm=spatial_norm)
     targets = alignment.targets({}, unit_range(PREPROCESSED["pixels"]))
     name = "dinov2" if spatial_norm is None else "zscore"
     assert_as_exact_as_the_reference(targets, PREPROCESSED[name], PREPROCESSED[f"{name}_f64"], name)
@@ -244,10 +247,11 @@ def test_the_encoders_input_is_repas_and_irepas_dinov2_preprocessing(spatial_nor
 
 def test_a_layer_the_model_lacks_is_refused():
     objective = aligned()
-    alignment = Alignment(objective.alignment.encoder, objective.alignment.variables, "dit_block_9")
+    alignment = Alignment("dit_block_9", encoder=objective.alignment.encoder, resolution=None)
     with pytest.raises(ValueError, match="no submodule 'dit_block_9'"):
         DiffusionObjective(objective.model, objective.process, objective.inputs, guidance=None,
-                           solver=Euler(), steps=2, alignment=alignment).init(jax.random.PRNGKey(0))
+                           solver=Euler(), steps=2, alignment=alignment,
+                           variables={REPRESENTATION: objective.representation}).init(jax.random.PRNGKey(0))
 
 
 def test_from_run_publishes_the_model_without_the_alignment_head(tmp_path):
@@ -287,29 +291,30 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     import optax
     from test_diffusion_run_sources import batch_for, precision
 
+    from dew.config import ObjectiveConfig
     from dew.data import TFDSImages
-    from dew.objectives.diffusion import Denoising, DiffusionRunConfig, EndToEnd, RepresentationAlignment
+    from dew.objectives.diffusion import DiffusionRunConfig, EndToEnd
     from dew.training import Trainer
 
     for name in ("flux_source", "rae"):
         with tarfile.open(Path(__file__).resolve().parent / "fixtures" / f"{name}.tar.xz") as archive:
             archive.extractall(tmp_path / name, filter="data")
-    alignment = RepresentationAlignment(encoder=str(tmp_path / "rae" / "dinov2_plain"), layer="x_embedder",
-                                        width=8, resolution=56)
+    alignment = Alignment("x_embedder", source=str(tmp_path / "rae" / "dinov2_plain"), width=8, resolution=56)
     config = DiffusionRunConfig(pretrained=str(tmp_path / "flux_source" / "pipeline"), preset=None,
-                                model=precision(), data=TFDSImages(image_size=16), solver=Euler(),
-                                guidance=None, sampling_steps=2, ema_decay=None, val_metrics=(),
-                                mode=Denoising(alignment=alignment))
+                                model=precision(), data=TFDSImages(image_size=16), val_metrics=(),
+                                objective=ObjectiveConfig("diffusion", {
+                                    "alignment": alignment, "solver": Euler(), "guidance": None, "steps": 2,
+                                    "ema_decay": None}))
     objective = config.build()
     trainer = Trainer(objective, optax.sgd(1e-1), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()
     before = jax.tree.map(np.asarray, state.variables["params"])  # the step donates these buffers
-    held = state.variables[REPRESENTATION], objective.alignment.variables
+    held = state.variables[REPRESENTATION], objective.representation
     assert jax.tree.all(jax.tree.map(lambda got, want: np.array_equal(got, want), *held))
     batch = batch_for(objective, 16)
     state, *_ = trainer.compile(state, batch)(state, batch)
     moved = jax.tree.map(lambda got, want: not np.array_equal(got, want), state.variables["params"], before)
     assert all(any(jax.tree.leaves(moved[name])) for name in (ALIGNMENT, "x_embedder"))
     with pytest.raises(ValueError, match="own `autoencoder`"):
-        dataclasses.replace(config, mode=Denoising(alignment=dataclasses.replace(
-            alignment, end_to_end=EndToEnd())))
+        dataclasses.replace(config, objective=ObjectiveConfig("diffusion", {
+            **config.objective.fields, "end_to_end": EndToEnd()}))

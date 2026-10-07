@@ -83,10 +83,9 @@ def test_the_run_record_builds_the_same_objective_again():
         "class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "label"}}
 
 
-def test_a_lambda_loss_is_refused_where_the_run_is_saved(tmp_path):
-    run = supervised_run(lambda outputs, batch: squared(outputs, batch))
+def test_a_lambda_loss_is_refused_where_the_run_states_it():
     with pytest.raises(ValueError, match="define it at module level"):
-        run.save(str(tmp_path))
+        supervised_run(lambda outputs, batch: squared(outputs, batch))
 
 
 def test_a_run_stating_another_objectives_arguments_refuses_to_train():

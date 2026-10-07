@@ -40,7 +40,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from dew.config import ModelConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.data import Dataset, TFDSImages
 from dew.diffusion.presets import Flow
 from dew.objectives.base import Step
@@ -67,10 +67,10 @@ def run_config(directory):
                                                "dtype": "float32", "attention_impl": "reference"}),
         data=TFDSImages(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
-        preset=Flow(), solver=Euler(), sampling_steps=3, guidance=None,
-        text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
+        preset=Flow(), text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),
-        val_metrics=())
+        val_metrics=(),
+        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3, "guidance": None}))
 
 
 def batches(objective):

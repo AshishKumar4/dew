@@ -16,7 +16,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.diffusion import presets
 from dew.inputs import Condition, Field, InputSpec
 from dew.objectives.base import Step
-from dew.objectives.diffusion.few_step import ShortcutObjective, ShortcutTraining
+from dew.objectives.diffusion.few_step import ShortcutObjective
 
 CASE = np.load(Path(__file__).resolve().parent / "fixtures" / "shortcut" / "targets.npz")
 SETTINGS = json.loads(str(CASE["settings"]))
@@ -56,9 +56,8 @@ def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
     rows = count // SETTINGS["bootstrap_every"]
     table = label_table(range(SETTINGS["num_classes"]), null=SETTINGS["num_classes"])
     inputs = InputSpec(Field("image", CASE["pixels"].shape[1:]), {"textcontext": Condition(table)})
-    task = ShortcutObjective(Tiny(), presets.Shortcut()(), inputs,
-                             ShortcutTraining(sections=SETTINGS["denoise_timesteps"],
-                                              bootstrap_every=SETTINGS["bootstrap_every"]),
+    task = ShortcutObjective(Tiny(), presets.Shortcut()(), inputs, sections=SETTINGS["denoise_timesteps"],
+                             bootstrap_every=SETTINGS["bootstrap_every"],
                              unconditional_prob=SETTINGS["class_dropout_prob"])
     # The reference draws its self-consistency rows and its flow rows apart
     # and keeps the first of the flow draws, and its flow rows take the
@@ -87,9 +86,9 @@ def test_the_loss_and_its_gradient_are_the_references(monkeypatch):
 def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
     from diffusion_stubs import batch_for
 
-    from dew.config import ModelConfig
+    from dew.config import ModelConfig, ObjectiveConfig
     from dew.data import TFDSImages
-    from dew.objectives.diffusion import DiffusionRunConfig, ShortcutTraining, TextCondition
+    from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
     from dew.sampling import Euler
     from dew.training import Trainer
 
@@ -101,12 +100,10 @@ def test_a_run_config_trains_a_shortcut_model_on_its_own_targets():
         ),
         data=TFDSImages(image_size=4),
         preset=presets.Shortcut(),
-        solver=Euler(),
-        guidance=None,
-        sampling_steps=3,
         val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        mode=ShortcutTraining(sections=4, bootstrap_every=2),
+        objective=ObjectiveConfig("shortcut",
+                                  {"sections": 4, "bootstrap_every": 2, "solver": Euler(), "steps": 3}),
     )
     task = config.build()
     assert isinstance(task, ShortcutObjective) and task.model.interval
