@@ -28,7 +28,7 @@ import optax
 from flax import linen as nn
 
 from dew.inputs import InputSpec
-from dew.objectives.base import Aux, Batch, Objective, Ratio, Source, Step, Variables
+from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables
 
 type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
 """What a model returns: an array, or a tree of them."""
@@ -42,7 +42,9 @@ class Supervised(Objective[Ratio]):
     starts from, on `loss`, reporting `metrics` beside it.
 
     `inputs.sample` is the batch field the model reads and its per-example
-    shape, which the trainer checks the first batch against. A model with no
+    shape, which the trainer checks the first batch against. The model's
+    collections besides its parameters update as it trains, a BatchNorm's
+    running statistics among them. A model with no
     starting weights initializes on integer zeros of that shape, which a model
     that embeds ids reads as ids and any other promotes to its own dtype.
     """
@@ -73,13 +75,19 @@ class Supervised(Objective[Ratio]):
         return self.model.init(key, jnp.zeros((1, *self.sample.shape), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        outputs = self.model.apply(variables, batch[self.sample.key], rngs={"dropout": step.key})
+        # The model's own collections besides its parameters, such as a
+        # BatchNorm's running statistics, update as it runs, and the trainer
+        # keeps the updates (`Aux.variables`).
+        held = [name for name in variables if name not in ("params", FROZEN)]
+        outputs, updates = self.model.apply(variables, batch[self.sample.key], rngs={"dropout": step.key},
+                                            mutable=held)
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "
                              "takes the mean over the batch's rows itself")
-        return self.row_mean(losses, batch), Aux({name: self.row_mean(metric(outputs, batch), batch).mean()[0]
-                                                  for name, metric in self.metrics.items()})
+        metrics = {name: self.row_mean(metric(outputs, batch), batch).mean()[0]
+                   for name, metric in self.metrics.items()}
+        return self.row_mean(losses, batch), Aux(metrics, variables=dict(updates) if held else None)
 
 
 def selected(outputs: Outputs, output: tuple[int | str, ...]) -> jax.Array:

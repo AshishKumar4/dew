@@ -190,3 +190,47 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     train(str(record), "--trust", "autoencoder_experiment",
           "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
     assert losses(tmp_path / "again") == trained
+
+
+class Normed(nn.Module):
+    """A layer over a BatchNorm that normalizes by the batch it reads."""
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(2)(nn.BatchNorm(use_running_average=False, momentum=0.5)(x.astype(jnp.float32)))
+
+
+RESTORED = """
+import json, sys
+import jax, numpy as np
+from dew.checkpoints import Checkpoints
+held = Checkpoints(sys.argv[1]).variables(ema=None, step=None, mesh=None, layout=None, param_dtype=None)
+print(json.dumps({jax.tree_util.keystr(path): np.asarray(leaf).tobytes().hex()
+                  for path, leaf in jax.tree_util.tree_leaves_with_path(held["batch_stats"])}))
+"""
+
+
+def test_batch_statistics_update_as_the_model_trains_and_reload_from_its_checkpoint(tmp_path):
+    """A BatchNorm's running statistics move with every step, and a new
+    process restores the ones the run ended on, bit for bit."""
+    from test_examples import REPO_ROOT
+
+    from dew.checkpoints import Checkpoints
+
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    trainer = Trainer(Supervised(Normed(), squared, inputs=INPUTS), optax.adam(0.05),
+                      key=jax.random.key(0), checkpoints=checkpoints)
+    # Copied to the host: a step may donate the buffers it starts from.
+    start = jax.tree.map(np.asarray, trainer.initial_state().variables["batch_stats"])
+    state = trainer.fit(Data(), steps=4, log_every=4, checkpoint_every=4)
+    checkpoints.wait()
+    trained = state.variables["batch_stats"]
+    for began, ended in zip(jax.tree.leaves(start), jax.tree.leaves(trained), strict=True):
+        assert not np.array_equal(np.asarray(began), np.asarray(ended))
+    restored = subprocess.run([sys.executable, "-c", RESTORED, str(tmp_path / "run")], capture_output=True,
+                              text=True, timeout=300, check=False,
+                              env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")})
+    assert restored.returncode == 0, restored.stderr[-2000:]
+    assert json.loads(restored.stdout.splitlines()[-1]) == {
+        jax.tree_util.keystr(path): np.asarray(leaf).tobytes().hex()
+        for path, leaf in jax.tree_util.tree_leaves_with_path(trained)}
