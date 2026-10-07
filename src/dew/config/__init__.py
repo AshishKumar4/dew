@@ -200,7 +200,7 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
         annotation = registry.resolve_alias(annotation)
         if name in ("dtype", "param_dtype"):
             typed = registry.DtypeName | None
-            declared = None if declared is None else registry.dtype_name(declared)
+            declared = registry.dtype_name(registry.resolve_dtype(declared))
         elif name == "precision":
             typed = Literal["default", "high", "highest"] | None
             declared = None if declared is None else str(declared).lower().removeprefix("precision.")
@@ -761,16 +761,16 @@ class RunConfig:
             objective = ObjectiveConfig(name)
         model_flags, model_declared = _member_flags(models[model.name], model.fields)
         if objective is None:
-            objective_field = (tyro.conf.Suppress[None], dataclasses.field(default=None))
-            objective_declared = {}
+            objective_flags, objective_declared = tyro.conf.Suppress[None], {}
+            objective_default = dataclasses.field(default=None)
         else:
             objective_flags, objective_declared = _member_flags(objectives[objective.name], objective.fields)
-            objective_field = (objective_flags, dataclasses.field(default_factory=objective_flags))
+            objective_default = dataclasses.field(default_factory=objective_flags)
         # The run parses with its model and objective as those flags, and
         # validates once it holds the classes they name.
         parser = dataclasses.make_dataclass(
             cls.__name__, [("model", model_flags, dataclasses.field(default_factory=model_flags)),
-                           ("objective", *objective_field)],
+                           ("objective", objective_flags, objective_default)],
             bases=(cls,), frozen=True, namespace={"__post_init__": lambda self: None})
         held = None if default is None else parser(
             **{field.name: getattr(default, field.name) for field in dataclasses.fields(cls)
@@ -787,10 +787,13 @@ class RunConfig:
     @classmethod
     def _started(cls, default: Self | None, field: str) -> ModelConfig | ObjectiveConfig | None:
         """The value the command line starts `field` from: `default`'s, or the class's default."""
-        if default is not None:
-            return getattr(default, field)
         declared = cls.__dataclass_fields__[field]
-        return declared.default_factory() if callable(declared.default_factory) else declared.default
+        value = (getattr(default, field) if default is not None else
+                 declared.default_factory() if callable(declared.default_factory) else declared.default)
+        if not isinstance(value, ModelConfig | ObjectiveConfig | None):
+            raise TypeError(f"{cls.__name__}.{field} starts from {value!r}, not a ModelConfig or an "
+                            "ObjectiveConfig")
+        return value
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
