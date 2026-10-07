@@ -16,7 +16,7 @@ import pytest
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.objectives.lm.chunked import chunked_cross_entropy, head_logits, support_log_probs
+from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits, support_log_probs
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.sessions import SUPPORT_COLUMNS_KEY, SUPPORT_KEY, Call, Session, Status, pack
 from dew.sampling.text import Sampling
@@ -40,8 +40,7 @@ def sampled(softcap=None, temperature=0.7):
     assert (drawn.lengths == NEW).all(), "the fixture wants full-length draws"
     tokens = jnp.asarray(drawn.tokens)
     hidden = obj.token_scores(params, tokens).hidden
-    head = model.apply(params, params["params"], method=type(model).head_weight)
-    logits = head_logits(hidden, head, softcap=softcap, precision=None)
+    logits = model_logits(model, params, hidden)
     flat = logits.reshape(-1, VOCAB)
     for transform in sampling.transforms():
         flat = transform(None, flat)
