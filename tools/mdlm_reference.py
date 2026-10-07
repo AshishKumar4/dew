@@ -51,16 +51,16 @@ def source(path: str) -> str:
     return urllib.request.urlopen(url).read().decode()
 
 
-def published() -> types.SimpleNamespace:
-    """MDLM's loss path as a class of its own methods, with the functions
-    and classes they name."""
+def published(names: set[str] = METHODS) -> types.SimpleNamespace:
+    """MDLM's `Diffusion` as a class of the methods `names`, with the
+    functions and classes they name."""
     tree = ast.parse(source("diffusion.py"))
     diffusion = next(node for node in tree.body
                      if isinstance(node, ast.ClassDef) and node.name == "Diffusion")
     methods = [node for node in diffusion.body
-               if isinstance(node, ast.FunctionDef) and node.name in METHODS]
+               if isinstance(node, ast.FunctionDef) and node.name in names]
     found = {node.name for node in methods}
-    assert found == METHODS, METHODS - found
+    assert found == names, names - found
     module = [node for node in tree.body if isinstance(node, ast.FunctionDef | ast.ClassDef)
               and node.name in {"_sample_categorical", "Loss"}]
     module.append(ast.ClassDef(name="MDLM", bases=[], keywords=[], body=methods, decorator_list=[]))

@@ -2926,6 +2926,11 @@
    ],
    "note": "RoutedMoE.generate_masks' own body extracted from src/maxtext/layers/moe.py at the commit (SHA-256 checked), called on a stand-in self with its three fields and an identity sharding hint; dispatch and combine masks for four dropping cases. JAX 0.11.2.post3."
   },
+  "mdlm/continuation.npz": {
+   "tool": "tools/mdlm_sampling_reference.py",
+   "sources": [{"repo": "kuleshov-group/mdlm", "version": "c112c526d193436838c98d81455ee51f90309470", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.0", "runs": "torch"}],
+   "note": "Diffusion._sample (ddpm, noise_removal) with _ddpm_update, forward and _subs_parameterization as published, from a prompt row whose response is masked (_sample_prior returns it, the one change), around a stand-in that reads the whole row; 200000 responses counted. The stand-in's weights are inputs."
+  },
   "mdlm/loss.npz": {
    "tool": "tools/mdlm_reference.py",
    "sources": [
@@ -3400,6 +3405,11 @@
    ],
    "note": "Fetches and executes upstream get_targets and train.py's loss_fn with a closed-form stand-in network with per-pixel weights and an EMA copy; the float64 run replays the float32 run's jax.random draws."
   },
+  "sqrt_loss/loss.npz": {
+   "tool": "tools/sqrt_loss_reference.py",
+   "sources": [{"repo": "XiangLi1999/Diffusion-LM", "version": "759889d58ef38e2eed41a8c34db8032e072826f4", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.0", "runs": "torch"}],
+   "note": "GaussianDiffusion.training_losses (emb, START_X, fixed variance, MSE) on the 2000-step sqrt table, as published in float32 and with _extract_into_tensor's float32 read widened for float64, around an affine stand-in; images, weights, indices and noise are inputs."
+  },
   "stylegan_t": {
    "tool": "tools/stylegan_t_reference.py",
    "sources": [
@@ -3506,6 +3516,11 @@
     }
    ],
    "note": "libs/uvit_t2i.py and libs/timm.py fetched at the commit, SHA-256 checked, math attention; float32 and float64 (widened) forward and gradients. Torch 2.14.0+cpu."
+  },
+  "v_loss/loss.npz": {
+   "tool": "tools/v_loss_reference.py",
+   "sources": [{"repo": "google-research/google-research", "version": "adb2c533488cc9b27b3878c7e34603a95f4540ef", "runs": "fetched"}, {"repo": "jax-ml/jax", "version": "0.11.2.post3", "runs": "jax"}],
+   "note": "diffusion_distillation's Model.training_losses for a v model under constant weighting (x MSE), discrete over improved-diffusion's 1000-step cosine table, in float32 and float64 on the same float32 noise, around an affine stand-in; images and weights are inputs."
   },
   "vae/contract.npz": {
    "tool": "tools/autoencoder_contract_reference.py",
