@@ -199,14 +199,14 @@ class RepresentationAlignment:
     def build(self, variables: Variables | None = None) -> Alignment:
         """Return the alignment over the encoder's weights.
 
-        It uses the `representation` subtree of `variables` when a saved tree supplies
-        it, and the checkpoint's weights otherwise.
+        It uses the `representation` subtree of `variables` when the tree holds one, as a
+        saved run's does, and the checkpoint's weights otherwise.
         """
         from dew.interop.pretrained import split_revision
         from dew.nn.autoencoders.rae import load_dinov2
 
         name, revision = split_revision(self.encoder)
-        supplied = None if variables is None else variables[REPRESENTATION]["params"]
+        supplied = (variables or {}).get(REPRESENTATION, {}).get("params")
         module, params, _ = load_dinov2(name, revision=revision, params=supplied)
         return Alignment(module.clone(input_size=self.resolution), {"params": params}, self.layer,
                          weight=self.weight, projector=self.projector, width=self.width,

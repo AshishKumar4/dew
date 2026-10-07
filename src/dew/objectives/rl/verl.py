@@ -32,7 +32,7 @@ import numpy as np
 from dew.records import integer, integers, record as section, text
 
 from .records import real, reals, sequence
-from .sessions import Call, Session, Status, _chains
+from .sessions import Call, Session, Status, chains
 
 MEDIA = ("multi_modal_data", "mm_processor_kwargs", "mm_processor_output")
 """The fields that put media into a row's context, which Dew's text trainer
@@ -98,7 +98,7 @@ def to_verl(trajectories: Sequence[Session | VerlTrajectory]) -> list[VerlRow]:
     for given in trajectories:
         trajectory = given if isinstance(given, VerlTrajectory) else VerlTrajectory(given)
         session = trajectory.session
-        built = _chains(session, 0, 1 << 62)
+        built = chains(session, 0, 1 << 62)
         for number, chain in enumerate(built):
             sampled = [index >= 0 for index in chain.calls]
             # A chain starts with its first call's whole prompt.

@@ -86,8 +86,8 @@ def dew_side(args) -> None:
         values = jax.jit(states)(pretrained.variables, jnp.asarray(rows[:, :-1]))
         hidden[f"dew-{implementation}"] = np.asarray(jnp.asarray(values, jnp.float32))
         if table is None:
-            table = jnp.asarray(model.apply(pretrained.variables, pretrained.variables["params"],
-                                            method=type(model).head_weight), jnp.bfloat16)
+            head = model.apply(pretrained.variables, method="output_table")
+            table = jnp.asarray(head.matrix.T if head.vocab_major else head.matrix, jnp.bfloat16)
 
     width = next(iter(hidden.values())).shape[-1]
     # A tied head is the embedding table, [vocab, width]; a Dense kernel is [width, vocab].

@@ -102,7 +102,6 @@ from typing import ClassVar, Protocol
 
 import jax
 import numpy as np
-from jax.sharding import Mesh
 
 from dew.coordination import agreed
 from dew.data.dataset import Batch, DataPartition, Dataset, tapped
@@ -524,7 +523,11 @@ class RolloutScheduler:
         mesh = mesh_of(state.variables)
         if mesh is not None:
             packed = first_reader_batch(mesh, packed)
-        packed[OLD_LOG_PROBS_KEY] = self._proximal(state.variables, packed, mesh) * packed[RESPONSE_MASK_KEY]
+        # Over a mesh the rows are placed as the step places the batch, every
+        # process's rows together, so the rescoring runs once over the pool's
+        # batch and each process reads its own rows back.
+        scored = self._rescore(state.variables, packed if mesh is None else shard_batch(mesh, packed))
+        packed[OLD_LOG_PROBS_KEY] = local_rows(scored).astype(np.float32) * packed[RESPONSE_MASK_KEY]
         if sampling:
             versions = [call.version for rollout in rollouts for call in rollout.calls]
             oldest = min(versions, default=updates)
@@ -564,16 +567,6 @@ class RolloutScheduler:
         return ([rollout for group in admitted for rollout in group.done[:self.groups]],
                 [latency for group in admitted for latency in group.latencies[:self.groups]],
                 len(admitted), tally, waited)
-
-    def _proximal(self, params: Variables, packed: dict[str, np.ndarray], mesh: Mesh | None) -> np.ndarray:
-        """The trainer's likelihoods of this process's packed rows, `[rows, width - 1]`.
-
-        Over a mesh the rows are placed as the step places the batch, every
-        process's rows together, so the rescoring runs once over the pool's
-        batch and each process reads its own rows back.
-        """
-        scored = self._rescore(params, packed if mesh is None else shard_batch(mesh, packed))
-        return local_rows(scored).astype(np.float32)
 
 
 __all__ = ["Publisher", "RolloutScheduler", "SchedulerRecord", "task_ids"]

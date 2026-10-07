@@ -282,8 +282,8 @@ def test_admission_builds_each_sessions_chains_once_however_many_groups_complete
     # Fitting every completing group against those before it must not rebuild
     # their chains: once when a group completes, once more in pack.
     built = []
-    original = sessions_module._chains
-    monkeypatch.setattr(sessions_module, "_chains", lambda *args: built.append(args) or original(*args))
+    original = sessions_module.chains
+    monkeypatch.setattr(sessions_module, "chains", lambda *args: built.append(args) or original(*args))
     tasks = tuple(range(16))
     source = Scripted(lambda task, submission, sample, version: finished(float(sample), version))
     rollout, data, records = scheduler(source, ahead=0, rows=32, stream=(tasks,))

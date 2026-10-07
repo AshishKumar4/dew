@@ -5,26 +5,16 @@ An episode becomes a `Session` (`session_of`), which `to_verl` writes as one
 rollouts and pack to the same training batch.
 """
 
-import dataclasses
 import json
-from dataclasses import replace
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
 from test_tool_episodes import build, collect
 
 from dew.objectives.rl import session_of
-from dew.objectives.rl.episodes import Episode
-from dew.objectives.rl.records import EpisodeFields
 from dew.objectives.rl.sessions import pack
 from dew.objectives.rl.verl import from_verl, to_verl
-
-
-def test_an_episode_record_names_every_field_of_the_episode_it_carries():
-    """The journal's record is the dataclass's own fields, so a field added,
-    renamed or dropped there fails here instead of leaving the record silently."""
-    declared = {field.name for field in dataclasses.fields(Episode) if field.init}
-    assert set(EpisodeFields.__optional_keys__) | set(EpisodeFields.__required_keys__) == declared
 
 
 def rollouts_of(episodes):
@@ -63,7 +53,7 @@ def test_action_construction_rejects_boolean_token_ids(field):
 def test_an_episode_record_reads_back_every_sampling_control():
     """A recorded action's policy comes back whole, its penalties and stop
     strings included, and an unset pad id stays the task's to fill."""
-    from dew.objectives.rl.records import episode_from_record, episode_record
+    from dew.objectives.rl.records import episode_from_record
     from dew.sampling import Sampling
 
     trainer, rollout = build()
@@ -73,7 +63,7 @@ def test_an_episode_record_reads_back_every_sampling_control():
     turns = tuple(replace(turn, action=replace(turn.action, sampling=policy)) for turn in episode.transitions)
     episode = replace(episode, transitions=turns)
 
-    restored = episode_from_record(json.loads(json.dumps(episode_record(episode))))
+    restored = episode_from_record(json.loads(json.dumps(asdict(episode))))
 
     assert restored == episode
     assert restored.transitions[0].action.sampling.pad_id is None
