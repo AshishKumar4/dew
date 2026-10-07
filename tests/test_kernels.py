@@ -660,6 +660,45 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
                                      "decode kernel")
 
 
+@pytest.mark.skipif(jax.default_backend() != 'gpu', reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("page_size", [16, 32])
+def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
+    """`decode_attention.attend_paged` reads a row's pages through its table,
+    shuffled and shared between rows, to the row's length, its query heads
+    sharing key heads as Qwen3-0.6B's do (16 over 8 of 128), and is within
+    tests/reference_error.py's rule of jax.nn's xla attention over the
+    gathered rows against float64: rows reading 1 key, a page, one past a
+    block, and every page."""
+    from dew.nn.kernels import decode_attention
+
+    rng = np.random.default_rng(0)
+    per_row, kv_heads, heads, width = 6, 8, 16, 128
+    capacity = per_row * page_size
+    lengths = jnp.asarray([1, page_size, decode_attention.BLOCK + 1, capacity], jnp.int32)
+    rows = lengths.shape[0]
+    count = rows * per_row + 3
+    table = jnp.asarray(rng.permutation(count)[:rows * per_row].reshape(rows, per_row), jnp.int32)
+    table = table.at[1, 0].set(table[0, 0])
+    query = jnp.asarray(rng.normal(size=(rows, heads, width)), jnp.bfloat16)
+    key_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)) * 0.3, jnp.bfloat16)
+    value_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)), jnp.bfloat16)
+    assert decode_attention.fits_paged(query, key_pages)
+    out = jax.jit(decode_attention.attend_paged)(query, key_pages, value_pages, table, lengths)
+    key, value = (jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, capacity, width), 0, 2)
+                  for pages in (key_pages, value_pages))
+    plain = jax.nn.dot_product_attention(query[:, None], key, value, key_value_seq_lengths=lengths,
+                                         implementation='xla')[:, 0]
+    assert out.shape == plain.shape and out.dtype == plain.dtype
+    q = np.asarray(query, np.float64).reshape(rows, kv_heads, heads // kv_heads, width)
+    k, v = np.asarray(key, np.float64), np.asarray(value, np.float64)
+    read = np.arange(capacity)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
+    logits = np.where(read, np.einsum('bngd,bsnd->bngs', q, k) / np.sqrt(width), -np.inf)
+    probs = np.exp(logits - logits.max(-1, keepdims=True))
+    truth = np.einsum('bngs,bsnd->bngd', probs / probs.sum(-1, keepdims=True), v).reshape(rows, heads, width)
+    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
+                                     "paged decode kernel")
+
+
 
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):

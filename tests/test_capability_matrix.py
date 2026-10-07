@@ -95,6 +95,7 @@ from dew.objectives.rl.sessions import (
     RESPONSE_MASK_KEY,
     SEGMENT_IDS_KEY,
 )
+from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import models, objectives
 from dew.sampling import Euler, Sampling
 from dew.training import Trainer
@@ -145,6 +146,7 @@ CANVAS = "canvas"
 """Refines a canvas of tokens against a cache of committed clean ones (`BlockDenoiser`)."""
 
 REASONS: Mapping[str, str] = {
+    LOGITS: r"logits|sample alone",
     CAUSAL: r"causal",
     BIDIRECTIONAL: r"bidirectional|reads the whole|future",
     PACKING: r"pack|segment",
@@ -468,7 +470,7 @@ class Trained:
 
 
 def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapping | None = None,
-                  data=None, sampled: bool = True, rollout=None) -> Trained:
+                  data=None, sampled: bool = True, rollout=None, scores: bool = True) -> Trained:
     """The proof every supported cell gives, on `batch`.
 
     The first batch passes the objective's input check and a cut one does
@@ -477,7 +479,8 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     first update moves a leaf exactly where its gradient is nonzero, and a
     gradient that is not finite would leave the leaf so. The run checkpoints
     its step, and evaluation scores `evaluated` (the batch by default) to
-    finite artifacts. `data` replaces the batch stream with the method's own;
+    finite artifacts, or, for an objective that scores no tokens (`scores`
+    False), to none. `data` replaces the batch stream with the method's own;
     a method that trains on what its `rollout` samples from the batch, not
     on the batch (`sampled` False), has no sample field to check.
     """
@@ -505,7 +508,8 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     assert Checkpoints(str(directory)).latest == 1
     trained = Trained(directory, state, variables)
     artifact = objective.evaluate(variables, batch if evaluated is None else evaluated, trained.step)
-    assert artifact is not None and finite(artifact), artifact
+    # An objective that scores no tokens evaluates to nothing (`Objective.evaluate`).
+    assert (artifact is not None and finite(artifact)) if scores else artifact is None, artifact
     return trained
 
 
@@ -897,6 +901,36 @@ def refuse_block_diffusion(family: Family) -> None:
     BlockDiffusionObjective(loaded(family).model, prompt_length=4, num_canvases=2, canvas_size=2)
 
 
+def supervised_over(family: Family) -> Supervised:
+    """Supervised's cross entropy over what the model's call returns, each
+    position's token its label, reported beside its accuracy."""
+    return Supervised(loaded(family).given, CrossEntropy(labels="text"), (Accuracy(labels="text"),),
+                      inputs=InputSpec(Field("text", (SEQ,))))
+
+
+def supervised(family: Family, directory: Path) -> None:
+    """Supervised's loss trains and checkpoints, and the checkpoint scores the
+    batch to the same bits. It saves no task (`saved_task` None) and scores
+    no tokens, so evaluation is nothing and the checkpoint is the reload."""
+    objective = supervised_over(family)
+    batch = {"text": token_batch(SEQ) % family.vocab}
+    trained = assert_trains(objective, batch, directory, scores=False)
+    restored = Checkpoints(str(trained.directory)).variables()
+    expected = scored(objective, trained.variables, batch)
+    np.testing.assert_array_equal(scored(objective, restored, batch), expected)
+
+
+def refuse_supervised(family: Family) -> None:
+    supervised_over(family)
+
+
+CALLED = frozenset({"causal_transformer", "causal_transformer+modernbert", "multimodal_transformer+gemma3",
+                    "user+causal", "torch+gpt_neox", "nnx+causal", "simple_dit", "user+denoiser"})
+"""The families `supervised` covers: models whose call maps tokens to their
+logits, as a decoder, an encoder, a media wrapper, a user's module, a torch
+model and an NNX one, and denoisers, whose call also needs a time it cannot
+give; its loss is the user's own, so `lm` covers the rest."""
+
 DISTILLED = frozenset({"simple_dit", "unet", "flux_transformer", "user+denoiser"})
 """The denoisers the few-step and distillation rows cover: a transformer whose
 time is scaled, a convolutional one, a published family's DenoisingCondition,
@@ -991,6 +1025,8 @@ METHODS: tuple[Method, ...] = (
            refuse_guidance_distillation, trains=("guidance_distillation",),
            within=lambda family: family.name in DISTILLED),
     Method("jepa", frozenset({ENCODES}), frozenset(), jepa, trains=("jepa",)),
+    Method("supervised", frozenset({LOGITS, DENOISES}), frozenset({LOGITS}), supervised, refuse_supervised,
+           trains=("supervised",), within=lambda family: family.name in CALLED),
     Method("block_diffusion", frozenset({LOGITS, CAUSAL}), frozenset({CANVAS}), block_diffusion,
            refuse_block_diffusion, trains=("block_diffusion",),
            within=lambda family: family.name in KINDS),
