@@ -2,9 +2,11 @@
 
 `Supervised(model, loss, metrics=(), inputs=InputSpec(Field("x", (4,))))`
 applies the model to the batch field `inputs.sample` names, with no subclass
-of `Objective`. `loss(outputs, batch)` returns one loss per example, any
-trailing axes averaged too, and the objective is their mean over the batch's
-rows (`Objective.row_mean`), so an evaluation batch's repeated rows count for
+of `Objective`. `loss(outputs, batch)` reads the model's output as it
+returns it, an array or any tree of them (an autoencoder's reconstruction
+and latent, say), and returns one loss per example, any trailing axes
+averaged too; the objective is their mean over the batch's rows
+(`Objective.row_mean`), so an evaluation batch's repeated rows count for
 nothing. Each metric is called the same way and reported as its own mean,
 under its function's name or its class's.
 
@@ -28,7 +30,10 @@ from flax import linen as nn
 from dew.inputs import InputSpec
 from dew.objectives.base import Aux, Batch, Objective, Ratio, Source, Step, Variables
 
-type Criterion = Callable[[jax.Array, Batch], jax.Array]
+type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
+"""What a model returns: an array, or a tree of them."""
+
+type Criterion = Callable[[Outputs, Batch], jax.Array]
 """A loss or a metric: the model's outputs and the batch, to one value per example."""
 
 
@@ -69,8 +74,6 @@ class Supervised(Objective[Ratio]):
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         outputs = self.model.apply(variables, batch[self.sample.key], rngs={"dropout": step.key})
-        # `mutable` is unset, so apply returns the output alone, not a pair.
-        assert not isinstance(outputs, tuple)
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "
@@ -79,26 +82,49 @@ class Supervised(Objective[Ratio]):
                                                   for name, metric in self.metrics.items()})
 
 
+def selected(outputs: Outputs, output: tuple[int | str, ...]) -> jax.Array:
+    """The array at the path `output` within the model's outputs: an index
+    into a tuple or a list, a key into a mapping, each in turn; the outputs
+    themselves for an empty path."""
+    for step in output:
+        if isinstance(outputs, Mapping) and isinstance(step, str):
+            outputs = outputs[step]
+            continue
+        if isinstance(outputs, (tuple, list)) and isinstance(step, int):
+            outputs = outputs[step]
+            continue
+        raise TypeError(f"output {output} indexes the model's {type(outputs).__name__} with {step!r}")
+    if not isinstance(outputs, jax.Array):
+        raise TypeError(f"output {output} selects a {type(outputs).__name__}, not the logits; name "
+                        "the path to them")
+    return outputs
+
+
 @dataclasses.dataclass(frozen=True)
 class CrossEntropy:
-    """The softmax cross entropy of logits over the last axis, against the
-    integer labels in `labels`, in float32 or wider as the logits are."""
+    """The softmax cross entropy of the logits at `output` within the model's
+    outputs (`selected`) over their last axis, against the integer labels in
+    `labels`, in float32 or wider as the logits are."""
 
     labels: str = "label"
+    output: tuple[int | str, ...] = ()
 
-    def __call__(self, outputs: jax.Array, batch: Batch) -> jax.Array:
-        logits = outputs.astype(jnp.promote_types(outputs.dtype, jnp.float32))
+    def __call__(self, outputs: Outputs, batch: Batch) -> jax.Array:
+        logits = selected(outputs, self.output)
+        logits = logits.astype(jnp.promote_types(logits.dtype, jnp.float32))
         return optax.softmax_cross_entropy_with_integer_labels(logits, batch[self.labels])
 
 
 @dataclasses.dataclass(frozen=True)
 class Accuracy:
-    """1 where the largest logit is the label in `labels`, else 0."""
+    """1 where the largest of the logits at `output` (`selected`) is the label in `labels`, else 0."""
 
     labels: str = "label"
+    output: tuple[int | str, ...] = ()
 
-    def __call__(self, outputs: jax.Array, batch: Batch) -> jax.Array:
-        return (jnp.argmax(outputs, axis=-1) == batch[self.labels]).astype(jnp.float32)
+    def __call__(self, outputs: Outputs, batch: Batch) -> jax.Array:
+        logits = selected(outputs, self.output)
+        return (jnp.argmax(logits, axis=-1) == batch[self.labels]).astype(jnp.float32)
 
 
-__all__ = ["Accuracy", "Criterion", "CrossEntropy", "Supervised"]
+__all__ = ["Accuracy", "Criterion", "CrossEntropy", "Outputs", "Supervised", "selected"]
