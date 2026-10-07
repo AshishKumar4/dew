@@ -252,7 +252,7 @@ run = ActivityRun(model=ModelConfig("toypackage.models:Population", {"neurons": 
                                               checkpoint_dir=sys.argv[1], name="activity",
                                               compilation_cache_dir=None, multi_host=False))
 state = run.run()
-print(state.variables["params"]["w"].sharding.spec)
+print(tuple(state.variables["params"]["w"].sharding.spec))
 '''
 
 
@@ -281,7 +281,7 @@ def test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_
 
     trained = run("-c", TRAIN_RUN, str(tmp_path / "first"))
     assert trained.returncode == 0, trained.stderr[-3000:]
-    assert trained.stdout.splitlines()[-1] == "PartitionSpec(None, 'fsdp')"
+    assert trained.stdout.splitlines()[-1] == "(None, 'fsdp')"
     assert len(scalars(tmp_path / "first", "train/loss")) == 4
     assert 0.0 < scalars(tmp_path / "first", "val/mean_rate")[-1] < 1.0
 
