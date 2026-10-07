@@ -72,6 +72,7 @@ from dew.objectives.lm.chunked import (
     head_cross_entropy,
     head_table,
     logits_cross_entropy,
+    logits_support_log_probs,
     model_logits,
     reads_states,
     support_log_probs,
@@ -891,7 +892,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         `support` is the per-row ragged `(ids, columns)` pair that `sessions.pack`
         builds, each `[B, C]`, where `columns` is the column in `tokens` of the id
         each kept id belongs to; a target with entries is renormalized over them
-        (`support_log_probs`).
+        (`support_log_probs`, or `logits_support_log_probs` over the whole
+        logits of a head no matrix gives, as an adapter's on `lm_head`).
         """
         log_probs = -scores.losses
         if temperature == 1.0 and support is None:
@@ -906,18 +908,20 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 else logits_cross_entropy(scores.hidden, targets, predict=False, temperature=temperature))
             log_probs = -losses
         if support is not None:
-            head = head_table(self.model, params)
-            if head is None:
-                raise ValueError(
-                    "a sampler's support is rescored against the rows of the head's matrix, and no "
-                    "matrix alone is this model's head (a prediction head, or an adapter's factors "
-                    "on it)")
             ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
             # The id at column c is the target the state at c - 1 predicts.
-            filtered, present = support_log_probs(
-                scores.hidden, head.matrix, targets, ids, jnp.where(columns > 0, columns - 1, -1),
-                temperature=temperature, vocab_major=head.vocab_major, softcap=head.softcap,
-                precision=head.precision, bias=head.bias)
+            owners = jnp.where(columns > 0, columns - 1, -1)
+            head = head_table(self.model, params)
+            if head is not None:
+                filtered, present = support_log_probs(
+                    scores.hidden, head.matrix, targets, ids, owners, temperature=temperature,
+                    vocab_major=head.vocab_major, softcap=head.softcap, precision=head.precision,
+                    bias=head.bias)
+            else:
+                logits = (model_logits(self.model, params, scores.hidden) if reads_states(self.model)
+                          else scores.hidden)
+                filtered, present = logits_support_log_probs(logits, targets, ids, owners,
+                                                             temperature=temperature)
             log_probs = jnp.where(present, filtered, log_probs)
         return log_probs
 

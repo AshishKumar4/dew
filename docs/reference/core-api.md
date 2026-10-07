@@ -11,6 +11,7 @@ Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean
 | `init(key, variables=None)` | Return a Flax variables mapping with a `params` collection. Pure; the trainer traces it once for shapes and once for values. `variables` is a held tree the caller supplies, which is how the trainer passes it as data; with `None` the objective uses its own (`DiffusionObjective.held_variables`, for example). An objective that holds nothing ignores it. |
 | `loss(variables, batch, step)` | Return additive statistics and `Aux`. Use `Ratio(total, mass)` for a shared denominator; a scalar denotes a unit-mass term. |
 | `reduce_loss(statistics)` | Return `(value, has_data)`. Override for an objective-owned composite Flax PyTree. |
+| `with_gradients(stats, gradients, params)` | Return `stats` whose derivative in `params` is `gradients`, for a loss that states its own gradient rule. |
 | `apply_effects(variables, effects)` | Return nonparameter replacements from additive accepted-window observations. Required when the objective emits effects. |
 | `evaluate(variables, batch, step)` | Return an artifact, a tuple of artifacts, or `None`. The base method returns `None`. |
 | `preview(variables, batch, step, *, scored=None)` | Return display artifacts for a tracker, or `None`. The base method reuses `scored`, the first scoring artifacts. |
