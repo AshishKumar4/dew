@@ -47,7 +47,7 @@ if TYPE_CHECKING:
 
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
-    from dew.nn.backbones.causal_transformer import DecoderBank
+    from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.sampling.pipelines import TextToImage
     from dew.training.distributed import Layout, MeshSpec
     from dew.training.state import TrainState

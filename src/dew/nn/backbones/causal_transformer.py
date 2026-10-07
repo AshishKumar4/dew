@@ -86,7 +86,7 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_stack import DecoderBank, PipelineStage, StackView, _merged, run_pipeline, run_stack
+from .decoder_stack import DecoderBank, StackView, _merged, run_pipeline, run_stack
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 INTERMEDIATES = "intermediates"
@@ -1929,4 +1929,4 @@ class CausalTransformer(nn.Module):
         return any(mixer.keeps_triton_gemm for mixer in self.declared_mixers)
 
 
-__all__ = ["CausalTransformer", "DecoderBank", "PipelineStage", "StackView"]
+__all__ = ["CausalTransformer"]

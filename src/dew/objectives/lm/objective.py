@@ -81,7 +81,7 @@ from dew.registry import metrics, objectives
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
-    from dew.nn.backbones.causal_transformer import DecoderBank
+    from dew.nn.backbones.decoder_stack import DecoderBank
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
