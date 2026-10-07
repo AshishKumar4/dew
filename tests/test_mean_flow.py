@@ -30,6 +30,8 @@ class Tiny(nn.Module):
     whose table entry is the class, the blank prompt's padding reading the
     reference's null class."""
 
+    interval = True
+
     @nn.compact
     def __call__(self, x, time, textcontext, duration=None, train=False):
         def column(value):
