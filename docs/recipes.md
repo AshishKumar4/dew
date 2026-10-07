@@ -121,7 +121,7 @@ With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local 
 
 To train on your own text, replace `corpus.txt` with a UTF-8 file or a directory of `.txt` files. Tokenize it into a new output directory with the tokenizer the run will train with. The recipe reads the vocabulary size from `meta.json`, so there is no flag for it. `data:token-windows` cuts fixed-width windows from the token stream.
 
-For whole documents, tokenize with `--pack` and select `data:packed-tokens`. `--pack` treats each input file as one document and writes the tokenizer's EOS ID after it. The byte tokenizer's EOS is ID 255, a byte that never occurs in UTF-8 text. The packed loader then resets attention boundaries and positions between documents.
+For whole documents, tokenize with `--pack` and add `--data.pack`. `--pack` treats each input file as one document and writes the tokenizer's EOS ID after it. The byte tokenizer's EOS is ID 255, a byte that never occurs in UTF-8 text. The packed loader then resets attention boundaries and positions between documents.
 
 `--pretrained` takes a supported Hugging Face model directory, a Hub ID, or `repo@revision` for a branch, tag or commit. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its fields `--model.max-seq-len` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
 

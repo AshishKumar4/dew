@@ -65,7 +65,7 @@ class Tokenize:
     """The fraction of the token stream held out, from its head, as validation."""
     pack: bool = False
     """End every document (input file) with the tokenizer's eos id, so
-    PackedTokens can cut the stream back into documents."""
+    TokenWindows(pack=True) can cut the stream back into documents."""
 
     def run_command(self) -> int:
         from dew.data import TokenCorpus

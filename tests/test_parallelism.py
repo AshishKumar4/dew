@@ -476,14 +476,14 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     position as a dict where the DataLoader reports JSON bytes. A checkpoint
     holds bytes, so the position has to arrive as bytes and go back as a
     dict."""
-    from dew.data import PackedTokens
+    from dew.data import TokenWindows
 
     documents = np.concatenate([np.arange(1, 9), [0]] * 40).astype(np.uint16)
     (tmp_path / "train.bin").write_bytes(documents.tobytes())
     (tmp_path / "val.bin").write_bytes(documents.tobytes())
     (tmp_path / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = PackedTokens(path=str(tmp_path), seq_len=8, seed=0, loading=Loading(workers=0),
+    data = TokenWindows(pack=True, path=str(tmp_path), seq_len=8, seed=0, loading=Loading(workers=0),
                         packing_bins=2).load(batch=jax.device_count())
 
     mesh = MeshSpec().build()

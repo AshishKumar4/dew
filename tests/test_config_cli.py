@@ -15,7 +15,7 @@ import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
+from dew.data import Dataset, OnlineImages, TFDSImages, TokenWindows
 from dew.data.dataset import record_argument, tokenized
 from dew.diffusion.presets import Flow
 from dew.registry import datasets, import_path
@@ -68,10 +68,10 @@ def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
 
 def test_another_dataset_is_its_subcommand():
     recipe = load_recipe("lm")
-    config = parse(recipe.LmRunConfig, ["data:packed-tokens", "--data.path", "d",
+    config = parse(recipe.LmRunConfig, ["data:token-windows", "--data.path", "d", "--data.pack",
                                         "--data.seq-len", "64", "--data.packing-bins", "2"])
-    assert config.data == PackedTokens(path="d", seq_len=64, packing_bins=2)
-    with pytest.raises(ValueError, match="token-windows or data:packed-tokens"):
+    assert config.data == TokenWindows(pack=True, path="d", seq_len=64, packing_bins=2)
+    with pytest.raises(ValueError, match="trains on token files: data:token-windows"):
         recipe.LmRunConfig(data=TFDSImages())
 
 

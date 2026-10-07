@@ -128,12 +128,12 @@ dew tokenize --input data/corpus.txt --out data/corpus-byte \
 | `--out` | required | Directory for `train.bin`, `val.bin` and `meta.json`. |
 | `--tokenizer` | `byte` | `byte`, or a Hugging Face tokenizer name. |
 | `--val-fraction` | `0.01` | Share of the token stream held out for validation, taken from its head. |
-| `--pack` | off | Write the tokenizer's EOS ID after every input file, so `PackedTokens` can split the stream back into documents. Refused for a tokenizer without an EOS ID. |
+| `--pack` | off | Write the tokenizer's EOS ID after every input file, so `TokenWindows(pack=True)` can split the stream back into documents. Refused for a tokenizer without an EOS ID. |
 
-The binary files use the smallest unsigned dtype that holds the vocabulary. Two dataset types read them:
+The binary files use the smallest unsigned dtype that holds the vocabulary. `TokenWindows(path, seq_len).load(batch=B)` reads them:
 
-- `TokenWindows(path, seq_len).load(batch=B)` cuts fixed windows of `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each window starts `seq_len` IDs after the last, so every transition is scored once.
-- `PackedTokens` packs whole documents into rows and adds `text_segment_ids` and `text_positions`. The objective skips padded targets and the transitions between documents. Packing needs a segment mask in attention, which can change which attention implementations run.
+- By default it cuts fixed windows of `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each window starts `seq_len` IDs after the last, so every transition is scored once.
+- With `pack=True` it packs whole documents into rows and adds `text_segment_ids` and `text_positions`. The objective skips padded targets and the transitions between documents. Packing needs a segment mask in attention, which can change which attention implementations run.
 
 ## LMObjective
 

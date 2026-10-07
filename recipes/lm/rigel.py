@@ -35,7 +35,7 @@ from collections.abc import Mapping
 import tyro
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import DataPhase, PackedTokens
+from dew.data import DataPhase, TokenWindows
 from dew.training.optim import ParamGroup, Power, PowerTail
 
 LAYERS = 40
@@ -136,7 +136,7 @@ def run_config(args: RigelArgs):
     from train import LmRunConfig
     return LmRunConfig(
         model=ModelConfig("causal_transformer", {**model_config(args.width), "dtype": "bfloat16"}),
-        data=PackedTokens(phases=phases(args.corpora, args.steps), seq_len=args.seq_len),
+        data=TokenWindows(phases=phases(args.corpora, args.steps), seq_len=args.seq_len, pack=True),
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
         trainer=TrainerConfig(batch_size=args.batch_size, steps=args.steps,
                               eval_every=None, checkpoint_every=5_000),

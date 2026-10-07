@@ -385,10 +385,10 @@ def mode_data(args) -> dict:
 def mode_packed(args) -> dict:
     import jax
 
-    from dew.data import DataPartition, PackedTokens
+    from dew.data import DataPartition, TokenWindows
     from dew.training import MeshSpec
 
-    data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=None,
+    data = TokenWindows(pack=True, path=args.tokens, seq_len=args.seq_len, val_batches=None,
                         loading=Loading(workers=args.workers,
                                         worker_buffer=1)).load(batch=BATCH)
     partition = DataPartition.of(MeshSpec().build())
@@ -477,11 +477,11 @@ def mode_packed_fit(args) -> dict:
 
     import jax
 
-    from dew.data import PackedTokens
+    from dew.data import TokenWindows
 
     trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
     restored_step, restored = restored_state(trainer)
-    data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=0,
+    data = TokenWindows(pack=True, path=args.tokens, seq_len=args.seq_len, val_batches=0,
                         loading=Loading(workers=args.workers,
                                         worker_buffer=1)).load(batch=BATCH)
     seen: list = []
@@ -612,9 +612,9 @@ def mode_fit(args) -> dict:
         # The packed token split, whose documents are strided over the
         # processes before packing. The objective's evaluation ignores the
         # batch's contents, so the split only has to shard.
-        from dew.data import DataPartition, PackedTokens
+        from dew.data import DataPartition, TokenWindows
 
-        data = PackedTokens(path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
+        data = TokenWindows(pack=True, path=args.tokens, seq_len=args.seq_len, val_batches=args.val_steps,
                             loading=Loading(workers=args.workers)).load(batch=BATCH)
         val = data.val
         assert val is not None
