@@ -304,13 +304,12 @@ def main(config: LmRunConfig) -> TrainState:
         config = replace(config, pretrained=reference)
     # run.json records the resolved model as
     # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
-    settings = config.model.precision_settings()
-    resolved = {name: value for name, value in fields.items() if name not in settings}
+    resolved = dict(fields)
     if config.objective == objectives.paths["block_diffusion"]:
         resolved["max_seq_len"] = model.max_seq_len
-    config = replace(config, model=replace(config.model, config=resolved))
+    config = replace(config, model=replace(config.model, fields=resolved))
     name = config.trainer.name or (
-        f"{config.objective}-{'+'.join(d.name for d in token_directories(read_corpora(config.data)))}/"
+        f"{objectives.label(str(config.objective))}-{'+'.join(d.name for d in token_directories(read_corpora(config.data)))}/"
         f"seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")

@@ -151,8 +151,7 @@ class ModelConfig:
     @property
     def label(self) -> str:
         """The model's alias, or its class's name where it has none, for a run's name."""
-        return next((alias for alias, path in models.paths.items() if path == self.name),
-                    self.name.rpartition(":")[2])
+        return models.label(self.name)
 
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
