@@ -143,7 +143,7 @@ def checkpoint(args):
     from dew.sampling import TextToImage
 
     pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
-                                           revision='7187bb75a425dfb9fa0055951b8f0f7520185b87')
+                                           revision='fc23e794b5f50fd53a619d1b2e0f3f6c7ccf51e5')
     original = conv._polyphase_depthwise_3x3, conv._materialized_depthwise_3x3
     prompt = 'a watercolor painting of a mountain lake at sunrise'
 
