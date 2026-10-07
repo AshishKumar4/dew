@@ -734,7 +734,7 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
     return [*groups, field], _declared_type(type(held), field)
 
 
-def _names(held: DataclassInstance | type[DataclassInstance]) -> set[str]:
+def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
     """The fields a dataclass declares."""
     return {field.name for field in dataclasses.fields(held)}
 
