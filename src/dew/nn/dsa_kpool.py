@@ -426,25 +426,10 @@ class KPoolSparseAttentionMixer(MixerBase):
                 f"the kpool_sparse_attention mixer has no {', '.join(asked)}: the layer "
                 "scales by its nope head dim, rotates nothing, attends its own selection "
                 "of the whole sequence and norms its latents, not its values")
-        return functools.partial(
-            KPoolSparseAttention,
-            emb_features=ctx.emb_features,
-            num_heads=ctx.num_heads,
-            max_seq_len=ctx.max_seq_len,
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            v_head_dim=self.v_head_dim,
-            index_n_heads=self.index_n_heads,
-            index_head_dim=self.index_head_dim,
-            index_topk=self.index_topk,
-            index_kpool=self.index_kpool,
-            index_kpool_always_select_tail=self.index_kpool_always_select_tail,
-            norm_eps=ctx.norm_eps,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
-            attention_bias=ctx.attention_bias,
-            dtype=ctx.dtype,
-            precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
-            force_fp32_for_softmax=ctx.force_fp32_for_softmax)
+        return self.factory(
+            KPoolSparseAttention, ctx,
+            context=("emb_features", "num_heads", "max_seq_len", "norm_eps", "scale_offset",
+                     "scale_after_cast", "attention_bias", "dtype", "precision", "attention_impl",
+                     "force_fp32_for_softmax"),
+            kind=("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "v_head_dim", "index_n_heads",
+                  "index_head_dim", "index_topk", "index_kpool", "index_kpool_always_select_tail"))

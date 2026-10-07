@@ -572,21 +572,9 @@ class Mamba2Mixer(MixerBase):
     def build(self, ctx: MixerContext):
         if not ctx.causal:
             raise ValueError("mamba2 requires causal=True; its recurrence has no bidirectional mode")
-        return functools.partial(
-            Mamba2,
-            emb_features=ctx.emb_features,
-            num_heads=self.num_heads,
-            head_dim=self.head_dim,
-            state_size=self.state_size,
-            n_groups=self.n_groups,
-            conv_kernel=self.conv_kernel,
-            chunk_size=self.chunk_size,
-            use_bias=self.use_bias,
-            use_conv_bias=self.use_conv_bias,
-            norm_groups=self.norm_groups,
-            time_step_limit=(float(self.time_step_limit[0]), float(self.time_step_limit[1])),
-            norm_eps=ctx.norm_eps,
-            init_std=ctx.init_std,
-            output_init_std=ctx.output_init_std,
-            dtype=ctx.dtype,
-            precision=ctx.precision)
+        return self.factory(
+            Mamba2, ctx,
+            context=("emb_features", "norm_eps", "init_std", "output_init_std", "dtype", "precision"),
+            kind=("num_heads", "head_dim", "state_size", "n_groups", "conv_kernel", "chunk_size", "use_bias",
+                  "use_conv_bias", "norm_groups"),
+            time_step_limit=(float(self.time_step_limit[0]), float(self.time_step_limit[1])))

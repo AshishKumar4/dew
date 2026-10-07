@@ -753,31 +753,14 @@ class MLAMixer(MixerBase):
                 "a sharing mla layer attends the selection of an earlier "
                 "layer's indexer, so the kind has to select: index_topk, "
                 "index_n_heads and index_head_dim have to be set")
-        return functools.partial(
-            MultiHeadLatentAttention,
-            emb_features=ctx.emb_features,
-            num_heads=ctx.num_heads,
-            max_seq_len=ctx.max_seq_len,
-            q_lora_rank=self.q_lora_rank,
-            kv_lora_rank=self.kv_lora_rank,
-            qk_nope_head_dim=self.qk_nope_head_dim,
-            qk_rope_head_dim=self.qk_rope_head_dim,
-            v_head_dim=self.v_head_dim,
-            causal=ctx.causal,
-            rope_theta=ctx.rope_theta,
-            rope_interleave=self.rope_interleave,
-            yarn=self.yarn,
-            scale_offset=ctx.scale_offset,
-            scale_after_cast=ctx.scale_after_cast,
-            attention_bias=ctx.attention_bias,
+        return self.factory(
+            MultiHeadLatentAttention, ctx,
+            context=("emb_features", "num_heads", "max_seq_len", "causal", "rope_theta", "scale_offset",
+                     "scale_after_cast", "attention_bias", "kv_store_key", "dtype", "precision",
+                     "attention_impl"),
+            kind=("q_lora_rank", "kv_lora_rank", "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim",
+                  "rope_interleave", "yarn", "index_rope_interleave"),
             index_topk=None if ctx.kv_shared else self.index_topk,
             index_n_heads=None if ctx.kv_shared else self.index_n_heads,
             index_head_dim=None if ctx.kv_shared else self.index_head_dim,
-            index_rope_interleave=self.index_rope_interleave,
-            index_shared=ctx.kv_shared,
-            kv_store_key=ctx.kv_store_key,
-            dtype=ctx.dtype,
-            precision=ctx.precision,
-            attention_impl=ctx.attention_impl,
-            rotary=not self.mla_use_nope,
-            output_gate=self.mla_use_output_gate)
+            index_shared=ctx.kv_shared, rotary=not self.mla_use_nope, output_gate=self.mla_use_output_gate)

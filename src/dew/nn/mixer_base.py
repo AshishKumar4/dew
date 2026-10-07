@@ -13,6 +13,7 @@ the run's dtype and kernel choices, so a new kind needs no backbone branch.
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Callable
 
 from flax import linen as nn
@@ -123,3 +124,10 @@ class MixerBase:
         """The block's mixer factory for this value at this layer's geometry."""
         raise NotImplementedError(
             f"{type(self).__name__} names a mixer kind but builds no mixer")
+
+    def factory(self, module: Callable[..., nn.Module], ctx: MixerContext, *, context: tuple[str, ...] = (),
+                kind: tuple[str, ...] = (), **given) -> Callable[..., nn.Module]:
+        """`module` with the `context` fields of `ctx` and the `kind` fields of
+        this value passed by their own names, and `given` beside them."""
+        return functools.partial(module, **{name: getattr(ctx, name) for name in context},
+                                 **{name: getattr(self, name) for name in kind}, **given)

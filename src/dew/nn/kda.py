@@ -279,14 +279,8 @@ class KimiDeltaAttentionMixer(MixerBase):
             raise ValueError(
                 "kimi_delta_attention requires causal=True; its recurrence has no bidirectional mode"
             )
-        return functools.partial(
-            KimiDeltaAttention,
-            emb_features=ctx.emb_features,
-            num_heads=self.linear_num_heads,
-            head_dim=self.linear_head_dim,
-            conv_kernel=self.linear_conv_kernel_dim,
-            lower_bound=self.linear_lower_bound,
-            full_rank_gate=self.use_full_rank_gate,
-            norm_eps=ctx.norm_eps,
-            dtype=ctx.dtype,
-            precision=ctx.precision)
+        return self.factory(
+            KimiDeltaAttention, ctx, context=("emb_features", "norm_eps", "dtype", "precision"),
+            num_heads=self.linear_num_heads, head_dim=self.linear_head_dim,
+            conv_kernel=self.linear_conv_kernel_dim, lower_bound=self.linear_lower_bound,
+            full_rank_gate=self.use_full_rank_gate)

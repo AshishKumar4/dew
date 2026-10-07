@@ -172,12 +172,6 @@ def gemma3n_vision_path(hf_name: str) -> tuple[str, ...]:
     return prefix + parts[:-1] + ("scale" if norm else "kernel",)
 
 
-def translate_gemma3n_vision_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Mapping[str, object]:
-    return translate_parameters(hf_tensors, gemma3n_vision_path, param_dtype)
-
-
 def translate_gemma3n_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Mapping[str, object]:
