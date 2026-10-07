@@ -21,7 +21,10 @@ their outputs stale. The outputs are refreshed by a daily full run; the smoke
 run is what fails when a notebook breaks.
 
     python tools/run_tutorials.py --imports /tmp/imports.json
-    python tools/check_tutorial_outputs.py /tmp/imports.json [--report]
+    python tools/check_tutorial_outputs.py /tmp/imports.json [--report] [PREFIX ...]
+
+A run of some notebooks (run_tutorials.py's prefixes) is checked with the
+same prefixes, so the notebooks another run covers are not flagged here.
 """
 
 from __future__ import annotations
@@ -70,6 +73,7 @@ def verdict(path: Path, imports: dict[str, list[str]]) -> tuple[str, list[str]]:
 
 def main() -> int:
     report = "--report" in sys.argv[2:]
+    prefixes = tuple(argument for argument in sys.argv[2:] if argument != "--report")
     source = Path(sys.argv[1])
     imports = json.loads(source.read_text()) if source.is_file() else {}
     if not source.is_file():
@@ -78,6 +82,8 @@ def main() -> int:
     rows = []
     flagged = 0
     for path in sorted((ROOT / "tutorials").glob("*.ipynb")):
+        if prefixes and not path.name.startswith(prefixes):
+            continue
         label, lines = verdict(path, imports)
         print(f"{path.name}: {label}")
         for line in lines:
