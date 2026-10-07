@@ -34,11 +34,11 @@ SKIPPED = {"tests/test_gen_api.py"}
 DURATIONS = Path("tests/test_durations.json")
 
 
-def weights(files: list[str], timings: dict, python: str) -> dict[str, float]:
+def weights(files: list[str], timings: dict, python: str) -> dict[str, float | None]:
     """Each file's seconds on armada at `python`: its median, a split file's
     as the sum of its last complete set of groups; else its tests' sum in
     tests/test_durations.json, scaled by how much slower armada ran the
-    files measured both ways; else the mean."""
+    files measured both ways; else None, for a file nothing has timed."""
     recorded: dict[str, float] = {}
     if DURATIONS.is_file():
         for node, seconds in json.loads(DURATIONS.read_text()).items():
@@ -57,11 +57,7 @@ def weights(files: list[str], timings: dict, python: str) -> dict[str, float]:
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
-    known = {name: measured.get(name, recorded[name] * slower if name in recorded else None)
-             for name in files}
-    present = [seconds for seconds in known.values() if seconds is not None]
-    mean = sum(present) / len(present) if present else 1.0
-    return {name: mean if seconds is None else seconds for name, seconds in known.items()}
+    return {name: measured.get(name, recorded[name] * slower if name in recorded else None) for name in files}
 
 
 def row(python: str, name: str, split: str) -> str:
@@ -69,17 +65,22 @@ def row(python: str, name: str, split: str) -> str:
 
 
 def plan(target: float, timings: dict) -> list[dict]:
-    """The matrix's entries: about `target` seconds of files each, for each Python."""
+    """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
+    timed runs alone, so however long it takes it holds up no other file, and its time is known from
+    then on."""
     files = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     entries = []
     for python in PYTHONS:
-        weighed = weights(files, timings, python)
-        tasks: list[tuple[list[str], str]] = []
-        for name, seconds in weighed.items():
-            if seconds > target:
+        timed = weights(files, timings, python)
+        weighed = {name: target if seconds is None else seconds for name, seconds in timed.items()}
+        tasks: list[tuple[list[str], str]] = [
+            ([name], "") for name, seconds in timed.items() if seconds is None]
+        for name, seconds in timed.items():
+            if seconds is not None and seconds > target:
                 groups = math.ceil(seconds / target)
                 tasks += [([name], f"{group}/{groups}") for group in range(1, groups + 1)]
-        light = {name: seconds for name, seconds in weighed.items() if seconds <= target}
+        light = {name: seconds for name, seconds in timed.items()
+                 if seconds is not None and seconds <= target}
         bins: list[tuple[float, int, list[str]]] = [
             (0.0, index, []) for index in range(max(math.ceil(sum(light.values()) / target), 1))]
         for name, seconds in sorted(light.items(), key=lambda item: (-item[1], item[0])):

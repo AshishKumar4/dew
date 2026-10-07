@@ -1142,3 +1142,24 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     rebuilt = Adapter.from_run(tmp_path / "run")
     rebuilt.save(rebuilt.variables, tmp_path / "from-run")
     _same_files(tmp_path / "from-run", tmp_path / "in-process")
+
+
+def test_an_nnx_model_behind_flaxs_bridge_is_refused_rather_than_adapted_in_name_only():
+    """An NNX `Linear` behind `flax.nnx.bridge.ToLinen` makes no `nn.Dense`
+    call for the branch to join, so its factors would train while the
+    forward never read them: the forward stayed the base model's with a
+    nonzero B, and every factor's gradient was zero."""
+    from flax import nnx
+    from flax.nnx import bridge
+
+    class Projection(nnx.Module):
+        def __init__(self, *, rngs):
+            self.q_proj = nnx.Linear(8, 8, rngs=rngs)
+
+        def __call__(self, x):
+            return self.q_proj(x)
+
+    model = bridge.ToLinen(Projection)
+    variables = model.init(jax.random.key(0), jnp.ones((2, 8)))
+    with pytest.raises(TypeError, match=r"Projection is an NNX model behind flax\.nnx\.bridge\.ToLinen"):
+        LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=1)

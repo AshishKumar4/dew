@@ -89,6 +89,27 @@ A package outside Dew works the same way, with nothing to register: a field type
 
 A model defined where no import path reaches it, in `__main__` or inside a function, trains, checkpoints and resumes the same way. The first checkpoint warns, and loading the run says, that its model has no import path.
 
+A model written in Flax NNX trains through Flax's own bridge, `flax.nnx.bridge.ToLinen`, which turns an NNX module into a Linen one with its parameters, its other state (a `BatchNorm`'s `batch_stats`) and its random streams (the `dropout` stream an objective passes to `apply`). The bridge runs the module's `__call__`, which is all `DiffusionObjective` calls on a denoiser: `bridge.ToLinen(MyDenoiser, args=(channels,))` is the model. An objective that reads another method, such as `hidden_states` and `logits` for `LMObjective`, needs a Linen class that names it, a few lines of your own:
+
+```python
+from flax.nnx import bridge
+
+
+class MyTokens(bridge.ToLinen):
+    causal: bool = True
+
+    def hidden_states(self, tokens, *, train=False, **fields):
+        return self(tokens, nnx_method="hidden_states", train=train, **fields)
+
+    def logits(self, tokens, *, train=False, **fields):
+        return self(tokens, nnx_method="logits", train=train, **fields)
+
+
+model = MyTokens(MyNNXLanguageModel, args=(vocab_size,))
+```
+
+Such a model checkpoints and resumes as any unregistered model does. `LoRA` cannot adapt it: the adapter intercepts `flax.linen.Dense` calls, and an NNX `Linear` behind the bridge makes none, so `LoRA.apply` refuses an NNX model rather than train factors the forward never reads. Adapt it in NNX before the bridge instead, with `flax.nnx.LoRALinear` in place of `nnx.Linear` or `flax.nnx.LoRA` beside it.
+
 Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.
 
 ## Objective
