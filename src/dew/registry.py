@@ -67,7 +67,11 @@ type Annotation = type | types.UnionType | types.GenericAlias | typing.TypeAlias
 type Configured = (JSON | DTypeLike | Enum | np.ndarray | np.generic
                    | types.FunctionType | types.BuiltinFunctionType
                    | DataclassInstance | Mapping[str, object]
-                   | Mapping[str | tuple[str, ...], object] | Sequence[Configured])
+                   | Mapping[RecordKey, object] | Sequence[Configured])
+
+# A config mapping's key as a record reads it back (`_key`): a name, a
+# number, or a tree path of them.
+type RecordKey = str | int | float | tuple[str | int | float, ...]
 
 # `build` called with no record at all, which is every caller that writes its
 # fields as keywords. Shared because it is read and never written.
@@ -380,7 +384,7 @@ def _record_key(key: object, declared: Annotation) -> str:
     return written
 
 
-def _same_key(read: Configured, key: Configured) -> bool:
+def _same_key(read: RecordKey, key: RecordKey) -> bool:
     """Whether a key read back is the key written: equal, and of the same type
     part by part."""
     if isinstance(key, tuple):
@@ -500,15 +504,20 @@ def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, d
     return configured(member(**_arguments(member, fields, dtypes=dtypes)))
 
 
-def _key(annotation: Annotation, key: str) -> Configured:
+def _key(annotation: Annotation, key: str) -> RecordKey:
     """One record key as the mapping declares its keys: a name, a number, a
     literal, or the tuple path `_record_key` joined with `/`, each part read
     by its own declared type. A spelling the type does not read is refused."""
     annotation = resolve_alias(annotation)
     if wants_tuple(annotation):
         parts = key.split("/")
-        return tuple(_key(part_type, part) for part_type, part in zip(entry_types(annotation, len(parts)),
-                                                                       parts, strict=True))
+        read: list[str | int | float] = []
+        for part_type, part in zip(entry_types(annotation, len(parts)), parts, strict=True):
+            value = _key(part_type, part)
+            if isinstance(value, tuple):
+                raise ValueError(f"the record key {key!r} nests a path inside a path")
+            read.append(value)
+        return tuple(read)
     if typing.get_origin(annotation) in (Union, types.UnionType):
         # An int spelling reads as an int before a float or a string reads it.
         for member in sorted(typing.get_args(annotation),
@@ -523,12 +532,13 @@ def _key(annotation: Annotation, key: str) -> Configured:
         if not held:
             raise ValueError(f"the record key {key!r} is none of {annotation}")
         return held[0]
-    if annotation in (int, float):
-        try:
-            return annotation(key)
-        except ValueError:
-            raise ValueError(f"the record key {key!r} is not the {annotation.__name__} its mapping "
-                             f"declares") from None
+    try:
+        if annotation is int:
+            return int(key)
+        if annotation is float:
+            return float(key)
+    except ValueError:
+        raise ValueError(f"the record key {key!r} is not the {annotation} its mapping declares") from None
     if annotation is type(None):
         raise ValueError(f"the record key {key!r} is not None")
     return key
