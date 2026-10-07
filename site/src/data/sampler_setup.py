@@ -17,4 +17,4 @@ def text_model(name):
     return model.text_generation(sampling=Sampling(temperature=0))
 
 
-pipe = from_pretrained("dewml/hybrid-dit-176m", revision="3d480f6ce4698cc7859c8b25d040ff2f2f34a4d5")
+pipe = from_pretrained("dewml/hybrid-dit-176m", revision="dc93073f4e2b1902b166c28d9d2b53dca4c1551e")
