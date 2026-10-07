@@ -680,8 +680,30 @@ def _artifact_name(name: str) -> str:
 
 
 @dataclasses.dataclass(frozen=True)
+class Prepared:
+    """What a run trains, as its class builds it (`RunConfig.prepare`).
+
+    `run` is the run as it records itself, with what building resolved (a
+    pinned source, the model's fields as built). `metrics`, `rollout` and
+    `validation` are `RunConfig.train`'s. `after` runs on the state training
+    ends on and the run's directory, as a decision run fits its calibration
+    on its held-out rows and saves it there.
+    """
+
+    run: "RunConfig"
+    objective: Objective
+    data: Dataset
+    metrics: Sequence[Metric] = ()
+    rollout: Rollout | None = None
+    validation: Mapping[str, Reader] | None = None
+    after: Callable[[TrainState, str], None] | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class RunConfig:
-    """A whole run's configuration; recipes subclass it to add their objective's settings."""
+    """A whole run's configuration. A kind of run subclasses it with its own
+    settings and builds what it trains from them (`prepare`); `run` trains it.
+    """
 
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora"}
     """The optional settings `cli` turns on by their own flags, each with the
@@ -723,14 +745,20 @@ class RunConfig:
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
 
-        The path goes through `epath`, the same filesystem layer Orbax writes the
+        The file is the run's class record, its class's import path and its
+        fields (`to_dict`), so `load` rebuilds the run as the class it is. The
+        path goes through `epath`, the same filesystem layer Orbax writes the
         checkpoints with, so a `gs://` run directory gets the record too.
         """
         path = epath.Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         target = path / RUN_FILE
-        target.write_text(json.dumps(self.to_dict(), indent=2, sort_keys=True))
+        target.write_text(json.dumps(self.record(), indent=2, sort_keys=True))
         return str(target)
+
+    def record(self) -> dict[str, JSON]:
+        """The run's class record: its class's import path and its fields (`to_dict`)."""
+        return {"class": registry.import_path(type(self)), "fields": self.to_dict()}
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -807,11 +835,54 @@ class RunConfig:
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
-        """Read the config a run in `directory` was built from, as this class.
+        """Read the run a directory's `run.json` records, or the file itself,
+        as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
-        record = json.loads((epath.Path(directory) / RUN_FILE).read_text())
+        path = epath.Path(directory)
+        return cls.read(json.loads((path if path.suffix == ".json" else path / RUN_FILE).read_text()),
+                        trust=trust)
+
+    @classmethod
+    def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
+        """The run a class record (`record`) names, as its class, which must be
+        this one or derive from it."""
         registry.import_trusted(record, trust)
-        return cls.from_dict(record)
+        named = registry._class_record(record)
+        if named is None:
+            raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
+        run_class = registry.imported(named[0])
+        if not (isinstance(run_class, type) and issubclass(run_class, cls)):
+            raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
+        return run_class.from_dict(named[1])
+
+    def prepare(self) -> Prepared:
+        """Build what this run trains: the objective its record names around
+        its model, on its data. A kind of run with settings of its own builds
+        from them in its own `prepare`."""
+        if self.objective is None or self.lora is not None:
+            raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
+                             "name an objective, and train an adapter as a kind of run that attaches one")
+        return Prepared(self, self.objective.build(model=self.model.build()),
+                        self.data.load(batch=self.trainer.batch_size))
+
+    def run(self) -> TrainState:
+        """Prepare the process, build what this run trains (`prepare`) and train it.
+
+        The run trains under `trainer.name`, or `<objective>-<data>/date-<time>`."""
+        from dew.training import prepare_process, run_timestamp
+
+        trainer = self.trainer
+        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
+                        layout=trainer.layout)
+        prepared = self.prepare()
+        name = trainer.name or (f"{objectives.label(registry.import_path(type(prepared.objective)))}-"
+                                f"{datasets.label(registry.import_path(type(prepared.run.data)))}/"
+                                f"date-{run_timestamp()}")
+        state = prepared.run.train(prepared.objective, prepared.data, name=name, metrics=prepared.metrics,
+                                   rollout=prepared.rollout, validation=prepared.validation)
+        if prepared.after is not None:
+            prepared.after(state, os.path.join(trainer.checkpoint_dir, name))
+        return state
 
     def _naming(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config with `objective`'s class as its record names it.
@@ -866,7 +937,9 @@ class RunConfig:
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
             _quantize(objective, self.trainer.quantization)
-        self = self._naming(objective)
+        # The record names the run's directory, so its run.json trains the same run again.
+        self = dataclasses.replace(self._naming(objective),
+                                   trainer=dataclasses.replace(self.trainer, name=name))
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
@@ -951,5 +1024,5 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "ModelConfig", "ObjectiveConfig", "OptimConfig", "RunConfig", "ScheduleSpec",
-           "TrainerConfig", "Wandb"]
+__all__ = ["JsonDict", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared", "RunConfig",
+           "ScheduleSpec", "TrainerConfig", "Wandb"]

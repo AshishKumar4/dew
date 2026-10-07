@@ -84,7 +84,7 @@ def test_the_run_record_builds_the_same_objective_again():
     np.testing.assert_array_equal(again.scalar_loss(variables, batch(), STEP)[0],
                                   original.scalar_loss(variables, batch(), STEP)[0])
     assert record["objective"]["fields"]["loss"] == {
-        "class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "label"}}
+        "class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "label", "output": []}}
 
 
 def test_a_lambda_loss_is_refused_where_the_run_states_it():

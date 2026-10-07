@@ -39,17 +39,14 @@ def test_rigel_has_its_published_parameter_counts():
     assert (total, active - embedding) == (2_345_567_552, 260_998_464)
 
 
-def test_rigel_passes_the_lm_recipes_nested_flags_through(tmp_path, monkeypatch):
-    """After its own flags, rigel.py takes the LM recipe's, a nested field such
+def test_rigel_passes_the_lm_runs_nested_flags_through(tmp_path, monkeypatch):
+    """After its own flags, rigel.py takes the LM run's, a nested field such
     as `--data.seq-len` included, without naming the data subcommand, as
     recipes/lm/train.py does."""
-    spec = importlib.util.spec_from_file_location("train", PATH.parent / "train.py")
-    assert spec is not None and spec.loader is not None
-    recipe = importlib.util.module_from_spec(spec)
-    monkeypatch.setitem(sys.modules, "train", recipe)  # rigel.py imports it by that name
-    spec.loader.exec_module(recipe)
+    from dew.objectives.lm import LMRunConfig
+
     configs = []
-    monkeypatch.setattr(recipe, "main", configs.append)
+    monkeypatch.setattr(LMRunConfig, "run", lambda config: configs.append(config))
     monkeypatch.setattr(sys, "argv", ["rigel.py", "--corpora", "web", str(tmp_path), "--data.seq-len", "512",
                                       "--trainer.checkpoint-dir", str(tmp_path / "runs")])
     runpy.run_path(str(PATH), run_name="__main__")
