@@ -16,7 +16,7 @@ import jax
 import numpy as np
 
 from dew.config import ModelConfig
-from dew.registry import import_path, imported, to_record
+from dew.registry import imported, to_record
 
 
 class Residual(nn.Module):
@@ -82,7 +82,7 @@ def test_a_layer_held_twice_is_recorded_once_and_two_equal_layers_twice():
     layer once and refers to it; two layers built alike are two records."""
     shared = models()["shared"]
     assert ModelConfig.from_model(shared).fields["layers"] == [
-        {"class": import_path(nn.Dense), "fields": {"features": 8}, "share": 0}, {"shared": 0}]
+        {**to_record(nn.Dense(8), nn.Module), "share": 0}, {"shared": 0}]
     separate = ModelConfig.from_model(models()["separate"]).fields["layers"]
     assert separate[0] == separate[1] and all("share" not in layer for layer in separate)
     rebuilt = ModelConfig.from_model(shared).build()
