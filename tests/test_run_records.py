@@ -78,8 +78,7 @@ def test_the_published_run_reads_back_as_it_was_written():
     is to re-export the published run in the same change, since the site,
     the quick start and the live sampler all load it."""
     held = json.loads(PUBLISHED.read_text())
-    since_the_export = {**held, "optim": {**held["optim"], "b1": None, "b2": None}}
-    assert json.loads(json.dumps(DiffusionRunConfig.from_dict(held).to_dict())) == since_the_export
+    assert json.loads(json.dumps(DiffusionRunConfig.from_dict(held).to_dict())) == held
 
 
 @pytest.mark.network
