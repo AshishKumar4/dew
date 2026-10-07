@@ -227,13 +227,28 @@ class Llama4Mixer(MixerBase):
                 "and keys with its own scale-free L2 norm under use_qk_norm, "
                 "scales by 1/sqrt(head_dim), rotates whole interleaved pairs "
                 "and attends by chunk rather than by window")
-        return self.factory(
-            Llama4Attention, ctx,
-            context=("emb_features", "num_heads", "num_kv_heads", "head_dim", "max_seq_len", "causal",
-                     "rope_theta", "rope_scaling", "norm_eps", "attention_bias", "dtype", "precision",
-                     "attention_impl", "force_fp32_for_softmax"),
-            kind=("use_rope", "use_qk_norm", "attn_temperature_tuning", "floor_scale", "attn_scale"),
-            attention_chunk_size=ctx.attention_chunk)
+        return functools.partial(
+            Llama4Attention,
+            emb_features=ctx.emb_features,
+            num_heads=ctx.num_heads,
+            num_kv_heads=ctx.num_kv_heads,
+            head_dim=ctx.head_dim,
+            max_seq_len=ctx.max_seq_len,
+            causal=ctx.causal,
+            rope_theta=ctx.rope_theta,
+            rope_scaling=ctx.rope_scaling,
+            use_rope=self.use_rope,
+            use_qk_norm=self.use_qk_norm,
+            attention_chunk_size=ctx.attention_chunk,
+            attn_temperature_tuning=self.attn_temperature_tuning,
+            floor_scale=self.floor_scale,
+            attn_scale=self.attn_scale,
+            norm_eps=ctx.norm_eps,
+            attention_bias=ctx.attention_bias,
+            dtype=ctx.dtype,
+            precision=ctx.precision,
+            attention_impl=ctx.attention_impl,
+            force_fp32_for_softmax=ctx.force_fp32_for_softmax)
 
 
 def default_no_rope_layers(num_layers: int, interval: int) -> tuple[int, ...]:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 
 from dew.nn.mixer_base import MixerBase, MixerContext
 
@@ -33,9 +34,17 @@ class GatedDeltaNetMixer(MixerBase):
             raise ValueError("gated_delta_net requires causal=True; its recurrence has no bidirectional mode")
         from dew.nn.linear import CHUNK_SIZE, GatedDeltaNet
 
-        return self.factory(
-            GatedDeltaNet, ctx, context=("emb_features", "norm_eps", "dtype", "precision"),
-            kind=("fused_in_proj",), num_k_heads=self.linear_num_key_heads,
-            num_v_heads=self.linear_num_value_heads, head_k_dim=self.linear_key_head_dim,
-            head_v_dim=self.linear_value_head_dim, conv_kernel=self.linear_conv_kernel_dim,
-            chunk_size=CHUNK_SIZE, gate_activation=self.output_gate_type)
+        return functools.partial(
+            GatedDeltaNet,
+            emb_features=ctx.emb_features,
+            num_k_heads=self.linear_num_key_heads,
+            num_v_heads=self.linear_num_value_heads,
+            head_k_dim=self.linear_key_head_dim,
+            head_v_dim=self.linear_value_head_dim,
+            conv_kernel=self.linear_conv_kernel_dim,
+            chunk_size=CHUNK_SIZE,
+            norm_eps=ctx.norm_eps,
+            gate_activation=self.output_gate_type,
+            fused_in_proj=self.fused_in_proj,
+            dtype=ctx.dtype,
+            precision=ctx.precision)
