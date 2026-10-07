@@ -146,7 +146,12 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     question of a row, recomputed blocks; the run reloads as a task."""
     clef = _module("clef")
     contamination = _module("contamination")
-    _rows(tmp_path / "rows.jsonl", 24, joint=True)
+    rows = _rows(tmp_path / "rows.jsonl", 24, joint=True)
+    # One example whose questions alone pass the row's 1,024 tokens: dropped and counted.
+    long = {**rows[0], "questions": {**rows[0]["questions"], "urgent": {
+        "type": "noul", "instructions": "Is it urgent? " + "Consider every detail. " * 300}}}
+    with open(tmp_path / "rows.jsonl", "a") as file:
+        file.write(json.dumps(long) + "\n")
     index = tmp_path / "index.npz"
     contamination.Overlaps.of(["nothing shared with these rows at all"]).save(index)
     config = clef.ClefRun.cli([*_flags(tmp_path / "rows.jsonl", index, tmp_path / "runs", 8),
@@ -154,6 +159,7 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
                                "--head.width", "24", "--head.heads", "2", "--head.feedforward", "40",
                                "--head.layers", "1", "--head.routing-layers", "1", "--max-len", "1024"])
     clef.main(config)
+    assert sum(_summary(tmp_path / "runs" / "run")["unfit"].values()) == 1
     decide = Decide.from_run(str(tmp_path / "runs" / "run"))
     team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
     answers = decide("charged twice", {"team": team, "urgent": Noul("Is it urgent?")})
