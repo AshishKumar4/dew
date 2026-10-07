@@ -21,13 +21,15 @@ The step's custom metadata records which leaves are stored this way, so
 checkpoint that records none reads as it was written.
 
 Each kept step stores its weights whole; a best step is not a delta of the
-latest. An EMA at decay 0.9999 trails the weights by about 10^4 steps, the
-distance a best step usually has from the latest late in a run, and weights
-further apart share fewer leading bits, so the 25% above bounds what such a
-delta saves: at most a quarter of one weights copy, about 12% of the 2.6 GB
-the 176M DiT's best and latest steps hold. Storing one step against another
-would make retention keep a base alive while any delta reads it, or
-re-encode the best step at every save, which that saving does not pay for.
+latest. Measured on a 1.8M-parameter byte-level decoder trained 3,000 steps
+on Tiny Shakespeare (AdamW, warmup and cosine decay), with each step written
+through these same Orbax writes: an earlier step's parameters stored as XOR
+planes against the latest take 8% fewer bytes 2,700 steps back, 15% fewer
+1,000 back, 23% fewer 100 back and 30% fewer 10 back, and its Adam moments
+7% to 17% fewer. Over a best and a latest step that is 4% to 15% of their
+parameters' bytes. Storing one step against another would make retention keep
+a base alive while any delta reads it, or re-encode the best step at every
+save, which that saving does not pay for.
 
 Besides the persistent directory, a run can keep a local checkpoint on every
 host, written more often, so a preempted pod resumes from its own disks rather
