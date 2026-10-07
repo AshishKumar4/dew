@@ -227,8 +227,8 @@ def test_batch_statistics_update_as_the_model_trains_and_reload_from_its_checkpo
     trained = state.variables["batch_stats"]
     for began, ended in zip(jax.tree.leaves(start), jax.tree.leaves(trained), strict=True):
         assert not np.array_equal(np.asarray(began), np.asarray(ended))
-    restored = subprocess.run([sys.executable, "-c", RESTORED, str(tmp_path / "run")], capture_output=True,
-                              text=True, timeout=300, check=False,
+    restored = subprocess.run([sys.executable, "-c", RESTORED, str(tmp_path / "run")],
+                              capture_output=True, text=True, timeout=300, check=False,
                               env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(REPO_ROOT / "src")})
     assert restored.returncode == 0, restored.stderr[-2000:]
     assert json.loads(restored.stdout.splitlines()[-1]) == {
