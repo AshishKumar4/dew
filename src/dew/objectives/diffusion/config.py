@@ -14,9 +14,8 @@ import os
 from typing import TYPE_CHECKING, ClassVar
 
 import jax
-import numpy as np
 
-from dew.config import ModelConfig, RunConfig
+from dew.config import ModelConfig, ObjectiveConfig, RunConfig
 from dew.data import ImageDataset, OnlineImages, OnlineVideos, TFDSImages, VideoDataset
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
@@ -30,35 +29,32 @@ from dew.registry import (
     datasets,
     dtype_name,
     encoders,
+    from_record,
     metrics,
     models,
+    objectives,
     presets,
     resolve_dtype,
-    solvers,
-    trainings,
+    to_record,
 )
-from dew.sampling.guidance import CFG
-from dew.sampling.solvers import EulerAncestral
+from dew.sampling.solvers import EulerAncestral, Solver
 
+from .alignment import Alignment
 from .end_to_end import AUTOENCODER
-from .few_step import SMOOTH_TIME_SCALE, MeanFlowTraining
-from .objective import LOSS_HEADS, Denoising, DiffusionObjective, Training
+from .few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
+from .objective import LOSS_HEADS, DiffusionObjective
 
 if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew.diffusion.presets import Preset
-    from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
-    from dew.sampling.solvers import Solver
+    from dew.objectives.rl.flow import FlowRollout
 
-    # A kind's `union` imports every aliased class, this module's training
-    # modes included, so the run builds it at the end of the module, where
-    # the annotations, read when a command line is parsed, find it.
-    # Statically the fields are typed as the kinds' base classes, which a
-    # reader and a checker need.
+    # A kind's `union` imports every aliased class, so the run builds it at
+    # the end of the module, where the annotations, read when a command line
+    # is parsed, find it. Statically the fields are typed as the kinds' base
+    # classes, which a reader and a checker need.
     PresetSpec = Preset
-    SolverSpec = Solver
-    TrainingSpec = Training
     # The run reads captions through `load(tokenize=)`, which the token
     # datasets do not take; `sample_field` refuses those at runtime.
     CaptionedSpec = ImageDataset | OnlineImages | VideoDataset
@@ -175,69 +171,6 @@ class PretrainedAutoencoder:
 
 
 @dataclasses.dataclass(frozen=True)
-class FlowGRPO(Training):
-    """Flow-GRPO training of the model as a policy on an image reward.
-
-    Flow-GRPO is from Liu et al. (2025). For each prompt, a group of rollouts runs
-    through the flow SDE; their rewards are normalized within the group, and the
-    model trains on the clipped likelihood ratio, with the conditional KL to the
-    initial model at weight `beta`.
-
-    The fields are `FlowGRPOObjective`'s and `FlowRollout`'s, which document them.
-    `reward` names an image metric, by alias or import path, that scores each sample against its
-    own prompt, where higher must be better (`clip_score`).
-
-    Under Flow-GRPO, the run's `ema_decay` and `unconditional_prob` are unused: the
-    EMA slot holds the frozen KL reference when `beta` > 0 and nothing otherwise,
-    and no training row drops its condition.
-    """
-
-    reward: str = "clip_score"
-    noise_level: float = 0.7
-    beta: float = 0.0
-    clip_range: float = 1e-4
-    adv_clip_max: float = 5.0
-    groups: int = 4
-    rollout_steps: int = 11
-    train_steps: int | None = None
-
-    def __post_init__(self) -> None:
-        if ":" not in self.reward and self.reward not in metrics:
-            raise ValueError(f"reward names {self.reward!r}, which no metric alias names; the aliases are "
-                             f"{sorted(metrics)}, or name a metric by its import path")
-
-    def objective(self, base: nn.Module, variables: Variables | None, *, unconditional_prob: float,
-                  ema_decay: float | None, **run) -> FlowGRPOObjective:
-        from dew.objectives.rl.flow import FlowGRPOObjective
-        from dew.sampling.flow import FlowSDE
-
-        return FlowGRPOObjective(sde=FlowSDE(self.noise_level), beta=self.beta, clip_range=self.clip_range,
-                                 adv_clip_max=self.adv_clip_max, variables=variables, **run)
-
-    def rollout(self, objective: DiffusionObjective) -> FlowRollout:
-        """Return the trainer's rollout over `objective`, scored by the named metric."""
-        from dew.artifacts import ImageGrid
-        from dew.eval.common import ImageMetric
-        from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
-
-        if not isinstance(objective, FlowGRPOObjective):
-            raise TypeError(f"Flow-GRPO rolls out the FlowGRPOObjective it builds, "
-                            f"not a {type(objective).__name__}")
-
-        metric = metrics[self.reward]()
-        if not isinstance(metric, ImageMetric):
-            raise ValueError(f"reward {self.reward!r} is a {type(metric).__name__}, and Flow-GRPO "
-                             "scores each sample with an image metric's per-sample measure")
-
-        def reward(images, batch):
-            return np.asarray(metric.fn(ImageGrid(images), batch))
-
-        return FlowRollout(objective, reward, groups=self.groups, steps=self.rollout_steps,
-                           train_steps=self.train_steps)
-
-
-
-@dataclasses.dataclass(frozen=True)
 class DiffusionRunConfig(RunConfig):
     """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
 
@@ -250,18 +183,15 @@ class DiffusionRunConfig(RunConfig):
     None uses the one the `pretrained` pipeline's scheduler reads, which a preset
     may restate.
     """
-    solver: SolverSpec = dataclasses.field(default_factory=EulerAncestral)
-    """The solver validation samples with."""
-    guidance: CFG | None = dataclasses.field(default_factory=lambda: CFG(3.0))
-    """How validation samples are guided, with scale and interval.
-
-    None samples the conditional prediction alone.
+    objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig(
+        "diffusion", {"solver": to_record(EulerAncestral(), Solver)}))
+    """The objective and its arguments: the denoising loss (`diffusion`) with its
+    EMA, condition dropout and validation sampling (`--objective.ema-decay`,
+    `--objective.guidance`, `--objective.steps`), or a loss of its own in its
+    place, as `--objective mean_flow --objective.omega 2` or `--objective rcm
+    --objective.teacher-run runs/teacher`. Each objective refuses a preset or a
+    guidance its loss cannot train or sample with.
     """
-    sampling_steps: int = 200
-    unconditional_prob: float = 0.12
-    """The fraction of training examples whose condition is dropped."""
-    ema_decay: float | None = 0.999
-    """The EMA decay; None disables the EMA and 1.0 keeps a frozen copy."""
     text: TextCondition | None = dataclasses.field(default_factory=TextCondition)
     """The text condition, passed under its encoder's keyword (`ConditionEncoder.keyword`).
 
@@ -282,16 +212,6 @@ class DiffusionRunConfig(RunConfig):
     `--model` holds only the precision settings and `text` and `autoencoder` stay
     unset.
     """
-    mode: TrainingSpec = dataclasses.field(default_factory=Denoising)
-    """How the run trains, with the denoising loss or with another loss in its place.
-
-    `Denoising` is the denoising loss, optionally with EDM2's learned weighting or
-    representation alignment. `FlowGRPO`, `MeanFlowTraining`, `ShortcutTraining`,
-    `ConsistencyDistillation`, `GuidanceDistillation` and `AdversarialDistillation`
-    train on their own losses. Each mode refuses a preset or guidance that its loss
-    cannot train or sample with. On the command line, pick one with
-    `mode:mean-flow-training --mode.omega 2`.
-    """
     val_metrics: tuple[str, ...] = ("clip",)
     """Metric aliases or import paths, scored on every validation pass.
 
@@ -302,7 +222,8 @@ class DiffusionRunConfig(RunConfig):
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
-        self.mode.check(self)
+        if not issubclass(objectives[self.objective.name], DiffusionObjective):
+            raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
 
         if self.pretrained is not None:
             # The pipeline's own denoiser trains; the model flags it reads are
@@ -320,6 +241,8 @@ class DiffusionRunConfig(RunConfig):
                 raise ValueError(
                     f"{self.pretrained} decides the model, its text conditioning and its "
                     f"autoencoder; leave {', '.join(chosen)} unset")
+            if self.objective.fields.get("end_to_end") is not None:
+                raise ValueError("end-to-end tuning trains a run's own `autoencoder`; a pipeline sets none")
             object.__setattr__(self, "text", None)
         elif self.preset is None:
             raise ValueError("preset None trains on the convention a pretrained pipeline's "
@@ -381,8 +304,8 @@ class DiffusionRunConfig(RunConfig):
         if isinstance(model, IntervalModel) and self.preset is not None:
             built = self.preset()
             fields["interval"] = isinstance(built, Process) and built.interval
-        if isinstance(self.mode, MeanFlowTraining) and isinstance(model, TimeScaled) \
-                and "time_scale" not in self.model.fields:
+        if (issubclass(objectives[self.objective.name], MeanFlowObjective) and isinstance(model, TimeScaled)
+                and "time_scale" not in self.model.fields):
             fields["time_scale"] = SMOOTH_TIME_SCALE
         return fields
 
@@ -447,7 +370,6 @@ class DiffusionRunConfig(RunConfig):
             sample, convention = self.sample_field(), None
         else:
             source = self._source(variables)
-            base = source.model
             if self.lora is not None:
                 # The adapter binds to the denoiser and the pipeline's
                 # weights, so the objective trains its factors alone.
@@ -463,19 +385,18 @@ class DiffusionRunConfig(RunConfig):
             # Qwen-Image 2.1's are RGBA.
             sample = source.inputs.sample
         inputs = InputSpec(sample=sample, conditions=conditions)
-        process = self._process(convention)
-        return self.mode.objective(base, variables, model=model, process=process, inputs=inputs,
-                                   autoencoder=autoencoder, unconditional_prob=self.unconditional_prob,
-                                   ema_decay=self.ema_decay, solver=self.solver, guidance=self.guidance,
-                                   steps=self.sampling_steps)
+        objective = self.objective.build(model=model, process=self._process(convention), inputs=inputs,
+                                         autoencoder=autoencoder, variables=variables)
+        assert isinstance(objective, DiffusionObjective)
+        return objective
 
-    def rollout(self, objective: DiffusionObjective):
-        """Return the mode's rollout for `objective`, which the trainer runs.
+    def rollout(self, objective: DiffusionObjective) -> FlowRollout | None:
+        """Return the trainer's rollout over `objective`: Flow-GRPO's
+        (`FlowGRPOObjective.rollout`), or None for an objective whose loss
+        trains on each batch as it comes."""
+        from dew.objectives.rl.flow import FlowGRPOObjective
 
-        `FlowGRPO` returns its rollout, and a mode whose loss trains on each batch as it
-        comes returns None.
-        """
-        return self.mode.rollout(objective)
+        return objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
 
     def pinned(self) -> DiffusionRunConfig:
         """Return this run with its Hub sources pinned to the commits they resolve to now.
@@ -492,12 +413,15 @@ class DiffusionRunConfig(RunConfig):
             name, revision = split_revision(source)
             return f"{name}@{sources.snapshot(name, revision, weights=False).name}"
 
-        mode = self.mode
-        if isinstance(mode, Denoising) and mode.alignment is not None:
-            mode = dataclasses.replace(mode, alignment=dataclasses.replace(
-                mode.alignment, encoder=pin(mode.alignment.encoder)))
+        objective = self.objective
+        stated = objective.fields.get("alignment")
+        if stated is not None:
+            alignment = from_record(Alignment, stated)
+            if alignment.source is not None:
+                objective = dataclasses.replace(objective, fields={**objective.fields, "alignment": to_record(
+                    dataclasses.replace(alignment, source=pin(alignment.source)), Alignment)})
         return dataclasses.replace(self, pretrained=None if self.pretrained is None else pin(self.pretrained),
-                                   mode=mode)
+                                   objective=objective)
 
     def _scratch(self, variables: Variables | None):
         """The registry's model, the run's text or audio condition and its
@@ -520,8 +444,7 @@ class DiffusionRunConfig(RunConfig):
     def _autoencoder_params(self, variables: Variables) -> Variables:
         """The autoencoder's weights in a saved tree: frozen beside the
         model, or trained under `params` when REPA-E tuned it."""
-        if isinstance(self.mode, Denoising) and self.mode.alignment is not None \
-                and self.mode.alignment.end_to_end is not None:
+        if self.objective.fields.get("end_to_end") is not None:
             return variables["params"][AUTOENCODER]
         return variables["autoencoder"]
 
@@ -591,6 +514,4 @@ class DiffusionRunConfig(RunConfig):
 
 if not TYPE_CHECKING:
     PresetSpec = presets.union
-    SolverSpec = solvers.union
-    TrainingSpec = trainings.union
     CaptionedSpec = datasets.union

@@ -17,7 +17,6 @@ kvfrans/shortcut-models' `get_targets`, in JAX, which
 
 from __future__ import annotations
 
-import dataclasses
 from collections.abc import Callable
 
 import jax
@@ -25,16 +24,16 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.diffusion.presets import MeanFlow, Shortcut
+from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.protocols import IntervalModel
-from dew.objectives.base import Aux, Step, Variables
-from dew.sampling.solvers import Euler
+from dew.objectives.base import Aux, Step
+from dew.sampling.solvers import Euler, Solver
 
-from .objective import DiffusionObjective, Training, _own_loss
+from .objective import DiffusionObjective, _own_loss
 
 Velocity = Callable[[jax.Array, jax.Array, jax.Array], jax.Array]
 """An average velocity u(z, t, r) over [r, t]."""
@@ -112,6 +111,8 @@ def shortcut_target(velocity: Velocity, x, sigma, step) -> jax.Array:
     return jax.lax.stop_gradient(jnp.clip((first + second) / 2, -4, 4))
 
 
+_EULER = Euler()
+
 SMOOTH_TIME_SCALE = 0.002
 """The Fourier time scale a model trained through a derivative in time takes
 when its config names none, and the fastest an sCM teacher's may turn. On a
@@ -133,55 +134,6 @@ def _interval_velocity(model: nn.Module, process: Process, method: str, preset: 
         raise TypeError(f"{method} hands its model each interval's duration, and a "
                         f"{type(model).__name__} embeds none: train an IntervalModel with interval set, "
                         f"as simple_dit(interval=True)")
-
-
-@dataclasses.dataclass(frozen=True)
-class MeanFlowTraining(Training):
-    """MeanFlow training under the `MeanFlow` preset, for a model that samples in one step.
-
-    `MeanFlowObjective` documents the fields. Sampling is unguided, because the
-    guidance is trained in.
-    """
-
-    preset_class = MeanFlow
-    guided = False
-
-    instantaneous: float = 0.75
-    omega: float = 1.0
-    kappa: float = 0.0
-    guidance_interval: tuple[float, float] = (0.0, 1.0)
-    norm_p: float = 1.0
-    norm_eps: float = 0.01
-
-    def __post_init__(self) -> None:
-        # A record carries the interval as a JSON list.
-        start, stop = (float(edge) for edge in self.guidance_interval)
-        object.__setattr__(self, "guidance_interval", (start, stop))
-
-    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
-        return MeanFlowObjective(mean_flow=self, variables=variables, **run)
-
-
-@dataclasses.dataclass(frozen=True)
-class ShortcutTraining(Training):
-    """Shortcut-model training under the `Shortcut` preset.
-
-    `ShortcutObjective` documents the fields, and `sections` must be a power of two,
-    at least 2. Sampling is unguided.
-    """
-
-    preset_class = Shortcut
-    guided = False
-
-    sections: int = 128
-    bootstrap_every: int = 8
-
-    def __post_init__(self) -> None:
-        if self.sections < 2 or self.sections & (self.sections - 1):
-            raise ValueError(f"sections is a power of two, not {self.sections}")
-
-    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
-        return ShortcutObjective(shortcut=self, variables=variables, **run)
 
 
 class MeanFlowObjective(DiffusionObjective):
@@ -207,14 +159,16 @@ class MeanFlowObjective(DiffusionObjective):
     `simple_dit(time_scale=0.002)` for this, in place of the default 16.
     """
 
-    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, mean_flow: MeanFlowTraining,
-                 **kwargs):
-        _interval_velocity(model, process, "MeanFlow", "presets.MeanFlow")
+    def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
+                 instantaneous: float = 0.75, omega: float = 1.0, kappa: float = 0.0,
+                 guidance_interval: tuple[float, float] = (0.0, 1.0), norm_p: float = 1.0,
+                 norm_eps: float = 0.01, solver: Solver = _EULER, steps: int = 2, **kwargs):
         _own_loss("MeanFlow", kwargs)
-        kwargs.setdefault("solver", Euler())
-        kwargs.setdefault("steps", 2)
-        super().__init__(model, process, inputs, **kwargs)
-        self.mean_flow = mean_flow
+        super().__init__(model, process, inputs, solver=solver, steps=steps, **kwargs)
+        _interval_velocity(self.model, self.process, "MeanFlow", "presets.MeanFlow")
+        self.instantaneous, self.omega, self.kappa = instantaneous, omega, kappa
+        self.guidance_interval = guidance_interval
+        self.norm_p, self.norm_eps = norm_p, norm_eps
 
     def _draws(self, key, count: int, shape) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
         """The loss's randomness: two training times per row, the noise, and a
@@ -232,7 +186,7 @@ class MeanFlowObjective(DiffusionObjective):
         schedule = self.process.schedule
         given, blank = self._conditions(variables, batch, condition_key, dropout=False)
         first, second, noise, uniform = self._draws(draw_key, count, samples.shape)
-        t, r = intervals(first, second, self.mean_flow.instantaneous)
+        t, r = intervals(first, second, self.instantaneous)
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
         )
@@ -247,11 +201,11 @@ class MeanFlowObjective(DiffusionObjective):
                 return output
             return average
 
-        if self.mean_flow.omega != 1.0 or self.mean_flow.kappa != 0.0:
-            start, stop = self.mean_flow.guidance_interval
+        if self.omega != 1.0 or self.kappa != 0.0:
+            start, stop = self.guidance_interval
             inside = (t >= start) & (t <= stop)
-            omega = expand(jnp.where(inside, self.mean_flow.omega, 1.0), v)
-            kappa = expand(jnp.where(inside, self.mean_flow.kappa, 0.0), v)
+            omega = expand(jnp.where(inside, self.omega, 1.0), v)
+            kappa = expand(jnp.where(inside, self.kappa, 0.0), v)
             guided = jax.lax.stop_gradient(
                 guided_velocity(
                     v,
@@ -268,7 +222,7 @@ class MeanFlowObjective(DiffusionObjective):
                                   given, blank)
         guided = jnp.where(expand(dropped, v), v, guided)
         u, target = mean_flow_target(velocity(conditions, train=True), z, t, r, guided)
-        losses = adaptive_loss(u, target, self.mean_flow.norm_p, self.mean_flow.norm_eps)
+        losses = adaptive_loss(u, target, self.norm_p, self.norm_eps)
         return self.row_mean(losses, batch), Aux(metrics={})
 
 
@@ -280,7 +234,8 @@ _NOISE_FLOOR = 1e-5
 class ShortcutObjective(DiffusionObjective):
     """Trains a shortcut model on an interval process (`presets.Shortcut`).
 
-    `sections` is the finest grid, the reference's `denoise_timesteps` (128).
+    `sections` is the finest grid, the reference's `denoise_timesteps` (128),
+    a power of two.
     Flow-matching rows train at one step of 1 / sections, on times of that
     grid. One row in `bootstrap_every` (8) trains self-consistency at a level
     from `shortcut_levels`, on times of that level's grid. Its target is two
@@ -294,14 +249,15 @@ class ShortcutObjective(DiffusionObjective):
     are powers of two up to `sections` are the ones the model trained at.
     """
 
-    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, shortcut: ShortcutTraining,
+    def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
+                 sections: int = 128, bootstrap_every: int = 8, solver: Solver = _EULER, steps: int = 2,
                  **kwargs):
-        _interval_velocity(model, process, "a shortcut model", "presets.Shortcut")
+        if sections < 2 or sections & (sections - 1):
+            raise ValueError(f"sections is a power of two, not {sections}")
         _own_loss("a shortcut model", kwargs)
-        kwargs.setdefault("solver", Euler())
-        kwargs.setdefault("steps", 2)
-        super().__init__(model, process, inputs, **kwargs)
-        self.shortcut = shortcut
+        super().__init__(model, process, inputs, solver=solver, steps=steps, **kwargs)
+        _interval_velocity(self.model, self.process, "a shortcut model", "presets.Shortcut")
+        self.sections, self.bootstrap_every = sections, bootstrap_every
 
     def _draws(self, key, count: int, grid: jax.Array, shape) -> tuple[jax.Array, jax.Array, jax.Array]:
         """The loss's randomness: each row's time index below its `grid`, the
@@ -315,19 +271,19 @@ class ShortcutObjective(DiffusionObjective):
         encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
         samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
-        rows = count // self.shortcut.bootstrap_every
+        rows = count // self.bootstrap_every
         schedule = self.process.schedule
         given, blank = self._conditions(variables, batch, condition_key, dropout=False)
 
-        levels = shortcut_levels(rows, self.shortcut.sections)
-        grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.shortcut.sections))])
+        levels = shortcut_levels(rows, self.sections)
+        grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])
         index, noise, dropping = self._draws(draw_key, count, grid, samples.shape)
         # Data at t = index / grid in the reference's time, on its path; Dew's sigma is 1 - t.
         t = index / grid
         sigma = 1 - t
         x = (1 - (1 - _NOISE_FLOOR) * expand(t, samples)) * noise + expand(t, samples) * samples
         v = (1 - _NOISE_FLOOR) * noise - samples
-        step_size = jnp.concatenate([2.0 ** -levels, jnp.full((count - rows,), 1 / self.shortcut.sections)])
+        step_size = jnp.concatenate([2.0 ** -levels, jnp.full((count - rows,), 1 / self.sections)])
         dropped = (jnp.arange(count) >= rows) & dropping
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)

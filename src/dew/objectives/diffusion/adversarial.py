@@ -20,7 +20,6 @@ the losses follow the papers' equations.
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from collections.abc import Sequence
 
@@ -28,21 +27,14 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.diffusion.presets import Flow
+from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.dit import TextContext, masked_mean
 from dew.objectives.base import Aux, Batch, Objective, Step, Variables
 
-from .objective import (
-    DISCRIMINATOR,
-    SPECTRAL,
-    TEACHER,
-    DiffusionObjective,
-    Distillation,
-    FlowDistillationObjective,
-)
+from .objective import DISCRIMINATOR, SPECTRAL, TEACHER, FlowDistillationObjective
 
 
 def timestep_embedding(time: jax.Array, features: int) -> jax.Array:
@@ -203,47 +195,12 @@ def r1_penalty(score, features: Sequence[jax.Array], batch: Batch) -> jax.Array:
         jnp.sum(jnp.square(g).reshape(g.shape[0], -1), axis=-1) for g in gradients]), axis=0)
 
 
-@dataclasses.dataclass(frozen=True)
-class AdversarialDistillation(Distillation):
-    """Adversarial distillation of a saved flow run into a few-step student.
-
-    This is LADD with ADD's R1 penalty and distillation term. It trains under the
-    `Flow` preset and samples unguided. `AdversarialDistillationObjective` documents
-    the fields, and `feature_layers` must name at least one layer.
-    """
-
-    preset_class = Flow
-    guided = False
-
-    feature_layers: tuple[str, ...] = ()
-    student_times: tuple[float, ...] = (1.0, 0.75, 0.5, 0.25)
-    renoise_times: tuple[float, float] = (1.0, 1.0)
-    distillation_weight: float = 2.5
-    r1_weight: float = 1e-5
-    cmap_dim: int = 64
-    kernel_size: tuple[int, int] = (9, 9)
-
-    def __post_init__(self) -> None:
-        if not self.feature_layers:
-            raise ValueError("the discriminator reads the teacher's tokens after at least one layer")
-        object.__setattr__(self, "feature_layers", tuple(self.feature_layers))
-        object.__setattr__(self, "student_times", tuple(float(time) for time in self.student_times))
-        mean, std = (float(value) for value in self.renoise_times)
-        object.__setattr__(self, "renoise_times", (mean, std))
-        height, width = (int(size) for size in self.kernel_size)
-        object.__setattr__(self, "kernel_size", (height, width))
-
-    def objective(self, base: nn.Module, variables: Variables | None, **run) -> DiffusionObjective:
-        return AdversarialDistillationObjective(distillation=self, teacher=base, variables=variables,
-                                                teacher_variables=self.teacher_variables(variables), **run)
-
-
 class AdversarialDistillationObjective(FlowDistillationObjective):
     """Trains LADD, with ADD's R1 penalty and its distillation term.
 
-    `teacher` is the teacher's model and `teacher_variables` its variables,
-    frozen under `TEACHER`. The student starts from them, and a `Head` reads
-    the teacher's token grid after each layer in `feature_layers`. The
+    The student starts from the teacher's weights (`FlowDistillationObjective`),
+    and a `Head` reads the teacher's token grid after each layer in
+    `feature_layers`, at least one. The
     student's time is drawn from `student_times`, and the renoising level
     from LADD's logit-normal with `renoise_times` (mean 1, std 1, the
     high-noise setting the paper uses for images).
@@ -266,13 +223,19 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
 
     network = DISCRIMINATOR
 
-    def __init__(self, model: nn.Module, process: Process, inputs: InputSpec,
-                 distillation: AdversarialDistillation, *, time_features: int = 256, **kwargs):
-        kwargs.setdefault("steps", 2)
-        super().__init__(model, process, inputs, **kwargs)
-        self.distillation = distillation
+    def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
+                 feature_layers: tuple[str, ...], student_times: tuple[float, ...] = (1.0, 0.75, 0.5, 0.25),
+                 renoise_times: tuple[float, float] = (1.0, 1.0), distillation_weight: float = 2.5,
+                 r1_weight: float = 1e-5, cmap_dim: int = 64, kernel_size: tuple[int, int] = (9, 9),
+                 time_features: int = 256, steps: int = 2, **kwargs):
+        if not feature_layers:
+            raise ValueError("the discriminator reads the teacher's tokens after at least one layer")
+        super().__init__(model, process, inputs, steps=steps, **kwargs)
+        self.feature_layers, self.student_times = feature_layers, student_times
+        self.renoise_times = renoise_times
+        self.distillation_weight, self.r1_weight = distillation_weight, r1_weight
         self.time_features = time_features
-        self.heads = Heads(len(distillation.feature_layers), distillation.cmap_dim, distillation.kernel_size)
+        self.heads = Heads(len(feature_layers), cmap_dim, kernel_size)
 
     def network_variables(self, key: jax.Array, state: Variables) -> Variables:
         """The heads, drawn on the teacher's token grids."""
@@ -295,18 +258,18 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
     def _features(self, teacher: Variables, x, t, conditions) -> list[jax.Array]:
         """The teacher's token grid after each feature layer at `(x, t)`."""
         schedule = self.process.schedule
-        layers = self.distillation.feature_layers
+        layers = self.feature_layers
         _, captured = self.teacher.apply(teacher, x, schedule.model_time(t), **conditions,
                                          capture_intermediates=lambda module, method: (
                                              method == "__call__" and module.name in layers),
                                          mutable=["intermediates"])
         # Flax opens the collection only when a layer was captured.
         kept = dict(captured).get("intermediates", {})
-        missing = [name for name in self.distillation.feature_layers if name not in kept]
+        missing = [name for name in self.feature_layers if name not in kept]
         if missing:
             raise ValueError(f"the teacher has no layers {missing} to read features after")
         grids = []
-        for name in self.distillation.feature_layers:
+        for name in self.feature_layers:
             tokens = jnp.asarray(kept[name]["__call__"][0])
             side = math.isqrt(tokens.shape[1])
             if side * side != tokens.shape[1]:
@@ -321,8 +284,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         schedule = self.process.schedule
         assert self.process.prediction is not None
         conditions, _ = self._conditions(variables, batch, drop_key, dropout=True)
-        indices = jax.random.randint(time_key, (count,), 0, len(self.distillation.student_times))
-        t = jnp.asarray(self.distillation.student_times)[indices]
+        indices = jax.random.randint(time_key, (count,), 0, len(self.student_times))
+        t = jnp.asarray(self.student_times)[indices]
         noise = jax.random.normal(noise_key, samples.shape)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
@@ -330,7 +293,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         clean, _ = student(noisy, t)
 
         level_key, renoise_noise = jax.random.split(renoise_key)
-        mean, std = self.distillation.renoise_times
+        mean, std = self.renoise_times
         level = jax.nn.sigmoid(mean + std * jax.random.normal(level_key, (count,)))
         rates = broadcast_rates(schedule, level, samples)
         renoise = jax.random.normal(renoise_noise, samples.shape)
@@ -358,17 +321,17 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         generator = hinge_generator(fake_scores)
         total = discriminator + generator
         metrics = {"discriminator": jnp.mean(discriminator), "generator": jnp.mean(generator)}
-        if self.distillation.r1_weight > 0:
+        if self.r1_weight > 0:
             r1 = r1_penalty(lambda features: score(heads, spectral, features)[0],
                             [jax.lax.stop_gradient(f) for f in real], batch)
             metrics["r1"] = jnp.mean(r1)
-            total = total + self.distillation.r1_weight * r1
-        if self.distillation.distillation_weight > 0:
+            total = total + self.r1_weight * r1
+        if self.distillation_weight > 0:
             target, _ = self.process.denoiser(self.teacher, teacher, conditions)(
                 renoised(jax.lax.stop_gradient(clean)), level)
             distance = jnp.sum(jnp.square(clean - jax.lax.stop_gradient(target)),
                                axis=tuple(range(1, clean.ndim)))
-            distillation = self.distillation.distillation_weight * schedule.rates(level)[0] * distance
+            distillation = self.distillation_weight * schedule.rates(level)[0] * distance
             metrics["distillation"] = jnp.mean(distillation)
             total = total + distillation
         return (self.row_mean(total, batch),

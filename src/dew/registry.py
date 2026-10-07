@@ -48,7 +48,6 @@ if TYPE_CHECKING:
     from dew.nn.mixers import MixerBase
     from dew.nn.vision import ProjectorBase, TowerBase
     from dew.objectives.base import Metric, Objective
-    from dew.objectives.diffusion.objective import Training
     from dew.sampling.solvers import Solver
     from dew.training.optim import ScheduleBase
 
@@ -619,26 +618,47 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> di
 def _arguments(function: Callable[..., Configured], fields: Mapping[str, object], *,
                dtypes: bool) -> Mapping[str, object]:
     """The record's fields as the parameters of the registered `function`, or
-    of a class's constructor, each walked against its own annotation, as
-    `_declared` walks a dataclass's. A field the function does not take, or a
-    parameter without a default that the record lacks, raises; a function
-    taking `**kwargs` takes any field. A record or a JSON list is read
-    against its parameter's annotation and a dtype's name is the dtype; any
-    other value, a scalar or a value the caller built, is taken as given."""
-    parameters = inspect.signature(function).parameters.values()
-    named = [parameter for parameter in parameters
-             if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)]
-    names = sorted(parameter.name for parameter in named)
-    open_ended = any(parameter.kind is parameter.VAR_KEYWORD for parameter in parameters)
-    unknown = [] if open_ended else sorted(set(fields) - set(names))
-    missing = [parameter.name for parameter in named
-               if parameter.name not in fields and parameter.default is parameter.empty]
+    of a class's constructor (`parameters`), each walked against its own
+    annotation, as `_declared` walks a dataclass's. A field the function does
+    not take, or a parameter without a default that the record lacks, raises;
+    a function taking `**kwargs` takes any field. A record or a JSON list is
+    read against its parameter's annotation and a dtype's name is the dtype;
+    any other value, a scalar or a value the caller built, is taken as given."""
+    named, open_ended = parameters(function)
+    unknown = [] if open_ended else sorted(set(fields) - set(named))
+    missing = [name for name, (parameter, _) in named.items()
+               if name not in fields and parameter.default is parameter.empty]
     if unknown or missing:
         raise ValueError(f"{function.__name__} does not match the record: unknown fields {unknown}, "
-                         f"missing fields {missing}; its parameters are {names}")
-    return {name: _rebuilt(_parameter_type(function, name), value, dtypes=dtypes, name=name)
+                         f"missing fields {missing}; its parameters are {sorted(named)}")
+    return {name: _rebuilt(_parameter_type(named[name][1], name) if name in named else None, value,
+                           dtypes=dtypes, name=name)
             if isinstance(value, (Mapping, list)) or (dtypes and name == "dtype") else value
             for name, value in fields.items()}
+
+
+type Parameters = dict[str, tuple[inspect.Parameter, Callable[..., Configured]]]
+
+
+def parameters(member: Callable[..., Configured]) -> tuple[Parameters, bool]:
+    """`member`'s named parameters, each with the function that declares it,
+    and whether it takes any other keyword besides.
+
+    A class's parameters are its constructor's, and a constructor that passes
+    `**kwargs` on to its base's takes the base's too, as a few-step
+    diffusion objective takes every `DiffusionObjective` argument. A subclass
+    that names an argument again declares its own default for it."""
+    owners = ([vars(owner)["__init__"] for owner in member.__mro__[:-1] if "__init__" in vars(owner)]
+              if isinstance(member, type) else [member])
+    named: Parameters = {}
+    for owner in owners:
+        held = list(inspect.signature(owner).parameters.values())[1 if isinstance(member, type) else 0:]
+        for parameter in held:
+            if parameter.kind in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY):
+                named.setdefault(parameter.name, (parameter, owner))
+        if not any(parameter.kind is parameter.VAR_KEYWORD for parameter in held):
+            return named, False
+    return named, bool(owners)
 
 
 def _parameter_type(function: Callable[..., Configured], name: str) -> Annotation:
@@ -647,10 +667,8 @@ def _parameter_type(function: Callable[..., Configured], name: str) -> Annotatio
     annotation. An annotation naming what the function's module does not
     import at runtime raises, since a record cannot be read against it."""
     # A classmethod a record names, `Class.reader`, is a bound method; its
-    # annotations and module are its function's, and a class's are its
-    # constructor's.
-    underlying = (function.__init__ if isinstance(function, type)
-                  else function.__func__ if isinstance(function, types.MethodType) else function)
+    # annotations and module are its function's.
+    underlying = function.__func__ if isinstance(function, types.MethodType) else function
     if not isinstance(underlying, types.FunctionType):
         return None
     annotations = get_annotations(underlying, format=Format.FORWARDREF)
@@ -959,18 +977,10 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
     "one_cycle": "dew.training.optim:OneCycle",
     "power": "dew.training.optim:Power",
 }, base="dew.training.optim:ScheduleBase")
-trainings: Aliases[type[Training], Training] = Aliases("training", {
-    "diffusion": "dew.objectives.diffusion.objective:Denoising",
-    "flow_grpo": "dew.objectives.diffusion.config:FlowGRPO",
-    "guidance_distillation": "dew.objectives.diffusion.guidance_distillation:GuidanceDistillation",
-    "ladd": "dew.objectives.diffusion.adversarial:AdversarialDistillation",
-    "mean_flow": "dew.objectives.diffusion.few_step:MeanFlowTraining",
-    "rcm": "dew.objectives.diffusion.consistency:ConsistencyDistillation",
-    "shortcut": "dew.objectives.diffusion.few_step:ShortcutTraining",
-}, base="dew.objectives.diffusion.objective:Training")
+
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, datasets, encoders, metrics, objectives, mixers,
-                              towers, projectors, schedules, trainings)
+                              towers, projectors, schedules)
 """Every kind, which a record's alias is looked up across."""
 
 __all__ = [
@@ -988,6 +998,7 @@ __all__ = [
     "mixers",
     "models",
     "objectives",
+    "parameters",
     "presets",
     "projectors",
     "record_fields",

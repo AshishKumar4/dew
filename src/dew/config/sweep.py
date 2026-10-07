@@ -12,7 +12,6 @@ and asks it for the next point; it needs `dewml[hpo]`.
 from __future__ import annotations
 
 import dataclasses
-import inspect
 import itertools
 import json
 import shlex
@@ -24,7 +23,7 @@ import numpy as np
 import tyro
 
 from dew.records import JSON
-from dew.registry import Annotation, _declared_type, models, objectives, wants_tuple
+from dew.registry import Annotation, _declared_type, models, objectives, parameters, wants_tuple
 from dew.telemetry.records import TrialFinished, json_value
 
 if TYPE_CHECKING:
@@ -113,7 +112,7 @@ def _placed(config: RunConfig, path: str) -> tuple[list[str], Annotation]:
         # A flag's annotation types the value, as `--model.<field>` reads it;
         # an argument without a flag (the loss a `Supervised` is given) takes JSON.
         annotation = _declared_type(_member_flags(member, held.fields)[0], field)
-        if annotation is None and field not in inspect.signature(member).parameters:
+        if annotation is None and field not in parameters(member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
         return [*groups, "fields", field], annotation
     if not (dataclasses.is_dataclass(held) and field in _names(held)):
@@ -129,14 +128,14 @@ def _names(held: DataclassInstance | type[DataclassInstance]) -> set[str]:
 def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
     """`text` as the flag of `annotation` reads it (`assigned`), a tuple as
     the list its record holds."""
-    from dew.config import _scalar
+    from dew.config import _flag_json, _scalar
 
     if annotation is not None and _scalar(annotation):
         holder = dataclasses.make_dataclass("Set", [("value", tyro.conf.Positional[annotation])])
         given = shlex.split(text) if wants_tuple(annotation) else [text]
         return json.loads(json.dumps(tyro.cli(holder, args=given, prog=f"--set {path}").value))
     try:
-        return json.loads(text)
+        return _flag_json(text)
     except json.JSONDecodeError:
         return text
 

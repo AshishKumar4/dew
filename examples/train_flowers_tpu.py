@@ -34,7 +34,7 @@ from PIL import Image
 
 import dew
 from dew.artifacts import uint8_pixels
-from dew.config import ModelConfig, OptimConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages
 from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
@@ -112,10 +112,8 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
                                val_batches=1, loading=Loading(workers=0, threads=1,
                                                               read_buffer=2, worker_buffer=1)),
         preset=EDM(regime="pixel"),
-        solver=Heun(),
-        guidance=CFG(2.0),
-        sampling_steps=2,
-        ema_decay=0.9,
+        objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(2.0), "steps": 2,
+                                                "ema_decay": 0.9}),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         # A validation pass needs a consumer; a smoke that walks the
         # validation path names a metric that downloads nothing (fid and
@@ -139,10 +137,8 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         model=ModelConfig.from_model(SimpleDiT(**config.model, dtype=jnp.bfloat16)),
         data=replace(prepared, image_size=config.image_size, val_batches=4),
         preset=EDM(regime="pixel"),
-        solver=Heun(),
-        guidance=CFG(config.guidance),
-        sampling_steps=config.sampling_steps,
-        ema_decay=0.9999,
+        objective=ObjectiveConfig("diffusion", {"solver": Heun(), "guidance": CFG(config.guidance),
+                                                "steps": config.sampling_steps, "ema_decay": 0.9999}),
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=("fid", "clip_score"),
         optim=OptimConfig(weight_decay=0.01, schedule=Cosine(
@@ -193,7 +189,7 @@ def main(config: Config) -> Path:
 
     run_dir = Path(run.trainer.checkpoint_dir) / name
     pipe = dew.pipeline(str(run_dir))
-    drawn = pipe(list(PROMPTS), steps=run.sampling_steps, guidance=config.guidance,
+    drawn = pipe(list(PROMPTS), steps=objective.steps, guidance=config.guidance,
                  solver=Heun(), key=1).host().images
     grid(drawn, config.out / "samples.png")
 
