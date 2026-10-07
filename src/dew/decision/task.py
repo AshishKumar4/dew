@@ -97,12 +97,14 @@ class Weights:
 class Usage:
     """What a request cost: the tokens every question row read, and how much of the state the rows kept.
 
-    The kept share is the smallest any question kept.
+    The kept share is the smallest any question kept. `trimmed` says whether a
+    row shortened a question's instructions or options to fit.
     """
 
     input_tokens: int
     state_tokens: int
     state_kept: int
+    trimmed: bool = False
 
     @property
     def truncated(self) -> bool:
@@ -283,7 +285,8 @@ class Decide:
                        for encoded, scores in own for slot, laid in enumerate(encoded.questions)}
             usage = Usage(sum(len(encoded.tokens) for encoded, _ in own),
                           max((encoded.state_tokens for encoded, _ in own), default=0),
-                          min((encoded.state_kept for encoded, _ in own), default=0))
+                          min((encoded.state_kept for encoded, _ in own), default=0),
+                          any(encoded.trimmed for encoded, _ in own))
             answered.append(({name: answers[name] for name in questions}, usage))
         return answered
 
@@ -302,7 +305,7 @@ class Decide:
         answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
                    for slot, laid in enumerate(row.questions)}
         return ({name: answers[name] for name in questions},
-                Usage(len(row.tokens), row.state_tokens, row.state_kept))
+                Usage(len(row.tokens), row.state_tokens, row.state_kept, row.trimmed))
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = ()) -> list[Encoded]:
@@ -311,9 +314,9 @@ class Decide:
             count = len(questions[laid.name].options)
             if len(laid.options) != count:
                 raise ValueError(
-                    f"question {laid.name!r}: {len(laid.options)} of its {count} options fit in "
-                    f"max_len={self.layout.max_len}; raise max_len, shorten the question, or ask "
-                    "fewer options (`tournament`)")
+                    f"question {laid.name!r}: {len(laid.options)} of its {count} options fit in the "
+                    f"maximum context length, max_len={self.layout.max_len}; raise max_len, shorten "
+                    "the question, or ask fewer options (`tournament`)")
         return rows
 
     def _answer(self, question: Question, logits: np.ndarray) -> Answer:
@@ -480,7 +483,7 @@ class Decide:
         return replace(self, calibration=replace(self.calibration, abstention=abstention))
 
     def systemone(self, request: Mapping[str, object], *, details: bool = False,
-                  strict: bool = False) -> dict[str, JSON]:
+                  strict: bool = False, whole: bool = False) -> dict[str, JSON]:
         """Answer a Jev request body with a Jev response body.
 
         The request holds `state` and `questions` in Jev's wire format, and
@@ -496,6 +499,11 @@ class Decide:
         images, each a PIL image, encoded image bytes, or a base64 string, bare or as
         a `data:` URL. `strict` answers as Jev's own endpoint does: the request's
         extension fields are dropped and the response holds Jev's fields alone.
+
+        With `whole`, a request that the layout could answer only by cutting its
+        state, instructions or options is refused instead, naming the maximum
+        context length, as a benchmark that forbids truncation requires
+        (Decision Index counts such a refusal as unsupported).
         """
         if strict and details:
             raise ValueError("strict answers hold Jev's fields alone, so they carry no details")
@@ -512,6 +520,10 @@ class Decide:
         images = [] if strict else decoded_images(request.get("images"))
         answers, usage = (self._seen(state, questions, images) if images
                           else self.batch([(state, questions)])[0])
+        if whole and (usage.truncated or usage.trimmed):
+            cut = "state" if usage.truncated else "instructions or options"
+            raise ValueError(f"the request does not fit the maximum context length, max_len="
+                             f"{self.layout.max_len} tokens, without cutting its {cut}")
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
         if details:
