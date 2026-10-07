@@ -693,7 +693,10 @@ class Objective(ABC, Generic[Loss, Effects]):
 
         `gradients` has the structure of `stats`: for each scalar statistic,
         its gradient with respect to `params` (the trained `params`
-        collection `loss` was given), or None for one no parameter moves. A
+        collection `loss` was given), or None for one no parameter moves.
+        A rule is the derivative of the statistic as returned, a `Ratio`'s
+        total say, so the step applies it over the mass after the reduction,
+        as it does the total's own derivative. A
         `loss` that computes its own update rule (e-prop's eligibility traces,
         a forward-gradient or evolution-strategies estimate, a synthetic
         gradient) returns this. Each statistic keeps its value, which adds
