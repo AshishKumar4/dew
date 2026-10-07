@@ -702,9 +702,12 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
 
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
-    """A key the mask drops leaves the output unchanged when its value moves,
-    which the unmasked call does not, and an all-True mask is the unmasked
-    call bitwise."""
+    """A key the mask drops leaves the output bitwise unchanged when its value
+    moves, which the unmasked call does not. An all-True mask computes the
+    unmasked attention, but not always bitwise: XLA:GPU fuses the masked
+    softmax differently (2.4e-7 apart on an A100), so it is held to
+    tests/reference_error.py's rule against the unmasked call, both measured
+    from float64."""
     module = NormalAttention(16, heads=2, dim_head=8, attention_impl=implementation)
     rng = np.random.default_rng(0)
     queries = jnp.asarray(rng.normal(size=(2, 5, 16)), jnp.float32)
@@ -716,5 +719,17 @@ def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
     np.testing.assert_array_equal(module.apply(params, queries, context, mask=dropped),
                                   module.apply(params, queries, moved, mask=dropped))
     assert not np.array_equal(module.apply(params, queries, context), module.apply(params, queries, moved))
-    np.testing.assert_array_equal(module.apply(params, queries, context, mask=kept),
-                                  module.apply(params, queries, context))
+    weights = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), params["params"])
+
+    def projected(tokens: jax.Array, name: str) -> np.ndarray:
+        return np.einsum("bsc,chd->bshd", np.asarray(tokens, np.float64), weights[name]["kernel"]) + \
+            weights[name]["bias"]
+
+    q, k, v = projected(queries, "to_q"), projected(context, "to_k"), projected(context, "to_v")
+    logits = np.einsum("bshd,bthd->bhst", q, k) / np.sqrt(8)
+    probabilities = np.exp(logits - logits.max(-1, keepdims=True))
+    attended = np.einsum("bhst,bthd->bshd", probabilities / probabilities.sum(-1, keepdims=True), v)
+    truth = np.einsum("bshd,hdc->bsc", attended, weights["to_out_0"]["kernel"]) + weights["to_out_0"]["bias"]
+    assert_as_exact_as_the_reference(np.asarray(module.apply(params, queries, context, mask=kept)),
+                                     np.asarray(module.apply(params, queries, context)), truth,
+                                     f"{implementation} attention under an all-True mask")
