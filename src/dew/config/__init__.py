@@ -1054,13 +1054,17 @@ class RunConfig:
             prepared.after(state, os.path.join(trainer.checkpoint_dir, name))
         return state
 
-    def _naming(self, objective: Objective[Loss, Effects]) -> Self:
-        """Return this config with `objective`'s class as its record names it.
+    def recorded(self, objective: Objective[Loss, Effects]) -> Self:
+        """Return this config as the record of the run that trains `objective`.
 
         The record names the class by its import path, so it says what was
         trained and loads in a process that imported nothing. Arguments the
         run states belong to the class it names, so a run that states them
-        for another class than the one it trains is refused.
+        for another class than the one it trains is refused. Each argument
+        the objective resolved from what it was built around
+        (`Objective.resolved`) and the run leaves unstated is recorded as
+        the objective holds it, so the record builds what the run sampled
+        with.
         """
         trained = registry.import_path(type(objective))
         stated = ObjectiveConfig(trained) if self.objective is None else self.objective
@@ -1068,7 +1072,13 @@ class RunConfig:
             if stated.fields:
                 raise ValueError(f"the run states the arguments of {stated.name} and trains {trained}")
             stated = ObjectiveConfig(trained)
-        return dataclasses.replace(self, objective=stated)
+        missing = [name for name in objective.resolved if not hasattr(objective, name)]
+        if missing:
+            raise ValueError(f"{trained} resolves {missing} and holds no attribute of that name to record")
+        resolved = registry.argument_records(type(objective), {
+            name: getattr(objective, name) for name in objective.resolved if name not in stated.fields})
+        return dataclasses.replace(self, objective=dataclasses.replace(
+            stated, defaults={**stated.defaults, **resolved}))
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
@@ -1108,7 +1118,7 @@ class RunConfig:
         if self.trainer.quantization is not None:
             _quantize(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
-        self = dataclasses.replace(self._naming(objective),
+        self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early
