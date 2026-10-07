@@ -322,7 +322,6 @@ def to_record(value, annotation) -> JSON:
     declares a base, a union or nothing, so the reader knows what to build;
     a function is `{"function": <import path>}`.
     """
-    from flax import linen as nn
 
     from dew.records import recorded_duration
 
@@ -331,9 +330,7 @@ def to_record(value, annotation) -> JSON:
     if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
         return dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        fields = {f.name: to_record(getattr(value, f.name), _declared_type(type(value), f.name))
-                  for f in dataclasses.fields(value) if _recorded(f)
-                  and not (isinstance(value, nn.Module) and f.name in ('parent', 'name'))}
+        fields = record_fields(value, type(value))
         if type(value) is _unwrapped(annotation):
             return fields
         return {"class": import_path(type(value)), "fields": fields}
@@ -436,6 +433,12 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             return _built(_member(named[0], classes), named[1], dtypes=dtypes)
         return configured(value)
     if isinstance(value, Mapping):
+        if typing.get_origin(annotation) is Callable or annotation is Callable:
+            # A callable field, such as a Sequential's layers, takes a record
+            # of any class: a layer is called, whatever class it is.
+            named = _class_record(value)
+            if named is not None:
+                return _built(_member(named[0], (object,)), named[1], dtypes=dtypes)
         if isinstance(annotation, type) and annotation is not object:
             # A field typed with a class takes a record of the class itself or
             # of any class derived from it or function returning it; `object`
@@ -622,6 +625,24 @@ def _returns(member: Callable[..., Configured], held: type) -> bool:
     derived from it."""
     returned = _parameter_type(member, "return")
     return isinstance(returned, type) and issubclass(returned, held)
+
+
+def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
+    """The record of a dataclass value's constructor fields, each as `owner`
+    declares it, at every level of a nested value alike.
+
+    A field still holding its declared callable default, such as a Flax
+    layer's initializer closure, is left out: no record can name a closure,
+    and the class supplies the same default again when the record is read."""
+    from flax import linen as nn
+
+    fields = {}
+    for field in dataclasses.fields(value):
+        held = getattr(value, field.name)
+        if (_recorded(field) and not (isinstance(value, nn.Module) and field.name in ('parent', 'name'))
+                and not (callable(held) and held is field.default)):
+            fields[field.name] = to_record(held, _declared_type(owner, field.name))
+    return fields
 
 
 def _recorded(field: dataclasses.Field) -> bool:
@@ -923,6 +944,7 @@ __all__ = [
     "objectives",
     "presets",
     "projectors",
+    "record_fields",
     "schedules",
     "solvers",
     "to_record",
