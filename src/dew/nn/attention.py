@@ -800,7 +800,7 @@ def triton_attention(query, key, value, causal: bool):
         tokamax = importlib.import_module('tokamax')
     except ImportError as e:
         raise ValueError("attention implementation 'triton' needs tokamax: "
-                         "uv pip install tokamax -c constraints.txt (docs/installation.md)") from e
+                         "uv pip install 'tokamax>=0.0.15' (docs/installation.md)") from e
 
     def local(query, key, value):
         return tokamax.dot_product_attention(query, key, value, is_causal=causal,

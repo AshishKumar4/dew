@@ -83,7 +83,7 @@ The choice is the same on a mesh. The experts run inside the dispatch's `shard_m
 
 Left to its default, tokamax picks its v1 TPU kernel, which is 13 times slower than XLA on a v6e, so Dew names the kernel it wants. If a model asks for `'tokamax'` and the package cannot be imported, initialization fails; Dew does not fall back to XLA under that name.
 
-tokamax's releases do not install cleanly beside Dew. tokamax 0.0.13 and 0.0.14 pin `typeguard==2.13.3`, but tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. So installing either release downgrades typeguard, `uv pip check` reports the conflict, and every recipe then fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. If you install tokamax with `-c constraints.txt`, you get a commit from its main branch that dropped typeguard ([Installation](../installation.md)). The grouped-matmul numbers on this page were measured on 0.0.14.
+Install tokamax 0.0.15 or later ([Installation](../installation.md)). tokamax 0.0.13 and 0.0.14 pin `typeguard==2.13.3`, but tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. So installing either release downgrades typeguard, `uv pip check` reports the conflict, and every recipe then fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. The grouped-matmul numbers on this page were measured on 0.0.14.
 
 ## Dispatch and expert parallelism
 
