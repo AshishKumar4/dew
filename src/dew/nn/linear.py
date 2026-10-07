@@ -37,7 +37,7 @@ from dew.nn.scatter import DROPPED
 from .attention import unweighted_rmsnorm
 from .blocks import normal_kernel
 from .inputs import AttentionMetadata
-from .precision import at_least_fp32
+from .precision import asks_default_precision, at_least_fp32
 from .sharding import logical_axes
 
 CHUNK_SIZE = 64
@@ -380,7 +380,7 @@ def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     through `dew.nn.kernels.delta_rule.step`, which reads and writes the
     state once (CUDA, where `delta_rule.fits` the state). A row `active`
     `[B]` marks False keeps its state untouched and outputs zeros."""
-    work = state.dtype
+    work = jnp.float32
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
     decay = jnp.broadcast_to(jnp.exp(g[:, 0].astype(work))[..., None], key.shape)
     final, out = delta_rule.step(state, query * key.shape[-1] ** -0.5, key, value, decay,
@@ -414,9 +414,16 @@ class GatedDeltaNet(nn.Module):
     num_k_heads` value heads share a key head (`repeat_interleave`).
 
     The decode state is `recurrent_state` [B, H, Dk, Dv] and `conv_state`
-    [B, D, K-1] in the `cache` collection; the conv state crosses from prefill
-    to decode so a continuation sees the last K-1 real columns. Parameter names
-    are the checkpoint's (`conv1d/weight` the `[D, 1, K]` taps, `A_log` and
+    [B, D, K-1] in the `cache` collection. A bfloat16 model holds its
+    recurrent state in bfloat16, as vLLM does, rounded stochastically after
+    each decode token (`delta_rule.round_to_bf16`): rounding to nearest
+    holds a slowly decaying state where it is, and its error grew tenfold
+    over 1024 tokens. Any other model holds fp32, as does one asked for more
+    than the default matmul precision (`matmul_precision` "highest", as its
+    vocabulary head stays fp32), and the rule always runs in fp32
+    (docs/performance.md, "The hybrid's bf16 state"). The conv state
+    crosses from prefill to decode so a continuation sees the last K-1 real
+    columns. Parameter names are the checkpoint's (`conv1d/weight` the `[D, 1, K]` taps, `A_log` and
     `dt_bias` `[Hv]`). `fused_in_proj` keeps Qwen3-Next's two fused leaves,
     `in_proj_qkvz` and `in_proj_ba`, split per key-head row group as
     `fix_query_key_value_ordering` does (modeling_qwen3_next.py:540-586).
@@ -541,26 +548,31 @@ class GatedDeltaNet(nn.Module):
         if decode:
             # The first decode-mode call only allocates, the way
             # open_kv_cache's is: init_cache's dummy token must not consume
-            # a position or leave state behind.
+            # a position or leave state behind. The conv state holds the
+            # projections' own values, so it is held in their dtype at no
+            # cost; the recurrent state is held as the docstring says.
             allocated = self.has_variable('cache', 'recurrent_state')
+            held = (jnp.promote_types(self.dtype, jnp.bfloat16)
+                    if self.dtype is not None and asks_default_precision(self.precision, configured=True)
+                    else wide)
             conv_state = self.variable(
                 'cache', 'conv_state', jnp.zeros,
-                (B, self.conv_features, self.conv_kernel - 1), wide)
+                (B, self.conv_features, self.conv_kernel - 1), jnp.promote_types(query.dtype, held))
             recurrent = self.variable(
                 'cache', 'recurrent_state', jnp.zeros,
-                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim),
-                wide)
+                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim), held)
             if not allocated:
                 # Allocation only: the caller's first real forward, not this
                 # call, starts the state.
                 out = jnp.zeros((B, S, self.value_features), self.dtype)
                 return self.out_proj(out)
+            previous = conv_state.value.astype(wide)
             if valid is not None:
-                mixed, history = _masked_conv1d(conv_input, taps, valid, conv_state.value)
-                conv_state.value = history
+                mixed, history = _masked_conv1d(conv_input, taps, valid, previous)
+                conv_state.value = history.astype(conv_state.value.dtype)
             else:
-                history = jnp.concatenate([conv_state.value, conv_input], axis=2)
-                conv_state.value = history[:, :, -(self.conv_kernel - 1):]
+                history = jnp.concatenate([previous, conv_input], axis=2)
+                conv_state.value = history[:, :, -(self.conv_kernel - 1):].astype(conv_state.value.dtype)
                 mixed = causal_conv1d(history, taps)[..., -S:]
         elif valid is not None:
             mixed, _ = _masked_conv1d(conv_input, taps, valid)
@@ -584,16 +596,19 @@ class GatedDeltaNet(nn.Module):
             beta = jnp.where(valid[:, :, None], beta, 0.0)
             g = jnp.where(valid[:, :, None], g, 0.0)
 
-        state = None if recurrent is None else recurrent.value
-        if S == 1 and state is not None and delta_rule.fits(state):
-            out, final = decode_gated_delta_rule(query, key, value, g, beta, state,
+        held = None if recurrent is None else recurrent.value
+        state = None if held is None else held.astype(wide)
+        if S == 1 and held is not None and delta_rule.fits(held):
+            out, final = decode_gated_delta_rule(query, key, value, g, beta, held,
                                                  None if valid is None else valid[:, 0])
         elif S == 1:
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+            if held is not None and held.dtype == jnp.bfloat16:
+                final = delta_rule.round_to_bf16(final, key[:, 0].astype(wide), value[:, 0].astype(wide))
         else:
             out, final = chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size)
         if recurrent is not None:
-            recurrent.value = final
+            recurrent.value = final.astype(recurrent.value.dtype)
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
         out = self.norm(out, gate)  # the norm scales, then the activation gates
