@@ -15,15 +15,20 @@ grades a task that leaves one out as not green.
 A task runs its files under its Python's environment (tools/armada/install.sh)
 with CI's selection, and writes a verdict row for each. A row is red on a
 failed or erroring test, on a test skipped because its import failed (a file
-CI would never have run), or when pytest left no report of it.
+CI would never have run), or when pytest left no report of it. A task still
+running at its deadline, short of armada's own timeout, is interrupted and
+every row it holds is red, so a hang is graded with its stack dump rather
+than leaving the task without a verdict.
 """
 
 import argparse
 import heapq
 import json
 import math
+import signal
 import subprocess
 import sys
+import threading
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -102,8 +107,8 @@ def file_of(case: ET.Element) -> str:
     return "/".join(parts[:module + 1]) + ".py"
 
 
-def task(python: str, tests: list[str], split: str, out: Path) -> int:
-    """Run `tests` and write one verdict row a file."""
+def task(python: str, tests: list[str], split: str, out: Path, deadline: float) -> int:
+    """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds."""
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
     grouping = ["--splits", split.split("/")[1], "--group", split.split("/")[0], "--splitting-algorithm",
@@ -114,11 +119,21 @@ def task(python: str, tests: list[str], split: str, out: Path) -> int:
                "-p", "no:cacheprovider", f"--junitxml={report}", *tests, *grouping]
     # Streamed as it comes, so a task armada stops at its timeout still shows where it was.
     lines = []
+    expired = threading.Event()
     with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as done:
+        def interrupt() -> None:
+            expired.set()
+            done.send_signal(signal.SIGINT)
+            threading.Timer(60, done.kill).start()
+
+        timer = threading.Timer(deadline, interrupt)
+        timer.start()
         for line in done.stdout or ():
             sys.stdout.write(line)
             sys.stdout.flush()
             lines.append(line)
+        done.wait()
+        timer.cancel()
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     rows = []
@@ -131,6 +146,8 @@ def task(python: str, tests: list[str], split: str, out: Path) -> int:
                 if "could not import" in f"{node.get('message')} {node.text}"]
         if not own and done.returncode not in (0, 5):
             red.append(f"pytest exited {done.returncode} with no report of {name}")
+        if expired.is_set():
+            red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
         seconds = sum(float(case.get("time") or 0) for case in own)
         rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([output[-4000:]] if red else [])),
@@ -150,12 +167,14 @@ def main() -> int:
     running.add_argument("--tests", required=True)
     running.add_argument("--split", default="")
     running.add_argument("--out", type=Path, required=True)
+    running.add_argument("--deadline", type=float, default=1680.0,
+                         help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     args = parser.parse_args()
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps({"include": plan(args.target, timings)}))
         return 0
-    return task(args.python, args.tests.split(), args.split, args.out)
+    return task(args.python, args.tests.split(), args.split, args.out, args.deadline)
 
 
 if __name__ == "__main__":
