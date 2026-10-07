@@ -172,7 +172,9 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mappi
     Scalars, literals and tuples of them are typed as declared; dtypes read
     their names and precision its level. Any other field (a sequence of
     records, a nested model) takes one JSON value, the record `build` reads.
-    A field with no default also takes None, for leaving it to the recipe."""
+    A field with no default also takes None, for leaving it to the recipe. A
+    field whose default no record carries (a callable, say) gets no flag and
+    keeps that default."""
     flags, defaults = [], {}
     for field in dataclasses.fields(member):
         if not field.init or field.name in ("parent", "name"):

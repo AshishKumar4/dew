@@ -26,12 +26,14 @@ class Keyed:
     places: Mapping[tuple[str, int], float] = dataclasses.field(default_factory=dict)
     sides: Mapping[Literal["left", "right"], int] = dataclasses.field(default_factory=dict)
     either: Mapping[int | str, int] = dataclasses.field(default_factory=dict)
+    numbers: Mapping[float | int, str] = dataclasses.field(default_factory=dict)
 
 
 KEYED = Keyed(weights={0: 0.5, -3: 2.0, 10**20: 1.0},
               scales={0.1: "a", -0.0: "b", 1e-300: "c", math.inf: "d"},
               paths={("params", "layers_0", "q"): 1, ("",): 2, ("a", "", "b"): 3},
-              places={("layer", 7): 0.25}, sides={"left": 1, "right": 2}, either={1: 1, "x": 2})
+              places={("layer", 7): 0.25}, sides={"left": 1, "right": 2}, either={1: 1, "x": 2},
+              numbers={1: "int", 1.5: "float"})
 
 READ_BACK = """
 import json, sys
@@ -39,7 +41,7 @@ from dew.registry import from_record
 from test_record_keys import Keyed
 held = from_record(Keyed, json.loads(sys.stdin.read()), dtypes=False)
 print(repr({name: [(type(key).__name__, key) for key in getattr(held, name)] for name in
-            ("weights", "scales", "paths", "places", "sides", "either")}))
+            ("weights", "scales", "paths", "places", "sides", "either", "numbers")}))
 print(held == Keyed(**{f: getattr(held, f) for f in Keyed.__dataclass_fields__}))
 """
 
@@ -53,7 +55,7 @@ def test_a_record_reads_its_keys_back_as_their_declared_types_in_a_fresh_process
                           env=env, timeout=300, check=False)
     assert done.returncode == 0, done.stderr[-2000:]
     expected = {name: [(type(key).__name__, key) for key in getattr(KEYED, name)] for name in
-                ("weights", "scales", "paths", "places", "sides", "either")}
+                ("weights", "scales", "paths", "places", "sides", "either", "numbers")}
     assert done.stdout.splitlines()[0] == repr(expected)
     assert from_record(Keyed, json.loads(written), dtypes=False) == KEYED
 

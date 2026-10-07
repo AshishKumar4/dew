@@ -510,7 +510,9 @@ def _key(annotation: Annotation, key: str) -> Configured:
         return tuple(_key(part_type, part) for part_type, part in zip(entry_types(annotation, len(parts)),
                                                                        parts, strict=True))
     if typing.get_origin(annotation) in (Union, types.UnionType):
-        for member in sorted(typing.get_args(annotation), key=lambda member: member is str):
+        # An int spelling reads as an int before a float or a string reads it.
+        for member in sorted(typing.get_args(annotation),
+                             key=lambda member: (member is str, member is float)):
             try:
                 return _key(member, key)
             except ValueError:
