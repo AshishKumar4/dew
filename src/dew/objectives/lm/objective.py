@@ -48,7 +48,7 @@ from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, lay
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import AffineHead, DecoderTraining, Logits, TokenModel
+from dew.nn.protocols import DecoderTraining, Logits, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -73,6 +73,7 @@ from dew.objectives.base import (
 from dew.objectives.lm.chunked import (
     chunked_tile,
     head_cross_entropy,
+    head_table,
     logits_cross_entropy,
     model_logits,
     reads_states,
@@ -921,8 +922,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                 else logits_cross_entropy(scores.hidden, targets, predict=False, temperature=temperature))
             log_probs = -losses
         if support is not None:
-            head = (self.model.apply(params, method="output_table") if isinstance(self.model, AffineHead)
-                    else None)
+            head = head_table(self.model, params)
             if head is None:
                 raise ValueError(
                     "a sampler's support is rescored against the rows of the head's matrix, and no "
