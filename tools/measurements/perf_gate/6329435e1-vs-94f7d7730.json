@@ -1,0 +1,134 @@
+{
+  "base": "base",
+  "head": "head",
+  "rows": [
+    {
+      "name": "step lm-dense 4x1024",
+      "unit": "ms",
+      "tool": "benchmark_step.py"
+    },
+    {
+      "name": "step lm-moe 4x1024",
+      "unit": "ms",
+      "tool": "benchmark_step.py"
+    },
+    {
+      "name": "step simple-dit-b 32x64px",
+      "unit": "ms",
+      "tool": "benchmark_step.py"
+    },
+    {
+      "name": "serve qwen3-0.6b 32 slots",
+      "unit": "items/s",
+      "tool": "benchmark_lm_serving.py"
+    },
+    {
+      "name": "serve qwen3-0.6b 128 slots",
+      "unit": "items/s",
+      "tool": "benchmark_lm_serving.py"
+    },
+    {
+      "name": "attention cudnn S=2048 D=128 causal fwd+bwd",
+      "unit": "ms",
+      "tool": "benchmark_attention.py"
+    },
+    {
+      "name": "attention xla S=2048 D=128 causal fwd+bwd",
+      "unit": "ms",
+      "tool": "benchmark_attention.py"
+    },
+    {
+      "name": "image pipeline flowers 128px, device crop+flip+jitter",
+      "unit": "items/s",
+      "tool": "benchmark_image_pipeline.py"
+    },
+    {
+      "name": "checkpoint lm-dense save",
+      "unit": "ms",
+      "tool": ""
+    },
+    {
+      "name": "checkpoint lm-dense restore",
+      "unit": "ms",
+      "tool": ""
+    }
+  ],
+  "samples": {
+    "base": [
+      {
+        "step lm-dense 4x1024": 82.866,
+        "step lm-moe 4x1024": 57.15,
+        "step simple-dit-b 32x64px": 41.275,
+        "serve qwen3-0.6b 32 slots": "not run: ine 746, in random_wrap\n    _check_prng_key_data(impl, base_arr)\n  File \"/content/c30pg-a100-perf-gate/job-1/venv/lib/python3.12/site-packages/jax/_src/random/prng.py\", line 129, in _check_prng_key_data\n    raise TypeError(\"JAX encountered invalid PRNG key data: expected key_data \"\nTypeError: JAX encountered invalid PRNG key data: expected key_data to have ndim, shape, and dtype attributes. Got 0\n",
+        "serve qwen3-0.6b 128 slots": "not run: ine 746, in random_wrap\n    _check_prng_key_data(impl, base_arr)\n  File \"/content/c30pg-a100-perf-gate/job-1/venv/lib/python3.12/site-packages/jax/_src/random/prng.py\", line 129, in _check_prng_key_data\n    raise TypeError(\"JAX encountered invalid PRNG key data: expected key_data \"\nTypeError: JAX encountered invalid PRNG key data: expected key_data to have ndim, shape, and dtype attributes. Got 0\n",
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 10.096316899989688,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.671896250004465,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: e/job-1/dew/tools/benchmark_image_pipeline.py --flowers exited 1: Traceback (most recent call last):\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/tools/benchmark_image_pipeline.py\", line 34, in <module>\n    from dew.data import DataPartition, Loading, TFDSImages\nImportError: cannot import name 'TFDSImages' from 'dew.data' (/content/gate-base/src/dew/data/__init__.py). Did you mean: 'HFImages'?\n",
+        "checkpoint lm-dense save": "not run: ate-base/src/dew/checkpoints/__init__.py\", line 599, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/gate-base/src/dew/checkpoints/__init__.py\", line 268, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n",
+        "checkpoint lm-dense restore": "not run: ate-base/src/dew/checkpoints/__init__.py\", line 599, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/gate-base/src/dew/checkpoints/__init__.py\", line 268, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n"
+      },
+      {
+        "step lm-dense 4x1024": 82.644,
+        "step lm-moe 4x1024": 57.176,
+        "step simple-dit-b 32x64px": 41.249,
+        "serve qwen3-0.6b 32 slots": "not run: ine 746, in random_wrap\n    _check_prng_key_data(impl, base_arr)\n  File \"/content/c30pg-a100-perf-gate/job-1/venv/lib/python3.12/site-packages/jax/_src/random/prng.py\", line 129, in _check_prng_key_data\n    raise TypeError(\"JAX encountered invalid PRNG key data: expected key_data \"\nTypeError: JAX encountered invalid PRNG key data: expected key_data to have ndim, shape, and dtype attributes. Got 0\n",
+        "serve qwen3-0.6b 128 slots": "not run: ine 746, in random_wrap\n    _check_prng_key_data(impl, base_arr)\n  File \"/content/c30pg-a100-perf-gate/job-1/venv/lib/python3.12/site-packages/jax/_src/random/prng.py\", line 129, in _check_prng_key_data\n    raise TypeError(\"JAX encountered invalid PRNG key data: expected key_data \"\nTypeError: JAX encountered invalid PRNG key data: expected key_data to have ndim, shape, and dtype attributes. Got 0\n",
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 10.361989250009174,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.692161049995775,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: e/job-1/dew/tools/benchmark_image_pipeline.py --flowers exited 1: Traceback (most recent call last):\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/tools/benchmark_image_pipeline.py\", line 34, in <module>\n    from dew.data import DataPartition, Loading, TFDSImages\nImportError: cannot import name 'TFDSImages' from 'dew.data' (/content/gate-base/src/dew/data/__init__.py). Did you mean: 'HFImages'?\n",
+        "checkpoint lm-dense save": "not run: ate-base/src/dew/checkpoints/__init__.py\", line 599, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/gate-base/src/dew/checkpoints/__init__.py\", line 268, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n",
+        "checkpoint lm-dense restore": "not run: ate-base/src/dew/checkpoints/__init__.py\", line 599, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/gate-base/src/dew/checkpoints/__init__.py\", line 268, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n"
+      },
+      {
+        "step lm-dense 4x1024": 82.585,
+        "step lm-moe 4x1024": 57.161,
+        "step simple-dit-b 32x64px": 41.36,
+        "serve qwen3-0.6b 32 slots": "not run: ine 746, in random_wrap\n    _check_prng_key_data(impl, base_arr)\n  File \"/content/c30pg-a100-perf-gate/job-1/venv/lib/python3.12/site-packages/jax/_src/random/prng.py\", line 129, in _check_prng_key_data\n    raise TypeError(\"JAX encountered invalid PRNG key data: expected key_data \"\nTypeError: JAX encountered invalid PRNG key data: expected key_data to have ndim, shape, and dtype attributes. Got 0\n",
+        "serve qwen3-0.6b 128 slots": "not run: ine 746, in random_wrap\n    _check_prng_key_data(impl, base_arr)\n  File \"/content/c30pg-a100-perf-gate/job-1/venv/lib/python3.12/site-packages/jax/_src/random/prng.py\", line 129, in _check_prng_key_data\n    raise TypeError(\"JAX encountered invalid PRNG key data: expected key_data \"\nTypeError: JAX encountered invalid PRNG key data: expected key_data to have ndim, shape, and dtype attributes. Got 0\n",
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 9.887704200014014,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.68076239998754,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: e/job-1/dew/tools/benchmark_image_pipeline.py --flowers exited 1: Traceback (most recent call last):\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/tools/benchmark_image_pipeline.py\", line 34, in <module>\n    from dew.data import DataPartition, Loading, TFDSImages\nImportError: cannot import name 'TFDSImages' from 'dew.data' (/content/gate-base/src/dew/data/__init__.py). Did you mean: 'HFImages'?\n",
+        "checkpoint lm-dense save": "not run: ate-base/src/dew/checkpoints/__init__.py\", line 599, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/gate-base/src/dew/checkpoints/__init__.py\", line 268, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n",
+        "checkpoint lm-dense restore": "not run: ate-base/src/dew/checkpoints/__init__.py\", line 599, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/gate-base/src/dew/checkpoints/__init__.py\", line 268, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n"
+      }
+    ],
+    "head": [
+      {
+        "step lm-dense 4x1024": 71.923,
+        "step lm-moe 4x1024": 51.681,
+        "step simple-dit-b 32x64px": 38.923,
+        "serve qwen3-0.6b 32 slots": 7426.836456683876,
+        "serve qwen3-0.6b 128 slots": 14466.2004759618,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 10.019619900003818,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.727139150002586,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: ror(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at \"ModuleNotFoundError: No module named 'importlib_resources'\". Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": "not run: points/__init__.py\", line 1610, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/src/dew/checkpoints/__init__.py\", line 699, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n",
+        "checkpoint lm-dense restore": "not run: points/__init__.py\", line 1610, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/src/dew/checkpoints/__init__.py\", line 699, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n"
+      },
+      {
+        "step lm-dense 4x1024": 71.606,
+        "step lm-moe 4x1024": 51.705,
+        "step simple-dit-b 32x64px": 38.98,
+        "serve qwen3-0.6b 32 slots": 7982.17594921136,
+        "serve qwen3-0.6b 128 slots": 14500.743240312617,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 11.236675049997302,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.86560619999,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: ror(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at \"ModuleNotFoundError: No module named 'importlib_resources'\". Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": "not run: points/__init__.py\", line 1610, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/src/dew/checkpoints/__init__.py\", line 699, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n",
+        "checkpoint lm-dense restore": "not run: points/__init__.py\", line 1610, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/src/dew/checkpoints/__init__.py\", line 699, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n"
+      },
+      {
+        "step lm-dense 4x1024": 71.546,
+        "step lm-moe 4x1024": 51.686,
+        "step simple-dit-b 32x64px": 38.956,
+        "serve qwen3-0.6b 32 slots": 7986.964696432084,
+        "serve qwen3-0.6b 128 slots": 14500.582689285431,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 10.954343000003064,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.72550440001032,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: ror(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at \"ModuleNotFoundError: No module named 'importlib_resources'\". Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": "not run: points/__init__.py\", line 1610, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/src/dew/checkpoints/__init__.py\", line 699, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n",
+        "checkpoint lm-dense restore": "not run: points/__init__.py\", line 1610, in restore\n    restored = _filled(template, restored, step)\n               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/content/c30pg-a100-perf-gate/job-1/dew/src/dew/checkpoints/__init__.py\", line 699, in _filled\n    raise ValueError(\"checkpoint directory and serialized attempted step disagree\")\nValueError: checkpoint directory and serialized attempted step disagree\n"
+      }
+    ]
+  }
+}
