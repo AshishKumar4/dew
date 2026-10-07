@@ -110,7 +110,11 @@ class LMRunConfig(RunConfig):
                    max(tokens.seq_len, len(samples.prompt) + samples.max_new_tokens))
         run, source = self, None
         if self.pretrained is None:
-            fields = {**self.model.fields, "max_seq_len": context, "vocab_size": vocab_size}
+            # A fresh masked-diffusion model may corrupt to the id past the
+            # tokenizer's, as MDLM does, so the table covers its mask id too.
+            mask = self.model.arguments.get("mask_token_id")
+            table = max(vocab_size, mask + 1) if isinstance(mask, int) else vocab_size
+            fields = {**self.model.fields, "max_seq_len": context, "vocab_size": table}
             model = models.build(self.model.name, {**self.model.arguments, **fields})
         else:
             source, run = self.pretrained_source(written, vocab_size, context)
@@ -240,10 +244,11 @@ class LMRunConfig(RunConfig):
 
 def token_vocabulary(tokens: TokenWindows) -> tuple[str, int]:
     """The tokenizer and vocabulary size the token files `data` reads were
-    written with: one directory's, or those of each corpus of a weighted
-    mixture or of the phases, which feed one embedding table and so have to
-    agree."""
-    path = tokens.corpora if tokens.phases else tokens.path
+    written with: one directory's (a `hub` split's, tokenized here on first
+    use), or those of each corpus of a weighted mixture or of the phases,
+    which feed one embedding table and so have to agree."""
+    path = (tokens.hub.tokenized() if tokens.hub is not None
+            else tokens.corpora if tokens.phases else tokens.path)
     if not path:
         raise ValueError("--data.path is the token directory `dew tokenize` wrote")
     directories = [Path(path)] if isinstance(path, str) else [Path(name) for name in sorted(path)]
