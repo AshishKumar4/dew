@@ -1,0 +1,11 @@
+#!/bin/sh
+# The fast half of the lint gate, on the Python files this commit stages:
+# ruff and tools/lint_slop.py over the paths CI lints with each. Pyright and
+# the tests stay in CI. Install it as CONTRIBUTING.md says; `git commit
+# --no-verify` skips it once. It lints the files as they are in the working
+# tree.
+staged() { git diff --cached --name-only --diff-filter=ACMR -z -- "$@"; }
+staged 'src/dew/*.py' 'tests/*.py' 'examples/*.py' 'recipes/*.py' \
+    tools/lint_slop.py tools/complexity.py tools/mutation.py | xargs -0r uvx ruff@0.14.3 check --quiet || exit 1
+staged 'src/dew/*.py' 'tests/*.py' 'tools/*.py' 'examples/*.py' 'recipes/*.py' |
+    JAX_PLATFORMS=cpu xargs -0r python tools/lint_slop.py || exit 1
