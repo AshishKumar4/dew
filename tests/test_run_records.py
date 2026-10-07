@@ -147,14 +147,14 @@ def test_a_record_holds_the_sampling_its_objective_resolved_and_builds_it_after_
 
 
 class Misnamed(Supervised):
-    """A `Supervised` that names an argument it resolves after no attribute it holds."""
+    """A `Supervised` that says it resolves its metrics, which it holds under another name."""
 
-    resolved = ("criterion",)
+    resolved = ("metrics",)
 
 
 def test_a_resolved_argument_the_objective_holds_no_attribute_for_is_refused():
     objective = Misnamed(nn.Dense(2), lambda output, batch: output, inputs=InputSpec(Field("x", (3,))))
-    with pytest.raises(ValueError, match=r"resolves \['criterion'\] and holds no attribute"):
+    with pytest.raises(ValueError, match=r"resolves \['metrics'\] and holds no attribute"):
         RunConfig().recorded(objective)
 
 
