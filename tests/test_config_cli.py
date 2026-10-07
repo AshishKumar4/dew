@@ -12,7 +12,7 @@ from typing import Annotated
 
 import numpy as np
 import pytest
-from test_diffusion_objective import RES, StubText
+from diffusion_stubs import RES, StubText
 
 from dew.config import RunConfig, ScheduleSpec
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages

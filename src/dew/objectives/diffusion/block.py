@@ -14,14 +14,12 @@ Reference: gemma bf0b49901a428d13e9c2b2629f0eb9c153d3cbd3,
 
 from __future__ import annotations
 
-import functools
 import math
 from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import optax
 from flax import linen as nn, struct
 
 from dew.artifacts import TokenScores
@@ -142,14 +140,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     corrupted, but only one valid canvas, chosen uniformly, contributes the
     diffusion cross entropy.
 
-    `processor` is what `pipeline` uses to turn text into ids and decode
-    them, unless it is given another one. A run records its tokenizer.
-
-    `variables` is the tree training starts from: the SFT source's, or an
-    adapter's split of it. A split (`dew.objectives.base.freeze`) is kept,
-    so the optimizer updates only what the split leaves in `params`. `model`
-    may be the loaded source itself, which supplies its model, variables and
-    processor. With no variables, training starts from a fresh init.
+    `model` may be the loaded SFT source, and `variables` and `processor`
+    override its own (`Objective.bind_model`).
 
     Both cross entropies score the final states through the bounded head
     (`dew.objectives.lm.chunked.head_cross_entropy`), `head_chunks`
@@ -210,9 +202,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.encoder_loss_weight = encoder_loss_weight
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
-        # The EMA follows what moves; the frozen collection never does.
-        self.ema = None if ema_decay is None else EMASpec(
-            optax.constant_schedule(ema_decay), select=lambda path: path[0] != FROZEN)
+        self.ema = EMASpec.constant(ema_decay)
         self.head_chunks = head_chunks
 
     def task_record(self) -> Mapping[str, JSON]:
@@ -288,27 +278,15 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return stats, Aux(metrics={"canvas_ce": canvas_stats.mean()[0],
                                   "encoder_ce": encoder_stats.mean()[0]})
 
-    def evaluate(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
+    def _evaluation_scores(self, params: Variables, batch: Batch, key: jax.Array) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
 
         One noise level and one canvas per row are drawn from the pass's key,
-        as in training. Dropout is off, and the averaged weights are used when
-        the run keeps them. So `perplexity` over a validation pass is the
-        exponential of the denoising loss per target."""
-        params = self.evaluation_variables(params, step)
-        losses, weights, correct = self._scored(params, batch, step.key)
-        return TokenScores(losses=losses, weights=weights, correct=correct)
-
-    @functools.cached_property
-    def _scored(self):
-        """Compile the evaluation's canvas and scores once per objective, as
-        `MaskedDiffusion._scored` does, rather than running the model op by op."""
-        def scored(params, batch, key):
-            canvas_losses, target_mask, _, _, correct = self._token_losses(params, batch, key, train=False)
-            assert correct is not None
-            return canvas_losses, target_mask.astype(canvas_losses.dtype), correct
-
-        return jax.jit(scored)
+        as in training, with dropout off. So `perplexity` over a validation
+        pass is the exponential of the denoising loss per target."""
+        canvas_losses, target_mask, _, _, correct = self._token_losses(params, batch, key, train=False)
+        assert correct is not None
+        return TokenScores(canvas_losses, target_mask.astype(canvas_losses.dtype), correct)
 
     def _row(self, batch: Batch):
         """Read one batch's rows and the masks every later phase reads.

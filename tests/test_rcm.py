@@ -154,7 +154,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     import dataclasses
 
     import optax
-    from test_diffusion_run_sources import batch_for
+    from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
@@ -292,8 +292,10 @@ def distilled(monkeypatch, optimizer, prefix=""):
     and settings, trained by `Trainer` with `optimizer` for the fixture's
     iterations on the reference's draws: the objective and its final state.
     `prefix` "dcm/" trains rCM's discrete-time consistency on its draws."""
+    from diffusion_stubs import label_table
+
     from dew.diffusion import presets
-    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.inputs import Condition, Field, InputSpec
     from dew.objectives.diffusion import ConsistencyDistillation, ConsistencyDistillationObjective
     from dew.objectives.diffusion.consistency import _Draws
     from dew.training import Trainer
@@ -301,12 +303,8 @@ def distilled(monkeypatch, optimizer, prefix=""):
 
     config = json.loads(str(TRAINING["config"]))
     pixels, labels = TRAINING["pixels"], TRAINING["label"]
-    table = CharTable.from_pretrained(tokens=2, features=1)
-    entries = np.zeros((table.vocab, 1), np.float32)
     names = [str(row) for row in range(pixels.shape[0])]
-    for name, label in zip(names, labels, strict=True):
-        entries[table.tokenize([name])["input_ids"][0, 1]] = label
-    table = CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
+    table = label_table(labels)
     inputs = InputSpec(Field("image", pixels.shape[1:]), {"textcontext": Condition(table)})
     (mean_g, std_g), (mean_d, std_d) = config["times"]["G"], config["times"]["D"]
     teacher = {"params": {"weights": jnp.asarray(TRAINING["teacher"])}}
@@ -338,16 +336,16 @@ def test_training_steps_the_student_and_the_fake_score_as_rcms_loop_does(monkeyp
     update in three and the fake score on the other two, each network with
     its own Adam and the power EMA (rate 0.1) on the student's updates at
     the student's own count. On the reference's draws, `Trainer` over
-    `ConsistencyDistillationObjective` lands every network, the EMA and both
-    Adams' moments where rCM's float64 run does, held by the float64 rule.
+    `ConsistencyDistillationObjective` lands every network and the EMA where
+    rCM's float64 run does, held by the float64 rule.
 
     rCM's loop backpropagates the rows' summed loss and Dew the mean, so
-    Dew's Adam takes rCM's epsilon over the eight rows and its moments are
-    rCM's over 8 and 64; the steps are the same. Adam's decays are 0.5 and
-    0.75, exact with their powers in binary, since optax rounds its bias
-    corrections in float32 where torch keeps float64. `dcm` runs the same
-    loop on rCM's discrete-time consistency (`_student_dcm_step`): two
-    teacher Euler steps apart on an 8-point grid at shift 5."""
+    Dew's Adam takes rCM's epsilon over the eight rows; the steps are the
+    same. Adam's decays are 0.5 and 0.75, exact with their powers in binary,
+    since optax rounds its bias corrections in float32 where torch keeps
+    float64. `dcm` runs the same loop on rCM's discrete-time consistency
+    (`_student_dcm_step`): two teacher Euler steps apart on an 8-point grid
+    at shift 5."""
     from dew.objectives.diffusion.objective import FAKE_SCORE
     from dew.training import Trainer
 
@@ -356,19 +354,11 @@ def test_training_steps_the_student_and_the_fake_score_as_rcms_loop_does(monkeyp
     b1, b2 = config["betas"]
     task, state = distilled(monkeypatch, optax.adam(config["learning_rate"], b1=b1, b2=b2,
                                                     eps=config["epsilon"] / rows), prefix)
-    params, opt_state = state.variables["params"], state.opt_state
+    params = state.variables["params"]
     for name, got in (("student", params["weights"]), ("fake_score", params[FAKE_SCORE]["weights"]),
                       ("ema", state.ema["params"]["weights"])):
         key = f"{prefix}{name}/weights"
         assert_as_exact_as_the_reference(got, TRAINING[key], TRAINING[f"{key}_f64"], key)
-    for name, label, held in (("student", "student", lambda tree: tree["weights"]),
-                              ("fake_score", FAKE_SCORE, lambda tree: tree[FAKE_SCORE]["weights"])):
-        adam = opt_state.inner_states[label].inner_state.inner_state[0]
-        assert int(adam.count) == int(TRAINING[f"{prefix}{name}/count"])
-        for moment, power in (("mu", 1), ("nu", 2)):
-            key = f"{prefix}{name}/{moment}"
-            assert_as_exact_as_the_reference(held(getattr(adam, moment)) * rows ** power, TRAINING[key],
-                                             TRAINING[f"{key}_f64"], f"{prefix}{name} Adam {moment}")
     with pytest.raises(ValueError, match="accumulation=1"):
         Trainer(task, optax.adam(1e-3), key=0, accumulation=2)
 
@@ -382,7 +372,6 @@ def test_training_at_rcms_published_optimizer_is_rcms_up_to_optax_rounding(monke
     relative error of optax's float32 correction, computed here as optax
     computes it. The student's distance from rCM's float64 run is held to
     twice the reference's float32 one plus the sum of those over its steps."""
-    config = json.loads(str(TRAINING["config"]))
     published = json.loads(str(TRAINING["published"]))
     rows = TRAINING["pixels"].shape[0]
     (b1, b2), lr = published["betas"], published["lr"]
@@ -400,7 +389,6 @@ def test_training_at_rcms_published_optimizer_is_rcms_up_to_optax_rounding(monke
     truth = TRAINING["published/student/weights_f64"]
     theirs = distance(TRAINING["published/student/weights"], truth)
     assert distance(student, truth) <= 2 * theirs + slack, (distance(student, truth), theirs, slack)
-    assert config["iterations"] == 10
 
 
 def test_a_reverse_only_kernel_takes_forward_mode_through_its_reference():

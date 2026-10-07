@@ -27,6 +27,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
+from affine_run import BATCH, FEATURES, Counting, Data, Features, Regression, Spread, raw_leaf, val_batches
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
 from recording import RecordingTracker
@@ -52,82 +53,12 @@ from dew.training import (
 from dew.training.optim import Cosine
 from dew.training.transaction import write_back
 
-BATCH = 8
-FEATURES = 3
-
-
-class Affine(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(2)(x)
-
-
-class Regression(Objective):
-    """Squared error of an affine map against `2 * x[:, :2]`."""
-
-    def __init__(self, ema_decay=0.5):
-        self.model = Affine()
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
-
-    def init(self, key, variables=None):
-        return self.model.init(key, jnp.zeros((1, FEATURES)))
-
-    def loss(self, variables, batch, step):
-        prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
-
-
-class Counting:
-    """An endless, checkpointable stream whose batches say which they are."""
-
-    def __init__(self, batch=BATCH):
-        self.index = 0
-        self.batch = batch
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        rng = np.random.default_rng(self.index)
-        self.index += 1
-        x = rng.normal(size=(self.batch, FEATURES)).astype(np.float32)
-        return {"x": x, "y": 2 * x[:, :2], "index": np.full((self.batch,), self.index - 1)}
-
-    def get_state(self):
-        return json.dumps({"index": self.index}).encode()
-
-    def set_state(self, state):
-        self.index = json.loads(state)["index"]
-
-
-class Data:
-    """The `Dataset` contract the trainer reads: train, val and batch."""
-
-    def __init__(self, train=Counting, val=None, batch=BATCH):
-        self._train, self._val = train, val
-        self.batch = batch
-
-    def train(self, partition):
-        return self._train()
-
-    @property
-    def val(self):
-        return None if self._val is None else lambda partition: self._val()
-
 
 def endless():
     """A stream without get_state."""
     source = Counting()
     while True:
         yield next(source)
-
-
-def val_batches(count=3):
-    def stream():
-        source = Counting()
-        for _ in range(count):
-            yield next(source)
-    return stream
 
 
 def make_trainer(tmp_path=None, objective=None, optimizer=None, keep=3, **kwargs):
@@ -499,11 +430,6 @@ def held_lm_trainer(**settings):
     objective = LMObjective(model, seq_len=4, variables=weights, ema_decay=0.999)
     return Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
                    layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights
-
-
-def raw_leaf(leaf):
-    return jax.random.key_data(leaf) if jnp.issubdtype(
-        leaf.dtype, jax.dtypes.prng_key) else leaf
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
@@ -1269,35 +1195,6 @@ def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
 # --------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------
-
-class Features(Regression):
-    """An objective whose evaluation returns its predictions as representations."""
-
-    artifact = Representations
-
-    def evaluate(self, params, batch, step):
-        params = params if step.ema is None else step.ema
-        return Representations(features=self.model.apply(params, batch["x"]),
-                               labels=batch["index"])
-
-
-class Spread:
-    name = "spread"
-    reads = Representations
-
-    def __init__(self, seen):
-        self.seen = seen
-
-    def __call__(self, artifact, batch):
-        self.seen.append((np.asarray(artifact.features).shape, np.asarray(batch["x"]).shape))
-        return float(jnp.std(artifact.features)), 1
-
-    def merge(self, accumulated, contribution):
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
-
-    def finalize(self, accumulated):
-        return accumulated[0] / accumulated[1]
-
 
 def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     seen = []

@@ -6,6 +6,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Data
+from recording import RecordingTracker
 
 from dew.artifacts import Representations
 from dew.inputs import Field
@@ -54,17 +56,6 @@ def make_objective(mask, **kwargs):
 def step_with(params, key=7, index=0):
     """What the trainer hands the objective: the EMA copy is the params themselves."""
     return Step(step=jnp.asarray(index), key=jax.random.PRNGKey(key), ema=params)
-
-
-class Data:
-    def __init__(self, train, val=None, batch=4):
-        self._train, self.batch, self.records = train, batch, None
-        self.val = None if val is None else lambda partition: val()
-
-    def train(self, partition):
-        return self._train()
-
-    steps_per_epoch = None
 
 
 def images(seed=0, batch=4):
@@ -450,17 +441,8 @@ def test_jepa_trains_under_fsdp(mask):
     across the fsdp axis, the EMA target encoder has to follow their layout,
     and the loss has to come back finite with its collapse telemetry intact.
     """
-    logged = []
-
-    class Tracker:
-        def log(self, scalars, step):
-            logged.append(dict(scalars))
-
-        def artifact(self, value, step):
-            pass
-
     trainer = make_jepa_trainer(mask, fsdp=2)
-    trainer.tracker = Tracker()
+    tracker = trainer.tracker = RecordingTracker()
     state = trainer.fit(Data(image_batches, batch=jax.device_count()), steps=2, log_every=1)
 
     sharded = [p for p in jax.tree.leaves(state.variables) if 'fsdp' in str(p.sharding.spec)]
@@ -474,7 +456,7 @@ def test_jepa_trains_under_fsdp(mask):
                      jax.tree.leaves(state.variables["params"]["context_encoder"])]
     assert encoder_specs == [p.sharding.spec for p in jax.tree.leaves(state.ema)]
     assert int(state.step) == 2
-    ticks = [entry for entry in logged if "train/loss" in entry]
+    ticks = [entry for _, entry in tracker.scalars if "train/loss" in entry]
     assert len(ticks) == 2
     assert all(np.isfinite(entry["train/loss"]) for entry in ticks)
     assert all(entry["train/repr_std"] > 0 for entry in ticks), "collapse telemetry was lost"
