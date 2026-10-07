@@ -87,10 +87,12 @@ class DecisionRunConfig(RunConfig):
 
         def calibrate(state: TrainState, directory: str) -> None:
             """Fit the task's temperatures on the held-out rows and save them into the run."""
-            calibrated = objective.pipeline(state).calibrated(held_out)
-            dataclasses.replace(calibrated, name=os.path.basename(directory)).save(directory)
+            task = objective.pipeline(state)
+            assert isinstance(task, Decide), "a decision objective's task is a Decide"
+            dataclasses.replace(task.calibrated(held_out), name=os.path.basename(directory)).save(directory)
 
-        return Prepared(self, objective, dataset, metrics=(Accuracy(), ECE(), AURC(), LogLoss()),
+        metrics = (Accuracy(), ECE(), AURC(), LogLoss())
+        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics),
                         after=calibrate if self.calibrate and held_out else None)
 
 

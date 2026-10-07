@@ -8,6 +8,8 @@ import pytest
 
 from dew.decision import Choice, Decide, DecisionTable
 from dew.decision.config import DecisionRunConfig
+from dew.decision.scoring import ScoringRule
+from dew.registry import from_record
 
 pytestmark = pytest.mark.mesh
 
@@ -34,7 +36,7 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"])
     assert isinstance(config.data, DecisionTable)
-    assert config.prepare().objective.loss_rule.name == "log_loss+0.5*brier"
+    assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
     config.run()
     run = tmp_path / "runs" / "tickets"
     assert (run / "decide.json").is_file()

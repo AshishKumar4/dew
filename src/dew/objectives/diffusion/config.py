@@ -398,8 +398,10 @@ class DiffusionRunConfig(RunConfig):
         run = self.pinned()
         objective = run.build()
         dataset = run.data.load(batch=run.trainer.batch_size, tokenize=objective.inputs.tokenize)
-        return Prepared(run, objective, dataset, metrics=run.build_eval_metrics(),
-                        rollout=objective.rollout() if isinstance(objective, FlowGRPOObjective) else None)
+        metrics = run.build_eval_metrics()
+        rollout = objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
+        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
+                                                    rollout=rollout))
 
     def pinned(self) -> DiffusionRunConfig:
         """Return this run with its Hub sources pinned to the commits they resolve to now.

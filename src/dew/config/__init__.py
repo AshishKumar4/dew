@@ -684,18 +684,14 @@ class Prepared:
     """What a run trains, as its class builds it (`RunConfig.prepare`).
 
     `run` is the run as it records itself, with what building resolved (a
-    pinned source, the model's fields as built). `metrics`, `rollout` and
-    `validation` are `RunConfig.train`'s. `after` runs on the state training
-    ends on and the run's directory, as a decision run fits its calibration
-    on its held-out rows and saves it there.
+    pinned source, the model's fields as built). `train` trains it under a
+    name: `run.train` over the objective and the data the class built.
+    `after` runs on the state training ends on and the run's directory, as a
+    decision run fits its calibration on its held-out rows and saves it there.
     """
 
     run: "RunConfig"
-    objective: Objective
-    data: Dataset
-    metrics: Sequence[Metric] = ()
-    rollout: Rollout | None = None
-    validation: Mapping[str, Reader] | None = None
+    train: Callable[[str], TrainState]
     after: Callable[[TrainState, str], None] | None = None
 
 
@@ -839,8 +835,8 @@ class RunConfig:
         as the class it names, which must be this one or derive from it.
         `trust` names the packages outside Dew the record may import."""
         path = epath.Path(directory)
-        return cls.read(json.loads((path if path.suffix == ".json" else path / RUN_FILE).read_text()),
-                        trust=trust)
+        record = (path if str(directory).endswith(".json") else path / RUN_FILE).read_text()
+        return cls.read(json.loads(record), trust=trust)
 
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
@@ -862,8 +858,9 @@ class RunConfig:
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
-        return Prepared(self, self.objective.build(model=self.model.build()),
-                        self.data.load(batch=self.trainer.batch_size))
+        objective = self.objective.build(model=self.model.build())
+        dataset = self.data.load(batch=self.trainer.batch_size)
+        return Prepared(self, lambda name: self.train(objective, dataset, name=name))
 
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
@@ -875,11 +872,11 @@ class RunConfig:
         prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
                         layout=trainer.layout)
         prepared = self.prepare()
-        name = trainer.name or (f"{objectives.label(registry.import_path(type(prepared.objective)))}-"
+        stated = prepared.run.objective
+        name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
                                 f"{datasets.label(registry.import_path(type(prepared.run.data)))}/"
                                 f"date-{run_timestamp()}")
-        state = prepared.run.train(prepared.objective, prepared.data, name=name, metrics=prepared.metrics,
-                                   rollout=prepared.rollout, validation=prepared.validation)
+        state = prepared.train(name)
         if prepared.after is not None:
             prepared.after(state, os.path.join(trainer.checkpoint_dir, name))
         return state
