@@ -28,7 +28,13 @@ and the save and restore of lm-dense's training state. Each row runs in a
 process of its own, with the tree's own copy of the tool where it has one. A row
 regresses when the head's median is worse than the base's by more than either
 tree's spread across rounds (at least 2%), and the two trees' ranges do not
-overlap. `report` writes the table and exits 1 on a regression. Every commit
+overlap. With three rounds each, samples separate by chance 1 time in 20 when
+nothing changed, and the band lowers that further. A row's band is also its
+sensitivity: it cannot see a change smaller than its own noise. A row the base
+cannot run (a tree older than its tool) is not compared. A row the base runs and
+the head does not is broken, and a row neither runs leaves the battery
+incomplete; both fail the gate, as a regression does. `report` writes the table
+and exits 1 on any of them. Every commit
 promoted to main that touches `src` passes the gate on a Colab A100 first, and
 its table is kept in `tools/measurements/perf_gate/<head>-vs-<base>.md`:
 
@@ -42,7 +48,9 @@ A row that one tree cannot run is reported as not compared, not gated. The
 serving tool, for example, needs a newer PRNG API than main had on 2026-09-30.
 The 32-slot serving row is host-bound, and its median across rounds spread 33%
 on the A100's VM, so a serving sample is the best of five repeats, since noise
-only slows it. The gate's CPU rows stay off armada. A small decoder's CPU
+only slows it. The median of the five is shown beside it, ungated, because a
+regression that adds an occasional stall (a recompile, a pause) shows there and
+not in the best repeat. The gate's CPU rows stay off armada. A small decoder's CPU
 training step ran 458-735 ms across six containers on one commit, a 1.6x
 spread, and within one container it varied by 1.6-10% between processes, too
 wide to gate a regression of a few percent.
