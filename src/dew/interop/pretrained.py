@@ -14,7 +14,7 @@ import dataclasses
 import functools
 import json
 import os
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from functools import partial
 from pathlib import Path
@@ -361,14 +361,15 @@ class Pretrained:
 
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
-                 ema: bool | None = None) -> Self:
+                 ema: bool | None = None, trust: Sequence[str] = ()) -> Self:
         """Return a trained run's selected checkpoint, rebuilt from the run's own inference record,
-        in the layout of the architecture the record names."""
+        in the layout of the architecture the record names. `trust` names the packages outside
+        Dew the record may import (`TextGeneration.from_run`)."""
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
         from dew.records import record, text
         from dew.registry import models, objectives
-        declaration = run_record(str(directory), step)
+        declaration = run_record(str(directory), step, trust)
         model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         model = model_config.build()
         kind = text(declaration['objective'], 'objective')

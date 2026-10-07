@@ -99,10 +99,22 @@ def import_path(member: Importable) -> str:
 
 
 def imported(path: str) -> Callable[..., Configured]:
-    """The class or function an import path names, importing its module."""
+    """The class or function an import path names, importing its module.
+
+    Records arrive from the Hub, and importing a module runs its top level,
+    so a record imports only Dew's own modules and modules already imported.
+    Code that defines its own classes imports them before it loads a run of
+    them; a run of a package not yet imported loads once the caller trusts
+    the package (`import_trusted`), as `trust_remote_code` does in
+    transformers."""
     module, _, name = path.partition(":")
     if not module or not name:
         raise ValueError(f"{path!r} is not an import path, `module:Qualified.name`")
+    if module != "dew" and not module.startswith("dew.") and module not in sys.modules:
+        package = module.split(".")[0]
+        raise ValueError(f"{path!r} names {module}, which is outside Dew and not imported; import it "
+                         f"first, or trust its package where the run loads (trust=({package!r},), "
+                         f"--trust {package})")
     # Whatever the path names, untyped until `callable` says what it is.
     held: Any = importlib.import_module(module)
     for part in name.split("."):
@@ -113,6 +125,23 @@ def imported(path: str) -> Callable[..., Configured]:
     if not isinstance(held, (type, types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
         raise ValueError(f"{path!r} names {held!r}, which is neither a class nor a function")
     return held
+
+
+def import_trusted(record: object, trust: Sequence[str]) -> None:
+    """Import every module of a `trust`ed package that `record` names by an
+    import path, so reading the record finds them imported (`imported`)."""
+    if isinstance(record, str):
+        module, colon, name = record.partition(":")
+        if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
+            importlib.import_module(module)
+    elif isinstance(record, Mapping):
+        for value in record.values():
+            import_trusted(value, trust)
+    elif isinstance(record, list):
+        for value in record:
+            import_trusted(value, trust)
+    elif record is not None and not isinstance(record, (bool, int, float)):
+        raise ValueError(f"{record!r} is not JSON a record holds")
 
 
 class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
@@ -950,6 +979,7 @@ __all__ = [
     "encoders",
     "from_record",
     "import_path",
+    "import_trusted",
     "imported",
     "metrics",
     "mixers",

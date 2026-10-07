@@ -225,7 +225,8 @@ class TextToImage:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextToImage:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                 trust: Sequence[str] = ()) -> TextToImage:
         """Load the run in `directory`, built from its `run.json` the way the recipe built it.
 
         The weights come from the run's latest checkpoint, or from `step`.
@@ -246,7 +247,8 @@ class TextToImage:
 
         `dtype` sets the compute dtype of the model, the encoders and the VAE.
         `param_dtype` sets the dtype the parameters are stored in; None keeps
-        the checkpoint's dtypes exactly.
+        the checkpoint's dtypes exactly. `trust` names the packages outside
+        Dew the run's record may import (`TextGeneration.from_run`).
         """
         from dew.config import ModelConfig
         from dew.diffusion.process import Process
@@ -256,7 +258,7 @@ class TextToImage:
         from dew.records import integer, record as fields, text
         from dew.registry import from_record, objectives, solvers
 
-        record = run_record(directory, step)
+        record = run_record(directory, step, trust)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
         inputs_record = fields(record['inputs'], 'inputs')
         autoencoder_record = None if record['autoencoder'] is None else fields(record['autoencoder'],
@@ -302,7 +304,7 @@ class TextToImage:
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
                         ema: bool | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None, dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None) -> TextToImage:
+                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> TextToImage:
         """Download a run directory from the Hugging Face Hub and load it with `from_run`.
 
         The repository holds the run directory as `HfApi().upload_folder`
@@ -312,7 +314,7 @@ class TextToImage:
 
         return cls.from_run(os.fspath(pull_from_hub(repo_id, revision=revision)),
                             ema=ema, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype)
+                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
     @classmethod
     def from_flaxdiff(cls, directory: str | os.PathLike, config: Mapping[str, object], *, jax_version: str,
