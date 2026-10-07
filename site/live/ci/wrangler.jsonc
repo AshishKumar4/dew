@@ -1,0 +1,17 @@
+{
+	"name": "dew-ci",
+	"account_id": "f44999d1ddda7012e9a87729eba250f1",
+	"main": "index.ts",
+	"compatibility_date": "2026-09-29",
+	"workers_dev": true,
+	"containers": [{ "name": "dew-ci", "class_name": "RemoteJob", "scheduling_policy": "durable_object" }],
+	"durable_objects": { "bindings": [
+		{ "name": "REMOTE_JOB", "class_name": "RemoteJob" },
+		{ "name": "RUNNER_PREPARER", "class_name": "RemoteJob" },
+		{ "name": "RUNNER_CACHE", "class_name": "RunnerCache" },
+		{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" }
+	] },
+	"migrations": [{ "tag": "v1", "new_sqlite_classes": ["RemoteJob", "RunnerCache", "RunnerFleet"] }],
+	"vars": { "SNAPSHOT_COMMIT": "set-by-live-deploy" },
+	"observability": { "enabled": true }
+}

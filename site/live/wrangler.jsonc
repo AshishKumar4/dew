@@ -19,14 +19,6 @@
 		{
 			"class_name": "SnapshotPreparer",
 			"scheduling_policy": "durable_object"
-		},
-		{
-			"class_name": "RunnerPreparer",
-			"scheduling_policy": "durable_object"
-		},
-		{
-			"class_name": "RemoteJob",
-			"scheduling_policy": "durable_object"
 		}
 	],
 	"durable_objects": {
@@ -37,10 +29,6 @@
 			{ "name": "POOL", "class_name": "ModelPool" },
 			{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
 			{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
-			{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
-			{ "name": "RUNNER_CACHE", "class_name": "RunnerCache" },
-			{ "name": "RUNNER_PREPARER", "class_name": "RunnerPreparer" },
-			{ "name": "REMOTE_JOB", "class_name": "RemoteJob" }
 		]
 	},
 	// v2 moves the containers to the durable_object scheduling policy, which needs a new
@@ -105,14 +93,6 @@
 				{
 					"class_name": "SnapshotPreparer",
 					"scheduling_policy": "durable_object"
-				},
-				{
-					"class_name": "RunnerPreparer",
-					"scheduling_policy": "durable_object"
-				},
-				{
-					"class_name": "RemoteJob",
-					"scheduling_policy": "durable_object"
 				}
 			],
 			"durable_objects": {
@@ -123,10 +103,6 @@
 			{ "name": "POOL", "class_name": "ModelPool" },
 					{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
 					{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
-					{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
-					{ "name": "RUNNER_CACHE", "class_name": "RunnerCache" },
-					{ "name": "RUNNER_PREPARER", "class_name": "RunnerPreparer" },
-					{ "name": "REMOTE_JOB", "class_name": "RemoteJob" }
 				]
 			},
 			"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7402", "simple": { "limit": 30, "period": 60 } }],

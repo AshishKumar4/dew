@@ -10,7 +10,7 @@ import { SESSION_HEADER } from './kernel';
 import { limitsOf } from './limits';
 import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
-import { operatorAuthorized, remoteRun } from './remote';
+import { operatorAuthorized } from './remote';
 
 export { Coordinator } from './coordinator';
 export { LiveKernel } from './kernel';
@@ -18,7 +18,6 @@ export { SharedHost } from './shared-host';
 export { ModelPool } from './model-pool';
 export { SnapshotRegistry } from './snapshots';
 export { SnapshotPreparer } from './preparer';
-export { RunnerFleet, RunnerCache, RunnerPreparer, RemoteJob } from './remote';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
@@ -107,10 +106,6 @@ export default {
 				if (generation) await pool.configure(generation);
 			} else if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
 			return Response.json(await pool.status());
-		}
-		if (request.method === 'POST' && url.pathname === '/v1/remote/run') {
-			try { return await remoteRun(request, env); }
-			catch (error) { return Response.json({ message: String(error) }, { status: 400 }); }
 		}
 		const origin = request.headers.get('Origin');
 		const allowed = listed(env.ALLOWED_ORIGINS);

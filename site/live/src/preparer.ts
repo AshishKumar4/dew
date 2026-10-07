@@ -74,7 +74,7 @@ export function livePreparation(commit: string, sourceCommit: string): Preparati
 	};
 }
 
-export class ManagedPreparer extends DurableObject<Env> {
+export class ManagedPreparer<Environment extends { SNAPSHOT_COMMIT: string } = Env> extends DurableObject<Environment> {
 	private busy = false;
 
 	async status(): Promise<{ phase: string; at: number } | null> {

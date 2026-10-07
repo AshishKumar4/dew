@@ -3,11 +3,20 @@ import { SnapshotRegistry, type SnapshotGeneration } from './snapshots';
 import { commandOf, runnerPlan, type RunnerPlan } from './remote-plan';
 import { ManagedPreparer } from './preparer';
 
+interface RemoteEnv {
+ RUNNER_SECRET: string;
+ SNAPSHOT_COMMIT: string;
+ RUNNER_FLEET: DurableObjectNamespace<RunnerFleet>;
+ RUNNER_CACHE: DurableObjectNamespace<RunnerCache>;
+ RUNNER_PREPARER: DurableObjectNamespace<RemoteJob>;
+ REMOTE_JOB: DurableObjectNamespace<RemoteJob>;
+}
+
 const JOB_MS = 40 * 60_000;
 // Cloudflare's published account ceiling is 1,500 concurrent vCPUs; standard-4 uses four.
 const JOB_LIMIT = 375;
 
-export class RunnerFleet extends DurableObject<Env> {
+export class RunnerFleet extends DurableObject<RemoteEnv> {
 	async active(): Promise<number> {
 		return Object.keys((await this.ctx.storage.get<Record<string, number>>('jobs')) ?? {}).length;
 	}
@@ -47,12 +56,12 @@ export class RunnerFleet extends DurableObject<Env> {
 }
 
 export class RunnerCache extends SnapshotRegistry {
-	constructor(ctx: DurableObjectState, env: Env) {
+	constructor(ctx: DurableObjectState, env: RemoteEnv) {
 		super(ctx, { SNAPSHOT_COMMIT: '', PREPARER: env.RUNNER_PREPARER });
 	}
 }
 
-export class RunnerPreparer extends ManagedPreparer {
+export class RunnerPreparer extends ManagedPreparer<RemoteEnv> {
 	async prepare(key: string): Promise<SnapshotGeneration> {
 		return this.runPreparation(async () => {
 			const plan = await this.env.RUNNER_FLEET.get(this.env.RUNNER_FLEET.idFromName('global')).plan(key);
@@ -69,14 +78,14 @@ export class RunnerPreparer extends ManagedPreparer {
 	}
 }
 
-export class RemoteJob extends DurableObject<Env> {
-	private busy = false;
+export class RemoteJob extends RunnerPreparer {
+	private jobBusy = false;
 	private stopping: Promise<void> | null = null;
 
 	async run(id: string, plan: RunnerPlan, command: string[], generation: SnapshotGeneration): Promise<Response> {
 		const container = this.ctx.container;
-		if (!container || this.busy || container.running) throw new Error('this runner already has a job');
-		this.busy = true;
+		if (!container || this.jobBusy || container.running) throw new Error('this runner already has a job');
+		this.jobBusy = true;
 		try {
 			await this.ctx.storage.put('job', id);
 			await this.ctx.storage.setAlarm(Date.now() + JOB_MS);
@@ -143,7 +152,7 @@ export class RemoteJob extends DurableObject<Env> {
 	private stop(): Promise<void> {
 		this.stopping ??= (async () => {
 			if (this.ctx.container?.running) await this.ctx.container.destroy();
-			this.busy = false;
+			this.jobBusy = false;
 			await this.ctx.storage.deleteAlarm();
 			const id = await this.ctx.storage.get<string>('job');
 			if (id) await this.env.RUNNER_FLEET.get(this.env.RUNNER_FLEET.idFromName('global')).release(id);
@@ -157,13 +166,13 @@ export class RemoteJob extends DurableObject<Env> {
 	override async alarm(): Promise<void> { await this.expire(); }
 }
 
-export function operatorAuthorized(request: Request, env: Env): boolean {
+export function operatorAuthorized(request: Request, env: { RUNNER_SECRET: string }): boolean {
 	const expected = new TextEncoder().encode(`Bearer ${env.RUNNER_SECRET}`);
 	const supplied = new TextEncoder().encode(request.headers.get('Authorization') ?? '');
 	return Boolean(env.RUNNER_SECRET) && expected.length === supplied.length && crypto.subtle.timingSafeEqual(expected, supplied);
 }
 
-export async function remoteRun(request: Request, env: Env): Promise<Response> {
+export async function remoteRun(request: Request, env: RemoteEnv): Promise<Response> {
 	if (!operatorAuthorized(request, env)) {
 		return new Response('Forbidden', { status: 403 });
 	}
