@@ -10,6 +10,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Affine, Data
+from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
 from dew.config.sweep import assigned
@@ -120,3 +121,15 @@ def test_set_refuses_a_path_the_run_does_not_declare_and_a_value_its_type_does_n
         assigned(run, ["trainer.steps"])
     with pytest.raises(SystemExit):
         assigned(run, ["trainer.steps=many"])
+
+
+def test_a_model_whose_call_needs_more_than_the_sample_is_refused_by_name():
+    """Supervised feeds the model one input, so a call that also needs a time
+    (a denoiser's) is refused naming what it needs, before anything traces."""
+    class Timed(nn.Module):
+        @nn.compact
+        def __call__(self, sample, time, *, train=False):
+            return nn.Dense(1)(sample) * time[:, None]
+
+    with pytest.raises(TypeError, match="sample alone, and Timed's call also needs time"):
+        Supervised(Timed(), squared, inputs=INPUTS)
