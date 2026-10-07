@@ -931,7 +931,7 @@ To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.sweep import grid_search
+from dew.config.sweep import GridSearch
 from dew.data import TokenWindows
 
 config = RunConfig(
@@ -954,12 +954,12 @@ def trial(run: RunConfig) -> float:
 
 with LocalTracker("runs/sweep/tracking") as tracker:
     trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
-                          ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+                          ledger="runs/sweep/ledger.json", tracker=tracker, search=GridSearch())
 best = min(trials, key=lambda trial: trial.value)
 print(best.overrides, round(best.value, 4))
 ```
 
-This prints `{'optim.learning_rate': 0.01} 1.0024`; the slower rate reaches 1.015. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>`, with its own `run.json`, checkpoints and tracking journal. A finished trial is written to the ledger before it is reported, so calling `sweep` again continues an interrupted sweep without retraining the finished trials. `random_search` and `grid_search` are built in; `optuna_search` needs `dewml[hpo]`.
+This prints `{'optim.learning_rate': 0.01} 1.0024`; the slower rate reaches 1.015. Each trial is a real run under `runs/sweep/lm-rate/trial-<index>`, with its own `run.json`, checkpoints and tracking journal. A finished trial is written to the ledger before it is reported, so calling `sweep` again continues an interrupted sweep without retraining the finished trials. `RandomSearch` and `GridSearch` are built in; `OptunaSearch` needs `dewml[hpo]`.
 
 ## Diffusion and sampling
 

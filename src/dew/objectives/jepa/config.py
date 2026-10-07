@@ -84,5 +84,3 @@ class JepaRunConfig(RunConfig):
             LinearProbe(self.probe_classes), KnnProbe(self.probe_classes, k=self.knn_k))
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes))
 
-
-__all__ = ["JepaRunConfig"]
