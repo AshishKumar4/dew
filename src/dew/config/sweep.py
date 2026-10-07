@@ -14,22 +14,13 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import json
-import shlex
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import Protocol
 
 import numpy as np
-import tyro
 
-from dew.records import JSON
-from dew.registry import Annotation, _declared_type, models, objectives, parameters, wants_tuple
 from dew.telemetry.records import TrialFinished, json_value
-
-if TYPE_CHECKING:
-    from _typeshed import DataclassInstance
-
-    from dew.config import RunConfig
 
 type Choice = None | bool | int | float | str
 """One candidate value for a swept field, of a type both JSON and Optuna can hold."""
@@ -44,59 +35,6 @@ class Search(Protocol):
     """Chooses the next point in a space, given the trials already finished."""
 
     def __call__(self, space: Space, finished: Sequence[TrialFinished]) -> Point: ...
-
-
-def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
-    """The record `node` holds under `key`. A field declaring a base or a
-    union records its value's class beside its fields, and this is the fields."""
-    held = node[key]
-    held = held["fields"] if isinstance(held, dict) and "class" in held else held
-    if not isinstance(held, dict):
-        raise KeyError(f"{key} holds {held!r}, not a record of fields")
-    return held
-
-
-def _placed(config: RunConfig, path: str) -> tuple[list[str], Annotation]:
-    """The keys of `path`'s value in `config`'s record, and the annotation it is read by."""
-    from dew.config import ModelConfig, ObjectiveConfig, _member_flags
-
-    *groups, field = path.split(".")
-    held: object = config
-    for group in groups:
-        if not (dataclasses.is_dataclass(held) and group in _names(held)):
-            raise KeyError(f"{path} names no group of the run record")
-        held = getattr(held, group)
-    if isinstance(held, ModelConfig | ObjectiveConfig) and field not in _names(held):
-        member = models[held.name] if isinstance(held, ModelConfig) else objectives[held.name]
-        # A flag's annotation types the value, as `--model.<field>` reads it;
-        # an argument without a flag (the loss a `Supervised` is given) takes JSON.
-        annotation = _declared_type(_member_flags(member, held.fields)[0], field)
-        if annotation is None and field not in parameters(member)[0]:
-            raise KeyError(f"{path} names no argument of {held.name}")
-        return [*groups, "fields", field], annotation
-    if not (dataclasses.is_dataclass(held) and field in _names(held)):
-        raise KeyError(f"{path} names no field of the run record")
-    return [*groups, field], _declared_type(type(held), field)
-
-
-def _names(held: DataclassInstance | type[DataclassInstance]) -> set[str]:
-    """The fields a dataclass declares."""
-    return {field.name for field in dataclasses.fields(held)}
-
-
-def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
-    """`text` as the flag of `annotation` reads it (`RunConfig.assigned`), a
-    tuple as the list its record holds."""
-    from dew.config import _flag_json, _scalar
-
-    if annotation is not None and _scalar(annotation):
-        holder = dataclasses.make_dataclass("Set", [("value", tyro.conf.Positional[annotation])])
-        given = shlex.split(text) if wants_tuple(annotation) else [text]
-        return json.loads(json.dumps(tyro.cli(holder, args=given, prog=f"--set {path}").value))
-    try:
-        return _flag_json(text)
-    except json.JSONDecodeError:
-        return text
 
 
 @dataclasses.dataclass(frozen=True)
