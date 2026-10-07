@@ -5492,6 +5492,7 @@
 "tests/test_optional_ema.py::test_metadata_inspection_and_restore_share_the_committed_snapshot": 0.244,
 "tests/test_optional_ema.py::test_zero_beta_grpo_has_no_reference_and_keeps_live_updates_and_preview": 1.881,
 "tests/test_outside_packages.py::test_a_packages_model_and_its_own_kind_build_and_record_by_import_path": 1.24,
+"tests/test_outside_packages.py::test_a_packages_own_run_artifact_metric_and_axis_train_from_its_record_in_a_new_process": 3.64,
 "tests/test_outside_packages.py::test_a_path_naming_nothing_is_refused_by_what_it_names": 0.875,
 "tests/test_outside_packages.py::test_dew_pipeline_loads_a_packages_run_only_when_trusted": 3.985,
 "tests/test_packaging.py::test_every_requirement_names_a_release": 0.004,
