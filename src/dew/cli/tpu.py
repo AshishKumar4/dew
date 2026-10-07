@@ -65,6 +65,19 @@ class Base:
     """Print the commands that would run, then exit."""
 
 
+@dataclasses.dataclass
+class Named(Base):
+    """A command on one TPU, named first on its command line."""
+
+    name: Positional[str]
+    """Name of the TPU."""
+
+    def opened(self) -> tuple[config.TpuConfig, Gcloud, Tpu]:
+        """The config, the gcloud it runs and this TPU, its zone found as every command finds it."""
+        cfg, gcloud = _open(self)
+        return cfg, gcloud, _tpu(self, cfg, gcloud, self.name)
+
+
 # ----------------------------------------------------------------- shared work
 
 
@@ -320,14 +333,12 @@ class Init:
 
 
 @dataclasses.dataclass
-class Create(Base):
+class Create(Named):
     """Create a TPU VM or pod slice and wait until it is ready."""
 
     reads: ClassVar[tuple[str, ...]] = (
         "project", "zones", "accelerator_type", "runtime_version", "data_disk", "ssh_user")
 
-    name: Positional[str]
-    """Name of the TPU."""
     type: Kind = None
     """Accelerator type, for example v5e-16."""
     spot: bool = False
@@ -380,15 +391,12 @@ def _startup_script() -> Path:
 
 
 @dataclasses.dataclass
-class Delete(Base):
+class Delete(Named):
     """Delete a TPU, and the queued resource that holds it."""
 
-    name: Positional[str]
-    """Name of the TPU."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        _, gcloud, tpu = self.opened()
         node = None if gcloud.dry_run else tpu.describe()
         if node is not None and node.queued_resource:
             argv = gcloud.argv("compute", "tpus", "queued-resources", "delete",
@@ -403,15 +411,12 @@ class Delete(Base):
 
 
 @dataclasses.dataclass
-class Start(Base):
+class Start(Named):
     """Start a stopped TPU."""
 
-    name: Positional[str]
-    """Name of the TPU."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        _, gcloud, tpu = self.opened()
         code = gcloud.run(tpu.vm("start", self.name, f"--zone={tpu.zone}"), capture=False).code
         if not code:
             _worker_table(_wait_ready(tpu))
@@ -419,15 +424,12 @@ class Start(Base):
 
 
 @dataclasses.dataclass
-class Stop(Base):
+class Stop(Named):
     """Stop a TPU. It keeps its disks and its name."""
 
-    name: Positional[str]
-    """Name of the TPU."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        _, gcloud, tpu = self.opened()
         return gcloud.run(tpu.vm("stop", self.name, f"--zone={tpu.zone}"), capture=False).code
 
 
@@ -457,15 +459,12 @@ class List(Base):
 
 
 @dataclasses.dataclass
-class Describe(Base):
+class Describe(Named):
     """Show what a TPU is and where its workers are."""
 
-    name: Positional[str]
-    """Name of the TPU."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        _, gcloud, tpu = self.opened()
         node = tpu.describe()
         if node is None:
             if gcloud.dry_run:
@@ -488,11 +487,9 @@ class Describe(Base):
 
 
 @dataclasses.dataclass
-class Ssh(Base):
+class Ssh(Named):
     """Open a shell on one worker, with ports forwarded."""
 
-    name: Positional[str]
-    """Name of the TPU."""
     worker: int = 0
     """Worker to connect to."""
     forward: Annotated[
@@ -502,8 +499,7 @@ class Ssh(Base):
     """Ports to forward from the worker. Repeat for each port."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        _, gcloud, tpu = self.opened()
         flags = [f"-L {port}:localhost:{port}" for port in self.forward]
         argv = tpu.ssh_argv(str(self.worker), ssh_flags=flags)
         if rest:
@@ -512,15 +508,12 @@ class Ssh(Base):
 
 
 @dataclasses.dataclass
-class SshConfig(Base):
+class SshConfig(Named):
     """Write ~/.ssh/config entries for every worker: NAME, NAME-worker-1 and on."""
 
-    name: Positional[str]
-    """Name of the TPU."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, gcloud, tpu = self.opened()
         if gcloud.dry_run:
             addresses = [f"<worker-{index}-ip>" for index in range(_slice(tpu, cfg)[0])]
         else:
@@ -540,19 +533,16 @@ class SshConfig(Base):
 
 
 @dataclasses.dataclass
-class AttachDisk(Base):
+class AttachDisk(Named):
     """Attach a persistent disk to every worker and mount it at /mnt/persist."""
 
-    name: Positional[str]
-    """Name of the TPU."""
     disk: Positional[str]
     """Name of the disk, in the TPU's zone."""
     read_only: bool = False
     """Attach it read-only, which a disk shared by several workers needs."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, gcloud, tpu = self.opened()
         source = f"projects/{_project(gcloud, cfg)}/zones/{tpu.zone}/disks/{self.disk}"
         mode = "read-only" if self.read_only else "read-write"
         attached = gcloud.run(tpu.vm("attach-disk", self.name, f"--zone={tpu.zone}",
@@ -565,11 +555,9 @@ class AttachDisk(Base):
 
 
 @dataclasses.dataclass
-class Run(Base):
+class Run(Named):
     """Run a command on the workers. Put the command after --."""
 
-    name: Positional[str]
-    """Name of the TPU."""
     worker: Worker = "all"
     """Worker index, or all for every worker at once."""
     detach: bool = False
@@ -580,8 +568,7 @@ class Run(Base):
     def run(self, rest: list[str]) -> int:
         if not rest:
             raise SystemExit("dew tpu run NAME -- COMMAND")
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, _, tpu = self.opened()
         workers = _workers(self.worker, tpu, cfg)
         command = shlex.join(rest)
         if not self.detach:
@@ -594,11 +581,9 @@ class Run(Base):
 
 
 @dataclasses.dataclass
-class Logs(Base):
+class Logs(Named):
     """Show the log of a detached job."""
 
-    name: Positional[str]
-    """Name of the TPU."""
     job: Positional[str]
     """Job id that run or train printed."""
     worker: Worker = "0"
@@ -609,9 +594,8 @@ class Logs(Base):
     """How much of the tail to print."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
         job = _job(self.job, self.name)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, _, tpu = self.opened()
         workers = _workers(self.worker, tpu, cfg)
         return exit_code(tpu.fanout([
             (index, tpu_setup.tail(job, index, self.follow, self.lines))
@@ -619,11 +603,9 @@ class Logs(Base):
 
 
 @dataclasses.dataclass
-class Copy(Base):
+class Copy(Named):
     """Copy a local file or directory to the workers."""
 
-    name: Positional[str]
-    """Name of the TPU."""
     src: Positional[str]
     """Local path."""
     dst: Positional[str]
@@ -632,19 +614,16 @@ class Copy(Base):
     """Worker to copy to, or all."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        _, gcloud, tpu = self.opened()
         argv = tpu.scp_argv([self.src], f"{tpu.host}:{self.dst}", worker=self.worker,
                             recurse=Path(self.src).is_dir())
         return gcloud.run(argv, capture=False).code
 
 
 @dataclasses.dataclass
-class Sync(Base):
+class Sync(Named):
     """Copy the git working tree to ~/<repo> on every worker."""
 
-    name: Positional[str]
-    """Name of the TPU."""
     exclude: Annotated[
         tyro.conf.UseAppendAction[tuple[str, ...]],
         tyro.conf.arg(metavar="PATTERN"),
@@ -654,8 +633,7 @@ class Sync(Base):
     """Also remove files under ~/<repo> that the local tree does not have."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, _, tpu = self.opened()
         count, _ = _slice(tpu, cfg)
         root, code = _sync(tpu, cfg, count, self.exclude, self.delete)
         if not code:
@@ -664,14 +642,12 @@ class Sync(Base):
 
 
 @dataclasses.dataclass
-class Setup(Base):
+class Setup(Named):
     """Install uv, a venv, jax and dew on every worker, then count the devices."""
 
     reads: ClassVar[tuple[str, ...]] = (
         "project", "zones", "ssh_user", "accelerator_type", "gcs_bucket", "python_version")
 
-    name: Positional[str]
-    """Name of the TPU."""
     from_source: bool = False
     """Sync the working tree and install it in editable mode."""
     version: Release = ""
@@ -690,8 +666,7 @@ class Setup(Base):
     """Private key the workers use for git over ssh, installed as ~/.ssh/id_ed25519."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, gcloud, tpu = self.opened()
         count, kind = _slice(tpu, cfg, self.type or "")
 
         source = ""
@@ -747,11 +722,9 @@ def _verify_devices(tpu: Tpu, count: int, expected: int) -> int:
 
 
 @dataclasses.dataclass
-class Train(Base):
+class Train(Named):
     """Sync the tree and start a recipe on every worker. Recipe after --."""
 
-    name: Positional[str]
-    """Name of the TPU."""
     job: Job = ""
     """Name of the job. A timestamp by default."""
     delete: bool = False
@@ -761,8 +734,7 @@ class Train(Base):
         if not rest:
             raise SystemExit("dew tpu train NAME -- recipes/lm/train.py [FLAGS]")
         job = _job(self.job, self.name)
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, _, tpu = self.opened()
         count, _ = _slice(tpu, cfg)
         root, code = _sync(tpu, cfg, count, (), self.delete)
         if code:
@@ -779,15 +751,12 @@ class Train(Base):
 
 
 @dataclasses.dataclass
-class Status(Base):
+class Status(Named):
     """Show what each worker is doing."""
 
-    name: Positional[str]
-    """Name of the TPU."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, gcloud, tpu = self.opened()
         count, _ = _slice(tpu, cfg)
         node = None if gcloud.dry_run else tpu.describe()
         if node is not None:
@@ -805,15 +774,12 @@ class Status(Base):
 
 
 @dataclasses.dataclass
-class Reset(Base):
+class Reset(Named):
     """Kill whatever holds the accelerators on every worker."""
 
-    name: Positional[str]
-    """Name of the TPU."""
 
     def run(self, rest: list[str]) -> int:
-        cfg, gcloud = _open(self)
-        tpu = _tpu(self, cfg, gcloud, self.name)
+        cfg, _, tpu = self.opened()
         count, _ = _slice(tpu, cfg)
         return exit_code(tpu.fanout([(index, tpu_setup.RESET) for index in range(count)]))
 
