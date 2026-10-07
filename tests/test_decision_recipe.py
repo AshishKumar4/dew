@@ -90,7 +90,8 @@ def _mixture(tmp_path: Path, rows: list[dict], evaluated: list[str], held: int) 
     mine = sources.Rows(weight=1.0, held=held, path=str(tmp_path / "rows.jsonl"))
     mixture = sources.Mixture(**{**off, "rows": mine})
     out = tmp_path / "mixture"
-    sources.write(mixture, out, contamination.Overlaps.of(evaluated))
+    items = [contamination.Evaluated((text,)) for text in evaluated]
+    sources.write(mixture, out, contamination.Overlaps.of(items))
     return out
 
 
