@@ -87,13 +87,13 @@ def objective(end_to_end: EndToEnd) -> DiffusionObjective:
         model=module, params=module.init(jax.random.PRNGKey(5), jnp.zeros((1, 8, 8, 3)))["params"],
         dtype=jnp.float32, latent_shift=0.1, latent_scale=0.8)
     encoder = Patches()
-    alignment = Alignment(encoder, encoder.init(jax.random.PRNGKey(9), jnp.zeros((1, 8, 8, 3))),
-                          "dit_block_0", width=8)
+    weights = encoder.init(jax.random.PRNGKey(9), jnp.zeros((1, 8, 8, 3)))
+    alignment = Alignment("dit_block_0", encoder=encoder, width=8, resolution=None)
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=2, num_heads=2, mlp_ratio=1,
                              output_channels=4)
     return DiffusionObjective(model, presets.Flow()(), InputSpec(Field("image", (8, 8, 3))), guidance=None,
                               solver=Euler(), steps=2, autoencoder=autoencoder, alignment=alignment,
-                              end_to_end=end_to_end, ema_decay=None)
+                              end_to_end=end_to_end, ema_decay=None, variables={REPRESENTATION: weights})
 
 
 # Eight rows, which the test mesh's eight devices divide.
@@ -362,22 +362,22 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
     tail = "_f64" if dtype == jnp.float64 else ""
     with tarfile.open(FIXTURES / "tiny_diffusers.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
-    alignment = Alignment(Representation(), cast({"params": {"Conv_0": module("representation")}}), "block_0",
-                          width=PROJECTOR)
+    representation = cast({"params": {"Conv_0": module("representation")}})
+    alignment = Alignment("block_0", encoder=Representation(), width=PROJECTOR, resolution=None)
     table = label_table(range(CLASSES), null=CLASSES)
     inputs = InputSpec(Field("image", (SIDE, SIDE, 3)), {"textcontext": Condition(table)})
     task = DiffusionObjective(
         StandIn(), presets.Flow(density="uniform")(), inputs, guidance=None, solver=Euler(), steps=2,
         autoencoder=StableDiffusionVAE(modelname=str(tmp_path / "sd" / "vae"), dtype=dtype),
         alignment=alignment, end_to_end=EndToEnd(discriminator_width=DISCRIMINATOR_WIDTH), ema_decay=None,
-        unconditional_prob=DROPOUT)
+        unconditional_prob=DROPOUT, variables={REPRESENTATION: representation})
     assert task.autoencoder is not None
     discriminator = cast(PatchDiscriminator(DISCRIMINATOR_WIDTH).variables_from_torch(
         {key.removeprefix("weights/discriminator."): STEPPED[key] for key in STEPPED.files
          if key.startswith("weights/discriminator.")}))
     variables = task.init(jax.random.PRNGKey(0), cast({
         "encoders": task.encoder_params(), "autoencoder": task.autoencoder.params,
-        REPRESENTATION: alignment.variables, PERCEPTUAL: variables_from_torch(*drawn_weights()),
+        REPRESENTATION: representation, PERCEPTUAL: variables_from_torch(*drawn_weights()),
         DISCRIMINATOR: discriminator}))
     params = cast({**nested((path, module(name)) for name, path in LAYOUT),
                    AUTOENCODER: variables["params"][AUTOENCODER], DISCRIMINATOR: discriminator["params"]})
@@ -563,15 +563,9 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.data import TFDSImages
-    from dew.objectives.diffusion import (
-        Denoising,
-        DiffusionRunConfig,
-        PretrainedAutoencoder,
-        RepresentationAlignment,
-        TextCondition,
-    )
+    from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 
     for name in ("tiny_diffusers", "rae"):
         with tarfile.open(FIXTURES / f"{name}.tar.xz") as archive:
@@ -579,13 +573,15 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=32), preset=presets.Flow(), solver=Euler(), guidance=None,
-        sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+        data=TFDSImages(image_size=32), preset=presets.Flow(), val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
-        mode=Denoising(alignment=RepresentationAlignment(
-            encoder=str(tmp_path / "rae/dinov2_plain"), layer="dit_block_0", width=8, resolution=112,
-            end_to_end=EndToEnd(perceptual_weight=0.0, discriminator_width=8))))
+        objective=ObjectiveConfig("diffusion", {
+            "alignment": Alignment("dit_block_0", source=str(tmp_path / "rae/dinov2_plain"), width=8,
+                                   resolution=112),
+            "end_to_end": EndToEnd(perceptual_weight=0.0, discriminator_width=8), "solver": Euler(),
+            "guidance": None, "steps": 2, "ema_decay": None}))
     task = config.build()
     trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
     state = trainer.initial_state()

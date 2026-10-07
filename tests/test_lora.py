@@ -1017,8 +1017,9 @@ def _recipe_run(tmp_path, image_size, *args):
     config = module.DiffusionRecipeConfig.cli([
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "data:tfds-images", "--data.path", str(IMAGES), "--data.image-size", str(image_size),
-        "--data.augmentation", "none", "--data.val-batches", "None", "solver:euler", "guidance:none",
-        "--sampling-steps", "2", "--ema-decay", "None", "--val-metrics",
+        "--data.augmentation", "none", "--data.val-batches", "None", "--objective.solver",
+        '{"class": "euler"}', "--objective.guidance", "None", "--objective.steps", "2",
+        "--objective.ema-decay", "None", "--val-metrics",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.batch-size", str(jax.device_count()),
         "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
@@ -1045,7 +1046,7 @@ def test_a_pretrained_pipeline_run_from_the_command_line_trains_its_lora(pipelin
 
     directory = pipelines["flux"].source
     config, state = _recipe_run(tmp_path, 16, "--pretrained", str(directory), "preset:none",
-                                "--unconditional-prob", "0.0", "--lora.rank", "2", "--lora.modules",
+                                "--objective.unconditional-prob", "0.0", "--lora.rank", "2", "--lora.modules",
                                 *DENOISER_MODULES)
     assert config.lora == LoRA(rank=2, modules=DENOISER_MODULES)
 

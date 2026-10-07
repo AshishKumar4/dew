@@ -72,12 +72,14 @@ def test_the_diffusion_flow_trains_restores_and_samples(tmp_path):
     step(tmp_path, str(ROOT / "recipes" / "diffusion" / "train.py"), "data:tfds-images",
          "--data.path", str(IMAGES), "--data.image-size", "8", "--data.augmentation", "none",
          "--data.val-batches", "0", "--data.loading.workers", "0", "--data.loading.threads", "1",
-         "--data.loading.read-buffer", "2", "preset:flow", "solver:euler", "guidance:none",
+         "--data.loading.read-buffer", "2", "preset:flow", "--objective.solver", '{"class": "euler"}',
+         "--objective.guidance", "None",
          "--text.encoder", "char_table", "--text.checkpoint", "char_table",
          "--model", "simple_dit", "--model.patch_size", "2", "--model.emb_features", "16",
          "--model.num_layers", "1", "--model.num_heads", "2",
-         "--model.dtype", "float32", "--model.attention-impl", "xla", "--sampling-steps", "2",
-         "--ema-decay", "None", "--val-metrics", "--trainer.batch-size", "4", "--trainer.steps", "2",
+         "--model.dtype", "float32", "--model.attention-impl", "xla", "--objective.steps", "2",
+         "--objective.ema-decay", "None", "--val-metrics", "--trainer.batch-size", "4",
+         "--trainer.steps", "2",
          "--trainer.log-every", "1", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
          "--trainer.checkpoint-dir", "runs", "--trainer.name", "demo", "--trainer.multi-host", "False")
     sampled = step(tmp_path, "-c", (

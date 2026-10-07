@@ -19,7 +19,7 @@ from test_guidance_distillation import FIXTURES, FLUX
 from test_objective_inputs import cases, corpus_windows
 
 from dew import Dataset, Evaluation
-from dew.config import ModelConfig
+from dew.config import ModelConfig, ObjectiveConfig
 from dew.data import DataPartition, Loading, TFDSImages
 from dew.data.chat import Role
 from dew.data.dataset import rows_of
@@ -52,9 +52,11 @@ def runnable(name: str, windows, tmp_path):
         archive.extractall(tmp_path / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=8), preset=Flow(), solver=Euler(), guidance=None, sampling_steps=2,
-        ema_decay=None, val_metrics=(),
-        text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline"))).build()
+        data=TFDSImages(image_size=8), preset=Flow(), val_metrics=(),
+        text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline")),
+        objective=ObjectiveConfig("diffusion",
+                                  {"solver": Euler(), "guidance": None, "steps": 2,
+                                   "ema_decay": None})).build()
     objective = GuidanceDistillationObjective(teacher.model, teacher.process, teacher.inputs, teacher=teacher,
                                               teacher_variables=teacher.init(jax.random.key(0)), steps=2)
     return objective, batch_for(teacher, 8)

@@ -400,7 +400,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     import optax
     from diffusion_stubs import STUB_TEXT
 
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.data import Dataset, VideoDataset
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
@@ -414,11 +414,10 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
         ),
         data=VideoDataset(frame_size=32, frames=9),
         trainer=TrainerConfig(batch_size=8, steps=1),
-        solver=Euler(),
-        sampling_steps=2,
         val_metrics=(),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"),
+        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),
     )
     objective = config.build()
     assert objective.latent_shape == (3, 4, 4, 4)

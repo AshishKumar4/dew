@@ -21,7 +21,7 @@ from steady_state import steady_state
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
-from dew.config import ModelConfig, RunConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
@@ -48,8 +48,14 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
         model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
         data=TFDSImages(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
-        preset=preset, solver=Euler(), sampling_steps=3,
-        text=TextCondition(encoder=encoder, checkpoint=checkpoint))
+        preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
+        objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
+
+
+def stating(config, **fields):
+    """`config` with its objective stating `fields` beside what it states."""
+    return dataclasses.replace(config, objective=dataclasses.replace(
+        config.objective, fields={**config.objective.fields, **fields}))
 
 
 _DEFAULT_MAKE_RUN_PRESET = EDM()
@@ -215,7 +221,7 @@ def test_a_run_that_keeps_one_copy_of_its_weights_samples_it_by_default(tmp_path
     checkpoints = Checkpoints(str(single), keep=1)
     checkpoints.save(int(state.step), state.replace(ema=None), None, artifact=objective.inference_record())
     checkpoints.wait()
-    dataclasses.replace(run_config(single), ema_decay=None).save(str(single))
+    stating(run_config(single), ema_decay=None).save(str(single))
 
     expected = (
         TextToImage.from_run(str(tmp_path / "kept"), ema=False)(["a lily"], steps=3, key=0).host().images
@@ -358,7 +364,7 @@ def test_the_autoencoder_record_carries_its_revision(tmp_path):
 
 def test_guidance_is_a_value_with_its_interval(tmp_path):
     """The run preserves interval and rescaling controls, or disables guidance."""
-    config = dataclasses.replace(run_config(tmp_path), guidance=CFG(4.0, (0.2, 0.8), rescale=0.3))
+    config = stating(run_config(tmp_path), guidance=CFG(4.0, (0.2, 0.8), rescale=0.3))
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
 
     # The record a command line or a run.json carries builds the same value.
@@ -367,7 +373,7 @@ def test_guidance_is_a_value_with_its_interval(tmp_path):
     assert from_record.guidance == CFG(4.0, (0.2, 0.8), rescale=0.3)
     assert from_record.build().guidance == CFG(4.0, (0.2, 0.8), rescale=0.3)
 
-    unguided = dataclasses.replace(config, guidance=None)
+    unguided = stating(config, guidance=None)
     assert unguided.build().guidance is None
     assert DiffusionRunConfig.from_dict(unguided.to_dict()).guidance is None
 
@@ -985,11 +991,10 @@ def test_restored_bf16_clip_blank_and_samples_are_the_objectives_bits(tmp_path, 
     """
     from pathlib import Path
 
-    config = dataclasses.replace(
+    config = stating(dataclasses.replace(
         run_config(tmp_path, preset=Flow()),
         text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
-                           dtype="bfloat16"),
-        guidance=CFG(5.0), ema_decay=None)
+                           dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
     with jax.default_matmul_precision(precision):
         objective = config.build()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
@@ -1025,11 +1030,10 @@ def test_binding_new_encoder_weights_recomputes_the_warmed_blank(tmp_path):
     """
     from pathlib import Path
 
-    config = dataclasses.replace(
+    config = stating(dataclasses.replace(
         run_config(tmp_path, preset=Flow()),
         text=TextCondition(encoder="clip_text", checkpoint=str(Path(__file__).parent / "fixtures/clip/tiny"),
-                           dtype="bfloat16"),
-        guidance=CFG(5.0), ema_decay=None)
+                           dtype="bfloat16")), guidance=CFG(5.0), ema_decay=None)
     objective = config.build()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.key(0))
     state = trainer.initial_state()

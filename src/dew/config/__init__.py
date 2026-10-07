@@ -164,17 +164,19 @@ class ObjectiveConfig:
     """An objective's class and the arguments the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
-    constructor arguments the run states, which the command line sets one
-    flag each (`--objective.ema_decay 0.999`); what the objective is built
-    around, the model and what a recipe reads off its data, `build` takes
-    from the caller.
+    constructor arguments the run states, held as their records
+    (`registry.argument_records`), which the command line sets one flag each
+    (`--objective.ema_decay 0.999`); what the objective is built around, the
+    model and what a recipe reads off its data, `build` takes from the caller.
     """
 
     name: str
     fields: JsonDict = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", registry.import_path(objectives[self.name]))
+        member = objectives[self.name]
+        object.__setattr__(self, "name", registry.import_path(member))
+        object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
 
     def build(self, **derived: Configured) -> Objective:
         """Build the objective from its fields and the arguments the caller

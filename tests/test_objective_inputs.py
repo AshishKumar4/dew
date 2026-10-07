@@ -17,7 +17,7 @@ import jax
 import numpy as np
 import pytest
 
-from dew.config import ModelConfig
+from dew.config import ModelConfig, ObjectiveConfig
 from dew.data import DataPartition, PreferencePairs, TFDSImages, TokenCorpus, TokenWindows
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
@@ -28,17 +28,14 @@ from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.objectives import DistillationObjective
 from dew.objectives.diffusion import (
-    AdversarialDistillation,
     AdversarialDistillationObjective,
-    ConsistencyDistillation,
     ConsistencyDistillationObjective,
     GuidanceDistillationObjective,
-    MeanFlowTraining,
-    ShortcutTraining,
 )
 from dew.objectives.diffusion.block import BlockDiffusionObjective
-from dew.objectives.diffusion.config import DiffusionRunConfig, FlowGRPO, TextCondition
+from dew.objectives.diffusion.config import DiffusionRunConfig, TextCondition
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+from dew.objectives.diffusion.objective import TEACHER
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
@@ -74,33 +71,32 @@ def windows(tmp_path_factory):
     return corpus_windows(tmp_path_factory.mktemp("corpus"))
 
 
-def diffusion(preset=None, **training) -> DiffusionRunConfig:
-    """The diffusion recipe's config: a captioned image dataset, one kind of training."""
+def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfig:
+    """The diffusion recipe's config: a captioned image dataset and `objective`
+    with `fields`, sampling in two Euler steps."""
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)),
         data=TFDSImages(path=str(IMAGES), image_size=4, augmentation="none", val_batches=None),
-        preset=Flow() if preset is None else preset, solver=Euler(), guidance=None, sampling_steps=2,
-        ema_decay=None, val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        **training)
+        preset=Flow() if preset is None else preset, val_metrics=(),
+        text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        objective=ObjectiveConfig(objective, {"solver": Euler(), "steps": 2, **fields}))
 
 
 def with_teacher(kind):
     """A distilled diffusion kind over the recipe's model, inputs and data,
     its teacher the recipe's own objective at initialization."""
-    config = diffusion()
+    config = diffusion(guidance=None, ema_decay=None)
     base = config.build()
     drawn = base.init(jax.random.key(0))
     teacher = base.model_variables(drawn)
     shared = (base.model, base.process, base.inputs)
     built = {
         "ladd": lambda: AdversarialDistillationObjective(
-            *shared, AdversarialDistillation(feature_layers=("dit_block_0",), cmap_dim=4, kernel_size=(1, 1)),
-            teacher=base.model, teacher_variables=teacher, guidance=None, steps=2),
-        "rcm": lambda: ConsistencyDistillationObjective(
-            *shared, ConsistencyDistillation(), teacher=base.model, teacher_variables=teacher, guidance=None,
-            steps=2),
+            *shared, feature_layers=("dit_block_0",), cmap_dim=4, kernel_size=(1, 1),
+            variables={TEACHER: teacher}, steps=2),
+        "rcm": lambda: ConsistencyDistillationObjective(*shared, variables={TEACHER: teacher}, steps=2),
         "guidance_distillation": lambda: GuidanceDistillationObjective(
-            *shared, teacher=base, teacher_variables=drawn, steps=2),
+            *shared, variables={TEACHER: drawn}, steps=2),
     }[kind]()
     return built, first(config.data, built)
 
@@ -179,11 +175,11 @@ def cases(windows):
         "grpo": lambda: packed(lambda seq_len: GRPOObjective(decoder(), seq_len)),
         "ppo": lambda: packed(lambda seq_len: PPOObjective(decoder(), seq_len,
                                                            critic=ValueHead(decoder()))),
-        "diffusion": lambda: built(diffusion()),
-        "mean_flow": lambda: built(diffusion(MeanFlow(), mode=MeanFlowTraining())),
-        "shortcut": lambda: built(diffusion(Shortcut(), mode=ShortcutTraining(sections=4,
-                                                                                  bootstrap_every=2))),
-        "flow_grpo": lambda: built(diffusion(mode=FlowGRPO())),
+        "diffusion": lambda: built(diffusion(guidance=None, ema_decay=None)),
+        "mean_flow": lambda: built(diffusion(MeanFlow(), "mean_flow", ema_decay=None)),
+        "shortcut": lambda: built(diffusion(Shortcut(), "shortcut", sections=4, bootstrap_every=2,
+                                            ema_decay=None)),
+        "flow_grpo": lambda: built(diffusion(objective="flow_grpo", guidance=None)),
         "ladd": lambda: with_teacher("ladd"),
         "rcm": lambda: with_teacher("rcm"),
         "guidance_distillation": lambda: with_teacher("guidance_distillation"),

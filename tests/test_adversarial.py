@@ -17,17 +17,12 @@ from reference_error import assert_as_exact_as_the_reference
 
 import dew
 from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
-from dew.objectives.diffusion import (
-    AdversarialDistillation,
-    AdversarialDistillationObjective,
-    DiffusionRunConfig,
-    TextCondition,
-)
+from dew.objectives.diffusion import AdversarialDistillationObjective, DiffusionRunConfig, TextCondition
 from dew.objectives.diffusion.adversarial import Head
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL, TEACHER
 from dew.sampling import Consistency, Euler, TextToImage
@@ -131,13 +126,11 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
     teacher = {"params": unflattened("teacher") | layers}
     model = Tokens(settings["width"])
     task = AdversarialDistillationObjective(
-        model, Flow()(), InputSpec(Field("image", pixels.shape[1:])),
-        AdversarialDistillation(feature_layers=settings["layers"], student_times=settings["student_times"],
-                                renoise_times=tuple(settings["renoise_times"]),
-                                distillation_weight=settings["distillation_weight"],
-                                r1_weight=settings["r1_weight"], cmap_dim=settings["cmap_dim"],
-                                kernel_size=(1, 1)),
-        teacher=model, teacher_variables=teacher, time_features=settings["time_features"], ema_decay=None)
+        model, Flow()(), InputSpec(Field("image", pixels.shape[1:])), feature_layers=settings["layers"],
+        student_times=settings["student_times"], renoise_times=tuple(settings["renoise_times"]),
+        distillation_weight=settings["distillation_weight"], r1_weight=settings["r1_weight"],
+        cmap_dim=settings["cmap_dim"], kernel_size=(1, 1), variables={TEACHER: teacher},
+        time_features=settings["time_features"], ema_decay=None)
     variables = task.init(jax.random.PRNGKey(0))
     student = unflattened("student")
     for name in ("layer_a", "layer_b"):
@@ -175,9 +168,11 @@ def runs(tmp_path_factory):
         model=ModelConfig("simple_dit",
                           {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                            "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=4), preset=Flow(), solver=Euler(), guidance=None,
-        sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(root)),
-        text=TextCondition(encoder="char_table", checkpoint="char_table"))
+        data=TFDSImages(image_size=4), preset=Flow(), val_metrics=(),
+        trainer=TrainerConfig(checkpoint_dir=str(root)),
+        text=TextCondition(encoder="char_table", checkpoint="char_table"),
+        objective=ObjectiveConfig("diffusion",
+                                  {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
     objective = teacher.build()
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     state = trainer.initial_state()
@@ -187,9 +182,9 @@ def runs(tmp_path_factory):
     checkpoints.save(1, state, None, artifact=objective.inference_record())
     checkpoints.wait()
     teacher.save(str(root / "teacher"))
-    student = dataclasses.replace(teacher, solver=Consistency(), mode=AdversarialDistillation(
-        teacher=str(root / "teacher"), feature_layers=("dit_block_0", "dit_block_1"), cmap_dim=8,
-        kernel_size=(3, 3)))
+    student = dataclasses.replace(teacher, objective=ObjectiveConfig("ladd", {
+        "teacher_run": str(root / "teacher"), "feature_layers": ["dit_block_0", "dit_block_1"], "cmap_dim": 8,
+        "kernel_size": [3, 3], "solver": Consistency(), "steps": 2, "ema_decay": None}))
     return student, batch
 
 
@@ -209,7 +204,7 @@ def test_each_side_trains_on_its_own_loss(runs):
             total, aux = task.loss({**params, "params": tree}, batch, step)
             if name is None:
                 return total.total
-            gamma = task.distillation.r1_weight
+            gamma = task.r1_weight
             return sum(aux.metrics[key] * (gamma if key == "r1" else 1) for key in name) * total.mass
         return jax.grad(loss)(params["params"])
 
@@ -259,9 +254,8 @@ def test_a_lora_student_distills_beside_its_whole_teacher():
     held = jax.tree.map(np.asarray, teacher["params"])  # the step donates these buffers
     adapter = LoRA(rank=2, modules=("ada_proj", "final_proj")).apply(model, teacher, key=1)
     task = AdversarialDistillationObjective(
-        adapter.model, Flow()(), InputSpec(Field("image", (4, 4, 3))),
-        AdversarialDistillation(feature_layers=("dit_block_0",), cmap_dim=4), teacher=model,
-        teacher_variables=teacher, ema_decay=None, variables={**adapter.variables, "encoders": {}})
+        adapter.model, Flow()(), InputSpec(Field("image", (4, 4, 3))), feature_layers=("dit_block_0",),
+        cmap_dim=4, ema_decay=None, variables={**adapter.variables, "encoders": {}, TEACHER: teacher})
     assert [program.trained for program in task.program_key()] == [True, False]
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (8, 4, 4, 3), 0, 256), np.uint8)}
     trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(4))

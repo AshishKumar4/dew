@@ -16,7 +16,7 @@ import optax
 import pytest
 from reference_error import assert_fp32_reduction_bound
 
-from dew.config import OptimConfig
+from dew.config import ObjectiveConfig, OptimConfig
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -991,11 +991,11 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=TFDSImages(image_size=RES), text=None, guidance=None,
-        sampling_steps=2, val_metrics=(),
+        data=TFDSImages(image_size=RES), text=None, val_metrics=(),
         trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
                               steps=1, eval_every=None, checkpoint_every=None,
-                              compilation_cache_dir=None, **trainer))
+                              compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",
+                              {"guidance": None, "steps": 2}))
 
 
 def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
