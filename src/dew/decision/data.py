@@ -1,10 +1,13 @@
 """Labelled requests: what a decision model trains and calibrates on."""
 
 import random
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import numpy as np
+
+from dew import records
 from dew.data.dataset import Dataset, DatasetSpec, Tokenize
 from dew.data.sources.hf import HFDatasetSource, HFOptions
 from dew.decision.questions import Choice, Question
@@ -16,20 +19,31 @@ class Example:
     """One state, its questions, and the right answer to some of them.
 
     An answer names an option by its key or its index (`Question.index`), so
-    a dataset's integer label column can be used as it is. A question with no
-    answer is asked but not scored.
+    a dataset's integer label column can be used as it is. Where the gold is a
+    distribution, as a teacher's or a panel's is, `targets` gives it instead:
+    one probability per option, in the question's own order. A question with
+    neither is asked but not scored.
     """
 
     state: JSON
     questions: Mapping[str, Question]
     answers: Mapping[str, str | int] = field(default_factory=dict)
+    targets: Mapping[str, tuple[float, ...]] = field(default_factory=dict)
 
     def __post_init__(self):
-        unknown = set(self.answers) - set(self.questions)
+        unknown = (set(self.answers) | set(self.targets)) - set(self.questions)
         if unknown:
             raise ValueError(f"answers name questions the example does not ask: {sorted(unknown)}")
+        both = set(self.answers) & set(self.targets)
+        if both:
+            raise ValueError(f"questions {sorted(both)} have both an answer and a target distribution")
         for name, label in self.answers.items():
             self.questions[name].index(label)
+        for name, target in self.targets.items():
+            count = len(self.questions[name].options)
+            if len(target) != count or min(target) < 0 or abs(sum(target) - 1) > 1e-3:
+                raise ValueError(f"targets.{name} is a distribution over the question's {count} options, "
+                                 f"got {list(target)}")
 
     @classmethod
     def of(cls, row: "Example | Mapping[str, object]") -> "Example":
@@ -48,11 +62,49 @@ class Example:
             if isinstance(label, bool) or not isinstance(label, (str, int)):
                 raise ValueError(f"answers.{name} names an option by its key or index, got {label!r}")
             answers[name] = label
-        return cls(json_value(row.get("state"), "state"), questions, answers)
+        targets = {name: _distribution(questions[name], target, f"targets.{name}")
+                   for name, target in record(row.get("targets", {}), "targets").items() if name in questions}
+        return cls(json_value(row.get("state"), "state"), questions, answers, targets)
 
     def labels(self) -> dict[str, int]:
-        """Return each answered question's right option, as an index."""
-        return {name: self.questions[name].index(label) for name, label in self.answers.items()}
+        """Return each answered question's right option, as an index: a target's most likely one."""
+        labels = {name: self.questions[name].index(label) for name, label in self.answers.items()}
+        return labels | {name: int(np.argmax(target)) for name, target in self.targets.items()}
+
+    def distribution(self, name: str) -> np.ndarray:
+        """Return question `name`'s gold as a distribution over its options.
+
+        That is its target, or else all of the mass on its answer.
+        """
+        if name in self.targets:
+            target = np.asarray(self.targets[name], np.float64)
+            return target / target.sum()
+        return np.eye(len(self.questions[name].options))[self.labels()[name]]
+
+
+@dataclass(frozen=True)
+class Weighted:
+    """Examples that fill `weight`, a share of every training step, in a mixture of several.
+
+    `DecisionObjective.dataset` reads a mapping of names to these as one stream,
+    each set at its share whatever its length (`dew.data.dataset.mixture`).
+    """
+
+    examples: Sequence[Example]
+    weight: float
+
+
+def _distribution(question: Question, target: JSON, name: str) -> tuple[float, ...]:
+    """A target distribution from a row: probabilities in the question's option order, or keyed by option."""
+    match target:
+        case list():
+            return tuple(records.number(value, name) for value in target)
+        case dict():
+            if set(target) != set(question.options):
+                raise ValueError(f"{name} keys {sorted(target)}, not the options {list(question.options)}")
+            return tuple(records.number(target[option], f"{name}.{option}") for option in question.options)
+        case _:
+            raise ValueError(f"{name} is a list of probabilities or a mapping of options to them")
 
 
 _FORMATS = {".csv": "csv", ".json": "json", ".jsonl": "json", ".parquet": "parquet"}
