@@ -18,13 +18,13 @@ Without `--set`, the record continues the run from its own checkpoints.
 """
 
 import json
+import tempfile
 from pathlib import Path
 
 import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.cache import dew_cache_dir
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import HFOptions, HubDataset
 from dew.inputs import Field, InputSpec
@@ -64,7 +64,7 @@ def spirals(path: Path, count: int, seed: int) -> str:
 
 
 def run() -> RunConfig:
-    data = Path(dew_cache_dir()) / "examples" / "spirals"
+    data = Path(tempfile.gettempdir()) / "dew-examples" / "spirals"
     files = {"train": spirals(data / "train.jsonl", 2048, 0),
              "validation": spirals(data / "validation.jsonl", 256, 1)}
     return RunConfig(
