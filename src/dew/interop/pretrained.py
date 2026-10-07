@@ -403,7 +403,7 @@ class Pretrained:
         return replace(bundle, adapter=Adapter.recorded(model, variables, model_config.adapter))
 
     @classmethod
-    def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike | None = jnp.bfloat16,
+    def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
              attention_impl: str = "auto", max_seq_len: int | None = None,
              revision: str | None = None, gguf_file: str | None = None,
@@ -466,7 +466,7 @@ class Pretrained:
                          fallback=fallback)
 
     @classmethod
-    def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike | None = jnp.bfloat16,
+    def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
               param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
               attention_impl: str = "auto", max_seq_len: int | None = None,
               revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
