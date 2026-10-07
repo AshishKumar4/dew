@@ -583,6 +583,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
+    # tests/test_packed_grpo.py covers the tiled default.
     keeps_whole_logits: ClassVar[bool] = True
     """Whether the head's default (`head_tile` None) keeps the whole fp32 logits for the backward pass.
 
