@@ -5,9 +5,11 @@ optimize it, and how the trainer runs. Recipes parse it with tyro, build the
 objective and the data it names, and pass both to `RunConfig.train`, so
 `to_dict()` is a full record of a run and `from_dict()` rebuilds it.
 
-Model kwargs are an opaque JSON dict, and the model's class declares which
-fields it takes. A dataset is the spec itself, which tyro turns into a
-subcommand over the aliased specs (`data:token-windows --data.path ...`).
+The model is its class and the fields the run gives it: `--model
+hybrid_dit` (an alias or an import path) picks the class, and each of its
+own fields is a flag typed by its annotation (`--model.num_layers 12`,
+`--model.dtype bfloat16`). A dataset is the spec itself, which tyro turns
+into a subcommand over the aliased specs (`data:token-windows --data.path ...`).
 
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
@@ -23,9 +25,12 @@ import json
 import os
 import re
 import sys
+import types
+import typing
 from collections.abc import Callable, Mapping, Sequence
+from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, Union
 
 import jax
 import optax
@@ -44,7 +49,7 @@ from dew.lora import LoRA, _Adapted, adapted
 from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
-from dew.registry import _declared_type, datasets, from_record, models, schedules, to_record, with_precision
+from dew.registry import _declared_type, datasets, from_record, models, schedules, to_record
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
@@ -90,60 +95,24 @@ else:
 
 @dataclasses.dataclass(frozen=True)
 class ModelConfig:
-    """Holds the architecture name and the fields `models.build` receives."""
+    """A model's class and the fields the run gives it.
 
-    architecture: str = "simple_dit"
-    config: JsonDict = dataclasses.field(default_factory=dict)
+    `name` is an alias or an import path, held as the path. `fields` are the
+    class's own fields, its compute and storage dtypes, attention kernel and
+    matmul precision included, which the command line sets one flag each
+    (`RunConfig.cli`); a recipe fills the ones it derives from its data in
+    `build`.
+    """
+
+    name: str = "simple_dit"
+    fields: JsonDict = dataclasses.field(default_factory=dict)
     adapter: JsonDict | None = None
     """The bound LoRA record; its factors are stored with the checkpoint variables."""
     quantization: Quantization | None = None
     """The quantized training the model was wrapped in, which `build` wraps it in again."""
-    dtype: registry.DtypeName | None = "bfloat16"
-    """The compute dtype; parameter storage is set separately.
 
-    A model that declares no `dtype` field, and holds no model part that
-    does, refuses any value but None (`dew.registry.precision_fields`).
-    """
-    param_dtype: registry.DtypeName | None = None
-    """The parameter storage dtype, written into the model's `param_dtype` field.
-
-    Unset stores float32, the model's own default. A model that declares no
-    such field refuses any other value.
-    """
-    matmul_precision: Literal["default", "high", "highest"] | None = None
-    """The precision every matmul in the model asks XLA for, written into its `precision` field.
-
-    `default` is the backend's fastest algorithm; `high` and `highest` trade
-    throughput for mantissa bits (on Ampere and later, tf32 and fp32 against
-    bf16x3). Unset keeps the model's own setting, `default`. Under bf16 compute, a
-    decoder's vocabulary head at `default` rounds its logits and their gradient to
-    bf16, as torch autocast does. `high` and `highest` keep that head in fp32,
-    which is the setting to use when comparing parallel layouts in bf16
-    (`dew.nn.precision.head_product`). A model that declares no `precision`
-    field refuses any value but None.
-    """
-    attention_impl: AttentionImpl = "auto"
-    """The attention kernel.
-
-    `dew.nn.attention` documents the kernels and how 'auto' chooses among them for
-    each call.
-    """
-
-    def fields(self) -> Mapping[str, object]:
-        """Return the model's fields with the run's precision settings in them."""
-        return with_precision(self.architecture, self.config,
-                              dtype=self.dtype, attention_impl=self.attention_impl,
-                              param_dtype=self.param_dtype,
-                              matmul_precision=self.matmul_precision)
-
-    def precision_settings(self) -> frozenset[str]:
-        """Return the names `fields()` writes that `config` did not have.
-
-        These are the run's precision settings, as this architecture takes them. A
-        resolved record leaves them out, because this value writes them again every
-        time it builds the model.
-        """
-        return frozenset(self.fields()) - frozenset(self.config)
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "name", registry.import_path(models[self.name]))
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -152,10 +121,7 @@ class ModelConfig:
 
     @classmethod
     def from_model(cls, model) -> Self:
-        """Return the module's constructor fields, with its actual compute settings.
-
-        The class is recorded by its import path, which `build` imports.
-        """
+        """Return the module's class and constructor fields, its adapter and quantization apart."""
         model_type = type(model)
         adapter, quantization = None, None
         if isinstance(model_type, _Adapted):
@@ -164,43 +130,75 @@ class ModelConfig:
         if isinstance(model_type, _Quantized):
             quantization = model_type._dew_quantization
             model_type = model_type._unquantized_type
-        architecture = registry.import_path(model_type)
-        fields = {}
-        compute, storage, attention = None, None, 'auto'
-        precision: Literal['default', 'high', 'highest'] | None = None
-        for field in dataclasses.fields(model):
-            if not field.init or field.name in ('parent', 'name'):
-                continue
-            value = getattr(model, field.name)
-            if field.name == 'dtype':
-                compute = registry.dtype_name(value)
-            elif field.name == 'param_dtype':
-                storage = registry.dtype_name(value)
-            elif field.name == 'precision':
-                if value is not None:
-                    setting = str(value).lower()
-                    if setting == 'default':
-                        precision = 'default'
-                    elif setting == 'high':
-                        precision = 'high'
-                    elif setting == 'highest':
-                        precision = 'highest'
-                    else:
-                        raise ValueError(f'model precision {value!r} has no recorded counterpart')
-            elif field.name == 'attention_impl':
-                attention = value
-            elif callable(value) and value is field.default:
-                continue
-            else:
-                fields[field.name] = to_record(value, _declared_type(model_type, field.name))
-        return cls(architecture, fields, adapter=adapter, quantization=quantization, dtype=compute,
-                   param_dtype=storage, matmul_precision=precision, attention_impl=attention)
+        fields = {field.name: to_record(getattr(model, field.name), _declared_type(model_type, field.name))
+                  for field in dataclasses.fields(model)
+                  if field.init and field.name not in ('parent', 'name')
+                  and not (callable(getattr(model, field.name)) and getattr(model, field.name) is field.default)}
+        return cls(registry.import_path(model_type), fields, adapter=adapter, quantization=quantization)
 
-    def build(self):
-        model = models.build(self.architecture, self.fields())
+    def with_dtype(self, dtype: str | None) -> Self:
+        """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
+        return dataclasses.replace(self, fields=registry.with_dtype(self.name, self.fields, dtype))
+
+    def build(self, **derived: object):
+        """Build the model from its fields and the ones the recipe `derived`."""
+        model = models.build(self.name, {**self.fields, **derived})
         if self.quantization is not None:
             model = self.quantization.apply(model)
         return model if self.adapter is None else adapted(model, self.adapter)
+
+
+def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, dict[str, object]]:
+    """A dataclass of `member`'s own fields, one optional flag each, defaulting
+    to `given` over the class's defaults, and those class defaults.
+
+    Scalars, literals and tuples of them are typed as declared; dtypes read
+    their names and precision its level. Any other field (a sequence of
+    records, a nested model) takes one JSON value, the record `build` reads."""
+    flags, defaults = [], {}
+    for field in dataclasses.fields(member):
+        if not field.init or field.name in ("parent", "name"):
+            continue
+        declared = (field.default if field.default is not dataclasses.MISSING
+                    else field.default_factory() if field.default_factory is not dataclasses.MISSING else None)
+        annotation = _declared_type(member, field.name)
+        if field.name in ("dtype", "param_dtype"):
+            flag = registry.DtypeName | None
+            declared = None if declared is None else registry.dtype_name(declared)
+        elif field.name == "precision":
+            flag = Literal["default", "high", "highest"] | None
+            declared = None if declared is None else str(declared).lower().removeprefix("precision.")
+        elif _scalar(annotation):
+            flag = annotation | None
+        else:
+            flag = Annotated[object, _JSON_FLAG]
+            try:
+                declared = json_value(to_record(declared, annotation), field.name)
+            except (TypeError, ValueError):
+                continue
+        defaults[field.name] = declared
+        flags.append((field.name, flag, dataclasses.field(default=given.get(field.name, declared))))
+    return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), defaults
+
+
+def _scalar(annotation: object) -> bool:
+    """Whether tyro reads `annotation` as one typed flag: a bool, number,
+    string, literal or enum, a tuple of those, or an optional one."""
+    annotation = registry.resolve_alias(annotation)
+    origin = typing.get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        return all(_scalar(member) for member in typing.get_args(annotation) if member is not type(None))
+    if origin is Literal:
+        return True
+    if origin in (tuple, Sequence):
+        return all(_scalar(member) for member in typing.get_args(annotation) if member is not Ellipsis)
+    return annotation in (bool, int, float, str) or (isinstance(annotation, type) and issubclass(annotation, Enum))
+
+
+_JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
+    nargs=1, metavar="JSON", instance_from_str=lambda args: json.loads(args[0]),
+    is_instance=lambda value: True, str_from_instance=lambda value: [json.dumps(value)])
+"""A model field tyro cannot type, written as the JSON record `build` reads."""
 
 
 @dataclasses.dataclass(frozen=True)

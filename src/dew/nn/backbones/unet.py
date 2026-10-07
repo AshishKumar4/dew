@@ -42,7 +42,7 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
     residual = partial(ResidualBlock, kernel_size=(3, 3), activation=model.activation,
                        norm_groups=model.norm_groups, dtype=model.dtype,
                        precision=model.precision)
-    attention = partial(stage_attention, attention_impl=model.attention_impl,
+    attention = partial(stage_attention, attention_impl=model.attention_impl, dtype=model.dtype,
                         precision=model.precision)
 
     x = conv(features=feature_depths[0])(x)

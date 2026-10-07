@@ -2067,30 +2067,32 @@ class Stage:
     channel count over `heads`, which the unet knows and a config does not.
     `dew.registry.from_record` builds one from a record (`{"heads": 8}` from a
     command line), so a misspelled field raises at the build boundary.
-    `precision` of None means the model's, which `dew.registry.with_precision`
-    writes into every stage with the model's dtype.
+    `dtype` and `precision` of None mean the model's. The softmax runs in
+    fp32 by default, as every fused kernel computes it.
     """
 
     heads: int
     use_projection: bool = False
     use_self_and_cross: bool = True
     only_pure_attention: bool = True
-    force_fp32_for_softmax: bool = False
+    force_fp32_for_softmax: bool = True
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4
-    dtype: Dtype | None = jnp.float32
+    dtype: Dtype | None = None
     precision: PrecisionLike = None
 
 
-def stage_attention(stage: Stage, channels: int, attention_impl: str,
+def stage_attention(stage: Stage, channels: int, attention_impl: str, dtype: Dtype | None,
                     precision: PrecisionLike, name: str) -> "TransformerBlock":
     """Build the block a `Stage` describes, at the stage's channel count.
 
-    A stage that names no precision takes the model's.
+    A stage that names no dtype or precision takes the model's, and a model
+    that names no dtype attends in fp32.
     """
     return TransformerBlock(
-        heads=stage.heads, dim_head=channels // stage.heads, dtype=stage.dtype,
+        heads=stage.heads, dim_head=channels // stage.heads,
+        dtype=stage.dtype or dtype or jnp.float32,
         attention_impl=attention_impl, use_projection=stage.use_projection,
         use_self_and_cross=stage.use_self_and_cross,
         precision=stage.precision or precision,
