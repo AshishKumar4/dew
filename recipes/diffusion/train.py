@@ -112,7 +112,7 @@ def run_summary(config: DiffusionRunConfig, fields: dict, arguments_hash: str) -
     sample = config.sample_field()
     return {
         **fields,
-        "architecture": config.pretrained or config.model.architecture,
+        "architecture": config.pretrained or config.model.label,
         "dataset": corpus_name(config.data),
         "image_size": sample.shape[-2],
         "batch_size": config.trainer.batch_size,
@@ -132,7 +132,7 @@ def experiment_name(config: DiffusionRunConfig, summary: dict) -> str:
     name = name + "/arguments_hash-{arguments_hash}/date-{date}"
     if config.autoencoder is not None:
         name = f"LDM-{name}"
-    if 'hybrid_dit' in config.model.architecture:
+    if config.model.label == 'hybrid_dit':
         name = f"SSM-{name}"
     if summary.get('scan_order', 'raster') != 'raster':
         name = f"{summary['scan_order'].capitalize()}-{name}"

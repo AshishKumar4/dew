@@ -241,7 +241,7 @@ class ConsistencyDistillation(Distillation):
         teacher = DiffusionRunConfig.load(self.teacher)
         if teacher.pretrained is not None:  # a pipeline's denoiser is its source's, not `model`'s
             return
-        model = models.build(teacher.model.architecture, teacher.model_fields(None))
+        model = models.build(teacher.model.name, teacher.model_fields(None))
         if isinstance(model, TimeScaled) and abs(model.time_scale) > SMOOTH_TIME_SCALE:
             raise ValueError(f"sCM differentiates the student in time, and its teacher's time features turn "
                              f"at time_scale={model.time_scale}, faster than {SMOOTH_TIME_SCALE}; train the "

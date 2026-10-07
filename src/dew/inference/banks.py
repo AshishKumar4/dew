@@ -310,7 +310,7 @@ class SafetensorsBanks(LayerBanks):
             translate_weights,
         )
         from dew.interop.safetensors_io import read_weights
-        from dew.registry import dtype_name, models, with_precision
+        from dew.registry import dtype_name, models
 
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
@@ -335,8 +335,8 @@ class SafetensorsBanks(LayerBanks):
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
-        _check_tree(self._shapes, models.build("causal_transformer", with_precision(
-            "causal_transformer", record, dtype="float32", attention_impl="reference")))
+        _check_tree(self._shapes, models.build(
+            "causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"}))
         self.cache_limit = cache_bytes
         self.read_ahead = read_ahead
         self._cache: dict[tuple[tuple[str, ...], int], Variables] = {}

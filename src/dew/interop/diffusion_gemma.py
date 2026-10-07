@@ -32,7 +32,7 @@ from dew.nn.vision.gemma4 import (
     translate_gemma4_vision_weights,
 )
 from dew.objectives.base import Variables
-from dew.registry import from_record, precision_fields, projectors, towers
+from dew.registry import from_record, projectors, towers
 
 
 # The wrapper config states these three with a default this assembly supplies
@@ -67,8 +67,7 @@ def build(config: Mapping[str, object], *, dtype: str | None = "bfloat16",
     fields["causal"] = True
     if max_seq_len is not None:
         fields["max_seq_len"] = max_seq_len
-    precise = NativeFields(CausalTransformer, {**fields, **precision_fields(
-        "causal_transformer", fields, dtype=dtype, attention_impl=attention_impl)})
+    precise = NativeFields(CausalTransformer, {**fields, "dtype": dtype, "attention_impl": attention_impl})
     text = from_record(CausalTransformer, precise)
     conditioner = None
     if config.get("vision_config") is not None:

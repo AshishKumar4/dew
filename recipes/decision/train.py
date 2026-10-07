@@ -25,7 +25,7 @@ A question type's temperature needs ten held-out answers and a bucket's
 import json
 from dataclasses import dataclass, field, replace
 
-from dew.config import OptimConfig, RunConfig
+from dew.config import ModelConfig, OptimConfig, RunConfig
 from dew.data.text import HFTokenizer
 from dew.decision import (
     AURC,
@@ -52,6 +52,8 @@ class DecisionRunConfig(RunConfig):
     objective: str = "decision"
     data: DecisionTable = field(default_factory=DecisionTable)
     optim: OptimConfig = field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
+    model: ModelConfig = field(
+        default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     pretrained: str = "convaiinnovations/laya"
     """A Laya-style repository, read whole, or a Hugging Face model, read as the backbone."""
     subfolder: str | None = None
@@ -83,16 +85,24 @@ class DecisionRunConfig(RunConfig):
 
 
 def backbone(config: DecisionRunConfig) -> Decide | Pretrained:
-    """Laya's checkpoint whole, or a Hugging Face model as the backbone, adapted when `--lora` asks."""
+    """Laya's checkpoint whole, or a Hugging Face model as the backbone, adapted when `--lora` asks.
+
+    The checkpoint decides the backbone; the model flags choose only its
+    compute dtype and attention kernel."""
+    settings = ("dtype", "attention_impl")
+    decided = sorted(set(config.model.fields) - set(settings))
+    if decided:
+        raise ValueError(f"--model sets {decided}, which {config.pretrained} decides; only "
+                         f"{', '.join(settings)} are choices")
+    dtype = str(config.model.fields.get("dtype") or "float32")
+    attention_impl = str(config.model.fields.get("attention_impl", "auto"))
     if LayaCheckpoint.exists(config.pretrained, subfolder=config.subfolder, revision=config.revision):
         if config.lora is not None:
             raise ValueError("--lora adapts a Hugging Face backbone; a Laya checkpoint trains whole")
         return Decide.from_pretrained(config.pretrained, subfolder=config.subfolder, revision=config.revision,
-                                      dtype=config.model.dtype or "float32",
-                                      attention_impl=config.model.attention_impl)
-    source = Pretrained.load(config.pretrained, revision=config.revision,
-                             dtype=config.model.dtype or "float32",
-                             attention_impl=config.model.attention_impl)
+                                      dtype=dtype, attention_impl=attention_impl)
+    source = Pretrained.load(config.pretrained, revision=config.revision, dtype=dtype,
+                             attention_impl=attention_impl)
     return source if config.lora is None else source.adapt(config.lora, key=config.trainer.key)
 
 

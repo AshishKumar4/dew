@@ -135,7 +135,7 @@ def run_config(args: RigelArgs):
     """The LM recipe's run config for `args`."""
     from train import LmRunConfig
     return LmRunConfig(
-        model=ModelConfig("causal_transformer", config=model_config(args.width)),
+        model=ModelConfig("causal_transformer", {**model_config(args.width), "dtype": "bfloat16"}),
         data=PackedTokens(phases=phases(args.corpora, args.steps), seq_len=args.seq_len),
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
         trainer=TrainerConfig(batch_size=args.batch_size, steps=args.steps,

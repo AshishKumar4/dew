@@ -18,12 +18,12 @@ from dew.objectives.jepa import JepaObjective, KnnProbe, LinearProbe, MultiBlock
 from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
 
-DEFAULT_ENCODER_CONFIG = {"precision": "default"}
+DEFAULT_ENCODER_CONFIG = {"precision": "default", "dtype": "bfloat16"}
 
 # What the predictor takes from the encoder unless --predictor overrides it.
 # Its depth and width are its own: a predictor as wide as the encoder makes the
 # objective too easy. The compute dtype and the attention kernel are not here:
-# they belong to the run's precision policy, which writes them into both models.
+# the predictor computes as the encoder does (`build_predictor`).
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
                      "ssm_state_dim", "dropout_rate", "precision")
 
@@ -74,7 +74,7 @@ def sample_field(config: JepaRunConfig) -> Field:
 
 def build_encoder(config: JepaRunConfig):
     """The encoder, and the fields the registry built it from."""
-    return config.model.build(), config.model.fields()
+    return config.model.build(), config.model.fields
 
 
 def build_predictor(config: JepaRunConfig, encoder_fields: Mapping[str, object], encoder, grid,
@@ -87,16 +87,17 @@ def build_predictor(config: JepaRunConfig, encoder_fields: Mapping[str, object],
         "factorized": is_video,
         "scan_order": encoder.scan_order,
     }
-    record = ModelConfig('jepa_predictor', fields, dtype=config.model.dtype,
-                         attention_impl=config.model.attention_impl)
-    return record.build(), record.fields()
+    shared = {key: config.model.fields[key] for key in ("dtype", "attention_impl")
+              if key in config.model.fields}
+    record = ModelConfig('jepa_predictor', {**fields, **shared})
+    return record.build(), record.fields
 
 
 def run_summary(config: JepaRunConfig, encoder_fields: Mapping[str, object]) -> dict:
     """Flat view of the run, for the tracker."""
     return {
         **encoder_fields,
-        "architecture": config.model.architecture,
+        "architecture": config.model.label,
         "dataset": datasets.alias_of(type(config.data)),
         "image_size": sample_field(config).shape[-2],
         "batch_size": config.trainer.batch_size,
@@ -114,7 +115,7 @@ def main(config: JepaRunConfig) -> TrainState:
 
     sample = sample_field(config)
     is_video = sample.key == "video"
-    if is_video != (models[config.model.architecture] is models['jepa_video_encoder']):
+    if is_video != (models[config.model.name] is models['jepa_video_encoder']):
         raise ValueError(
             "a video dataset and --model.architecture jepa_video_encoder go together")
 

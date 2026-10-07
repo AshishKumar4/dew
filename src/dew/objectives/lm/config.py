@@ -35,7 +35,7 @@ class LMRunConfig(RunConfig):
     """The loss convention: lm, masked_diffusion (MDLM), or block_diffusion
     (the official DiffusionGemma fine-tuning objective)."""
     model: ModelConfig = dataclasses.field(
-        default_factory=lambda: ModelConfig("causal_transformer"))
+        default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     data: DataSpec = dataclasses.field(default_factory=TokenWindows)
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
