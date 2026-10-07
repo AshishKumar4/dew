@@ -1,22 +1,9 @@
-// The one Coordinator decides whether a new session may start, and records how
-// long each session ran, so that the daily budget bounds what live execution costs.
-//
-// Each session it opens also asks for a spare: a container started with nobody on
-// it, which loads the model and compiles the page's cell while it waits
-// WARM_SECONDS for a page. The next session takes the spare, if one is up, and
-// starts with the model in memory. A spare is a session row whose visitor is ''
-// until one claims it; its time counts against the budget like any other.
-// Each row records the image its container started from: a session takes only
-// a spare running the image of the current deploy, and the open that finds a
-// spare on an older image stops it.
-
 import { DurableObject } from 'cloudflare:workers';
 import { type Limits, limitsOf } from './limits';
 
 export type Refusal = 'busy' | 'one-at-a-time' | 'too-many-starts' | 'budget';
-/** `warm` when the session took a spare; `spare` names a new spare for the Worker to start. */
 export type Opened =
-	| { ok: true; id: string; warm: boolean; spare: string | null }
+	| { ok: true; id: string }
 	| { ok: false; reason: Refusal; retryAfter: number };
 
 // A session nobody connected to within this long never started a container, so it costs nothing.
@@ -45,16 +32,12 @@ export class Coordinator extends DurableObject<Env> {
 				created INTEGER NOT NULL,
 				started INTEGER,
 				ended INTEGER,
-				spare INTEGER NOT NULL DEFAULT 0,
 				image TEXT
 			);
 			CREATE INDEX IF NOT EXISTS sessions_ip ON sessions (ip, created);
 			CREATE INDEX IF NOT EXISTS sessions_day ON sessions (day);
 		`);
 		const columns = ctx.storage.sql.exec<{ name: string }>('PRAGMA table_info(sessions)').toArray();
-		if (!columns.some(({ name }) => name === 'spare')) {
-			ctx.storage.sql.exec('ALTER TABLE sessions ADD COLUMN spare INTEGER NOT NULL DEFAULT 0');
-		}
 		if (!columns.some(({ name }) => name === 'image')) ctx.storage.sql.exec('ALTER TABLE sessions ADD COLUMN image TEXT');
 	}
 
@@ -66,33 +49,31 @@ export class Coordinator extends DurableObject<Env> {
 	private sweep(now: number): void {
 		const sql = this.ctx.storage.sql;
 		sql.exec('UPDATE sessions SET ended = created WHERE ended IS NULL AND started IS NULL AND created < ?', now - UNUSED_MS);
-		const { wallSeconds, warmSeconds } = this.limits;
+		const { wallSeconds } = this.limits;
 		const overdue = sql
 			.exec<{ id: string }>(
-				'SELECT id FROM sessions WHERE ended IS NULL AND started IS NOT NULL AND started + (? + spare * ?) * 1000 < ?',
+				'SELECT id FROM sessions WHERE ended IS NULL AND started IS NOT NULL AND started + ? * 1000 < ?',
 				wallSeconds,
-				warmSeconds,
 				now - REPORT_GRACE_MS,
 			)
 			.toArray();
 		for (const { id } of overdue) {
 			// Count the longest the container could have run, and make sure it is gone.
-			sql.exec('UPDATE sessions SET ended = started + (? + spare * ?) * 1000 WHERE id = ?', wallSeconds, warmSeconds, id);
+			sql.exec('UPDATE sessions SET ended = started + ? * 1000 WHERE id = ?', wallSeconds, id);
 			this.ctx.waitUntil(this.env.POOL.get(this.env.POOL.idFromName('global')).close(id));
 		}
 	}
 
 	/**
 	 * Seconds of today's budget taken: finished sessions as they ran, running ones at the
-	 * longest they can run, a spare's wait included.
+	 * longest they can run.
 	 */
 	private committed(day: string): number {
 		const row = this.ctx.storage.sql
 			.exec<{ ms: number | null }>(
-				`SELECT SUM(CASE WHEN ended IS NULL THEN (? + spare * ?) * 1000 ELSE MAX(0, ended - COALESCE(started, ended)) END) AS ms
+				`SELECT SUM(CASE WHEN ended IS NULL THEN ? * 1000 ELSE MAX(0, ended - COALESCE(started, ended)) END) AS ms
 				 FROM sessions WHERE day = ?`,
 				this.limits.wallSeconds,
-				this.limits.warmSeconds,
 				day,
 			)
 			.one();
@@ -102,7 +83,7 @@ export class Coordinator extends DurableObject<Env> {
 	/** A session for visitor `ip`; `image` is the kernel image the current deploy starts. */
 	async open(ip: string, now: number, image: string): Promise<Opened> {
 		this.sweep(now);
-		const { maxSessions, ipStarts, ipWindowSeconds, wallSeconds, warmSeconds, budgetSeconds } = this.limits;
+		const { maxSessions, ipStarts, ipWindowSeconds, wallSeconds, budgetSeconds } = this.limits;
 		const sql = this.ctx.storage.sql;
 		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ip = ? AND ended IS NULL', ip) >= 1) {
 			return { ok: false, reason: 'one-at-a-time', retryAfter: 30 };
@@ -115,43 +96,14 @@ export class Coordinator extends DurableObject<Env> {
 			return { ok: false, reason: 'too-many-starts', retryAfter: Math.ceil((oldest - windowStart) / 1000) };
 		}
 		const day = utcDay(now);
-		const stale = sql
-			.exec<{ id: string }>("SELECT id FROM sessions WHERE ip = '' AND ended IS NULL AND image IS NOT NULL AND image != ?", image)
-			.toArray();
-		for (const { id } of stale) {
-			sql.exec('UPDATE sessions SET ended = ? WHERE id = ?', now, id);
-			this.ctx.waitUntil(this.env.POOL.get(this.env.POOL.idFromName('global')).close(id));
+		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ended IS NULL') >= maxSessions) return { ok: false, reason: 'busy', retryAfter: 2 };
+		if (this.committed(day) + wallSeconds > budgetSeconds) {
+			const tomorrow = Date.parse(`${day}T00:00:00Z`) + 86_400_000;
+			return { ok: false, reason: 'budget', retryAfter: Math.ceil((tomorrow - now) / 1000) };
 		}
-		// A spare is already counted against the cap and the budget. One whose container has
-		// not reported its start may never get a host, so a session does not wait on it.
-		const spare = sql
-			.exec<{ id: string }>("SELECT id FROM sessions WHERE ip = '' AND ended IS NULL AND started IS NOT NULL AND image = ? LIMIT 1", image)
-			.toArray()[0];
-		let id: string;
-		if (spare) {
-			id = spare.id;
-			sql.exec('UPDATE sessions SET ip = ?, created = ? WHERE id = ?', ip, now, id);
-		} else {
-			if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ended IS NULL') >= maxSessions) {
-				return { ok: false, reason: 'busy', retryAfter: 60 };
-			}
-			if (this.committed(day) + wallSeconds > budgetSeconds) {
-				const tomorrow = Date.parse(`${day}T00:00:00Z`) + 86_400_000;
-				return { ok: false, reason: 'budget', retryAfter: Math.ceil((tomorrow - now) / 1000) };
-			}
-			id = crypto.randomUUID();
-			sql.exec('INSERT INTO sessions (id, ip, day, created) VALUES (?, ?, ?, ?)', id, ip, day, now);
-		}
-		let next: string | null = null;
-		if (
-			this.count("SELECT COUNT(*) AS n FROM sessions WHERE ip = '' AND ended IS NULL") === 0 &&
-			this.count('SELECT COUNT(*) AS n FROM sessions WHERE ended IS NULL') < maxSessions &&
-			this.committed(day) + wallSeconds + warmSeconds <= budgetSeconds
-		) {
-			next = crypto.randomUUID();
-			sql.exec("INSERT INTO sessions (id, ip, day, created, spare) VALUES (?, '', ?, ?, 1)", next, day, now);
-		}
-		return { ok: true, id, warm: spare !== undefined, spare: next };
+		const id = crypto.randomUUID();
+		sql.exec('INSERT INTO sessions (id, ip, day, created, image) VALUES (?, ?, ?, ?, ?)', id, ip, day, now, image);
+		return { ok: true, id };
 	}
 
 	/**
