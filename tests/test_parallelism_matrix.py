@@ -46,16 +46,27 @@ CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
 }
 
 
+@pytest.fixture(scope="session")
+def references(tmp_path_factory):
+    """Each model's one-device reference and fp64 anchor, computed by its
+    first layout's test and read by the rest that run in this process: a
+    cell is a test of its own, so CI spreads a model's layouts over tasks
+    rather than running them all in one."""
+    tool = load("layout_parity")
+    return tool.References(directory=tmp_path_factory.mktemp("layout-references"), prepare=True)
+
+
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layouts", "devices"), [
-    *(pytest.param(model, layouts, None, id=model) for model, layouts in sorted(CELLS.items())),
-    *(pytest.param(model, layouts, 4, id=f"{model}-on-four")
-      for model, layouts in sorted(CELLS_ON_FOUR.items()))])
-def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layouts, devices):
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    *(pytest.param(model, layout, None, id=f"{model}-{layout}")
+      for model, layouts in sorted(CELLS.items()) for layout in layouts),
+    *(pytest.param(model, layout, 4, id=f"{model}-{layout}-on-four")
+      for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts)])
+def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, devices, references):
     tool = load("layout_parity")
     with jax.enable_x64(new_val=True):
-        rows = tool.run([model], layouts, dtype="float32", steps=1, anchor=True, mixture={},
-                        objective={}, references=tool.References(), speak=lambda line: None,
+        rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture={},
+                        objective={}, references=references, speak=lambda line: None,
                         keep=lambda rows: None, devices=devices)
     assert tool.verdict(rows) == 0, [
         {key: row.get(key) for key in ("layout", "status", "worst_leaf", "worst_ratio", "loss_error",
