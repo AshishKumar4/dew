@@ -74,12 +74,13 @@ class Supervised(Objective[Ratio]):
 
 @dataclasses.dataclass(frozen=True)
 class CrossEntropy:
-    """The softmax cross entropy of logits over the last axis, against the integer labels in `labels`."""
+    """The softmax cross entropy of logits over the last axis, against the
+    integer labels in `labels`, in float32 or wider as the logits are."""
 
     labels: str = "label"
 
     def __call__(self, outputs: jax.Array, batch: Batch) -> jax.Array:
-        logits = outputs.astype(jnp.float32)
+        logits = outputs.astype(jnp.promote_types(outputs.dtype, jnp.float32))
         return optax.softmax_cross_entropy_with_integer_labels(logits, batch[self.labels])
 
 
