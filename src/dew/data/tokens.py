@@ -4,18 +4,17 @@ The corpus is the `train.bin`, `val.bin` and `meta.json` that
 `dew tokenize` writes, or the same splits as ArrayRecord shards
 (`dew.data.sources.text`).
 
-`TokenWindows` reads fixed `seq_len + 1` windows off the token stream.
-`PackedTokens` packs whole documents into windows of that size and carries
-the segment ids and positions the backbone's mask needs. Train shuffles from
-`seed`, reshuffles per epoch and runs forever; val reads `val.bin` once, in
-file order, in whole batches, so every validation pass scores the same
-windows. Both shard by JAX process.
+`TokenWindows` reads `seq_len + 1` windows off the token stream, at a fixed
+stride or packed with whole documents and the segment ids and positions the
+backbone's mask needs. Train shuffles from `seed`, reshuffles per epoch and
+runs forever; val reads `val.bin` once, in file order, in whole batches, so
+every validation pass scores the same windows. Both shard by JAX process.
 
-Both put the sharding last, so both resume from a global record count.
-`TokenWindows` reads windows off the stream at a fixed stride, and
-`PackedTokens` plans its packing over the whole corpus in file order. A step
-is then the same windows at any process count, and a saved position is a
-place in one order rather than one process's offset into its shard.
+The sharding comes last, so a run resumes from a global record count: the
+strided windows are fixed spans of the stream, and packing is planned over
+the whole corpus in file order. A step is then the same windows at any
+process count, and a saved position is a place in one order rather than one
+process's offset into its shard.
 """
 
 from __future__ import annotations
@@ -37,13 +36,12 @@ from .dataset import (
     DatasetSpec,
     Forwarding,
     Reader,
+    Records,
     Tokenize,
     describe,
     record_argument,
-    train_stream,
-    validation_pass,
 )
-from .sources.text import HubText, TokenWindowSource, token_corpus
+from .sources.text import HubText, _Documents, _Windows, same_tokenizer, token_corpus
 
 
 class _BoundedIterator(Forwarding):
@@ -88,50 +86,6 @@ def bounded(stream: Reader, batches: int | None) -> Reader:
         return _BoundedIterator(stream(partition), batches)
 
     return first
-
-
-@dataclasses.dataclass(frozen=True)
-class TokenWindows(DatasetSpec):
-    """Reads fixed windows of `seq_len + 1` ids from the token stream.
-
-    `path` is the directory that `dew tokenize` or `TokenCorpus.write` wrote.
-    `hub` reads a Hugging Face text split instead, tokenized once into dew's
-    cache (`HubText`), which is what `load("hf/<name>", tokenizer=,
-    seq_len=)` builds. Training windows start `stride` ids apart, `seq_len`
-    by default. A stride of one lets the shuffled training stream read every
-    contiguous window. Validation always starts windows `seq_len` ids apart, so it
-    counts each target once. A batch is `{"text": int32 [batch, seq_len + 1]}`.
-    `val_batches` caps the batches in a validation pass; None scores the
-    whole split.
-
-    The training stream's saved position is a global window count, so a run
-    can resume with any number of processes that divides the global batch.
-    """
-
-    path: str | None = None
-    seq_len: int = 256
-    stride: int | None = dataclasses.field(default=None, kw_only=True)
-    val_batches: int | None = 4
-    field: str | None = None
-    """The arrayrecord field that holds the ids, for a corpus stored as ArrayRecord shards of dict
-    records; None reads each record's bytes as the ids. A `.bin` corpus ignores it."""
-    hub: HubText | None = dataclasses.field(default=None, kw_only=True)
-
-    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        self.uncaptioned(tokenize)
-        if self.hub is not None and self.path:
-            raise ValueError("TokenWindows reads path= or hub=, not both")
-        path = self.path if self.hub is None else self.hub.tokenized()
-        corpus, held_out = token_corpus(path, "TokenWindows", field=self.field)
-        train = TokenWindowSource(corpus, self.seq_len, stride=self.stride)
-        validation = TokenWindowSource(held_out, self.seq_len)
-        return Dataset(
-            train=train_stream(train, [], batch=batch, seed=self.seed, loading=self.loading),
-            val=bounded(validation_pass(validation, [], batch=batch, seed=self.seed,
-                                        loading=self.loading), self.val_batches),
-            records=len(train),
-            batch=batch,
-        )
 
 
 def chunk_counts(lengths, chunk_len: int):
@@ -322,32 +276,39 @@ class PackedWindows(_WrappingDataset):
 
 
 @dataclasses.dataclass(frozen=True)
-class PackedTokens(DatasetSpec):
-    """Packs whole documents into windows of `seq_len + 1` tokens.
+class TokenWindows(DatasetSpec):
+    """Reads windows of `seq_len + 1` ids from tokenized corpora, as spans of
+    the stream or packed with whole documents.
 
-    Documents come from `TokenDocumentSource`, which cuts the token stream at
-    the eos ids the tokenize tool writes after each document (`--pack`). The
-    packer adds each document to the first window with room, split into
-    chunks when it is longer than a window. Every window has
-    `text_segment_ids` (which document each token is from, 0 for padding) and
-    `text_positions` (the token's position inside its document), so the model
-    can stop attention and the loss at document boundaries.
+    `path` is the directory that `dew tokenize` or `TokenCorpus.write` wrote.
+    `hub` reads a Hugging Face text split instead, tokenized once into dew's
+    cache (`HubText`), which is what `load("hf/<name>", tokenizer=,
+    seq_len=)` builds. A batch is `{"text": int32 [batch, seq_len + 1]}`.
 
-    `PackedWindows` plans the packing over the whole corpus in file order,
-    before the data is sharded, so the windows depend on the corpus alone and
-    not on which documents one process reads. The training stream shuffles
-    and shards windows as it does any other record. Its saved position is a
-    global window count, so a run can resume on any number of processes.
-    Every run over the same corpus packs the same documents together; the
-    seed decides only the order the windows come in.
+    A window is a contiguous span of the stream by default. Training windows
+    start `stride` ids apart, `seq_len` by default; a stride of one lets the
+    shuffled training stream read every contiguous window. Validation always
+    starts windows `seq_len` ids apart, so it counts each target once.
 
-    `path` names one tokenized directory, or maps several to the share of a
-    step each fills, like MaxText's weighted `grain_train_files`. Each corpus
-    is packed by its own plan, so a window holds documents from one corpus.
-    `mixture` then interleaves the windows at their weights before the data
-    is sharded. The weights are shares of the windows a step reads, and so
-    of its tokens, and a position is still one global window count. The
-    corpora must come from one tokenizer, as their `meta.json` records.
+    With `pack`, whole documents fill the windows instead. They are cut at the
+    eos ids the tokenize tool writes after each document (`--pack`), and the
+    packer adds each to the first of `packing_bins` open windows with room,
+    split into chunks when it is longer than a window. Every window then also
+    has `text_segment_ids` (which document each token is from, 0 for padding)
+    and `text_positions` (the token's position inside its document), so the
+    model can stop attention and the loss at document boundaries. The packing
+    is planned over the whole corpus in file order, before the data is
+    sharded (`PackedWindows`), so every run over the same corpus packs the
+    same documents together and the seed decides only the order the windows
+    come in.
+
+    `path` may also map several directories to the share of a step each
+    fills, like MaxText's weighted `grain_train_files`. Each corpus is read by
+    its own order (and packed by its own plan, so a window holds one
+    corpus's documents), and `mixture` interleaves them at their weights
+    before the data is sharded. The weights are shares of the windows a step
+    reads, and so of its tokens. The corpora must come from one tokenizer,
+    as their `meta.json` records.
 
     `phases` replaces `path` for a run that switches its data at step
     boundaries. Each `DataPhase` names a corpus or mixture and the step it
@@ -356,29 +317,32 @@ class PackedTokens(DatasetSpec):
     phases left it, so no window repeats before its corpus's epoch ends
     (`dew.data.providers.phased_dataset`). On resume, the run checks the
     phases it has already read, and you may append phases or move a boundary
-    it has not reached. So a run of one mixture can continue into a phase
-    list that begins with that mixture. With `phases`, leave `path` unset;
-    validation reads the first phase's held-out split.
+    it has not reached. Validation reads the first phase's held-out split.
 
-    `records` is exactly the number of windows in one pass over the split,
-    so `steps_per_epoch` is that pass. For a mixture, a pass is the windows in
+    The training stream's saved position is a global window count, so a run
+    can resume with any number of processes that divides the global batch.
+    `records` is exactly the windows in one pass over the split, so
+    `steps_per_epoch` is that pass; for a mixture, a pass is the windows in
     which every corpus has been read at least once (`mixed_records`), and for
-    a phased run it is the first phase's pass. `val_batches` caps the batches
-    in a validation pass; None scores the whole split. For a mixture, that
-    split is the held-out splits mixed at the same weights, each corpus in
-    its own order.
+    a phased run it is the first phase's pass. `val_batches` caps the
+    batches in a validation pass; None scores the whole split, a mixture's
+    held-out splits mixed at the same weights.
     """
 
     path: str | Mapping[str, float] | None = None
-    phases: Annotated[tuple[DataPhase, ...], record_argument(tuple[DataPhase, ...])] = ()
     seq_len: int = 256
     val_batches: int | None = 4
     field: str | None = None
     """The arrayrecord field that holds the ids, for a corpus stored as ArrayRecord shards of dict
     records; None reads each record's bytes as the ids. A `.bin` corpus ignores it."""
-    packing_bins: int = 8
-    """The number of windows the plan keeps open at once. More of them leave less padding in a
-    window and let documents further apart in the file share one."""
+    stride: int | None = dataclasses.field(default=None, kw_only=True)
+    pack: bool = dataclasses.field(default=False, kw_only=True)
+    packing_bins: int = dataclasses.field(default=8, kw_only=True)
+    """The windows packing keeps open at once. More of them leave less padding in a window and let
+    documents further apart in the file share one."""
+    phases: Annotated[tuple[DataPhase, ...], record_argument(tuple[DataPhase, ...])] = dataclasses.field(
+        default=(), kw_only=True)
+    hub: HubText | None = dataclasses.field(default=None, kw_only=True)
 
     @property
     def corpora(self) -> list[str]:
@@ -389,36 +353,30 @@ class PackedTokens(DatasetSpec):
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
         from .providers import corpora_dataset, name_ordered, phased_dataset
-        from .sources.text import TokenDocumentSource, same_tokenizer
 
         self.uncaptioned(tokenize)
+        if self.hub is not None and (self.path or self.phases):
+            raise ValueError("TokenWindows reads hub= alone, without path= or phases=")
         if self.phases and self.path:
-            raise ValueError("PackedTokens reads path= or phases=, not both")
-        weighted = name_ordered(self.path)
+            raise ValueError("TokenWindows reads path= or phases=, not both")
+        if self.pack and self.stride is not None:
+            raise ValueError("a packed window holds whole documents, so packing takes no stride")
+        weighted = {self.hub.tokenized(): 1.0} if self.hub is not None else name_ordered(self.path)
         if not weighted and not self.phases:
-            raise ValueError("PackedTokens needs path= set to the directory "
-                             "`dew tokenize` wrote, or several with weights")
+            raise ValueError("TokenWindows needs path= set to the directory `dew tokenize` "
+                             "wrote, several with weights, phases= or hub=")
         same_tokenizer(self.corpora)
-        window = self.seq_len + 1
-
-        # One source per split, and one plan over it. Finding the boundaries
-        # reads the whole file, so rebuilding either per epoch would read a
-        # multi-gigabyte train.bin again for a table the run already has.
-        def packed(tokens) -> PackedWindows:
-            # Cut where the packer would, so a chunk of a long document reads
-            # its own span instead of the whole document.
-            source = TokenDocumentSource(tokens, chunk_len=window)
-            return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
-                                 self.packing_bins, describe(source))
-
-        splits: dict[str, tuple[PackedWindows, PackedWindows]] = {}
+        # One pair of sources per corpus, read once. Packing finds the
+        # document boundaries by reading the whole file, so rebuilding it per
+        # phase would read a multi-gigabyte train.bin again for a table the
+        # run already has.
+        splits: dict[str, tuple[Records, Records]] = {}
 
         def corpora(named: Mapping[str, float]) -> tuple[list[Corpus], list[Corpus]]:
             train, held = [], []
             for path, weight in named.items():
                 if path not in splits:
-                    corpus, held_out = token_corpus(path, "PackedTokens", field=self.field)
-                    splits[path] = packed(corpus), packed(held_out)
+                    splits[path] = self._windows(*token_corpus(path, "TokenWindows", field=self.field))
                 train.append(Corpus(path, splits[path][0], weight))
                 held.append(Corpus(path, splits[path][1], weight))
             return train, held
@@ -431,3 +389,18 @@ class PackedTokens(DatasetSpec):
         return phased_dataset([(train, until) for (train, _), until in phases], phases[0][0][1], [],
                               batch=batch, seed=self.seed, loading=self.loading,
                               val_batches=self.val_batches)
+
+    def _windows(self, corpus, held_out) -> tuple[Records, Records]:
+        """The training and validation windows of one corpus's two splits."""
+        if not self.pack:
+            return _Windows(corpus, self.seq_len, stride=self.stride), _Windows(held_out, self.seq_len)
+        window = self.seq_len + 1
+
+        def packed(tokens) -> PackedWindows:
+            # Cut where the packer would, so a chunk of a long document reads
+            # its own span instead of the whole document.
+            source = _Documents(tokens, chunk_len=window)
+            return PackedWindows(pygrain.MapDataset.source(source), source.lengths, window,
+                                 self.packing_bins, describe(source))
+
+        return packed(corpus), packed(held_out)

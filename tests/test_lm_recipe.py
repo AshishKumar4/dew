@@ -13,7 +13,7 @@ import pytest
 
 import dew
 from dew.config import ObjectiveConfig
-from dew.data import PackedTokens, TokenWindows
+from dew.data import TokenWindows
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, Samples
 from dew.sampling import Sampling
@@ -110,9 +110,9 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     args = ["--trainer.epochs", "1", "--sample-prompt", "the ", "--sample-tokens", "4",
             "--trainer.name", "run"]
     if packed:
-        args = ["data:packed-tokens", "--data.packing-bins", "2", *args]
+        args = ["--data.pack", "--data.packing-bins", "2", *args]
     config = run_config(recipe, tokens, *args)
-    assert isinstance(config.data, PackedTokens if packed else TokenWindows)
+    assert config.data.pack == packed
 
     state = recipe.main(config)
 
@@ -149,7 +149,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
     config = recipe.LmRunConfig.cli( [
-        "data:packed-tokens", "--data.path", str(first), "0.7", str(second), "0.3",
+        "--data.pack", "--data.path", str(first), "0.7", str(second), "0.3",
         "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
@@ -550,7 +550,7 @@ def test_an_objective_the_recipe_does_not_train_is_refused():
 
 
 def test_masked_diffusion_trains_on_packed_documents(tmp_path):
-    """`--objective masked_diffusion` over data:packed-tokens: the packed
+    """`--objective masked_diffusion` over packed documents: the packed
     windows reach the objective with their packing, so a validation batch
     scores its documents and weighs its padded tail at nothing. A batch that
     lost its segment ids on the way would count the tail as text."""
@@ -569,7 +569,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     (directory / "meta.json").write_text(json.dumps(
         {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
     config = recipe.LmRunConfig.cli( [
-        "data:packed-tokens", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
+        "--data.pack", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
         "--tokenizer", str(checkpoint), "--data.path", str(directory),
         "--data.seq-len", "11", "--data.loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",

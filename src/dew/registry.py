@@ -915,7 +915,6 @@ datasets: Aliases[type[DatasetSpec], DatasetSpec] = Aliases("dataset", {
     "local_videos": "dew.data.video:LocalVideos",
     "online_images": "dew.data.streaming:OnlineImages",
     "online_videos": "dew.data.streaming:OnlineVideos",
-    "packed_tokens": "dew.data.tokens:PackedTokens",
     "preference_pairs": "dew.data.preferences:PreferencePairs",
     "prompts": "dew.data.prompts:Prompts",
     "tfds": "dew.data.providers:PreparedTFDS",

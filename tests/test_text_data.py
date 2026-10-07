@@ -22,10 +22,7 @@ import optax
 import pytest
 from absl import flags
 
-from dew.data import ByteTokenizer, DataPartition, Loading, PackedTokens, TokenCorpus, TokenWindows
-from dew.data.dataset import describe
-from dew.data.sources.text import TokenBytes, TokenDocumentSource, TokenRecords, TokenWindowSource, dtype_for
-from dew.data.tokens import PackedWindows
+from dew.data import ByteTokenizer, DataPartition, Loading, TokenCorpus, TokenWindows
 from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
 from dew.nn.mixers import attention as attention_kind
@@ -171,96 +168,68 @@ def test_readers_that_miss_the_cache_together_share_one_load(tmp_path):
 
 
 # ---------------------------------------------------------------------------------
-# TokenWindowSource
+# The windows of a token stream
 # ---------------------------------------------------------------------------------
 
-def test_token_window_source_length_and_window_contract(tmp_path):
-    seq_len = 8
-    n = 37  # tokens; (37 - 1) // 8 == 4 windows
-    body = np.arange(1, n + 1, dtype=np.int64)
-    _token_dir(tmp_path, train_tokens=0, body=body, dtype=np.uint32)
-    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
+def _stream_dir(tmp_path, body, dtype=np.uint16):
+    """A token directory whose train and val splits are both `body`."""
+    _token_dir(tmp_path, train_tokens=0, body=body, dtype=dtype)
+    (tmp_path / "val.bin").write_bytes(np.asarray(body).astype(dtype).tobytes())
+    return tmp_path
 
-    assert len(source) == (n - 1) // seq_len
-    for i in range(len(source)):
-        window = source[i]["text"]
-        assert window.dtype == np.int32
-        assert window.shape == (seq_len + 1,)
-        # record i covers [i*seq_len, i*seq_len + seq_len + 1)
-        np.testing.assert_array_equal(
-            window, body[i * seq_len:(i + 1) * seq_len + 1])
-    with pytest.raises(IndexError):
-        source[len(source)]
+
+def _read(batches, count=None):
+    """The rows of `batches`, the first `count` batches of an endless stream, which it closes."""
+    try:
+        return [{key: value[row] for key, value in batch.items() if key != VALID_ROWS}
+                for batch in itertools.islice(batches, count) for row in range(len(batch["text"]))]
+    finally:
+        batches.close()
 
 
 @pytest.mark.parametrize("seq_len,stride,tokens", [
-    (4, 1, 5), (4, 1, 6), (4, 1, 13), (4, 2, 13),
-    (4, 3, 13), (4, 4, 13), (4, 6, 13), (8, 3, 22),
+    (4, 1, 5), (4, 1, 6), (4, 1, 13), (4, 2, 13), (4, 3, 13), (4, 4, 13), (4, 6, 13),
+    (8, 3, 22), (8, None, 37), (1, None, 7),
 ])
-def test_token_window_stride_reads_every_complete_window(tmp_path, seq_len, stride, tokens):
-    body = np.arange(tokens, dtype=np.int32)
-    _token_dir(tmp_path, train_tokens=0, body=body)
-    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len, stride=stride)
-    starts = list(range(0, tokens - seq_len, stride))
-    assert len(source) == len(starts)
-    for index, start in enumerate(starts):
-        expected = body[start:start + seq_len + 1]
-        assert source[index]["text"].tobytes() == expected.tobytes()
-        assert source[index]["text"].shape == (seq_len + 1,)
-    with pytest.raises(IndexError):
-        source[len(starts)]
-    with pytest.raises(IndexError):
-        source[-1]
+def test_an_epoch_reads_every_complete_window_stride_apart(tmp_path, seq_len, stride, tokens):
+    """One training epoch is each complete window of `seq_len + 1` int32 ids
+    starting `stride` apart (`seq_len` by default) once, the incomplete tail
+    left out; validation tiles the split `seq_len` apart, in file order."""
+    body = np.arange(tokens)
+    _stream_dir(tmp_path, body, dtype=np.uint32)
+    data = _windows(tmp_path, seq_len=seq_len, stride=stride).load(batch=1)
+    starts = range(0, tokens - seq_len, stride or seq_len)
+
+    epoch = _read(data.train(DataPartition()), data.records)
+    assert data.records == len(starts)
+    assert all(row["text"].dtype == np.int32 for row in epoch)
+    assert sorted(row["text"].tolist() for row in epoch) == [body[s:s + seq_len + 1].tolist() for s in starts]
+    assert [row["text"].tolist() for row in _read(data.val(DataPartition()))] == [
+        body[s:s + seq_len + 1].tolist() for s in range(0, tokens - seq_len, seq_len)]
 
 
-@pytest.mark.parametrize("seq_len,tokens", [(1, 7), (4, 13), (8, 37)])
-def test_token_window_default_stride_preserves_records_and_order(tmp_path, seq_len, tokens):
-    body = np.arange(tokens, dtype=np.int32)
-    _token_dir(tmp_path, train_tokens=0, body=body)
-    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
-    explicit = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len, stride=seq_len)
-    assert len(source) == len(explicit) == (tokens - 1) // seq_len
-    assert repr(source) == repr(explicit)
-    for index in range(len(source)):
-        expected = body[index * seq_len:index * seq_len + seq_len + 1].tobytes()
-        assert source[index]["text"].tobytes() == explicit[index]["text"].tobytes() == expected
+def test_a_window_needs_a_positive_stride_and_length_and_a_long_enough_split(tmp_path):
+    _stream_dir(tmp_path, np.zeros(4))
+    for fields, refusal in (({"seq_len": 2, "stride": 0}, "stride"), ({"seq_len": 2, "stride": -1}, "stride"),
+                            ({"seq_len": 0}, "seq_len"), ({"seq_len": 4}, "too few for even one window")):
+        with pytest.raises(ValueError, match=refusal):
+            _windows(tmp_path, **fields).load(batch=1)
 
 
-@pytest.mark.parametrize("stride", [0, -1])
-def test_token_window_stride_refuses_nonpositive_steps(tmp_path, stride):
-    _token_dir(tmp_path, train_tokens=16)
-    with pytest.raises(ValueError, match="stride"):
-        TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), 4, stride=stride)
-
-
-def test_token_window_source_reads_the_dtype_from_meta(tmp_path):
+def test_the_ids_are_read_at_the_width_meta_json_records(tmp_path):
+    """uint32 when meta.json says so; without one, nanoGPT's uint16."""
     seq_len = 4
-    tokens = np.arange(1, 3 * seq_len + 1, dtype=np.uint32)
-    (tmp_path / "train.bin").write_bytes(tokens.astype("<u4").tobytes())
-    (tmp_path / "meta.json").write_text(json.dumps(
-        {"dtype": "uint32", "vocab_size": 100000, "tokenizer": "gpt2"}))
-    (tmp_path / "val.bin").write_bytes(tokens.astype("<u4").tobytes())
+    tokens = np.arange(70000, 70000 + 3 * seq_len + 1, dtype=np.uint32)
+    _stream_dir(tmp_path, tokens, dtype=np.uint32)
+    data = _windows(tmp_path, seq_len=seq_len).load(batch=1)
+    assert _read(data.val(DataPartition()))[0]["text"].tolist() == tokens[:seq_len + 1].tolist()
 
-    source = TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
-    assert source.tokens.dtype == np.dtype("uint32")
-    np.testing.assert_array_equal(source[0]["text"], tokens[:seq_len + 1])
-
-    # Without meta.json the nanoGPT default applies.
     bare = tmp_path / "bare"
     bare.mkdir()
-    (bare / "train.bin").write_bytes(tokens.astype("<u2").tobytes())
-    default_source = TokenWindowSource(TokenBytes(str(bare / "train.bin")), seq_len)
-    assert default_source.tokens.dtype == np.dtype("uint16")
-    np.testing.assert_array_equal(
-        default_source[0]["text"], tokens[:seq_len + 1].astype("<u2").astype(np.int32))
-
-
-def test_token_window_source_rejects_files_too_short(tmp_path):
-    (tmp_path / "train.bin").write_bytes(np.zeros(seq_len := 4, np.uint16).tobytes())
-    with pytest.raises(ValueError, match="too few for even one window"):
-        TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), seq_len)
-    with pytest.raises(ValueError, match="seq_len"):
-        TokenWindowSource(TokenBytes(str(tmp_path / "train.bin")), 0)
+    for split in ("train", "val"):
+        (bare / f"{split}.bin").write_bytes(tokens.astype("<u2").tobytes())
+    data = _windows(bare, seq_len=seq_len).load(batch=1)
+    assert _read(data.val(DataPartition()))[0]["text"].tolist() == tokens[:seq_len + 1].astype("<u2").tolist()
 
 
 # ---------------------------------------------------------------------------------
@@ -278,7 +247,7 @@ def _windows(tmp_path, **fields):
 def _packed_tokens(tmp_path, **fields):
     """The packed spec over `tmp_path`, read in this process."""
     fields = {"val_batches": None, "loading": Loading(workers=0, worker_buffer=1), **fields}
-    return PackedTokens(path=str(tmp_path), **fields)
+    return TokenWindows(path=str(tmp_path), pack=True, **fields)
 
 def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
     """Window k is tokens [k seq_len, k seq_len + seq_len], so consecutive
@@ -483,22 +452,22 @@ def test_a_registered_token_spec_reads_the_directory(tmp_path):
     assert data.records == 40 and data.batch == 4
 
 
-@pytest.mark.parametrize("spec", [TokenWindows, PackedTokens])
-def test_a_token_spec_refuses_a_directory_without_a_val_split(tmp_path, spec):
+@pytest.mark.parametrize("pack", [False, True])
+def test_a_token_spec_refuses_a_directory_without_a_val_split(tmp_path, pack):
     """With val.bin missing the validation loader read train.bin, so every
     pass scored windows the model was training on."""
     _token_dir(tmp_path, train_tokens=64, eos_id=0)
     with pytest.raises(ValueError, match=r"val\.bin.*dew tokenize --val-fraction"):
-        spec(path=str(tmp_path), seq_len=8, loading=Loading(workers=0)).load(batch=4)
+        TokenWindows(path=str(tmp_path), seq_len=8, pack=pack, loading=Loading(workers=0)).load(batch=4)
 
 
-@pytest.mark.parametrize("spec", [TokenWindows, PackedTokens])
-def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, spec):
+@pytest.mark.parametrize("pack", [False, True])
+def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, pack):
     (tmp_path / "not_a_dataset.txt").write_text("hello")
     with pytest.raises(ValueError, match="holds no train corpus"):
-        spec(path=str(tmp_path), loading=Loading(workers=0)).load(batch=4)
+        TokenWindows(path=str(tmp_path), pack=pack, loading=Loading(workers=0)).load(batch=4)
     with pytest.raises(ValueError, match="path="):
-        spec(loading=Loading(workers=0)).load(batch=4)
+        TokenWindows(pack=pack, loading=Loading(workers=0)).load(batch=4)
 
 
 # ---------------------------------------------------------------------------------
@@ -527,11 +496,8 @@ def test_written_tokens_round_trip_through_the_source(tmp_path):
         (corpus * 8).encode("utf-8"))
 
     seq_len = 32
-    train = TokenWindowSource(TokenBytes(str(out / "train.bin")), seq_len)
-    val = TokenWindowSource(TokenBytes(str(out / "val.bin")), seq_len)
-    assert train.tokens.dtype == np.dtype("uint8")
-    assert len(train) == (meta.train_tokens - 1) // seq_len
-    assert len(val) == (meta.val_tokens - 1) // seq_len
+    data = _windows(out, seq_len=seq_len).load(batch=1)
+    assert data.records == (meta.train_tokens - 1) // seq_len
 
     tok = ByteTokenizer()
     whole = corpus * 8  # a.txt (5x) then nested/b.txt (3x), in path order
@@ -544,22 +510,12 @@ def test_written_tokens_round_trip_through_the_source(tmp_path):
     assert len(val_bytes) == meta.val_tokens
     assert len(train_bytes) == meta.train_tokens
 
-    # Windows tile each split at stride seq_len, so stitching them back
-    # rebuilds the split up to the tokens past the last full window.
-    def stitch(source):
-        return np.concatenate(
-            [source[i]["text"][:seq_len] for i in range(len(source))]
-            + [source[len(source) - 1]["text"][seq_len:]])
-
-    def covered(n_tokens):
-        return ((n_tokens - 1) // seq_len) * seq_len + 1
-
-    train_ids, val_ids = stitch(train), stitch(val)
-    assert len(val_ids) == covered(meta.val_tokens)
-    assert len(train_ids) == covered(meta.train_tokens)
+    # Validation windows tile the split at stride seq_len, so stitching them
+    # back rebuilds it up to the tokens past the last full window.
+    windows = [row["text"] for row in _read(data.val(DataPartition()))]
+    val_ids = np.concatenate([window[:seq_len] for window in windows] + [windows[-1][seq_len:]])
+    assert len(val_ids) == ((meta.val_tokens - 1) // seq_len) * seq_len + 1
     assert list(val_ids) == whole_ids[:len(val_ids)]
-    assert list(train_ids) == whole_ids[meta.val_tokens:
-                                        meta.val_tokens + len(train_ids)]
 
     # And what the windows carry decodes back to that text (a window boundary
     # can split a multi-byte character, which decode replaces on both sides).
@@ -579,8 +535,6 @@ def test_documents_in_memory_are_written_one_eos_terminated_document_each(tmp_pa
     expected = [byte for text in documents if text for byte in [*text.encode(), eos]]
     assert stream == expected, "an empty document writes nothing, not a lone eos"
     assert meta.val_tokens == 0 and meta.eos_id == eos
-    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
-    assert len(source) == 3
 
 
 def test_a_path_that_holds_no_text_is_refused(tmp_path):
@@ -712,54 +666,31 @@ def test_a_bos_adding_tokenizer_starts_each_document_once_however_it_is_chunked(
     assert strings.tolist() == [bos, 4, 5, 6, bos, 7]
 
 
-def test_written_tokens_take_the_smallest_dtype_that_fits():
-    assert dtype_for(256) == np.dtype("uint8")
-    assert dtype_for(257) == np.dtype("uint16")
-    assert dtype_for(50257) == np.dtype("uint16")
-    assert dtype_for(70000) == np.dtype("uint32")
-
-
 # ---------------------------------------------------------------------------------
-# TokenDocumentSource and PackedTokens
+# Packed documents
 # ---------------------------------------------------------------------------------
 
-def test_document_source_reads_one_document_per_record(tmp_path):
-    documents = [[10, 11, 12], [20, 21], [30, 31, 32, 33]]
-    _document_dir(tmp_path, documents, eos_id=0)
-    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
+def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(tmp_path):
+    """The documents are the spans through each eos id, the eos closing its
+    own; a split cuts the stream mid-document, so the piece past the last
+    eos is a document rather than lost, and a split with no eos at all is
+    one document."""
+    stream = [10, 11, 12, 0, 20, 21, 0, 30, 31]
+    _stream_dir(tmp_path, stream)
+    meta = json.loads((tmp_path / "meta.json").read_text())
+    (tmp_path / "meta.json").write_text(json.dumps({**meta, "eos_id": 0}))
+    data = _packed_tokens(tmp_path, seq_len=15, packing_bins=1).load(batch=1)
+    (window,) = _read(data.val(DataPartition()))
+    assert window["text"].tolist() == [*stream, *[0] * 7]
+    assert window["text_segment_ids"].tolist() == [1, 1, 1, 1, 2, 2, 2, 3, 3, *[0] * 7]
 
-    assert len(source) == 3
-    for index, document in enumerate(documents):
-        # The eos closes the document, so it belongs to the record.
-        np.testing.assert_array_equal(
-            source[index]["text"], np.asarray([*document, 0], np.int32))
-    assert list(source.lengths) == [4, 3, 5]
+    (tmp_path / "meta.json").write_text(json.dumps({**meta, "eos_id": 9}))
+    data = _packed_tokens(tmp_path, seq_len=15, packing_bins=1).load(batch=1)
+    assert _read(data.val(DataPartition()))[0]["text_segment_ids"].tolist() == [1] * 9 + [0] * 7
 
-
-def test_document_source_keeps_the_tail_past_the_last_boundary(tmp_path):
-    """A split cuts the stream mid-document; dropping the piece past the last
-    eos would lose those tokens with nothing said about it."""
-    stream = np.asarray([10, 11, 0, 20, 21], np.int64)
-    _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=0)
-    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
-
-    assert len(source) == 2
-    np.testing.assert_array_equal(source[1]["text"], np.asarray([20, 21], np.int32))
-
-
-def test_document_source_needs_an_eos_id(tmp_path):
-    _token_dir(tmp_path, train_tokens=32)  # meta.json without eos_id
+    (tmp_path / "meta.json").write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="no eos_id"):
-        TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
-
-
-def test_document_source_reads_a_split_without_a_boundary_as_one_document(tmp_path):
-    _token_dir(tmp_path, train_tokens=32, body=[1, 2, 3, 4], eos_id=9)
-    source = TokenDocumentSource(TokenBytes(str(tmp_path / "train.bin")))
-
-    assert len(source) == 1
-    np.testing.assert_array_equal(source[0]["text"],
-                                  np.asarray([1, 2, 3, 4], np.int32))
+        _packed_tokens(tmp_path, seq_len=15).load(batch=1)
 
 
 def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
@@ -1150,18 +1081,23 @@ def test_documents_packed_online_by_grain_keep_attention_inside_each_document(mo
                     f"row {row} position {query} attending to {key}")
 
 
-def test_the_packing_bins_are_part_of_the_order_a_position_counts_into():
+def test_a_position_saved_under_other_packing_bins_is_refused(tmp_path):
     """Which chunks share a window depends on how many bins the plan keeps
     open. Two plans with as many windows were described alike, so a run
     resumed under another bin count read other windows at the same count."""
-    lengths = np.asarray([3, 2, 1, 1])
-    documents = pygrain.MapDataset.source(
-        [{"text": np.full(length, index + 1, np.int32)} for index, length in enumerate(lengths)])
-    one, two = (PackedWindows(documents, lengths, 4, bins, "corpus") for bins in (1, 2))
-
-    assert len(one) == len(two) == 2
-    assert not np.array_equal(one[0]["text"], two[0]["text"]), "the plans differ"
-    assert describe(one) != describe(two)
+    _document_dir(tmp_path, [[5, 5], [6], [], []], eos_id=0)
+    one, two = (_packed_tokens(tmp_path, seq_len=3, packing_bins=bins).load(batch=1) for bins in (1, 2))
+    assert one.records == two.records == 2
+    first = [_read(data.val(DataPartition()))[0]["text_segment_ids"].tolist() for data in (one, two)]
+    assert first[0] != first[1], "the plans differ"
+    source, other = one.train(DataPartition()), two.train(DataPartition())
+    try:
+        next(source)
+        with pytest.raises(ValueError, match="resume the corpus"):
+            other.set_state(source.get_state())
+    finally:
+        source.close()
+        other.close()
 
 
 def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypatch):
@@ -1175,13 +1111,13 @@ def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypat
     data = _packed_tokens(tmp_path, seq_len=7, packing_bins=2).load(batch=2)
 
     spans = []
-    read = TokenBytes.__getitem__
+    read = np.memmap.__getitem__
 
     def recording(self, span):
         spans.append(span.stop - span.start)
         return read(self, span)
 
-    monkeypatch.setattr(TokenBytes, "__getitem__", recording)
+    monkeypatch.setattr(np.memmap, "__getitem__", recording)
     windows = list(itertools.islice(data.train(DataPartition()), 10))
 
     assert spans and max(spans) <= 8
@@ -1412,55 +1348,45 @@ CORPUS = np.concatenate([np.asarray([*document, PACK_EOS], np.int64) for documen
 
 @pytest.fixture
 def stores(tmp_path):
-    """The same corpus in every store, cut differently in each.
+    """The same corpus in every store, each split cut differently in each,
+    as the fields of a `TokenWindows` over it.
 
     The pieces are deliberately unequal, so a window that crosses a record
     boundary has to be joined out of two of them; identical windows then say
     the stream view is the stream, not the chunking.
     """
-    (tmp_path / "train.bin").write_bytes(CORPUS.astype(np.uint16).tobytes())
-    return {
-        "bin": TokenBytes(str(tmp_path / "train.bin"), eos_id=PACK_EOS),
-        "records": TokenRecords(_as_records(tmp_path, "train", CORPUS, [4, 3]),
-                                eos_id=PACK_EOS),
-        "packed_records": TokenRecords(
-            _as_records(tmp_path, "packed", CORPUS, [2, 9], field="ids"),
-            field="ids", eos_id=PACK_EOS),
-    }
+    meta = {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "train_tokens": len(CORPUS),
+            "val_tokens": len(CORPUS), "eos_id": PACK_EOS}
+    held = {}
+    stores = (("bin", None, None), ("records", [4, 3], None), ("packed_records", [2, 9], "ids"))
+    for name, sizes, field in stores:
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "meta.json").write_text(json.dumps(meta))
+        for split in ("train", "val"):
+            if sizes is None:
+                (directory / f"{split}.bin").write_bytes(CORPUS.astype(np.uint16).tobytes())
+            else:
+                _as_records(directory, split, CORPUS, sizes, field=field)
+        held[name] = {"field": field}
+    return tmp_path, held
 
 
-def test_a_corpus_reads_the_same_span_out_of_every_store(stores):
-    for name, source in stores.items():
-        assert len(source) == len(CORPUS), name
-        np.testing.assert_array_equal(source[0:len(CORPUS)], CORPUS, err_msg=name)
-        # A span inside one piece, and one that crosses two of them.
-        np.testing.assert_array_equal(source[1:3], CORPUS[1:3], err_msg=name)
-        np.testing.assert_array_equal(source[3:9], CORPUS[3:9], err_msg=name)
+def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(stores):
+    root, fields = stores
 
+    def validation(name, **spec):
+        data = _windows(root / name, field=fields[name]["field"], **spec).load(batch=1)
+        rows = _read(data.val(DataPartition()))
+        return [{key: value.tolist() for key, value in row.items()} for row in rows]
 
-def test_the_same_corpus_gives_the_same_windows_in_every_store(stores):
-    windows = {name: [TokenWindowSource(source, 4)[i]["text"]
-                      for i in range(len(TokenWindowSource(source, 4)))]
-               for name, source in stores.items()}
-
-    assert len(windows["bin"]) == (len(CORPUS) - 1) // 4
-    for name, held in windows.items():
-        assert len(held) == len(windows["bin"]), name
-        for expected, got in zip(windows["bin"], held, strict=True):
-            np.testing.assert_array_equal(got, expected, err_msg=name)
-            assert got.dtype == np.int32
-
-
-def test_the_same_corpus_gives_the_same_packing_plan_in_every_store(stores):
-    def plan(source):
-        documents = TokenDocumentSource(source)
-        windows = PackedWindows(pygrain.MapDataset.source(documents), documents.lengths,
-                                6, 2, describe(documents))
-        return [documents.lengths.tolist(),
-                [{key: value.tolist() for key, value in windows[i].items()}
-                 for i in range(len(windows))]]
-
-    expected = plan(stores["bin"])
-    assert expected[0] == [4, 3, 6, 2, 3], "the documents are the eos spans"
-    for name, source in stores.items():
-        assert plan(source) == expected, name
+    windows = {name: validation(name, seq_len=4) for name in fields}
+    packed = {name: validation(name, seq_len=5, pack=True, packing_bins=2) for name in fields}
+    assert [row["text"] for row in windows["bin"]] == [
+        CORPUS[start:start + 5].tolist() for start in range(0, len(CORPUS) - 4, 4)]
+    lengths = [count for row in packed["bin"]
+               for segment, count in Counter(row["text_segment_ids"]).items() if segment]
+    assert sorted(lengths) == [2, 3, 3, 4, 6], "the documents are the eos spans"
+    for name in fields:
+        assert windows[name] == windows["bin"], name
+        assert packed[name] == packed["bin"], name

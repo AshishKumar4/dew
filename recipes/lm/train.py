@@ -13,7 +13,7 @@ takes the vocabulary from the data, not the command line.
         --data.seq-len 256 --trainer.batch-size 32 --trainer.epochs 10 \\
         --model.emb-features 384 --model.num-layers 6 --model.num-heads 6
 
-`data:packed-tokens` packs whole documents into the windows instead.
+`--data.pack` packs whole documents into the windows instead.
 """
 
 import json
@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.config import ModelConfig
-from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
+from dew.data import ByteTokenizer, HFTokenizer, TokenWindows
 from dew.inference import RunProcessor
 from dew.objectives.lm import LMRunConfig, Perplexity, Samples
 from dew.registry import datasets, models, objectives
@@ -35,8 +35,8 @@ from dew.training import TrainState, prepare_process, run_timestamp
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and
     # a type checker cannot read a variable in a type expression. Statically
-    # the field holds the two token datasets __post_init__ lets through.
-    TokenSpec = TokenWindows | PackedTokens
+    # the field holds the token dataset __post_init__ lets through.
+    TokenSpec = TokenWindows
 else:
     TokenSpec = datasets.union
 
@@ -48,26 +48,23 @@ class LmRunConfig(LMRunConfig):
     Everything else a decoder run records is `dew.objectives.lm.LMRunConfig`,
     which a script that trains on some other layout of the same ids uses as
     it stands. What this adds is the one thing the recipe itself requires:
-    `--data.path` is a directory `dew tokenize` wrote, or with
-    data:packed-tokens several with their weights (`--data.path a 0.7 b 0.3`).
+    `--data.path` is a directory `dew tokenize` wrote, or several with their
+    weights (`--data.path a 0.7 b 0.3`).
     """
 
     data: TokenSpec = field(default_factory=TokenWindows)
 
     def __post_init__(self):
         super().__post_init__()
-        if not isinstance(self.data, (TokenWindows, PackedTokens)):
-            raise ValueError(
-                "the language model recipe trains on token files: "
-                "data:token-windows or data:packed-tokens")
-        if (self.objective.name == objectives.paths["block_diffusion"]
-                and not isinstance(self.data, TokenWindows)):
-            raise ValueError("block_diffusion requires data:token-windows, not packed documents")
+        if not isinstance(self.data, TokenWindows):
+            raise ValueError("the language model recipe trains on token files: data:token-windows")
+        if self.objective.name == objectives.paths["block_diffusion"] and self.data.pack:
+            raise ValueError("block_diffusion trains on spans of the stream, not packed documents")
 
 
 def read_corpora(data: TokenSpec) -> str | list[str] | None:
     """What the run reads: --data.path, or every corpus the phases name."""
-    return data.corpora if isinstance(data, PackedTokens) and data.phases else data.path
+    return data.corpora if data.phases else data.path
 
 
 def token_directories(path: str | Mapping[str, float] | list[str] | None) -> list[Path]:
