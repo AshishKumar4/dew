@@ -371,9 +371,6 @@ class DecisionObjective(Objective[Ratio]):
         scoring = None
         if held is not None:
             held_rows = _Rows(held, f"{len(held)} held-out rows")
-            if len(held_rows) < batch:
-                raise ValueError(f"{len(held_rows)} held-out rows of answered questions, "
-                                 f"fewer than one batch of {batch}")
             scoring = validation_pass(held_rows, [_Encode(encoding, held_rows, augment=False)], batch=batch,
                                       seed=seed, loading=loading)
         return Dataset(train=train_stream(rows, [_Encode(encoding, rows, augment=True)], batch=batch,
