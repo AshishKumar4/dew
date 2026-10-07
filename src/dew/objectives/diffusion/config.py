@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, ClassVar
 
 import jax
@@ -415,7 +416,7 @@ class DiffusionRunConfig(RunConfig):
 
         objective = self.objective
         stated = objective.fields.get("alignment")
-        if stated is not None:
+        if isinstance(stated, Mapping):
             alignment = from_record(Alignment, stated)
             if alignment.source is not None:
                 objective = dataclasses.replace(objective, fields={**objective.fields, "alignment": to_record(

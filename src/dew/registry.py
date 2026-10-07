@@ -34,7 +34,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
-from typing_extensions import Format, get_annotations
+from typing_extensions import Format, get_annotations, is_protocol
 
 from dew.records import JSON
 
@@ -511,7 +511,7 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     function declared to return one."""
     def fits(member: Callable[..., Configured]) -> bool:
         if isinstance(member, type):
-            return issubclass(member, held)
+            return any(_derives(member, base) for base in held)
         return callable(member) and any(_returns(member, base) for base in held)
 
     found = ([imported(name)] if ":" in name else
@@ -637,7 +637,8 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
             for name, value in fields.items()}
 
 
-def argument_records(member: Callable[..., Configured], fields: Mapping[str, object]) -> dict[str, JSON]:
+def argument_records(member: type | Callable[..., Configured], fields: Mapping[str, object]
+                     ) -> dict[str, JSON]:
     """`fields` as records of `member`'s parameters (`parameters`): each read
     against its parameter's annotation and written back, so an alias becomes
     its import path, a value already built becomes its record, and an
@@ -659,7 +660,7 @@ def argument_records(member: Callable[..., Configured], fields: Mapping[str, obj
 type Parameters = dict[str, tuple[inspect.Parameter, Callable[..., Configured]]]
 
 
-def parameters(member: Callable[..., Configured]) -> tuple[Parameters, bool]:
+def parameters(member: type | Callable[..., Configured]) -> tuple[Parameters, bool]:
     """`member`'s named parameters, each with the function that declares it,
     and whether it takes any other keyword besides.
 
@@ -706,7 +707,15 @@ def _returns(member: Callable[..., Configured], held: type) -> bool:
     """Whether the function `member` is declared to return `held` or a class
     derived from it."""
     returned = _parameter_type(member, "return")
-    return isinstance(returned, type) and issubclass(returned, held)
+    return isinstance(returned, type) and _derives(returned, held)
+
+
+def _derives(member: type, base: type) -> bool:
+    """Whether `member` is `base` or derives from it. A protocol declares an
+    interface and no class to derive from, so a record's class for one is a
+    class of Dew's or of a trusted package (`_owned`), as a protocol kind's
+    aliases are."""
+    return _owned(member, called=False) if is_protocol(base) else issubclass(member, base)
 
 
 def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:

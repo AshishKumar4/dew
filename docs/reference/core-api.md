@@ -565,7 +565,8 @@ A decoder trained through the LM recipe, exported with `PretrainedDecoder.from_m
 ```text
 DiffusionObjective(model, process, inputs, *, autoencoder=None,
                    unconditional_prob=0.12, ema_decay=0.999, solver=DDIM(),
-                   guidance=CFG(3.0), steps=200, variables=None)
+                   guidance=CFG(3.0), steps=200, variables=None, uncertainty=None,
+                   alignment=None, end_to_end=None)
 JepaObjective(encoder, predictor, mask, sample, momentum=(0.996, 1.0),
               momentum_steps=100000, label_key="label", encoder_variables=None,
               predictor_variables=None)
