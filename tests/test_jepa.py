@@ -356,6 +356,36 @@ def health_in(z, dtype):
     return np.asarray([z.std(axis=0).mean(), np.sqrt(np.mean(off ** 2))])
 
 
+def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_blocks(mask):
+    """The documented objective, written in numpy over the modules' own
+    outputs: the target encoder's whole view, layer-normalized without an
+    affine, gathered at each block's indices, against the predictor's
+    output for that block from the shared context, squared and averaged.
+    Held to it in float64, as exact as the same composition in float32."""
+    objective = make_objective(mask)
+    params = objective.init(jax.random.PRNGKey(0))
+    batch, step = {"image": images()}, step_with(params)
+    samples = (np.asarray(batch["image"], np.float32) - 127.5) / 127.5
+    context_idx, target_idx = objective.mask.sample(jax.random.split(step.key)[0], len(samples))
+    full = np.asarray(objective.encode(part(params, "context_encoder"), jnp.asarray(samples)))
+    context = objective.encode(part(params, "context_encoder"), jnp.asarray(samples), context_idx)
+    blocks = mask.num_targets
+    repeated = (jnp.repeat(context, blocks, axis=0), jnp.repeat(context_idx, blocks, axis=0))
+    predictions = np.asarray(objective.predictor.apply(
+        part(params, "predictor"), *repeated, target_idx.reshape(len(samples) * blocks, -1)))
+
+    def loss_in(dtype):
+        z = full.astype(dtype)
+        normed = (z - z.mean(-1, keepdims=True)) / np.sqrt(z.var(-1, keepdims=True) + 1e-6)
+        targets = np.stack([normed[row][np.asarray(target_idx)[row, block]]
+                            for row in range(len(samples)) for block in range(blocks)])
+        return np.mean(np.square(predictions.astype(dtype) - targets))
+
+    dew = float(objective.scalar_loss(params, batch, step)[0])
+    assert_as_exact_as_the_reference(np.asarray([dew]), np.asarray([loss_in(np.float32)]),
+                                     np.asarray([loss_in(np.float64)]), "JEPA loss")
+
+
 def test_representation_health_is_the_float64_statistics():
     """Both statistics against numpy's in float64, as exact as numpy's float32,
     on embeddings whose dimensions are half redundant; a collapsed batch has
