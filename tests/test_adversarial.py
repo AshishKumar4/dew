@@ -173,8 +173,8 @@ def runs(tmp_path_factory):
     root = tmp_path_factory.mktemp("ladd")
     teacher = DiffusionRunConfig(
         model=ModelConfig("simple_dit",
-                          {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2},
-                          dtype="float32", attention_impl="xla"),
+                          {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2,
+                           "dtype": "float32", "attention_impl": "xla"}),
         data=TFDSImages(image_size=4), preset=Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"))

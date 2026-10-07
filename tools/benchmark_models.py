@@ -45,7 +45,7 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import float64_twin, models, projectors, resolve_dtype, towers, with_precision
+from dew.registry import models, projectors, resolve_dtype, towers
 from dew.training import Layout, MeshSpec, Trainer
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
@@ -159,16 +159,14 @@ def decoder_objective(
 def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool = False) -> Objective:
     """The objective a recipe would train for this case.
 
-    The model goes through the same precision function the recipes use, so the
-    dtype and the attention kernel land in the nested unet attention configs
-    too, and a row of this table is a row a real run would produce. With
-    `widened` every model is the float32 configuration's float64 twin
-    (`dew.registry.float64_twin`), nested stages included, which computes in
-    float64 throughout under x64: layout_parity's fp64 step.
+    The case's dtype, attention kernel and matmul precision go into the
+    model's own fields, as a recipe's model record names them; a unet's
+    stages compute in the model's dtype. With `widened` every model computes
+    in float64 throughout under x64: layout_parity's fp64 step.
 
     A composite takes built values rather than a flat record, so its trunk
-    goes through the policy and the wrapper takes it, the way the pretrained
-    loader assembles the same two models (dew.interop.pretrained and
+    takes the fields and the wrapper takes it, the way the pretrained loader
+    assembles the same two models (dew.interop.pretrained and
     dew.interop.diffusion_gemma.build).
     """
     if widened:
@@ -179,9 +177,11 @@ def build_objective(case: Case, attention_impl: str = 'auto', *, widened: bool =
         dtype = case.dtype
 
     def built(architecture: str, config: Mapping[str, object]):
-        fields = with_precision(architecture, config, dtype=dtype, attention_impl=attention_impl,
-                                matmul_precision=case.matmul_precision)
-        return models.build(architecture, **(float64_twin(fields) if widened else fields))
+        declared = {field.name for field in dataclasses.fields(models[architecture])}
+        settings = {"attention_impl": attention_impl, "precision": case.matmul_precision}
+        return models.build(architecture, **config, dtype=jnp.float64 if widened else dtype,
+                            **{key: value for key, value in settings.items()
+                               if value is not None and key in declared})
 
     sample_key = "video" if case.frames else "image"
 

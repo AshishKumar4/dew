@@ -705,29 +705,23 @@ def test_a_stage_names_the_dials_the_block_supports(rng):
     assert not jnp.allclose(projected, output(use_projection=True, norm_epsilon=1.0), atol=1e-5)
 
 
-def test_with_precision_fills_a_stage_whichever_shape_it_arrives_in():
-    """The run's dtype and the fused-kernel softmax reach into every stage
-    through `with_precision`, whether the stage is a value or the record of
-    one from a logged config."""
-    from dew.registry import with_precision
+@pytest.mark.parametrize("dtype", [None, jnp.float32, jnp.bfloat16])
+def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
+    """An unchanged stage inherits the model dtype, or fp32 when both leave it unset."""
+    from dew.nn.attention import stage_attention
 
-    record, value = ({"heads": 2}, Stage(heads=2))
-    from_record = with_precision("unet", {"attention_configs": [None, record]},
-                                 dtype="bfloat16", attention_impl="xla")
-    from_value = with_precision("unet", {"attention_configs": [None, value]},
-                                dtype="bfloat16", attention_impl="xla")
-    # A record keeps the dtype's name, which `build` resolves with every
-    # other field; a value is resolved where it is written, since nothing
-    # resolves it afterwards. The build boundary makes the two agree.
-    assert from_record["attention_configs"][1] == {
-        "heads": 2, "dtype": "bfloat16", "force_fp32_for_softmax": True}
-    assert from_value["attention_configs"][1] == Stage(
-        heads=2, dtype=jnp.bfloat16, force_fp32_for_softmax=True)
-    built = [models.build("unet", feature_depths=(8, 16), num_res_blocks=1, norm_groups=4,
-                          **fields) for fields in (from_record, from_value)]
-    assert built[0].attention_configs == built[1].attention_configs
-    assert built[0].attention_configs[1].dtype == jnp.bfloat16
-    assert built[0].attention_configs[1].force_fp32_for_softmax is True
+    expected_dtype = dtype or jnp.float32
+    stage = Stage(heads=2)
+    block = stage_attention(stage, 8, "reference", dtype, None, "attention")
+    explicit = stage_attention(
+        Stage(heads=2, dtype=expected_dtype), 8, "reference", dtype, None, "attention")
+    x = jnp.ones((1, 2, 2, 8), expected_dtype)
+    variables = block.init(rng, x)
+    output = block.apply(variables, x)
+
+    assert stage.dtype is None and stage.force_fp32_for_softmax is True
+    assert output.dtype == expected_dtype
+    np.testing.assert_array_equal(output, explicit.apply(variables, x))
 
 
 def test_a_block_pattern_and_a_ratio_together_are_refused():

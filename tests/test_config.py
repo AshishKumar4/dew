@@ -10,14 +10,12 @@ import jax
 import jax.numpy as jnp
 import pytest
 from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
 from test_instrumentation import Regression, batches
 
 import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import Dataset
-from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.registry import Aliases, datasets, projectors, towers
 from dew.training import Layout, MeshSpec
@@ -108,10 +106,9 @@ def test_save_and_load_carry_a_subclass_with_its_own_knobs(tmp_path):
         RunConfig.load(str(tmp_path))
 
 
-def test_the_model_config_builds_with_the_run_precision():
+def test_the_model_config_builds_with_its_own_dtype_and_attention():
     fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
-    config = ModelConfig("causal_transformer", fields,
-                         dtype="bfloat16", attention_impl="xla")
+    config = ModelConfig("causal_transformer", {**fields, "dtype": "bfloat16", "attention_impl": "xla"})
     model = config.build()
     import jax
     ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
@@ -123,68 +120,15 @@ def test_the_model_config_builds_with_the_run_precision():
     assert jnp.array_equal(logits, expected)
 
 
-class PrecisionProbe(nn.Module):
-    """A one-layer model that declares every field the run's precision
-    settings write: the compute dtype and the attention kernel each model
-    takes, and the parameter storage and matmul precision only some do."""
+def test_a_model_builds_and_records_its_own_fields():
+    fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2,
+              "dtype": "float32", "precision": "high"}
+    config = ModelConfig("causal_transformer", fields)
 
-    features: int = 4
-    dtype: Dtype = jnp.float32
-    param_dtype: Dtype = jnp.float32
-    precision: PrecisionLike = None
-    attention_impl: AttentionImpl | None = None
-
-    def setup(self):
-        self.dense = nn.Dense(self.features, dtype=self.dtype,
-                              param_dtype=self.param_dtype, precision=self.precision)
-
-    def __call__(self, x):
-        return self.dense(x)
-
-
-def test_the_run_stores_its_parameters_and_names_its_matmul_precision():
-    """`--model.param-dtype` and `--model.matmul-precision` reach the fields
-    a model declares for them: the parameters are stored in the dtype the run
-    named, and the precision is the one every Dense of the model asks XLA
-    for. The probe is named by its import path."""
-    config = ModelConfig(f"{__name__}:PrecisionProbe", {"features": 4}, dtype="float32",
-                         param_dtype="bfloat16", matmul_precision="highest")
-
-    model = config.build()
-    variables = model.init(jax.random.key(0), jnp.ones((1, 3), jnp.float32))
-
-    assert variables["params"]["dense"]["kernel"].dtype == jnp.bfloat16
-    assert model.bind(variables).dense.precision == "highest"
-    assert config.precision_settings() == {
-        "dtype", "attention_impl", "param_dtype", "precision"}
-
-
-def test_a_model_takes_the_precision_settings_it_declares():
-    """A run's storage and matmul precision reach the model through the
-    fields it declares, and a record keeps neither: the config writes them
-    again."""
-    fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
-    config = ModelConfig("causal_transformer", fields, dtype="float32", matmul_precision="high")
-
-    built = config.fields()
-
-    assert built["precision"] == "high" and "param_dtype" not in built
-    assert config.precision_settings() == {"dtype", "attention_impl", "precision"}
+    assert config.fields == fields
     assert config.build().precision == "high"
-    assert ModelConfig("causal_transformer", fields).fields().keys() == {
-        *fields, "dtype", "attention_impl"}
-
-
-def test_a_precision_setting_the_model_declares_no_field_for_is_refused():
-    """`causal_transformer` declares `precision` and no `param_dtype`, so a
-    run that names a storage dtype for it would store float32 regardless."""
-    fields = {"vocab_size": 64, "emb_features": 32, "num_layers": 1, "num_heads": 2}
-    config = ModelConfig("causal_transformer", fields, dtype="float32",
-                         param_dtype="bfloat16", matmul_precision="high")
-
-    with pytest.raises(ValueError, match=r"the model 'causal_transformer' declares no param_dtype field, "
-                                         r"so the run's --model.param-dtype bfloat16 would not reach it"):
-        config.fields()
+    assert RunConfig(model=config).to_dict()["model"] == {
+        "name": config.name, "fields": fields, "adapter": None, "quantization": None}
 
 
 class Unprecise(nn.Module):
@@ -197,45 +141,26 @@ class Unprecise(nn.Module):
         return nn.Dense(self.features)(x)
 
 
-def test_a_model_without_precision_fields_refuses_every_setting_and_builds_without_them():
+def test_a_model_without_dtype_builds_and_refuses_a_dtype_override():
     unprecise = f"{__name__}:Unprecise"
-    with pytest.raises(ValueError, match=r"Unprecise' declares no dtype field.*set --model.dtype to None"):
-        ModelConfig(unprecise, {}).fields()
-    with pytest.raises(ValueError, match=r"declares no dtype or precision field, so the run's "
-                                         r"--model.dtype float32, --model.matmul-precision highest"):
-        ModelConfig(unprecise, {}, dtype="float32", matmul_precision="highest").fields()
-    assert isinstance(ModelConfig(unprecise, {"features": 2}, dtype=None).build(), Unprecise)
+    config = ModelConfig(unprecise, {"features": 2})
+    with pytest.raises(ValueError, match=r"declares no dtype field and holds no part that does"):
+        config.with_dtype("float32")
+    assert isinstance(config.build(), Unprecise)
 
 
-def test_a_composite_takes_the_dtype_through_its_parts_and_refuses_what_none_declares():
-    """DiffusionGemma declares no dtype, and hands the run's to the decoder
-    in its config, which declares one; nothing in it stores parameters at
-    another dtype."""
+def test_a_composite_takes_a_dtype_override_through_its_parts():
+    """A dtype override reaches DiffusionGemma's decoder without mutating the source."""
     text = {"class": "causal_transformer", "fields": {"vocab_size": 64, "emb_features": 32,
                                                      "num_layers": 1, "num_heads": 2}}
     fields = {"text": text, "canvas_length": 4}
 
-    written = ModelConfig("diffusion_gemma", fields, dtype="float32").fields()
+    config = ModelConfig("diffusion_gemma", fields)
+    written = config.with_dtype("float32").fields
     assert written["text"]["fields"]["dtype"] == "float32"
-    with pytest.raises(ValueError, match="'diffusion_gemma' declares no param_dtype field"):
-        ModelConfig("diffusion_gemma", fields, dtype="float32", param_dtype="bfloat16").fields()
-    with pytest.raises(ValueError, match="'diffusion_gemma' declares no dtype field"):
-        ModelConfig("diffusion_gemma", {"canvas_length": 4}, dtype="float32").fields()
-
-
-def test_a_model_config_that_carries_a_precision_setting_the_run_names_is_refused():
-    """The run owns these fields, so a --model.config that carries one names
-    it twice and is refused with the flag that sets it."""
-    fields = {"vocab_size": 64, "precision": "highest"}
-    with pytest.raises(ValueError, match=r"--model.matmul-precision"):
-        ModelConfig("causal_transformer", fields, matmul_precision="high").fields()
-    # Unset, the run claims nothing and the config keeps its own precision.
-    assert ModelConfig("causal_transformer", fields).fields()["precision"] == "highest"
-
-
-def test_a_model_config_that_names_the_precision_twice_is_refused():
-    with pytest.raises(ValueError, match=r"--model.dtype"):
-        ModelConfig("simple_dit", {"dtype": "float32"}).fields()
+    assert "dtype" not in config.fields["text"]["fields"]
+    with pytest.raises(ValueError, match=r"declares no dtype field and holds no part that does"):
+        ModelConfig("diffusion_gemma", {"canvas_length": 4}).with_dtype("float32")
 
 
 def test_an_unknown_model_field_is_refused():
@@ -264,12 +189,11 @@ def test_the_run_length_is_steps_or_epochs():
 def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
     config = RunConfig.cli( [
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
-        "--trainer.steps", "5", "--model.architecture", "uvit",
-        "--model.config", '{"emb_features": 32}',
+        "--trainer.steps", "5", "--model", "uvit", "--model.emb_features", "32",
         "data:token-windows", "--data.path", "tokens", "--data.seq-len", "8"])
     assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.trainer.layout.min_shard == 8
-    assert config.model.config == {"emb_features": 32}
+    assert config.model.fields == {"emb_features": 32}
     assert type(config.data) is datasets["token_windows"]
     assert config.data.seq_len == 8
     assert RunConfig.from_dict(config.to_dict()) == config
@@ -530,7 +454,8 @@ def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
         "vocab_size": 8, "emb_features": 4, "num_layers": 1, "num_heads": 1,
         "max_seq_len": 8, "mlp_features": 8, "mixer": AttentionMixer(),
         "kinds": {"full_attention": LayerKind(mixer=mixer)},
-    }, dtype="float32"))
+        "dtype": "float32",
+    }))
     model = run.model.build()
     tokens = jnp.asarray([[0, 1, 2, 3]], jnp.int32)
     variables = model.init(jax.random.key(1), tokens)

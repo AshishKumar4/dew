@@ -217,10 +217,7 @@ def dew_side(args, images, total, attention):
             return Ratio(jnp.sum(losses * weights),
                         jnp.asarray(losses.size, jnp.promote_types(losses.dtype, jnp.float32))), Aux(metrics={})
 
-    from dew.registry import with_precision
-
-    model = models.build("simple_dit", with_precision("simple_dit", MODEL, dtype=args.dtype,
-                                                      attention_impl=attention))
+    model = models.build("simple_dit", {**MODEL, "dtype": args.dtype, "attention_impl": attention})
     # The npz holds flaxdiff's whole variables dict, {"params": ...}. flaxdiff
     # keeps its Fourier table out of that dict, and its main branch draws it
     # from numpy's RandomState(42) (commit 63f2427), as Dew's init does, so

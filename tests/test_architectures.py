@@ -520,7 +520,7 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 
 def unet_run(fields):
     return DiffusionRunConfig(
-        model=ModelConfig("unet", fields, dtype="float32", attention_impl="reference"),
+        model=ModelConfig("unet", {**fields, "dtype": "float32", "attention_impl": "reference"}),
         data=TFDSImages(image_size=8), text=None, guidance=None,
         solver=Euler(), sampling_steps=SAMPLER_STEPS)
 
@@ -552,8 +552,8 @@ def test_a_record_rebuilds_each_field_as_its_annotation_asks():
     config = replace(unet_run(JSON_UNET), val_metrics=("psnr", "ssim"))
     rebuilt = DiffusionRunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert rebuilt.val_metrics == ("psnr", "ssim")
-    assert type(rebuilt.model.config["feature_depths"]) is list
-    assert rebuilt.model.config["feature_depths"] == [8, 16]
+    assert type(rebuilt.model.fields["feature_depths"]) is list
+    assert rebuilt.model.fields["feature_depths"] == [8, 16]
     assert rebuilt == config
 
 

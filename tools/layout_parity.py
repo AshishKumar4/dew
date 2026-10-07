@@ -595,7 +595,7 @@ def anchor_program(case, batch, state):
 
 def anchor_step(case, batch) -> tuple[float, dict[str, NDArray]]:
     """Step one's loss and its gradient by leaf name in fp64: the model's
-    float64 twin (`dew.registry.float64_twin`), which computes in float64
+    float64 twin (`benchmark_models.build_objective(widened=True)`), which computes in float64
     throughout, on the reference's own initial variables widened to fp64.
     The trainer draws those from its key's first split, so they come from
     the trainer, not from the objective's `init` on the key itself."""

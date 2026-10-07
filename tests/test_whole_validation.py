@@ -51,7 +51,7 @@ def runnable(name: str, windows, tmp_path):
     with tarfile.open(FIXTURES / "flux_source.tar.xz") as archive:
         archive.extractall(tmp_path / "flux", filter="data")
     teacher = DiffusionRunConfig(
-        model=ModelConfig("flux_transformer", FLUX, dtype="float32", attention_impl="xla"),
+        model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
         data=TFDSImages(image_size=8), preset=Flow(), solver=Euler(), guidance=None, sampling_steps=2,
         ema_decay=None, val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline"))).build()

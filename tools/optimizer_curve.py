@@ -33,7 +33,7 @@ import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.config import OptimConfig
 from dew.data import DataPartition, Loading, TokenWindows
 from dew.objectives.lm import LMObjective
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.training import MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
@@ -101,12 +101,8 @@ def run(config: Comparison) -> Curve:
     data = TokenWindows(path=config.dataset, seq_len=config.sequence_length, seed=config.seed,
                         loading=Loading(workers=0, threads=1, read_buffer=1,
                                         worker_buffer=1)).load(batch=config.batch_size)
-    fields = with_precision(
-        "causal_transformer",
-        dict(vocab_size=vocab_size, emb_features=config.emb_features,
-             num_layers=config.num_layers, num_heads=config.num_heads,
-             max_seq_len=config.sequence_length),
-        dtype="bfloat16", attention_impl="auto")
+    fields = dict(vocab_size=vocab_size, emb_features=config.emb_features, num_layers=config.num_layers,
+                  num_heads=config.num_heads, max_seq_len=config.sequence_length, dtype="bfloat16")
     model = models.build("causal_transformer", **fields)
     objective = LMObjective(model, config.sequence_length, ema_decay=1.0)
 
