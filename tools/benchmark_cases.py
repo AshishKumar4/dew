@@ -18,11 +18,10 @@ class Case:
     architecture: str
     config: dict[str, object] = field(default_factory=dict)
     dtype: str | None = None
-    """Compute dtype, written into the model config by the precision policy;
-    None takes the run's --dtype."""
+    """Compute dtype, written into the model's `dtype` field; None takes the run's --dtype."""
     matmul_precision: str | None = None
-    """What every matmul asks XLA for (`ModelConfig.matmul_precision`), written
-    into a model that declares `precision`; None keeps the model's own."""
+    """What every matmul asks XLA for, written into a model that declares
+    `precision`; None keeps the model's own."""
     orders: bool = False
     """Layout comparisons use 52 exact residual orders against fp64 when True.
     Other measurements and rows retain their ordinary single-draw path."""

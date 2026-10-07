@@ -117,7 +117,7 @@ def main(config: JepaRunConfig) -> TrainState:
     is_video = sample.key == "video"
     if is_video != (models[config.model.name] is models['jepa_video_encoder']):
         raise ValueError(
-            "a video dataset and --model.architecture jepa_video_encoder go together")
+            "a video dataset and --model jepa_video_encoder go together")
 
     encoder, encoder_fields = build_encoder(config)
     grid = (sample.shape[-2] // encoder.patch_size,) * 2

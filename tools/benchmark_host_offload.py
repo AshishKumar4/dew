@@ -40,7 +40,7 @@ import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import LayerBanks, at_namespace, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import Placement
 
@@ -194,9 +194,8 @@ def build(config: OffloadConfig, depth: int) -> CausalTransformer:
               "mlp": "swiglu"}
     if config.cache_length is not None:
         fields["max_seq_len"] = config.cache_length
-    return models.build("causal_transformer", **with_precision(
-        "causal_transformer", fields, dtype=config.dtype,
-        attention_impl=config.attention_impl))
+    return models.build("causal_transformer", **fields, dtype=config.dtype,
+                        attention_impl=config.attention_impl)
 
 
 def shapes_of(model: CausalTransformer, tokens, dtype: str) -> dict:

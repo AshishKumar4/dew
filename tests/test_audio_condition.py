@@ -150,7 +150,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
                        loading=Loading(workers=0))
     config = DiffusionRunConfig(
         model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
-                                        "num_heads": 2}, dtype="float32", attention_impl="reference"),
+                                        "num_heads": 2, "dtype": "float32", "attention_impl": "reference"}),
         data=data, text=None, audio=AudioCondition(), sampling_steps=4, guidance=CFG(2.0),
         ema_decay=None, val_metrics=())
     objective = config.build()

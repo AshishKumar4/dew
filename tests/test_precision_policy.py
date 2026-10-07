@@ -1,10 +1,4 @@
-"""The run's precision policy: one dtype knob, one attention knob.
-
-`--model.dtype` and `--model.attention-impl` are the only way in;
-`with_precision` writes them into the model config that gets built and logged,
-`Aliases.build` resolves the names back into dtypes, and the attention kernel
-raises a ValueError for a knob a fused kernel cannot honor.
-"""
+"""Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
 import collections
 import json
@@ -32,7 +26,7 @@ from dew.nn.llama4 import Llama4Attention
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
-from dew.registry import dtype_name, float64_twin, models, resolve_dtype, with_precision
+from dew.registry import dtype_name, models, resolve_dtype
 
 import_module("dew.nn.multimodal")  # registers the fixture kind
 
@@ -163,18 +157,8 @@ def test_cudnn_rejects_a_head_dimension_it_cannot_honor(without_deterministic_op
         scaled_dot_product_attention(*narrow, implementation="cudnn")
 
 
-@pytest.mark.parametrize("key,value,flag", [("dtype", "bfloat16", "--model.dtype"),
-                                           ("attention_impl", "xla", "--model.attention-impl")])
-def test_policy_rejects_a_second_path_for_the_same_knob(key, value, flag):
-    """The refusal names the flag that owns the knob the config carried."""
-    with pytest.raises(ValueError, match=flag):
-        with_precision('simple_dit', {key: value}, dtype="bfloat16",
-                       attention_impl="auto")
-
-
-def test_logged_policy_values_round_trip_through_the_registry():
-    """The policy writes strings so a logged config stays a record; the
-    registry maps them back on the way in."""
+def test_logged_dtype_values_round_trip_through_the_registry():
+    """Recorded dtype names are resolved at the model's build boundary."""
     assert resolve_dtype("bfloat16") is jnp.bfloat16
     assert dtype_name(jnp.bfloat16) == "bfloat16"
     with pytest.raises(ValueError, match="not one of"):
@@ -239,7 +223,7 @@ tools/deepseek_v41_numerics.py's, not this one."""
 
 
 def _translated(name):
-    """A fixture's decoder config, less the precision fields the policy writes."""
+    """A fixture's decoder config, leaving compute settings to the caller."""
     config = translate_config(json.loads((FIXTURES / name / "config.json").read_text()))
     return {key: value for key, value in config.items() if key not in ("dtype", "attention_impl")}
 
@@ -254,15 +238,13 @@ fixtures' (`FIXTURE_DECODERS`)."""
 
 
 def build_model(architecture, dtype="bfloat16"):
-    """Every registered architecture at a tiny size, the policy applied where
-    it enters: leaf models through `with_precision`; the composites wrap a
-    language model built that way, so the compute dtype reaches their trunk.
-    "float64" is the float32 configuration's float64 twin (`float64_twin`),
-    which x64 has to be on for."""
+    """Every registered architecture at a tiny size with an explicit compute dtype.
+
+    Float64 references use an actual dtype (not a recorded run dtype name),
+    under x64. Composite trunks receive the same dtype as leaf models.
+    """
     def resolved(name, fields):
-        config = with_precision(name, fields, dtype="float32" if dtype == "float64" else dtype,
-                                attention_impl="auto")
-        return float64_twin(config) if dtype == "float64" else config
+        return {**fields, "dtype": jnp.float64 if dtype == "float64" else dtype}
 
     if architecture in DECODERS:
         return models.build("causal_transformer", **resolved("causal_transformer", DECODERS[architecture]))
@@ -446,7 +428,7 @@ def test_a_model_below_float64_computes_the_same_bits_whether_x64_is_on(architec
 
 
 @pytest.mark.parametrize("architecture", sorted(models))
-def test_default_policy_computes_in_bf16_and_keeps_params_fp32(architecture, rng):
+def test_explicit_bf16_compute_keeps_params_fp32(architecture, rng):
     """bf16 is a compute dtype: every param leaf stays float32 so checkpoints
     and the optimizer state are unchanged. DiffusionGemma refines a canvas
     against an encoded prompt, so its forward is the encode-then-refine pair."""

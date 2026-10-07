@@ -123,8 +123,8 @@ def test_a_run_config_builds_the_unet_and_scores_a_batch():
 
     config = DiffusionRunConfig(
         model=ModelConfig("edm2_unet", {"model_channels": 8, "channel_mult": [1, 2], "num_blocks": 1,
-                                        "attn_resolutions": [2], "channels_per_head": 8},
-                          dtype="float32", attention_impl="xla"),
+                                        "attn_resolutions": [2], "channels_per_head": 8,
+                                        "dtype": "float32", "attention_impl": "xla"}),
         data=TFDSImages(image_size=4), preset=EDM(regime="pixel"),
         solver=Euler(), guidance=None, sampling_steps=2, ema_decay=None,
         val_metrics=(), text=TextCondition(encoder="char_table", checkpoint="char_table"),

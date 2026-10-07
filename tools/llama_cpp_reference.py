@@ -174,10 +174,9 @@ def export(directory: Path):
 
     from dew.data.text import HFTokenizer
     from dew.interop.pretrained import PretrainedDecoder
-    from dew.registry import models, with_precision
+    from dew.registry import models
 
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", FIELDS, dtype="float32", attention_impl="xla"))
+    model = models.build("causal_transformer", **FIELDS, dtype="float32", attention_impl="xla")
     variables = weights(jax.eval_shape(model.init, jax.random.key(SEED), jnp.zeros((1, 8), jnp.int32)))
     PretrainedDecoder.from_model(model, variables, tokenizer=HFTokenizer(str(TOKENIZER))).save(str(directory))
     return model, variables

@@ -578,7 +578,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
             archive.extractall(tmp_path / name, filter="data")
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
-                                         "mlp_ratio": 1}, dtype="float32", attention_impl="xla"),
+                                         "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
         data=TFDSImages(image_size=32), preset=presets.Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),

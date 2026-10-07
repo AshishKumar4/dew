@@ -27,7 +27,7 @@ import optax
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.objectives.lm import TEXT_KEY, LMObjective
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.training import MeshSpec, Trainer
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,8 +48,7 @@ class Record:
 
 def run(config: dict[str, object], batch: int, seq: int, steps: int,
         precision: str | None = None) -> Record:
-    fields = with_precision("causal_transformer", config,
-                            dtype="bfloat16", attention_impl="reference")
+    fields = {**config, "dtype": "bfloat16", "attention_impl": "reference"}
     if precision is not None:
         fields["precision"] = precision
     model = models.build("causal_transformer", **fields)

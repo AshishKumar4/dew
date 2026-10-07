@@ -2,16 +2,16 @@
 
     python recipes/diffusion/train.py --data.path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
         --data.image-size 128 --trainer.batch-size 32 --trainer.epochs 2000 \\
-        --model.architecture simple_dit \\
-        --model.config '{"patch_size": 4, "emb_features": 512, "num_layers": 12, "num_heads": 8}'
+        --model simple_dit --model.patch-size 4 --model.emb-features 512 \\
+        --model.num-layers 12 --model.num-heads 8
 
 The dataset is a subcommand over the registry (`data:cc12m --data.path /mnt/gcs`),
 and so are the preset (`preset:flow --preset.shift 3.0`), the solver, the text
 condition (`text:None` for an unconditional run) and the autoencoder
 (`autoencoder:stable-diffusion-autoencoder`). The corpora this recipe names
 (`oxford-flowers102`, the default, `cc12m`, the LAION sets) are `CORPORA` below,
-values of the specs `dew.data` reads. Architecture kwargs go through
---model.config as one JSON object, straight to the registry. The run spec is
+values of the specs `dew.data` reads. `--model` picks the model's class and
+`--model.<field>` sets each of its fields. The run spec is
 `dew.objectives.diffusion.DiffusionRunConfig`, saved as run.json next to the
 checkpoints, and training and inference both build from `config.build()`.
 
