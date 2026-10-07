@@ -713,7 +713,7 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     return held
 
 
-def _placed(config: RunConfig, path: str) -> tuple[list[str], Annotation]:
+def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
     """The keys of `path`'s value in `config`'s record, and the annotation it is read by."""
     *groups, field = path.split(".")
     held: object = config
