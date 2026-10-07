@@ -70,7 +70,8 @@ def test_the_language_model_flow_trains_exports_loads_and_generates(tmp_path):
 @pytest.mark.mesh(devices=0)
 def test_the_diffusion_flow_trains_restores_and_samples(tmp_path):
     step(tmp_path, str(ROOT / "recipes" / "diffusion" / "train.py"), "data:tfds-images",
-         "--data.path", str(IMAGES), "--data.image-size", "8", "--data.augmentation", "none",
+         "--data.path", str(IMAGES), "--data.name", "dew_images", "--data.image-size", "8",
+         "--data.augmentation", "none",
          "--data.val-batches", "0", "--data.loading.workers", "0", "--data.loading.threads", "1",
          "--data.loading.read-buffer", "2", "preset:flow", "--objective.solver", '{"class": "euler"}',
          "--objective.guidance", "None",
