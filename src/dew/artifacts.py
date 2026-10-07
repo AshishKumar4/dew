@@ -9,11 +9,16 @@ on the host as static metadata.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import jax
 import numpy as np
 from flax import struct
 from jax.typing import ArrayLike
 from numpy.typing import NDArray
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
 @struct.dataclass
@@ -75,10 +80,17 @@ class Decisions:
     scored: jax.Array
 
 
-# Scoring and preview hooks each return one artifact or a tuple. Metrics
-# pick exactly one scoring artifact by type; previews never satisfy metrics.
-Artifact = ImageGrid | VideoGrid | TextSamples | Representations | TokenScores | Decisions
-Artifacts = Artifact | tuple[Artifact, ...]
+type Artifact = DataclassInstance
+"""What an objective's scoring and preview hooks return: a dataclass whose
+per-row fields lead with the batch's rows, which a validation pass cuts to
+the real ones. Dew's own are the classes above. A package's objective may
+score into a dataclass of its own, which its metrics read by type
+(`Metric.reads`); a metric picks exactly one scoring artifact, and previews
+never satisfy metrics. A tracker shows a preview of Dew's types, so a
+package shows its own as one of them, a spike raster as an `ImageGrid`."""
+
+type Artifacts = Artifact | tuple[Artifact, ...]
+"""One artifact, or several."""
 
 
 def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
