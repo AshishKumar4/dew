@@ -1,14 +1,15 @@
-// live.dewml.dev: the "Run live" buttons on dewml.dev. The Worker checks the
-// visitor with Turnstile, the Coordinator enforces the limits below, and each
-// session gets an isolated Python context with shared model weights. Deploy with
-// `pnpm live:deploy`, which pins trusted snapshot preparation; see deploy.mjs.
 {
 	"$schema": "../node_modules/wrangler/config-schema.json",
 	"name": "dewml-live",
 	"account_id": "f44999d1ddda7012e9a87729eba250f1",
 	"main": "src/index.ts",
 	"compatibility_date": "2026-09-29",
-	"routes": [{ "pattern": "live.dewml.dev", "custom_domain": true }],
+	"routes": [
+		{
+			"pattern": "live.dewml.dev",
+			"custom_domain": true
+		}
+	],
 	"workers_dev": false,
 	"preview_urls": false,
 	"containers": [
@@ -19,123 +20,232 @@
 		{
 			"class_name": "SnapshotPreparer",
 			"scheduling_policy": "durable_object"
-		},
-		{
-			"class_name": "RunnerPreparer",
-			"scheduling_policy": "durable_object"
-		},
-		{
-			"class_name": "RemoteJob",
-			"scheduling_policy": "durable_object"
 		}
 	],
 	"durable_objects": {
 		"bindings": [
-			{ "name": "KERNEL", "class_name": "LiveKernel" },
-			{ "name": "COORDINATOR", "class_name": "Coordinator" },
-			{ "name": "SHARED", "class_name": "SharedHost" },
-			{ "name": "POOL", "class_name": "ModelPool" },
-			{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
-			{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
-			{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
-			{ "name": "RUNNER_CACHE", "class_name": "RunnerCache" },
-			{ "name": "RUNNER_PREPARER", "class_name": "RunnerPreparer" },
-			{ "name": "REMOTE_JOB", "class_name": "RemoteJob" }
+			{
+				"name": "COORDINATOR",
+				"class_name": "Coordinator"
+			},
+			{
+				"name": "SHARED",
+				"class_name": "SharedHost"
+			},
+			{
+				"name": "POOL",
+				"class_name": "ModelPool"
+			},
+			{
+				"name": "SNAPSHOTS",
+				"class_name": "SnapshotRegistry"
+			},
+			{
+				"name": "PREPARER",
+				"class_name": "SnapshotPreparer"
+			}
 		]
 	},
-	// v2 moves the containers to the durable_object scheduling policy, which needs a new
-	// class: a Kernel keeps nothing a later session reads. A Worker still on v1 takes two
-	// deploys: delete its old container application (`wrangler containers delete`), deploy
-	// up to v2 with an empty `Kernel` Durable Object still exported, then deploy v3.
 	"migrations": [
-		{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] },
-		{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
-		{ "tag": "v3", "deleted_classes": ["Kernel"] },
-		{ "tag": "v4", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] },
-		{ "tag": "v5", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] },
-		{ "tag": "v6", "new_sqlite_classes": ["ModelPool"] }
+		{
+			"tag": "v1",
+			"new_sqlite_classes": [
+				"Kernel",
+				"Coordinator"
+			]
+		},
+		{
+			"tag": "v2",
+			"new_sqlite_classes": [
+				"LiveKernel"
+			]
+		},
+		{
+			"tag": "v3",
+			"deleted_classes": [
+				"Kernel"
+			]
+		},
+		{
+			"tag": "v4",
+			"new_sqlite_classes": [
+				"SharedHost",
+				"SnapshotRegistry",
+				"SnapshotPreparer"
+			]
+		},
+		{
+			"tag": "v5",
+			"new_sqlite_classes": [
+				"RunnerFleet",
+				"RunnerCache",
+				"RunnerPreparer",
+				"RemoteJob"
+			]
+		},
+		{
+			"tag": "v6",
+			"new_sqlite_classes": [
+				"ModelPool"
+			]
+		},
+		{
+			"tag": "v7",
+			"deleted_classes": [
+				"LiveKernel",
+				"RunnerFleet",
+				"RunnerCache",
+				"RunnerPreparer",
+				"RemoteJob"
+			]
+		}
 	],
-	// Requests to the API per visitor IP; sessions have their own limits below.
-	"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7401", "simple": { "limit": 30, "period": 60 } }],
+	"ratelimits": [
+		{
+			"name": "REQUESTS",
+			"namespace_id": "7401",
+			"simple": {
+				"limit": 30,
+				"period": 60
+			}
+		}
+	],
 	"vars": {
-		// Space-separated. preview.dewml.dev uses the preview Worker below.
 		"SNAPSHOT_COMMIT": "set-by-live-deploy",
 		"ALLOWED_ORIGINS": "https://dewml.dev",
 		"TURNSTILE_HOSTNAMES": "dewml.dev",
-		// Whether a token from Cloudflare's always-pass test sitekey counts; only the preview Worker takes them.
 		"TURNSTILE_TEST_KEYS": "refuse",
-		// Session-seconds a UTC day may use; 40 hours caps the monthly bill.
 		"BUDGET_SECONDS": "144000",
 		"MAX_SESSIONS": "8",
 		"WALL_SECONDS": "1200",
-		// How long a spare Python context waits for the next session: it costs about $0.02 a
-		// window idle (12 GiB and 20 GB provisioned), plus about 4 vCPU-minutes to load
-		// and compile, and counts against the budget.
 		"WARM_SECONDS": "600",
 		"IDLE_SECONDS": "300",
 		"CPU_SECONDS": "900",
 		"IP_WINDOW_SECONDS": "600",
 		"IP_STARTS": "3"
 	},
-	"observability": { "enabled": true },
+	"observability": {
+		"enabled": true
+	},
 	"env": {
-		// live-preview.dewml.dev, which preview.dewml.dev uses: the same Worker and snapshot, but
-		// with Turnstile's test secret, so a headless browser can run the page end to end.
-		// Anyone can pass its check, so its budget and session count are small. Deploy with
-		// `pnpm live:deploy <sha> -- --env preview`.
 		"preview": {
 			"name": "dewml-live-preview",
-			// The retired private snapshot lab existed only on preview.
 			"migrations": [
-				{ "tag": "v1", "new_sqlite_classes": ["Kernel", "Coordinator"] },
-				{ "tag": "v2", "new_sqlite_classes": ["LiveKernel"] },
-				{ "tag": "v3", "deleted_classes": ["Kernel"] },
-				{ "tag": "v4", "new_sqlite_classes": ["SnapshotLab"] },
-				{ "tag": "v5", "deleted_classes": ["SnapshotLab"] },
-				{ "tag": "v6", "new_sqlite_classes": ["SharedHost", "SnapshotRegistry", "SnapshotPreparer"] },
-				{ "tag": "v7", "new_sqlite_classes": ["RunnerFleet", "RunnerCache", "RunnerPreparer", "RemoteJob"] },
-				{ "tag": "v8", "new_sqlite_classes": ["ModelPool"] }
-			],
-			"routes": [{ "pattern": "live-preview.dewml.dev", "custom_domain": true }],
-			"containers": [
 				{
-					"class_name": "SharedHost",
-					"scheduling_policy": "durable_object"
+					"tag": "v1",
+					"new_sqlite_classes": [
+						"Kernel",
+						"Coordinator"
+					]
 				},
 				{
-					"class_name": "SnapshotPreparer",
-					"scheduling_policy": "durable_object"
+					"tag": "v2",
+					"new_sqlite_classes": [
+						"LiveKernel"
+					]
 				},
 				{
-					"class_name": "RunnerPreparer",
-					"scheduling_policy": "durable_object"
+					"tag": "v3",
+					"deleted_classes": [
+						"Kernel"
+					]
 				},
 				{
-					"class_name": "RemoteJob",
-					"scheduling_policy": "durable_object"
+					"tag": "v4",
+					"new_sqlite_classes": [
+						"SnapshotLab"
+					]
+				},
+				{
+					"tag": "v5",
+					"deleted_classes": [
+						"SnapshotLab"
+					]
+				},
+				{
+					"tag": "v6",
+					"new_sqlite_classes": [
+						"SharedHost",
+						"SnapshotRegistry",
+						"SnapshotPreparer"
+					]
+				},
+				{
+					"tag": "v7",
+					"new_sqlite_classes": [
+						"RunnerFleet",
+						"RunnerCache",
+						"RunnerPreparer",
+						"RemoteJob"
+					]
+				},
+				{
+					"tag": "v8",
+					"new_sqlite_classes": [
+						"ModelPool"
+					]
+				},
+				{
+					"tag": "v9",
+					"deleted_classes": [
+						"LiveKernel",
+						"RunnerFleet",
+						"RunnerCache",
+						"RunnerPreparer",
+						"RemoteJob"
+					]
 				}
 			],
+			"routes": [
+				{
+					"pattern": "live-preview.dewml.dev",
+					"custom_domain": true
+				}
+			],
+			"containers": [],
 			"durable_objects": {
 				"bindings": [
-					{ "name": "KERNEL", "class_name": "LiveKernel" },
-					{ "name": "COORDINATOR", "class_name": "Coordinator" },
-					{ "name": "SHARED", "class_name": "SharedHost" },
-			{ "name": "POOL", "class_name": "ModelPool" },
-					{ "name": "SNAPSHOTS", "class_name": "SnapshotRegistry" },
-					{ "name": "PREPARER", "class_name": "SnapshotPreparer" },
-					{ "name": "RUNNER_FLEET", "class_name": "RunnerFleet" },
-					{ "name": "RUNNER_CACHE", "class_name": "RunnerCache" },
-					{ "name": "RUNNER_PREPARER", "class_name": "RunnerPreparer" },
-					{ "name": "REMOTE_JOB", "class_name": "RemoteJob" }
+					{
+						"name": "COORDINATOR",
+						"class_name": "Coordinator"
+					},
+					{
+						"name": "SHARED",
+						"class_name": "SharedHost",
+						"script_name": "dewml-live"
+					},
+					{
+						"name": "POOL",
+						"class_name": "ModelPool",
+						"script_name": "dewml-live"
+					},
+					{
+						"name": "SNAPSHOTS",
+						"class_name": "SnapshotRegistry",
+						"script_name": "dewml-live"
+					},
+					{
+						"name": "PREPARER",
+						"class_name": "SnapshotPreparer",
+						"script_name": "dewml-live"
+					}
 				]
 			},
-			"ratelimits": [{ "name": "REQUESTS", "namespace_id": "7402", "simple": { "limit": 30, "period": 60 } }],
+			"ratelimits": [
+				{
+					"name": "REQUESTS",
+					"namespace_id": "7402",
+					"simple": {
+						"limit": 30,
+						"period": 60
+					}
+				}
+			],
 			"vars": {
 				"SNAPSHOT_COMMIT": "set-by-live-deploy",
 				"ALLOWED_ORIGINS": "https://preview.dewml.dev",
 				"TURNSTILE_HOSTNAMES": "preview.dewml.dev",
 				"TURNSTILE_TEST_KEYS": "accept",
-				// Four hours a day: a running spare holds half an hour of it.
 				"BUDGET_SECONDS": "14400",
 				"MAX_SESSIONS": "2",
 				"WALL_SECONDS": "1200",
@@ -143,7 +253,6 @@
 				"IDLE_SECONDS": "300",
 				"CPU_SECONDS": "900",
 				"IP_WINDOW_SECONDS": "600",
-				// Test runs start sessions back to back.
 				"IP_STARTS": "10"
 			}
 		}
