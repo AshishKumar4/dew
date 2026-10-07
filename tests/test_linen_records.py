@@ -15,7 +15,7 @@ import jax
 import numpy as np
 
 from dew.config import ModelConfig
-from dew.registry import to_record
+from dew.registry import imported, to_record
 
 
 class Residual(nn.Module):
@@ -69,4 +69,4 @@ def test_a_nested_linen_model_rebuilds_from_its_record_with_its_weights_in_a_fre
 def test_a_nested_layers_default_initializer_is_left_out_and_a_given_one_is_kept():
     record = ModelConfig.from_model(models()["residual"]).fields
     assert "bias_init" not in record["inner"] and "scale_init" not in record["norm"]
-    assert record["inner"]["kernel_init"] == {"function": "jax._src.nn.initializers:zeros"}
+    assert imported(record["inner"]["kernel_init"]["function"]) is nn.initializers.zeros
