@@ -20,6 +20,15 @@ The step's custom metadata records which leaves are stored this way, so
 `restore` and `stored` return them bit for bit as they were trained, and a
 checkpoint that records none reads as it was written.
 
+Each kept step stores its weights whole; a best step is not a delta of the
+latest. An EMA at decay 0.9999 trails the weights by about 10^4 steps, the
+distance a best step usually has from the latest late in a run, and weights
+further apart share fewer leading bits, so the 25% above bounds what such a
+delta saves: at most a quarter of one weights copy, about 12% of the 2.6 GB
+the 176M DiT's best and latest steps hold. Storing one step against another
+would make retention keep a base alive while any delta reads it, or
+re-encode the best step at every save, which that saving does not pay for.
+
 Besides the persistent directory, a run can keep a local checkpoint on every
 host, written more often, so a preempted pod resumes from its own disks rather
 than from remote storage. This is Orbax's emergency checkpointing

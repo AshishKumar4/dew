@@ -80,11 +80,13 @@ def _element_for(kind, seed=0):
 
 
 def _spec(kind, labels_file, augmentation="flip_jitter"):
-    """A prepared TFDS spec, or an arrayrecord one: `record` is what differs."""
+    """A prepared TFDS spec, or an arrayrecord one: `record` is what differs.
+    Both augment on the host, the per-record path these tests read."""
     if kind == "tfds":
-        return TFDSImages(image_size=SCALE, augmentation=augmentation, labels=str(labels_file),
-                          caption_templates=CAPTION_TEMPLATES)
-    return ArrayRecordImages(image_size=SCALE, augmentation=augmentation, shards=("cc12m",))
+        return TFDSImages(image_size=SCALE, augmentation=augmentation, augmentation_backend="host",
+                          labels=str(labels_file), caption_templates=CAPTION_TEMPLATES)
+    return ArrayRecordImages(image_size=SCALE, augmentation=augmentation, augmentation_backend="host",
+                             shards=("cc12m",))
 
 
 def _resized(kind, element):
