@@ -687,6 +687,34 @@ class Objective(ABC, Generic[Loss, Effects]):
             return value, jnp.asarray(a=True)
         raise TypeError("custom loss statistics require Objective.reduce_loss")
 
+    @staticmethod
+    def with_gradients(stats: Loss, gradients, params: Variables) -> Loss:
+        """Return `stats` with `gradients` as their derivative in `params`: a gradient rule not the loss's.
+
+        `gradients` has the structure of `stats`: for each scalar statistic,
+        its gradient with respect to `params` (the trained `params`
+        collection `loss` was given), or None for one no parameter moves. A
+        `loss` that computes its own update rule (e-prop's eligibility traces,
+        a forward-gradient or evolution-strategies estimate, a synthetic
+        gradient) returns this. Each statistic keeps its value, which adds
+        zero, `<gradient, params - stop_gradient(params)>`, whose derivative
+        is `gradient`; so the trainer's one gradient path, with its
+        microbatching, accumulation, sharding and logging, applies the rule
+        as it applies `jax.grad`'s.
+        """
+        moved = jax.tree.leaves(jax.tree.map(lambda leaf: leaf - jax.lax.stop_gradient(leaf), params))
+
+        def held(value, gradient):
+            value = jax.lax.stop_gradient(jnp.asarray(value))
+            if gradient is None:
+                return value
+            if value.ndim:
+                raise ValueError(f"a statistic with supplied gradients is a scalar, not {value.shape}")
+            pairs = zip(jax.tree.leaves(gradient), moved, strict=True)
+            return value + sum(jnp.vdot(jax.lax.stop_gradient(rule), change) for rule, change in pairs)
+
+        return jax.tree.map(held, stats, gradients)
+
     def scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
         """Return the reduced loss and the `Aux` for `batch`, so JAX can differentiate the loss directly."""
         stats, aux = self._loss(variables, batch, step)
