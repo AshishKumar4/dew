@@ -133,6 +133,47 @@ python recipes/decision/train.py --data.path tickets.csv --data.text text --data
 
 It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `DecisionTable` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
 
+## Train a general decision model
+
+Two recipes train a model that answers questions it has not seen, as Jev, Laya and Clef do:
+
+- `recipes/decision/encoder.py` trains ModernBERT-large whole under a fresh Laya head, as Laya and OpenDecider-nano are built.
+- `recipes/decision/clef.py` trains a fresh joint schema head with LoRA factors over a frozen Qwen3.5-4B, as Clef is built, on 4,096-token rows. `--pretrained Qwen/Qwen3.5-9B --lora.rank 256` gives Clef-flash's size.
+
+```bash
+python recipes/decision/contamination.py --out eval-index.npz --jsonl suite-rows.jsonl.gz \
+    --hub LocalLLaMA/typed-decisions@d0e2f0c4:all/test-00000-of-00001.parquet
+python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
+python recipes/decision/encoder.py --mixture.root data/mixture --trainer.checkpoint-dir runs
+```
+
+`sources.py` writes the sets both recipes train on, each pinned to a commit, as JSON-lines rows that `Example.of` reads:
+
+- Open-Jev's typed decisions;
+- typed-decisions' train split;
+- gliclass;
+- BANKING77, CLINC150, WANLI, HellaSwag, ARC, BoolQ and GSM8K;
+- your own rows (`--mixture.rows.path`).
+
+It records their weights beside them, in `mixture.json`. Benchmark-style items are framed both ways requests carry them: the content in the state or in the question, and the options by name or by letter. Where a set's gold is a distribution, as Open-Jev's and typed-decisions' are, the example carries it as `targets`, and training scores against that distribution rather than its most likely option.
+
+`contamination.py` reduces evaluation items to hashes, and `--decontaminate` drops every training example that repeats one:
+
+- A decision, meaning a state with a question and its options, that is an evaluation decision is dropped, however short its state.
+- Content an evaluation item shares is dropped too: a state, or the instructions of a request with no state. A synthetic set's examples are compared whole. Natural text is also compared line by line and by 13-word runs.
+- A question and its options alone are a task's schema, which every row of a table shares, so rows of other states asked the same question are kept.
+
+What was dropped is recorded with the sets.
+
+The recipes are default `DecisionRunConfig`s, so every value is a flag. `mixture` (a `DecisionMixture`) reads the sets at their shares of every step through `DecisionObjective.dataset`. `--mixture.weights mine 0.1` adds a set of your own from the same directory. `head` draws Clef's joint head. An example a joint row cannot hold is dropped and counted in the run's summary.
+
+The loss is the log loss plus half the Brier score, plus the ranked probability score on ordered levels: the proper scoring rules that Laya's RLCD and Clef's post-training reward.
+
+A trained run is measured where a decision model is used, at `/v1/systemone`. Serve it with `examples/serve_decisions.py --run runs/... --whole`; `--whole` refuses, rather than cuts, a request too long to answer whole, as Decision Index requires. Then:
+
+- Decision Index runs through its own kit (`python -m decision_index pipeline --engine http`).
+- typed-decisions, Open-Jev's test and OOD splits, and Laya's application battery run through `recipes/decision/benchmark.py`, whose typed-decisions scorer reproduces the dataset card's reference row.
+
 ## How this relates to Laya
 
 Laya's encoder loads through Dew's ModernBERT family and its head maps onto `DecisionHead`. For the same requests, Dew lays out the same tokens as Laya's own code, and its option logits are within the 2x reference-error rule of Laya's (`tests/test_decision_laya.py`, `tests/reference_error.py`). Laya's inference options are available here as values: per-bucket temperatures, binning, abstention, the parallel option layout and tournaments. Two parts are not. Laya's action head is left out, because its own model card reports that it carries no signal; gate on confidence instead. Laya's router, which picks its English or multilingual checkpoint per request, is shown in `examples/route_decisions.py` and is not built in.
