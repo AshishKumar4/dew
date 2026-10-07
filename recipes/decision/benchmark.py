@@ -46,17 +46,31 @@ type Engine = Callable[[Mapping[str, object]], Mapping[str, object]]
 
 
 def http(url: str, *, timeout: float = 600.0) -> Engine:
-    """An engine posting to `url`'s `/v1/systemone`."""
+    """An engine posting to `url`'s `/v1/systemone`.
+
+    A request the server refuses for its capacity (a 422, as a server that
+    answers only whole requests gives) comes back with no answers, which the
+    scorers count as refused and score as an even spread, as Decision Index
+    counts an unanswered request as wrong.
+    """
     import httpx
 
     client = httpx.Client(base_url=url, timeout=timeout)
 
     def answer(request: Mapping[str, object]) -> Mapping[str, object]:
         response = client.post("/v1/systemone", json=dict(request))
+        if response.status_code == 422:
+            return {"answers": {}, "refused": response.json().get("error")}
         response.raise_for_status()
         return response.json()
 
     return answer
+
+
+def _found(answers: Mapping[str, object], name: str, options: list[str]) -> np.ndarray:
+    """An answer's distribution, or an even spread over `options` for a question left unanswered."""
+    return (distribution(answers[name], options) if name in answers
+            else np.full(len(options), 1.0 / len(options)))
 
 
 def distribution(answer: Mapping[str, object], options: list[str]) -> np.ndarray:
@@ -87,17 +101,19 @@ def typed_decisions(engine: Engine) -> dict:
     path = hf_hub_download(TYPED_DECISIONS[0], "all/test-00000-of-00001.parquet", repo_type="dataset",
                            revision=TYPED_DECISIONS[1])
     rows = defaultdict(list)
-    started = time.time()
+    started, refused = time.time(), 0
     for case in pq.read_table(path).to_pylist():
         questions, gold = json.loads(case["questions"]), json.loads(case["gold"])
         answers = engine({"state": json.loads(case["state"]), "questions": questions})["answers"]
+        refused += not answers
         for name, expected in gold.items():
             options = list(expected["probabilities"])
             truth = np.array([float(expected["probabilities"][option]) for option in options])
-            found = distribution(answers[name], options)
+            found = _found(answers, name, options)
             rows[expected["type"]].append((truth, found, options.index(expected["label"])))
     scores = {kind: _scored(entries) for kind, entries in rows.items()}
     scores["all"] = _scored([entry for entries in rows.values() for entry in entries])
+    scores["refused_requests"] = refused
     scores["seconds"] = time.time() - started
     return scores
 
@@ -125,17 +141,19 @@ def open_jev(engine: Engine, split: str, limit: int | None = None) -> dict:
     from sources import OpenJev
 
     rows = defaultdict(list)
-    started = time.time()
+    started, refused = time.time(), 0
     for example in OpenJev().read(split)[:limit]:
         request = {"state": example.state,
                    "questions": {name: question.wire() for name, question in example.questions.items()}}
         answers = engine(request)["answers"]
+        refused += not answers
         for name, question in example.questions.items():
             truth = example.distribution(name)
-            found = distribution(answers[name], list(question.options))
+            found = _found(answers, name, list(question.options))
             rows[question.kind].append((truth, found, int(np.argmax(truth))))
     scores = {kind: _scored(entries) for kind, entries in rows.items()}
     scores["all"] = _scored([entry for entries in rows.values() for entry in entries])
+    scores["refused_requests"] = refused
     scores["seconds"] = time.time() - started
     return scores
 
@@ -169,13 +187,16 @@ def battery(engine: Engine, laya: Path) -> dict:
     scores = {}
     for name, suite in bench_apps.SUITES.items():
         started, rows = time.time(), []
+        refused = 0
         for (state, questions), gold in zip(suite["cases"], suite["gold"], strict=True):
             answers = engine({"state": state, "questions": questions})["answers"]
+            refused += not answers
             (question_name, question), = questions.items()
             noul = question["type"] == "noul"
             options = ["false", "true"] if noul else list(question["criteria"])
-            rows.append((gold, list(distribution(answers[question_name], options))))
-        scores[name] = {**bench_local.metrics(rows), "seconds": time.time() - started}
+            rows.append((gold, list(_found(answers, question_name, options))))
+        scores[name] = {**bench_local.metrics(rows), "refused_requests": refused,
+                        "seconds": time.time() - started}
     return scores
 
 

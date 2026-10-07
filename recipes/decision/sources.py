@@ -136,6 +136,8 @@ class OpenJev(Source):
 
     natural: ClassVar[bool] = False
     weight: float = 0.30
+    calibration: int | None = None
+    """How many of the calibration split's examples to hold out; None, all of them."""
     config: str = "release-v2-redistributable"
     revision: str = "c67699e13d0ae25e35b77165a4b6b079bedc8aba"
     questions: int = 8
@@ -161,7 +163,8 @@ class OpenJev(Source):
     def split(self) -> tuple[list[Example], list[Example]]:
         train = self.examples()
         random.Random(self.seed).shuffle(train)
-        return (train if self.limit is None else train[:self.limit]), self.read("calibration")
+        held = self.read("calibration")[:self.calibration]
+        return (train if self.limit is None else train[:self.limit]), held
 
 
 def _open_jev_question(row: dict) -> tuple[Question, tuple[float, ...]]:
