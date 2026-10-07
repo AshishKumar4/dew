@@ -2018,12 +2018,7 @@ def mode_step_fits(args) -> dict:
 def mode_whole_validation(args) -> dict:
     """Every evaluated objective's validation pass and `Perplexity`'s, on this
     pool, as `tests/test_whole_validation.py` runs them on one process."""
-    import sys
-
     import jax
-
-    # The recipe cases import `recipes`, which sits at the repository root.
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from test_objective_inputs import corpus_windows
     from test_whole_validation import EVALUATED, evaluated, perplexity
 

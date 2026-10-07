@@ -90,7 +90,7 @@ class Train:
     """Train a run: the one a Python file builds, or the one a run's `run.json` records."""
 
     run: Positional[str]
-    """A Python file whose `run` is a `RunConfig` or a function returning one, or a `run.json`."""
+    """A Python file whose `run` is a run config or a function returning one, or a `run.json`."""
     set: Annotated[tuple[str, ...], tyro.conf.UseAppendAction] = ()
     """`path=value`, once a field: the run's field at the dotted path, read as its
     flag reads it (`--set trainer.steps=2000 --set model.num_layers=12`)."""
@@ -98,15 +98,12 @@ class Train:
     """Packages outside Dew whose modules a `run.json` may import."""
 
     def run_command(self) -> int:
-        from dew import registry
         from dew.config import RunConfig
         from dew.config.sweep import assigned
-        from dew.training import prepare_process
 
         path = Path(self.run)
-        trust = self.trust
         if path.suffix == ".json":
-            record = json.loads(path.read_text())
+            run = RunConfig.load(str(path), trust=self.trust)
         else:
             # The file imports as the module its name names, as `python -m`
             # imports one beside it, so a record names what it defines by that
@@ -114,25 +111,13 @@ class Train:
             sys.path.insert(0, str(path.resolve().parent))
             built = importlib.import_module(path.stem).run
             built = built() if callable(built) else built
-            if type(built) is not RunConfig:
-                raise TypeError(f"{self.run}'s run is {built!r}; dew train trains a RunConfig, and a "
-                                "recipe's own config trains through its recipe")
-            record, trust = built.to_dict(), (*trust, path.stem)
-        # What trains is what the record reads back as, so its run.json trains the same run.
-        registry.import_trusted(record, trust)
-        run = assigned(RunConfig.from_dict(record), self.set)
-        objective = run.objective
-        if objective is None or run.lora is not None:
-            raise ValueError("dew train builds the objective the run names around its whole model; "
-                             "name an objective, and train an adapter through a recipe")
-        # The record names the run's directory, so its run.json trains the same run again.
-        name = run.trainer.name or path.stem
-        run = dataclasses.replace(run, trainer=dataclasses.replace(run.trainer, name=name))
-        trainer = run.trainer
-        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
-                        layout=trainer.layout)
-        run.train(objective.build(model=run.model.build()), run.data.load(batch=trainer.batch_size),
-                  name=name)
+            if not isinstance(built, RunConfig):
+                raise TypeError(f"{self.run}'s run is {built!r}, not a run config")
+            if built.trainer.name is None:
+                built = dataclasses.replace(built, trainer=dataclasses.replace(built.trainer, name=path.stem))
+            # What trains is what the record reads back as, so its run.json trains the same run.
+            run = RunConfig.read(built.record(), trust=(*self.trust, path.stem))
+        assigned(run, self.set).run()
         return 0
 
 

@@ -36,7 +36,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
-from dew.artifacts import TextSamples, TokenScores
+from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.coordination import agreed, collective_host
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
@@ -1239,9 +1239,10 @@ class Perplexity:
     reads = TokenScores
     shown = Shown(better="lower")
 
-    def __call__(self, scores: TokenScores, batch) -> tuple[float, float]:
-        weights = np.asarray(scores.weights, dtype=np.float64)
-        losses = np.asarray(scores.losses, dtype=np.float64)
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
+        assert isinstance(artifact, TokenScores), "the trainer hands a metric the artifact it reads"
+        weights = np.asarray(artifact.weights, dtype=np.float64)
+        losses = np.asarray(artifact.losses, dtype=np.float64)
         return float(np.sum(losses * weights)), float(np.sum(weights))
 
     merge = staticmethod(merge_totals)

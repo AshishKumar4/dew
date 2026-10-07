@@ -1011,10 +1011,9 @@ def _recipe_run(tmp_path, image_size, *args):
     TFDS image fixture, with `args` ending in the run's LoRA flags
     (`--lora.rank`, `--lora.modules`) and no subcommand. Returns the parsed
     config and the trained state."""
-    from test_diffusion_corpora import recipe
+    from dew.objectives.diffusion import DiffusionRunConfig
 
-    module = recipe()
-    config = module.DiffusionRecipeConfig.cli([
+    config = DiffusionRunConfig.cli([
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "data:tfds-images", "--data.path", str(IMAGES), "--data.image-size", str(image_size),
         "--data.augmentation", "none", "--data.val-batches", "None", "--objective.solver",
@@ -1024,7 +1023,7 @@ def _recipe_run(tmp_path, image_size, *args):
         "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
         *args])
-    return config, module.main(config)
+    return config, config.run()
 
 
 def _same_files(ours: Path, theirs: Path) -> None:
