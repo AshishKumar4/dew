@@ -585,7 +585,7 @@ def test_convenience_encoder_rebuild_binds_saved_weights_without_source_reads(ki
               "dtype": "bfloat16", "param_dtype": "float32"}
     spec = InputSpec.from_json(
         {"sample": {"key": "image", "shape": [8, 8, 3]},
-         "conditions": {"textcontext": {"encoder": {"name": kind, "fields": fields},
+         "conditions": {"textcontext": {"encoder": {"class": kind, "fields": fields},
                                          "field": "text", "unconditional": ""}}},
         params={"textcontext": saved})
     restored = spec.conditions["textcontext"].encoder

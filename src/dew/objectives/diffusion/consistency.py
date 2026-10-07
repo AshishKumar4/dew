@@ -38,7 +38,7 @@ from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
 from dew.nn.protocols import TimeScaled
 from dew.objectives.base import Aux, EMASpec, ProgramModule, Step, Variables
-from dew.registry import models, objectives, trainings
+from dew.registry import models
 
 from .few_step import SMOOTH_TIME_SCALE
 from .objective import FAKE_SCORE, TEACHER, DiffusionObjective, Distillation, FlowDistillationObjective
@@ -185,7 +185,6 @@ class _Draws(NamedTuple):
     critic_noise: jax.Array
 
 
-@trainings("rcm")
 @dataclasses.dataclass(frozen=True)
 class ConsistencyDistillation(Distillation):
     """rCM distillation of a saved flow run into a few-step student.
@@ -250,7 +249,6 @@ class ConsistencyDistillation(Distillation):
                              "(consistency_weight=0)")
 
 
-@objectives("rcm")
 class ConsistencyDistillationObjective(FlowDistillationObjective):
     """Trains rCM: sCM distillation of a flow teacher, regularized by DMD2.
 

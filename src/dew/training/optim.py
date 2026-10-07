@@ -31,7 +31,6 @@ import numpy as np
 import optax
 
 from dew.nn.sharding import LogicalAxes, declared_axes
-from dew.registry import schedules
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -707,9 +706,9 @@ class ScheduleBase:
     """The base of the schedule records, each of which holds its own fields
     and builds an optax schedule.
 
-    Subclasses are registered under `dew.registry.schedules`, so a run's
-    record names the schedule's kind and holds only the fields that schedule
-    reads. A subclass builds its values in `values`; `schedule` reads them.
+    A run's record names the schedule's class and holds only the fields that
+    schedule reads; `dew.registry.schedules` holds the short aliases. A
+    subclass builds its values in `values`; `schedule` reads them.
     """
 
     every: int = dataclasses.field(default=1, kw_only=True)
@@ -742,7 +741,6 @@ class ScheduleBase:
         raise NotImplementedError
 
 
-@schedules("cosine")
 @dataclasses.dataclass(frozen=True)
 class Cosine(ScheduleBase):
     """A linear warmup from `init` to `peak`, then a cosine decay to `end` at
@@ -774,7 +772,6 @@ class PowerTail:
     end: float = 0.0
 
 
-@schedules("power")
 @dataclasses.dataclass(frozen=True)
 class Power(ScheduleBase):
     """lm-engine's power schedule (`power_schedule`), a power law of the step after a linear warmup.
@@ -801,7 +798,6 @@ class Power(ScheduleBase):
             decay_end=steps if tail.steps is None else tail.steps, end_value=tail.end)
 
 
-@schedules("linear")
 @dataclasses.dataclass(frozen=True)
 class Linear(ScheduleBase):
     """lm-engine's linear schedule (`linear_schedule`), with a warmup, a constant rate and a linear decay.
@@ -823,7 +819,6 @@ class Linear(ScheduleBase):
                                end_value=self.end)
 
 
-@schedules("one_cycle")
 @dataclasses.dataclass(frozen=True)
 class OneCycle(ScheduleBase):
     """torch's `OneCycleLR` with its default two phases and cosine annealing.
@@ -867,7 +862,6 @@ class OneCycle(ScheduleBase):
         return value
 
 
-@schedules("exponential")
 @dataclasses.dataclass(frozen=True)
 class Exponential(ScheduleBase):
     """A geometric decay from `offset + init` to `offset + end` over

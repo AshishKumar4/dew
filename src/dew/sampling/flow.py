@@ -24,7 +24,6 @@ from jax.typing import ArrayLike
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
-from dew.registry import solvers
 
 from .guidance import Guidance, Walk
 
@@ -124,7 +123,6 @@ def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
                               jnp.where(valid, variance, jnp.nan))
 
 
-@solvers("flow_sde")
 @dataclass(frozen=True)
 class FlowSDE:
     """Samples a rectified-flow `Process` with Flow-GRPO's Euler-Maruyama solver.

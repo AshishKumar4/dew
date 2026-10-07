@@ -3,7 +3,7 @@
 A mixer is the module a `DecoderBlock` holds as `self_attn`, with the `(x,
 decode=..., positions=..., segment_ids=...) -> x` signature. Grouped-query
 causal attention is the `attention` kind; MLA, the gated delta rule and the
-rest register beside it as frozen dataclass values under the reference's
+rest sit beside it as frozen dataclass values under the reference's
 field names. A kind builds its `DecoderBlock` factory with `mixer.build(ctx)`
 from a `MixerContext`, the layer geometry the backbone owns (heads, head
 dims, the kind-resolved rotary base, the window, the KV-sharing slot) plus
@@ -20,7 +20,6 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kv_cache import KVCache
 from dew.nn.rope import LongRopeScaling, RopeScaling, YarnScaling
-from dew.registry import mixers as mixers  # the registry every kind module imports from here
 
 
 @dataclasses.dataclass(frozen=True)
@@ -102,12 +101,12 @@ class MixerContext:
 class MixerBase:
     """One mixer kind's value: its fields, and how it builds its mixer.
 
-    Registered under its name (`@mixers("mla")`); a `{"name": ..., "fields": ...}` record
-    builds it through `mixers.from_record`, which refuses unknown kinds and
-    fields. `build` returns the `DecoderBlock` factory called with
-    `name='self_attn'`. The backbone types its field as this base because a
-    union of members that register over time cannot be spelled before they
-    exist; `mixers.union` is the live union for introspection and tyro.
+    A `{"class": ..., "fields": ...}` record, by alias (`"mla"`) or import
+    path, builds it through `mixers.from_record`, which refuses unknown kinds
+    and fields. `build` returns the `DecoderBlock` factory called with
+    `name='self_attn'`. The backbone types its field as this base, so a kind
+    defined outside Dew is taken too; `mixers.union` is the union of the
+    aliased kinds, for introspection and tyro.
     """
 
     keeps_triton_gemm = False

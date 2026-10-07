@@ -353,7 +353,7 @@ def _deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     config.update(
         head_dim=nope + rope,
         mixer={
-            'name': 'mla', 'fields': {
+            'class': 'mla', 'fields': {
             'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
                             else records.integer(hf_config['q_lora_rank'], 'q_lora_rank')),
             'kv_lora_rank': records.integer(kv_rank, 'kv_lora_rank'),
@@ -850,7 +850,7 @@ def _deepseek_v4_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
         'rope_head_dim': rope_width,
         'compressor': None, 'compress_rate': None,
         'index_topk': None, 'index_n_heads': None, 'index_head_dim': None}
-    mixer = {'name': 'deepseek_v4', 'fields': fields}
+    mixer = {'class': 'deepseek_v4', 'fields': fields}
     if groups < 1 or heads * head_dim % groups:
         _refuse(f"o_groups {groups}",
                 f"the grouped output projection splits the {heads * head_dim} "
@@ -912,7 +912,7 @@ def _v4_attention_kinds(hf_config: Mapping[str, object], used: set[str],
             if compressor == 'csa':
                 layer_mixer.update(index)
             record.update(rope_theta=compress_theta, yarn=compress_ramp,
-                          mixer={'name': 'deepseek_v4', 'fields': layer_mixer})
+                          mixer={'class': 'deepseek_v4', 'fields': layer_mixer})
         kinds[kind] = record
     return kinds
 

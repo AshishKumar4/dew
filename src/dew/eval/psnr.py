@@ -7,7 +7,6 @@ to (B*T, H, W, C) and every frame scores independently.
 import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
-from dew.registry import metrics
 
 from .common import ImageMetric, paired
 
@@ -44,7 +43,6 @@ def peak_signal_noise_ratio(
     return scores if per_example else jnp.mean(scores)
 
 
-@metrics("psnr")
 class PSNR(ImageMetric):
     """Measures the mean PSNR in dB between the sampled frames and the batch's; higher is better.
 

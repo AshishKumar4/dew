@@ -52,7 +52,6 @@ from dew.objectives.base import (
     Step,
     Variables,
 )
-from dew.registry import objectives
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -75,7 +74,6 @@ def _schedule(value: Weight) -> optax.Schedule:
     return value if callable(value) else optax.constant_schedule(value)
 
 
-@objectives("distillation")
 class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
     """Mixes the student's own loss with a frozen teacher's soft targets."""
 

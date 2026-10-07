@@ -30,7 +30,7 @@ from dew.objectives.base import (
     part,
 )
 from dew.records import JSON, json_value, record
-from dew.registry import objectives
+from dew.registry import import_path
 from dew.rl import gae
 from dew.rl.advantage import MEAN_EPS, WHITEN_EPS
 from dew.rl.surrogate import clipped_value_loss_terms
@@ -84,7 +84,6 @@ class _Policy:
         return self.task(inputs, max_new_tokens, key=key, sampling=sampling)
 
 
-@objectives("ppo")
 class PPOObjective(Objective[Ratio, Variables]):
     """Trains a policy and a critic together, with both losses over the same token mass.
 
@@ -157,14 +156,14 @@ class PPOObjective(Objective[Ratio, Variables]):
         return _Policy(self.actor.policy(part(variables, "policy")))
 
     def inference_record(self) -> JSON:
-        """Return the actor's decoder record under PPO's registered name, or None when the actor has none.
+        """Return the actor's decoder record under PPO's import path, or None when the actor has none.
 
         A loader rebuilds the decoder from it and takes the policy half of
         the saved tree."""
         actor = self.actor.inference_record()
         if actor is None:
             return None
-        return json_value({**record(actor, 'inference record'), 'objective': objectives.name_of(type(self))},
+        return json_value({**record(actor, 'inference record'), 'objective': import_path(type(self))},
                           'inference record')
 
     def build_task(self, variables: Variables, *,

@@ -62,7 +62,7 @@ def test_an_unknown_field_is_refused():
     with pytest.raises(ValueError, match=r"unknown fields \['epochs'\]"):
         DiffusionRunConfig.from_dict({**record, "epochs": 3})
     with pytest.raises(ValueError, match=r"unknown fields \['warp'\]"):
-        DiffusionRunConfig.from_dict({**record, "preset": {"name": "edm", "fields": {"warp": 1.0}}})
+        DiffusionRunConfig.from_dict({**record, "preset": {"class": "edm", "fields": {"warp": 1.0}}})
     with pytest.raises(ValueError, match=r"unknown fields \['seed'\]"):
         RunConfig.from_dict({"trainer": {"seed": 23}})
 

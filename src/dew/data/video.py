@@ -19,8 +19,6 @@ from collections.abc import Mapping
 import grain.python as pygrain
 import numpy as np
 
-from dew.registry import datasets
-
 from .dataset import (
     CAPTION,
     Batch,
@@ -156,7 +154,6 @@ class VideoDataset(DatasetSpec):
         )
 
 
-@datasets("local_videos")
 @dataclasses.dataclass(frozen=True)
 class LocalVideos(VideoDataset):
     """Reads every video file under `path`, captioned with `caption`.

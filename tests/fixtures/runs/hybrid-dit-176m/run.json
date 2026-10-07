@@ -8,6 +8,7 @@
     "revision": "main"
   },
   "data": {
+    "class": "dew.data.images:ArrayRecordImages",
     "fields": {
       "augmentation": "flip_jitter",
       "augmentation_backend": "host",
@@ -31,8 +32,7 @@
       ],
       "val_batches": 4,
       "val_split": null
-    },
-    "name": "array_record_images"
+    }
   },
   "ema_decay": null,
   "guidance": {
@@ -45,15 +45,15 @@
   },
   "lora": null,
   "mode": {
+    "class": "dew.objectives.diffusion.objective:Denoising",
     "fields": {
       "alignment": null,
       "uncertainty": null
-    },
-    "name": "diffusion"
+    }
   },
   "model": {
     "adapter": null,
-    "architecture": "hybrid_dit",
+    "architecture": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
     "attention_impl": "auto",
     "config": {
       "adaln_silu": false,
@@ -74,8 +74,10 @@
     "param_dtype": null,
     "quantization": null
   },
-  "objective": "diffusion",
+  "objective": "dew.objectives.diffusion.objective:DiffusionObjective",
   "optim": {
+    "b1": null,
+    "b2": null,
     "clip_grads": 0.0,
     "ema_profiles": [],
     "forced_weight_normalization": false,
@@ -88,6 +90,7 @@
     "weight_decay": null
   },
   "preset": {
+    "class": "dew.diffusion.presets:EDM",
     "fields": {
       "P_mean": null,
       "P_std": null,
@@ -97,20 +100,19 @@
       "sigma_data": 0.5,
       "sigma_max": 80.0,
       "sigma_min": 0.002
-    },
-    "name": "edm"
+    }
   },
   "pretrained": null,
   "sampling_steps": 20,
   "solver": {
+    "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
     "fields": {
       "algorithm": "dpmsolver++",
       "euler_at_final": false,
       "lower_order_final": true,
       "order": 2,
       "solver_type": "midpoint"
-    },
-    "name": "dpmsolver_multistep"
+    }
   },
   "text": {
     "checkpoint": "openai/clip-vit-large-patch14",

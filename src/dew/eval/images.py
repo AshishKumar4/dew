@@ -1,7 +1,7 @@
 """Measure CLIP metrics on generated images.
 
 `CLIPScore().score(images, prompts)` scores a set of images against the
-prompts they were sampled from, and the registered metrics take the same
+prompts they were sampled from, and the validation metrics take the same
 cosine over a validation pass.
 
 Both metrics run the vendored towers in `dew.nn.text_encoders`, since
@@ -22,7 +22,6 @@ from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
 from dew.objectives.base import Batch
-from dew.registry import metrics
 
 from .common import ImageMetric, metric_device
 
@@ -82,7 +81,6 @@ def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: s
                                   text["attention_mask"], modelname=modelname)
 
 
-@metrics("clip")
 class CLIPDistance(ImageMetric):
     """Measures the CLIP distance, `mean(1 - cos(image, text))`; lower is better.
 
@@ -97,7 +95,6 @@ class CLIPDistance(ImageMetric):
         super().__init__(name="clip_similarity", measure=measure, better="lower")
 
 
-@metrics("clip_score")
 class CLIPScore(ImageMetric):
     """Measures CLIPScore for an image set against its prompts (`score`), or over a validation pass.
 

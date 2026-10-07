@@ -286,7 +286,7 @@ class TextToImage:
         elif autoencoder_record is not None:
             autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
         solver_record = fields(record['solver'], 'solver')
-        solver = solvers.build(text(solver_record['name'], 'solver name'),
+        solver = solvers.build(text(solver_record['class'], 'solver class'),
                                 fields(solver_record['fields'], 'solver fields'))
         guidance = (None if record['guidance'] is None
                     else from_record(CFG, fields(record['guidance'], 'guidance'), dtypes=False))
@@ -721,7 +721,7 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
 
     roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
     for keyword, condition in record(inputs['conditions'], 'conditions').items():
-        name = text(record(record(condition, keyword)['encoder'], 'encoder')['name'], 'encoder name')
+        name = text(record(record(condition, keyword)['encoder'], 'encoder')['class'], 'encoder class')
         collections = encoders[name].parameter_collections
         roots.extend([("encoders", keyword)] if collections is None else
                      [("encoders", keyword, collection) for collection in collections])

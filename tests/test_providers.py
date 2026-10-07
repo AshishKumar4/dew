@@ -79,7 +79,7 @@ def test_a_hub_name_keeps_its_slashes():
 
 
 # ---------------------------------------------------------------------------
-# A provider is a registered spec
+# A provider is a spec
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("name, options", [
@@ -98,7 +98,7 @@ def test_a_provider_spec_round_trips_through_a_run_config(name, options):
     config = RunConfig(data=spec)
 
     record = config.to_dict()
-    assert record["data"]["name"] == name
+    assert record["data"]["class"] == registry.paths[name]
     assert record["data"]["fields"]["options"]["config"] == options.config
     assert RunConfig.from_dict(json.loads(json.dumps(record))) == config
 

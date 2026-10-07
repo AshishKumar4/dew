@@ -7,15 +7,12 @@ import dataclasses
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
-from dew.registry import datasets
-
 from .dataset import Batch, DataPartition, Dataset, DatasetSpec, Loading, Tokenize, tokenized
 
 if TYPE_CHECKING:
     from .online_loader import Fetch
 
 
-@datasets("online_images")
 @dataclasses.dataclass(frozen=True)
 class OnlineImages(DatasetSpec):
     """Fetches images by url as they are read, as an endless stream.
@@ -82,7 +79,6 @@ class OnlineImages(DatasetSpec):
                        records=len(rows), batch=batch)
 
 
-@datasets("online_videos")
 @dataclasses.dataclass(frozen=True)
 class OnlineVideos(OnlineImages):
     """Fetches video clips by url as they are read, as an endless stream.

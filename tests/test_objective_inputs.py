@@ -191,7 +191,7 @@ def cases(windows):
 
 
 def test_every_registered_objective_has_a_recipe_case(windows):
-    assert set(cases(windows)) == set(objectives), "a registered objective needs a case here"
+    assert set(cases(windows)) == set(objectives), "an aliased objective needs a case here"
 
 
 @pytest.mark.parametrize("name", sorted(objectives))

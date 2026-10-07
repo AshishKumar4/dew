@@ -14,13 +14,12 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.weights import translate_parameters
 from dew.nn.attention import RMSNorm
-from dew.registry import Record, from_record, projectors, towers
+from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5Encoder
 from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _vision_section
 
 
-@towers("gemma3n")
 @dataclasses.dataclass(frozen=True)
 class Gemma3nVision(TowerBase):
     """MobileNet-v5's encoder construction fields, as timm model_args names them."""
@@ -114,7 +113,6 @@ class Gemma3nProjectorModule(nn.Module):
         return jnp.where(mask[..., None], hard, token_embeddings)
 
 
-@projectors("gemma3n")
 @dataclasses.dataclass(frozen=True)
 class Gemma3nProjector(ProjectorBase):
     vision_width: int
@@ -233,11 +231,11 @@ def _gemma3n_vision_record(
 def translate_gemma3n_vision_config(hf_config: Mapping[str, object]) -> Record:
     _, options = _gemma3n_vision_record(hf_config)
     value: Gemma3nVision = from_record(Gemma3nVision, options)
-    return {"name": "gemma3n", "fields": {**dataclasses.asdict(value)}}
+    return {"class": "gemma3n", "fields": {**dataclasses.asdict(value)}}
 
 
 def translate_gemma3n_projector_config(hf_config: Mapping[str, object],
                                        text_width: int) -> Record:
     embedder, _ = _gemma3n_vision_record(hf_config)
     value: Gemma3nProjector = from_record(Gemma3nProjector, {**embedder, "text_width": text_width})
-    return {"name": "gemma3n", "fields": {**dataclasses.asdict(value)}}
+    return {"class": "gemma3n", "fields": {**dataclasses.asdict(value)}}

@@ -15,7 +15,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
-from dew.registry import models
 
 if TYPE_CHECKING:
     from dew.nn.hyper_connections import HyperConnections
@@ -176,7 +175,6 @@ def _place(embeddings: jax.Array, table: jax.Array, indices: jax.Array) -> jax.A
 
 
 
-@models("multimodal_transformer")
 class MultimodalTransformer(nn.Module):
     """Conditions the shared decoder on images and audio, using the ordinary decoder cache and head.
 

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from flax import linen as nn
 
-from dew.nn.mixer_base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import ProjectionGroup, declared_groups
 
@@ -35,7 +35,6 @@ class _MLP(nn.Module):
         return declared_groups(self.feedforward)
 
 
-@mixers("mlp")
 @dataclasses.dataclass(frozen=True)
 class MLPMixer(MixerBase):
     """An MLP in the mixer's slot, with no attention or recurrent state.

@@ -204,7 +204,7 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
         bound = linear.get('gate_lower_bound')
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
         kinds['linear_attention'].update(mixer={
-            'name': 'kimi_delta_attention', 'fields': {
+            'class': 'kimi_delta_attention', 'fields': {
             'linear_num_heads': _record_int(linear, 'num_heads'),
             'linear_head_dim': _record_int(linear, 'head_dim'),
             'linear_conv_kernel_dim': _record_int(linear, 'short_conv_kernel_size'),
@@ -213,7 +213,7 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
     if 'full_attention' in types:
         kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
         kinds['full_attention'].update(mixer={
-            'name': 'mla', 'fields': {
+            'class': 'mla', 'fields': {
             'q_lora_rank': None if text.get('q_lora_rank') is None else _record_int(text, 'q_lora_rank'),
             'kv_lora_rank': _record_int(text, 'kv_lora_rank'),
             'qk_nope_head_dim': _record_int(text, 'qk_nope_head_dim'),

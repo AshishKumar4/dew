@@ -8,6 +8,7 @@ from pathlib import Path
 
 from dew.data import ArrayRecordImages, OnlineImages, TFDSImages
 from dew.objectives.diffusion import DiffusionRunConfig
+from dew.registry import import_path
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -39,7 +40,7 @@ def test_a_corpus_is_a_subcommand_and_its_record_reads_back_without_the_recipe()
         record = json.loads(json.dumps(config.to_dict()))
 
         assert type(config.data) is kind
-        assert record["data"]["name"] in {"array_record_images", "online_images", "tfds_images"}
+        assert record["data"]["class"] == import_path(kind)
         assert DiffusionRunConfig.from_dict(record).data == config.data
         assert type(config).from_dict(record) == config
 

@@ -21,6 +21,7 @@ import dataclasses
 
 from dew.config import DataSpec, ModelConfig, OptimConfig, RunConfig
 from dew.data import TokenWindows
+from dew.registry import objectives
 from dew.sampling.text import Sampling
 
 from .objective import IndexerTraining
@@ -90,10 +91,12 @@ class LMRunConfig(RunConfig):
     """The training canvas width; None uses the checkpoint's canvas length."""
 
     def __post_init__(self) -> None:
-        if self.objective not in ("lm", "masked_diffusion", "block_diffusion"):
+        super().__post_init__()
+        if self.objective not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
+                                                                        "block_diffusion")):
             raise ValueError(
                 f"--objective {self.objective!r} is not lm, masked_diffusion or block_diffusion")
-        if self.objective == "block_diffusion":
+        if self.objective == objectives.paths["block_diffusion"]:
             if self.pretrained is None:
                 raise ValueError("block_diffusion fine-tuning requires --pretrained")
             if (self.balance_rate is not None or self.mtp_weight is not None

@@ -795,20 +795,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         return None
 
     def inference_record(self) -> JSON:
-        """Return the registered model and task settings that let a saved step be rebuilt.
+        """Return the model and task settings that let a saved step be rebuilt.
 
-        It records the objective's registered name, its `model`'s record, and
-        `task_record`'s settings. An objective that is not registered, or
-        declares no task settings, returns None; a custom research method can
-        still restore its raw state.
+        It records the objective's import path, its `model`'s record, and
+        `task_record`'s settings. An objective that declares no task settings
+        returns None; a custom research method can still restore its raw state.
         """
         from dew.config import ModelConfig
-        from dew.registry import objectives, to_record
+        from dew.registry import import_path, to_record
 
         settings = self.task_record()
-        if settings is None or not any(member is type(self) for member in objectives.values()):
+        if settings is None:
             return None
-        return {'objective': objectives.name_of(type(self)),
+        return {'objective': import_path(type(self)),
                 'model': to_record(ModelConfig.from_model(self.model), ModelConfig), **settings}
 
     def build_task(self, variables: Variables, *,

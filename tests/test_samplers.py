@@ -1344,11 +1344,11 @@ def test_public_solver_imports_and_registry_records_resolve_the_same_classes():
     }
     for name, member in names.items():
         assert solvers[name] is member
-        assert solvers.name_of(member) == name
+        assert solvers.alias_of(member) == name
         if name not in ("flow_sde", "unmask"):
             assert getattr(exported, member.__name__) is member
             assert getattr(dew.sampling, member.__name__) is member
         value = solvers.build(name)
         record = json.loads(json.dumps(to_record(value, Solver)))
-        assert record["name"] == name
+        assert record["class"] == solvers.paths[name]
         assert solvers.from_record(record) == value

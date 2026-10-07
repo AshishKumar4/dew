@@ -42,7 +42,7 @@ from dew.objectives.base import (
     joined,
     part,
 )
-from dew.registry import objectives
+from dew.registry import import_path
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -200,7 +200,6 @@ def _laid_rows(examples: Iterable[Example | Mapping[str, object]], *,
     return [(example, (name,)) for example in held for name in example.labels()]
 
 
-@objectives("decision")
 class DecisionObjective(Objective[Ratio]):
     """Trains a decision model on questions with known answers.
 
@@ -390,7 +389,7 @@ class DecisionObjective(Objective[Ratio]):
         from dew.registry import to_record
 
         return {
-            "objective": objectives.name_of(type(self)),
+            "objective": import_path(type(self)),
             "model": to_record(ModelConfig.from_model(self.model.backbone), ModelConfig),
             "head": self.model.head.record(),
             "layout": {"name": type(self.layout).__name__,

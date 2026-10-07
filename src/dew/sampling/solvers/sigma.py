@@ -9,7 +9,6 @@ import jax.numpy as jnp
 from jax import lax
 
 from dew.diffusion.schedules import expand
-from dew.registry import solvers
 
 from .common import _push, _sigma_integrator
 
@@ -36,7 +35,6 @@ def _ancestral(sigma_t, sigma_s):
     sigma_up = (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5
     return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
-@solvers("euler")
 @dataclass(frozen=True)
 class Euler:
     """The DDIM update written as an Euler step of the probability flow ODE.
@@ -50,7 +48,6 @@ class Euler:
         return stepped, state
 
 
-@solvers("euler_ancestral")
 @dataclass(frozen=True)
 class EulerAncestral:
     """Euler with k-diffusion's ancestral noise injection (`get_ancestral_step`, eta 1).
@@ -73,7 +70,6 @@ class EulerAncestral:
         return x + dx * (sigma_down - sigma_t) + dW, state
 
 
-@solvers("heun")
 @dataclass(frozen=True)
 class Heun:
     """Heun's second-order method: an Euler step, the derivative re-evaluated at its end, and their average.
@@ -143,7 +139,6 @@ class Heun:
         return jnp.where(sigma_s > 0, x + 0.5 * (dx_0 + dx_1) * dt, x_euler), state
 
 
-@solvers("rk4")
 @dataclass(frozen=True)
 class RK4:
     """Classical fourth-order Runge-Kutta over dx/dsigma = eps on a variance-exploding schedule.
@@ -171,7 +166,6 @@ class RK4:
         return x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6, state
 
 
-@solvers("kdpm2")
 @dataclass(frozen=True)
 class KDPM2:
     """k-diffusion's DPM-Solver-2 (`sample_dpm_2`), the update of Diffusers
@@ -217,7 +211,6 @@ class KDPM2:
 
         return lax.cond(jnp.all(sigma_s == 0), lambda _: denoised, midpoint, None), state
 
-@solvers("multistep_dpm")
 @dataclass(frozen=True)
 class MultiStepDPM:
     """A third order multistep integrator of dx/dsigma = eps on a variance
@@ -269,7 +262,6 @@ def _lagrange_integral(nodes: list, j: int, a, b):
     return integral / scale
 
 
-@solvers("lms")
 @dataclass(frozen=True)
 class LMS:
     """Linear multistep over dx/dsigma = (x - x_0) / sigma, k-diffusion's

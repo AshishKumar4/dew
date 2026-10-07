@@ -165,7 +165,7 @@ def test_audio_weight_loading_refuses_unknown_or_missing_computation(audio):
         audio_config({**record, "extra_computational_field": True})
     rebuilt = audio_config({**dataclasses.asdict(config), "model_type": record["model_type"]})
     assert rebuilt == config
-    assert towers.from_record({"name": record["model_type"], "fields": dataclasses.asdict(config)}) == config
+    assert towers.from_record({"class": record["model_type"], "fields": dataclasses.asdict(config)}) == config
 
 
 def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):

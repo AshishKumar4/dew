@@ -15,7 +15,7 @@ from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
 from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
 from dew.objectives.jepa import JepaObjective, KnnProbe, LinearProbe, MultiBlockMask
-from dew.registry import datasets
+from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
 
 DEFAULT_ENCODER_CONFIG = {"precision": "default"}
@@ -54,6 +54,7 @@ class JepaRunConfig(RunConfig):
     knn_k: int = 20
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.probe_classes is None and self.trainer.eval_every is not None:
             raise ValueError(
                 "a JEPA validation pass scores the frozen-encoder probes; set probe_classes, "
@@ -68,7 +69,7 @@ def sample_field(config: JepaRunConfig) -> Field:
     if isinstance(spec, VideoDataset):
         return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
     raise ValueError(
-        f"the JEPA recipe trains on image or video datasets, not {datasets.name_of(type(spec))}")
+        f"the JEPA recipe trains on image or video datasets, not {type(spec).__name__}")
 
 
 def build_encoder(config: JepaRunConfig):
@@ -96,7 +97,7 @@ def run_summary(config: JepaRunConfig, encoder_fields: Mapping[str, object]) -> 
     return {
         **encoder_fields,
         "architecture": config.model.architecture,
-        "dataset": datasets.name_of(type(config.data)),
+        "dataset": datasets.alias_of(type(config.data)),
         "image_size": sample_field(config).shape[-2],
         "batch_size": config.trainer.batch_size,
         "learning_rate": config.optim.learning_rate,
@@ -113,7 +114,7 @@ def main(config: JepaRunConfig) -> TrainState:
 
     sample = sample_field(config)
     is_video = sample.key == "video"
-    if is_video != (config.model.architecture == 'jepa_video_encoder'):
+    if is_video != (models[config.model.architecture] is models['jepa_video_encoder']):
         raise ValueError(
             "a video dataset and --model.architecture jepa_video_encoder go together")
 
@@ -147,7 +148,7 @@ def main(config: JepaRunConfig) -> TrainState:
         probes = (LinearProbe(config.probe_classes), KnnProbe(config.probe_classes, k=config.knn_k))
 
     name = config.trainer.name or (
-        f"jepa-{datasets.name_of(type(config.data))}/res-{sample.shape[-2]}/"
+        f"jepa-{datasets.alias_of(type(config.data))}/res-{sample.shape[-2]}/"
         f"patch-{encoder.patch_size}/mixer-{encoder.ssm_attention_ratio}/"
         f"emb-{encoder.emb_features}/lr-{config.optim.learning_rate}/date-{run_timestamp()}")
     return config.train(
@@ -156,7 +157,7 @@ def main(config: JepaRunConfig) -> TrainState:
                  "mask": {"grid": grid, "block_shapes": mask.block_shapes,
                           "block_area": mask.block_area, "num_context": mask.num_context},
                  "arguments": run_summary(config, encoder_fields),
-                 "dataset": {"name": datasets.name_of(type(config.data)),
+                 "dataset": {"name": datasets.alias_of(type(config.data)),
                              "records": data.records}})
 
 

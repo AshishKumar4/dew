@@ -4,8 +4,6 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 
-from dew.registry import models
-
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
@@ -23,7 +21,6 @@ def scatter_tokens(held: jax.Array, kept: jax.Array, tokens: jax.Array) -> jax.A
     return held.at[jnp.arange(held.shape[0])[:, None], kept].set(tokens)
 
 
-@models("simple_dit")
 class SimpleDiT(_DiTStackOptions):
     """The standard DiT: a plain stack of adaLN-Zero attention blocks.
 

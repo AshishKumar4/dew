@@ -27,10 +27,10 @@ from recording import RecordingTracker
 from dew.interop.hf_decoders import _yarn_record, translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.mixers import mixers
 from dew.nn.mla import MLAMixer, MultiHeadLatentAttention
 from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq, yarn_query_scale, yarn_rope_freqs
 from dew.objectives.lm import LMObjective
+from dew.registry import mixers
 from dew.training import Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mla"
@@ -276,7 +276,7 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
 def mla_record(settings: dict) -> dict:
     """The fixture's reference config as the `mla` kind's record."""
     return {
-        "name": "mla", "fields": {
+        "class": "mla", "fields": {
         "q_lora_rank": settings["q_lora_rank"],
         "kv_lora_rank": settings["kv_lora_rank"],
         "qk_nope_head_dim": settings["qk_nope_head_dim"],
@@ -307,7 +307,7 @@ def mla_model(settings: dict, **overrides) -> CausalTransformer:
 
 
 def test_the_mla_record_and_value_agree():
-    """`mixer={"name": "mla", "fields": {...}}` from a config is the dataclass from code,
+    """`mixer={"class": "mla", "fields": {...}}` from a config is the dataclass from code,
     yarn record included."""
     settings = CONFIG["v32"]
     built = mla_model(settings).mixer
@@ -356,7 +356,7 @@ def test_the_mla_kind_refuses_the_dials_it_cannot_honour():
         mla_model(settings, v_norm=True, attention_scale=0.25).init(
             jax.random.key(0), tokens)
     record = mla_record(settings)
-    mismatched = {"name": record["name"], "fields": {
+    mismatched = {"class": record["class"], "fields": {
         **record["fields"], "yarn": dict(record["fields"]["yarn"], rope_theta=5000.0)}}
     with pytest.raises(ValueError, match=r"rope_theta .* disagree"):
         mla_model(settings, mixer=mismatched).init(jax.random.key(0), tokens)
@@ -378,7 +378,7 @@ def deepseek_stack() -> CausalTransformer:
     return CausalTransformer(
         vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
         head_dim=16, mlp_features=64, max_seq_len=16,
-        mixer={"name": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
+        mixer={"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
                "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16}},
         mixture={"experts": 8, "top_k": 2, "layers": (1,),

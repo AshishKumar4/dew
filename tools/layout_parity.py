@@ -226,7 +226,7 @@ def zoo() -> dict[str, Any]:
               "kinds": {"sliding_attention": {"window": 8, "rope_theta": 10000.0},
                         "full_attention": {"head_dim": 32, "num_kv_heads": 1}},
               "mixture": {**released["mixture"], "experts": 8, "top_k": 2, "expert_features": 32}}
-    mamba = {"mixer": {"name": "mamba2", "fields": {"num_heads": 4, "head_dim": 16, "state_size": 8,
+    mamba = {"mixer": {"class": "mamba2", "fields": {"num_heads": 4, "head_dim": 16, "state_size": 8,
                        "n_groups": 1, "chunk_size": 8}}}
     hybrid = {**dense, "layer_types": ("mamba", "attention") * 2,
               "kinds": {"mamba": mamba, "attention": {}}}
@@ -234,7 +234,7 @@ def zoo() -> dict[str, Any]:
     nemotron_h.update(vocab_size=512, num_layers=20, max_seq_len=33,
                      layer_types=tuple(nemotron_h["layer_types"]) * 4)
     window = {**dense, "layer_types": ("sliding",) * 4, "kinds": {"sliding": {"window": 12}}}
-    mla = {**dense, "mixer": {"name": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
+    mla = {**dense, "mixer": {"class": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
                               "qk_rope_head_dim": 8, "v_head_dim": 8}}}
     mamba2 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": mamba}}
     rigel = {**dense, "layer_types": ("mamba",) * 3 + ("sliding",),
@@ -292,9 +292,9 @@ def zoo() -> dict[str, Any]:
                      batch_size=8, image_size=16, fsdp_min_param_size=256),
         "multimodal": Case("multimodal_transformer", dense, media={
             "family": "gemma3", "image_token_id": 511, "images": 1, "pixels": [3, 16, 16],
-            "tower": {"name": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
+            "tower": {"class": "siglip", "fields": {"hidden_size": 32, "intermediate_size": 64, "num_layers": 1,
                       "num_heads": 4, "image_size": 16, "patch_size": 8}},
-            "projector": {"name": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
+            "projector": {"class": "gemma", "fields": {"text_width": 64, "patches_per_side": 2,
                           "tokens_per_side": 2}}}, **lm),
     }
 

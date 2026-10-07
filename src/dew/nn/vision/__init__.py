@@ -20,7 +20,7 @@ bias-free map, summed 2D position tables, RMS-normed blocks with a 2D rotary
 and gated feed-forwards, and a position pooler with standardization. The
 Qwen 3.5 trunk is a NaViT-style patchify with the still frame repeated along
 time, interpolated learned positions with a 2D rotary, full-attention blocks
-and the merger MLP as its projector. Each tower's projector is a registered
+and the merger MLP as its projector. Each tower's projector is a
 value beside it: Gemma 3's averages each patch block, norms and maps to the
 decoder width, Llama 4's maps the shuffled output to the decoder width,
 Gemma 4's norms without a scale and maps, and Qwen 3.5's is the merger.
