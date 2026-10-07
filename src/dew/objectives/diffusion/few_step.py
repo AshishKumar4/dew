@@ -126,7 +126,6 @@ default 16 against 0.002 was MeanFlow 23% against 99%, an sCM student 11%
 against 98.6%."""
 
 
-@trainings("mean_flow")
 def _interval_velocity(model: nn.Module, process: Process, method: str, preset: str) -> None:
     """Refuse what an interval method cannot train: a process other than the
     unshifted linear path's interval velocity, or a model that embeds no
@@ -142,6 +141,7 @@ def _interval_velocity(model: nn.Module, process: Process, method: str, preset: 
                         f"as simple_dit(interval=True)")
 
 
+@trainings("mean_flow")
 @dataclasses.dataclass(frozen=True)
 class MeanFlowTraining(Training):
     """MeanFlow training under the `MeanFlow` preset, for a model that samples in one step.

@@ -38,12 +38,13 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 from flax.typing import PrecisionLike
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import at_least_fp32, head_product, rounded_operand, rounded_to, rounds_to_bf16
-from dew.nn.protocols import AffineHead, HiddenStates, LogitsFromHidden
+from dew.nn.protocols import AffineHead, HiddenStates, LogitsFromHidden, OutputTable
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -109,7 +110,13 @@ def _biased_logits(logits, bias):
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
 
 
-def reads_states(model) -> bool:
+def head_table(model: nn.Module, variables) -> OutputTable | None:
+    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
+    or None for a model whose head no matrix alone is, or that names none."""
+    return model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+
+
+def reads_states(model: nn.Module) -> bool:
     """Whether `model` scores its final states (`HiddenStates`) through a head
     that takes them: a matrix (`AffineHead`) or its exact head
     (`LogitsFromHidden`). One that does not gives its logits only from its
@@ -117,12 +124,12 @@ def reads_states(model) -> bool:
     return isinstance(model, HiddenStates) and isinstance(model, AffineHead | LogitsFromHidden)
 
 
-def model_logits(model, variables, hidden) -> jax.Array:
+def model_logits(model: nn.Module, variables, hidden) -> jax.Array:
     """`model`'s logits of its final states `hidden` over `variables`: the
     matrix `AffineHead.output_table` gives, contracted as the chunked head
     contracts it (`head_logits`), or the model's exact head
     (`LogitsFromHidden`) where no matrix alone is the head."""
-    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    table = head_table(model, variables)
     if table is None:
         return model.apply(variables, hidden, method="logits_from_hidden")
     return head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
@@ -628,7 +635,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                          predict=predict)
 
 
-def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
+def head_cross_entropy(model: nn.Module, variables, hidden, targets, chunks: int, *,
                        tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
                        temperature: float = 1.0, excluded: int | None = None):
     """`chunked_cross_entropy` of `hidden` against `model`'s head over `variables`.
@@ -640,7 +647,7 @@ def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
     the fp32 `[..., vocab]` logits for the backward pass, a vocabulary-sized
     row per token, which the tiled head never does.
     """
-    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    table = head_table(model, variables)
     if table is not None:
         return chunked_cross_entropy(
             hidden, table.matrix, targets, chunks, softcap=table.softcap, precision=table.precision,
