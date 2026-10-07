@@ -183,7 +183,8 @@ class LMRunConfig(RunConfig):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
         name, revision = split_revision(self.pretrained)
-        loaded = Pretrained.load(name, dtype=resolve_dtype(self.model.fields.get("dtype")),
+        dtype = resolve_dtype(self.model.fields.get("dtype"))
+        loaded = Pretrained.load(name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
                                  max_seq_len=reach, revision=revision)
         if not same_vocabulary(written, loaded, name):
