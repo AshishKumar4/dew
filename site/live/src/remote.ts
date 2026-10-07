@@ -102,7 +102,7 @@ export class RemoteJob extends DurableObject<Env> {
 			try {
 				await send({ type: 'job', id, commit: plan.commit });
 				const checkout = await (await container.exec(['sh', '-c',
-					'hostname localhost && git fetch --depth=1 origin "$1" && git reset --hard "$1" && /opt/bootstrap/bin/uv pip install --python .venv/bin/python --no-deps -e .',
+					'hostname localhost && mkdir -p /dev/shm && mount -t tmpfs -o size=512m,mode=1777 tmpfs /dev/shm && git fetch --depth=1 origin "$1" && git reset --hard "$1" && /opt/bootstrap/bin/uv pip install --python .venv/bin/python --no-deps -e .',
 					'checkout', plan.commit], { cwd: '/workspace' })).output();
 				if (checkout.exitCode !== 0) throw new Error(new TextDecoder().decode(checkout.stderr));
 				const process = await container.exec(['timeout', '-k', '10', '2300', ...command], {

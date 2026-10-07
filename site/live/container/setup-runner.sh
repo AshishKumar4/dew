@@ -17,6 +17,6 @@ git -C /workspace checkout --detach "$commit"
 cd /workspace
 /opt/bootstrap/bin/uv venv --python "$python" .venv
 /opt/bootstrap/bin/uv pip install --python .venv/bin/python torch torchvision --index-url https://download.pytorch.org/whl/cpu
-/opt/bootstrap/bin/uv pip install --python .venv/bin/python -e '.[test,av,tfds,metrics,plots,inference-clients,vision,quantization,profile,torchax,gguf]' tokamax -c constraints.txt
+/opt/bootstrap/bin/uv pip install --python .venv/bin/python -e '.[test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf]' tokamax -c constraints.txt
 .venv/bin/python -c 'import dew, jax, pytest; print("CI environment ready", jax.__version__)'
 rm -rf /var/lib/apt/lists/* /root/.cache/uv /root/.cache/pip
