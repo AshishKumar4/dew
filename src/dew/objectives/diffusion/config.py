@@ -25,7 +25,18 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import FROZEN, Variables, merge
-from dew.registry import DtypeName, datasets, encoders, metrics, models, presets, solvers, trainings
+from dew.registry import (
+    DtypeName,
+    datasets,
+    dtype_name,
+    encoders,
+    metrics,
+    models,
+    presets,
+    resolve_dtype,
+    solvers,
+    trainings,
+)
 from dew.sampling.guidance import CFG
 from dew.sampling.solvers import EulerAncestral
 
@@ -516,11 +527,11 @@ class DiffusionRunConfig(RunConfig):
         return variables["autoencoder"]
 
     @property
-    def _compute(self) -> str | None:
+    def _compute(self) -> DtypeName | None:
         """The compute dtype the model's record names, which the text and audio
         encoders and a pretrained pipeline compute in too."""
         held = self.model.fields.get("dtype")
-        return None if held is None else str(held)
+        return None if held is None else dtype_name(resolve_dtype(str(held)))
 
     def _source(self, variables: Variables | None):
         """The `pretrained` pipeline at the data's resolution: its own

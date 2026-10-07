@@ -188,7 +188,7 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mappi
         elif field.name == "precision":
             typed = Literal["default", "high", "highest"] | None
             declared = None if declared is None else str(declared).lower().removeprefix("precision.")
-        elif _scalar(annotation):
+        elif annotation is not None and _scalar(annotation):
             typed = annotation if declared is not None else annotation | None
         else:
             typed = Annotated[JSON, _JSON_FLAG]
@@ -692,6 +692,8 @@ class RunConfig:
                 given.insert(flags[0], f"{field}:{subcommand}")
         factory = cls.__dataclass_fields__["model"].default_factory
         start = default.model if default is not None else factory() if callable(factory) else ModelConfig()
+        if not isinstance(start, ModelConfig):
+            raise TypeError(f"{cls.__name__}.model defaults to {start!r}, not a ModelConfig")
         chosen = next((index for index, arg in enumerate(given)
                        if arg == "--model" or arg.startswith("--model=")), None)
         if chosen is not None:
@@ -713,6 +715,8 @@ class RunConfig:
             **{field.name: getattr(default, field.name) for field in dataclasses.fields(cls)
                if field.name != "model"}, model=flags())
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
+        if parsed is None:
+            raise ValueError("the command line built no run config")
         chosen_fields = {key: value for key, value in dataclasses.asdict(parsed.model).items()
                          if key in start.fields or value != declared[key]}
         return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
