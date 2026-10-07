@@ -22,8 +22,9 @@ def ci(tmp_path, monkeypatch):
 
 def test_the_plan_packs_every_file_once_for_each_python(ci, tmp_path):
     """Files are packed near the target by armada's medians, else the
-    recorded durations, else the mean; a file heavier than the target splits
-    into groups of itself; every row is named once, test_gen_api never."""
+    recorded durations; a file nothing has timed runs alone; a file heavier
+    than the target splits into groups of itself; every row is named once,
+    test_gen_api never."""
     for name in ("test_heavy", "test_light", "test_new", "test_measured", "test_gen_api"):
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
