@@ -66,9 +66,9 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         # Ettin's encoders state that they attend both ways, which
         # ModernBertAttention does whatever they say (is_causal = False).
         'causal_mask', 'is_causal'))
-    for flag in ('causal_mask', 'is_causal'):
-        if hf.get(flag):
-            _refuse(flag, "ModernBERT attends both ways; a causal checkpoint is a different model")
+    for causal in ('causal_mask', 'is_causal'):
+        if hf.get(causal):
+            _refuse(causal, "ModernBERT attends both ways; a causal checkpoint is a different model")
     for dropout in ('attention_dropout', 'mlp_dropout'):
         if records.number(hf.get(dropout, 0.0), dropout):
             _refuse(dropout, "ModernBERT drops inside its attention and MLP where the blocks here do not")
