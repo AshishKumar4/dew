@@ -7,7 +7,7 @@ import numpy as np
 import optax
 import pytest
 
-from dew.objectives.base import Aux, EMASpec, Objective, Step, everything, merge, select, under
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, everything, merge, select, under
 
 
 def tree():
@@ -222,3 +222,40 @@ def test_the_held_variables_hook_is_what_the_initializer_binds():
     assert tiny.held_variables() is None
     holding = lm_objective(variables=weights)
     assert held_bytes(holding.initializer) == held_bytes(holding.held_variables())
+
+
+class SuppliedRule(Objective):
+    """A squared error whose loss states its own gradient rule: the sum of the
+    batch's rows for the total, whatever the error, as e-prop or a
+    forward-gradient estimate states one the loss's derivative is not."""
+
+    def init(self, key, variables=None):
+        return {"params": {"w": jnp.zeros((3,))}}
+
+    def loss(self, variables, batch, step):
+        params = variables["params"]
+        stats = self.row_mean(jnp.square(batch["x"] @ params["w"] - 1.0), batch)
+        return self.with_gradients(stats, Ratio({"w": batch["x"].sum(0)}, None), params)
+
+
+def test_a_supplied_gradient_is_what_the_trainer_steps_with():
+    """The statistics keep their value, the derivative of the reduced loss
+    is the supplied rule over the mass, and two microbatches of a window
+    pool their rules by mass, as the trainer pools `jax.grad`'s."""
+    from affine_run import Data
+
+    from dew.training import Layout, Trainer
+
+    rows = [np.random.default_rng(seed).normal(size=(4, 3)).astype(np.float32) for seed in (0, 1)]
+    objective = SuppliedRule()
+    params, step = objective.init(None), Step(jnp.asarray(0), jax.random.key(0), None)
+    value, gradient = jax.value_and_grad(
+        lambda p: objective.scalar_loss({"params": p}, {"x": rows[0]}, step)[0])(params["params"])
+    np.testing.assert_allclose(value, np.mean(np.square(rows[0] @ np.zeros(3) - 1.0)))
+    np.testing.assert_allclose(gradient["w"], rows[0].sum(0) / 4, rtol=1e-6)
+
+    trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                      layout=Layout(min_shard=1, tolerance=1.0))
+    stepped = trainer.fit(Data(lambda: iter([{"x": x} for x in rows]), batch=4), steps=2).variables
+    expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 8
+    np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
