@@ -60,9 +60,9 @@ from pathlib import Path
 import httpx
 import jax
 import jax.numpy as jnp
-import optax
 import tyro
 
+from dew.config import OptimConfig
 from dew.data import HFTokenizer, Loading
 from dew.data.prompts import Prompts
 from dew.inference import (
@@ -587,8 +587,7 @@ def main(config: Config) -> dict:
                                tasks=prompt_tasks, groups=config.groups,
                                max_lag=config.max_lag, ahead=config.max_lag, truncation="score",
                                log=history.append)
-    optimizer = optax.chain(optax.clip_by_global_norm(1.0),
-                            optax.adamw(config.learning_rate, b2=0.99, weight_decay=0.0))
+    optimizer = OptimConfig(learning_rate=config.learning_rate, b2=0.99, weight_decay=0.0, clip_grads=1.0)
     trainer = Trainer(objective, optimizer, key=jax.random.key(config.seed), rollout=rollout,
                       accumulation=config.accumulation)
     began = time.perf_counter()

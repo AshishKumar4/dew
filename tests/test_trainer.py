@@ -27,6 +27,7 @@ import numpy as np
 import optax
 import orbax.checkpoint as ocp
 import pytest
+from affine_run import BATCH, FEATURES, Counting, Data, Features, Regression, Spread, raw_leaf, val_batches
 from flax import linen as nn
 from flax.errors import ScopeParamShapeError
 from recording import RecordingTracker
@@ -36,6 +37,7 @@ from steady_state import steady_state
 from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
+from dew.config import OptimConfig
 from dew.data import DataPartition
 from dew.objectives.base import Aux, EMASpec, Objective, freeze, merge, select, under
 from dew.training import (
@@ -48,69 +50,8 @@ from dew.training import (
     ema_update,
     trainer as trainer_module,
 )
+from dew.training.optim import Cosine
 from dew.training.transaction import write_back
-
-BATCH = 8
-FEATURES = 3
-
-
-class Affine(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(2)(x)
-
-
-class Regression(Objective):
-    """Squared error of an affine map against `2 * x[:, :2]`."""
-
-    def __init__(self, ema_decay=0.5):
-        self.model = Affine()
-        self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
-
-    def init(self, key, variables=None):
-        return self.model.init(key, jnp.zeros((1, FEATURES)))
-
-    def loss(self, variables, batch, step):
-        prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
-
-
-class Counting:
-    """An endless, checkpointable stream whose batches say which they are."""
-
-    def __init__(self, batch=BATCH):
-        self.index = 0
-        self.batch = batch
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        rng = np.random.default_rng(self.index)
-        self.index += 1
-        x = rng.normal(size=(self.batch, FEATURES)).astype(np.float32)
-        return {"x": x, "y": 2 * x[:, :2], "index": np.full((self.batch,), self.index - 1)}
-
-    def get_state(self):
-        return json.dumps({"index": self.index}).encode()
-
-    def set_state(self, state):
-        self.index = json.loads(state)["index"]
-
-
-class Data:
-    """The `Dataset` contract the trainer reads: train, val and batch."""
-
-    def __init__(self, train=Counting, val=None, batch=BATCH):
-        self._train, self._val = train, val
-        self.batch = batch
-
-    def train(self, partition):
-        return self._train()
-
-    @property
-    def val(self):
-        return None if self._val is None else lambda partition: self._val()
 
 
 def endless():
@@ -118,14 +59,6 @@ def endless():
     source = Counting()
     while True:
         yield next(source)
-
-
-def val_batches(count=3):
-    def stream():
-        source = Counting()
-        for _ in range(count):
-            yield next(source)
-    return stream
 
 
 def make_trainer(tmp_path=None, objective=None, optimizer=None, keep=3, **kwargs):
@@ -184,6 +117,18 @@ def test_train_state_exposes_the_whole_variables_tree():
 def test_fit_trains_to_the_step_it_was_asked_for():
     state = make_trainer().fit(Data(endless), steps=4, log_every=2)
     assert int(state.step) == 4
+
+
+def test_an_optim_config_is_built_over_the_updates_fit_makes():
+    """Four steps of two microbatches are two updates: the run is the config built over two, bit
+    for bit, not over four. Before fit there is no length to build it over."""
+    config = OptimConfig(schedule=Cosine(peak=0.1, warmup_steps=0), weight_decay=0.1, b2=0.99)
+    with pytest.raises(ValueError, match="fit"):
+        make_trainer(optimizer=config).initial_state()
+    built, over_two, over_four = (make_trainer(optimizer=given, accumulation=2).fit(Data(), steps=4).variables
+                                  for given in (config, config.build(2), config.build(4)))
+    jax.tree.map(np.testing.assert_array_equal, built, over_two)
+    assert not all(jax.tree.leaves(jax.tree.map(np.array_equal, built, over_four)))
 
 
 @pytest.mark.parametrize("variant", ["ema", "accumulation", "schedule", "dynamic_scale", "checkpoints"])
@@ -487,11 +432,6 @@ def held_lm_trainer(**settings):
                    layout=Layout(min_shard=1, tolerance=1.0), **settings), objective, weights
 
 
-def raw_leaf(leaf):
-    return jax.random.key_data(leaf) if jnp.issubdtype(
-        leaf.dtype, jax.dtypes.prng_key) else leaf
-
-
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
     from dew.data import Loading, TokenWindows
     from dew.data.dataset import Forwarding
@@ -574,7 +514,7 @@ def ladder_lm_trainer(directory, fits):
     trainer = make_trainer(directory, objective=objective, optimizer=optax.adam(1e-2))
 
     def headroom(executable, devices, held=0):
-        rung = (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat))
+        rung = (objective.head_tile is not None, trainer_module.recompute_record(objective))
         return 0 if fits(rung) else -1
     return trainer, objective, headroom
 
@@ -609,7 +549,7 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: True)
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     actual = resumed.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
-    assert (objective.head_tile is not None, trainer_module.remat_record(objective.model.remat)) == (
+    assert (objective.head_tile is not None, trainer_module.recompute_record(objective)) == (
         True, 'minimal')
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
@@ -626,7 +566,7 @@ def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(t
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
     monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
     resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
-    assert trainer_module.remat_record(objective.model.remat) == 'full'
+    assert trainer_module.recompute_record(objective) == 'full'
     assert "the rung its checkpoint trained on" in caplog.text
 
 
@@ -1255,35 +1195,6 @@ def test_global_positions_that_disagree_between_processes_are_refused(tmp_path):
 # --------------------------------------------------------------------------
 # Validation
 # --------------------------------------------------------------------------
-
-class Features(Regression):
-    """An objective whose evaluation returns its predictions as representations."""
-
-    artifact = Representations
-
-    def evaluate(self, params, batch, step):
-        params = params if step.ema is None else step.ema
-        return Representations(features=self.model.apply(params, batch["x"]),
-                               labels=batch["index"])
-
-
-class Spread:
-    name = "spread"
-    reads = Representations
-
-    def __init__(self, seen):
-        self.seen = seen
-
-    def __call__(self, artifact, batch):
-        self.seen.append((np.asarray(artifact.features).shape, np.asarray(batch["x"]).shape))
-        return float(jnp.std(artifact.features)), 1
-
-    def merge(self, accumulated, contribution):
-        return accumulated[0] + contribution[0], accumulated[1] + contribution[1]
-
-    def finalize(self, accumulated):
-        return accumulated[0] / accumulated[1]
-
 
 def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     seen = []

@@ -9,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from diffusion_stubs import label_table
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
 
@@ -30,6 +31,8 @@ class Tiny(nn.Module):
     whose table entry is the class, the blank prompt's padding reading the
     reference's null class."""
 
+    interval = True
+
     @nn.compact
     def __call__(self, x, time, textcontext, duration=None, train=False):
         def column(value):
@@ -41,17 +44,6 @@ class Tiny(nn.Module):
         weights = self.param("weights", nn.initializers.zeros, (4, *x.shape[1:]))
         return (jnp.tanh(x) * weights[0] + jnp.sin(3 * column(t)) * x * weights[1]
                 + column(h) * jnp.cos(x) * weights[2] + column(y) * weights[3])
-
-
-def labelled() -> CharTable:
-    """Character tables of one feature: the digit k reads k, and the padding
-    id 0 reads the null class."""
-    table = CharTable.from_pretrained(tokens=2, features=1)
-    entries = np.zeros((table.vocab, 1), np.float32)
-    entries[0] = CLASSES
-    for digit in range(CLASSES):
-        entries[table.tokenize([str(digit)])["input_ids"][0, 1]] = digit
-    return CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
 
 
 @pytest.mark.parametrize("power", ["0", "1"])
@@ -66,7 +58,8 @@ def test_the_loss_and_its_gradient_are_the_references(power, monkeypatch):
     case = np.load(FIXTURES / f"loss_p{power}.npz")
     settings = json.loads(str(case["settings"]))
     assert settings["num_classes"] == CLASSES
-    inputs = InputSpec(Field("image", case["pixels"].shape[1:]), {"textcontext": Condition(labelled())})
+    table = label_table(range(CLASSES), null=CLASSES)
+    inputs = InputSpec(Field("image", case["pixels"].shape[1:]), {"textcontext": Condition(table)})
     task = MeanFlowObjective(
         Tiny(), presets.MeanFlow()(), inputs, MeanFlowTraining(
             instantaneous=settings["data_proportion"], omega=settings["omega"], kappa=settings["kappa"],
@@ -133,7 +126,7 @@ def test_meanflow_refuses_an_instantaneous_process():
 
 def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp_path):
     import optax
-    from test_diffusion_run_sources import batch_for
+    from diffusion_stubs import batch_for
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, TrainerConfig
@@ -184,12 +177,11 @@ def test_a_meanflow_run_samples_unguided():
         DiffusionRunConfig(preset=presets.MeanFlow(), mode=MeanFlowTraining())
 
 
-@pytest.mark.parametrize("extra", [{"uncertainty": 8}])
-def test_meanflow_refuses_the_denoising_losss_extras(extra):
+def test_meanflow_refuses_the_denoising_losss_extras():
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
     with pytest.raises(ValueError, match="own loss"):
         MeanFlowObjective(model, presets.MeanFlow()(), InputSpec(Field("image", (4, 4, 3))),
-                          MeanFlowTraining(), **extra)
+                          MeanFlowTraining(), uncertainty=8)
 
 
 def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():

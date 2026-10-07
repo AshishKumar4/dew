@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_trainer import Data, Regression
+from affine_run import Data, Regression
 
 from dew.checkpoints import Checkpoints, Ranking
 from dew.config import OptimConfig, RunConfig

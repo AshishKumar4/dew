@@ -27,6 +27,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import equations
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.precision import rounded_operand, rounded_to
@@ -51,13 +52,13 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
     with jax.default_matmul_precision('default'):
         logits = model.apply(variables, ids)
         states = model.apply(variables, ids, method='hidden_states')
-        matrix = model.apply(variables, variables['params'], method='head_weight')
-        stored, vocab_major = model.apply(variables, variables['params'], method='head_table')
-        actual = chunked.head_logits(states, stored, softcap=None, precision=None,
-                                     vocab_major=vocab_major, bias=bias)
+        table = model.apply(variables, method='output_table')
+        actual = chunked.head_logits(states, table.matrix, softcap=None, precision=None,
+                                     vocab_major=table.vocab_major, bias=bias)
         np.testing.assert_array_equal(actual, logits)
         for tile in (None, (2, 11)):
-            losses, predicted, _ = chunked_cross_entropy(states, matrix, ids, 4, tile=tile, bias=bias)
+            losses, predicted, _ = chunked_cross_entropy(states, table.matrix, ids, 4, tile=tile,
+                                                         vocab_major=table.vocab_major, bias=bias)
             expected = optax.softmax_cross_entropy_with_integer_labels(logits, ids)
             assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
             np.testing.assert_array_equal(predicted, logits.argmax(-1))
@@ -338,6 +339,12 @@ def test_dropping_one_chunk_fails_the_parity_check(monkeypatch, dropped):
 
 # --- against the real backbone ---------------------------------------------
 
+def head_matrix(model, variables):
+    """The `[features, vocab]` matrix `model`'s head contracts (`output_table`)."""
+    table = model.apply(variables, method="output_table")
+    return table.matrix.T if table.vocab_major else table.matrix
+
+
 def small_model(**overrides):
     config = {'vocab_size': 97, 'emb_features': 32, 'num_layers': 2, 'num_heads': 4,
                   'mlp_features': 64, 'max_seq_len': 16, 'dtype': jnp.bfloat16}
@@ -360,9 +367,7 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     expected = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
 
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    head = model.apply(variables, variables['params'],
-                       method=CausalTransformer.head_weight)
-    losses, predicted, _ = chunked_cross_entropy(hidden, head, targets, chunks)
+    losses, predicted, _ = chunked_cross_entropy(hidden, head_matrix(model, variables), targets, chunks)
 
     assert hidden.dtype == dtype
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
@@ -393,8 +398,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     def full(params):
         hidden = model.apply({'params': params}, ids,
                              method=CausalTransformer.hidden_states)
-        head = model.apply({'params': params}, params,
-                           method=CausalTransformer.head_weight)
+        head = head_matrix(model, {'params': params})
         operands = (rounded_operand(value.astype(jnp.float32), jnp.bfloat16)
                     for value in (hidden, head))
         logits = rounded_to(jnp.einsum('btd,dv->btv', *operands, precision=jax.lax.Precision.HIGHEST),
@@ -405,9 +409,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     def chunked(params):
         hidden = model.apply({'params': params}, ids,
                              method=CausalTransformer.hidden_states)
-        head = model.apply({'params': params}, params,
-                           method=CausalTransformer.head_weight)
-        return jnp.mean(chunked_cross_entropy(hidden, head, targets, 4)[0])
+        return jnp.mean(chunked_cross_entropy(hidden, head_matrix(model, {'params': params}), targets, 4)[0])
 
     expected = jax.grad(full)(variables['params'])
     got = jax.grad(chunked)(variables['params'])
@@ -660,10 +662,8 @@ def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
     def tiled(tree):
         states = model.apply({"params": tree}, ids,
                              method=CausalTransformer.hidden_states)
-        matrix = model.apply({"params": tree}, tree,
-                             method=CausalTransformer.head_weight)
         losses, _, log_z = chunked_cross_entropy(
-            states, matrix, targets, 4, softcap=30.)
+            states, head_matrix(model, {"params": tree}), targets, 4, softcap=30.)
         return jnp.mean(losses + 0.02 * jnp.square(log_z))
 
     expected, got = jax.grad(full)(params), jax.grad(tiled)(params)
@@ -697,21 +697,6 @@ def test_the_backward_saves_the_inputs_and_a_few_numbers_per_token(tokens):
     assert residual_elements(tiled, hidden, head) <= budget
     # The same count over the pass this replaces, which does tape the logits.
     assert residual_elements(full, hidden, head) > budget
-
-
-def equations(graph):
-    if hasattr(graph, "eqns"):
-        for equation in graph.eqns:
-            yield equation
-            yield from equations(equation.params)
-    elif hasattr(graph, "jaxpr"):
-        yield from equations(graph.jaxpr)
-    elif isinstance(graph, dict):
-        for value in graph.values():
-            yield from equations(value)
-    elif isinstance(graph, (tuple, list)):
-        for value in graph:
-            yield from equations(value)
 
 
 def test_no_matmul_is_wider_than_one_tile():

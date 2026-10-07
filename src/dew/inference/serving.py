@@ -10,10 +10,11 @@ its own cursor, length and budget, and the attention mask hides free rows
 and bucket filler.
 
 The model's attention indexes its cache by batch row (`open_kv_cache` writes
-`cache[row, cursor]`). Where every cached layer is plain attention over a
-dense cache or one page pool, an admitting step is one forward over every
-token it runs: each row's last draw and the admitted prompts, laid out in one
-row (`dew.nn.inputs.Admitted`), so the projections read their weights once.
+`cache[row, cursor]`). Where the model says its layers run it
+(`dew.nn.protocols.Serving`), over a dense cache or one page pool, an
+admitting step is one forward over every token it runs: each row's last draw
+and the admitted prompts, laid out in one row (`dew.nn.inputs.Admitted`), so
+the projections read their weights once.
 Otherwise (`Server.mixed_refusal` says why) the prompts run as one forward at
 their own width and the decode trip as another, in one program. The prompts
 are the fewest power-of-two rows that hold them (`admission_share`) at a
@@ -97,16 +98,22 @@ from dew.inference.serving_kernel import (
     _state_shardings,
 )
 from dew.inference.tasks import Processor, TextGeneration, _bucket, _ceiling, _decoded, _prepared, _sized
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
-from dew.nn.rope import LongRopeScaling
+from dew.nn.protocols import ProjectionGroup
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
-from dew.sampling.text import Generation, Sampling, _check_inputs, prediction_depths, resolve
+from dew.sampling.text import (
+    Generation,
+    Sampling,
+    _check_inputs,
+    prediction_depths,
+    rebuild_position,
+    resolve,
+)
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
@@ -357,13 +364,14 @@ Rows = DenseRows | PagedRows
 
 def _refuse_longrope_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
                            prefix: bool = False, mixed: bool = False) -> None:
-    """Refuse serving modes whose cache cannot rebuild a crossing request."""
-    if isinstance(model, CausalTransformer) and isinstance(model.rope_scaling, LongRopeScaling):
+    """Refuse serving modes whose cache cannot rebuild a crossing request (`rebuild_position`)."""
+    position = rebuild_position(model)
+    if position is not None:
         modes = [name for name, active in (('paged', paged), ('chunked', chunked),
                                           ('prefix', prefix), ('mixed admission', mixed)) if active]
         if modes:
             raise ValueError(
-                f'LongRoPE crossing position {model.rope_scaling.original_max_position_embeddings} '
+                f'LongRoPE crossing position {position} '
                 f'cannot rebuild {", ".join(modes)} serving; use whole-prompt dense admission')
 
 
@@ -404,7 +412,7 @@ class Server:
                              f"{self.groups} groups the mesh splits rows into")
         self.model = model
         self.variables = variables
-        self._weight_groups = {}
+        self._weight_groups: list[ProjectionGroup] = []
         self.processor = processor
         if sampling.stop:
             raise ValueError("a server takes stop strings compiled into stopping; build it with "
@@ -434,17 +442,16 @@ class Server:
         with self._context():
             source_shapes = unfreeze(dict(jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)))
-            for path, group in _projection_groups(model, variables).items():
+            for group in _projection_groups(model, variables):
                 node = source_shapes["params"]
-                for part in path:
+                for part in group.path:
                     node = node[part]
-                name, projections, widths = group
-                if name in node:
-                    packed = node.pop(name)
-                    for projection, width in zip(projections, widths, strict=True):
+                if group.packed in node:
+                    packed = node.pop(group.packed)
+                    for projection, width in zip(group.members, group.widths, strict=True):
                         node[projection] = {field: jax.ShapeDtypeStruct((*leaf.shape[:-1], width), leaf.dtype)
                                             for field, leaf in packed.items()}
-                    self._weight_groups[path] = group
+                    self._weight_groups.append(group)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
             shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)

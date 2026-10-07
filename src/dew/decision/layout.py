@@ -104,6 +104,8 @@ class Encoded:
     state_tokens: int
     """The state's length in tokens, before the layout cut it to fit."""
     state_kept: int
+    media: tuple[int, int] | None = None
+    """Where the row holds a request's images, as a [start, end) span of its tokens."""
 
 
 def render(value: JSON) -> str:
@@ -138,13 +140,19 @@ class Layout:
     max_len: int = 512
     joint: ClassVar[bool] = False
     """Whether every question of a request shares one row, rather than one row each."""
+    image: ClassVar[str | None] = None
+    """The text that stands for one image where a row holds a request's images,
+    which the backbone's processor expands; None where a row holds none."""
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
-             *, orders: Mapping[str, Sequence[int]] | None = None) -> list[Encoded]:
+             *, orders: Mapping[str, Sequence[int]] | None = None,
+             media: Sequence[int] = ()) -> list[Encoded]:
         """Lay out `questions` about `state`, each question's options in its `orders` entry.
 
         Slot s of a question shows its option order[s]; a question `orders` does not
-        name keeps its own order (or the layout's).
+        name keeps its own order (or the layout's). `media` are the tokens the
+        backbone's processor gave a request's images, which a layout with an
+        `image` text places in the row.
         """
         raise NotImplementedError
 
@@ -176,7 +184,10 @@ class QuestionLayout(Layout):
         return tuple(encoder.encode(text, add_special_tokens=False))
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
-             *, orders: Mapping[str, Sequence[int]] | None = None) -> list[Encoded]:
+             *, orders: Mapping[str, Sequence[int]] | None = None,
+             media: Sequence[int] = ()) -> list[Encoded]:
+        if media:
+            raise ValueError(f"a {type(self).__name__} row has no place for images")
         tokens = self.state(encoder, specials, state)
         return [self.encode(encoder, specials, question, tokens, conversation=_conversation(state),
                             order=(orders or {}).get(name), name=name)
@@ -303,7 +314,9 @@ class JointLayout(Layout):
     The row is a chat prompt (joint_schema_model.py `encode_record` at
     Cloudflare/clef 2f3de3dd): Clef's system prompt, the state, then a schema of
     numbered fields, each with its id, type, instructions and allowed options,
-    and the opening of the assistant's turn. Each option is rendered as compact
+    and the opening of the assistant's turn. A request's images come before the
+    state, each laid out as `image` and expanded by the backbone's processor.
+    Each option is rendered as compact
     JSON with sorted keys, `{"description": ..., "option_id": ...}`, and the
     head pools the tokens of each option and of each question's instructions.
     A choice's options come in the order of their keys, and a noul's as true,
@@ -315,9 +328,11 @@ class JointLayout(Layout):
     max_len: int = 16384
     max_state_tokens: int | None = None
     joint: ClassVar[bool] = True
+    image: ClassVar[str | None] = "<|vision_start|><|image_pad|><|vision_end|>"
 
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
-             *, orders: Mapping[str, Sequence[int]] | None = None) -> list[Encoded]:
+             *, orders: Mapping[str, Sequence[int]] | None = None,
+             media: Sequence[int] = ()) -> list[Encoded]:
         def tokens(text: str) -> list[int]:
             return encoder.encode(text, add_special_tokens=False)
 
@@ -346,7 +361,8 @@ class JointLayout(Layout):
                 schema.extend(tokens("\n"))
             schema.extend(tokens("END FIELD\n"))
             laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
-        prefix = tokens(f"<|im_start|>system\n{CLEF_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
+        opening = tokens(f"<|im_start|>system\n{CLEF_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
+        prefix = opening + list(media)
         suffix = tokens("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
         state_ids = tokens(_compact(state))
         whole = len(state_ids)
@@ -366,7 +382,7 @@ class JointLayout(Layout):
                              tuple(moved(option) for option in question.options), question.order)
                         for question in laid)
         return [Encoded(tuple(prefix + state_ids + schema + suffix), shifted, None, None, whole,
-                        len(state_ids))]
+                        len(state_ids), (len(opening), len(prefix)) if media else None)]
 
     @staticmethod
     def options(question: Question) -> tuple[tuple[str, JSON], ...]:

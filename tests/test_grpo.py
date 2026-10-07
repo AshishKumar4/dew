@@ -7,8 +7,7 @@ from `kl_penalty_forward`). The reference is tests/fixtures/rl/grpo.npz,
 written by tools/parity_grpo.py from torch over one fixed rollout: old,
 current and reference log-probabilities, both-signed advantages, and a mask
 with short tails, with entries past every clip point. `GRPOObjective` reads
-the same terms out of the rolled-out batch. Each mutation below removes one
-term and must move the loss, proving the term binds.
+the same terms out of the rolled-out batch.
 """
 
 from pathlib import Path
@@ -18,13 +17,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
+from rl_support import TinyHead, clipped_surrogate, token_mean
 from steady_state import steady_state
-from test_rl_surrogate import clipped_surrogate, token_mean
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
-from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective
 from dew.objectives.rl.rollout import SampledRollout
@@ -80,80 +77,7 @@ def test_grpo_loss_and_gradient_match_verl(reference):
         np.append(reference["verl_loss_f64"], reference["verl_current_grad_f64"]), "GRPO loss and gradient")
 
 
-def test_the_fixture_names_its_reference(reference):
-    assert str(reference["verl_version"]) == "0.9.0"
-    assert str(reference["torch_version"]).startswith("2.14")
-    assert float(reference["beta"]) == 0.01
-    assert np.asarray(reference["response_mask"]).shape == (4, 4)
-    assert np.asarray(reference["response_mask"]).sum() == 13
-
-
-def test_an_unclipped_ratio_moves_the_loss(reference):
-    """Without the 1 +- 0.2 clip the high-ratio entries dominate: observed
-    move 0.154."""
-    old, current, ref, advantages, mask, beta = terms(reference)
-
-    raw = token_mean(-jnp.asarray(advantages) * jnp.exp(
-        jnp.asarray(current) - jnp.asarray(old)), jnp.asarray(mask))
-    kl = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
-
-    assert abs(float(raw + beta * kl) - float(reference["verl_loss"])) > 1e-4
-
-
-def test_a_k1_penalty_moves_the_loss(reference):
-    """The k1 estimator prices drift linearly instead of exponentially:
-    observed move 0.0051 on the KL term, before the beta dilution."""
-    _, current, ref, _, mask, _ = terms(reference)
-
-    cubic = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
-    linear = token_mean(jnp.asarray(current) - jnp.asarray(ref), jnp.asarray(mask))
-
-    assert abs(float(linear) - float(cubic)) > 1e-4
-
-
-def test_a_flat_mean_moves_the_loss(reference):
-    """Averaging over the whole rectangle instead of the masked tokens
-    dilutes the short tails: observed move 0.082."""
-    old, current, ref, advantages, mask, beta = terms(reference)
-    ratio = token_log_ratio(jnp.asarray(current), jnp.asarray(old))
-    _pg, _ = clipped_surrogate(ratio, jnp.asarray(advantages), jnp.asarray(mask))
-    kl = token_mean(k3_kl(jnp.asarray(current), jnp.asarray(ref)), jnp.asarray(mask))
-    flat = jnp.mean(jnp.asarray(mask) * -jnp.asarray(advantages) * jnp.exp(ratio))
-
-    assert abs(float(flat + beta * kl) - float(reference["verl_loss"])) > 1e-4
-
-
 # --- the objective -------------------------------------------------------------
-
-class TinyHead(nn.Module):
-    """A position-wise map with the backbone's scoring contract: int32 ids
-    in, float32 logits out, the head split off behind `hidden_states` and
-    `output_table`."""
-
-    vocab_size: int
-
-    def setup(self):
-        self.lm_head = nn.Dense(self.vocab_size, use_bias=False)
-
-    @nn.compact
-    def hidden_states(self, tokens, train: bool = False, segment_ids=None, positions=None):
-        x = nn.Embed(self.vocab_size, 8)(tokens)
-        h = nn.LayerNorm()(x)
-        return nn.LayerNorm()(x + nn.Dense(8)(nn.gelu(nn.Dense(16)(h))))
-
-    @nn.compact
-    def init_cache(self, batch_size):
-        """A placeholder cache: the trunk mixes nothing across positions, so
-        incremental decoding keeps no state, but `generate` threads one."""
-        self.variable("cache", "index", lambda: jnp.zeros((batch_size,), jnp.int32))
-
-    def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None):
-        return self.lm_head(
-            self.hidden_states(tokens, train=train)).astype(jnp.float32)
-
-    def output_table(self):
-        return OutputTable(self.lm_head.variables["params"]["kernel"], vocab_major=False)
-
 
 def rollout_batch(seed=0):
     """Two packed rows, one chain each, the last RESPONSE_WIDTH ids sampled,

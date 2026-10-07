@@ -38,7 +38,7 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
-from dew.artifacts import Artifact, Artifacts
+from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.records import JSON
 
 if TYPE_CHECKING:
@@ -336,6 +336,11 @@ class EMASpec:
     """
     decay: optax.Schedule
     select: PathFilter = everything
+
+    @classmethod
+    def constant(cls, decay: float | None) -> EMASpec | None:
+        """Follow what moves at a constant `decay`, never the frozen collection; None keeps no EMA."""
+        return None if decay is None else cls(optax.constant_schedule(decay), lambda path: path[0] != FROZEN)
 
 
 class SavedTask(Protocol):
@@ -727,9 +732,26 @@ class Objective(ABC, Generic[Loss, Effects]):
         Every process runs this numerical work, outside the optimizer's jit.
         Display sampling and decoding go in `preview`. Each scoring batch has
         its own key, and `step.ema` holds the averaged weights. The default
-        returns None.
+        returns `_evaluation_scores` over the `evaluation_variables`, compiled
+        once, or None for an objective that scores no tokens.
         """
-        return None
+        if self._evaluation_scores is None:
+            return None
+        return self._compiled_scores(self.evaluation_variables(params, step), batch, step.key)
+
+    _evaluation_scores: Callable[..., TokenScores] | None = None
+    """The per-token scores of one evaluation batch, a pure function of the
+    weights, the batch and the pass's key, or None when the objective scores
+    no tokens."""
+
+    @functools.cached_property
+    def _compiled_scores(self) -> Callable[..., TokenScores]:
+        """`_evaluation_scores` compiled once per objective. Run op by op, the
+        model's forward would dispatch every operation of every validation
+        batch from the host, and jax's eager shard_map refuses the chunked
+        head's map over the data axis alone."""
+        assert self._evaluation_scores is not None
+        return jax.jit(self._evaluation_scores)
 
     def evaluation_variables(self, variables: Variables, step: Step) -> Variables:
         """Return the weights a validation pass and a preview score: the

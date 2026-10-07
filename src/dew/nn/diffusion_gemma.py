@@ -287,22 +287,6 @@ class DiffusionGemma(nn.Module):
         """Return the logits of final states `hidden`, through the head the encoder and the decoder share."""
         return self.text.logits_from_hidden(hidden)
 
-    def head_weight(self, params):
-        """Return the `[D, vocab]` head the encoder and the decoder score with, in its stored dtype.
-
-        It is read from the text tree of `params` by `CausalTransformer.head_weight`."""
-        return self.text.head_weight(params["text"])
-
-    def vocabulary_bias(self, params):
-        """The decoder's vocabulary bias, for the same affine head its forward scores."""
-        return self.text.vocabulary_bias(params['text'])
-
-    def head_table(self, params):
-        """Return the head as the text tree stores it, and whether its rows are the vocabulary.
-
-        It is read from the text tree of `params` by `CausalTransformer.head_table`."""
-        return self.text.head_table(params["text"])
-
     def output_table(self) -> OutputTable | None:
         """Return the shared head as the matrix final states contract, or
         None where none does (`CausalTransformer.output_table`)."""

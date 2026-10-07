@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write pytorch-fid's own pool3 features and FID for tests/test_metrics.py.
+"""Write pytorch-fid's own pool3 features and FID for tests/test_fid.py.
 
 pytorch-fid is the reference implementation FID numbers are reported with,
 and its published weights are the ones the jax-fid checkpoint Dew converts

@@ -303,7 +303,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
                                          capture_intermediates=lambda module, method: (
                                              method == "__call__" and module.name in layers),
                                          mutable=["intermediates"])
-        kept = captured["intermediates"]
+        # Flax opens the collection only when a layer was captured.
+        kept = dict(captured).get("intermediates", {})
         missing = [name for name in self.distillation.feature_layers if name not in kept]
         if missing:
             raise ValueError(f"the teacher has no layers {missing} to read features after")

@@ -33,9 +33,8 @@ from flax import linen as nn
 
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of
-from dew.nn.multimodal import MultimodalTransformer
+from dew.nn.inputs import RESPONSE_FIELDS, ModelInputs, Request, continuation_keys, local_rows, mesh_of
+from dew.nn.protocols import Logits, TokenModel
 from dew.objectives.base import Variables
 from dew.registry import presets, solvers
 
@@ -161,10 +160,14 @@ class DiscreteProcess:
         `pad_token_id`, but it does not end the bidirectional refinement
         early.
 
-        Raises `ValueError` when the model is not a bidirectional
-        transformer, when the prompt plus `max_new_tokens` exceeds its
-        `max_seq_len`, or when the inputs include conditioning or token fields
-        that masked generation cannot extend.
+        The response continues the prompt's token fields
+        (`ModelInputs.extended`): its slots are text, at the positions after
+        the prompt's, and the conditioning is the prompt's own.
+
+        Raises `ValueError` when the model does not read the whole row
+        (`refuse_causal`), when the prompt plus `max_new_tokens` exceeds the
+        `max_seq_len` it declares, or when the inputs include a token field
+        a response has no rule to continue.
         """
         solver = Unmask() if solver is None else solver
 
@@ -189,7 +192,8 @@ class DiscreteDenoiser:
     The denoiser ignores `t`, because the masked model is conditioned on the
     corruption it sees and not on the time. `Unmask.step` reads the time
     from the process. `t` stays in the signature because `sample` calls
-    every denoiser as `(x_t, t)`.
+    every denoiser as `(x_t, t)`. A model with full-sequence logits
+    (`Logits`) is read through them, and any other through its call.
 
     The model's own logits at an unmasked position do not matter, since the
     position keeps its token (MDLM's carry-over parameterization). The mask
@@ -211,7 +215,8 @@ class DiscreteDenoiser:
     def __call__(self, x_t, t):
         fields = {} if self.inputs is None else self.inputs.kwargs()
         logits = self.model.apply(self.params, x_t, **fields, rngs=None, mutable=False,
-                                  capture_intermediates=False, method=None)
+                                  capture_intermediates=False,
+                                  method="logits" if isinstance(self.model, Logits) else None)
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
         # Normalized in fp32, as `token_log_probs` does: the reveal draws its
         # categorical from these, and a bf16 log partition would quantize it.
@@ -266,30 +271,49 @@ class MDLM:
         return DiscreteProcess(schedule=LogLinear(eps=self.eps), mask_id=self.mask_id)
 
 
+def refuse_causal(model: nn.Module) -> None:
+    """Raise ValueError unless `model` can fill a masked row: MDLM draws each
+    masked slot from the row's full-sequence logits (`Logits`), so every
+    position must read the ones after it (`TokenModel` with `causal` False)."""
+    name = type(model).__name__
+    if not isinstance(model, Logits):
+        raise ValueError(f"masked generation requires a bidirectional model, and this {name} gives no "
+                         f"full-sequence logits (Logits)")
+    if not isinstance(model, TokenModel):
+        raise ValueError(f"masked generation requires a bidirectional model, and this {name} does not say "
+                         f"whether a position reads the ones after it (TokenModel)")
+    if model.causal:
+        raise ValueError(f"masked generation requires a bidirectional model, and this {name} is causal: "
+                         f"no position reads the masked ones after it")
+
+
 def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelInputs,
                       budget: int, steps: int, n: int, eos_ids: tuple[int, ...], pad_id: int) -> None:
-    decoder = model if isinstance(model, CausalTransformer | MultimodalTransformer) else None
-    if decoder is None or decoder.causal:
-        raise ValueError("masked generation requires a bidirectional model")
+    from dew.sampling.text import Bounded
+
+    refuse_causal(model)
     for name, value, minimum in (("max_new_tokens", budget, 0), ("steps", steps, 1), ("n", n, 1)):
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
-    vocab = model.vocab_size
-    if type(process.mask_id) is not int or not 0 <= process.mask_id < vocab:
-        raise ValueError("mask_id is outside the vocabulary")
-    if type(pad_id) is not int or not 0 <= pad_id < vocab:
-        raise ValueError("pad_token_id is outside the vocabulary")
-    if any(type(token) is not int or not 0 <= token < vocab for token in eos_ids):
-        raise ValueError("eos_token_ids contain an id outside the vocabulary")
+    # A model that declares no vocabulary or capacity is checked for neither, as text generation does.
+    bounded = isinstance(model, Bounded)
+    vocab = model.vocab_size if bounded else None
+    if vocab is not None:
+        if type(process.mask_id) is not int or not 0 <= process.mask_id < vocab:
+            raise ValueError("mask_id is outside the vocabulary")
+        if type(pad_id) is not int or not 0 <= pad_id < vocab:
+            raise ValueError("pad_token_id is outside the vocabulary")
+        if any(type(token) is not int or not 0 <= token < vocab for token in eos_ids):
+            raise ValueError("eos_token_ids contain an id outside the vocabulary")
     if min(inputs.tokens.shape) < 1:
         raise ValueError("masked generation needs nonempty token rows")
-    if inputs.tokens.shape[1] + budget > model.max_seq_len:
+    capacity = model.max_seq_len if bounded else None
+    if capacity is not None and inputs.tokens.shape[1] + budget > capacity:
         raise ValueError("prompt plus max_new_tokens exceeds max_seq_len")
-    if inputs.conditioning:
-        raise ValueError("native MDLM is text-only; conditioning payloads are not supported")
-    unknown = inputs.token_fields.keys() - {"attention_mask", "positions", "rotary_positions", "segment_ids"}
-    if unknown:
-        raise ValueError(f"masked generation cannot extend token fields {sorted(unknown)}")
+    unruled = sorted(inputs.token_fields.keys() - RESPONSE_FIELDS.keys())
+    if unruled:
+        raise ValueError(f"masked generation cannot extend token fields {unruled}: a response has no "
+                         f"rule for their slots (dew.nn.inputs.RESPONSE_FIELDS)")
     positions = inputs.token_fields.get("positions")
     if positions is not None and positions.ndim != 2:
         raise ValueError("positions must be [B, S] logical token positions")
@@ -298,38 +322,18 @@ def _validate_request(model: nn.Module, process: DiscreteProcess, inputs: ModelI
 def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[ModelInputs, jax.Array]:
     """`inputs` extended by `width` masked slots, and which slots may change.
 
-    Every per-token field is continued past the prompt's last real token: a
-    logical position counts on from it, a rotary coordinate counts on from
-    the largest on each axis, the attention mask marks the response valid for
-    rows that hold a prompt, and a segment id repeats. `_validate_request`
-    admits no other field.
+    The prompt's validity and logical positions are written out first, so
+    the response's continue from them (`ModelInputs.extended`): its slots
+    are real in the rows that hold a prompt, the only rows whose slots may
+    change, and count on from the prompt's last real token.
     """
     batch, prompt = inputs.tokens.shape
     valid = jnp.asarray(inputs.token_fields.get("attention_mask", jnp.ones((batch, prompt), bool)), bool)
-    active = valid.any(axis=1)
     positions = inputs.token_fields.get("positions", jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0))
-    last_slot = jnp.max(jnp.where(valid, jnp.arange(prompt)[None, :], 0), axis=1)
-    fields = {}
-    for name, value in {**inputs.token_fields, "positions": positions, "attention_mask": valid}.items():
-        if name == "positions":
-            tail = value[jnp.arange(batch), last_slot, None] + jnp.arange(1, width + 1)[None]
-        elif name == "rotary_positions":
-            # Multi-axis RoPE continues one beyond the largest real coordinate
-            # on every axis, unlike resettable logical document positions.
-            keep = valid.reshape(valid.shape + (1,) * (value.ndim - 2))
-            last = jnp.max(jnp.where(keep, value, -1), axis=tuple(range(1, value.ndim)))
-            coordinates = last[:, None] + jnp.arange(1, width + 1)[None]
-            tail = jnp.broadcast_to(coordinates.reshape((batch, width) + (1,) * (value.ndim - 2)),
-                                    (batch, width, *value.shape[2:]))
-        elif name == "attention_mask":
-            tail = jnp.broadcast_to(active[:, None], (batch, width))
-        else:
-            tail = jnp.broadcast_to(value[jnp.arange(batch), last_slot, None], (batch, width))
-        fields[name] = jnp.concatenate([value, tail.astype(value.dtype)], axis=1)
-    tokens = jnp.concatenate([inputs.tokens, jnp.full((batch, width), mask_id, jnp.int32)], axis=1)
-    mutable = jnp.concatenate([jnp.zeros((batch, prompt), bool),
-                               jnp.broadcast_to(active[:, None], (batch, width))], axis=1)
-    return ModelInputs(tokens, fields, inputs.conditioning), mutable
+    written = replace(inputs, token_fields={**inputs.token_fields, "positions": positions,
+                                            "attention_mask": valid})
+    extended = written.extended(jnp.full((batch, width), mask_id, jnp.int32))
+    return extended, extended.token_fields["attention_mask"] & (jnp.arange(prompt + width) >= prompt)
 
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,

@@ -74,7 +74,7 @@ Trainer(objective, optimizer, *, key,
         step=None, rollout=None, profile=None)
 ```
 
-`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
+`objective` is an initialized objective object, and `optimizer` is an Optax gradient transformation or a `dew.config.OptimConfig`. `fit` builds a config over the optimizer updates its `steps` make, `steps // accumulation`, so the config's schedule spans that run; `OptimConfig.weight_decay` says which parameters its decay spares. The required JAX `key` seeds initialization and the run. `mesh` and `layout` describe placement. The optional objects turn on checkpoints, tracking, host-side rollouts and profiling.
 
 `accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, and keep float64 when it is enabled in JAX. A TPU has no float64 (XLA rewrites it into pairs of float32, which are not IEEE doubles), so a trainer whose parameters are stored in float64 on a TPU mesh is refused when it places the state. Each finalized gradient enters Optax in its parameter's dtype, and partially accumulated gradients keep the wider working dtype.
 
@@ -105,6 +105,8 @@ Checkpointable data must supply the consumed iterator position. A failed scaled 
 
 `initial_state()` constructs an unplaced initial `TrainState`. `place()` returns `(state, shardings, position)`, restoring from the configured checkpointer when available. Eager and placed initialization can differ in low floating-point bits across backends; compare the actual path used by your run.
 
+An `OptimConfig` is built by `fit` over the run's optimizer updates. If you need `initial_state`, `place` or `compile` before `fit`, pass `OptimConfig(...).build(steps)` to `Trainer` instead, where `steps` is the run's length in optimizer updates.
+
 `compile(state, batch)` returns `compiled(state, batch) -> (state, loss, metrics, loss_finite, accepted)`. The scaler is part of `TrainState`. `loss_finite` and `accepted` are separate, because a finite scalar loss can come with a nonfinite gradient that is rejected. The callable consumes the state it is given (`donate_argnums=0`), and the returned state takes over its buffers, so write `new = compiled(old, batch)` and keep no reference to the old state. The batch is not donated, because the loader still owns it.
 
 ## TrainState
@@ -134,11 +136,12 @@ Import `Dataset`, `DataPartition` and `Loading` from `dew.data`.
 Dataset(train, val, records, batch, ramp=None)
 Dataset.from_records(records, *, batch, seed=0, validation=None, loading=Loading())
 Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())
+Dataset.from_torch(dataset, *, batch, fields=None, seed=0, validation=None, loading=Loading())
 DataPartition(index=0, count=1, readers=1, reader=0)
 Loading(workers=0, threads=64, read_buffer=128, worker_buffer=2)
 ```
 
-`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, with its last batch padded by repeated rows that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order.
+`from_records` reads records held in memory: a mapping of equal-length columns, a sequence of per-record mappings, or a source with `__len__` and `__getitem__`. Its training stream reshuffles from `seed` every epoch and saves a global record position. `validation` is one ordered pass over every record, with its last batch padded by repeated rows that `VALID_ROWS` marks. `from_grain` reads a Grain pipeline the caller built, in the caller's order. `from_torch` reads a map-style `torch.utils.data.Dataset` as `from_records` reads a source, naming a tuple sample's entries with `fields`; it refuses a `DataLoader` and an `IterableDataset`.
 
 `train(partition)` opens a training iterator, and `val(partition)` opens one finite validation pass; `val` is `None` when there is no validation data. Each iterator reads the share of every global batch that its `DataPartition` names. The partition splits each batch into `count` disjoint shares; `index` is the share to read; `readers` is the number of processes that read that share alike; and `reader` is which of those processes this one is. `DataPartition.of(mesh)` is the share a process reads on a mesh, and `DataPartition()` is every row.
 
@@ -162,7 +165,7 @@ An image specification takes its validation data from `val_split`, one of the da
 
 `Dataset.from_grain(train, *, batch, validation=None, records=None, loading=Loading())` builds a run over Grain pipelines the caller assembled. A `MapDataset` is repeated and cut into the reader's share, and its position is saved as one global record count. A pipeline that is read as it comes is passed as a function of the `DataPartition` that builds the `IterDataset` of that share. That pipeline is batched where it is and reports Grain's own iterator state.
 
-A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file or `TokenRecords` over ArrayRecord shards of token arrays. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in both.
+A token corpus is a `TokenSource`: `TokenBytes` over a `.bin` file or `TokenRecords` over ArrayRecord shards of token arrays. `TokenWindows` and `PackedTokens` read `path` as a directory of `train` and `val` files and take whichever store their suffix names, so the same corpus gives the same windows and the same packing plan in both. `TokenWindows(hub=HubText(name, split=, column=, tokenizer=, options=))` reads a Hugging Face text split instead, tokenized once into `dew_cache_dir()/tokens`, which is what `dew.data.load("hf/<name>", tokenizer=, seq_len=)` builds.
 
 
 ## Checkpoints
@@ -187,7 +190,7 @@ LMObjective(model, seq_len, *, ema_decay=None, pad_id=None, head_chunks=4, head_
 IndexerTraining(phase, weight=1.0)
 ```
 
-`model` may be a decoder bundle that `Pretrained.load` returned. The objective then reads the bundle's model, initial variables and processor, and `pipeline` decodes with that processor; passing `variables=` or `processor=` as well overrides that part. An adapted bundle (`bundle.adapt(LoRA(...), key=)`) trains only the adapter's factors, and its `save` and `export` merge them into the kernels. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `head_weight(params)`, returning the `(D, vocab)` vocabulary matrix. The objective also reads `final_logit_softcap` and `precision`. Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
+`model` may be a decoder bundle that `Pretrained.load` returned. The objective then reads the bundle's model, initial variables and processor, and `pipeline` decodes with that processor; passing `variables=` or `processor=` as well overrides that part. An adapted bundle (`bundle.adapt(LoRA(...), key=)`) trains only the adapter's factors, and its `save` and `export` merge them into the kernels. The model must implement Linen `hidden_states(tokens, train=..., positions=..., segment_ids=...)`, returning `(B, S, D)`, and `output_table()`, returning the `OutputTable` (the stored vocabulary matrix and its orientation, bias, softcap and precision) that its logits contract (`dew.nn.protocols`). Prediction-depth training needs `mtp_hidden_states` and compatible prediction-depth configuration. Mutable router, QK and indexer collections are required when their options are enabled.
 
 `variables` is the tree training starts from, either whole or split by `dew.objectives.base.freeze` or an adapter into the part that trains and the part that stays frozen. `loss_role` requires aligned `text_roles`. `pad_id` masks matching targets. `head_chunks` controls vocabulary tiling, and `head_tile` the head's backward tile (`'whole'`, `'tiled'` or a tile shape; `None` picks one for the objective); `samples` configures text previews. `ema_decay` defaults to `None`, which trains without an averaged copy; a decay such as `0.999` keeps one that evaluation and previews read, and `1.0` retains a frozen one. Routing balance, auxiliary loss, prediction-depth weight, and QK statistics require matching model computation. These interfaces make `LMObjective` specific to compatible decoders. `z_loss` adds PaLM's auxiliary term, the coefficient times the squared log partition of every counted prediction; zero adds nothing. `router_z_loss` is the routers' own z-loss (ST-MoE), and zero adds nothing. `token_accuracy=False` drops the `token_accuracy` metric and the pass over every logit it costs.
 
