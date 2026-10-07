@@ -16,6 +16,8 @@ import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import Dataset
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.vision import GemmaProjector, SiglipVision
+from dew.objectives.diffusion import DiffusionRunConfig
 from dew.registry import Aliases, datasets, projectors, towers
 from dew.training import Layout, MeshSpec
 
@@ -92,17 +94,23 @@ def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
         config.to_dict()
 
 
-def test_save_and_load_carry_a_subclass_with_its_own_knobs(tmp_path):
-    @dataclasses.dataclass(frozen=True)
-    class LMRunConfig(RunConfig):
-        seq_len: int = 256
-        pad_id: int | None = None
+@dataclasses.dataclass(frozen=True)
+class KnobbedRun(RunConfig):
+    """A kind of run with knobs of its own."""
 
-    config = LMRunConfig(trainer=TrainerConfig(steps=3), seq_len=64, pad_id=0)
+    seq_len: int = 256
+    pad_id: int | None = None
+
+
+def test_save_and_load_carry_a_subclass_with_its_own_knobs(tmp_path):
+    """The record names the run's class, so a reader that knows only the
+    base builds the kind of run it records, and a reader of another kind
+    refuses it."""
+    config = KnobbedRun(trainer=TrainerConfig(steps=3), seq_len=64, pad_id=0)
     assert config.save(str(tmp_path)) == str(tmp_path / "run.json")
-    assert LMRunConfig.load(str(tmp_path)) == config
-    with pytest.raises(ValueError, match="unknown fields \\['pad_id', 'seq_len'\\]"):
-        RunConfig.load(str(tmp_path))
+    assert KnobbedRun.load(str(tmp_path)) == config and RunConfig.load(str(tmp_path)) == config
+    with pytest.raises(ValueError, match="which is no DiffusionRunConfig"):
+        DiffusionRunConfig.load(str(tmp_path))
 
 
 def test_the_model_config_builds_with_its_own_dtype_and_attention():
@@ -464,19 +472,19 @@ def test_a_saved_model_retains_nested_mixer_behavior(tmp_path):
     assert jnp.array_equal(restored.apply(variables, tokens), expected)
 
 
+@dataclasses.dataclass(frozen=True)
+class VisionRun(RunConfig):
+    """A run that records a vision tower and its projector."""
+
+    vision: dict[str, object] = dataclasses.field(default_factory=lambda: {
+        "tower": SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1, image_size=2,
+                              patch_size=1),
+        "projector": GemmaProjector(text_width=2, patches_per_side=2, tokens_per_side=1),
+    })
+
+
 def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     import jax
-
-    from dew.nn.vision import GemmaProjector, SiglipVision
-
-    @dataclasses.dataclass(frozen=True)
-    class VisionRun(RunConfig):
-        vision: dict[str, object] = dataclasses.field(default_factory=lambda: {
-            "tower": SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1,
-                                   num_heads=1, image_size=2, patch_size=1),
-            "projector": GemmaProjector(text_width=2,
-                                         patches_per_side=2, tokens_per_side=1),
-        })
 
     run = VisionRun()
     tower, projector = run.vision["tower"].build(), run.vision["projector"].build()

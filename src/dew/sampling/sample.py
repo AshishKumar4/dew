@@ -58,7 +58,9 @@ def sample[StateT](
     The time grid runs from T to 0. The solver takes one step across each
     interval, and the result is the model's clean prediction at the last
     point. Pass exactly one of `steps` and `times`. With `steps`, the
-    process supplies a grid of that many points. An explicit `times` grid is
+    process supplies its grid (`times(steps)`): that many points for a
+    Gaussian process, and MDLM's grid of that many reveal steps for a masked
+    one (`DiscreteProcess.times`). An explicit `times` grid is
     used as the trajectory, descending and concrete, for a source whose
     solver pairs its own sigma and model-time tables. Its length sets the
     number of steps, so a grid of `steps + 1` points ending on the terminal

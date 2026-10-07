@@ -17,6 +17,8 @@ raises an error.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import dataclasses
 import datetime
 import functools
@@ -233,8 +235,9 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
         held = _record_class(member)
-        given = (_declared(held, given, dtypes=True) if held is not None
-                 else _arguments(member, given, dtypes=True))
+        with _reading(given):
+            given = (_declared(held, given, dtypes=True) if held is not None
+                     else _arguments(member, given, dtypes=True))
         return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
@@ -329,7 +332,8 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     takes a `dtype` as the dtype its name says (True), and a run record
     keeps the name it wrote (`RunConfig.from_dict`, False).
     """
-    built = _rebuilt(annotation, value, dtypes=dtypes)
+    with _reading(value):
+        built = _rebuilt(annotation, value, dtypes=dtypes)
     witness: type[ValueT] = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
@@ -344,8 +348,13 @@ def to_record(value, annotation) -> JSON:
     dataclass is the record of its fields where `annotation` names its class
     exactly, and `{"class": <import path>, "fields": {...}}` where the field
     declares a base, a union or nothing, so the reader knows what to build;
-    a function is `{"function": <import path>}`.
+    a function is `{"function": <import path>}`. A Flax module held twice in
+    one record, as `nn.Sequential([dense, dense])` holds its one shared layer,
+    is written once as a class record with `"share": <n>`, and each later
+    place that holds it as `{"shared": <n>}`, so the reader builds one module
+    and the model keeps one set of parameters for it (`recording`).
     """
+    from flax import linen as nn
 
     from dew.records import recorded_duration
 
@@ -354,10 +363,15 @@ def to_record(value, annotation) -> JSON:
     if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
         return dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        fields = record_fields(value, type(value))
-        if type(value) is _unwrapped(annotation):
-            return fields
-        return {"class": import_path(type(value)), "fields": fields}
+        with recording() as written:
+            if isinstance(value, nn.Module) and id(value) in written:
+                return _referred(written, written[id(value)])
+            fields = record_fields(value, type(value))
+            record = (fields if type(value) is _unwrapped(annotation)
+                      else {"class": import_path(type(value)), "fields": fields})
+            if isinstance(value, nn.Module):
+                written[id(value)] = (value, record)
+            return record
     if isinstance(value, (types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
         return {"function": import_path(value)}
     if isinstance(value, (list, tuple)):
@@ -443,6 +457,9 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     annotation = resolve_alias(annotation)
     if isinstance(value, Mapping) and set(value) == {"function"} and isinstance(value["function"], str):
         return imported(value["function"])
+    if (isinstance(value, Mapping) and annotation not in (None, object)
+            and typing.get_origin(annotation) not in _MAPPINGS and _sharing(value) is not None):
+        return _shared(annotation, value, dtypes=dtypes)
     if typing.get_origin(annotation) in (Union, types.UnionType):
         if value is None:
             return value
@@ -503,6 +520,109 @@ def _class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
     if set(value) <= {"class", "fields"} and isinstance(name, str) and isinstance(fields, Mapping):
         return name, fields
     return None
+
+
+type _Written = dict[int, tuple[nn.Module, dict[str, JSON]]]
+
+_WRITTEN: contextvars.ContextVar[_Written | None] = contextvars.ContextVar("_WRITTEN", default=None)
+"""The Flax modules the record being written holds, by identity, each with its record."""
+
+
+@contextlib.contextmanager
+def recording() -> Iterator[_Written]:
+    """One record being written: a module held twice in it is written once
+    and referred to after (`to_record`). The outermost call opens the record;
+    one inside it writes into the same record."""
+    held = _WRITTEN.get()
+    if held is not None:
+        yield held
+        return
+    opened: _Written = {}
+    token = _WRITTEN.set(opened)
+    try:
+        yield opened
+    finally:
+        _WRITTEN.reset(token)
+
+
+def _referred(written: _Written, first: tuple[nn.Module, dict[str, JSON]]) -> JSON:
+    """The reference to a module the record already holds: its first record
+    becomes a class record numbered `share`, in place, and the reference
+    names that number."""
+    module, record = first
+    if "share" not in record:
+        if "class" not in record:
+            fields = dict(record)
+            record.clear()
+            record.update({"class": import_path(type(module)), "fields": fields})
+        record["share"] = sum("share" in held for _, held in written.values())
+    return {"shared": record["share"]}
+
+
+@dataclasses.dataclass
+class _Shared:
+    """The shared modules of the record being read: each one's defining
+    record, by number, and the module once it is built."""
+
+    defined: dict[int, Mapping[str, object]]
+    built: dict[int, Configured] = dataclasses.field(default_factory=dict)
+
+
+_READING: contextvars.ContextVar[_Shared | None] = contextvars.ContextVar("_READING", default=None)
+
+
+@contextlib.contextmanager
+def _reading(record: Configured | Mapping[str, object]) -> Iterator[None]:
+    """One record being read: every module it shares (`to_record`) is built
+    once, where the record first holds it or refers to it. The outermost call
+    opens the record; one inside it reads the same record."""
+    if _READING.get() is not None:
+        yield
+        return
+    defined: dict[int, Mapping[str, object]] = {}
+
+    def scan(node) -> None:  # any value a record holds, a record of records or not
+        if isinstance(node, Mapping):
+            number = _sharing(node)
+            if number is not None and "share" in node:
+                if number in defined:
+                    raise ValueError(f"the record defines its shared module {number} twice")
+                defined[number] = {str(key): entry for key, entry in node.items() if key != "share"}
+            for entry in node.values():
+                scan(entry)
+        elif isinstance(node, (list, tuple)):
+            for entry in node:
+                scan(entry)
+
+    scan(record)
+    token = _READING.set(_Shared(defined))
+    try:
+        yield
+    finally:
+        _READING.reset(token)
+
+
+def _sharing(value: Mapping[str, object] | Mapping[RecordKey, object]) -> int | None:
+    """The number of the shared module `value` defines, a class record with
+    `"share": n`, or refers to, `{"shared": n}`; None for any other record."""
+    keys = set(value)
+    number = (value.get("shared") if keys == {"shared"} else
+              value.get("share") if {"class", "share"} <= keys <= {"class", "fields", "share"} else None)
+    return number if isinstance(number, int) and not isinstance(number, bool) else None
+
+
+def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool) -> Configured:
+    """The one module a shared record (`{"share": n, ...}`) or a reference to
+    it (`{"shared": n}`) stands for, built the first time either is read."""
+    shared = _READING.get()
+    number = _sharing(value)
+    if shared is None or number is None:
+        raise ValueError(f"{value!r} is no shared module of a record being read")
+    if number not in shared.built:
+        if number not in shared.defined:
+            raise ValueError(f"the record refers to its shared module {number} and defines none")
+        shared.built[number] = _rebuilt(annotation, shared.defined[number], dtypes=dtypes)
+    return shared.built[number]
 
 
 def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
@@ -649,11 +769,12 @@ def argument_records(member: type | Callable[..., Configured], fields: Mapping[s
     if unknown:
         raise ValueError(f"{member.__name__} takes no {unknown}; its parameters are {sorted(named)}")
     records = {}
-    for name, value in fields.items():
-        annotation = _parameter_type(named[name][1], name) if name in named else None
-        built = (_rebuilt(annotation, value, dtypes=False, name=name)
-                 if isinstance(value, (Mapping, list)) else value)
-        records[name] = to_record(built, annotation)
+    with _reading(fields), recording():
+        for name, value in fields.items():
+            annotation = _parameter_type(named[name][1], name) if name in named else None
+            built = (_rebuilt(annotation, value, dtypes=False, name=name)
+                     if isinstance(value, (Mapping, list)) else value)
+            records[name] = to_record(built, annotation)
     return records
 
 
@@ -728,11 +849,12 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
     from flax import linen as nn
 
     fields = {}
-    for field in dataclasses.fields(value):
-        held = getattr(value, field.name)
-        if (_recorded(field) and not (isinstance(value, nn.Module) and field.name in ('parent', 'name'))
-                and not (callable(held) and held is field.default)):
-            fields[field.name] = to_record(held, _declared_type(owner, field.name))
+    with recording():
+        for field in dataclasses.fields(value):
+            held = getattr(value, field.name)
+            if (_recorded(field) and not (isinstance(value, nn.Module) and field.name in ('parent', 'name'))
+                    and not (callable(held) and held is field.default)):
+                fields[field.name] = to_record(held, _declared_type(owner, field.name))
     return fields
 
 
@@ -915,7 +1037,6 @@ datasets: Aliases[type[DatasetSpec], DatasetSpec] = Aliases("dataset", {
     "local_videos": "dew.data.video:LocalVideos",
     "online_images": "dew.data.streaming:OnlineImages",
     "online_videos": "dew.data.streaming:OnlineVideos",
-    "packed_tokens": "dew.data.tokens:PackedTokens",
     "preference_pairs": "dew.data.preferences:PreferencePairs",
     "prompts": "dew.data.prompts:Prompts",
     "tfds": "dew.data.providers:PreparedTFDS",

@@ -1,9 +1,17 @@
-"""The labelled sets the decision recipes train on, each read at a pinned commit.
+"""The labelled sets the decision recipes train on, each read at a pinned commit and written as JSON lines.
+
+    python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
 
 Every source turns its rows into `dew.decision.Example`s: a state, typed
 questions, and each question's gold, an answer or a distribution. `Mixture`
-holds one of each at its weight and gives `DecisionObjective.dataset` the
-weighted sets and the held-out examples.
+holds one of each at its weight, and this writes each set's training
+examples to `<out>/<name>.jsonl` and the ones it holds back to
+`<out>/<name>.held.jsonl`, in the rows `Example.of` reads, and records the
+weights, every source's settings and what decontamination dropped in
+`<out>/mixture.json`. A run reads the directory as a
+`dew.decision.DecisionMixture` (`encoder.py`, `clef.py`). `--decontaminate`
+names an evaluation index `contamination.py` built: every example whose
+content an evaluation item shares is dropped before it is written.
 
 Sources whose rows are benchmark-style items (a passage and a question, a
 request and its intents) are framed two ways, half of the rows each, chosen
@@ -19,15 +27,20 @@ BoolQ's card state Apache-2.0, Apache-2.0 and CC BY-SA 3.0; BANKING77 CC BY
 BY-SA 4.0. Nothing non-commercial is read.
 """
 
+import dataclasses
 import hashlib
 import json
 import random
 from collections import defaultdict
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, fields
-from typing import ClassVar
+from pathlib import Path
+from typing import TYPE_CHECKING, ClassVar
 
-from dew.decision import Choice, Example, Noul, Question, Score, Weighted
+from dew.decision import Choice, Example, Noul, Question, Score
+
+if TYPE_CHECKING:
+    from contamination import Overlaps
 
 type Value = str | int | float | bool | None | list["Value"] | dict[str, "Value"]
 """A JSON value, as `json.loads` returns one."""
@@ -129,18 +142,20 @@ class OpenJev(Source):
     """ZefanCai/Open-Jev's typed decisions (CC0), grouped by state into examples of several questions.
 
     Rows that share a group and a state become one example, at most `questions`
-    of them each, so a joint layout reads them in one row. A row's `target` is
-    its gold distribution in its options' order; a choice's options read
-    `key: description`. The calibration split is held out whole.
+    of them each, so a joint layout reads them in one row: two fit Clef's
+    layout in 4,096 tokens in every example of a sample of 2,000, where a
+    fifth of the examples of three or more do not. A row's `target` is its gold
+    distribution in its options' order; a choice's options read
+    `key: description`. The calibration split is held out, `calibration` of
+    its examples or all of them.
     """
 
     natural: ClassVar[bool] = False
     weight: float = 0.30
     calibration: int | None = None
-    """How many of the calibration split's examples to hold out; None, all of them."""
     config: str = "release-v2-redistributable"
     revision: str = "c67699e13d0ae25e35b77165a4b6b079bedc8aba"
-    questions: int = 8
+    questions: int = 2
 
     def read(self, split: str) -> list[Example]:
         rows = _rows("ZefanCai/Open-Jev", self.revision, f"data/{self.config}/{split}-00000-of-00001.parquet")
@@ -436,27 +451,55 @@ class Mixture:
             if source.weight > 0:
                 yield entry.name, source
 
-    def read(self, keep: Callable[[str, Sequence[Example], bool], list[Example]] | None = None
-             ) -> tuple[dict[str, Weighted], list[Example]]:
-        """Every source's training set at its weight, and their held-out examples together.
-
-        `keep` filters each source's examples, by its name and whether it is
-        natural text, before they are weighed: the decontamination step
-        (`contamination.Overlaps.keep`).
-        """
-        weighted, held = {}, []
-        for name, source in self.sources():
-            train, kept_back = source.split()
-            if keep is not None:
-                train = keep(name, train, source.natural)
-                kept_back = keep(f"{name} (held out)", kept_back, source.natural)
-            weighted[name] = Weighted(train, source.weight)
-            held.extend(kept_back)
-        return weighted, held
 
 
-def weights(mixture: Mixture) -> Mapping[str, float]:
-    """The share of a step each source fills, normalised."""
-    total = sum(source.weight for _, source in mixture.sources())
-    return {name: source.weight / total for name, source in mixture.sources()}
+def row(example: Example) -> dict[str, Value]:
+    """`example` as the JSON row `Example.of` reads back."""
+    return {"state": example.state,
+            "questions": {name: question.wire() for name, question in example.questions.items()},
+            "answers": dict(example.answers),
+            "targets": {name: list(target) for name, target in example.targets.items()}}
 
+
+def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None) -> dict[str, Value]:
+    """Write `mixture`'s sets under `out`, each decontaminated against `overlaps`, and return what
+    `<out>/mixture.json` records."""
+    out.mkdir(parents=True, exist_ok=True)
+    counts: dict[str, Value] = {}
+    for name, source in mixture.sources():
+        train, held = source.split()
+        if overlaps is not None:
+            train = overlaps.keep(name, train, source.natural)
+            held = overlaps.keep(f"{name} (held out)", held, source.natural)
+        for suffix, examples in ((".jsonl", train), (".held.jsonl", held)):
+            if examples:
+                lines = (json.dumps(row(example), ensure_ascii=False) + "\n" for example in examples)
+                (out / f"{name}{suffix}").write_text("".join(lines))
+        counts[name] = {"train": len(train), "held": len(held)}
+    made: dict[str, Value] = {
+        "weights": {name: source.weight for name, source in mixture.sources()},
+        "rows": counts,
+        "sources": {name: {"class": type(source).__name__, **dataclasses.asdict(source)}
+                    for name, source in mixture.sources()},
+        "decontamination": None if overlaps is None else dict(overlaps.report),
+    }
+    (out / "mixture.json").write_text(json.dumps(made, indent=1) + "\n")
+    return made
+
+
+@dataclass(frozen=True)
+class Conversion:
+    """The module's command: the sets, where they go, and the index they are decontaminated against."""
+
+    out: str = "data/mixture"
+    decontaminate: str | None = None
+    mixture: Mixture = field(default_factory=Mixture)
+
+
+if __name__ == "__main__":
+    import tyro
+    from contamination import Overlaps
+
+    conversion = tyro.cli(Conversion)
+    overlaps = None if conversion.decontaminate is None else Overlaps.load(conversion.decontaminate)
+    print(json.dumps(write(conversion.mixture, Path(conversion.out), overlaps)["rows"]))

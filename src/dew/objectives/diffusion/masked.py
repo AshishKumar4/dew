@@ -180,7 +180,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         The model reads every field the batch's `ModelInputs` carries, and a
         model that takes no such field refuses it. A packed batch
-        (data:packed-tokens) names each window's documents in
+        (`TokenWindows(pack=True)`) names each window's documents in
         `text_segment_ids`, 0 for the padded tail, and their positions in
         `text_positions`. Each document then attends to itself alone, in both
         directions, with its own positions, and the tail is neither masked

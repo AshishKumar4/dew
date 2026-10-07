@@ -133,16 +133,16 @@ def _scored(entries: list[tuple[np.ndarray, np.ndarray, int]]) -> dict:
 def open_jev(engine: Engine, split: str, limit: int | None = None) -> dict:
     """Open-Jev's `test` or `ood` split, each example's questions asked in one request, against its targets.
 
-    The examples are grouped as the recipes train on them (`sources.OpenJev`);
-    the same metrics as typed-decisions, the gold label the target's most
-    likely option.
+    Up to eight questions of a state are asked in one request, as a joint
+    model reads them; the same metrics as typed-decisions, the gold label the
+    target's most likely option.
     """
     sys.path.insert(0, str(Path(__file__).parent))
     from sources import OpenJev
 
     rows = defaultdict(list)
     started, refused = time.time(), 0
-    for example in OpenJev().read(split)[:limit]:
+    for example in OpenJev(questions=8).read(split)[:limit]:
         request = {"state": example.state,
                    "questions": {name: question.wire() for name, question in example.questions.items()}}
         answers = engine(request)["answers"]

@@ -319,7 +319,7 @@ def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
     config = grpo_run()
     objective = config.build()
     assert isinstance(objective, FlowGRPOObjective)
-    prepared, started, state = grpo_step(objective, config.rollout(objective))
+    prepared, started, state = grpo_step(objective, objective.rollout())
     assert prepared["latents"].shape[:2] == (jax.device_count() * 2, 2)
     assert np.all(np.isfinite(prepared["rewards"]))
     assert any(not np.array_equal(after, before) for after, before in zip(
@@ -336,7 +336,7 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
     config = grpo_run(beta=0.1, directory=str(tmp_path))
     objective = config.build()
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    _, started, state = grpo_step(objective, config.rollout(objective), checkpoints=checkpoints)
+    _, started, state = grpo_step(objective, objective.rollout(), checkpoints=checkpoints)
     checkpoints.save(1, state, None, {}, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))

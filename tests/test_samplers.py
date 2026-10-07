@@ -1312,6 +1312,24 @@ def test_heun_walks_edms_algorithm_2_with_its_churn(name):
     assert_as_exact_as_the_reference(walked, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
 
 
+@pytest.mark.parametrize("name", ["deterministic", "churn"])
+def test_the_closing_denoise_is_edms_last_euler_step_onto_sigma_zero(name):
+    """NVlabs' sampler ends with an Euler step from its last sigma onto the
+    zero it appends, which lands on the model's clean prediction at that
+    sigma. `sample` stopped at the last sigma closes with that prediction
+    (`final_denoise`, its default) and matches the published sampler as
+    exactly as its own float32 walk; the churn case's last sigma, 0.002, is
+    below its S_min, so nothing is churned there."""
+    arguments = json.loads(str(EDM[f"{name}.arguments"]))
+    steps = arguments["num_steps"]
+    solver = Heun(s_churn=arguments.get("S_churn", 0.0), s_tmin=arguments.get("S_min", 0.0),
+                  s_tmax=arguments.get("S_max", float("inf")), s_noise=arguments.get("S_noise", 1.0))
+    x_T = jnp.asarray(EDM["latents"] * np.float32(80.0))
+    closed = sample(edm_grid(steps).denoiser(EDMOracle(), {}, {}), x_T, solver=solver,
+                    key=jax.random.PRNGKey(7), times=np.arange(steps, 0, -1, dtype=np.float32))
+    assert_as_exact_as_the_reference(closed, EDM[f"{name}.result32"], EDM[f"{name}.result"], name)
+
+
 def test_heun_refuses_a_churn_past_the_schedules_top():
     """gamma is sqrt(2) - 1 here, so churning at sigma 80 would evaluate the
     model at 113, a level the grid has no time for."""

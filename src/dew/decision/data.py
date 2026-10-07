@@ -1,5 +1,6 @@
 """Labelled requests: what a decision model trains and calibrates on."""
 
+import json
 import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -96,6 +97,52 @@ class Weighted:
     examples: Sequence["Example | Mapping[str, object]"]
     """`Example`s, or rows `Example.of` reads."""
     weight: float
+
+
+@dataclass(frozen=True)
+class DecisionMixture:
+    """Labelled sets of examples, each at its share of every training step.
+
+    `root` holds each set as JSON-lines rows `Example.of` reads, `<name>.jsonl`,
+    and the rows it holds back for validation and calibration as
+    `<name>.held.jsonl`, where it holds some back. Each set's share is the one
+    `<root>/mixture.json` records, as `recipes/decision/sources.py` writes it
+    beside the sets, unless `weights` gives another: a weight there adds a
+    set of your own, and a weight of 0 leaves a set out.
+    """
+
+    root: str = "data/mixture"
+    weights: dict[str, float] = field(default_factory=dict)
+
+    def recorded(self) -> JSON:
+        """What `<root>/mixture.json` records about how the sets were made, or nothing."""
+        path = Path(self.root) / "mixture.json"
+        return json_value(json.loads(path.read_text()), "mixture.json") if path.is_file() else {}
+
+    def shares(self) -> dict[str, float]:
+        """Each set's share by name, those of weight 0 left out."""
+        recorded = record(record(self.recorded(), "mixture.json").get("weights", {}), "weights")
+        stated = {name: records.number(weight, f"weights.{name}") for name, weight in recorded.items()}
+        shares = {name: float(weight) for name, weight in (stated | self.weights).items() if weight > 0}
+        if not shares:
+            raise ValueError(f"no set has a weight: give --mixture.weights, or write "
+                             f"{self.root}/mixture.json")
+        return shares
+
+    def read(self) -> tuple[dict[str, Weighted], list[Example]]:
+        """Every set at its share, and the rows they hold back, together."""
+        weighted, held = {}, []
+        for name, weight in self.shares().items():
+            weighted[name] = Weighted(_lines(Path(self.root) / f"{name}.jsonl"), weight)
+            kept = Path(self.root) / f"{name}.held.jsonl"
+            if kept.is_file():
+                held.extend(_lines(kept))
+        return weighted, held
+
+
+def _lines(path: Path) -> list[Example]:
+    with path.open() as file:
+        return [Example.of(json.loads(line)) for line in file if line.strip()]
 
 
 def _distribution(question: Question, target: JSON, name: str) -> tuple[float, ...]:

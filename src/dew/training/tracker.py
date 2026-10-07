@@ -44,9 +44,9 @@ if TYPE_CHECKING:
 
 
 type Reported = Record | Artifact
-"""What a tracker is handed: one of the run's own records, or one of the
-artifact types an objective's evaluation produces. A renderer is registered
-per type, and a new artifact type joins `dew.artifacts.Artifact`."""
+"""What a tracker is handed: one of the run's own records, or an artifact an
+objective's evaluation produces. A renderer is registered per artifact type
+Dew defines, and a type with none is refused (`dew.artifacts.Artifact`)."""
 
 
 class Tracker(Protocol):

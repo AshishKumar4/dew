@@ -665,7 +665,7 @@ class ChatMessages(DatasetSpec):
     The packing plan adds each conversation to the first window with room,
     split into chunks when it is longer than a window. Every window has
     `text_roles` beside the ids, so the loss can count one role's targets.
-    As with the documents of `PackedTokens`, the plan runs over the whole
+    As with the documents of `TokenWindows(pack=True)`, the plan runs over the whole
     corpus in row order before the data is sharded. So `records` is exactly
     the number of windows in one pass, and a saved position is a global
     window count.

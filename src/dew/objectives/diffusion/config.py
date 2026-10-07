@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, ClassVar
 
 import jax
 
-from dew.config import ModelConfig, ObjectiveConfig, RunConfig
+from dew.config import ModelConfig, ObjectiveConfig, Prepared, RunConfig
 from dew.data import ImageDataset, OnlineImages, OnlineVideos, TFDSImages, VideoDataset
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
@@ -49,7 +49,6 @@ if TYPE_CHECKING:
     from flax import linen as nn
 
     from dew.diffusion.presets import Preset
-    from dew.objectives.rl.flow import FlowRollout
 
     # A kind's `union` imports every aliased class, so the run builds it at
     # the end of the module, where the annotations, read when a command line
@@ -283,9 +282,7 @@ class DiffusionRunConfig(RunConfig):
             return Field("video", (spec.frames, spec.image_size, spec.image_size, 3))
         if isinstance(spec, (ImageDataset, OnlineImages)):
             return Field("image", (spec.image_size, spec.image_size, 3))
-        raise ValueError(
-            f"the diffusion recipe trains on image or video datasets, not "
-            f"{type(spec).__name__}")
+        raise ValueError(f"a diffusion run trains on image or video datasets, not {type(spec).__name__}")
 
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
         """Return the fields the registry builds the model from.
@@ -391,13 +388,20 @@ class DiffusionRunConfig(RunConfig):
         assert isinstance(objective, DiffusionObjective)
         return objective
 
-    def rollout(self, objective: DiffusionObjective) -> FlowRollout | None:
-        """Return the trainer's rollout over `objective`: Flow-GRPO's
-        (`FlowGRPOObjective.rollout`), or None for an objective whose loss
-        trains on each batch as it comes."""
+    def prepare(self) -> Prepared:
+        """The objective `build` makes, with the run's Hub sources pinned
+        (`pinned`), on its data, whose captions the objective's conditions
+        tokenize. `val_metrics` score each validation, and Flow-GRPO samples
+        the batches it trains on (`FlowGRPOObjective.rollout`)."""
         from dew.objectives.rl.flow import FlowGRPOObjective
 
-        return objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
+        run = self.pinned()
+        objective = run.build()
+        dataset = run.data.load(batch=run.trainer.batch_size, tokenize=objective.inputs.tokenize)
+        metrics = run.build_eval_metrics()
+        rollout = objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
+        return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,
+                                                    rollout=rollout))
 
     def pinned(self) -> DiffusionRunConfig:
         """Return this run with its Hub sources pinned to the commits they resolve to now.

@@ -2,22 +2,23 @@
 
 A corpus is a stream of token ids, stored either as the `.bin` files that
 `TokenCorpus.write` (and `dew tokenize`) writes or as ArrayRecord shards of
-token arrays. `TokenSource` is that stream, read by slice, and `TokenBytes`
-and `TokenRecords` read it from the two stores. `token_corpus` finds the
-train and validation corpora a run needs in a directory, and picks the
-reader from the files it finds there.
+token arrays. Either store is read the same way: its length in tokens, a
+contiguous span by slice, and the `eos_id` that ends a document (None for a
+corpus written without boundaries). `token_corpus` finds the train and
+validation corpora a run needs in a directory, and picks the reader from
+the files it finds there.
 
-`TokenWindowSource` reads a record as a contiguous window of `seq_len + 1`
-ids starting at `i * stride`. The default stride is `seq_len`, so record
-i's last token is record i+1's first and every transition appears once.
+`_Windows` reads a record as a contiguous window of `seq_len + 1` ids
+starting at `i * stride`. The default stride is `seq_len`, so record i's
+last token is record i+1's first and every transition appears once.
 Smaller strides overlap windows. Nothing here decodes or draws random
 numbers; the sampler does the shuffling.
 
-`TokenDocumentSource` reads a record as one document: the span from after the
-previous eos id through its own. The packed pipeline uses it, because it
-needs to know where documents end so it can pack several into one window.
-Both read through `TokenSource` and nothing else, so the same corpus in
-either store gives the same windows and the same packing plan.
+`_Documents` reads a record as one document: the span from after the
+previous eos id through its own. Packing uses it, because it needs to know
+where documents end so it can pack several into one window. Both read a
+corpus by span and nothing else, so the same corpus in either store gives
+the same windows and the same packing plan.
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import tempfile
 import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
 import numpy as np
 
@@ -44,31 +45,6 @@ if TYPE_CHECKING:
 # meta.json's "dtype" names numpy dtypes; uint16 covers byte tokenizers and
 # most HF ones, uint32 the rest.
 _DEFAULT_DTYPE = np.dtype("<u2")
-
-
-@runtime_checkable
-class TokenSource(Protocol):
-    """Reads a tokenized corpus as one stream of ids.
-
-    `len(source)` is the number of tokens it holds, and `source[start:stop]`
-    returns that span of them as an array. `TokenWindowSource` and
-    `TokenDocumentSource` read their records through these two operations
-    only. A fixed window is a strided span, and a document is the span
-    between two eos ids.
-
-    `eos_id` is the id that ends a document. Only the packed reader needs it,
-    and it is None for a corpus written without document boundaries. A
-    source's repr names what it reads, such as its path, because a saved
-    position compares against that description (`describe`). A repr with a
-    memory address would never match after a restart.
-    """
-
-    @property
-    def eos_id(self) -> int | None: ...
-
-    def __len__(self) -> int: ...
-
-    def __getitem__(self, span: slice) -> np.ndarray: ...
 
 
 def _meta(root: Path) -> Mapping[str, object]:
@@ -145,7 +121,7 @@ class TokenCorpus:
     @classmethod
     def write(cls, documents: str | os.PathLike[str] | Iterable[str], out: str | os.PathLike[str], *,
               tokenizer: str = "byte", val_fraction: float = 0.01, pack: bool = False) -> TokenCorpus:
-        """Tokenize a corpus into the directory `TokenWindows` and `PackedTokens` read.
+        """Tokenize a corpus into the directory `TokenWindows` reads.
 
         `documents` is a text file, a directory read as every `*.txt` under it
         in path order (each file one document), or any iterable of strings, one
@@ -160,7 +136,7 @@ class TokenCorpus:
         head. The ids the tokenizer adds to a single encode (for many
         tokenizers, a bos id) are written once per document. With `pack`,
         every document ends with the tokenizer's eos id, which is where
-        `PackedTokens` cuts documents; a tokenizer without one raises
+        `TokenWindows(pack=True)` cuts documents; a tokenizer without one raises
         `ValueError`. A file is read in chunks that each end at a newline. So
         a corpus larger than memory needs only disk space, and a tokenizer
         that merges across its input sees whole lines.
@@ -177,7 +153,7 @@ class TokenCorpus:
             raise ValueError(f"pack ends every document with an eos id, and tokenizer {tokenizer!r} has none")
         root = Path(out)
         root.mkdir(parents=True, exist_ok=True)
-        dtype = dtype_for(encoder.vocab_size)
+        dtype = _dtype_for(encoder.vocab_size)
 
         # One encode pass writes the whole stream to a scratch file; the split
         # point needs the total count, and slicing a memmap of it costs a linear
@@ -249,7 +225,7 @@ def _added(encoder: ByteTokenizer | HFTokenizer) -> tuple[list[int], list[int]]:
         f"contain its plain encoding {plain}; the ids it adds cannot be placed per document")
 
 
-def dtype_for(vocab_size: int) -> np.dtype:
+def _dtype_for(vocab_size: int) -> np.dtype:
     """The smallest unsigned dtype that holds every id a vocabulary emits."""
     for dtype in (np.dtype("uint8"), np.dtype("uint16")):
         if vocab_size <= np.iinfo(dtype).max + 1:
@@ -344,29 +320,31 @@ class HubText:
         return str(directory)
 
 
-class TokenBytes(_Reopened):
+class _TokenBytes(_Reopened):
     """Reads a flat `.bin` of token ids through a memmap.
 
     The dtype comes from the `meta.json` beside the file, where the tokenize
-    tool records it, and is uint16 when there is none. `eos_id` defaults to
-    the one `meta.json` records. The file is never loaded into memory; a
-    worker reads only the span it asks for.
+    tool records it, and is uint16 when there is none, as is `eos_id`. The
+    file is never loaded into memory; a worker reads only the span it asks
+    for. The repr names the file, because a saved position compares against
+    that description (`describe`), and a memory address would never match
+    after a restart.
     """
 
     handle = "_tokens"
 
-    def __init__(self, path: str, eos_id: int | None = None):
+    def __init__(self, path: str):
         self.path = str(path)
         meta = _meta(Path(self.path).parent)
         self.dtype = _dtype(meta)
-        self.eos_id = eos_id if eos_id is not None else _recorded(meta, "eos_id")
+        self.eos_id = _recorded(meta, "eos_id")
         self._tokens = self.open_handle()
 
     def open_handle(self) -> np.memmap:
         return np.memmap(self.path, dtype=self.dtype, mode="r")
 
     def __repr__(self) -> str:
-        return f"TokenBytes(path={self.path!r})"
+        return f"_TokenBytes(path={self.path!r})"
 
     def __len__(self) -> int:
         return len(self._tokens)
@@ -375,23 +353,47 @@ class TokenBytes(_Reopened):
         return np.asarray(self._tokens[span])
 
 
-class _Sharded:
-    """Reads token arrays as one stream, in the order they are stored.
+class _TokenRecords(_Reopened):
+    """Reads token arrays in ArrayRecord shards as one stream.
 
-    A corpus of records or rows is the concatenation of them, so where a span
-    falls is a binary search over their lengths, read once at construction. A
-    span that crosses a boundary reads both pieces and joins them; one that
-    does not reads one. Only the pieces a record covers are read, so a corpus
-    is no more in memory than the memmap is.
+    Each record holds one array of ids, either as raw bytes or, with
+    `field`, under that key of a dict packed by
+    `dew.data.images.pack_dict_of_byte_arrays`. `dtype` is the width of the
+    stored ids. The stream is the records joined in file order, so a corpus
+    written one document per record reads back the same as one written in
+    fixed blocks. Where a span falls is a binary search over the records'
+    lengths, read once at construction; a span that crosses a boundary reads
+    both records and joins them. Only the records a span covers are read, so
+    a corpus is no more in memory than the memmap is.
     """
 
-    def __init__(self, lengths: Sequence[int], dtype: np.dtype):
-        self.dtype = dtype
+    handle = "_records"
+
+    def __init__(self, paths: Sequence[str], *, field: str | None, dtype: np.dtype, eos_id: int | None):
+        self.paths = [str(path) for path in paths]
+        self.field = field
+        self.dtype = np.dtype(dtype)
+        self.eos_id = eos_id
+        self._records = self.open_handle()
+        lengths = [len(self.piece(index)) for index in range(len(self._records))]
         self._ends = np.cumsum(np.asarray(lengths, np.int64)) if lengths else np.zeros(0, np.int64)
 
     def piece(self, index: int) -> np.ndarray:
-        """Record or row `index`, as its token ids."""
-        raise NotImplementedError
+        """Record `index`'s token ids, out of its bytes."""
+        from ..images import unpack_dict_of_byte_arrays
+
+        raw = self._records[index]
+        if self.field is not None:
+            raw = unpack_dict_of_byte_arrays(raw)[self.field]
+        return np.frombuffer(raw, dtype=self.dtype)
+
+    def open_handle(self):
+        from array_record.python.array_record_data_source import ArrayRecordDataSource
+
+        return ArrayRecordDataSource(list(self.paths))
+
+    def __repr__(self) -> str:
+        return f"_TokenRecords(paths={self.paths!r}, field={self.field!r})"
 
     def __len__(self) -> int:
         return int(self._ends[-1]) if len(self._ends) else 0
@@ -414,51 +416,6 @@ class _Sharded:
         return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
 
 
-class TokenRecords(_Reopened, _Sharded):
-    """Reads token arrays in ArrayRecord shards as one stream.
-
-    Each record holds one array of ids, either as raw bytes or, with
-    `field`, under that key of a dict packed by
-    `dew.data.images.pack_dict_of_byte_arrays`. `dtype` is the width of the
-    stored ids, uint16 by default. The stream is the records joined in file
-    order, so a corpus written one document per record reads back the same
-    as one written in fixed blocks.
-    """
-
-    handle = "_records"
-
-    def __init__(self, paths: Sequence[str], *, field: str | None = None,
-                 dtype: np.dtype = _DEFAULT_DTYPE, eos_id: int | None = None):
-        if not paths:
-            raise ValueError("TokenRecords needs at least one arrayrecord file")
-        self.paths = [str(path) for path in paths]
-        self.field = field
-        self.eos_id = None if eos_id is None else int(eos_id)
-        self._records = self.open_handle()
-        super().__init__([len(self._ids(index, np.dtype(dtype)))
-                          for index in range(len(self._records))], np.dtype(dtype))
-
-    def _ids(self, index: int, dtype: np.dtype) -> np.ndarray:
-        """Record `index`'s token ids, out of its bytes."""
-        from ..images import unpack_dict_of_byte_arrays
-
-        raw = self._records[index]
-        if self.field is not None:
-            raw = unpack_dict_of_byte_arrays(raw)[self.field]
-        return np.frombuffer(raw, dtype=dtype)
-
-    def piece(self, index: int) -> np.ndarray:
-        return self._ids(index, self.dtype)
-
-    def open_handle(self):
-        from array_record.python.array_record_data_source import ArrayRecordDataSource
-
-        return ArrayRecordDataSource(list(self.paths))
-
-    def __repr__(self) -> str:
-        return f"TokenRecords(paths={self.paths!r}, field={self.field!r})"
-
-
 _STORES = (".bin", ".array_record")
 """What a tokenized corpus is held in, named by the suffix of its files."""
 
@@ -479,7 +436,7 @@ def same_tokenizer(paths: list[str]) -> None:
 
 
 def token_corpus(path: str | None, name: str, *, field: str | None = None
-                 ) -> tuple[TokenSource, TokenSource]:
+                 ) -> tuple[_TokenBytes | _TokenRecords, _TokenBytes | _TokenRecords]:
     """The `(train, val)` corpora of a tokenized directory, both required.
 
     A split's files are the ones named for it, and their suffix says which
@@ -495,7 +452,7 @@ def token_corpus(path: str | None, name: str, *, field: str | None = None
     return _split(root, "train", name, field), _split(root, "val", name, field)
 
 
-def _split(root: Path, split: str, name: str, field: str | None) -> TokenSource:
+def _split(root: Path, split: str, name: str, field: str | None) -> _TokenBytes | _TokenRecords:
     """One split of a tokenized directory, out of the store its files are in."""
     meta = _meta(root)
     dtype, eos_id = _dtype(meta), _recorded(meta, "eos_id")
@@ -513,11 +470,11 @@ def _split(root: Path, split: str, name: str, field: str | None) -> TokenSource:
             f"writes the held-out split")
     files = found[stores[0]]
     if stores[0] == ".bin":
-        return TokenBytes(files[0])
-    return TokenRecords(files, field=field, dtype=dtype, eos_id=eos_id)
+        return _TokenBytes(files[0])
+    return _TokenRecords(files, field=field, dtype=dtype, eos_id=eos_id)
 
 
-class TokenWindowSource:
+class _Windows:
     """Reads fixed `seq_len + 1` windows over a token corpus, by index.
 
     Record i is `{"text": ids}`, with the int32 ids starting at
@@ -526,7 +483,7 @@ class TokenWindowSource:
     contiguous window; incomplete tails are excluded.
     """
 
-    def __init__(self, tokens: TokenSource, seq_len: int, *, stride: int | None = None):
+    def __init__(self, tokens: _TokenBytes | _TokenRecords, seq_len: int, *, stride: int | None = None):
         if seq_len < 1:
             raise ValueError(f"seq_len must be at least 1, got {seq_len}")
         self.tokens = tokens
@@ -543,7 +500,7 @@ class TokenWindowSource:
     def __repr__(self) -> str:
         # The description a saved position compares against (`describe`).
         stride = "" if self.stride == self.seq_len else f", stride={self.stride}"
-        return f"TokenWindowSource(tokens={self.tokens!r}, seq_len={self.seq_len}{stride})"
+        return f"_Windows(tokens={self.tokens!r}, seq_len={self.seq_len}{stride})"
 
     def __len__(self) -> int:
         return (len(self.tokens) - self.seq_len - 1) // self.stride + 1
@@ -557,7 +514,7 @@ class TokenWindowSource:
         return {"text": self.tokens[start:start + self.seq_len + 1].astype(np.int32)}
 
 
-class TokenDocumentSource:
+class _Documents:
     """Reads one document per record over a token corpus, by index.
 
     A document is the span from after the previous `eos_id` through its own,
@@ -568,7 +525,7 @@ class TokenDocumentSource:
     ends of input documents. So a split can begin or end partway through a
     document.
 
-    `eos_id` defaults to the corpus's own. If neither is set, the constructor
+    The boundaries are the corpus's own `eos_id`; a corpus without one
     raises `ValueError`, because the stream has no boundaries to find.
     Finding them reads the corpus once at construction, and after that a
     worker reads only the span it asks for.
@@ -579,15 +536,13 @@ class TokenDocumentSource:
     span.
     """
 
-    def __init__(self, tokens: TokenSource, eos_id: int | None = None, *,
-                 chunk_len: int | None = None):
+    def __init__(self, tokens: _TokenBytes | _TokenRecords, *, chunk_len: int | None = None):
         self.tokens = tokens
-        found = tokens.eos_id if eos_id is None else eos_id
-        if found is None:
+        if tokens.eos_id is None:
             raise ValueError(
                 f"{tokens!r} records no eos_id: document boundaries are the "
                 "eos tokens `dew tokenize` writes with --pack")
-        self.eos_id = int(found)
+        self.eos_id = int(tokens.eos_id)
 
         held = tokens[0:len(tokens)]
         ends = (np.flatnonzero(held == self.eos_id) + 1).astype(np.int64)
@@ -609,7 +564,7 @@ class TokenDocumentSource:
     def __repr__(self) -> str:
         # The description a saved position compares against (`describe`); the
         # packed loader plans its order over these documents.
-        return (f"TokenDocumentSource(tokens={self.tokens!r}, eos_id={self.eos_id}, "
+        return (f"_Documents(tokens={self.tokens!r}, eos_id={self.eos_id}, "
                 f"chunk_len={self.chunk_len})")
 
     def __len__(self) -> int:
