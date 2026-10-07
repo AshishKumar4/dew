@@ -35,8 +35,8 @@ Decision Index requires of an engine:
         --max-len 8192 --head-max-len 6144 --option-tokens 512
     python -m decision_index pipeline --edition 0.2.1 --engine http \\
         --option base_url=http://127.0.0.1:8000 --out runs/di-encoder
- Requests are
-answered one at a time, each in one forward pass per budget's worth of
+
+Requests are answered one at a time, each in one forward pass per budget's worth of
 question rows; `GET /health` answers once the model is loaded.
 """
 
