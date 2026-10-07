@@ -52,8 +52,9 @@ class LMRunConfig(RunConfig):
     """The Hugging Face decoder to continue training from: a hub repo id,
     `repo@revision` (a branch, tag or commit), or a local directory in that
     layout. A run records a hub repo as `repo@commit`, with the commit it
-    resolved to. The checkpoint sets the architecture, so --model.config may
-    then give max_seq_len alone."""
+    resolved to. The checkpoint sets the architecture, so of its fields
+    --model.max-seq-len alone may be set."""
+
     def __post_init__(self) -> None:
         if self.objective.name not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
                                                                              "block_diffusion")):

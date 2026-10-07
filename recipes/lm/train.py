@@ -228,7 +228,7 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
 
     A --pretrained diffusion checkpoint carries mask_token_id in the fields it
     was built from and its weights in `pretrained`, so the run continues from
-    them; a from-scratch run names the mask id beside --model.causal False and
+    them; a from-scratch run names the mask id beside --model.no-causal and
     draws its tree from the key. The validation text is the unmasked rows
     decoded with the run's tokenizer, or bare ids when --sample-tokens is 0.
 
@@ -242,7 +242,7 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
         raise ValueError(
             "masked_diffusion trains a model with a mask token id: continue a "
             "--pretrained diffusion checkpoint, which carries one, or name "
-            "--model.mask-token-id beside --model.causal False")
+            "--model.mask-token-id beside --model.no-causal")
     decode = None if config.sample_tokens <= 0 else run_tokenizer(config.tokenizer).decode
     return config.objective.build(
         model=model, process=MDLM(mask_id=int(mask))(), seq_len=config.data.seq_len + 1, decode=decode,

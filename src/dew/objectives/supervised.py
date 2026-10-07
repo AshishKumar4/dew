@@ -1,18 +1,16 @@
 """Any Flax model, trained on a loss over its outputs and the batch.
 
 `Supervised(model, loss, metrics=(), inputs=InputSpec(Field("x", (4,))))`
-applies the model to the batch field `inputs.sample` names, and needs no
-subclass of `Objective`. `loss(outputs, batch)` returns one loss per example,
-with any trailing axes averaged too; the objective is their mean over the
-batch's rows (`Objective.row_mean`), so an evaluation batch's repeated rows
-count for nothing. Each metric is called the same way and reported as its own
-mean, under its function's name or its class's.
+applies the model to the batch field `inputs.sample` names, with no subclass
+of `Objective`. `loss(outputs, batch)` returns one loss per example, any
+trailing axes averaged too, and the objective is their mean over the batch's
+rows (`Objective.row_mean`), so an evaluation batch's repeated rows count for
+nothing. Each metric is called the same way and reported as its own mean,
+under its function's name or its class's.
 
-A loss or a metric is a function, or a configured object a call reaches
-(`CrossEntropy(labels="label")`), defined at module level: a run's record
-names it by its import path (`ObjectiveConfig`), so another process rebuilds
-the same objective from `run.json`. A lambda has no such path, and writing
-the record refuses it.
+A loss or a metric is a module-level function or a configured callable
+object (`CrossEntropy(labels="label")`): a run's record names it by import
+path (`ObjectiveConfig`), and writing the record refuses a lambda.
 """
 
 from __future__ import annotations
@@ -34,14 +32,13 @@ type Criterion = Callable[[jax.Array, Batch], jax.Array]
 
 
 class Supervised(Objective[Ratio]):
-    """Trains `model` on `loss`, reporting `metrics` beside it.
+    """Trains `model`, a Flax module or a loaded source whose weights training
+    starts from, on `loss`, reporting `metrics` beside it.
 
-    `model` is a Flax module, or a loaded source (`dew.interop.Pretrained`)
-    whose weights training starts from; `inputs.sample` is the batch field it
-    reads and that field's per-example shape, which the trainer checks the
-    first batch against. A model with no starting weights initializes on
-    integer zeros of that shape, which a model that embeds ids reads as ids
-    and any other promotes to its own dtype.
+    `inputs.sample` is the batch field the model reads and its per-example
+    shape, which the trainer checks the first batch against. A model with no
+    starting weights initializes on integer zeros of that shape, which a model
+    that embeds ids reads as ids and any other promotes to its own dtype.
     """
 
     def __init__(self, model: nn.Module | Source[nn.Module], loss: Criterion,
@@ -57,13 +54,16 @@ class Supervised(Objective[Ratio]):
         self.model = self.bind_model(model)
         self.criterion = loss
         self.metrics: Mapping[str, Criterion] = named
+        self.sample = inputs.sample
         self.inputs = inputs
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
-        return self.model.init(key, jnp.zeros((1, *self.inputs.sample.shape), jnp.int32))
+        return self.model.init(key, jnp.zeros((1, *self.sample.shape), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        outputs = self.model.apply(variables, batch[self.inputs.sample.key], rngs={"dropout": step.key})
+        outputs = self.model.apply(variables, batch[self.sample.key], rngs={"dropout": step.key})
+        # `mutable` is unset, so apply returns the output alone, not a pair.
+        assert not isinstance(outputs, tuple)
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "

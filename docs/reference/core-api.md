@@ -4,7 +4,7 @@ This page describes the main interfaces and the contracts between them, grouped 
 
 ## Objective
 
-Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean()` reduces a ratio statistic, and `objective.scalar_loss(variables, batch, step)` evaluates and reduces a loss for direct differentiation.
+Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean()` reduces a ratio statistic, and `objective.scalar_loss(variables, batch, step)` evaluates and reduces a loss for direct differentiation. `dew.Supervised(model, loss, metrics=(), *, inputs)` trains any Flax model on a per-example `loss(outputs, batch)` without a subclass ([Custom objectives](../concepts/objectives.md#supervised)).
 
 | Member | Contract |
 |---|---|
@@ -660,6 +660,8 @@ Prepared `DenoisingInputs` can supply encoded native conditions and initial late
 ## Configuration and registries
 
 Code builds every model, preset, solver, dataset and metric from its class. A record names a class by its import path, `{"class": "dew.nn.backbones.dit:SimpleDiT", "fields": {...}}`, and a function as `{"function": "optax:adamw"}`; `RunConfig.from_dict` and `ModelConfig.build` import what a record names. Where a person writes a record or a flag, `dew.registry` maps short aliases (`simple_dit`) to those paths.
+
+A run names its model as `ModelConfig(name, fields)` and its objective as `ObjectiveConfig(name, fields)`: the class's import path or alias and the fields or constructor arguments the run states. `ObjectiveConfig.build(**derived)` constructs the objective with the arguments its caller builds (the model, what the data decides), and a class that is not a dataclass is read through its `__init__` signature. `dew.config.sweep.override(config, {"model.num_layers": 12})` and `assigned(config, ["trainer.steps=2000"])` set fields by dotted path; `dew train` and sweeps go through them.
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 

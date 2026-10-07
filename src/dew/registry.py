@@ -131,9 +131,17 @@ def imported(path: str) -> Callable[..., Configured]:
     return held
 
 
+_TRUSTED: set[str] = {"flax"}
+"""The packages outside Dew the process trusts (`import_trusted`): from the
+start Flax's, whose layers a model's record names (a `Sequential`'s)."""
+
+
 def import_trusted(record: object, trust: Sequence[str]) -> None:
-    """Import every module of a `trust`ed package that `record` names by an
-    import path, so reading the record finds them imported (`imported`)."""
+    """Trust the packages in `trust` for the rest of the process, and import
+    every module of theirs that `record` names by an import path, so reading
+    the record finds them imported (`imported`) and may construct their
+    classes where a field declares no base class (`_owned`)."""
+    _TRUSTED.update(trust)
     if isinstance(record, str):
         module, colon, name = record.partition(":")
         if colon and name and module.split(".")[0] in trust and module.replace(".", "").isidentifier():
@@ -155,19 +163,37 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
     `models["dew.nn.backbones.dit:SimpleDiT"]`: the table is static, and a
     class outside it, Dew's or a user's, is named by its path."""
 
-    def __init__(self, kind: str, paths: Mapping[str, str]):
+    def __init__(self, kind: str, paths: Mapping[str, str], base: str | None = None):
         self.kind = kind
         self.paths = types.MappingProxyType(dict(paths))
+        self.base = base
+        """The import path of the class every member derives from, or None
+        where the members share only a protocol."""
         # What a lookup imported, untyped as an import is; typed on the way out.
         self._imported: dict[str, Any] = {}
 
     def __getitem__(self, name: str) -> T:
+        """The member an alias or import path names. The table's own entries
+        are code's; a path may come from a record, name anything imported, and
+        be built, so its member must derive from `base` (or be a function
+        declared to return one), and with no base be a class of Dew's or of a
+        trusted package (`_owned`)."""
         if ":" not in name and name not in self.paths:
             raise KeyError(f"no {self.kind} named {name!r}; known: {', '.join(sorted(self.paths))}, "
                            f"or any class by its import path")
         if name not in self._imported:
-            self._imported[name] = imported(self.paths.get(name, name))
+            member = imported(self.paths.get(name, name))
+            if name not in self.paths and not self._holds(member):
+                raise ValueError(f"{name!r} names {member!r}, which is no {self.kind}")
+            self._imported[name] = member
         return self._imported[name]
+
+    def _holds(self, member: Callable[..., Configured]) -> bool:
+        if self.base is None:
+            return _owned(member, called=False)
+        module, _, qualified = self.base.partition(":")
+        base = getattr(importlib.import_module(module), qualified)
+        return issubclass(member, base) if isinstance(member, type) else _returns(member, base)
 
     def __iter__(self) -> Iterator[str]:
         return iter(self.paths)
@@ -433,11 +459,17 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         return configured(value)
     if isinstance(value, Mapping):
         if typing.get_origin(annotation) is Callable or annotation is Callable:
-            # A callable field, such as a Sequential's layers, takes a record
-            # of any class: a layer is called, whatever class it is.
+            # A callable field, such as a Sequential's layers or a loss, takes
+            # a record of a class whose instances are called, whatever class.
             named = _class_record(value)
             if named is not None:
-                return _built(_member(named[0], (object,)), named[1], dtypes=dtypes)
+                member = _member(named[0], (object,))
+                if not _owned(member, called=True):
+                    raise ValueError(
+                        f"{named[0]!r} names {member!r}; a callable field's class record names a class "
+                        f"whose instances are called, of Dew's or of a trusted package (trust=, --trust), "
+                        f"and a function is the record {{'function': ...}}")
+                return _built(member, named[1], dtypes=dtypes)
         if isinstance(annotation, type) and annotation is not object:
             # A field typed with a class takes a record of the class itself or
             # of any class derived from it or function returning it; `object`
@@ -544,6 +576,17 @@ def _key(annotation: Annotation, key: str) -> RecordKey:
     return key
 
 
+def _owned(member: Callable[..., Configured], *, called: bool) -> bool:
+    """Whether a record may construct `member` where no base class holds it:
+    a class of Dew's or of a trusted package (`import_trusted`), and for a
+    `called` field one whose instances are called. Anything imported can be
+    named, and a function, or a class that does its work in its constructor
+    as `subprocess.Popen` does, is refused before anything runs."""
+    package = member.__module__.split(".")[0]
+    return (isinstance(member, type) and (package == "dew" or package in _TRUSTED)
+            and (not called or any("__call__" in vars(base) for base in member.__mro__[:-1])))
+
+
 def _record_class(member: Callable[..., Configured]) -> type | None:
     """`member` when it is a dataclass, whose fields a record names; None for
     a function or a plain class, which declares no fields to narrow."""
@@ -574,7 +617,7 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> di
 
 
 def _arguments(function: Callable[..., Configured], fields: Mapping[str, object], *,
-               dtypes: bool) -> dict[str, Configured]:
+               dtypes: bool) -> Mapping[str, object]:
     """The record's fields as the parameters of the registered `function`, or
     of a class's constructor, each walked against its own annotation, as
     `_declared` walks a dataclass's. A field the function does not take, or a
@@ -784,7 +827,7 @@ models: Aliases[type[nn.Module], nn.Module] = Aliases("model", {
     "video_dit": "dew.nn.backbones.video_dit:VideoDiT",
     "wan_transformer": "dew.nn.backbones.wan:WanTransformer",
     "z_image_transformer": "dew.nn.backbones.z_image:ZImageTransformer",
-})
+}, base="flax.linen:Module")
 presets: Aliases[type[Preset], Preset] = Aliases("preset", {
     "cosine": "dew.diffusion.presets:Cosine",
     "edm": "dew.diffusion.presets:EDM",
@@ -832,7 +875,7 @@ datasets: Aliases[type[DatasetSpec], DatasetSpec] = Aliases("dataset", {
     "tfds": "dew.data.providers:PreparedTFDS",
     "tfds_images": "dew.data.images:TFDSImages",
     "token_windows": "dew.data.tokens:TokenWindows",
-})
+}, base="dew.data.dataset:DatasetSpec")
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",
@@ -842,7 +885,7 @@ encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases(
     "qwen_image_text": "dew.inputs.diffusion:QwenImageConditioner",
     "t5": "dew.inputs.encoders:T5Text",
     "wan_text": "dew.inputs.diffusion:WanConditioner",
-})
+}, base="dew.inputs.encoders:ConditionEncoder")
 metrics: Aliases[Callable[..., Metric], Metric] = Aliases("metric", {
     "accuracy": "dew.decision.metrics:Accuracy",
     "aurc": "dew.decision.metrics:AURC",
@@ -879,7 +922,7 @@ objectives: Aliases[type[Objective], Objective] = Aliases("objective", {
     "rcm": "dew.objectives.diffusion.consistency:ConsistencyDistillationObjective",
     "shortcut": "dew.objectives.diffusion.few_step:ShortcutObjective",
     "supervised": "dew.objectives.supervised:Supervised",
-})
+}, base="dew.objectives.base:Objective")
 mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "attention": "dew.nn.mixers.attention:AttentionMixer",
     "deepseek_v4": "dew.nn.deepseek_v4:DeepseekV4Mixer",
@@ -890,7 +933,7 @@ mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "mamba2": "dew.nn.mixers.mamba2:Mamba2Mixer",
     "mla": "dew.nn.mla:MLAMixer",
     "mlp": "dew.nn.mixers.mlp:MLPMixer",
-})
+}, base="dew.nn.mixer_base:MixerBase")
 towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "deepseek_v41": "dew.nn.vision.deepseek_v41:DeepseekV41Vision",
     "gemma3n": "dew.nn.vision.gemma3n:Gemma3nVision",
@@ -900,7 +943,7 @@ towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "llama4": "dew.nn.vision.llama4:Llama4Vision",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Vision",
     "siglip": "dew.nn.vision.siglip:SiglipVision",
-})
+}, base="dew.nn.vision.common:TowerBase")
 projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "deepseek_v41": "dew.nn.vision.deepseek_v41:DeepseekV41Projector",
     "gemma": "dew.nn.vision.siglip:GemmaProjector",
@@ -908,14 +951,14 @@ projectors: Aliases[type[ProjectorBase], ProjectorBase] = Aliases("projector", {
     "gemma4": "dew.nn.vision.gemma4:Gemma4Projector",
     "llama4": "dew.nn.vision.llama4:Llama4Projector",
     "qwen3_5": "dew.nn.vision.qwen35:Qwen35Projector",
-})
+}, base="dew.nn.vision.common:ProjectorBase")
 schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
     "cosine": "dew.training.optim:Cosine",
     "exponential": "dew.training.optim:Exponential",
     "linear": "dew.training.optim:Linear",
     "one_cycle": "dew.training.optim:OneCycle",
     "power": "dew.training.optim:Power",
-})
+}, base="dew.training.optim:ScheduleBase")
 trainings: Aliases[type[Training], Training] = Aliases("training", {
     "diffusion": "dew.objectives.diffusion.objective:Denoising",
     "flow_grpo": "dew.objectives.diffusion.config:FlowGRPO",
@@ -924,7 +967,7 @@ trainings: Aliases[type[Training], Training] = Aliases("training", {
     "mean_flow": "dew.objectives.diffusion.few_step:MeanFlowTraining",
     "rcm": "dew.objectives.diffusion.consistency:ConsistencyDistillation",
     "shortcut": "dew.objectives.diffusion.few_step:ShortcutTraining",
-})
+}, base="dew.objectives.diffusion.objective:Training")
 
 KINDS: tuple[Aliases, ...] = (models, presets, solvers, datasets, encoders, metrics, objectives, mixers,
                               towers, projectors, schedules, trainings)
