@@ -12,30 +12,44 @@ supports must match them, softcapped models included.
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
+from affine_run import Data
 
+from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_cross_entropy, model_logits, support_log_probs
 from dew.objectives.rl.grpo import GRPOObjective
 from dew.objectives.rl.sessions import SUPPORT_COLUMNS_KEY, SUPPORT_KEY, Call, Session, Status, pack
 from dew.sampling.text import Sampling
+from dew.training import Layout, MeshSpec, Trainer
 
 VOCAB, PROMPT, NEW = 48, 3, 6
 
 
-def sampled(softcap=None, temperature=0.7):
+def sampled(softcap=None, temperature=0.7, adapted=False):
     """Draws at `temperature` with top-k 12 and top-p 0.8, and each drawn
-    id's support, read off the same logits the sampler filtered."""
+    id's support, read off the same logits the sampler filtered. `adapted`
+    puts LoRA factors on the head, moved off zero, so no matrix alone is it."""
     sampling = Sampling(temperature=temperature, top_k=12, top_p=0.8)
     model = CausalTransformer(vocab_size=VOCAB, emb_features=32, num_layers=2, num_heads=2,
                               num_kv_heads=1, mlp_features=64, max_seq_len=16,
                               final_logit_softcap=softcap, tie_embeddings=False)
-    obj = LMObjective(model, PROMPT + NEW - 1)
+    variables = None
+    if adapted:
+        adapter = LoRA(rank=2, modules=("lm_head",)).apply(model, model.init(jax.random.key(0), jnp.zeros(
+            (1, 4), jnp.int32)), key=1)
+        model, variables = adapter.model, adapter.variables
+    obj = LMObjective(model, PROMPT + NEW - 1, variables=variables)
     params = obj.init(jax.random.key(0))
     if softcap is not None:
         # Large enough logits that the cap bends them.
         params = jax.tree.map(lambda leaf: leaf * 3.0, params)
+    if adapted:
+        params = {**params, "params": jax.tree.map(
+            lambda leaf: jax.random.normal(jax.random.key(2), leaf.shape, leaf.dtype), params["params"])}
     drawn = obj.policy(params, sampling)([[1, 2, 3], [4, 5, 6]], NEW, key=7).host()
     assert (drawn.lengths == NEW).all(), "the fixture wants full-length draws"
     tokens = jnp.asarray(drawn.tokens)
@@ -76,6 +90,31 @@ def test_packed_scoring_equals_the_samplers_filtered_likelihoods(softcap):
     unfiltered = {key: value for key, value in batch.items() if key not in (SUPPORT_KEY, SUPPORT_COLUMNS_KEY)}
     assert np.abs(np.asarray(grpo.packed_log_probs(params, unfiltered))[drawn_ids] - scored).max() > 0.1
     assert len(batch[SUPPORT_KEY]) < len(scored) * VOCAB
+
+
+def test_an_adapted_head_rescores_its_support_and_trains_its_factors_alone():
+    """No matrix alone is a head with LoRA factors on it, so the packed GRPO
+    scoring renormalizes the whole exact logits over each recorded support:
+    the sampler's own filtered likelihoods. A Trainer step on GRPO's loss
+    moves every factor and leaves the frozen base as it was."""
+    obj, params, _, sampling, rollouts = sampled(adapted=True)
+    grpo = GRPOObjective(obj.model, obj.seq_len, sampling_temperature=sampling.temperature,
+                         variables=params)
+    batch = pack(rollouts, PROMPT + NEW, rows=jax.device_count(), support_capacity=12 * NEW)
+    drawn_ids = batch["response_mask"] != 0
+    scored = np.asarray(grpo.packed_log_probs(params, batch))[drawn_ids]
+    np.testing.assert_allclose(scored, batch["behavior_log_probs"][drawn_ids], atol=2e-5)
+
+    data = Data(lambda: iter([batch]), batch=jax.device_count())
+    trainer = Trainer(grpo, optax.sgd(0.1), key=jax.random.key(3), mesh=MeshSpec(),
+                      layout=Layout(min_shard=2**30))
+    initial = trainer.initial_state()
+    state = trainer.fit(data, steps=1)
+    leaves = {name: [jax.tree.leaves(tree.variables[name]) for tree in (initial, state)]
+              for name in (FROZEN, "params")}
+    for before, after in zip(*leaves[FROZEN], strict=True):
+        np.testing.assert_array_equal(before, after)
+    assert all(np.any(before != after) for before, after in zip(*leaves["params"], strict=True))
 
 
 def test_a_tempered_softcapped_cross_entropy_divides_after_the_cap():
