@@ -5,15 +5,8 @@
         --model simple_dit --model.patch-size 4 --model.emb-features 512 \\
         --model.num-layers 12 --model.num-heads 8
 
-The dataset is a subcommand over the registry (`data:array-record-images
---data.shards arrayrecord2/cc12m`), and so are the preset (`preset:flow
---preset.shift 3.0`), the text condition (`text:None` for an unconditional
-run) and the autoencoder (`autoencoder:stable-diffusion-autoencoder`). Oxford
-flowers with flower captions is the default; docs/recipes.md lists the other
-corpora as the values they are. `--model` picks the model's class and
-`--model.<field>` sets each of its fields. The run spec is
-`dew.objectives.diffusion.DiffusionRunConfig`, saved as run.json next to the
-checkpoints, and training and inference both build from `config.build()`.
+Oxford flowers with flower captions is the default; docs/recipes.md lists the
+other corpora. The run is `dew.objectives.diffusion.DiffusionRunConfig`.
 
 `--pretrained stabilityai/stable-diffusion-3.5-medium preset:none` fine-tunes a
 published pipeline (SD3, Flux, Qwen-Image or a UNet) on its own conditioning,

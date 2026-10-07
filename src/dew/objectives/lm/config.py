@@ -184,7 +184,7 @@ class LMRunConfig(RunConfig):
                              "is a number of tokens")
         name, revision = split_revision(self.pretrained)
         dtype = self.model.fields.get("dtype")
-        loaded = Pretrained.load(name, dtype=None if dtype is None else str(dtype),
+        loaded = Pretrained.load(name, **({} if dtype is None else {"dtype": str(dtype)}),
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
                                  max_seq_len=reach, revision=revision)
         if not same_vocabulary(written, loaded, name):

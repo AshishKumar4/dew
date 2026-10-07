@@ -8,7 +8,8 @@ fresh, with `lora` to train an adapter in place of the whole model. A tenth
 of the rows, at most 400, are held out (`DecisionTable.held_out`);
 validation scores them, and after training they fit the temperatures the
 task divides its logits by, saved into the run, so `Decide.from_run` and
-`dew.pipeline` answer calibrated.
+`dew.pipeline` answer calibrated. A question type's temperature needs ten
+held-out answers and a bucket's 2000, Laya's floors.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ from dew.data.text import HFTokenizer
 from dew.decision.data import DecisionTable
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.metrics import AURC, ECE, Accuracy
+from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import LogLoss
 from dew.decision.task import Decide
 from dew.training.state import TrainState
@@ -69,9 +71,9 @@ class DecisionRunConfig(RunConfig):
                 raise ValueError("--lora adapts a Hugging Face backbone; a Laya checkpoint trains whole")
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                            dtype=dtype, attention_impl=attention_impl)
-            layout, tokenizer = dataclasses.replace(
-                start.layout, max_len=self.max_len or start.layout.max_len,
-                head_max_len=self.head_max_len or start.layout.head_max_len), None
+            resized = {name: length for name, length in (("max_len", self.max_len),
+                                                         ("head_max_len", self.head_max_len)) if length}
+            layout, tokenizer = dataclasses.replace(start.layout, **resized), None
         else:
             if self.max_len or self.head_max_len:
                 raise ValueError("--max-len and --head-max-len resize a Laya checkpoint's layout; another "
@@ -81,6 +83,7 @@ class DecisionRunConfig(RunConfig):
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
             layout, tokenizer = None, HFTokenizer(self.pretrained)
         objective = self.objective.build(backbone=start, tokenizer=tokenizer, layout=layout)
+        assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         train, held_out = self.data.examples()
         dataset = objective.dataset(train, batch=self.trainer.batch_size, validation=held_out or None,
                                     seed=self.data.seed, loading=self.data.loading)
