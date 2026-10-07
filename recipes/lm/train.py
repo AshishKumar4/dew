@@ -29,7 +29,7 @@ from dew.config import ModelConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
 from dew.inference import RunProcessor
 from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
-from dew.registry import datasets, models
+from dew.registry import datasets, models, objectives
 from dew.training import TrainState, prepare_process, run_timestamp
 
 if TYPE_CHECKING:
@@ -60,7 +60,7 @@ class LmRunConfig(LMRunConfig):
             raise ValueError(
                 "the language model recipe trains on token files: "
                 "data:token-windows or data:packed-tokens")
-        if self.objective == "block_diffusion" and not isinstance(self.data, TokenWindows):
+        if self.objective == objectives.paths["block_diffusion"] and not isinstance(self.data, TokenWindows):
             raise ValueError("block_diffusion requires data:token-windows, not packed documents")
 
 
@@ -107,7 +107,7 @@ def context_length(config: LmRunConfig, samples: Samples | None) -> int:
     budget longer than the training context is what decides the model's
     max_seq_len; the sequence length being trained on is the floor.
     """
-    if config.objective == "block_diffusion":
+    if config.objective == objectives.paths["block_diffusion"]:
         return config.data.seq_len + 1
     if samples is None:
         return config.data.seq_len
@@ -286,7 +286,7 @@ def main(config: LmRunConfig) -> TrainState:
             f"{config.trainer.batch_size}, so an epoch is no steps at all: read "
             "more data or lower --trainer.batch-size")
 
-    samples = None if config.objective == "block_diffusion" else build_samples(config)
+    samples = None if config.objective == objectives.paths["block_diffusion"] else build_samples(config)
     context = context_length(config, samples)
 
     source = None
@@ -303,7 +303,7 @@ def main(config: LmRunConfig) -> TrainState:
     # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
     settings = config.model.precision_settings()
     resolved = {name: value for name, value in fields.items() if name not in settings}
-    if config.objective == "block_diffusion":
+    if config.objective == objectives.paths["block_diffusion"]:
         resolved["max_seq_len"] = model.max_seq_len
     config = replace(config, model=replace(config.model, config=resolved))
     name = config.trainer.name or (
@@ -329,10 +329,10 @@ def main(config: LmRunConfig) -> TrainState:
         else:
             source = source.adapt(config.lora, key=config.trainer.key)
             model, pretrained = source.model, source.variables
-    if config.objective == "masked_diffusion":
+    if config.objective == objectives.paths["masked_diffusion"]:
         return config.train(build_masked_objective(config, model, fields, pretrained), data,
                             name=name, metrics=validation, summary=summary)
-    if config.objective == "block_diffusion":
+    if config.objective == objectives.paths["block_diffusion"]:
         return config.train(build_block_objective(config, model, pretrained), data,
                             name=name, metrics=validation, summary=summary)
     options = {

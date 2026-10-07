@@ -1,5 +1,5 @@
-"""What the diffusion suites share: a small registered text encoder, a
-batch the data axis divides, and a table that reads a class off a prompt."""
+"""What the diffusion suites share: a small text encoder, a batch the data
+axis divides, and a table that reads a class off a prompt."""
 
 from dataclasses import dataclass
 
@@ -10,7 +10,6 @@ import numpy as np
 from dew.inputs import CharTable, ConditionEncoder
 from dew.nn.dit import TextContext
 from dew.objectives.base import Variables
-from dew.registry import encoders
 
 RES = 8
 TOKENS = 5
@@ -18,13 +17,12 @@ FEATURES = 6
 VOCAB = 11
 
 
-@encoders("stub_text")
 @dataclass(frozen=True, eq=False)
 class StubText(ConditionEncoder[str]):
     """A text encoder with a table of `VOCAB` vectors: tokenize maps a prompt to
     ids by character behind a start token, encode looks them up. Small, and
-    shaped like CLIP's output, so the models' text keyword takes it; registered,
-    so a run's text condition can name it."""
+    shaped like CLIP's output, so the models' text keyword takes it; a run's
+    text condition names it by its import path, `STUB_TEXT`."""
 
     checkpoint: str
     params: Variables
@@ -56,6 +54,8 @@ class StubText(ConditionEncoder[str]):
     def to_json(self):
         return {"checkpoint": self.checkpoint}
 
+
+STUB_TEXT = f"{__name__}:StubText"
 
 PROMPTS = ["a red bird", "two cats"]
 

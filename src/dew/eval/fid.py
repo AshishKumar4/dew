@@ -1,7 +1,7 @@
 """Measure FID between two populations of images.
 
 `FID().score(generated, reference)` scores two image sets against each other,
-and the same `FID` as a registered metric pools the same features, statistics
+and the same `FID` as a validation metric pools the same features, statistics
 and distance over the populations a validation pass consumes.
 """
 
@@ -20,7 +20,6 @@ from numpy.typing import NDArray
 from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
 from dew.objectives.base import Shown
-from dew.registry import metrics
 
 from .common import metric_device
 
@@ -216,7 +215,6 @@ def _pooled_distance(stats: FIDStats, weights: str | None = None) -> float:
     return distance
 
 
-@metrics("fid")
 @dataclass(frozen=True)
 class FID:
     """Measures the Fréchet Inception Distance between two image sets (`score`) or over a validation pass.

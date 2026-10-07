@@ -6,15 +6,12 @@ the patchify/conditioning/output machinery live in dit.py.
 
 from collections.abc import Sequence
 
-from dew.registry import models
-
 from ..dit import ModulatedBlock, build_block_pattern, remat_block
 from .dit import SimpleDiT
 
 DEFAULT_SSM_RATIO = "3:1"
 
 
-@models("hybrid_dit")
 class HybridSSMAttentionDiT(SimpleDiT):
     """A DiT that interleaves SSM blocks with attention blocks.
 

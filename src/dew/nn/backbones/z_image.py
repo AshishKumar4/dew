@@ -31,7 +31,6 @@ from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
-from dew.registry import models
 
 from .joint import JointAttention, layer_norm
 
@@ -134,7 +133,6 @@ class ZImageBlock(nn.Module):
         )
 
 
-@models("z_image_transformer")
 @logical_axes({("x_embedder",): (None, "embed"), ("cap_embedder",): (None, "embed"),
                ("final_linear",): ("embed", None), ("final_modulation",): (None, "embed"),
                ("t_embedder_1",): (None, "mlp"), ("t_embedder_2",): ("mlp", None)})

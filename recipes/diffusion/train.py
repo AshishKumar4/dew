@@ -91,7 +91,7 @@ def corpus_name(spec: DatasetSpec) -> str:
         if type(spec) is type(corpus) and all(
                 getattr(spec, name) == getattr(corpus, name) for name in chosen):
             return name
-    return datasets.name_of(type(spec))
+    return datasets.alias_of(type(spec))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,7 +116,7 @@ def run_summary(config: DiffusionRunConfig, fields: dict, arguments_hash: str) -
         "dataset": corpus_name(config.data),
         "image_size": sample.shape[-2],
         "batch_size": config.trainer.batch_size,
-        "preset": "source" if config.preset is None else presets.name_of(type(config.preset)),
+        "preset": "source" if config.preset is None else presets.alias_of(type(config.preset)),
         "learning_rate": config.optim.learning_rate,
         "arguments_hash": arguments_hash,
         "date": run_timestamp(),

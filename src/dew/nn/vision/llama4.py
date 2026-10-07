@@ -21,7 +21,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
 from dew.nn.text_encoders import MLP
 from dew.objectives.base import Variables
-from dew.registry import Record, projectors, towers
+from dew.registry import Record
 
 from .common import (
     ProjectorBase,
@@ -264,7 +264,6 @@ class Llama4VisionTransformer(nn.Module):
         return self.vision_adapter(hidden_states)
 
 
-@towers("llama4")
 @dataclasses.dataclass(frozen=True)
 class Llama4Vision(TowerBase):
     """A Llama 4 trunk's geometry, under the reference's field names."""
@@ -306,7 +305,6 @@ class Llama4ProjectorModule(nn.Module):
         return self.linear(image_features)
 
 
-@projectors("llama4")
 @dataclasses.dataclass(frozen=True)
 class Llama4Projector(ProjectorBase):
     """Llama 4's projector fields: the text width."""
@@ -388,7 +386,7 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
             f"({vision.get('projector_output_dim')}), the adapter's width")
     return {
-        "name": "llama4", "fields": {
+        "class": "llama4", "fields": {
         "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
@@ -408,4 +406,4 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
 
 def translate_llama4_projector_config(text_width: int) -> Record:
     """A Llama 4 wrapper's projector fields: the text width."""
-    return {"name": "llama4", "fields": {"text_width": int(text_width)}}
+    return {"class": "llama4", "fields": {"text_width": int(text_width)}}

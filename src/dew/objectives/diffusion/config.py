@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import dataclasses
 import os
-from importlib import import_module
 from typing import TYPE_CHECKING, ClassVar
 
 import jax
@@ -34,12 +33,6 @@ from .end_to_end import AUTOENCODER
 from .few_step import SMOOTH_TIME_SCALE, MeanFlowTraining
 from .objective import LOSS_HEADS, Denoising, DiffusionObjective, Training
 
-import_module("dew.eval")  # registers the image metrics
-import_module("dew.nn.backbones")  # registers the models before the config's unions are built
-for _mode in ("adversarial", "consistency", "guidance_distillation"):
-    # Each registers its training mode before `mode`'s union is built.
-    import_module(f"dew.objectives.diffusion.{_mode}")
-
 if TYPE_CHECKING:
     from flax import linen as nn
 
@@ -47,20 +40,17 @@ if TYPE_CHECKING:
     from dew.objectives.rl.flow import FlowGRPOObjective, FlowRollout
     from dew.sampling.solvers import Solver
 
-    # A registry's `union` is built from what has registered by import time, so
-    # only the run sees it. Statically the fields are typed as every member
-    # of those tables, which a reader and a checker need.
+    # A kind's `union` imports every aliased class, this module's training
+    # modes included, so the run builds it at the end of the module, where
+    # the annotations, read when a command line is parsed, find it.
+    # Statically the fields are typed as the kinds' base classes, which a
+    # reader and a checker need.
     PresetSpec = Preset
     SolverSpec = Solver
     TrainingSpec = Training
     # The run reads captions through `load(tokenize=)`, which the token
     # datasets do not take; `sample_field` refuses those at runtime.
     CaptionedSpec = ImageDataset | OnlineImages | VideoDataset
-else:
-    PresetSpec = presets.union
-    SolverSpec = solvers.union
-    TrainingSpec = trainings.union
-    CaptionedSpec = datasets.union
 
 # Every other dial of a stage is `dew.nn.attention.Stage`'s own default, and
 # a stage that names one restates it.
@@ -172,7 +162,6 @@ class PretrainedAutoencoder:
                                 params=params)
 
 
-@trainings("flow_grpo")
 @dataclasses.dataclass(frozen=True)
 class FlowGRPO(Training):
     """Flow-GRPO training of the model as a policy on an image reward.
@@ -183,7 +172,7 @@ class FlowGRPO(Training):
     initial model at weight `beta`.
 
     The fields are `FlowGRPOObjective`'s and `FlowRollout`'s, which document them.
-    `reward` names a registered image metric that scores each sample against its
+    `reward` names an image metric, by alias or import path, that scores each sample against its
     own prompt, where higher must be better (`clip_score`).
 
     Under Flow-GRPO, the run's `ema_decay` and `unconditional_prob` are unused: the
@@ -201,9 +190,9 @@ class FlowGRPO(Training):
     train_steps: int | None = None
 
     def __post_init__(self) -> None:
-        if self.reward not in metrics:
-            raise ValueError(f"reward names {self.reward!r}, which no metric is registered "
-                             f"under; the registered metrics are {sorted(metrics)}")
+        if ":" not in self.reward and self.reward not in metrics:
+            raise ValueError(f"reward names {self.reward!r}, which no metric alias names; the aliases are "
+                             f"{sorted(metrics)}, or name a metric by its import path")
 
     def objective(self, base: nn.Module, variables: Variables | None, *, unconditional_prob: float,
                   ema_decay: float | None, **run) -> FlowGRPOObjective:
@@ -240,12 +229,6 @@ class FlowGRPO(Training):
 class DiffusionRunConfig(RunConfig):
     """A diffusion run's configuration: the shared run fields plus the diffusion objective's own settings."""
 
-    objective: str = "diffusion"
-    """The name of the objective `build` returns, which is the name `mode` is registered under.
-
-    It is set from `mode` when the config is created, so a saved record names what
-    trained.
-    """
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
     data: CaptionedSpec = dataclasses.field(default_factory=TFDSImages)
@@ -294,23 +277,20 @@ class DiffusionRunConfig(RunConfig):
     representation alignment. `FlowGRPO`, `MeanFlowTraining`, `ShortcutTraining`,
     `ConsistencyDistillation`, `GuidanceDistillation` and `AdversarialDistillation`
     train on their own losses. Each mode refuses a preset or guidance that its loss
-    cannot train or sample with, and `objective` is set to the name the mode is
-    registered under. On the command line, pick one with
+    cannot train or sample with. On the command line, pick one with
     `mode:mean-flow-training --mode.omega 2`.
     """
     val_metrics: tuple[str, ...] = ("clip",)
-    """Names in the metrics registry, scored on every validation pass.
+    """Metric aliases or import paths, scored on every validation pass.
 
-    The registry lists what a run can name, so a metric registered elsewhere can
-    be named here without this class knowing about it. `__post_init__` refuses a
-    name that nothing is registered under.
+    `__post_init__` refuses an alias that names no metric.
     """
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
-        object.__setattr__(self, "objective", trainings.name_of(type(self.mode)))
         self.mode.check(self)
 
         if self.pretrained is not None:
@@ -342,11 +322,10 @@ class DiffusionRunConfig(RunConfig):
             height, width = self.sample_field().shape[-3:-1]
             object.__setattr__(self, "preset", dataclasses.replace(
                 self.preset, resolution_shift=self.preset.resolution_shift.at(height, width)))
-        unknown = [name for name in self.val_metrics if name not in metrics]
+        unknown = [name for name in self.val_metrics if ":" not in name and name not in metrics]
         if unknown:
-            raise ValueError(
-                f"val_metrics names {unknown}, which no metric is registered under; "
-                f"the registered metrics are {sorted(metrics)}")
+            raise ValueError(f"val_metrics names {unknown}, which no metric alias names; the aliases are "
+                             f"{sorted(metrics)}, or name a metric by its import path")
         if self.audio is not None and self.text is not None:
             raise ValueError(
                 "the models take one context under textcontext, and this run names both "
@@ -354,7 +333,7 @@ class DiffusionRunConfig(RunConfig):
         if self.audio is not None and not isinstance(self.data, VideoDataset):
             raise ValueError(
                 f"audio conditioning reads the audio of a VideoDataset's clips, and "
-                f"{datasets.name_of(type(self.data))} carries none")
+                f"{type(self.data).__name__} carries none")
 
     def sample_field(self) -> Field:
         """Return the batch field the model generates, at the resolution the data comes in."""
@@ -367,7 +346,7 @@ class DiffusionRunConfig(RunConfig):
             return Field("image", (spec.image_size, spec.image_size, 3))
         raise ValueError(
             f"the diffusion recipe trains on image or video datasets, not "
-            f"{datasets.name_of(type(spec))}")
+            f"{type(spec).__name__}")
 
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
         """Return the fields the registry builds the model from.
@@ -558,7 +537,7 @@ class DiffusionRunConfig(RunConfig):
             raise ValueError(
                 f"{self.pretrained}'s scheduler reads {type(convention.schedule).__name__} with "
                 f"{type(convention.prediction).__name__}, and preset "
-                f"{presets.name_of(type(self.preset))!r} is "
+                f"{type(self.preset).__name__} is "
                 f"{type(process.schedule).__name__} with {type(process.prediction).__name__}; "
                 "name a preset of its kind, or none for the scheduler's own")
         return process
@@ -586,3 +565,10 @@ class DiffusionRunConfig(RunConfig):
             else:
                 built.append(metrics[name]())
         return built
+
+
+if not TYPE_CHECKING:
+    PresetSpec = presets.union
+    SolverSpec = solvers.union
+    TrainingSpec = trainings.union
+    CaptionedSpec = datasets.union

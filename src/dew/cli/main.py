@@ -38,11 +38,13 @@ class Export:
     always, False never."""
     step: int | None = None
     """Which checkpoint to read; unset takes the latest."""
+    trust: tuple[str, ...] = ()
+    """Packages outside Dew whose modules the run's record may import."""
 
     def run_command(self) -> int:
         from dew.interop import Pretrained
 
-        Pretrained.from_run(self.run, ema=self.ema, step=self.step).save(self.destination)
+        Pretrained.from_run(self.run, ema=self.ema, step=self.step, trust=self.trust).save(self.destination)
         emit(f"exported {self.run} to {self.destination}")
         return 0
 

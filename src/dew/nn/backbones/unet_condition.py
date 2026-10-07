@@ -16,7 +16,6 @@ from dew.nn.blocks import ResidualBlock, torch_nearest_resize
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import HEADS, constrain, logical_axes, split_positions
-from dew.registry import models
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -259,7 +258,6 @@ class _Level(nn.Module):
         return x, tuple(outputs)
 
 
-@models("unet_2d_condition")
 class UNet2DCondition(nn.Module):
     """Denoises NHWC latents conditioned on text, pooled and size features, and optional inpainting inputs.
 

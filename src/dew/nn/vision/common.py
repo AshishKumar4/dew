@@ -21,9 +21,9 @@ PIXEL_VALUES_KEY = "pixel_values"
 class ProjectorBase:
     """One projector kind's value: its fields, and how it builds its module.
 
-    Each kind is a frozen dataclass of the reference's field names, registered
-    under its name (`@projectors("gemma")`). `build` turns the value into the
-    Flax module. A record that names nothing registered raises.
+    Each kind is a frozen dataclass of the reference's field names, with an
+    alias in `dew.registry.projectors` (`"gemma"`). `build` turns the value
+    into the Flax module. A record that names no known kind raises.
     """
 
     def build(self) -> nn.Module:

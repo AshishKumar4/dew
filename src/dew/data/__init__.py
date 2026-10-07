@@ -1,7 +1,7 @@
 """Data for a run: dataset specs, the `Dataset` value they load, and tokenizers.
 
-A dataset spec is a frozen dataclass registered with `@datasets(name)`, and
-its `load(batch=)` returns a `Dataset` of batch iterators:
+A dataset spec is a frozen dataclass, with an alias in `dew.registry.datasets`,
+and its `load(batch=)` returns a `Dataset` of batch iterators:
 
     data = TFDSImages(path="data/oxford_flowers102/2.1.1", image_size=128).load(batch=32)
     steps = epochs * data.steps_per_epoch
@@ -12,7 +12,7 @@ name, bucket path and caption wording, is up to the recipe. For example,
 `recipes/diffusion/train.py` defines its own in `CORPORA`
 (`oxford-flowers102`, `cc12m`, the LAION sets and others).
 
-Importing this package registers every dataset without importing the heavy
+Importing this package defines every dataset without importing the heavy
 dependencies. A spec imports cv2, tensorflow_datasets, HF `datasets`, the AV
 readers or `transformers` only when it uses them, so a host that only needs
 the token loaders never loads the image stack, and the reverse.

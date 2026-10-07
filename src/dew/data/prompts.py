@@ -23,8 +23,6 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from dew.registry import datasets
-
 from .chat import Conversation, render_prompt
 from .dataset import Batch, Dataset, DatasetSpec, Tokenize
 from .rows import json_records, parquet_names, parquet_rows, row_dataset
@@ -235,7 +233,6 @@ class PromptSource:
         }
 
 
-@datasets("prompts")
 @dataclasses.dataclass(frozen=True)
 class Prompts(DatasetSpec):
     """Reads prompts with their reward context, in fixed-width batches.

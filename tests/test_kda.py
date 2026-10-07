@@ -290,7 +290,7 @@ def test_padded_rows_preserve_the_memory_and_the_history():
 
 
 def test_the_kind_builds_from_the_configs_fields():
-    mixer = mixers.from_record({"name": "kimi_delta_attention", "fields": {
+    mixer = mixers.from_record({"class": "kimi_delta_attention", "fields": {
         "linear_num_heads": 3, "linear_head_dim": 8, "linear_conv_kernel_dim": 4,
         "linear_lower_bound": -5.0}})
     assert isinstance(mixer, KimiDeltaAttentionMixer)

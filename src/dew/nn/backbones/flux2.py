@@ -33,7 +33,6 @@ from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
-from dew.registry import models
 
 from .joint import (
     DoubleStreamBlock,
@@ -107,7 +106,6 @@ class Flux2SingleBlock(nn.Module):
                                             precision=self.precision, name="proj_fused")(joined)
 
 
-@models("flux2_transformer")
 @logical_axes({("context_embedder",): (None, "embed"), ("x_embedder",): (None, "embed"),
                ("proj_out",): ("embed", None),
                ("timestep_embedder_linear_1",): (None, "embed"),

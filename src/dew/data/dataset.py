@@ -1,6 +1,6 @@
 """The `Dataset` a run trains on, and the Grain plumbing every dataset shares.
 
-A `DatasetSpec` is a frozen dataclass registered with `@datasets(name)` that
+A `DatasetSpec` is a frozen dataclass that
 says what a dataset is and how to read it. `load(batch=)` turns it into a
 `Dataset`, which a recipe passes to the trainer. This module holds what the
 image, video and token specs have in common: the share of each batch a reader
@@ -270,8 +270,8 @@ def json_argument[Options: DataclassInstance](
 def record_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
     """A field typed `annotation` written as one JSON value on the command
     line, the record a run holds: a tuple of records as a list,
-    `[{"field": ...}, ...]`, and a mapping of registered records as an
-    object, `{"sigma": {"name": "linear", "fields": {...}}}`, since a flag per
+    `[{"field": ...}, ...]`, and a mapping of class records as an
+    object, `{"sigma": {"class": "linear", "fields": {...}}}`, since a flag per
     field cannot spell a collection whose length or keys the command line
     decides.
 

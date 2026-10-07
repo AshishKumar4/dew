@@ -21,7 +21,7 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.interop.weights import ParamTree, translate_parameters
-from dew.registry import from_record, towers
+from dew.registry import from_record
 
 from .activations import activation
 from .attention import LayerNorm, RMSNorm
@@ -37,7 +37,6 @@ class AudioEncoding:
     """True for valid encoded frames, including after temporal subsampling."""
 
 
-@towers("gemma3n_audio")
 @dataclasses.dataclass(frozen=True)
 class Gemma3nAudio(TowerBase):
     input_feat_size: int = 128
@@ -66,7 +65,6 @@ class Gemma3nAudio(TowerBase):
         return TowerGeometry(mel_features=self.input_feat_size)
 
 
-@towers("gemma4_audio")
 @dataclasses.dataclass(frozen=True)
 class Gemma4Audio(TowerBase):
     hidden_size: int = 1024

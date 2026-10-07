@@ -12,18 +12,16 @@ from typing import Annotated
 
 import numpy as np
 import pytest
-from diffusion_stubs import RES, StubText
+from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
 from dew.data.dataset import record_argument, tokenized
 from dew.diffusion.presets import Flow
-from dew.registry import datasets, encoders
+from dew.objectives.diffusion import DiffusionObjective
+from dew.registry import datasets, import_path
 from dew.sampling import Heun
 from dew.training import MeshSpec
-
-# The manifest names the encoder through the registry.
-encoders("stub_text")(StubText)
 
 pytestmark = pytest.mark.mesh
 
@@ -92,7 +90,7 @@ def test_a_recipe_config_round_trips_through_its_json_record(name):
     record = json.loads(json.dumps(config.to_dict()))
 
     assert getattr(recipe, cls).from_dict(record) == config
-    assert record["data"]["name"] == datasets.name_of(type(config.data))
+    assert record["data"]["class"] == import_path(type(config.data))
 
 
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
@@ -104,7 +102,7 @@ def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     record = json.loads(json.dumps(config.to_dict()))
 
     assert recipe.DiffusionRunConfig.from_dict(record) == config
-    assert record["data"]["name"] == "online_images"
+    assert record["data"]["class"] == datasets.paths["online_images"]
 
 
 def test_steps_and_epochs_are_one_choice():
@@ -161,7 +159,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
 
     monkeypatch.setattr(TFDSImages, "load", load)
     config = parse(recipe.DiffusionRunConfig, [
-        "--text.encoder", "stub_text", "--text.checkpoint", "stub",
+        "--text.encoder", STUB_TEXT, "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
@@ -175,8 +173,9 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     state = recipe.main(config)
 
     assert int(state.step) == 2
-    assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == config
-    assert config.to_dict()["preset"] == {"name": "edm", "fields": {
+    trained = dataclasses.replace(config, objective=import_path(DiffusionObjective))
+    assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == trained
+    assert config.to_dict()["preset"] == {"class": "dew.diffusion.presets:EDM", "fields": {
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,
         "regime": "pixel", "P_mean": None, "P_std": None, "min_snr_gamma": None}}
     assert config.model_fields(None)["output_channels"] == 3
@@ -269,9 +268,9 @@ def test_param_groups_on_the_command_line_read_their_schedules_as_records():
     writes it, and the config's own schedule steps per epoch by its flag."""
     from dew.training.optim import Cosine, OneCycle, ParamGroup
     groups = [{"name": "delays", "patterns": ["*/delay"], "bounds": [0, 24],
-               "schedule": {"name": "cosine", "fields": {"peak": 0.1, "warmup_steps": 0, "every": 40}}},
+               "schedule": {"class": "cosine", "fields": {"peak": 0.1, "warmup_steps": 0, "every": 40}}},
               {"name": "rest", "patterns": ["*"],
-               "b1": {"name": "one_cycle", "fields": {"peak": 0.85, "init": 0.95, "end": 0.95}}}]
+               "b1": {"class": "one_cycle", "fields": {"peak": 0.85, "init": 0.95, "end": 0.95}}}]
     config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups), "optim.schedule:one-cycle",
                                "--optim.schedule.peak", "5e-3", "--optim.schedule.every", "40"])
     assert config.optim.schedule == OneCycle(peak=5e-3, every=40)
@@ -289,13 +288,13 @@ class _Schedules(RunConfig):
         dataclasses.field(default_factory=dict)
 
 
-def test_a_mapping_of_registered_records_reads_from_one_flag_and_round_trips_its_record():
+def test_a_mapping_of_class_records_reads_from_one_flag_and_round_trips_its_record():
     """#45: each schedule is the record that names it, read from one JSON
     object on the command line and written back by the run's record."""
     from dew.training.optim import Exponential, Linear
 
-    given = {"sigma": {"name": "linear", "fields": {"peak": 0.5, "warmup_steps": 0, "end": 0.1}},
-             "delay": {"name": "exponential", "fields": {"init": 10.0, "end": 1.0, "every": 4}}}
+    given = {"sigma": {"class": "linear", "fields": {"peak": 0.5, "warmup_steps": 0, "end": 0.1}},
+             "delay": {"class": "exponential", "fields": {"init": 10.0, "end": 1.0, "every": 4}}}
     config = parse(_Schedules, ["--schedules", json.dumps(given)])
 
     assert config.schedules == {"sigma": Linear(peak=0.5, warmup_steps=0, end=0.1),

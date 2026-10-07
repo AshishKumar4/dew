@@ -48,7 +48,6 @@ from dew.objectives.base import (
     thaw,
     under,
 )
-from dew.registry import objectives
 
 from .masking import MultiBlockMask
 
@@ -101,7 +100,6 @@ class _Scanned(Protocol):
     def scan_order(self) -> str: ...
 
 
-@objectives("jepa")
 class JepaObjective(Objective[Ratio]):
     """Trains a JEPA encoder and predictor over images (B,H,W,C) or video (B,T,H,W,C).
 

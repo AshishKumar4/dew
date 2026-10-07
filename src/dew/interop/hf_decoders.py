@@ -297,8 +297,8 @@ def _fixed_mixture(mixture: Mixture, defaults: Mixture, represented: Collection[
 
 
 def _kind_name(record: Mapping[str, object], section: str) -> str:
-    """Return the registry name of one nested value record."""
-    return records.text(records.record(record[section], section)['name'], f"{section} name")
+    """Return the alias a nested value record names its class by."""
+    return records.text(records.record(record[section], section)['class'], f"{section} class")
 
 
 type Llama3Ramp = NativeFields[RopeScaling]
@@ -957,11 +957,11 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
         slots = records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:
             _refuse("audio_soft_tokens_per_image", "Gemma 3n audio needs its fixed slot count per clip")
-        projector = {"name": "gemma3n", "fields": {**asdict(from_record(vision_nn.Gemma3nProjector, {
+        projector = {"class": "gemma3n", "fields": {**asdict(from_record(vision_nn.Gemma3nProjector, {
             "vision_width": encoder.hidden_size, "text_width": text_width,
             "vocab_size": audio.get("vocab_size", 128), "vocab_offset": audio.get("vocab_offset", 262272),
             "norm_eps": encoder.rms_norm_eps}))}}
-    return {"audio": {"name": records.text(audio["model_type"], "audio_config model_type"), "fields": {
+    return {"audio": {"class": records.text(audio["model_type"], "audio_config model_type"), "fields": {
                       **asdict(encoder)}},
             "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
             "audio_soft_tokens": slots, "audio_projector": projector}
@@ -1263,7 +1263,7 @@ def translate_wrapper_weights(
     if audio is not None:
         encoder = towers.from_record(audio)
         if not isinstance(encoder, (audio_nn.Gemma3nAudio, audio_nn.Gemma4Audio)):
-            raise ValueError(f"audio tower {audio['name']!r} has no weight map here")
+            raise ValueError(f"audio tower {audio['class']!r} has no weight map here")
         variables["audio_tower"] = audio_nn.audio_weights(
             tables["audio_tower"], encoder, param_dtype=param_dtype
         )

@@ -15,8 +15,6 @@ from collections.abc import Mapping, Sequence
 
 import numpy as np
 
-from dew.registry import datasets
-
 from .dataset import Batch, Dataset, DatasetSpec, Tokenize
 from .rows import json_records, parquet_names, parquet_rows, row_dataset
 
@@ -139,7 +137,6 @@ class PreferenceSource:
         return {IDS_KEY: ids, MASK_KEY: mask}
 
 
-@datasets("preference_pairs")
 @dataclasses.dataclass(frozen=True)
 class PreferencePairs(DatasetSpec):
     """Reads chosen and rejected completions as fixed-width pairs, for DPO.

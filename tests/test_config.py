@@ -19,7 +19,7 @@ from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import Dataset
 from dew.nn.attention import AttentionImpl
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.registry import Registry, datasets, models, projectors, towers
+from dew.registry import Aliases, datasets, projectors, towers
 from dew.training import Layout, MeshSpec
 
 
@@ -53,8 +53,8 @@ def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
         RunConfig.from_dict({**record, "trainer": {**record["trainer"], "epochs_per_eval": 1}})
     with pytest.raises(ValueError, match="missing fields \\['project'\\]"):
         RunConfig.from_dict({**record, "trainer": {**record["trainer"], "wandb": {"entity": "dew"}}})
-    with pytest.raises(ValueError, match="no dataset named 'flowers'"):
-        RunConfig.from_dict({**record, "data": {"name": "flowers", "fields": {}}})
+    with pytest.raises(ValueError, match="no class is named 'flowers'"):
+        RunConfig.from_dict({**record, "data": {"class": "flowers", "fields": {}}})
 
 
 def test_a_field_a_record_lacks_takes_its_default():
@@ -76,7 +76,7 @@ def test_a_registered_arrayrecord_spec_round_trips(tmp_path):
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
 
     assert loaded == config
-    assert config.to_dict()["data"]["name"] == "array_record_images"
+    assert config.to_dict()["data"]["class"] == datasets.paths["array_record_images"]
 
 
 def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
@@ -91,7 +91,7 @@ def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
     config = RunConfig(
         data=Unregistered(path=str(tmp_path), image_size=8),
         trainer=TrainerConfig(steps=1))
-    with pytest.raises(ValueError, match="Unregistered is not a registered dataset"):
+    with pytest.raises(ValueError, match=r"Unregistered.*has no import path a record can name"):
         config.to_dict()
 
 
@@ -142,14 +142,12 @@ class PrecisionProbe(nn.Module):
         return self.dense(x)
 
 
-def test_the_run_stores_its_parameters_and_names_its_matmul_precision(monkeypatch):
+def test_the_run_stores_its_parameters_and_names_its_matmul_precision():
     """`--model.param-dtype` and `--model.matmul-precision` reach the fields
     a model declares for them: the parameters are stored in the dtype the run
     named, and the precision is the one every Dense of the model asks XLA
-    for. The probe is registered for this test alone, since the model table
-    is what the recipes and the qualification tools iterate."""
-    monkeypatch.setitem(models._members, "precision_probe", PrecisionProbe)
-    config = ModelConfig("precision_probe", {"features": 4}, dtype="float32",
+    for. The probe is named by its import path."""
+    config = ModelConfig(f"{__name__}:PrecisionProbe", {"features": 4}, dtype="float32",
                          param_dtype="bfloat16", matmul_precision="highest")
 
     model = config.build()
@@ -199,22 +197,21 @@ class Unprecise(nn.Module):
         return nn.Dense(self.features)(x)
 
 
-def test_a_model_without_precision_fields_refuses_every_setting_and_builds_without_them(monkeypatch):
-    monkeypatch.setitem(models._members, "unprecise", Unprecise)
-
-    with pytest.raises(ValueError, match=r"'unprecise' declares no dtype field.*set --model.dtype to None"):
-        ModelConfig("unprecise", {}).fields()
+def test_a_model_without_precision_fields_refuses_every_setting_and_builds_without_them():
+    unprecise = f"{__name__}:Unprecise"
+    with pytest.raises(ValueError, match=r"Unprecise' declares no dtype field.*set --model.dtype to None"):
+        ModelConfig(unprecise, {}).fields()
     with pytest.raises(ValueError, match=r"declares no dtype or precision field, so the run's "
                                          r"--model.dtype float32, --model.matmul-precision highest"):
-        ModelConfig("unprecise", {}, dtype="float32", matmul_precision="highest").fields()
-    assert isinstance(ModelConfig("unprecise", {"features": 2}, dtype=None).build(), Unprecise)
+        ModelConfig(unprecise, {}, dtype="float32", matmul_precision="highest").fields()
+    assert isinstance(ModelConfig(unprecise, {"features": 2}, dtype=None).build(), Unprecise)
 
 
 def test_a_composite_takes_the_dtype_through_its_parts_and_refuses_what_none_declares():
     """DiffusionGemma declares no dtype, and hands the run's to the decoder
     in its config, which declares one; nothing in it stores parameters at
     another dtype."""
-    text = {"name": "causal_transformer", "fields": {"vocab_size": 64, "emb_features": 32,
+    text = {"class": "causal_transformer", "fields": {"vocab_size": 64, "emb_features": 32,
                                                      "num_layers": 1, "num_heads": 2}}
     fields = {"text": text, "canvas_length": 4}
 
@@ -298,8 +295,7 @@ class PartialSpec:
 
 
 def test_an_unresolved_dependency_type_does_not_hide_a_buildable_field():
-    registry = Registry("partial")
-    registry("partial")(PartialSpec)
+    registry = Aliases("partial", {"partial": f"{__name__}:PartialSpec"})
     built = registry.build("partial", kernel={"window": 4, "rope_theta": 20.0})
     assert built.frequency() == 5.0
 
@@ -317,8 +313,7 @@ class MixedSpec:
 
 
 def test_a_multi_union_leaves_the_selected_opaque_record_for_its_consumer():
-    registry = Registry("mixed")
-    registry("mixed")(MixedSpec)
+    registry = Aliases("mixed", {"mixed": f"{__name__}:MixedSpec"})
     built = registry.build("mixed", kernel={"gain": 7, "dtype": "vendor_float"})
     assert built.frequency() == 14
 
@@ -341,10 +336,8 @@ class Shape:
     dtype: Any = None
 
 
-def shapes() -> Registry:
-    registry = Registry("shape")
-    registry("shape")(Shape)
-    return registry
+def shapes() -> Aliases:
+    return Aliases("shape", {"shape": f"{__name__}:Shape"})
 
 
 def test_a_record_builds_the_value_its_field_declares():
@@ -581,8 +574,7 @@ def test_a_bare_tuple_record_builds_a_jitted_residual_block():
 
     from dew.nn.blocks import ResidualBlock
 
-    registry = Registry("block")
-    registry("residual")(ResidualBlock)
+    registry = Aliases("block", {"residual": "dew.nn.blocks:ResidualBlock"})
     model = registry.build("residual", features=2, norm_groups=0, kernel_size=[1, 3])
     pixels = jnp.arange(12, dtype=jnp.float32).reshape(1, 2, 3, 2)
     time = jnp.ones((1, 2))
@@ -614,8 +606,7 @@ class Spec(Base):
     def frequency(self):
         return self.kernel.rope_theta / self.kernel.window
 """, module.__dict__)
-    registry = Registry("deferred")
-    registry("spec")(module.Spec)
+    registry = Aliases("deferred", {"spec": f"{module.Spec.__module__}:Spec"})
     built = registry.build("spec", kernel={"window": 4, "rope_theta": 20.0})
     assert built.frequency() == 5.0
 

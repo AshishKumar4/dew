@@ -8,14 +8,11 @@ grows linearly in T and the temporal half's linearly in S.
 
 import jax.numpy as jnp
 
-from dew.registry import models
-
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
 
-@models("video_dit")
 class VideoDiT(_DiTStackOptions):
     """Factorized spatial-temporal DiT over (B, T, H, W, C) inputs."""
     def setup(self):

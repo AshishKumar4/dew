@@ -263,7 +263,7 @@ def test_wrapper_checks_audio_weights_and_wrong_soft_token_count(bundle):
     config = json.loads((FIXTURE / "config.json").read_text())
     config["audio_config"] = {"model_type": "gemma3n_audio", "hidden_size": 32}
     record = translate_wrapper_config(config)
-    assert record["audio"]["name"] == "gemma3n_audio" and record["audio_soft_tokens"] == 188
+    assert record["audio"]["class"] == "gemma3n_audio" and record["audio_soft_tokens"] == 188
     with pytest.raises(ValueError, match="audio checkpoint is missing"):
         translate_wrapper_weights(load_file(str(FIXTURE / "model.safetensors")), record)
     config["audio_config"] = None

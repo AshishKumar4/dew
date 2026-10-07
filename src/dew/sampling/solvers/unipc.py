@@ -9,8 +9,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.registry import solvers
-
 from .common import _check_endpoint_domain, _push
 
 
@@ -139,7 +137,6 @@ def _unipc_tables(alpha: np.ndarray, sigma: np.ndarray, solver: UniPC) -> tuple[
     return corrector, predictor
 
 
-@solvers("unipc")
 @dataclass(frozen=True)
 class UniPC:
     """UniPC, a unified predictor and corrector in lambda, as Diffusers 0.34.0's `UniPCMultistepScheduler`.

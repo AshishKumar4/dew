@@ -32,7 +32,6 @@ from flax import linen as nn
 
 from dew.artifacts import ImageGrid
 from dew.objectives.base import Variables
-from dew.registry import metrics
 
 from .common import ImageMetric, paired
 from .psnr import frame_batch
@@ -129,7 +128,6 @@ def _distance():
     return jax.jit(lambda images, references: network.apply(variables, images, references))
 
 
-@metrics("lpips")
 class LPIPS(ImageMetric):
     """Mean LPIPS between the sampled frames and the batch's, lower is better.
 

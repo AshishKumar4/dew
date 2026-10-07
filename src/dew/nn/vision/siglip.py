@@ -17,7 +17,7 @@ from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
 from dew.nn.text_encoders import CLIPEncoderLayer
 from dew.objectives.base import Variables
-from dew.registry import Record, projectors, towers
+from dew.registry import Record
 
 from .common import (
     _PROJECTOR_PATHS,
@@ -86,7 +86,6 @@ class SiglipVisionTransformer(nn.Module):
         return self.post_layernorm(hidden_states)
 
 
-@towers("siglip")
 @dataclasses.dataclass(frozen=True)
 class SiglipVision(TowerBase):
     """A SigLIP trunk's geometry, under the reference's field names."""
@@ -150,7 +149,6 @@ class GemmaProjectorModule(nn.Module):
             self.mm_soft_emb_norm(pooled.reshape(batch, tokens * tokens, width)))
 
 
-@projectors("gemma")
 @dataclasses.dataclass(frozen=True)
 class GemmaProjector(ProjectorBase):
     """Gemma's projector fields: the decoder width and the patch grid pooled
@@ -238,7 +236,7 @@ def translate_siglip_vision_config(hf_config: Mapping[str, object]) -> Record:
     if records.number(vision.get("attention_dropout", 0.0), "attention_dropout"):
         raise ValueError("attention_dropout is training-time; this trunk runs eval")
     return {
-        "name": "siglip", "fields": {
+        "class": "siglip", "fields": {
         "hidden_size": hidden,
         "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
         "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
@@ -270,7 +268,7 @@ def translate_gemma_projector_config(vision: Mapping[str, object], text_width: i
         raise ValueError(
             f"{patches} patches per side do not split over {side} soft tokens per side")
     return {
-        "name": "gemma", "fields": {
+        "class": "gemma", "fields": {
         "text_width": int(text_width),
         "patches_per_side": patches,
         "tokens_per_side": side,

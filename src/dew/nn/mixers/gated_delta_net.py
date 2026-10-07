@@ -5,10 +5,9 @@ from __future__ import annotations
 import dataclasses
 import functools
 
-from dew.nn.mixer_base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext
 
 
-@mixers("gated_delta_net")
 @dataclasses.dataclass(frozen=True)
 class GatedDeltaNetMixer(MixerBase):
     """The Qwen3.5 family's linear-attention layer, by the config's field names.

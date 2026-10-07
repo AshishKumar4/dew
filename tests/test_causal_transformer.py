@@ -189,7 +189,7 @@ def test_attention_dropout_preserves_visibility_masks(rng):
 
 def test_attention_dropout_refuses_a_mixer_without_probabilities(rng):
     with pytest.raises(ValueError, match="ordinary attention mixers"):
-        tiny(attention_dropout_rate=.5, mixer={"name": "mamba2", "fields": {}}).init(
+        tiny(attention_dropout_rate=.5, mixer={"class": "mamba2", "fields": {}}).init(
             rng, tokens(rng, length=4))
 
 
@@ -484,7 +484,7 @@ def hybrid(**overrides):
                 partial_rotary_factor=0.5,
                 layer_types=('linear_attention',) * 3 + ('full_attention',),
                 kinds={'linear_attention': {'mixer': {
-                    'name': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
+                    'class': 'gated_delta_net', 'fields': {'linear_num_key_heads': 2,
                     'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
                     'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
                 **overrides)
@@ -1322,7 +1322,7 @@ def test_nope_and_xsa_are_the_attention_mixers_own_switches():
     cannot be handed them."""
     from dew.nn.backbones.layer_plan import LayerKind
     ids = tokens(jax.random.key(0), length=8)
-    record = {"name": "attention", "fields": {"nope": True, "exclusive_self_attention": True}}
+    record = {"class": "attention", "fields": {"nope": True, "exclusive_self_attention": True}}
     kinded = tiny(qk_norm=False, layer_types=("a", "a"), kinds={"a": LayerKind(mixer=record)})
     params = kinded.init(jax.random.key(1), ids)
     plain = tiny(qk_norm=False).apply(params, ids)

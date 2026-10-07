@@ -19,7 +19,6 @@ import json
 import math
 import shutil
 import tarfile
-from importlib import import_module
 from pathlib import Path
 
 import jax
@@ -399,7 +398,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
     """A `VideoDataset` run behind the Wan VAE denoises 1 + k latent frames
     for clips of 1 + 4k, trains, and samples clips of the length it read."""
     import optax
-    import_module("test_diffusion_objective")  # registers "stub_text"
+    from diffusion_stubs import STUB_TEXT
 
     from dew.config import ModelConfig, TrainerConfig
     from dew.data import Dataset, VideoDataset
@@ -419,7 +418,7 @@ def test_a_video_run_denoises_wan_latents_and_samples_whole_clips(source):
         solver=Euler(),
         sampling_steps=2,
         val_metrics=(),
-        text=TextCondition(encoder="stub_text", checkpoint="stub-clip"),
+        text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source), revision="main", dtype="float32"),
     )
     objective = config.build()

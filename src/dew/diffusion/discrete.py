@@ -36,7 +36,6 @@ from dew.diffusion.process import Conditioning
 from dew.nn.inputs import RESPONSE_FIELDS, ModelInputs, Request, continuation_keys, local_rows, mesh_of
 from dew.nn.protocols import Logits, TokenModel
 from dew.objectives.base import Variables
-from dew.registry import presets, solvers
 
 MDLM_STEPS = 64
 """Reverse steps `generate` takes by default, the count MDLM samples with."""
@@ -227,7 +226,6 @@ class DiscreteDenoiser:
         return filled, log_probs
 
 
-@solvers("unmask")
 @dataclass(frozen=True)
 class Unmask:
     """Integrates a `DiscreteProcess` with MDLM's reverse step from t to s < t.
@@ -256,7 +254,6 @@ class Unmask:
         return jnp.where(masked & reveal, drawn, x), state
 
 
-@presets("mdlm")
 @dataclass(frozen=True)
 class MDLM:
     """Builds MDLM's masked diffusion process on the log-linear schedule.

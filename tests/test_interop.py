@@ -627,52 +627,39 @@ def test_a_registry_imports_the_module_that_registers_a_name_and_no_other():
     assert done.stdout.splitlines() == ["dew.objectives.rl.ppo Heun", "False False", "refused True"]
 
 
-REGISTRATIONS = """
-import importlib
+ALIASES = """
 import json
 
 import dew.registry as registry
 
-index = registry._registering_modules()
-absent = set()
-for module in sorted({module for modules in index.values() for module in modules}):
-    try:
-        importlib.import_module(module)
-    except ModuleNotFoundError as missing:
-        if missing.name is None or missing.name.split(".")[0] == "dew":
-            raise
-        absent.add(module)  # an optional dependency this environment lacks
 drift = {}
-for attribute in dir(registry):
-    table = getattr(registry, attribute)
-    if not any(table is held for held in registry.Registry.shared()):
-        continue
-    indexed = {name for (named, name), modules in index.items()
-               if named == attribute and not set(modules) <= absent}
-    if indexed != set(table):
-        drift[attribute] = [sorted(indexed - set(table)), sorted(set(table) - indexed)]
-shared = registry.Registry.shared()
-print(json.dumps({"tables": sum(1 for attribute in dir(registry)
-                                if any(getattr(registry, attribute) is held for held in shared)),
-                  "drift": drift}))
+for kind in registry.KINDS:
+    for alias, path in kind.paths.items():
+        try:
+            member = kind[alias]
+        except ModuleNotFoundError as missing:
+            if missing.name is None or missing.name.split(".")[0] == "dew":
+                raise
+            continue  # an optional dependency this environment lacks
+        if registry.import_path(member) != path:
+            drift[f"{kind.kind} {alias}"] = registry.import_path(member)
+print(json.dumps(drift))
 """
 
 
-def test_the_index_of_registrations_is_every_registration_dew_makes():
-    """The lookup's index reads the decorators off Dew's sources. Importing
-    every module it names fills each of the 12 registries with exactly the
-    names it attributes to them, so a registration it cannot see (a decorator
-    over several lines, an aliased registry) or a line it mistakes for one
-    fails here."""
+def test_every_alias_names_the_class_at_its_path():
+    """Each alias imports, in a fresh process, a class whose own import path
+    is the path the alias names, so a class moved or renamed without its
+    alias fails here rather than in a user's run."""
     import os
     import subprocess
 
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
-    done = subprocess.run([sys.executable, "-c", REGISTRATIONS], capture_output=True, text=True, env=env,
+    done = subprocess.run([sys.executable, "-c", ALIASES], capture_output=True, text=True, env=env,
                           timeout=600)
     assert done.returncode == 0, done.stderr[-2000:]
-    assert json.loads(done.stdout.splitlines()[-1]) == {"tables": 12, "drift": {}}
+    assert json.loads(done.stdout.splitlines()[-1]) == {}
 
 
 def test_the_cli_exports_a_run_and_refuses_a_directory_that_is_not_one(tmp_path, capsys):

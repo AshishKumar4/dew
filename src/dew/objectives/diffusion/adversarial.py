@@ -34,7 +34,6 @@ from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.dit import TextContext, masked_mean
 from dew.objectives.base import Aux, Batch, Objective, Step, Variables
-from dew.registry import objectives, trainings
 
 from .objective import (
     DISCRIMINATOR,
@@ -204,7 +203,6 @@ def r1_penalty(score, features: Sequence[jax.Array], batch: Batch) -> jax.Array:
         jnp.sum(jnp.square(g).reshape(g.shape[0], -1), axis=-1) for g in gradients]), axis=0)
 
 
-@trainings("ladd")
 @dataclasses.dataclass(frozen=True)
 class AdversarialDistillation(Distillation):
     """Adversarial distillation of a saved flow run into a few-step student.
@@ -240,7 +238,6 @@ class AdversarialDistillation(Distillation):
                                                 teacher_variables=self.teacher_variables(variables), **run)
 
 
-@objectives("ladd")
 class AdversarialDistillationObjective(FlowDistillationObjective):
     """Trains LADD, with ADD's R1 penalty and its distillation term.
 

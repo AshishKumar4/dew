@@ -20,7 +20,7 @@ from dew.nn.blocks import torch_nearest_resize
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, T5EncoderTransformer
 from dew.objectives.base import Variables
-from dew.registry import dtype_name, encoders
+from dew.registry import dtype_name
 
 if TYPE_CHECKING:
     from transformers import CLIPTokenizer, PreTrainedTokenizerBase
@@ -133,7 +133,6 @@ class T5Segment:
     tokens: int
 
 
-@encoders("diffusion_text")
 @dataclass(eq=False)
 class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
     """Encodes text into the conditioning a published latent diffusion checkpoint reads.
@@ -394,7 +393,6 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
         shutil.copytree(Path(self.checkpoint) / self.assets, destination / self.assets, dirs_exist_ok=True)
 
 
-@encoders("qwen_image_text")
 @dataclass(eq=False)
 class QwenImageConditioner(_LanguageText):
     """The text conditioning of a Qwen-Image 2.1 checkpoint: its Qwen3-VL
@@ -455,7 +453,6 @@ class QwenImageConditioner(_LanguageText):
         return tuple(text.removeprefix("user\n").removesuffix("\nassistant\n") for text in texts)
 
 
-@encoders("hidden_states_text")
 @dataclass(eq=False)
 class HiddenStatesConditioner(_LanguageText):
     """Text conditioning read off a language model's hidden states: FLUX.2's
@@ -533,7 +530,6 @@ class HiddenStatesConditioner(_LanguageText):
                                   mask=jnp.asarray(tokens["attention_mask"], bool), guidance=guidance)
 
 
-@encoders("wan_text")
 @dataclass(eq=False)
 class WanConditioner(_LanguageText):
     """The text conditioning of a Wan 2.1 checkpoint: its UMT5 encoder's last

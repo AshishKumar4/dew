@@ -45,7 +45,7 @@ SHAPES = {
                "use_double_wide_mlp": True, "sandwich_norms": True},
     "altup": {"altup": {"num_inputs": 2}, "kv_shared_layers": (2, 3),
               "per_layer_input_dim": 8, "laurel_rank": 4},
-    "mla": {"mixer": {"name": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
+    "mla": {"mixer": {"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
                       "qk_nope_head_dim": 4, "qk_rope_head_dim": 4, "v_head_dim": 4}}},
 }
 

@@ -18,7 +18,7 @@ from dew.nn.activations import gelu_exact
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Variables
-from dew.registry import Record, projectors, towers
+from dew.registry import Record
 
 from .common import (
     ProjectorBase,
@@ -101,7 +101,6 @@ class DeepseekV41VisionTransformer(nn.Module):
         return hidden_states.reshape(images, rows, columns, cfg.hidden_size)
 
 
-@towers("deepseek_v41")
 @dataclasses.dataclass(frozen=True)
 class DeepseekV41Vision(TowerBase):
     """DeepSeek-V4.1's ViT geometry, under its vision_config's names."""
@@ -163,7 +162,6 @@ class DeepseekV41ProjectorModule(nn.Module):
                                 jnp.broadcast_to(end, (images, 1, self.out_width))], axis=1)
 
 
-@projectors("deepseek_v41")
 @dataclasses.dataclass(frozen=True)
 class DeepseekV41Projector(ProjectorBase):
     """DeepSeek-V4.1's aligner fields: the ViT width, the side of the squares
@@ -234,7 +232,7 @@ def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Rec
         raise ValueError(f"hidden_size {width} over {heads} heads leaves no head width the 2D rotary "
                          "splits into height and width pairs")
     return {
-        "name": "deepseek_v41", "fields": {
+        "class": "deepseek_v41", "fields": {
         "num_hidden_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
         "hidden_size": width,
         "num_attention_heads": heads,
@@ -250,7 +248,7 @@ def translate_deepseek_v41_projector_config(hf_config: Mapping[str, object],
     the decoder width its rows and span vectors enter."""
     vision = _vision_section(hf_config)
     return {
-        "name": "deepseek_v41", "fields": {
+        "class": "deepseek_v41", "fields": {
         "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "downsample_ratio": records.integer(vision.get("downsample_ratio", 3), "downsample_ratio"),
         "out_width": int(text_width),

@@ -1,6 +1,6 @@
 from model_client import CFG, DPMSolverMultistep, from_pretrained
 
-pipe = from_pretrained("dewml/hybrid-dit-176m", revision="84e2079043b56509cec9aea6274f1dcca2538c8c")
+pipe = from_pretrained("dewml/hybrid-dit-176m", revision="3d480f6ce4698cc7859c8b25d040ff2f2f34a4d5")
 prompt = "the northern lights over a frozen lake at night, vivid colors, dramatic lighting, highly detailed"
 negative = ("letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, "
             "low quality, dull colors, washed out, low contrast, grainy")
