@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import { limitsOf } from './limits';
-import { SESSION_HEADER } from './kernel';
+export const SESSION_HEADER = 'X-Dew-Session';
 import type { SnapshotGeneration } from './snapshots';
 
 const PORT = 8888;

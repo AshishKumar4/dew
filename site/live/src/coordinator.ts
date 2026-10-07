@@ -78,7 +78,7 @@ export class Coordinator extends DurableObject<Env> {
 		for (const { id } of overdue) {
 			// Count the longest the container could have run, and make sure it is gone.
 			sql.exec('UPDATE sessions SET ended = started + (? + spare * ?) * 1000 WHERE id = ?', wallSeconds, warmSeconds, id);
-			this.ctx.waitUntil(this.env.KERNEL.get(this.env.KERNEL.idFromName(id)).expire());
+			this.ctx.waitUntil(this.env.POOL.get(this.env.POOL.idFromName('global')).close(id));
 		}
 	}
 
@@ -120,7 +120,7 @@ export class Coordinator extends DurableObject<Env> {
 			.toArray();
 		for (const { id } of stale) {
 			sql.exec('UPDATE sessions SET ended = ? WHERE id = ?', now, id);
-			this.ctx.waitUntil(this.env.KERNEL.get(this.env.KERNEL.idFromName(id)).expire());
+			this.ctx.waitUntil(this.env.POOL.get(this.env.POOL.idFromName('global')).close(id));
 		}
 		// A spare is already counted against the cap and the budget. One whose container has
 		// not reported its start may never get a host, so a session does not wait on it.
