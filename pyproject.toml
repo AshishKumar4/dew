@@ -42,11 +42,9 @@ dependencies = [
     # dew.data.images decodes, resizes and jitters every image record with it.
     "opencv-python-headless",
     "einops",
-    "tqdm",
     # dew.data.dataset reads grain's private _PROCESS_KILL_TIMEOUT_S for its
     # close budget; 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",
-    "termcolor",
     # dew.training.display: the live training display. flax already depends
     # on rich, so this names a package every install has; 13 has the
     # progress columns the display uses.
