@@ -4,8 +4,8 @@
 each trial to the recipe's train function, and records the score that
 function returns. Each trial is written to a JSON ledger before it is
 reported, so an interrupted sweep resumes at the trial it stopped on and
-does not retrain the finished ones. `random_search` and `grid_search` need
-only numpy. `optuna_search` gives Optuna's sampler the trials in the ledger
+does not retrain the finished ones. `RandomSearch` and `GridSearch` need
+only numpy. `OptunaSearch` gives Optuna's sampler the trials in the ledger
 and asks it for the next point; it needs `dewml[hpo]`.
 """
 
@@ -41,34 +41,9 @@ type Point = dict[str, Choice]
 
 
 class Search(Protocol):
-    """Chooses the next point in a space, given the trials already finished.
+    """Chooses the next point in a space, given the trials already finished."""
 
-    Only the searches that draw at random, `random_search` and
-    `optuna_search`, read `seed`. `grid_search` goes through the product in
-    order and ignores it.
-    """
-
-    def __call__(self, space: Space, finished: Sequence[TrialFinished], seed: int) -> Point: ...
-
-
-def override[C: RunConfig](config: C, point: Mapping[str, JSON]) -> C:
-    """Return `config` with each dotted path in `point` replaced, through its record.
-
-    A path walks the run's fields and the fields of the values they hold.
-    Under `model` or `objective`, a name the config does not declare is an
-    argument of the class it names, as `--model.num_layers` is on the command
-    line. A path the run does not declare raises, rather than training the
-    unchanged config.
-    """
-    for path, value in point.items():
-        record = config.to_dict()
-        *groups, field = _placed(config, path)[0]
-        node = record
-        for group in groups:
-            node = _within(node, group)
-        node[field] = value
-        config = type(config).from_dict(record)
-    return config
+    def __call__(self, space: Space, finished: Sequence[TrialFinished]) -> Point: ...
 
 
 def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
@@ -79,22 +54,6 @@ def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
     if not isinstance(held, dict):
         raise KeyError(f"{key} holds {held!r}, not a record of fields")
     return held
-
-
-def assigned[C: RunConfig](config: C, assignments: Sequence[str]) -> C:
-    """Return `config` with each `path=value` in `assignments` set (`override`).
-
-    The value is read as the field's annotation reads a flag: a number, a
-    string, a literal or a tuple of them as its type parses it on the command
-    line, None for an optional field, and anything else (a record, a list of
-    records) as JSON, or as the text itself when it is not JSON.
-    """
-    for assignment in assignments:
-        path, equals, text = assignment.partition("=")
-        if not equals:
-            raise ValueError(f"{assignment!r} sets no value; write path=value, as trainer.steps=2000")
-        config = override(config, {path: _parsed(path, text, _placed(config, path)[1])})
-    return config
 
 
 def _placed(config: RunConfig, path: str) -> tuple[list[str], Annotation]:
@@ -126,8 +85,8 @@ def _names(held: DataclassInstance | type[DataclassInstance]) -> set[str]:
 
 
 def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
-    """`text` as the flag of `annotation` reads it (`assigned`), a tuple as
-    the list its record holds."""
+    """`text` as the flag of `annotation` reads it (`RunConfig.assigned`), a
+    tuple as the list its record holds."""
     from dew.config import _flag_json, _scalar
 
     if annotation is not None and _scalar(annotation):
@@ -140,43 +99,52 @@ def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
         return text
 
 
-def random_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """Draw one value per field independently, reproducibly from `seed` and the trial's number."""
-    rng = np.random.default_rng([seed, len(finished)])
-    return {path: values[int(rng.integers(len(values)))] for path, values in space.items()}
+@dataclasses.dataclass(frozen=True)
+class RandomSearch(Search):
+    """Draws one value per field independently, reproducibly from `seed` and the trial's number."""
+
+    seed: int = 0
+
+    def __call__(self, space: Space, finished: Sequence[TrialFinished]) -> Point:
+        rng = np.random.default_rng([self.seed, len(finished)])
+        return {path: values[int(rng.integers(len(values)))] for path, values in space.items()}
 
 
-def grid_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """Return the next point of the space's cartesian product, in order.
+@dataclasses.dataclass(frozen=True)
+class GridSearch(Search):
+    """Walks the space's cartesian product in order. Asking for more trials
+    than the grid has points raises `ValueError`."""
 
-    `seed` is part of the `Search` protocol, and this search draws nothing at
-    random, so it ignores `seed`. Asking for more trials than the grid has
-    points raises `ValueError`.
-    """
-    points = list(itertools.product(*space.values()))
-    if len(finished) >= len(points):
-        raise ValueError(f'the grid holds {len(points)} points and trial '
-                         f'{len(finished)} was asked for; lower the budget')
-    return dict(zip(space, points[len(finished)], strict=True))
+    def __call__(self, space: Space, finished: Sequence[TrialFinished]) -> Point:
+        points = list(itertools.product(*space.values()))
+        if len(finished) >= len(points):
+            raise ValueError(f'the grid holds {len(points)} points and trial '
+                             f'{len(finished)} was asked for; lower the budget')
+        return dict(zip(space, points[len(finished)], strict=True))
 
 
-def optuna_search(space: Space, finished: Sequence[TrialFinished], seed: int) -> Point:
-    """Ask Optuna's TPE sampler for the next point in the space.
+@dataclasses.dataclass(frozen=True)
+class OptunaSearch(Search):
+    """Asks Optuna's TPE sampler for the next point in the space.
 
     Each call builds a new study from the finished trials, seeded with
     `seed`, so a resumed sweep asks from the same trials as a sweep that
     never stopped.
     """
-    import optuna
 
-    distributions: dict[str, optuna.distributions.BaseDistribution] = {
-        path: optuna.distributions.CategoricalDistribution(list(values))
-        for path, values in space.items()}
-    study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=seed))
-    for trial in finished:
-        study.add_trial(optuna.trial.create_trial(
-            params=dict(trial.overrides), distributions=distributions, value=trial.value))
-    return dict(study.ask(distributions).params)
+    seed: int = 0
+
+    def __call__(self, space: Space, finished: Sequence[TrialFinished]) -> Point:
+        import optuna
+
+        distributions: dict[str, optuna.distributions.BaseDistribution] = {
+            path: optuna.distributions.CategoricalDistribution(list(values))
+            for path, values in space.items()}
+        study = optuna.create_study(sampler=optuna.samplers.TPESampler(seed=self.seed))
+        for trial in finished:
+            study.add_trial(optuna.trial.create_trial(
+                params=dict(trial.overrides), distributions=distributions, value=trial.value))
+        return dict(study.ask(distributions).params)
 
 
 def _recorded(space: Space) -> dict[str, list[Choice]]:
@@ -206,5 +174,4 @@ def _write(path: Path, space: Space, trials: Sequence[TrialFinished]) -> None:
     partial.replace(path)
 
 
-__all__ = ["Choice", "Point", "Search", "Space", "assigned", "grid_search", "optuna_search", "override",
-           "random_search"]
+__all__ = ["Choice", "GridSearch", "OptunaSearch", "Point", "RandomSearch", "Search", "Space"]
