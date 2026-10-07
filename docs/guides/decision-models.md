@@ -157,10 +157,11 @@ python recipes/decision/encoder.py --mixture.root data/mixture --trainer.checkpo
 
 It records their weights beside them, in `mixture.json`. Benchmark-style items are framed both ways requests carry them: the content in the state or in the question, and the options by name or by letter. Where a set's gold is a distribution, as Open-Jev's and typed-decisions' are, the example carries it as `targets`, and training scores against that distribution rather than its most likely option.
 
-`contamination.py` reduces evaluation items to hashes, and `--decontaminate` drops every training example whose content an evaluation item shares:
+`contamination.py` reduces evaluation items to hashes, and `--decontaminate` drops every training example that repeats one:
 
-- A synthetic set's examples are compared whole.
-- Natural text is also compared line by line and by 13-word runs.
+- A decision, meaning a state with a question and its options, that is an evaluation decision is dropped, however short its state.
+- Content an evaluation item shares is dropped too: a state, or the instructions of a request with no state. A synthetic set's examples are compared whole. Natural text is also compared line by line and by 13-word runs.
+- A question and its options alone are a task's schema, which every row of a table shares, so rows of other states asked the same question are kept.
 
 What was dropped is recorded with the sets.
 
