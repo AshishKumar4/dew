@@ -38,7 +38,7 @@ from affine_run import BATCH, Counting, Features, Regression, Spread, val_batche
 
 from dew.data import Dataset
 from dew.inference.banks import CheckpointBanks, HeldBanks
-from dew.nn.backbones.causal_transformer import StackView
+from dew.nn.backbones.decoder_stack import StackView
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.sampling.text import Sampling, generate

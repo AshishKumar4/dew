@@ -17,7 +17,8 @@ from dew.inference.banks import (
     in_namespace,
     narrowed,
 )
-from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank, StackView
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_stack import DecoderBank, StackView
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import GemmaProjector, SiglipVision

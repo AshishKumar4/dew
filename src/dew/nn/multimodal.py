@@ -11,7 +11,8 @@ import jax.numpy as jnp
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.backbones.causal_transformer import CausalTransformer, DecoderBank
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.protocols import OutputTable, ProjectionGroup
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 from dew.registry import models

@@ -51,7 +51,7 @@ if TYPE_CHECKING:
     from torchax.interop import JittableModule
     from transformers import PreTrainedModel
 
-    from dew.nn.backbones.causal_transformer import DecoderBank
+    from dew.nn.backbones.decoder_stack import DecoderBank
 
 INSTALL = "pip install 'dewml[torchax]'"
 
