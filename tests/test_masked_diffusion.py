@@ -8,7 +8,7 @@ source-format export of both families lives in test_masked_diffusion_export.py.
 """
 
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 
@@ -320,9 +320,20 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert raw.text == restored.decode(raw)
 
 
+@dataclass(frozen=True)
+class Withheld(Unmask):
+    """Reveals nothing, so the closing argmax alone fills the response."""
+
+    def step(self, x, t, t_next, denoised, log_probs, state, key, process, denoise):
+        return x, state
+
+
 def test_masked_continuation_uses_last_valid_packed_segment(masked_source):
+    """The response a packed row's last segment conditions is the one that
+    segment conditions alone: read through the closing argmax, which no
+    random draw shapes, since the rows differ in width."""
     source, _ = masked_source
-    task = source.text_generation()
+    task = replace(source.text_generation(), solver=Withheld())
     final = ModelInputs(jnp.asarray([[7, 8, 9, 0, 0]]), {
         "attention_mask": jnp.asarray([[1, 1, 1, 0, 0]], bool),
         "positions": jnp.asarray([[0, 1, 2, 42, 42]]),

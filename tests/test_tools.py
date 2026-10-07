@@ -710,6 +710,16 @@ def test_step_benchmark_overrides_reach_only_the_cases_they_apply_to():
     assert {c.batch_size for c in cases} == {2}
 
 
+@pytest.mark.parametrize("path", ["lm-dense", "lm-moe", "dit"])
+def test_kernel_benchmark_step_paths_build_their_models(path, monkeypatch):
+    """Each `tools/benchmark_kernels.py step --path` names a model the
+    registry builds: lm-moe's mixture once named a field `Mixture` had
+    dropped, and the step failed before it compiled."""
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    tool = load("benchmark_kernels")
+    assert sys.modules["benchmark_models"].build_objective(tool.case_for(path, 1, None)) is not None
+
+
 def test_step_benchmark_refuses_a_case_it_cannot_name():
     """An architecture outside the preset and a JSON field outside Case are
     both errors before anything compiles, and so is a composite whose row
