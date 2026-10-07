@@ -23,7 +23,7 @@ if (secretsAt >= 0) {
 	const endpoint = preview ? 'https://live-preview.dewml.dev' : 'https://live.dewml.dev';
 	for (let attempt = 0; attempt < 30; attempt++) {
 		const response = await fetch(`${endpoint}/v1/operator/warm`, { method: 'POST', headers: {
-			Authorization: `Bearer ${secrets.RUNNER_SECRET}`, 'User-Agent': 'Dew-Gateway-Operator/1.0',
+			Authorization: `Bearer ${secrets.OPERATOR_SECRET}`, 'User-Agent': 'Dew-Gateway-Operator/1.0',
 		} });
 		const body = await response.text();
 		if (response.ok) {

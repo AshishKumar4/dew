@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { SnapshotGeneration } from './snapshots';
+import { coordinatorOf } from './coordinator';
 
 const MIN_HOSTS = 2;
 const HOST_CAPACITY = 8;
@@ -82,12 +83,26 @@ export class ModelPool extends DurableObject<Env> {
 		});
 	}
 
+	async close(session: string): Promise<void> {
+		const pool = await this.state();
+		const host = pool.sessions[session];
+		try { if (host) await this.env.SHARED.get(this.env.SHARED.idFromName(host)).close(session); }
+		finally { await this.release(session); }
+	}
+
 	override async alarm(): Promise<void> {
 		try {
 			let pool = await this.state();
 			if (!pool.desired) return;
+			for (const [session, host] of Object.entries(pool.sessions)) {
+				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) {
+					await this.release(session);
+					await coordinatorOf(this.env).ended(session, Date.now());
+				}
+			}
+			pool = await this.state();
 			const target = Math.max(MIN_HOSTS, Math.ceil(Object.keys(pool.sessions).length / TARGET_LOAD));
-			const generation = pool.desired;
+			const generation = pool.desired!;
 			await this.ctx.storage.transaction(async (storage) => {
 				const current = (await storage.get<Pool>('pool'))!;
 				const matching = current.hosts.filter((host) => host.generation.snapshot.id === generation.snapshot.id);

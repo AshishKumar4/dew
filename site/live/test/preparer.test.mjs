@@ -36,7 +36,7 @@ async function preparation(failSmoke) {
 	globalThis.fetch = async () => new Response('# trusted pinned installer');
 	try {
 		const run = runner.runPreparation(async () => ({ commit: 'a'.repeat(64), sourceCommit: 'b'.repeat(40),
-			script: 'setup-runner.sh', args: ['c'.repeat(40), '3.12'], name: 'ci', entrypoint: ['sleep', 'infinity'],
+			script: 'setup-managed.sh', args: ['c'.repeat(40), 'b'.repeat(40)], name: 'live', entrypoint: ['sleep', 'infinity'],
 			async smoke(restored) { assert.equal(restored, container); if (failSmoke) throw new Error('offline smoke failed'); },
 		}));
 		if (failSmoke) await assert.rejects(run, /offline smoke failed/);

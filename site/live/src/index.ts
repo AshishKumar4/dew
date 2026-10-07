@@ -6,19 +6,17 @@
 //   GET  /v1/status              {active, maxSessions, budgetUsedSeconds, budgetSeconds}
 
 import { type Opened, type Refusal, coordinatorOf } from './coordinator';
-import { SESSION_HEADER } from './kernel';
+import { SESSION_HEADER } from './shared-host';
 import { limitsOf } from './limits';
 import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
-import { operatorAuthorized, remoteRun } from './remote';
+import { operatorAuthorized } from './operator';
 
 export { Coordinator } from './coordinator';
-export { LiveKernel } from './kernel';
 export { SharedHost } from './shared-host';
 export { ModelPool } from './model-pool';
 export { SnapshotRegistry } from './snapshots';
 export { SnapshotPreparer } from './preparer';
-export { RunnerFleet, RunnerCache, RunnerPreparer, RemoteJob } from './remote';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
@@ -63,7 +61,8 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 	}
 	const now = Date.now();
 	// Any Kernel object answers with the image of the deploy it runs in.
-	const image = await env.KERNEL.get(env.KERNEL.idFromName('image')).image();
+	const pool = env.POOL.get(env.POOL.idFromName('global'));
+	const image = await pool.image();
 	if (!image) return reply({ error: 'warming', message: 'The shared model is warming up. Try again in a minute.' },
 		503, cors, { 'Retry-After': '30' });
 	const opened: Opened = await coordinatorOf(env).open(await digestIp(env.SESSION_SECRET, visitorKey(ip)), now, image);
@@ -72,14 +71,14 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 			'Retry-After': String(opened.retryAfter),
 		});
 	}
-	if (opened.spare !== null) ctx.waitUntil(env.KERNEL.get(env.KERNEL.idFromName(opened.spare)).warm(opened.spare));
+	
 	const limits = limitsOf(env);
 	// The token outlives the session a little, so a page that connects late still gets in.
 	const expires = now + (limits.wallSeconds + 60) * 1000;
 	const token = await sign(env.SESSION_SECRET, opened.id, expires);
 	const socket = `wss://${new URL(request.url).host}/v1/sessions/${opened.id}/ws?token=${encodeURIComponent(token)}`;
 	return reply(
-		{ id: opened.id, token, socket, warm: opened.warm, limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
+		{ id: opened.id, token, socket,  limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
 		201,
 		cors,
 	);
@@ -91,7 +90,15 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 	if (!(await coordinatorOf(env).isOpen(id))) return new Response('this session is over', { status: 410 });
 	const forwarded = new Request(request.url, request);
 	forwarded.headers.set(SESSION_HEADER, id);
-	return env.KERNEL.get(env.KERNEL.idFromName(id)).fetch(forwarded);
+	const pool = env.POOL.get(env.POOL.idFromName('global'));
+	const image = await pool.image();
+	if (!image) return new Response('queued for a warm model host', { status: 503 });
+	const host = await pool.allocate(id, image);
+	if (!(await coordinatorOf(env).started(id, Date.now(), image))) {
+		await pool.close(id);
+		return new Response('this session is over', { status: 410 });
+	}
+	return env.SHARED.get(env.SHARED.idFromName(host)).fetch(forwarded);
 }
 
 export default {
@@ -108,10 +115,7 @@ export default {
 			} else if (request.method !== 'GET') return new Response('Method not allowed', { status: 405 });
 			return Response.json(await pool.status());
 		}
-		if (request.method === 'POST' && url.pathname === '/v1/remote/run') {
-			try { return await remoteRun(request, env); }
-			catch (error) { return Response.json({ message: String(error) }, { status: 400 }); }
-		}
+
 		const origin = request.headers.get('Origin');
 		const allowed = listed(env.ALLOWED_ORIGINS);
 		const cors: HeadersInit = {
