@@ -99,7 +99,6 @@ class Train:
 
     def run_command(self) -> int:
         from dew.config import RunConfig
-        from dew.config.sweep import assigned
 
         path = Path(self.run)
         if path.suffix == ".json":
@@ -117,7 +116,7 @@ class Train:
                 built = dataclasses.replace(built, trainer=dataclasses.replace(built.trainer, name=path.stem))
             # What trains is what the record reads back as, so its run.json trains the same run.
             run = RunConfig.read(built.record(), trust=(*self.trust, path.stem))
-        assigned(run, self.set).run()
+        run.assigned(self.set).run()
         return 0
 
 

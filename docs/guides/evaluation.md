@@ -167,15 +167,15 @@ Dew does not hash data contents or source revisions. Put their identities in the
 
 ## Hyperparameter sweeps
 
-`config.sweep(space, *, train, trials, ledger, tracker, search=random_search, seed=0)` on a `RunConfig` trains `trials` trials, each at a point the search picks from `space`. For each trial it calls the entry point `train`, which trains the config it is given and returns a score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. The sweep runs the trials one after another through the normal training loop and has no scheduler.
+`config.sweep(space, *, train, trials, ledger, tracker, search=RandomSearch())` on a `RunConfig` trains `trials` trials, each at a point the search picks from `space`. For each trial it calls the entry point `train`, which trains the config it is given and returns a score. Each trial is an ordinary run with its own record, checkpoints and tracking directory under `<trainer.name>/trial-<index>`. The sweep runs the trials one after another through the normal training loop and has no scheduler.
 
 A space maps dotted paths in the run record to the values a trial can take. The sweep applies a point through `to_dict` and `from_dict`, so a path the config class does not declare raises an error. A typo in the space therefore cannot leave a trial silently training the unchanged config.
 
 | Search | Behavior |
 |---|---|
-| `random_search` | Draws each field independently, reproducibly from the trial number. |
-| `grid_search` | Walks the cartesian product in order. |
-| `optuna_search` | Asks Optuna's sampler for the next point and tells it the trials in the ledger. Install `dewml[hpo]`. |
+| `RandomSearch(seed=0)` | Draws each field independently, reproducibly from the seed and the trial number. |
+| `GridSearch()` | Walks the cartesian product in order. |
+| `OptunaSearch(seed=0)` | Asks Optuna's sampler for the next point and tells it the trials in the ledger. Install `dewml[hpo]`. |
 
 A finished trial is written to the ledger before it is reported. So if a sweep is interrupted, running it again continues at the trial it stopped on and does not retrain the finished ones. A ledger written for a different space is refused. The tracker receives each trial's score as `sweep/value` at the trial's number, along with its `TrialFinished` record. A sweep needs `trainer.name`, because trials sharing one name would resume from each other's checkpoints.
 
@@ -184,7 +184,7 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 ```python
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.sweep import grid_search
+from dew.config.sweep import GridSearch
 from dew.data import TokenWindows
 
 config = RunConfig(
@@ -207,7 +207,7 @@ def trial(run: RunConfig) -> float:
 
 with LocalTracker("runs/sweep/tracking") as tracker:
     trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
-                          ledger="runs/sweep/ledger.json", tracker=tracker, search=grid_search)
+                          ledger="runs/sweep/ledger.json", tracker=tracker, search=GridSearch())
 print(min(trials, key=lambda trial: trial.value).overrides)
 ```
 
