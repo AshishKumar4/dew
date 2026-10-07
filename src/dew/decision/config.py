@@ -17,6 +17,8 @@ from __future__ import annotations
 import dataclasses
 import os
 
+import jax
+
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data.text import HFTokenizer
 from dew.decision.data import DecisionTable
@@ -89,10 +91,12 @@ class DecisionRunConfig(RunConfig):
                                     seed=self.data.seed, loading=self.data.loading)
 
         def calibrate(state: TrainState, directory: str) -> None:
-            """Fit the task's temperatures on the held-out rows and save them into the run."""
+            """Fit the task's temperatures on the held-out rows; process zero saves them into the run."""
             task = objective.pipeline(state)
             assert isinstance(task, Decide), "a decision objective's task is a Decide"
-            dataclasses.replace(task.calibrated(held_out), name=os.path.basename(directory)).save(directory)
+            calibrated = dataclasses.replace(task.calibrated(held_out), name=os.path.basename(directory))
+            if jax.process_index() == 0:
+                calibrated.save(directory)
 
         metrics = (Accuracy(), ECE(), AURC(), LogLoss())
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics),
