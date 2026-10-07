@@ -1,32 +1,22 @@
-"""recipes/decision/train.py end to end on Laya's toy checkpoint: a CSV in, a calibrated run out."""
+"""A decision run end to end on Laya's toy checkpoint: a CSV in, a calibrated run out."""
 
 import csv
-import importlib.util
 import json
-import sys
 from pathlib import Path
 
 import pytest
 
 from dew.decision import Choice, Decide, DecisionTable
+from dew.decision.config import DecisionRunConfig
+from dew.decision.scoring import ScoringRule
+from dew.registry import from_record
 
 pytestmark = pytest.mark.mesh
 
-RECIPE = Path(__file__).parents[1] / "recipes" / "decision" / "train.py"
 TINY = Path(__file__).parent / "fixtures" / "laya" / "tiny"
 
 
-@pytest.fixture(scope="module")
-def recipe():
-    spec = importlib.util.spec_from_file_location("decision_recipe", RECIPE)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(recipe, tmp_path):
+def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     table = tmp_path / "tickets.csv"
     tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
                ("how much is the pro plan", "sales"), ("refund my last invoice", "billing"),
@@ -36,7 +26,7 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(recipe, tmp_pa
         writer.writerow(["text", "label"])
         writer.writerows(tickets)
     # The command line `laya-train --data tickets.csv` is, with this run's sizes.
-    config = recipe.DecisionRunConfig.cli([
+    config = DecisionRunConfig.cli([
         "--data.path", str(table), "--data.held-out", "0.5", "--data.question", "team",
         "--data.loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
             {"class": "dew.decision.scoring:Combined",
@@ -46,11 +36,9 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(recipe, tmp_pa
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"])
     assert isinstance(config.data, DecisionTable)
-    recipe.main(config)
+    assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
+    config.run()
     run = tmp_path / "runs" / "tickets"
-    records = [json.loads(line) for line in (run / "tracking" / "records.jsonl").read_text().splitlines()]
-    assert next(record["value"]["summary"]["loss"] for record in records
-                if record["type"] == "RunRecord") == "log_loss+0.5*brier"
     assert (run / "decide.json").is_file()
     decide = Decide.from_run(str(run))
     answer = decide("I was billed twice", {"team": Choice("Which team?", ["billing", "technical", "sales"])})

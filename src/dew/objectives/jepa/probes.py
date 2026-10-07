@@ -18,9 +18,9 @@ import jax
 import jax.numpy as jnp
 import optax
 
-from dew.artifacts import Representations
+from dew.artifacts import Artifact, Representations
 from dew.eval.common import metric_device
-from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
+from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
 
 type ProbeParams = dict[str, jax.Array]
 """The linear probe's weight matrix under "w" and its bias under "b"."""
@@ -113,10 +113,11 @@ class LinearProbe:
     shown = Shown(better="higher", percent=True)
     reads = Representations
 
-    def __call__(self, representations: Representations, batch) -> tuple[float, float]:
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
+        assert isinstance(artifact, Representations), "the trainer hands a metric the artifact it reads"
         with metric_device():
             return float(linear_probe_accuracy(
-                representations.features, representations.labels, self.num_classes,
+                artifact.features, artifact.labels, self.num_classes,
                 steps=self.steps, learning_rate=self.learning_rate,
                 weight_decay=self.weight_decay)), 1
 
@@ -137,9 +138,10 @@ class KnnProbe:
     shown = Shown(better="higher", percent=True)
     reads = Representations
 
-    def __call__(self, representations: Representations, batch) -> tuple[float, float]:
+    def __call__(self, artifact: Artifact, batch: Batch, /) -> tuple[float, float]:
+        assert isinstance(artifact, Representations), "the trainer hands a metric the artifact it reads"
         with metric_device():
-            return float(knn_probe_accuracy(representations.features, representations.labels,
+            return float(knn_probe_accuracy(artifact.features, artifact.labels,
                                            self.num_classes, k=self.k)), 1
 
     merge = staticmethod(merge_totals)

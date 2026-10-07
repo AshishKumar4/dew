@@ -7,7 +7,7 @@ layer, reconstructed from the Rigel blog post and lm-engine 45b6b57b.
         --batch-size 32 --seq-len 1024
 
 `--corpora` is name, directory pairs; the second line is a muP proxy on one
-corpus, and any `LmRunConfig` flag follows the recipe's own.
+corpus, and any `LMRunConfig` flag follows the recipe's own.
 
 The architecture reproduces the published parameter counts exactly at width
 1024 (2,345,567,552 total, 260,998,464 active non-embedding): 40 layers in
@@ -36,6 +36,7 @@ import tyro
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.data import DataPhase, PackedTokens
+from dew.objectives.lm import LMRunConfig
 from dew.training.optim import ParamGroup, Power, PowerTail
 
 LAYERS = 40
@@ -118,7 +119,7 @@ def phases(corpora: Mapping[str, str], steps: int) -> tuple[DataPhase, ...]:
 
 @dataclasses.dataclass(frozen=True)
 class RigelArgs:
-    """What sizes a Rigel run; everything else is `LmRunConfig`'s."""
+    """What sizes a Rigel run; everything else is `LMRunConfig`'s."""
 
     corpora: dict[str, str]
     """Rigel's corpus names to tokenized directories, as name, directory
@@ -131,10 +132,9 @@ class RigelArgs:
     tokenizer: str = "ibm-granite/granite-4.0-h-micro"
 
 
-def run_config(args: RigelArgs):
-    """The LM recipe's run config for `args`."""
-    from train import LmRunConfig
-    return LmRunConfig(
+def run_config(args: RigelArgs) -> LMRunConfig:
+    """The LM run config for `args`."""
+    return LMRunConfig(
         model=ModelConfig("causal_transformer", {**model_config(args.width), "dtype": "bfloat16"}),
         data=PackedTokens(phases=phases(args.corpora, args.steps), seq_len=args.seq_len),
         optim=optim_config(args.width, args.steps, args.batch_size, args.seq_len),
@@ -145,6 +145,5 @@ def run_config(args: RigelArgs):
 
 
 if __name__ == "__main__":
-    from train import LmRunConfig, main
     args, rest = tyro.cli(RigelArgs, return_unknown_args=True)
-    main(LmRunConfig.cli(rest, default=run_config(args)))
+    LMRunConfig.cli(rest, default=run_config(args)).run()

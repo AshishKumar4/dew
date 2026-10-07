@@ -51,12 +51,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_lm_recipe import load_recipe
 
 from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.inputs import ModelInputs
+from dew.objectives.lm import LMRunConfig
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
 
@@ -133,7 +133,6 @@ def train_and_export(root: Path) -> Path:
     """A short real run on those tokens, written back out in the HF layout
     with the tokenizer that produced the ids, which writes its own files."""
 
-    recipe = load_recipe()
     tokenizer = HFTokenizer(str(TOKENIZER))
     tokens = root / "tokens"
     meta = write_token_files(tokens, tokenizer)
@@ -143,7 +142,7 @@ def train_and_export(root: Path) -> Path:
             model_args.append(f"--model.{'' if value else 'no-'}{key}")
         else:
             model_args.extend((f"--model.{key}", str(value)))
-    config = recipe.LmRunConfig.cli( [
+    config = LMRunConfig.cli([
         "--data.path", str(tokens), "--data.seq-len", str(SEQ),
         "--data.loading.workers", "0", "--tokenizer", str(TOKENIZER),
         "--trainer.batch-size", "16", "--trainer.steps", str(STEPS),
@@ -154,7 +153,7 @@ def train_and_export(root: Path) -> Path:
         "--model.dtype", "float32", "--sample-tokens", "0",
         "--optim.learning-rate", "3e-3",
         *model_args])
-    state = recipe.main(config)
+    state = config.run()
     assert int(state.step) == STEPS
 
     model = models.build(config.model.name, {**FIELDS, "vocab_size": meta["vocab_size"]},

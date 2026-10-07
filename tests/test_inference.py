@@ -21,7 +21,7 @@ from steady_state import steady_state
 import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
-from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
@@ -530,17 +530,12 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     which the fp32 rebuild does not. Observed on CPU: 3e-02 on logits of
     order 1."""
     pytest.importorskip("qwix")
-    from dew.objectives.lm import LMObjective
+    from dew.objectives.lm import LMObjective, LMRunConfig
     from dew.training.quantization import Quantization
 
     batch, seq = 8, 8
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
                   "mlp_features": 32, "max_seq_len": 16}
-
-    @dataclasses.dataclass(frozen=True)
-    class LmRun(RunConfig):
-        """The two fields the LM entry of `dew.pipeline` reads beside the model."""
-        tokenizer: str = "byte"
 
     class Stream:
         def __init__(self):
@@ -559,7 +554,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
         def set_state(self, state):
             self.position = int(state.decode())
 
-    config = LmRun(
+    config = LMRunConfig(
         model=ModelConfig("causal_transformer", {**fields,
                                                "dtype": "float32", "attention_impl": "reference"}),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=batch, steps=1,
@@ -569,7 +564,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
                          Dataset(lambda partition: Stream(), None, None, batch), name="run")
     Checkpoints(str(tmp_path / "run")).wait()
 
-    record = json.loads((tmp_path / "run" / "run.json").read_text())
+    record = json.loads((tmp_path / "run" / "run.json").read_text())["fields"]
     assert record["trainer"]["quantization"]["dtype"] == "int8"
     task = dew.pipeline(str(tmp_path / "run"))
 

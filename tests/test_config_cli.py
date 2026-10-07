@@ -1,11 +1,9 @@
-"""The recipes' command lines: the registries as subcommands, and a run that
-rebuilds from what it logged."""
+"""The run classes' command lines: the registries as subcommands, and a run
+that rebuilds from what it logged."""
 
 import dataclasses
-import importlib.util
 import itertools
 import json
-import sys
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Annotated
@@ -18,6 +16,9 @@ from dew.config import RunConfig, ScheduleSpec
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
 from dew.data.dataset import record_argument, tokenized
 from dew.diffusion.presets import Flow
+from dew.objectives.diffusion import DiffusionRunConfig
+from dew.objectives.jepa import JepaRunConfig
+from dew.objectives.lm import LMRunConfig
 from dew.registry import datasets, import_path
 from dew.sampling import Heun
 from dew.training import MeshSpec
@@ -27,26 +28,12 @@ pytestmark = pytest.mark.mesh
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_recipe(name):
-    """A recipe file, loaded once as `recipe_<name>`: a recipe registers its
-    corpora on import, and a name maps to one class."""
-    module = sys.modules.get(f"recipe_{name}")
-    if module is None:
-        path = REPO_ROOT / "recipes" / name / "train.py"
-        spec = importlib.util.spec_from_file_location(f"recipe_{name}", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)
-    return module
-
-
 def parse(cls, args):
     return cls.cli(args)
 
 
 def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
-    recipe = load_recipe("diffusion")
-    config = parse(recipe.DiffusionRunConfig, [
+    config = parse(DiffusionRunConfig, [
         "--data.image-size", "64", "--data.augmentation", "flip_only",
         "preset:flow", "--preset.shift", "3.0", "--objective.solver", '{"class": "heun"}',
         "--objective.guidance", '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 2.5}}',
@@ -67,12 +54,11 @@ def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
 
 
 def test_another_dataset_is_its_subcommand():
-    recipe = load_recipe("lm")
-    config = parse(recipe.LmRunConfig, ["data:packed-tokens", "--data.path", "d",
+    config = parse(LMRunConfig, ["data:packed-tokens", "--data.path", "d",
                                         "--data.seq-len", "64", "--data.packing-bins", "2"])
     assert config.data == PackedTokens(path="d", seq_len=64, packing_bins=2)
     with pytest.raises(ValueError, match="token-windows or data:packed-tokens"):
-        recipe.LmRunConfig(data=TFDSImages())
+        LMRunConfig(data=TFDSImages()).prepare()
 
 
 def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
@@ -81,30 +67,28 @@ def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
 
 
 @pytest.mark.parametrize("name", ["diffusion", "lm", "jepa"])
-def test_a_recipe_config_round_trips_through_its_json_record(name):
-    recipe = load_recipe(name)
-    cls = {"diffusion": "DiffusionRunConfig", "lm": "LmRunConfig", "jepa": "JepaRunConfig"}[name]
+def test_a_run_config_round_trips_through_its_json_record(name):
+    cls = {"diffusion": DiffusionRunConfig, "lm": LMRunConfig, "jepa": JepaRunConfig}[name]
     args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6",
                           "--objective.unconditional-prob", "0.2"],
             "lm": ["--data.path", "d", "--sample-tokens", "4", "--objective.ema-decay", "0.9"],
             "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
-    config = parse(getattr(recipe, cls), [*args, "--trainer.steps", "5"])
+    config = parse(cls, [*args, "--trainer.steps", "5"])
 
-    record = json.loads(json.dumps(config.to_dict()))
+    record = json.loads(json.dumps(config.record()))
 
-    assert getattr(recipe, cls).from_dict(record) == config
-    assert record["data"]["class"] == import_path(type(config.data))
+    assert RunConfig.read(record) == config
+    assert record["fields"]["data"]["class"] == import_path(type(config.data))
 
 
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
     name the sources, so the run and its solvers rebuild from run.json."""
-    recipe = load_recipe("diffusion")
-    config = recipe.DiffusionRunConfig(data=OnlineImages(sources=("user/urls",), image_size=64))
+    config = DiffusionRunConfig(data=OnlineImages(sources=("user/urls",), image_size=64))
 
     record = json.loads(json.dumps(config.to_dict()))
 
-    assert recipe.DiffusionRunConfig.from_dict(record) == config
+    assert DiffusionRunConfig.from_dict(record) == config
     assert record["data"]["class"] == datasets.paths["online_images"]
 
 
@@ -151,7 +135,6 @@ def _batches(batch):
 
 
 def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
-    recipe = load_recipe("diffusion")
     batch = 8
     def load(self, *, batch, tokenize=None):
         train = tokenized(_batches(batch), tokenize)
@@ -161,7 +144,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
                        records=4 * batch, batch=batch)
 
     monkeypatch.setattr(TFDSImages, "load", load)
-    config = parse(recipe.DiffusionRunConfig, [
+    config = parse(DiffusionRunConfig, [
         "--text.encoder", STUB_TEXT, "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
@@ -174,10 +157,10 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     # batch and downloads nothing, unlike the default clip metric.
     config = dataclasses.replace(config, val_metrics=("psnr",))
 
-    state = recipe.main(config)
+    state = config.run()
 
     assert int(state.step) == 2
-    assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == config
+    assert RunConfig.load(str(tmp_path / "run")) == config
     assert config.to_dict()["preset"] == {"class": "dew.diffusion.presets:EDM", "fields": {
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,
         "regime": "pixel", "P_mean": None, "P_std": None, "min_snr_gamma": None}}
@@ -185,7 +168,6 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     assert (tmp_path / "run" / "2").is_dir()
 
 def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_path, monkeypatch):
-    recipe = load_recipe("jepa")
     batch = 8
     size = 32
 
@@ -221,7 +203,7 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
 
     monkeypatch.setattr(TFDSImages, "load", load)
     config = parse(
-        recipe.JepaRunConfig,
+        JepaRunConfig,
         [
             "--data.image-size",
             str(size),
@@ -250,10 +232,10 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
         ],
     )
 
-    state = recipe.main(config)
+    state = config.run()
 
     assert int(state.step) == 2
-    assert recipe.JepaRunConfig.load(str(tmp_path / "run")) == config
+    assert RunConfig.load(str(tmp_path / "run")) == config
     assert (tmp_path / "run" / "2").is_dir()
 
 
@@ -261,9 +243,8 @@ def test_a_jepa_run_without_probes_schedules_no_validation_pass():
     """A JEPA validation pass scores the frozen-encoder probes, so a run that
     names no probe classes yet schedules passes is refused where it is
     configured, not at its first pass."""
-    recipe = load_recipe("jepa")
     with pytest.raises(ValueError, match="probe_classes"):
-        recipe.JepaRunConfig()
+        JepaRunConfig()
 
 
 def test_param_groups_on_the_command_line_read_their_schedules_as_records():

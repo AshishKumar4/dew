@@ -37,14 +37,13 @@ from dew.objectives.diffusion.config import DiffusionRunConfig, TextCondition
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.diffusion.objective import TEACHER
-from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
+from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, JepaRunConfig, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
 from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.objectives.supervised import CrossEntropy, Supervised
 from dew.registry import objectives
 from dew.sampling.solvers import Euler
-from recipes.jepa.train import JepaRunConfig, sample_field
 
 IMAGES = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 SEQ_LEN = 15
@@ -127,7 +126,7 @@ def jepa():
     """The JEPA recipe's sample field over its image dataset, the grid it patches."""
     config = JepaRunConfig(data=TFDSImages(path=str(IMAGES), image_size=16, augmentation="none",
                                            val_batches=None), probe_classes=2)
-    sample = sample_field(config)
+    sample = config.sample()
     encoder = JepaEncoder(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=2)
     grid = (sample.shape[-2] // encoder.patch_size,) * 2
     predictor = JepaPredictor(grid=grid, emb_features=16, predictor_features=8, num_layers=1,
