@@ -49,7 +49,7 @@ from dew.registry import objectives
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
-    from dew.nn.backbones.causal_transformer import DecoderBank
+    from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.nn.diffusion_gemma import DiffusionGemma
 
 

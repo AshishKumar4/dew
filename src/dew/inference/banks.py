@@ -2,7 +2,7 @@
 
 A scanned run of identical layers reads each parameter as one array with
 the layer axis in front; that stacked array is a bank, and one layer's
-slice of it is a row. (`dew.nn.backbones.causal_transformer.StackView`
+slice of it is a row. (`dew.nn.backbones.decoder_stack.StackView`
 adapts banks to the `layers_N` subtrees a checkpoint stores.) This module
 builds the banked store directly. It reads, stacks and places each bank
 separately and releases that bank's rows before reading the next, so a
@@ -40,7 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSh
 from jax.typing import DTypeLike
 
 from dew import records
-from dew.nn.backbones.causal_transformer import DecoderBank
+from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.hyper_connections import Carried
 from dew.objectives.base import Variables, merge
 
