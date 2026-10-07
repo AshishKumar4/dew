@@ -401,10 +401,7 @@ def translate_clip_config(hf_config: Mapping[str, object]) -> CLIPFields:
 
 
 _PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
-_FEEDFORWARD = ("fc1", "fc2")
 _NORMS = ("layer_norm1", "layer_norm2")
-_DENSE_LEAF = {"weight": "kernel", "bias": "bias"}
-_NORM_LEAF = {"weight": "scale", "bias": "bias"}
 
 # A tower's tensors outside its encoder layers. The reference spells the
 # vision tower's first norm `pre_layrnorm`.
@@ -433,18 +430,19 @@ _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projectio
                           "logit_scale")
 
 
-def _layer_path(parts) -> tuple[str, ...] | None:
-    """`encoder.layers.N...` into the layer's path, the same in both towers."""
-    if len(parts) < 5 or parts[:2] != ["encoder", "layers"] or not parts[2].isdigit():
+def _encoder_layer_path(parts, root: str, norms: tuple[str, ...],
+                        projections: tuple[str, ...]) -> tuple[str, ...] | None:
+    """`<root>.layers.N...` into the path of a CLIP-style encoder layer: two
+    layer norms, biased attention maps and a biased fc1/fc2 MLP."""
+    if (len(parts) < 5 or parts[:2] != [root, "layers"] or not parts[2].isdigit()
+            or parts[-1] not in ("weight", "bias")):
         return None
     layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in _NORMS and leaf in _NORM_LEAF:
-        return (layer, module, _NORM_LEAF[leaf])
-    if len(parts) == 6 and leaf in _DENSE_LEAF:
-        sublayer = parts[4]
-        if ((module == "self_attn" and sublayer in _PROJECTIONS)
-                or (module == "mlp" and sublayer in _FEEDFORWARD)):
-            return (layer, module, sublayer, _DENSE_LEAF[leaf])
+    if len(parts) == 5 and module in norms:
+        return (layer, module, "scale" if leaf == "weight" else "bias")
+    if len(parts) == 6 and ((module == "self_attn" and parts[4] in projections)
+                            or (module == "mlp" and parts[4] in ("fc1", "fc2"))):
+        return (layer, module, parts[4], "kernel" if leaf == "weight" else "bias")
     return None
 
 
@@ -460,7 +458,7 @@ def _tower_path(hf_name: str, prefix: str,
     name = hf_name.removeprefix(prefix)
     if name == "embeddings.position_ids":
         return None
-    path = tensors.get(name) or _layer_path(name.split("."))
+    path = tensors.get(name) or _encoder_layer_path(name.split("."), "encoder", _NORMS, _PROJECTIONS)
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

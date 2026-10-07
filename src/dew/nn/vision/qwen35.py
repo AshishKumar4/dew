@@ -22,15 +22,7 @@ from dew.nn.text_encoders import MLP
 from dew.objectives.base import Variables
 from dew.registry import Record
 
-from .common import (
-    ProjectorBase,
-    TowerBase,
-    TowerGeometry,
-    _grid_rope,
-    _grid_rope_tables,
-    _vision_section,
-    projector_weight_path,
-)
+from .common import ProjectorBase, TowerBase, TowerGeometry, _grid_rope, _grid_rope_tables, _vision_section
 
 
 def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> tuple[jax.Array, jax.Array]:
@@ -332,13 +324,6 @@ def translate_qwen35_vision_weights(
     params.setdefault("patch_embed", {})["kernel"] = np.ascontiguousarray(
         conv.transpose(1, 2, 3, 4, 0).reshape(-1, conv.shape[0]))
     return params
-
-
-def translate_qwen35_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """A Qwen 3.5 merger's tensors at the requested storage precision."""
-    return translate_parameters(hf_tensors, lambda name: projector_weight_path("qwen3_5", name), param_dtype)
 
 
 def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:

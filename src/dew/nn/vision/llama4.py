@@ -8,30 +8,19 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew import records
-from dew.interop.weights import translate_parameters
 from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
-from dew.nn.text_encoders import MLP
-from dew.objectives.base import Variables
+from dew.nn.text_encoders import MLP, _encoder_layer_path
 from dew.registry import Record
 
-from .common import (
-    ProjectorBase,
-    TowerBase,
-    TowerGeometry,
-    _encoder_layer_path,
-    _image_size,
-    _vision_section,
-    projector_weight_path,
-)
+from .common import ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
 
 
 def _llama4_vision_tables(grid: int, head_dim: int, theta: float, *,
@@ -336,20 +325,6 @@ def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
-
-
-def translate_llama4_vision_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """Llama 4 vision parameters at the requested storage precision."""
-    return translate_parameters(hf_tensors, llama4_vision_path, param_dtype)
-
-
-def translate_llama4_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """Llama 4's outer projector map at the requested storage precision."""
-    return translate_parameters(hf_tensors, lambda name: projector_weight_path("llama4", name), param_dtype)
 
 
 def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:

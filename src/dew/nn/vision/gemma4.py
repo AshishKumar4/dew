@@ -443,13 +443,6 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     return (collection, *path)
 
 
-def translate_gemma4_vision_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """Gemma 4 parameters plus native FP32 frozen and clipping buffers."""
-    return translate_parameters(hf_tensors, gemma4_vision_path, param_dtype)
-
-
 def translate_gemma4_projector_weights(
     hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
 ) -> Variables:
