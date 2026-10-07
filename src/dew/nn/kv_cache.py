@@ -429,10 +429,10 @@ class KVStore:
 
         The TPU kernel reads bfloat16 and casts other page dtypes (its int8
         path broadcasts the scales to full width first), so a float32 or
-        quantized pool uses the gather. On a GPU, decode uses cuDNN's paged
-        forward when cuDNN supports the heads and the page size is a multiple
-        of 16 tokens. A grouped pool also uses the gather, which keeps each
-        group's pages where they are.
+        quantized pool uses the gather. On a GPU, decode reads the pages
+        through Dew's Pallas decode kernel where it fits the heads and the
+        page (`decode_attention.fits_paged`). A grouped pool also uses the
+        gather, which keeps each group's pages where they are.
         """
         page_size = self.layout.page_size
         if (page_size is None or self.layout.quantized is not None
@@ -442,11 +442,12 @@ class KVStore:
             return True
         if jax.default_backend() != "gpu":
             return False
-        from dew.nn.attention import _FORWARD_MODE, cudnn_runs
+        from dew.nn.attention import _FORWARD_MODE
+        from dew.nn.kernels import decode_attention
 
-        query = jax.ShapeDtypeStruct((self.rows, 1, self.kv_heads, self.head_dim), self.dtype)
-        return (page_size % 16 == 0 and cudnn_runs(query)
-                and not _FORWARD_MODE.get())
+        query = jax.ShapeDtypeStruct((self.rows, self.kv_heads, self.head_dim), self.dtype)
+        pages = jax.ShapeDtypeStruct((self.kv_heads, 1, page_size, self.head_dim), self.dtype)
+        return decode_attention.fits_paged(query, pages) and not _FORWARD_MODE.get()
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
         """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row.
@@ -458,10 +459,7 @@ class KVStore:
         """
         if jax.default_backend() == "gpu":
             if softcap is not None:
-                raise ValueError("the cuDNN paged kernel does not apply a logit softcap")
-            # JAX 0.11.2's paged cuDNN backward returns [rows, page, heads, dim]
-            # for a [pool_pages, page, heads, dim] operand; the verifier rejects
-            # it. Keep the old gathered attention as the wrapper's VJP.
+                raise ValueError("the GPU paged decode kernel does not apply a logit softcap")
             return _gpu_paged(query, self._get("cached_key"), self._get("cached_value"),
                               self._get(TABLE), lengths)
         from jax.experimental.pallas.ops.tpu.paged_attention import paged_attention
@@ -490,24 +488,12 @@ def _gather_pages(pool: jax.Array, table: jax.Array, groups: int) -> jax.Array:
 @jax.custom_vjp
 def _gpu_paged(query: jax.Array, key: jax.Array, value: jax.Array,
                table: jax.Array, lengths: jax.Array) -> jax.Array:
-    # Private JAX API, pinned by jax<0.11.3. Moving it breaks
-    # test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention.
-    from jax._src.cudnn.fused_attention_stablehlo import MaskType, paged_attention
+    """Dew's Pallas decode kernel over the pages (`decode_attention.attend_paged`),
+    differentiated as the gathered attention is. An inactive row reads one
+    slot, so its unused output stays finite."""
+    from dew.nn.kernels import decode_attention
 
-    rows = query.shape[0]
-    # The old gather pads q=1 to q=2 for cuDNN's odd-query backward restriction
-    # and passes query lengths of 2. Keep that forward tiling/rounding; discard
-    # the added query's output, rather than changing the accepted greedy tokens.
-    padded = jnp.pad(query[:, None], ((0, 0), (0, 1), (0, 0), (0, 0)))
-    pages = table[:, None, :, None]
-    # Inactive rows read one slot to keep the unused output finite; nobody reads it.
-    out = paged_attention(
-        padded, jnp.moveaxis(key, 0, 2), jnp.moveaxis(value, 0, 2),
-        jnp.full(rows, 2, jnp.int32), jnp.maximum(lengths, 1), pages, pages,
-        scale=query.shape[-1] ** -0.5, mask_type=MaskType.PADDING)
-    if not isinstance(out, jax.Array):
-        raise TypeError("cuDNN paged attention must return an array")
-    return out[:, 0]
+    return decode_attention.attend_paged(query, key, value, table, jnp.maximum(lengths, 1))
 
 
 def _gpu_paged_fwd(query, key, value, table, lengths):
