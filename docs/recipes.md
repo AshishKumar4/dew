@@ -134,7 +134,7 @@ python "$DEW_REPO/recipes/diffusion/train.py" --help
 python "$DEW_REPO/recipes/jepa/train.py" --help
 ```
 
-A diffusion configuration adds a training `preset`, a validation `solver`, guidance, the number of sampling steps, a text condition and an optional autoencoder. You pick registered choices with subcommands such as `preset:edm` and `solver:heun`. Guidance is a configuration object, so you set its scale with `--guidance.scale`; there is no bare numeric `--guidance` flag.
+A diffusion configuration adds a training `preset`, a text condition and an optional autoencoder. You pick a preset with a subcommand such as `preset:edm`. The objective (`--objective`, `diffusion` by default) holds the EMA, the condition dropout and how validation samples: `--objective.ema-decay 0.9999`, `--objective.steps 40`, and records for the solver and the guidance, `--objective.solver '{"class": "heun"}'` and `--objective.guidance '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 4.0}}'`. Another objective trains a loss of its own in place of the denoising loss: `mean_flow`, `shortcut`, `flow_grpo`, or a distillation of a saved run, `rcm`, `ladd` or `guidance_distillation` with `--objective.teacher-run <run directory>`. Each refuses a preset or a guidance its loss cannot train or sample with.
 
 By default the recipe trains on Oxford Flowers with a CLIP text encoder and scores validation with a CLIP metric. Prepare Oxford Flowers first and pass it as `--data.path` ([Installation](installation.md)). The CLIP text encoder and the CLIP metric download `openai/clip-vit-large-patch14` from Hugging Face unless it is cached. An offline tracker does not prepare any of these.
 
@@ -144,7 +144,7 @@ By default the recipe trains on Oxford Flowers with a CLIP text encoder and scor
 
 To train one of these published architectures from scratch, name it with `--model` and set its fields with `--model.<field>` flags. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
 
-`mode:flow-grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--mode.groups` images through the flow SDE and scores them with the image metric named by `--mode.reward`. That metric has to give better images higher scores, as `clip_score` does.
+`--objective flow_grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--objective.groups` images through the flow SDE and scores them with the image metric named by `--objective.reward`. That metric has to give better images higher scores, as `clip_score` does.
 
 A JEPA configuration adds predictor fields, target-mask settings and optional representation probes; the target encoder's EMA momentum is the objective's (`--objective.momentum 0.996 1.0`), ramped over the whole run unless `--objective.momentum-steps` says otherwise. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
 

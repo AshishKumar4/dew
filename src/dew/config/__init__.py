@@ -178,7 +178,7 @@ class ObjectiveConfig:
         object.__setattr__(self, "name", registry.import_path(member))
         object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
 
-    def build(self, **derived: Configured) -> Objective:
+    def build(self, **derived) -> Objective:
         """Build the objective from its fields and the arguments the caller
         `derived`; an argument both give is refused, since the caller's would
         silently replace what the run states."""
