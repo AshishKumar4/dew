@@ -5,8 +5,9 @@ Each test runs the published code beside Dew on the same events: Orbax's own
 retain, PyTorch's `ReduceLROnPlateau` for when `Plateau` stops, Flax's
 `DynamicScale` for the loss scale's recurrence, optax's `MultiSteps` for an
 accumulation window over equal microbatches and optax's own update on the
-pooled batch for unequal ones, and Orbax's manager, with no Dew in the read,
-for what a checkpoint holds.
+pooled batch for unequal ones, optax's own updates for weights held on the
+host, and Orbax's manager, with no Dew in the read, for what a checkpoint
+holds.
 """
 
 import dataclasses
@@ -21,6 +22,7 @@ import torch
 from flax.training.dynamic_scale import DynamicScale
 from orbax.checkpoint import checkpoint_managers
 from test_checkpoint_ranking import Overfit, data
+from test_host_training import HOST, Coupled, centered
 
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Ranking
@@ -235,3 +237,30 @@ def test_a_checkpoint_reads_back_through_orbaxs_own_manager(tmp_path):
         assert len(held) == len(leaves)
         for want, got in zip(leaves, held, strict=True):
             np.testing.assert_array_equal(np.asarray(got), want)
+
+
+@pytest.mark.parametrize("optimizer", [
+    optax.chain(optax.clip_by_global_norm(.25), optax.adam(optax.linear_schedule(.02, .01, 3))),
+    centered(),
+    optax.partition({"a": optax.adam(.01), "b": optax.adamw(.02)}, {"first": "a", "second": "b"}),
+], ids=["global-clip-scheduled-adam", "cross-leaf-mean", "masked-partition-state"])
+def test_weights_held_on_the_host_take_optaxs_own_updates(optimizer):
+    """With the weights and the optimizer state on the host, three steps land
+    where optax's own `update` lands from the same weights and gradients:
+    the gradient leaves the device and the update comes back whole, a global
+    clip, a mean across leaves and a partitioned state included."""
+    data = {"small": jnp.asarray(.5), "large": jnp.asarray(40.)}
+    trainer = Trainer(Coupled(), optimizer, key=jax.random.key(4), layout=HOST)
+    state, _, _ = trainer.place()
+    step = trainer.compile(state, data)
+    for _ in range(3):
+        state, *_ = step(state, data)
+    params = Coupled().init(None)["params"]
+    gradients = jax.grad(lambda p: Coupled().loss({"params": p}, data, None)[0])(params)
+    held = optimizer.init(params)
+    for _ in range(3):
+        updates, held = optimizer.update(gradients, held, params)
+        params = optax.apply_updates(params, updates)
+    for name, value in params.items():
+        np.testing.assert_allclose(np.asarray(state.variables["params"][name]), np.asarray(value),
+                                   rtol=1e-6, atol=1e-7)
