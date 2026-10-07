@@ -51,6 +51,8 @@ from flax import struct
 from jax import lax
 from reference_error import FACTOR
 
+from dew.inference import TextGeneration
+from dew.inference.serving import Server
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.sampling import Sampling, decoding, generate
@@ -103,6 +105,24 @@ def test_greedy_generation_emits_transformers_tokens(family):
     np.testing.assert_array_equal(np.asarray(result.tokens)[:, width:], fixture["greedy_tokens"])
     raw = selected(float64_log_softmax(fixture["greedy_f64"]), fixture["greedy_tokens"])
     assert np.max(np.abs(np.asarray(result.raw_log_probs, np.float64) - raw)) <= 2 * FACTOR * error
+
+
+def test_a_server_interleaving_requests_emits_each_ones_transformers_greedy_tokens(family):
+    """Three requests through a two-slot server, admitted one a step and
+    finishing at different budgets so rows leave and join mid-flight, each
+    emit the greedy tokens Transformers generated for that prompt alone."""
+    name, pretrained, fixture = family
+    task = TextGeneration(pretrained.model, pretrained.variables, sampling=Sampling(temperature=0))
+    server = Server.from_task(task, slots=2, capacity=64, admission=1)
+    budgets = (NEW_TOKENS, 4, 7)
+    tickets = [server.submit(jnp.asarray(row[mask.astype(bool)], jnp.int32), budget, key=index)
+               for index, (row, mask, budget) in enumerate(zip(fixture["prompt"], fixture["mask"], budgets,
+                                                               strict=True))]
+    server.run()
+    for ticket, budget, expected in zip(tickets, budgets, fixture["greedy_tokens"], strict=True):
+        generation = ticket.result()
+        assert int(generation.lengths[0]) == budget, name
+        np.testing.assert_array_equal(np.asarray(generation.tokens)[0, -budget:], expected[:budget])
 
 
 @struct.dataclass
