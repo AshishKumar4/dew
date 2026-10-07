@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """MDLM's sampler continuing a prompt, for tests/fixtures/mdlm/continuation.npz.
 
-The reference is `Diffusion._sample` of kuleshov-group/mdlm (diffusion.py,
-at tools/mdlm_reference.py's commit) with the `_ddpm_update`, `forward` and
+The reference is `Diffusion._sample` of kuleshov-group/mdlm's diffusion.py
+at c112c526d193436838c98d81455ee51f90309470, fetched by
+tools/mdlm_reference.py (`COMMIT`), with the `_ddpm_update`, `forward` and
 `_subs_parameterization` it runs, read out of the published file and
 executed as written on the stand-in of configs/config.yaml's settings
 (tools/mdlm_reference.py), sampling with `ddpm` for `STEPS` steps and
