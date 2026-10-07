@@ -28,7 +28,7 @@ from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import BlockDenoiser
+from dew.nn.protocols import BlockDenoiser, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -171,7 +171,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  ema_decay: float | None = None, head_chunks: int = 4,
                  processor: Processor | None | Omitted = OMITTED):
         model = self.bind_model(model, variables=variables, processor=processor)
-        if not isinstance(model, BlockDenoiser):
+        if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
             raise TypeError(
                 f"block diffusion encodes a clean prefix into a model's cache and denoises canvases "
                 f"against it, with the layer scalars the published SFT trains, as DiffusionGemma "
