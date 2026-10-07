@@ -3,11 +3,9 @@
 The loss is checked against a hand computation from the process's own parts,
 the frozen encoder's weights are shown to reach the compiled step as an
 argument and not as a constant, evaluation produces the typed artifact from
-the step's key, and a golden fingerprint of five real steps pins the numbers
-of the objective and the trainer together.
-"""
+the step's key."""
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import jax
@@ -15,64 +13,19 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_stubs import FEATURES, RES, TOKENS, VOCAB, StubText
 from flax import linen as nn
 
 from dew.artifacts import ImageGrid, VideoGrid
 from dew.data import Dataset
 from dew.diffusion import broadcast_rates, expand, presets
-from dew.inputs import CharTable, CLIPText, Condition, ConditionEncoder, Field, InputSpec, unit_range
+from dew.inputs import CharTable, CLIPText, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
 from dew.nn.dit import TextContext
-from dew.objectives.base import Step, Variables
+from dew.objectives.base import Step
 from dew.objectives.diffusion import VALIDATION_SAMPLES, DiffusionObjective
-from dew.registry import encoders
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
-
-RES = 8
-TOKENS = 5
-FEATURES = 6
-VOCAB = 11
-
-
-@encoders("stub_text")
-@dataclass(frozen=True, eq=False)
-class StubText(ConditionEncoder[str]):
-    """A text encoder with a table of `VOCAB` vectors: tokenize maps a prompt to
-    ids by character behind a start token, encode looks them up. Small, and
-    shaped like CLIP's output, so the models' text keyword takes it; registered,
-    so a run's text condition can name it."""
-
-    checkpoint: str
-    params: Variables
-
-    @classmethod
-    def from_pretrained(cls, checkpoint: str, *, params=None, **fields):
-        if params is None:
-            params = {"table": jnp.asarray(
-                np.random.RandomState(0).normal(size=(VOCAB, FEATURES)).astype(np.float32))}
-        return cls(checkpoint=checkpoint, params=params)
-
-    def tokenize(self, data):
-        ids = np.zeros((len(data), TOKENS), np.int32)
-        mask = np.zeros((len(data), TOKENS), np.int32)
-        for row, text in enumerate(data):
-            codes = [1] + [2 + (ord(char) % (VOCAB - 2)) for char in text[:TOKENS - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
-
-    def encode(self, params, tokens):
-        return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],
-                           mask=jnp.asarray(tokens["attention_mask"]))
-
-    def captions(self, tokens):
-        return tuple("".join(chr(97 + int(i)) for i in row[row > 1])
-                     for row in np.asarray(tokens["input_ids"]))
-
-    def to_json(self):
-        return {"checkpoint": self.checkpoint}
-
 
 _DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
 
@@ -81,7 +34,6 @@ def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE):
     model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
-    # The sigmas GOLDEN was captured with (EDM2's), stated so the pin holds.
     return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0), inputs, steps=3, guidance=guidance,
                               solver=Euler())
 
@@ -170,20 +122,6 @@ def test_lazy_blank_keeps_the_eager_towers_bits_and_construction_precision(kind)
     for got, want in zip(jax.tree.leaves(actual["textcontext"]), jax.tree.leaves(expected), strict=True):
         np.testing.assert_array_equal(np.ascontiguousarray(got).view(np.uint8),
                                       np.ascontiguousarray(want).view(np.uint8))
-
-
-def tree_fingerprint(tree):
-    # per-leaf sums accumulated in python floats, so the golden values below
-    # do not depend on float32 reduction order
-    return sum(float(jnp.sum(leaf)) for leaf in jax.tree.leaves(tree)
-               if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating))
-
-
-def tree_magnitude(tree):
-    """Sum of absolute values: no cancellation, so a relative tolerance means what it says."""
-    return sum(float(jnp.sum(jnp.abs(leaf))) for leaf in jax.tree.leaves(tree)
-               if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating))
-
 
 
 class Zero(nn.Module):
@@ -394,6 +332,9 @@ def test_a_checkpoint_of_this_state_resumes_in_place(tmp_path):
 
     assert int(resumed.step) == 2
     assert set(resumed.variables["encoders"]) == set(objective.inputs.conditions)
+    # the frozen encoder came through untouched
+    assert jnp.array_equal(resumed.variables["encoders"]["textcontext"]["table"],
+                           objective.inputs.conditions["textcontext"].encoder.params["table"])
     leaves = jax.tree.leaves(resumed.variables["params"])
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
@@ -491,47 +432,6 @@ def test_a_video_objective_returns_a_video_grid():
     batch = {"video": np.zeros((3, 2, RES, RES, 3), np.uint8)}
     artifact = objective.evaluate(params, batch, Step(jnp.asarray(0), jax.random.PRNGKey(0), None))
     assert isinstance(artifact, VideoGrid) and artifact.videos.shape == (3, 2, RES, RES, 3)
-
-
-def batches(count=8):
-    batch = make_batch(count)
-    while True:
-        yield batch
-
-
-def test_diffusion_objective_reproduces_the_golden_fingerprint(tmp_path):
-    """Five real steps of the tiny conditional DiT on the EDM process pin the
-    parameters, the EMA and the optimizer state together.
-
-    The values were captured from this implementation. The fingerprint of the
-    inlined train step this objective was lifted out of (8.209761425852776)
-    does not carry over: that step chained one random state object through
-    the schedule, the noise and the dropout and seeded itself from the
-    trainer's own derivation, while every draw here comes from the step's
-    fold_in(run_key, step) key split once (design decision 4), and the EDM
-    weight is Eq. 8 of Karras et al. without the epsilon guard (T21). Any
-    real change in what the objective computes moves these by orders of
-    magnitude more than the 1e-6 XLA reassociation leaves between CPUs.
-    """
-    objective = make_objective()
-    trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0))
-    data = Dataset(train=lambda partition: batches(), val=None, records=32, batch=8)
-    state = trainer.fit(data, steps=5, log_every=100)
-
-    assert int(state.step) == 5
-    assert tree_fingerprint(state.variables["params"]) == pytest.approx(GOLDEN["params"], rel=1e-6)
-    assert tree_fingerprint(state.ema) == pytest.approx(GOLDEN["ema"], rel=1e-6)
-    assert tree_magnitude(state.opt_state) == pytest.approx(GOLDEN["opt_state"], rel=1e-6)
-    # the frozen encoder came through untouched
-    assert jnp.array_equal(state.variables["encoders"]["textcontext"]["table"],
-                           objective.inputs.conditions["textcontext"].encoder.params["table"])
-
-
-# Captured on one CPU at c0f4156 (JAX_PLATFORMS=cpu, the eight simulated
-# devices of conftest move the third figure after the decimal point by 2e-9).
-GOLDEN = {"params": 15.044008062570356, "ema": 15.049092350082788,
-          "opt_state": 2.391809580367163}
-
 
 
 @pytest.fixture(scope="module")

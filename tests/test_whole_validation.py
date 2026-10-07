@@ -13,8 +13,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from diffusion_stubs import batch_for
 from reference_error import assert_computes_the_oracle, chain_roundings
-from test_diffusion_run_sources import batch_for
 from test_guidance_distillation import FIXTURES, FLUX
 from test_objective_inputs import cases, corpus_windows
 

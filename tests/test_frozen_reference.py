@@ -19,33 +19,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
+from affine_run import FEATURES, Regression
 
-from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, Trainer, ema_update
-
-FEATURES = 3
-
-
-class Affine(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(2)(x)
-
-
-class Regression(Objective):
-    """Squared error of an affine map, with the reference frozen at init."""
-
-    def __init__(self):
-        self.model = Affine()
-        self.ema = EMASpec(decay=optax.constant_schedule(1.0))
-
-    def init(self, key, variables=None):
-        return self.model.init(key, jnp.zeros((1, FEATURES)))
-
-    def loss(self, variables, batch, step):
-        prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
 
 
 class Counting:
@@ -83,7 +59,7 @@ class Data:
 def make_trainer(tmp_path=None, **kwargs):
     checkpoints = None if tmp_path is None else Checkpoints(str(tmp_path / "run"))
     return Trainer(
-        Regression(),
+        Regression(ema_decay=1.0),
         optax.sgd(0.1),
         key=jax.random.key(0),
         layout=Layout(min_shard=1, tolerance=1.0),

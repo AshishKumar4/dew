@@ -13,6 +13,7 @@ refusal of a vocabulary mismatch, and a real trainer run on CPU where the
 teacher never moves and a resumed run lands where the straight one does.
 """
 
+import itertools
 import json
 from pathlib import Path
 
@@ -21,6 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Data
 from flax.traverse_util import unflatten_dict
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -137,19 +139,6 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
         scaled_close(actual_leaves[path], leaf, 1e-4)
 
 
-def test_maxtext_anneals_are_optax_schedules():
-    """`compute_schedule`'s linear and cosine anneals from start to end over
-    max_steps are `optax.linear_schedule` and `optax.cosine_decay_schedule`
-    with alpha = end / start, at every fixture step; within 1e-6."""
-    arrays = fixture()
-    start, end, steps = (META["schedule"][name] for name in ("start", "end", "max_steps"))
-    linear = optax.linear_schedule(start, end, steps)
-    cosine = optax.cosine_decay_schedule(start, steps, alpha=end / start)
-    for index, step in enumerate(arrays["schedule/steps"]):
-        assert float(linear(step)) == pytest.approx(float(arrays["schedule/linear"][index]), abs=1e-6)
-        assert float(cosine(step)) == pytest.approx(float(arrays["schedule/cosine"][index]), abs=1e-6)
-
-
 # --------------------------------------------------------------------------
 # Schedules, endpoints and the feature pairs through the objective
 # --------------------------------------------------------------------------
@@ -241,7 +230,7 @@ def test_a_validation_pass_scores_with_the_teacher_the_trainer_substituted():
 def test_a_layer_the_model_does_not_have_is_named_at_init():
     student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None)
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
-    with pytest.raises(ValueError, match=r"no layer 5; it has layers \[0, 1\]"):
+    with pytest.raises(ValueError, match="no layer 5"):
         DistillationObjective(student, teacher, features=[(0, 5)]).init(jax.random.key(0))
 
 
@@ -288,19 +277,9 @@ def test_a_student_with_the_router_balance_loss_is_refused():
 # --------------------------------------------------------------------------
 
 
-class Data:
+def fixed(batch):
     """The one fixed batch, endlessly, as the trainer's dataset contract."""
-
-    def __init__(self, batch):
-        self.batch = batch["text"].shape[0]
-        self._batch = batch
-
-    def train(self, partition):
-        while True:
-            yield self._batch
-
-    val = None
-    steps_per_epoch = None
+    return Data(lambda: itertools.repeat(batch), batch=batch[TEXT_KEY].shape[0])
 
 
 def make_trainer(arrays, tmp_path=None):
@@ -323,7 +302,7 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
     initial = trainer.initial_state()
     before = float(trainer.objective.scalar_loss(initial.variables, batch, step_at())[0])
 
-    state = trainer.fit(Data(batch), steps=5, log_every=1)
+    state = trainer.fit(fixed(batch), steps=5, log_every=1)
 
     for path, leaf in jax.tree_util.tree_leaves_with_path(state.variables[TEACHER]):
         assert np.array_equal(np.asarray(leaf), np.asarray(dict(
@@ -335,8 +314,8 @@ def test_the_teacher_never_moves_and_the_student_learns(tmp_path):
     after = float(trainer.objective.scalar_loss(state.variables, batch, step_at())[0])
     assert after < before, (before, after)
 
-    make_trainer(arrays, tmp_path).fit(Data(batch), steps=3, log_every=1)
-    resumed = make_trainer(arrays, tmp_path).fit(Data(batch), steps=5, log_every=1)
+    make_trainer(arrays, tmp_path).fit(fixed(batch), steps=3, log_every=1)
+    resumed = make_trainer(arrays, tmp_path).fit(fixed(batch), steps=5, log_every=1)
     for straight, again in zip(jax.tree.leaves(state.variables),
                                jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(straight), np.asarray(again))

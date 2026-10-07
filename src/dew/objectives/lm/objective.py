@@ -27,7 +27,6 @@ prompt once per event.
 from __future__ import annotations
 
 import dataclasses
-import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
@@ -35,7 +34,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 from flax import linen as nn, struct
 
 from dew.artifacts import TextSamples, TokenScores
@@ -51,7 +49,6 @@ from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, s
 from dew.nn.protocols import DecoderTraining, Logits, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
     Batch,
@@ -574,19 +571,11 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     loss before `router_aux_loss_coef`, which corresponds to
     `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
 
-    `variables` is the tree training starts from, as `model.init`,
-    `Pretrained.load` or `LoRA.apply` return it; None draws a fresh one. A
-    split tree (`dew.objectives.base.freeze`, or an adapter's) is kept as
-    given: the optimizer updates what is in `params`, and the rest stays
-    under `frozen`. `model` may be a loaded source in place of the model
-    (`LMObjective(qwen, seq_len=512)`), which supplies its model, variables
-    and processor; `variables` and `processor` override them.
+    `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
+    `variables` and `processor` override its own (`Objective.bind_model`).
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
-
-    `processor` is what `pipeline` uses to turn text into ids and decode
-    them, unless it is given another one.
     """
 
     artifact = TokenScores
@@ -653,10 +642,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
             "router_z_loss": router_z_loss or None})
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
-        # The EMA follows what moves; the frozen collection never does.
-        self.ema = None if ema_decay is None else EMASpec(
-            decay=optax.constant_schedule(ema_decay),
-            select=lambda path: path[0] != FROZEN)
+        self.ema = EMASpec.constant(ema_decay)
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
 
@@ -1196,10 +1182,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         return {"moe": merge(moe, balanced)}
 
     def evaluate(self, params, batch, step: Step):
-        """Score the complete batch teacher-forced, using EMA when present."""
-        params = self.evaluation_variables(params, step)
-        losses, weights, correct = self._scored(params, _batch_text(batch), self._batch_roles(batch))
-        return TokenScores(losses=losses, weights=weights, correct=correct)
+        """Score the complete batch teacher-forced, using EMA when present; the
+        rows and roles are read outside the compiled scoring."""
+        prepared = {TEXT_KEY: _batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
+        return super().evaluate(params, prepared, step)
+
+    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+        scores = self.token_scores(params, batch[TEXT_KEY], roles=batch[ROLES_KEY], predict=True)
+        assert scores.correct is not None
+        return TokenScores(scores.losses, scores.weights, scores.correct)
 
     def preview(self, params, batch, step: Step, *, scored=None):
         """Sample the configured prompt once, then decode only on process zero.
@@ -1233,16 +1224,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             prompt=decode(np.asarray(prompt)[0].tolist()),
             texts=tuple(decode(row.tolist()) for row in np.asarray(generated)))
 
-    @functools.cached_property
-    def _scored(self):
-        """Compile the teacher-forced scores once per objective."""
-        def scored(params, prepared, roles):
-            scores = self.token_scores(params, prepared, roles=roles, predict=True)
-            assert scores.correct is not None
-            return scores.losses, scores.weights, scores.correct
-
-        return jax.jit(scored)
-
 
 @metrics("perplexity")
 class Perplexity:
@@ -1262,9 +1243,7 @@ class Perplexity:
         losses = np.asarray(scores.losses, dtype=np.float64)
         return float(np.sum(losses * weights)), float(np.sum(weights))
 
-    def merge(self, accumulated: tuple[float, float],
-              contribution: tuple[float, float]) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
+    merge = staticmethod(merge_totals)
 
     def finalize(self, accumulated: tuple[float, float]) -> float:
         total, count = accumulated
