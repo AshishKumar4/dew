@@ -10,10 +10,12 @@ uvicorn:
     python examples/serve_decisions.py --run runs/tickets
 
 `--model` loads a released Laya checkpoint (with `--subfolder multilingual`
-for the multilingual one), and `--run` a `DecisionObjective` run with the
-calibration saved into it. `POST /v1/systemone` takes what Jev's endpoint
-takes and answers as it answers, so a client written for Jev only changes
-its base URL:
+for the multilingual one) or a Clef release, and `--run` a
+`DecisionObjective` run with the calibration saved into it. `--dtype`
+chooses the compute dtype (bfloat16 on a GPU), and `--max-len`,
+`--head-max-len` and `--option-tokens` widen the layout's budgets.
+`POST /v1/systemone` takes what Jev's endpoint takes and answers as it
+answers, so a client written for Jev only changes its base URL:
 
     curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
       "state": "I was charged twice for March, fix it today.",
@@ -24,7 +26,16 @@ A request Jev would refuse gets a 422 with the reason, as Jev's does. With
 Bearer <key>`, and gets a 401 without it. `--details` adds Laya's extra
 answer fields (a noul's confidence, abstention, how much of the state was
 read); `--strict` answers exactly as Jev's endpoint does, dropping the
-request fields Jev does not know, such as Clef's `images`. Requests are
+request fields Jev does not know, such as Clef's `images`. `--whole`
+refuses, with a 422 naming the maximum context length, a request the
+layout could answer only by cutting its state, instructions or options, as
+Decision Index requires of an engine:
+
+    python examples/serve_decisions.py --run runs/encoder --whole --dtype bfloat16 \\
+        --max-len 8192 --head-max-len 6144 --option-tokens 512
+    python -m decision_index pipeline --edition 0.2.1 --engine http \\
+        --option base_url=http://127.0.0.1:8000 --out runs/di-encoder
+ Requests are
 answered one at a time, each in one forward pass per budget's worth of
 question rows; `GET /health` answers once the model is loaded.
 """
@@ -33,7 +44,7 @@ import hmac
 import json
 import os
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import tyro
 from starlette.applications import Starlette
@@ -46,13 +57,13 @@ from dew.decision import Decide
 
 
 def app(decide: Decide, *, api_key: str | None = None, details: bool = False,
-        strict: bool = False) -> Starlette:
+        strict: bool = False, whole: bool = False) -> Starlette:
     """A Starlette app answering `POST /v1/systemone` with `decide`."""
     one_at_a_time = threading.Lock()
 
     def answer(body: dict) -> dict:
         with one_at_a_time:
-            return decide.systemone(body, details=details, strict=strict)
+            return decide.systemone(body, details=details, strict=strict, whole=whole)
 
     async def systemone(request: Request) -> JSONResponse:
         given = request.headers.get("authorization", "")
@@ -86,15 +97,30 @@ class Options:
     api_key: str | None = os.environ.get("DEW_API_KEY")
     details: bool = False
     strict: bool = False
+    whole: bool = False
+    """Refuse a request rather than cut it to fit."""
+    dtype: str = "float32"
+    max_len: int | None = None
+    head_max_len: int | None = None
+    """For a layout of one row per question: the tokens its instructions and options share."""
+    option_tokens: int | None = None
+    """For a layout of one row per question: the most tokens one option keeps."""
 
 
 def main(options: Options) -> None:
     import uvicorn
 
-    decide = (Decide.from_run(options.run) if options.run is not None
+    decide = (Decide.from_run(options.run, dtype=options.dtype) if options.run is not None
               else Decide.from_pretrained(options.model or "convaiinnovations/laya",
-                                          subfolder=options.subfolder, revision=options.revision))
-    served = app(decide, api_key=options.api_key, details=options.details, strict=options.strict)
+                                          subfolder=options.subfolder, revision=options.revision,
+                                          dtype=options.dtype))
+    budgets = {"max_len": options.max_len, "head_max_len": options.head_max_len,
+               "option_tokens": options.option_tokens}
+    widened = {name: value for name, value in budgets.items() if value is not None}
+    if widened:
+        decide = replace(decide, layout=replace(decide.layout, **widened))
+    served = app(decide, api_key=options.api_key, details=options.details, strict=options.strict,
+                 whole=options.whole)
     uvicorn.run(served, host=options.host, port=options.port)
 
 
