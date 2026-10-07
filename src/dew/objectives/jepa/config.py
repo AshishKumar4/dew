@@ -82,7 +82,7 @@ class JepaRunConfig(RunConfig):
                                          **ramp)
         probes = () if not self.probe_classes else (
             LinearProbe(self.probe_classes), KnnProbe(self.probe_classes, k=self.knn_k))
-        return Prepared(self, objective, dataset, metrics=probes)
+        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes))
 
 
 __all__ = ["JepaRunConfig"]

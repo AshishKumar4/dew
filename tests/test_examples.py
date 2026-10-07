@@ -285,7 +285,7 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
           "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}", "--set", "trainer.steps=6",
           "--set", "trainer.log_every=1", "--set", "model.hidden=8")
     record = tmp_path / "first" / "train_supervised" / "run.json"
-    written = json.loads(record.read_text())
+    written = json.loads(record.read_text())["fields"]
     assert written["trainer"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
     assert written["objective"]["fields"]["loss"] == {"function": "train_supervised:cross_entropy"}
 
@@ -331,7 +331,7 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     assert {entry.name for entry in export.iterdir()} >= {
         "config.json", "generation_config.json", "model.safetensors"}
     run = tmp_path / "checkpoints" / tmp_path.name
-    objective = json.loads((run / "run.json").read_text())["objective"]
+    objective = json.loads((run / "run.json").read_text())["fields"]["objective"]
     assert objective["name"] == "dew.objectives.lm.objective:LMObjective"
     assert (export / "tokenizer_config.json").is_file()
     assert "tokenizer_name" not in json.loads((export / "generation_config.json").read_text())

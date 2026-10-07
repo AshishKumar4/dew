@@ -1,305 +1,308 @@
 {
-  "audio": null,
-  "autoencoder": {
-    "dtype": "bfloat16",
-    "latent_scale": null,
-    "latent_shift": null,
-    "modelname": "pcuenq/sd-vae-ft-mse-flax",
-    "revision": "main"
-  },
-  "data": {
-    "class": "dew.data.images:ArrayRecordImages",
-    "fields": {
-      "augmentation": "flip_jitter",
-      "augmentation_backend": "host",
-      "augmentation_size": null,
-      "count": null,
-      "crop_scale": [
-        1.0,
-        1.0
-      ],
-      "image_size": 256,
-      "loading": {
-        "read_buffer": 128,
-        "threads": 64,
-        "worker_buffer": 2,
-        "workers": 32
-      },
-      "path": null,
-      "seed": 0,
-      "shards": [
-        "arrayrecord2/laion12m_coco"
-      ],
-      "val_batches": 4,
-      "val_split": null
-    }
-  },
-  "lora": null,
-  "model": {
-    "adapter": null,
-    "fields": {
-      "adaln_silu": false,
-      "attention_impl": "auto",
-      "dtype": "float32",
-      "emb_features": 768,
-      "mlp_ratio": 4,
-      "norm_epsilon": 1e-05,
-      "num_heads": 12,
-      "num_layers": 16,
-      "patch_size": 2,
-      "scan_order": "zigzag",
-      "ssm_attention_ratio": "3:1",
-      "ssm_state_dim": 64,
-      "text_pooling": "all",
-      "use_2d_fusion": true
+  "class": "dew.objectives.diffusion.config:DiffusionRunConfig",
+  "fields": {
+    "audio": null,
+    "autoencoder": {
+      "dtype": "bfloat16",
+      "latent_scale": null,
+      "latent_shift": null,
+      "modelname": "pcuenq/sd-vae-ft-mse-flax",
+      "revision": "main"
     },
-    "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
-    "quantization": null
-  },
-  "objective": {
-    "fields": {
-      "ema_decay": null,
-      "guidance": {
-        "class": "dew.sampling.guidance:CFG",
-        "fields": {
-          "interval": [
-            0.0,
-            1.0
+    "data": {
+      "class": "dew.data.images:ArrayRecordImages",
+      "fields": {
+        "augmentation": "flip_jitter",
+        "augmentation_backend": "host",
+        "augmentation_size": null,
+        "count": null,
+        "crop_scale": [
+          1.0,
+          1.0
+        ],
+        "image_size": 256,
+        "loading": {
+          "read_buffer": 128,
+          "threads": 64,
+          "worker_buffer": 2,
+          "workers": 32
+        },
+        "path": null,
+        "seed": 0,
+        "shards": [
+          "arrayrecord2/laion12m_coco"
+        ],
+        "val_batches": 4,
+        "val_split": null
+      }
+    },
+    "lora": null,
+    "model": {
+      "adapter": null,
+      "fields": {
+        "adaln_silu": false,
+        "attention_impl": "auto",
+        "dtype": "float32",
+        "emb_features": 768,
+        "mlp_ratio": 4,
+        "norm_epsilon": 1e-05,
+        "num_heads": 12,
+        "num_layers": 16,
+        "patch_size": 2,
+        "scan_order": "zigzag",
+        "ssm_attention_ratio": "3:1",
+        "ssm_state_dim": 64,
+        "text_pooling": "all",
+        "use_2d_fusion": true
+      },
+      "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
+      "quantization": null
+    },
+    "objective": {
+      "fields": {
+        "ema_decay": null,
+        "guidance": {
+          "class": "dew.sampling.guidance:CFG",
+          "fields": {
+            "interval": [
+              0.0,
+              1.0
+            ],
+            "rescale": 0.0,
+            "scale": 5.0
+          }
+        },
+        "solver": {
+          "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
+          "fields": {
+            "algorithm": "dpmsolver++",
+            "euler_at_final": false,
+            "lower_order_final": true,
+            "order": 2,
+            "solver_type": "midpoint"
+          }
+        },
+        "steps": 20,
+        "unconditional_prob": 0.12
+      },
+      "name": "dew.objectives.diffusion.objective:DiffusionObjective"
+    },
+    "optim": {
+      "b1": null,
+      "b2": null,
+      "clip_grads": 0.0,
+      "ema_profiles": [],
+      "forced_weight_normalization": false,
+      "learning_rate": 0.0001,
+      "optimizer": "adamw",
+      "optimizer_opts": {},
+      "param_groups": [],
+      "schedule": null,
+      "state_dtype": "float32",
+      "weight_decay": null
+    },
+    "preset": {
+      "class": "dew.diffusion.presets:EDM",
+      "fields": {
+        "P_mean": null,
+        "P_std": null,
+        "min_snr_gamma": null,
+        "regime": "latent",
+        "rho": 7.0,
+        "sigma_data": 0.5,
+        "sigma_max": 80.0,
+        "sigma_min": 0.002
+      }
+    },
+    "pretrained": null,
+    "text": {
+      "checkpoint": "openai/clip-vit-large-patch14",
+      "dtype": "bfloat16",
+      "encoder": "clip_text",
+      "field": "text",
+      "max_length": null,
+      "param_dtype": "float32",
+      "revision": null,
+      "unconditional": ""
+    },
+    "trainer": {
+      "accumulation": 1,
+      "batch_ramp": null,
+      "batch_size": 128,
+      "best": null,
+      "checkpoint_dir": "run",
+      "checkpoint_every": "epoch",
+      "compilation_cache_dir": null,
+      "dynamic_scale": false,
+      "epochs": null,
+      "eval_every": "epoch",
+      "keep": 1,
+      "key": 0,
+      "layout": {
+        "host": [],
+        "host_parameters": [],
+        "min_shard": 65536,
+        "rules": [
+          [
+            "vocab",
+            [
+              "fsdp",
+              "tensor"
+            ]
           ],
-          "rescale": 0.0,
-          "scale": 5.0
-        }
-      },
-      "solver": {
-        "class": "dew.sampling.solvers.dpm:DPMSolverMultistep",
-        "fields": {
-          "algorithm": "dpmsolver++",
-          "euler_at_final": false,
-          "lower_order_final": true,
-          "order": 2,
-          "solver_type": "midpoint"
-        }
-      },
-      "steps": 20,
-      "unconditional_prob": 0.12
-    },
-    "name": "dew.objectives.diffusion.objective:DiffusionObjective"
-  },
-  "optim": {
-    "b1": null,
-    "b2": null,
-    "clip_grads": 0.0,
-    "ema_profiles": [],
-    "forced_weight_normalization": false,
-    "learning_rate": 0.0001,
-    "optimizer": "adamw",
-    "optimizer_opts": {},
-    "param_groups": [],
-    "schedule": null,
-    "state_dtype": "float32",
-    "weight_decay": null
-  },
-  "preset": {
-    "class": "dew.diffusion.presets:EDM",
-    "fields": {
-      "P_mean": null,
-      "P_std": null,
-      "min_snr_gamma": null,
-      "regime": "latent",
-      "rho": 7.0,
-      "sigma_data": 0.5,
-      "sigma_max": 80.0,
-      "sigma_min": 0.002
-    }
-  },
-  "pretrained": null,
-  "text": {
-    "checkpoint": "openai/clip-vit-large-patch14",
-    "dtype": "bfloat16",
-    "encoder": "clip_text",
-    "field": "text",
-    "max_length": null,
-    "param_dtype": "float32",
-    "revision": null,
-    "unconditional": ""
-  },
-  "trainer": {
-    "accumulation": 1,
-    "batch_ramp": null,
-    "batch_size": 128,
-    "best": null,
-    "checkpoint_dir": "run",
-    "checkpoint_every": "epoch",
-    "compilation_cache_dir": null,
-    "dynamic_scale": false,
-    "epochs": null,
-    "eval_every": "epoch",
-    "keep": 1,
-    "key": 0,
-    "layout": {
-      "host": [],
-      "host_parameters": [],
-      "min_shard": 65536,
-      "rules": [
-        [
-          "vocab",
           [
-            "fsdp",
+            "mlp",
             "tensor"
-          ]
-        ],
-        [
-          "mlp",
-          "tensor"
-        ],
-        [
-          "mlp",
-          "fsdp"
-        ],
-        [
-          "modulation",
-          "fsdp"
-        ],
-        [
-          "attention",
-          "tensor"
-        ],
-        [
-          "attention",
-          "fsdp"
-        ],
-        [
-          "linear",
-          "fsdp"
-        ],
-        [
-          "embed",
-          "fsdp"
-        ],
-        [
-          "head_dim",
-          "fsdp"
-        ],
-        [
-          "heads",
+          ],
           [
-            "fsdp",
-            "tensor"
-          ]
-        ],
-        [
-          "kv",
-          [
-            "fsdp",
-            "tensor"
-          ]
-        ],
-        [
-          "index",
-          "fsdp"
-        ],
-        [
-          "kvlora",
-          "fsdp"
-        ],
-        [
-          "qlora",
-          "fsdp"
-        ],
-        [
-          "output",
-          "fsdp"
-        ],
-        [
-          "exp",
-          "expert"
-        ],
-        [
-          "heads",
-          "tensor"
-        ],
-        [
-          "kv",
-          "tensor"
-        ],
-        [
-          "activation_batch",
-          [
-            "data",
-            "expert",
+            "mlp",
             "fsdp"
-          ]
-        ],
-        [
-          "activation_length",
-          "sequence"
-        ],
-        [
-          "activation_spread",
+          ],
           [
-            "sequence",
-            "tensor"
-          ]
-        ],
-        [
-          "activation_spread",
-          "sequence"
-        ],
-        [
-          "activation_heads",
-          "tensor"
-        ],
-        [
-          "activation_kv",
-          "tensor"
-        ],
-        [
-          "activation_mlp",
-          "tensor"
-        ],
-        [
-          "activation_vocab",
-          "tensor"
-        ],
-        [
-          "pages",
-          [
-            "data",
-            "expert",
+            "modulation",
             "fsdp"
-          ]
-        ],
-        [
-          "activation_batch",
+          ],
           [
-            "data",
+            "attention",
+            "tensor"
+          ],
+          [
+            "attention",
+            "fsdp"
+          ],
+          [
+            "linear",
+            "fsdp"
+          ],
+          [
+            "embed",
+            "fsdp"
+          ],
+          [
+            "head_dim",
+            "fsdp"
+          ],
+          [
+            "heads",
+            [
+              "fsdp",
+              "tensor"
+            ]
+          ],
+          [
+            "kv",
+            [
+              "fsdp",
+              "tensor"
+            ]
+          ],
+          [
+            "index",
+            "fsdp"
+          ],
+          [
+            "kvlora",
+            "fsdp"
+          ],
+          [
+            "qlora",
+            "fsdp"
+          ],
+          [
+            "output",
+            "fsdp"
+          ],
+          [
+            "exp",
             "expert"
+          ],
+          [
+            "heads",
+            "tensor"
+          ],
+          [
+            "kv",
+            "tensor"
+          ],
+          [
+            "activation_batch",
+            [
+              "data",
+              "expert",
+              "fsdp"
+            ]
+          ],
+          [
+            "activation_length",
+            "sequence"
+          ],
+          [
+            "activation_spread",
+            [
+              "sequence",
+              "tensor"
+            ]
+          ],
+          [
+            "activation_spread",
+            "sequence"
+          ],
+          [
+            "activation_heads",
+            "tensor"
+          ],
+          [
+            "activation_kv",
+            "tensor"
+          ],
+          [
+            "activation_mlp",
+            "tensor"
+          ],
+          [
+            "activation_vocab",
+            "tensor"
+          ],
+          [
+            "pages",
+            [
+              "data",
+              "expert",
+              "fsdp"
+            ]
+          ],
+          [
+            "activation_batch",
+            [
+              "data",
+              "expert"
+            ]
+          ],
+          [
+            "activation_batch",
+            "data"
           ]
         ],
-        [
-          "activation_batch",
-          "data"
-        ]
-      ],
-      "tolerance": 0.02
+        "tolerance": 0.02
+      },
+      "log_every": 100,
+      "mesh": {
+        "expert": 1,
+        "fsdp": 1,
+        "microbatches": null,
+        "replicas": 1,
+        "sequence": 1,
+        "stage": 1,
+        "tensor": 1
+      },
+      "multi_host": null,
+      "name": "text-to-image-176m",
+      "profile": null,
+      "quantization": null,
+      "steps": 1350000,
+      "wandb": null,
+      "xla_flags": null
     },
-    "log_every": 100,
-    "mesh": {
-      "expert": 1,
-      "fsdp": 1,
-      "microbatches": null,
-      "replicas": 1,
-      "sequence": 1,
-      "stage": 1,
-      "tensor": 1
-    },
-    "multi_host": null,
-    "name": "text-to-image-176m",
-    "profile": null,
-    "quantization": null,
-    "steps": 1350000,
-    "wandb": null,
-    "xla_flags": null
-  },
-  "val_metrics": []
+    "val_metrics": []
+  }
 }

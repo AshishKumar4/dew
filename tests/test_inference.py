@@ -569,7 +569,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
                          Dataset(lambda partition: Stream(), None, None, batch), name="run")
     Checkpoints(str(tmp_path / "run")).wait()
 
-    record = json.loads((tmp_path / "run" / "run.json").read_text())
+    record = json.loads((tmp_path / "run" / "run.json").read_text())["fields"]
     assert record["trainer"]["quantization"]["dtype"] == "int8"
     task = dew.pipeline(str(tmp_path / "run"))
 

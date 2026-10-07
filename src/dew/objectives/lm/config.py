@@ -92,9 +92,7 @@ class LMRunConfig(RunConfig):
         run's key, so the objective trains its factors alone. Perplexity scores
         each validation pass.
         """
-        tokens = self.data
-        if not isinstance(tokens, (TokenWindows, PackedTokens)):
-            raise ValueError("an LM run trains on token files: data:token-windows or data:packed-tokens")
+        tokens = self.tokens()
         written, vocab_size = token_vocabulary(tokens)
         if self.tokenizer != written:
             # Decoding with a different tokenizer than the ids were written with
@@ -139,7 +137,13 @@ class LMRunConfig(RunConfig):
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
         validation = () if self.trainer.eval_interval(loaded) is None else (Perplexity(),)
-        return Prepared(run, objective, loaded, metrics=validation)
+        return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation))
+
+    def tokens(self) -> TokenWindows | PackedTokens:
+        """The token files this run trains on; any other data is refused."""
+        if not isinstance(self.data, (TokenWindows, PackedTokens)):
+            raise ValueError("an LM run trains on token files: data:token-windows or data:packed-tokens")
+        return self.data
 
     def processor(self):
         """The run's tokenizer as its checkpoints record it for every loader."""
@@ -179,7 +183,8 @@ class LMRunConfig(RunConfig):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
         name, revision = split_revision(self.pretrained)
-        loaded = Pretrained.load(name, dtype=self.model.fields.get("dtype"),
+        dtype = self.model.fields.get("dtype")
+        loaded = Pretrained.load(name, dtype=None if dtype is None else str(dtype),
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
                                  max_seq_len=reach, revision=revision)
         if not same_vocabulary(written, loaded, name):
@@ -211,7 +216,7 @@ class LMRunConfig(RunConfig):
                              "--model.no-causal")
         decode = None if self.sample_tokens <= 0 else tokenizer_for(self.tokenizer).decode
         return self.objective.build(model=model, process=MDLM(mask_id=int(mask))(),
-                                    seq_len=self.data.seq_len + 1, decode=decode, variables=variables,
+                                    seq_len=self.tokens().seq_len + 1, decode=decode, variables=variables,
                                     processor=self.processor())
 
     def block_objective(self, model, variables):
@@ -226,7 +231,7 @@ class LMRunConfig(RunConfig):
         width = self.objective.fields.get("canvas_size") or model.canvas_length
         if not isinstance(prompt, int) or not isinstance(width, int):
             raise ValueError("block_diffusion splits each row at --objective.prompt-length")
-        response = self.data.seq_len + 1 - prompt
+        response = self.tokens().seq_len + 1 - prompt
         if width < 1 or response < width or response % width:
             raise ValueError("seq_len + 1 must equal prompt_length plus whole training canvases")
         return self.objective.build(model=model, num_canvases=response // width, variables=variables,

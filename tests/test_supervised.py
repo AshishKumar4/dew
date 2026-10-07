@@ -182,7 +182,7 @@ def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_i
     train(str(REPO_ROOT / "tests" / "autoencoder_experiment.py"),
           "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}")
     record = tmp_path / "first" / "autoencoder_experiment" / "run.json"
-    loss = json.loads(record.read_text())["objective"]["fields"]["loss"]
+    loss = json.loads(record.read_text())["fields"]["objective"]["fields"]["loss"]
     assert loss == {"function": "autoencoder_experiment:evidence_bound"}
     trained = losses(tmp_path / "first")
     assert len(trained) == 40 and np.mean(trained[-5:]) < 0.5 * np.mean(trained[:5])
