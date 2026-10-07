@@ -1,7 +1,8 @@
 """A plain Flax Linen graph records itself and rebuilds, in a fresh process,
 into a model that loads its original weights and computes the same bits:
 nested layers' default initializers are left out of the record at every
-level, as the root's are."""
+level, as the root's are, and a layer the graph holds twice stays one layer
+with one set of weights, while two equal layers stay two."""
 
 import json
 import os
@@ -15,7 +16,7 @@ import jax
 import numpy as np
 
 from dew.config import ModelConfig
-from dew.registry import imported, to_record
+from dew.registry import import_path, imported, to_record
 
 
 class Residual(nn.Module):
@@ -29,8 +30,11 @@ class Residual(nn.Module):
 
 
 def models() -> dict[str, nn.Module]:
+    shared = nn.Dense(8)
     return {"sequential": nn.Sequential([nn.Dense(16), nn.LayerNorm(), nn.Dense(8, use_bias=False)]),
-            "residual": Residual(nn.Dense(8, kernel_init=nn.initializers.zeros), nn.LayerNorm(epsilon=1e-3))}
+            "residual": Residual(nn.Dense(8, kernel_init=nn.initializers.zeros), nn.LayerNorm(epsilon=1e-3)),
+            "shared": nn.Sequential([shared, shared]),
+            "separate": nn.Sequential([nn.Dense(8), nn.Dense(8)])}
 
 
 REBUILD = """
@@ -44,7 +48,7 @@ for name, saved in json.loads(sys.stdin.read()).items():
     x = jnp.asarray(saved["x"], jnp.float32)
     params = flax.serialization.from_bytes(jax.eval_shape(model.init, jax.random.key(0), x),
                                            bytes.fromhex(saved["params"]))
-    out[name] = np.asarray(model.apply(params, x)).tobytes().hex()
+    out[name] = [np.asarray(model.apply(params, x)).tobytes().hex(), sorted(params["params"])]
 print(json.dumps(out))
 """
 
@@ -56,7 +60,7 @@ def test_a_nested_linen_model_rebuilds_from_its_record_with_its_weights_in_a_fre
         params = model.init(jax.random.key(0), x)
         held[name] = {"record": to_record(ModelConfig.from_model(model), ModelConfig),
                       "params": flax.serialization.to_bytes(params).hex(), "x": np.asarray(x).tolist()}
-        expected[name] = np.asarray(model.apply(params, x)).tobytes().hex()
+        expected[name] = [np.asarray(model.apply(params, x)).tobytes().hex(), sorted(params["params"])]
     root = Path(__file__).resolve().parents[1]
     env = {**os.environ, "JAX_PLATFORMS": "cpu",
            "PYTHONPATH": os.pathsep.join([str(root / "src"), str(root / "tests")])}
@@ -64,9 +68,22 @@ def test_a_nested_linen_model_rebuilds_from_its_record_with_its_weights_in_a_fre
                           text=True, env=env, timeout=300, check=False)
     assert done.returncode == 0, done.stderr[-2000:]
     assert json.loads(done.stdout.splitlines()[-1]) == expected
+    assert expected["shared"][1] == ["layers_0"] and expected["separate"][1] == ["layers_0", "layers_1"]
 
 
 def test_a_nested_layers_default_initializer_is_left_out_and_a_given_one_is_kept():
     record = ModelConfig.from_model(models()["residual"]).fields
     assert "bias_init" not in record["inner"] and "scale_init" not in record["norm"]
     assert imported(record["inner"]["kernel_init"]["function"]) is nn.initializers.zeros
+
+
+def test_a_layer_held_twice_is_recorded_once_and_two_equal_layers_twice():
+    """Flax adopts a module by identity, so the record writes the shared
+    layer once and refers to it; two layers built alike are two records."""
+    shared = models()["shared"]
+    assert ModelConfig.from_model(shared).fields["layers"] == [
+        {"class": import_path(nn.Dense), "fields": {"features": 8}, "share": 0}, {"shared": 0}]
+    separate = ModelConfig.from_model(models()["separate"]).fields["layers"]
+    assert separate[0] == separate[1] and all("share" not in layer for layer in separate)
+    rebuilt = ModelConfig.from_model(shared).build()
+    assert rebuilt.layers[0] is rebuilt.layers[1]

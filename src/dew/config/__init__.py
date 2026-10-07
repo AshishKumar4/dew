@@ -202,26 +202,31 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
     field whose default no record carries (a callable, say) gets no flag and
     keeps that default."""
     flags, defaults = [], {}
-    for name, declared, annotation in _member_fields(member):
-        annotation = registry.resolve_alias(annotation)
-        if name in ("dtype", "param_dtype"):
-            typed = registry.DtypeName | None
-            declared = registry.dtype_name(registry.resolve_dtype(declared))
-        elif name == "precision":
-            typed = Literal["default", "high", "highest"] | None
-            declared = None if declared is None else str(declared).lower().removeprefix("precision.")
-        elif annotation is not None and _scalar(annotation):
-            typed = annotation if declared is not None else annotation | None
-        else:
-            typed = Annotated[JSON, _JSON_FLAG]
-            try:
-                declared = json.loads(json.dumps(to_record(declared, annotation)))
-            except (TypeError, ValueError):
-                continue  # a field no record carries keeps its class default
-        defaults[name] = declared
-        value = given.get(name, declared)
-        copied = functools.partial(copy.deepcopy, value)
-        flags.append((name, typed, dataclasses.field(default_factory=copied)))
+    # One record: a module two defaults share is written once.
+    with registry.recording():
+        for name, declared, annotation in _member_fields(member):
+            annotation = registry.resolve_alias(annotation)
+            if name in ("dtype", "param_dtype"):
+                typed = registry.DtypeName | None
+                declared = registry.dtype_name(registry.resolve_dtype(declared))
+            elif name == "precision":
+                typed = Literal["default", "high", "highest"] | None
+                declared = None if declared is None else str(declared).lower().removeprefix("precision.")
+            elif annotation is not None and _scalar(annotation):
+                typed = annotation if declared is not None else annotation | None
+            else:
+                typed = Annotated[JSON, _JSON_FLAG]
+                try:
+                    # The record itself, not a copy: a module a later default
+                    # shares turns this one into its defining record.
+                    declared = to_record(declared, annotation)
+                    json.dumps(declared)
+                except (TypeError, ValueError):
+                    continue  # a field no record carries keeps its class default
+            defaults[name] = declared
+            value = given.get(name, declared)
+            copied = functools.partial(copy.deepcopy, value)
+            flags.append((name, typed, dataclasses.field(default_factory=copied)))
     return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), defaults
 
 
@@ -728,9 +733,9 @@ class RunConfig:
         A value of a subclass of the field's type is written as its class's
         import path and its fields.
         """
-        return {field.name: to_record(getattr(self, field.name),
-                                     _declared_type(type(self), field.name))
-                for field in dataclasses.fields(self)}
+        with registry.recording():
+            return {field.name: to_record(getattr(self, field.name), _declared_type(type(self), field.name))
+                    for field in dataclasses.fields(self)}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
