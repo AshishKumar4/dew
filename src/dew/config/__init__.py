@@ -709,8 +709,8 @@ class RunConfig:
         parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
         chosen_fields = {key: value for key, value in dataclasses.asdict(parsed.model).items()
                          if key in start.fields or value != declared[key]}
-        return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)},
-                   model=dataclasses.replace(start, fields=chosen_fields))
+        return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
+                      if field.name != "model"}, model=dataclasses.replace(start, fields=chosen_fields))
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
