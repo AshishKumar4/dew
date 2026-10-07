@@ -1349,6 +1349,27 @@ slots, from 7175 to 7215 at 64, and from 8219 to 8343 at 128. Both sides had
 slow runs (the slowest 5196 and 4685 at 32 slots), and the tokens and
 log-probabilities are identical.
 
+On an A100 40 GB (Colab, jax 0.11.2) at integration `e769335e`, 2026-10-07,
+with the Pallas paged decode kernel, Dew's two caches and vLLM 0.30.0 ran in
+one session, alternating, two rounds of two repeats, closed loop and then
+open loop at 16 requests a second on 32 slots and 32 on 128:
+
+| slots | load | Dew, dense cache | Dew, paged cache | vLLM |
+|---:|---|---|---|---|
+| 32 | closed, tokens a second | 6830-7797 | 6635-7372 | 6732-6917 |
+| 32 | open: TTFT p50 / p99, gap p50 / p99 (ms) | 14.9-16.2 / 21.5-24.7, 3.38-3.73 / 9.5-10.2 | 13.9-16.4 / 19.9-24.7, 3.77-3.80 / 8.7-10.2 | 31.6-32.2 / 64.1-65.6, 3.07 / 23.4-24.1 |
+| 128 | closed, tokens a second | 14551-14576 | 12427-12439 | 12910-13184 |
+| 128 | open: TTFT p50 / p99, gap p50 / p99 (ms) | 16.2-17.4 / 24.6-27.4, 4.16-4.23 / 9.6-10.5 | 25.0-25.1 / 33.9-34.5, 7.96-7.97 / 13.2-13.4 | 50.5-53.4 / 73.8-77.8, 3.73-3.79 / 24.7-25.6 |
+
+With the dense cache Dew serves 1.10-1.13 times vLLM's closed-loop
+throughput at 128 slots and 0.99-1.16 at 32, where the first round's
+repeats ran up to 12% below the second's on both caches. The paged cache
+serves 0.85 of the dense one at 128 slots and 0.94-0.96 of vLLM. Under
+open-loop arrivals Dew's TTFT p50 is at most 0.52 of vLLM's and its gap p99
+at most 0.54, while vLLM's median token gap is shorter: by 0.3-0.7 ms
+against either cache at 32 slots and the dense one at 128, and by 4.2 ms
+against the paged cache at 128.
+
 ### The remaining gap, 2026-10-03
 
 At 64 slots Dew serves 7146 and 7197 tokens a second (medians of five runs,
@@ -2009,7 +2030,12 @@ nears its throughput. vLLM's median token gap is shorter at 128 slots and
 16 requests a second (3.91 against 4.48-4.52 ms), and the two overlap at
 32 slots and 8 a second (2.97-2.99 against 2.85-3.21). Its gap p99 is 61-70 ms
 against Dew's 16-23. vLLM ran its defaults through
-`tools/benchmark_lm_serving.py --backend vllm-engine`.
+`tools/benchmark_lm_serving.py --backend vllm-engine`. A rerun at
+integration `e769335e` (2026-10-07, the session of the A100 Qwen3-0.6B table
+above) gave Dew 6419-6510 tokens a second against vLLM's 4868-5080 at 32
+slots (1.26-1.34 times) and 9597-9861 against 7856-7927 at 128 (1.21-1.26).
+Open loop at the same rates, Dew's TTFT p50 was 21-39 ms against vLLM's
+90-1043, and its gap p99 16-24 ms against 62-71.
 
 ## Quantized serving of the 176M text-to-image model, 2026-09-28
 
