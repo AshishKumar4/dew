@@ -124,10 +124,11 @@ def _probes(args: argparse.Namespace, out: Path):
                ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30", "--json-out", str(out)],
                lambda _, name=name: {name: json.loads(out.read_text())[0]["ms_per_step"]})
     yield ([row.name for row in BATTERY if row.name.startswith("serve")], "benchmark_lm_serving.py",
-           ["--backend", "dew", "--model", args.model, "--slots", "32,128", "--repeats", "3",
+           ["--backend", "dew", "--model", args.model, "--slots", "32,128", "--repeats", "5",
             "--out", str(out)],
+           # The best repeat: a host-bound row's noise only ever slows it (32 slots spread 33% by median).
            lambda _: {f"serve qwen3-0.6b {entry['slots']} slots":
-                      statistics.median(r["output_tokens_per_second"] for r in entry["repeats"])
+                      max(r["output_tokens_per_second"] for r in entry["repeats"])
                       for entry in json.loads(out.read_text())["sweep"]})
     yield ([row.name for row in BATTERY if row.name.startswith("attention")], "benchmark_attention.py",
            ["--implementations", "cudnn", "xla", "--sequence-lengths", "2048", "--head-dims", "128",
