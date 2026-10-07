@@ -804,7 +804,6 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
     scores 0.0 here.
     """
     table = jnp.asarray(head_weight) if vocab_major else jnp.asarray(head_weight).T
-    width = targets.shape[1]
     kept = support_ids.shape[1]
     block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))
     blocks = -(-kept // block)
@@ -825,7 +824,22 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
         ids.reshape(-1, blocks, block).swapaxes(0, 1),
         columns.reshape(-1, blocks, block).swapaxes(0, 1),
     )
-    logits = jax.lax.map(chunk, pieces).swapaxes(0, 1).reshape(ids.shape)
+    return _over_supports(jax.lax.map(chunk, pieces).swapaxes(0, 1).reshape(ids.shape), ids, columns, targets)
+
+
+def logits_support_log_probs(logits, targets, support_ids, support_columns, *, temperature: float = 1.0):
+    """`support_log_probs` over a head no matrix gives: `[B, S, vocab]`
+    logits, the model's exact head's (`LogitsFromHidden`) or its own
+    (`Logits`), whose recorded support entries are read and renormalized."""
+    rows = jnp.arange(logits.shape[0])[:, None]
+    kept = logits[rows, jnp.maximum(support_columns, 0), jnp.maximum(support_ids, 0)]
+    return _over_supports(kept.astype(jnp.float32) / temperature, support_ids, support_columns, targets)
+
+
+def _over_supports(logits, ids, columns, targets):
+    """Each target's `[B, C]` support entries' logits, renormalized within its
+    support as `support_log_probs` returns them; -1 columns are padding."""
+    width = targets.shape[1]
     labels = jnp.take_along_axis(targets, jnp.maximum(columns, 0), axis=1)
 
     def row(logits, ids, columns, labels):
