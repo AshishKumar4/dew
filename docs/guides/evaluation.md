@@ -14,9 +14,9 @@ import itertools
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 
 from dew import Trainer
+from dew.config import OptimConfig
 from dew.data import Dataset
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
@@ -29,7 +29,7 @@ model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
                           dtype=jnp.float32, attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
-trainer = Trainer(objective, optax.adam(0.01), key=0)
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
                     metrics=(Perplexity(),))
 assert int(state.step) == 10
@@ -96,7 +96,7 @@ accuracy = Mean(
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
 accuracy_data = Dataset.from_records({"text": train_tokens}, batch=8,
                                     validation={"text": val_tokens})
-run = Trainer(language_model, optax.adam(0.01), key=jax.random.key(0),
+run = Trainer(language_model, OptimConfig(optimizer="adam", learning_rate=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
     accuracy_data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,

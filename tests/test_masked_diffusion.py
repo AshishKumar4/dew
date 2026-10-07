@@ -373,14 +373,9 @@ def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_
         np.testing.assert_array_equal(left, right)
 
 
-def test_masked_task_refuses_media_and_non_scalar_logical_positions(masked_source):
+def test_masked_task_refuses_non_scalar_logical_positions(masked_source):
     source, inputs = masked_source
     task = source.text_generation()
-    with pytest.raises(ValueError, match="conditioning"):
-        task(replace(inputs, conditioning={"pixel_values": jnp.zeros((3, 1, 3, 4, 4))}), 8, key=7)
-    for name in ("image_indices", "image_groups", "audio_indices"):
-        with pytest.raises(ValueError, match=name):
-            task(replace(inputs, token_fields={**inputs.token_fields, name: jnp.full((3, 4), -1)}), 8, key=7)
     with pytest.raises(ValueError, match="positions"):
         task(
             replace(inputs, token_fields={**inputs.token_fields, "positions": jnp.zeros((3, 4, 3))}), 8, key=7

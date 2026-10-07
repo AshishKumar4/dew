@@ -9,11 +9,11 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-import optax
 import tyro
 from PIL import Image
 
 from dew.artifacts import uint8_pixels
+from dew.config import OptimConfig
 from dew.data import TFDSImages
 from dew.diffusion import presets
 from dew.inputs import CLIPText, Condition, Field, InputSpec
@@ -51,6 +51,7 @@ def main(config: Config, data=None, inputs=None):
     inputs = inputs or text_conditioned_inputs(config.image_size)
     data = data or TFDSImages(
         path=None if config.data_path is None else str(config.data_path.expanduser()),
+        name="oxford_flowers102",
         image_size=config.image_size,
     ).load(batch=config.batch_size, tokenize=inputs.tokenize)
     steps = config.steps or data.epoch_steps(config.epochs)
@@ -58,7 +59,7 @@ def main(config: Config, data=None, inputs=None):
     objective = DiffusionObjective(model, presets.EDM(regime="pixel"), inputs,
                                    solver=Heun(), guidance=CFG(3.0), steps=40)
 
-    trainer = Trainer(objective, optax.adamw(config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=config.fsdp),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=steps, log_every=50)

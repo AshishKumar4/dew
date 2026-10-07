@@ -1417,7 +1417,7 @@ def test_masked_task_preserves_pool_rows_and_coordinates_invalid_requests(tmp_pa
     assert reports[1]["valid_lengths"] == [2, 3, 1]
     for report in reports:
         assert report["rows"] == 6
-        assert report["refused"] == ["conditioning", "steps"]
+        assert report["refused"] == ["token_type_ids", "steps"]
     assert [report["alone_width"] for report in reports] == [3 + 4, 4 + 4]
     for name in ("tokens", "lengths", "terminated", "decoder_steps"):
         assert reports[0][name] + reports[1][name] == single[name], name

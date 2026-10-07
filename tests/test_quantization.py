@@ -1026,6 +1026,32 @@ def test_the_trainer_knob_quantizes_the_objective_a_run_trains(tmp_path):
     assert float(jnp.max(jnp.abs(quantized_out - plain_out))) > 0.0
 
 
+def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teacher():
+    """The knob wraps the modules an objective trains (`ProgramModule.trained`):
+    a distillation's student computes quantized, and its frozen teacher
+    keeps its own numerics bit for bit."""
+    pytest.importorskip("qwix")
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.distillation import DistillationObjective
+    from dew.objectives.lm import LMObjective
+    from dew.training.quantization import _quantize
+
+    def decoder():
+        return CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                                 max_seq_len=8)
+
+    student, teacher = decoder(), decoder()
+    objective = DistillationObjective(LMObjective(student, seq_len=4), LMObjective(teacher, seq_len=4))
+    _quantize(objective, Quantization())
+    tokens = jnp.arange(8, dtype=jnp.int32)[None]
+    variables = student.init(jax.random.key(0), tokens)
+    trained, frozen = (entry.module for entry in objective.program_key())
+    assert float(jnp.max(jnp.abs(jax.jit(trained.apply)(variables, tokens)
+                                 - jax.jit(student.apply)(variables, tokens)))) > 0.0
+    np.testing.assert_array_equal(jax.jit(frozen.apply)(variables, tokens),
+                                  jax.jit(teacher.apply)(variables, tokens))
+
+
 def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
     """The wrap needs a module to wrap; an objective that keeps none is
     refused by name, before the run writes anything."""
@@ -1040,7 +1066,7 @@ def test_an_objective_that_trains_no_single_model_is_refused(tmp_path):
             return jnp.zeros(()), Aux({})
 
     config = diffusion_run(tmp_path, quantization=Quantization())
-    with pytest.raises(ValueError, match="Modelless keeps no `model`"):
+    with pytest.raises(ValueError, match="Modelless trains none"):
         config.train(
             Modelless(),
             Dataset(lambda partition: image_batches(RUN_BATCH)(), None, None, RUN_BATCH),

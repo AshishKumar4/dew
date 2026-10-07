@@ -1908,12 +1908,13 @@ def mode_masked_generation(args) -> dict:
     assert np.all(result.tokens[:, 4:] != 120)
     refused = []
     if processes > 1:
-        for label in ("conditioning", "steps"):
+        for label in ("token_type_ids", "steps"):
             invalid = request
             steps = 5
             if rank == 1:
-                if label == "conditioning":
-                    invalid = request.replace(conditioning={"pixel_values": jnp.zeros((rows, 1, 3, 4, 4))})
+                if label == "token_type_ids":
+                    extra = {"token_type_ids": jnp.zeros((rows, 4), jnp.int32)}
+                    invalid = request.replace(token_fields={**request.token_fields, **extra})
                 else:
                     steps = 0
             try:

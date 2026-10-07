@@ -6,12 +6,14 @@ and budgets, a row admitted while others run, a slot reused after its row
 left, a queue longer than the slots, and a request too large for the cache.
 """
 
+import dataclasses
 import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
@@ -702,6 +704,134 @@ def test_a_wrapped_decoder_holds_the_capacity_it_is_served_at():
     assert held == {128}
 
 
+class UserDecoder(nn.Module):
+    """A user's own decoder module, no Dew class: a plain module around a
+    decoder that forwards the calls a task and a server make, and answers
+    nothing a server asks of a model."""
+
+    decoder: nn.Module
+
+    @property
+    def vocab_size(self):
+        return self.decoder.vocab_size
+
+    @property
+    def max_seq_len(self):
+        return self.decoder.max_seq_len
+
+    def init_cache(self, batch_size):
+        self.decoder.init_cache(batch_size)
+
+    def __call__(self, tokens, **fields):
+        return self.decoder(tokens, **fields)
+
+    def states_and_logits(self, tokens, **fields):
+        return self.decoder.states_and_logits(tokens, **fields)
+
+    def states_and_logits_at(self, tokens, slots, **fields):
+        return self.decoder.states_and_logits_at(tokens, slots, **fields)
+
+
+class AnsweringDecoder(UserDecoder):
+    """`UserDecoder`, answering what a server asks of a model from the decoder it holds."""
+
+    @nn.nowrap
+    def with_cache_capacity(self, capacity):
+        return self.clone(decoder=self.decoder.with_cache_capacity(capacity))
+
+    @nn.nowrap
+    def mixed_admission_refusal(self):
+        return self.decoder.mixed_admission_refusal()
+
+    @property
+    def cache_rebuild_position(self):
+        return self.decoder.cache_rebuild_position
+
+    @nn.nowrap
+    def inference_projection_groups(self, variables):
+        held = {collection: tree["decoder"] for collection, tree in variables.items() if "decoder" in tree}
+        return tuple(dataclasses.replace(group, path=("decoder", *group.path))
+                     for group in self.decoder.inference_projection_groups(held))
+
+
+def wrapped(kind, model, variables, sampling, processor=None):
+    """A task over `kind` around `model`, its `variables` under `decoder`."""
+    held = {collection: {"decoder": tree} for collection, tree in variables.items()}
+    return TextGeneration(kind(model), held, processor, sampling=sampling)
+
+
+def test_a_user_decoder_module_is_served_as_far_as_it_answers():
+    """A server reads a model through what it answers, not its class. A
+    user's module around a decoder that answers from it is served at the
+    capacity asked for (`CacheCapacity`) and admits in one mixed forward
+    (`Serving`); one that answers neither keeps its whole context and
+    prefills in a forward of its own, and says why. Both draw what the bare
+    decoder draws."""
+    bound = task(capacity=1024)
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    unanswered = "UserDecoder does not say its layers run a mixed step (Serving)"
+    for kind, held, refusal in ((AnsweringDecoder, 128, None), (UserDecoder, 1024, unanswered)):
+        user = wrapped(kind, bound.model, bound.variables, bound.sampling, bound.processor)
+        server = Server.from_task(user, slots=4, capacity=128, admission=2)
+        assert server.mixed_refusal == refusal
+        assert {leaf.shape[1] for path, leaf in jax.tree_util.tree_leaves_with_path(server.cache)
+                if jax.tree_util.keystr(path).endswith("['cached_key']")} == {held}
+        tickets = [server.submit(prompt, budget, key=index)
+                   for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+        server.run()
+        for ticket, row in zip(tickets, alone, strict=True):
+            assert_same_generation(ticket.result(), row)
+
+
+def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
+    """Placement packs the projections a model names (`Serving`)
+    at their paths in its variables: a user's module around a decoder that
+    names the decoder's is packed, draws what the unpacked weights draw, and
+    is served and reloaded from them; one that names none keeps its layout."""
+    from dew.inference.projections import _inference_projections
+
+    bound = task(Sampling(temperature=0, eos_id=None))
+    answering = wrapped(AnsweringDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
+    plain = wrapped(UserDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
+    members = {"q_proj", "k_proj", "v_proj"}
+    packed = _inference_projections(answering.model, answering.variables)
+    attention = set(packed["params"]["decoder"]["layers_0"]["self_attn"])
+    assert "qkv_proj" in attention and not members & attention
+    assert members <= set(
+        _inference_projections(plain.model, plain.variables)["params"]["decoder"]["layers_0"]["self_attn"])
+    served = TextGeneration(answering.model, packed, bound.processor, sampling=bound.sampling)
+    for index, prompt in enumerate(PROMPTS[:3]):
+        assert_same_generation(served(prompt, 5, key=index), bound(prompt, 5, key=index))
+    server = Server.from_task(served, slots=2, capacity=128)
+    trained = jax.tree.map(lambda leaf: leaf * 1.5, answering.variables)
+    server.reload(trained)
+    retrained = wrapped(UserDecoder, bound.model, jax.tree.map(lambda leaf: leaf * 1.5, bound.variables),
+                        bound.sampling, bound.processor)
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, retrained(prompt, 5, key=3))
+
+
+def test_a_user_decoder_module_rebuilds_its_cache_where_its_decoder_says_it_goes_stale():
+    """Phi-3's LongRoPE keys go stale past position 8, and a model that says
+    so (`Serving`) has a crossing row's prefix recomputed: a user's
+    module around the decoder draws what the decoder draws across the
+    crossing, and a server refuses for it the modes that cannot rebuild."""
+    from pathlib import Path
+
+    from dew.interop import Pretrained
+
+    directory = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
+    greedy = Sampling(temperature=0, eos_id=None)
+    bare = TextGeneration(loaded.model, loaded.variables, sampling=greedy)
+    user = wrapped(AnsweringDecoder, loaded.model, loaded.variables, greedy)
+    prompts = np.load(directory / "input_ids.npy").astype(np.int32)[:, :4]
+    assert_same_generation(user(prompts, 8, key=0), bare(prompts, 8, key=0))
+    with pytest.raises(ValueError, match=r"LongRoPE crossing position 8.*chunked"):
+        Server.from_task(user, slots=2, capacity=64, chunk=2)
+
+
 def test_prefix_sharing_needs_a_paged_cache():
     with pytest.raises(ValueError, match="paged cache"):
         Server.from_task(task(), slots=2, capacity=128, prefix_cache=True)
@@ -709,8 +839,8 @@ def test_prefix_sharing_needs_a_paged_cache():
 
 @pytest.mark.parametrize("scan_layers", [False, True])
 def test_a_plain_decoder_takes_the_mixed_step_scanned_or_not(scan_layers):
-    """The holder walk names plain attention whether the stack is a loop or
-    scanned (a decode runs the plain loop, so a scanned stack's caches sit
+    """A decoder answers for its plain attention whether the stack is a loop
+    or scanned (a decode runs the plain loop, so a scanned stack's caches sit
     under its layers too): neither loses the mixed admitting step."""
     model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=2, num_heads=2, head_dim=8,
                               mlp_features=32, max_seq_len=128, dtype="float32", scan_layers=scan_layers)

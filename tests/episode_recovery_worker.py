@@ -3,6 +3,7 @@
 import itertools
 import json
 import sys
+from dataclasses import asdict
 from pathlib import Path
 
 import jax
@@ -11,7 +12,6 @@ from test_tool_episodes import build
 
 from dew.data import Dataset
 from dew.objectives.rl import EpisodeJournal
-from dew.objectives.rl.records import episode_record
 from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment
 
 
@@ -35,7 +35,7 @@ def main() -> None:
     )
     state = trainer.fit(data, steps=1, log_every=1)
     np.save(directory / "parameters.npy", np.asarray(state.variables["params"]["table"]))
-    (directory / "episodes.json").write_text(json.dumps([episode_record(episode) for episode in records]))
+    (directory / "episodes.json").write_text(json.dumps([asdict(episode) for episode in records]))
     assert int(state.updates) == 1
 
 

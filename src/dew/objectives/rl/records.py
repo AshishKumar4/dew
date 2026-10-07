@@ -2,8 +2,6 @@
 
 import math
 from collections.abc import Callable, Mapping
-from dataclasses import asdict
-from typing import TypedDict
 
 from dew.records import JSON, integer, integers, record as section, text
 from dew.sampling.text import Sampling
@@ -53,34 +51,8 @@ def action_record(value: Mapping[str, object]) -> Action:
                   _binding_id=text(record["_binding_id"], "_binding_id"))
 
 
-class EpisodeFields(TypedDict, total=False):
-    """Name every field of `Episode` a record carries, under the field's own name.
-
-    The keys are the dataclass's own init fields, which
-    `tests/test_verl_episodes.py` pins, so a field renamed there is a failing
-    test here rather than a key a reader never looks for. The nested records
-    are what `asdict` made of the identity, the observations and the turns.
-    Every key is written, and an exporter that drops one is what
-    `total=False` states.
-    """
-
-    identity: Mapping[str, object]
-    policy_step: int
-    initial: Mapping[str, object] | None
-    transitions: tuple[Mapping[str, object], ...]
-    status: EpisodeStatus
-    detail: str
-    reward: float | None
-    _binding_id: str
-
-
-def episode_record(episode: Episode) -> EpisodeFields:
-    """Write an episode's exact turns, observations, likelihoods and collection origin."""
-    return EpisodeFields(**asdict(episode))
-
-
 def episode_from_record(value: Mapping[str, object]) -> Episode:
-    """Read an episode without reconstructing actions from rendered text."""
+    """Read an episode `asdict` wrote, without reconstructing actions from rendered text."""
     record = section(value, "episode")
     identity = section(record["identity"], "identity")
     initial, reward = record["initial"], record["reward"]

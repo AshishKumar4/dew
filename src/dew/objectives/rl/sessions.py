@@ -36,6 +36,7 @@ them. A `TRUNCATED` session follows the `truncation` policy:
 
 from __future__ import annotations
 
+import itertools
 import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
@@ -49,6 +50,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.data.tokens import first_fit
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -316,13 +318,15 @@ def merges(chain: Sequence[int], call: Call) -> bool:
     return len(call.prompt_ids) >= size and tuple(call.prompt_ids[:size]) == tuple(chain)
 
 
-def _chains(session: Session, index: int, width: int) -> list[_Chain]:
+def chains(session: Session, index: int, width: int) -> list[_Chain]:
     """Split one session's calls into strict append-only chains no wider than `width`.
 
-    A call that does not continue the current chain starts a new chain from
-    its own full prompt. A single call wider than `width` is refused: dropping it would hide a session the
-    scheduler admitted. A merged chain is never wider than its last call,
-    whose prompt holds the whole chain, so fitting each call fits the chain.
+    Each chain records `index`, the session's number among those `pack`
+    reads. A call that does not continue the current chain starts a new
+    chain from its own full prompt. A single call wider than `width` is
+    refused: dropping it would hide a session the scheduler admitted. A
+    merged chain is never wider than its last call, whose prompt holds the
+    whole chain, so fitting each call fits the chain.
     """
     built: list[_Chain] = []
     for number, call in enumerate(session.calls):
@@ -367,11 +371,6 @@ def check_estimator(estimator: str) -> None:
         raise ValueError(f"estimator must be one of {ESTIMATORS}, got {estimator!r}")
 
 
-def chains(session: Session, width: int) -> tuple[tuple[int, ...], ...]:
-    """The ids of each strict append-only chain `pack` builds from `session`'s calls."""
-    return tuple(tuple(chain.tokens) for chain in _chains(session, 0, width))
-
-
 def advantages(sessions: Sequence[Session], estimator: str = "group", *,
                truncation: str = "mask") -> np.ndarray:
     """One advantage per session from the rewards of its `(task, group)`.
@@ -410,25 +409,18 @@ def _built(sessions: Sequence[Session], width: int, truncation: str) -> list[_Ch
         chain
         for index, session in enumerate(sessions)
         if _trained_reward(session, truncation) is not None
-        for chain in _chains(session, index, width)
+        for chain in chains(session, index, width)
     ]
 
 
 def _place(lengths: Sequence[int], width: int) -> list[list[int]]:
-    """Place chains first-fit in decreasing length, a stable order: per row, its chain numbers."""
+    """Place chains first-fit in decreasing length, a stable order: per row, its chain numbers.
+
+    With a window open per chain, `first_fit` never closes one, so it is plain first-fit.
+    """
     order = sorted(range(len(lengths)), key=lambda number: -lengths[number])
-    fill: list[int] = []
-    placed: list[list[int]] = []
-    for number in order:
-        size = lengths[number]
-        row = next((row for row, used in enumerate(fill) if used + size <= width), None)
-        if row is None:
-            fill.append(0)
-            placed.append([])
-            row = len(fill) - 1
-        placed[row].append(number)
-        fill[row] += size
-    return placed
+    grouped, starts = first_fit(np.asarray(lengths, np.int64)[order], width, max(len(order), 1))
+    return [[order[index] for index in grouped[start:stop]] for start, stop in itertools.pairwise(starts)]
 
 
 def chain_lengths(sessions: Sequence[Session], width: int, *, truncation: str) -> list[int]:
