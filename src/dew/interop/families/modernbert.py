@@ -62,7 +62,13 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         'initializer_cutoff_factor', 'cls_token_id', 'sep_token_id', 'mask_token_id',
         # Pre-5.0 releases carry these, which ModernBertConfig no longer reads:
         # the model norms at norm_eps and always rotates.
-        'layer_norm_eps', 'position_embedding_type'))
+        'layer_norm_eps', 'position_embedding_type',
+        # Ettin's encoders state that they attend both ways, which
+        # ModernBertAttention does whatever they say (is_causal = False).
+        'causal_mask', 'is_causal'))
+    for flag in ('causal_mask', 'is_causal'):
+        if hf.get(flag):
+            _refuse(flag, "ModernBERT attends both ways; a causal checkpoint is a different model")
     for dropout in ('attention_dropout', 'mlp_dropout'):
         if records.number(hf.get(dropout, 0.0), dropout):
             _refuse(dropout, "ModernBERT drops inside its attention and MLP where the blocks here do not")

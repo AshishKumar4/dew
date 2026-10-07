@@ -16,7 +16,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'
 DIRECTORY = FIXTURES / 'modernbert-tiny'
-RELEASES = ('modernbert-base', 'laya-encoder')
+RELEASES = ('modernbert-base', 'laya-encoder', 'ettin-encoder-400m')
 
 
 def _fixture(name: str) -> np.ndarray:
@@ -151,6 +151,19 @@ def test_the_released_configs_read_as_modernbert():
     assert (laya.rope_theta, laya.kind_of('sliding_attention').rope_theta) == (160000.0, 10000.0)
     assert laya.per_layer_types == ('full_attention', 'sliding_attention', 'sliding_attention') * 9 + (
         'full_attention',)
+    # Ettin's encoder states that it attends both ways, and sets one rope base for both kinds.
+    ettin = translate_config(json.loads((FIXTURES / 'ettin-encoder-400m' / 'config.json').read_text())).value
+    assert (ettin.emb_features, ettin.num_layers, ettin.hidden_features) == (1024, 28, 2624)
+    assert not ettin.causal and ettin.kind_of('sliding_attention').window == 65
+    assert (ettin.rope_theta, ettin.kind_of('sliding_attention').rope_theta) == (160000.0, 160000.0)
+
+
+def test_a_causal_modernbert_config_is_refused():
+    """ModernBertAttention attends both ways whatever `is_causal` says, so a
+    config that asks for a causal encoder names a model this is not."""
+    config = json.loads((FIXTURES / 'ettin-encoder-400m' / 'config.json').read_text())
+    with pytest.raises(ValueError, match='is_causal'):
+        translate_config({**config, 'is_causal': True})
 
 
 @pytest.mark.network
