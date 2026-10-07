@@ -271,6 +271,37 @@ class Weighted(nn.Module):
                 + jnp.cos(x) * time * w[3])
 
 
+def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_path):
+    """`--pretrained <pipeline> --objective rcm` with no teacher run: the
+    teacher is the model the run loads, its weights bitwise the source's,
+    and the student starts as it."""
+    import tarfile
+    from pathlib import Path
+
+    from test_diffusion_run_sources import precision
+
+    from dew.config import ObjectiveConfig
+    from dew.data import TFDSImages
+    from dew.diffusion.presets import Flow
+    from dew.interop.pretrained import load_diffusion_source
+    from dew.objectives.diffusion import DiffusionRunConfig
+    from dew.objectives.diffusion.objective import TEACHER, model_part
+
+    with tarfile.open(Path(__file__).resolve().parent / "fixtures" / "flux_source.tar.xz") as archive:
+        archive.extractall(tmp_path, filter="data")
+    pipeline = str(tmp_path / "pipeline")
+    objective = DiffusionRunConfig(pretrained=pipeline, preset=Flow(), model=precision(),
+                                   data=TFDSImages(image_size=16), val_metrics=(),
+                                   objective=ObjectiveConfig("rcm", {"ema_decay": None})).build()
+    source = load_diffusion_source(pipeline, dtype="float32", attention_impl="xla", size=(16, 16))
+    expected = model_part(source.variables)
+    held = objective.init(jax.random.PRNGKey(0))
+    for tree in (objective.teacher_variables, held[TEACHER]):
+        assert jax.tree.structure(tree) == jax.tree.structure(expected)
+        for got, want in zip(jax.tree.leaves(tree), jax.tree.leaves(expected), strict=True):
+            np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def discrete_fields(prefix: str) -> dict:
     """rCM's dCM settings as the objective's arguments, none for sCM."""
     if not prefix:
