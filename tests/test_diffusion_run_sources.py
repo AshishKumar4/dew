@@ -20,8 +20,9 @@ import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
 from reference_error import assert_as_exact_as_the_reference
+from releases import released_sampling
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -29,7 +30,8 @@ from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig, TextCondition
 from dew.objectives.rl.flow import FlowGRPOObjective
-from dew.sampling import Euler
+from dew.registry import argument_records
+from dew.sampling import CFG, Euler
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -137,6 +139,26 @@ def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     with pytest.raises(ValueError, match="name a preset of its kind"):
         DiffusionRunConfig(**common).build()
     assert DiffusionRunConfig(**common, preset=Flow(shift=3.0)).build() is not None
+
+
+def test_a_pretrained_run_records_its_pipelines_sampling_and_builds_it_after_a_release(pipelines,
+                                                                                       monkeypatch):
+    """A run over a published pipeline samples with the pipeline's own
+    guidance and steps where it states none. Its record holds them, so a
+    release that defaults a denoiser's sampling otherwise builds the run as
+    it sampled."""
+    config = DiffusionRunConfig(pretrained=str(pipelines / "sd3" / "pipeline"), preset=None,
+                                model=precision(), data=TFDSImages(image_size=16), val_metrics=(),
+                                objective=ObjectiveConfig("diffusion", {"solver": Euler(),
+                                                                        "ema_decay": None}))
+    objective = config.build()
+    record = json.loads(json.dumps(config.recorded(objective).record()))
+    sampled = {"guidance": objective.guidance, "steps": objective.steps}
+    held = record["fields"]["objective"]["defaults"]
+    assert {key: held[key] for key in sampled} == argument_records(DiffusionObjective, sampled)
+    released_sampling(monkeypatch, CFG(scale=4.5), steps=7)
+    rebuilt = RunConfig.read(record).build()
+    assert {"guidance": rebuilt.guidance, "steps": rebuilt.steps} == sampled
 
 
 def flow_run(family: str, size: int, pipelines) -> DiffusionRunConfig:

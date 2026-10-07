@@ -111,7 +111,7 @@ class LMRunConfig(RunConfig):
         run, source = self, None
         if self.pretrained is None:
             fields = {**self.model.fields, "max_seq_len": context, "vocab_size": vocab_size}
-            model = models.build(self.model.name, **fields)
+            model = models.build(self.model.name, {**self.model.arguments, **fields})
         else:
             source, run = self.pretrained_source(written, vocab_size, context)
             model, fields = source.model, dict(source.model_config)
