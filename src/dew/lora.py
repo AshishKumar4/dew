@@ -48,6 +48,7 @@ import numpy as np
 from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
+from flax.nnx import bridge
 
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
@@ -123,8 +124,7 @@ class LoRA:
         """
         from dew.nn.inputs import request_key
 
-        if isinstance(type(model), _Adapted):
-            raise ValueError("The model is already adapted")
+        _refuse_unadaptable(model)
         variables = thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
@@ -150,8 +150,7 @@ class LoRA:
         whose shapes do not fit the bound weight, ranks that disagree with the config,
         and PEFT features this loader does not support are refused by name.
         """
-        if isinstance(type(model), _Adapted):
-            raise ValueError("The model is already adapted")
+        _refuse_unadaptable(model)
         variables = thaw(variables)
         bound = bound_layouts(model, variables, layouts or {})
         path = FilePath(path)
@@ -314,6 +313,19 @@ class Adapter:
                     for field, value in _config(self, targets).items()}
         write_file(tensors, path / DIFFUSERS_WEIGHTS,
                    {"format": "pt", DIFFUSERS_METADATA: json.dumps(metadata, indent=2, sort_keys=True)})
+
+
+def _refuse_unadaptable(model: nn.Module) -> None:
+    """Refuse a model already adapted, and an NNX model behind Flax's bridge,
+    whose `nnx.Linear` makes no `nn.Dense` call the branch could join: its
+    factors would train while its forward never read them."""
+    if isinstance(type(model), _Adapted):
+        raise ValueError("The model is already adapted")
+    if isinstance(model, bridge.ToLinen):
+        raise TypeError(f"{model.nnx_class.__name__} is an NNX model behind flax.nnx.bridge.ToLinen; an "
+                        "adapter joins flax.linen.Dense calls, and its nnx.Linear layers make none. Adapt "
+                        "it in NNX before the bridge: flax.nnx.LoRALinear in place of nnx.Linear, or "
+                        "flax.nnx.LoRA beside it")
 
 
 def _scale(target: Target, rslora: bool) -> float:
