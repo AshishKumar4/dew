@@ -1,95 +1,124 @@
-"""Image-conditioned DiffusionGemma SFT on Oxford Flowers class-name captions.
+"""Image-conditioned DiffusionGemma SFT from scratch on Oxford Flowers, scored by naming held-out flowers.
 
-    python examples/sft_diffusion_gemma_images.py --flowers data/oxford_flowers102/2.1.1 \
-        --steps 2000 --out runs/flowers-caption
-    python examples/sft_diffusion_gemma_images.py --flowers data/oxford_flowers102/2.1.1 \
-        --smoke --out runs/flowers-caption-smoke
+    python examples/sft_diffusion_gemma_images.py --out runs/flowers-caption
+    JAX_PLATFORMS=cpu python examples/sft_diffusion_gemma_images.py --smoke --out /tmp/flowers-caption-smoke
 
-This trains a fresh, byte-vocabulary, 2-layer DiffusionGemma with a small
-Gemma4 vision tower; it does not load or qualify the released 26B model.
-Flowers has class labels rather than human captions, so each target is a
-deterministic class-name description. The same real image conditions the
-clean encoder and the denoiser's prefix cache. The smoke run records loss,
-vision-parameter movement and a generated caption; it is a workflow check,
-not a caption-quality benchmark. Preparation is separate, as for the other
-Flowers examples (TFDS ArrayRecords).
+This trains a fresh DiffusionGemma, a byte-vocabulary text stack with a small
+Gemma 4 vision tower, with `BlockDiffusionObjective`, the published
+DiffusionGemma SFT loss. It starts from random weights; it does not load or
+fine-tune the released 26B-A4B checkpoint. Flowers has class labels rather
+than human captions, so each target is "a photo of a <class name>". The image
+sits in the clean prompt as placeholder slots that the vision tower's
+features fill, and the caption is the response canvas the denoiser learns.
+
+The first run reads the dataset's three splits with `datasets` and stores
+them once beside the run, shrunk so that their shorter side is
+`--staging-size` pixels, as parquet. Training reads the train and validation
+splits with random crops and flips. Every `--eval-every` steps the trainer
+scores the canvas cross entropy over held-out test images. At the end the
+script loads the run back with `dew.pipeline`, which returns a
+`BlockGeneration` task. That task captions every test image, and
+`result.json` records how many captions name the right flower. `--smoke`
+writes a few synthetic images as parquet and trains a tiny model for four
+steps on one CPU device. It needs no network.
 """
 
 import json
+import time
 from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew.config import OptimConfig
-from dew.data import ByteTokenizer, DataPartition, Dataset, Loading, TFDSImages
-from dew.data.dataset import mapped, tokenized, train_stream
-from dew.data.images import ImageTransform, class_names
+import dew
+from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.data import ByteTokenizer, DataPartition, HFImages, HFOptions, Loading
+from dew.data.dataset import mapped
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Step
-from dew.objectives.diffusion.block import BlockDiffusionObjective
-from dew.training import Checkpoints, Trainer
+from dew.objectives.base import VALID_ROWS
+from dew.objectives.lm import Perplexity
+from dew.training import MeshSpec, prepare_process
+from dew.training.optim import Cosine
+
+EOS, PAD, IMAGE = 256, 257, 258
+"""The ids past the 256 bytes: end of caption, padding and the image placeholder."""
+SPLITS = ("train", "validation", "test")
 
 
 @dataclass
 class Config:
-    flowers: str
-    image_size: int = 32
-    prompt_tokens: int = 32
+    dataset: str = "Donghyun99/Oxford-Flower-102"
+    """A Hugging Face dataset with an image column, a ClassLabel `label` and these three splits."""
+    revision: str | None = None
+    image_size: int = 64
+    staging_size: int = 80
+    """The shorter side the stored images are shrunk to, which random crops cut from."""
+    patch_size: int = 4
+    prompt_tokens: int = 80
     canvas_length: int = 64
-    batch_size: int = 8
-    steps: int = 2000
+    batch_size: int = 64
+    steps: int = 6000
     learning_rate: float = 1e-3
-    features: int = 128
-    vision_features: int = 64
+    warmup_steps: int = 300
+    features: int = 256
+    layers: int = 4
+    vision_features: int = 192
+    vision_layers: int = 6
+    eval_every: int = 1000
     out: Path = Path("runs/flowers-caption")
     smoke: bool = False
+    """Train a tiny model on a few synthetic images on one CPU device."""
 
 
 def model_config(config: Config):
+    """The diffusion_gemma config this run builds, in the layout a checkpoint's config.json has."""
     return {"model_type": "diffusion_gemma", "canvas_length": config.canvas_length,
-            "image_token_id": 258,
+            "image_token_id": IMAGE,
             "text_config": {
-                "model_type": "diffusion_gemma_text", "vocab_size": 259,
+                "model_type": "diffusion_gemma_text", "vocab_size": IMAGE + 1,
                 "hidden_size": config.features, "intermediate_size": 4 * config.features,
-                "num_hidden_layers": 2, "num_attention_heads": 4, "num_key_value_heads": 4,
+                "num_hidden_layers": config.layers, "num_attention_heads": 4, "num_key_value_heads": 4,
                 "head_dim": config.features // 4, "hidden_activation": "gelu_pytorch_tanh",
                 "max_position_embeddings": config.prompt_tokens + config.canvas_length,
-                "layer_types": ["full_attention", "full_attention"], "tie_word_embeddings": True,
-                "pad_token_id": 257, "eos_token_id": 256, "rms_norm_eps": 1e-6,
+                "layer_types": ["full_attention"] * config.layers, "tie_word_embeddings": True,
+                "pad_token_id": PAD, "eos_token_id": EOS, "rms_norm_eps": 1e-6,
                 "rope_parameters": {"full_attention": {"rope_theta": 10000.0, "rope_type": "default"}}},
             "vision_config": {
                 "hidden_size": config.vision_features, "intermediate_size": 4 * config.vision_features,
-                "num_hidden_layers": 1, "num_attention_heads": 4, "num_key_value_heads": 4,
-                "head_dim": config.vision_features // 4, "patch_size": 4, "pooling_kernel_size": 2,
-                "position_embedding_size": 64, "rope_parameters": {"rope_theta": 10000.0},
+                "num_hidden_layers": config.vision_layers, "num_attention_heads": 4, "num_key_value_heads": 4,
+                "head_dim": config.vision_features // 4, "patch_size": config.patch_size,
+                "pooling_kernel_size": 2, "position_embedding_size": 64,
+                "rope_parameters": {"rope_theta": 10000.0},
                 "standardize": True, "use_clipped_linears": False, "rms_norm_eps": 1e-6}}
+
+
+def caption(name: str) -> str:
+    return "a photo of a " + name
 
 
 def caption_batch(batch, config: Config, labels):
     """One padded prompt/image block followed by the caption canvas, no packing."""
     tokenizer = ByteTokenizer()
     rows = len(batch["image"])
-    image_tokens = (config.image_size // 8) ** 2
+    image_tokens = (config.image_size // (2 * config.patch_size)) ** 2
     prompt = tokenizer.encode("Describe:")
     if 1 + image_tokens + len(prompt) > config.prompt_tokens:
         raise ValueError("prompt_tokens needs room for the image features and Describe: prompt")
     length = config.prompt_tokens + config.canvas_length
-    tokens = np.full((rows, length), 257, np.int32)
+    tokens = np.full((rows, length), PAD, np.int32)
     valid = np.zeros((rows, length), bool)
     indices = np.full((rows, length), -1, np.int32)
-    tokens[:, 0] = 256
-    tokens[:, 1:1+image_tokens] = 258
+    tokens[:, 0] = EOS
+    tokens[:, 1:1+image_tokens] = IMAGE
     indices[:, 1:1+image_tokens] = np.arange(image_tokens)
     start = 1 + image_tokens
     tokens[:, start:start+len(prompt)] = prompt
     valid[:, :start+len(prompt)] = True
     for row, label in enumerate(batch["label"]):
-        response = [*tokenizer.encode("a photo of a " + labels[int(label)]), 256]
+        response = [*tokenizer.encode(caption(labels[int(label)])), EOS]
         if len(response) > config.canvas_length:
             raise ValueError("canvas_length must hold a whole Flowers caption plus EOS")
         tokens[row, config.prompt_tokens:config.prompt_tokens+len(response)] = response
@@ -100,81 +129,122 @@ def caption_batch(batch, config: Config, labels):
                            "image_groups": np.where(indices >= 0, 0, -1).astype(np.int32),
                            "positions": np.maximum(positions, 0)},
                            {"pixel_values": pixels, "image_lengths": np.ones(rows, np.int32)})
-    return {"text": prepared}
+    # The rest of the batch rides along: the labels the caption accuracy
+    # reads, and the valid_rows a validation pass marks its repeats with.
+    return {**{key: value for key, value in batch.items() if key != "image"}, "text": prepared}
 
 
-def flowers_data(config: Config):
-    spec = TFDSImages(path=config.flowers, split="train", image_size=config.image_size,
-                         augmentation="none", val_batches=0,
-                         loading=Loading(workers=0, threads=2, read_buffer=16))
-    source = spec.source()
-    labels = class_names(str(Path(config.flowers) / "label.labels.txt"))
-    stream = tokenized(train_stream(source, [ImageTransform(spec)], batch=config.batch_size,
-                       seed=spec.seed, loading=spec.loading), None)
-    return Dataset(train=mapped(stream, lambda batch: caption_batch(batch, config, labels)),
-                   val=None, records=len(source), batch=config.batch_size)
+def staged_splits(config: Config) -> dict[str, str]:
+    """Each split as parquet beside the run, its images shrunk once so the
+    shorter side is `staging_size`; a later run reads the files it finds."""
+    import datasets
+    from PIL import Image
+
+    files = {split: str(config.out / "data" / f"{split}.parquet") for split in SPLITS}
+    if all(Path(path).is_file() for path in files.values()):
+        return files
+
+    def shrink(row):
+        image = row["image"].convert("RGB")
+        scale = config.staging_size / min(image.size)
+        row["image"] = image.resize((round(image.width * scale), round(image.height * scale)),
+                                    Image.Resampling.BICUBIC)
+        return row
+
+    for split, path in files.items():
+        table = datasets.load_dataset(config.dataset, split=split, revision=config.revision)
+        table.map(shrink, num_proc=8, desc=f"shrinking {split}").to_parquet(path + ".partial")
+        Path(path + ".partial").rename(path)
+    return files
 
 
-def main(config: Config):
+def smoke_splits(config: Config) -> dict[str, str]:
+    """Synthetic images of two classes, as parquet in the layout `staged_splits` writes."""
+    import datasets
+    from PIL import Image
+
+    features = datasets.Features({"image": datasets.Image(),
+                                  "label": datasets.ClassLabel(names=["pink rose", "yellow tulip"])})
+    files = {}
+    for index, split in enumerate(SPLITS):
+        images = [Image.fromarray(np.random.RandomState(10 * index + row).randint(
+            0, 256, (config.staging_size, config.staging_size, 3), np.uint8)) for row in range(8)]
+        files[split] = str(config.out / "data" / f"{split}.parquet")
+        datasets.Dataset.from_dict({"image": images, "label": [row % 2 for row in range(8)]},
+                                   features=features).to_parquet(files[split])
+    return files
+
+
+def main(config: Config) -> Path:
     if config.smoke:
-        config = replace(config, image_size=16, prompt_tokens=24, batch_size=2,
-                         steps=8, features=64, vision_features=32)
-    config.out.mkdir(parents=True, exist_ok=True)
+        config = replace(config, image_size=16, staging_size=20, prompt_tokens=24, canvas_length=32,
+                         batch_size=8, steps=4, warmup_steps=1, features=32, layers=1,
+                         vision_features=16, vision_layers=1, eval_every=2)
+    (config.out / "data").mkdir(parents=True, exist_ok=True)
+    files = smoke_splits(config) if config.smoke else staged_splits(config)
+    # Train on train + validation, score on test, which the run never reads.
+    spec = HFImages(name="parquet", split="train+validation", val_split="test", caption_columns=(),
+                    options=HFOptions(data_files=files, cache_dir=str(config.out / "data" / "cache")),
+                    image_size=config.image_size, augmentation="flip_only", crop_scale=(0.6, 1.0),
+                    augmentation_size=config.staging_size, val_batches=None,
+                    loading=Loading(workers=0, threads=1 if config.smoke else 8))
+    labels = [name.strip() for name in spec.source().features["label"].names]
     record = model_config(config)
-    model = build(record, dtype="float32", attention_impl="reference")
-    model = model.clone(text=model.text.clone(precision=jax.lax.Precision.HIGHEST),
-                        conditioner=model.conditioner.clone(precision=jax.lax.Precision.HIGHEST))
-    objective = BlockDiffusionObjective(model, prompt_length=config.prompt_tokens,
-                                       pad_token_id=257, self_cond_prob=0.5)
-    data = flowers_data(config)
-    checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
-    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate).build(config.steps),
-                      key=jax.random.key(0),
-                      checkpoints=checkpoints)
-    stream = data.train(DataPartition())
+    model = build(record, dtype="float32" if config.smoke else "bfloat16")
+    run = RunConfig(
+        model=ModelConfig.from_model(model), data=spec,
+        objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
+                                                      "pad_token_id": PAD}),
+        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, schedule=Cosine(
+            peak=config.learning_rate, warmup_steps=config.warmup_steps, end=config.learning_rate / 20)),
+        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=1,
+                              batch_size=config.batch_size, steps=config.steps,
+                              log_every=1 if config.smoke else 100, eval_every=config.eval_every,
+                              checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
+                              multi_host=False, compilation_cache_dir=None))
+    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
+                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+    objective = run.objective.build(model=model)
+    images = spec.load(batch=run.trainer.batch_size)
+    data = replace(images, train=mapped(images.train, lambda batch: caption_batch(batch, config, labels)),
+                   val=mapped(images.val, lambda batch: caption_batch(batch, config, labels)))
+    started = time.perf_counter()
+    name = "flowers-caption"
+    run.train(objective, data, name=name, metrics=(Perplexity(),),
+              summary={"dataset": config.dataset, "classes": len(labels)})
+    trained = time.perf_counter()
+
+    # The other half, from the files alone: the run directory loads as the
+    # canvas task its objective saved, and it captions every test image.
+    run_dir = Path(run.trainer.checkpoint_dir) / name
+    task = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
+    tokenizer = ByteTokenizer()
+    captions, correct = [], 0
+    stream = data.val(DataPartition())
     try:
-        probe = next(stream)
+        for batch in stream:
+            generated = task(batch["text"].slice_tokens(stop=config.prompt_tokens), config.canvas_length,
+                             key=3).host()
+            for row, length, label, real in zip(
+                    np.asarray(generated.tokens), np.asarray(generated.lengths), batch["label"],
+                    batch.get(VALID_ROWS, np.ones(len(batch["label"]), bool)), strict=True):
+                if not real:
+                    continue
+                text = tokenizer.decode([int(token) for token in row[config.prompt_tokens:][:length]
+                                         if token < 256])
+                captions.append({"label": labels[int(label)], "caption": text})
+                correct += text == caption(labels[int(label)])
     finally:
         stream.close()
-    initial = trainer.initial_state()
-    vision_before = jax.tree.map(np.asarray, initial.variables["params"]["conditioner"])
-    score = jax.jit(lambda params, inputs: objective.scalar_loss(params, {"text": inputs},
-                   Step(step=jnp.asarray(0), key=jax.random.key(7), ema=None))[0])
-    before = float(score(initial.variables, probe["text"]))
-    del initial
-    state = trainer.fit(data, steps=config.steps, log_every=1, checkpoint_every=config.steps)
-    checkpoints.wait()
-    after = float(score(state.variables, probe["text"]))
-    changed_pixels = probe["text"].replace(conditioning={**probe["text"].conditioning,
-                    "pixel_values": -probe["text"].conditioning["pixel_values"]})
-    changed_loss = float(score(state.variables, changed_pixels))
-    vision_delta = max(float(np.max(np.abs(np.asarray(after_leaf) - before_leaf)))
-                       for before_leaf, after_leaf in zip(jax.tree.leaves(vision_before),
-                           jax.tree.leaves(state.variables["params"]["conditioner"]), strict=True))
-    if not np.isfinite([before, after, changed_loss, vision_delta]).all():
-        raise ValueError("image SFT produced a non-finite loss or parameter change")
-    if vision_delta == 0 or changed_loss == after:
-        raise ValueError("image SFT must update the vision tower and depend on the conditioning pixels")
-    task = replace(objective.pipeline(state, ema=False), eos_token_ids=(256,))
-    generated = task(probe["text"].slice_tokens(stop=config.prompt_tokens), config.canvas_length,
-                     key=3).host()
-    tokenizer = ByteTokenizer()
-    captions = [
-        tokenizer.decode(
-            [int(token) for token in row[config.prompt_tokens : config.prompt_tokens + length] if token < 256]
-        )
-        for row, length in zip(np.asarray(generated.tokens), np.asarray(generated.lengths), strict=True)
-    ]
-    report = {"dataset": "oxford_flowers102/train", "records": data.records,
-              "device": jax.devices()[0].device_kind, "steps": int(state.step),
-              "updates": int(state.updates), "probe_sft_before": before, "probe_sft_after": after,
-              "changed_image_sft": changed_loss, "vision_parameter_max_delta": vision_delta,
-              "captions": captions, "released_26b_qualified": False}
+    report = {"dataset": config.dataset, "train_images": images.records, "test_images": len(captions),
+              "classes": len(labels), "device": jax.devices()[0].device_kind, "steps": config.steps,
+              "batch_size": config.batch_size, "train_seconds": round(trained - started, 1),
+              "caption_accuracy": correct / len(captions), "captions": captions[:32]}
     (config.out / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     (config.out / "model-config.json").write_text(json.dumps(record, indent=2) + "\n")
-    (config.out / "samples.txt").write_text("\n".join(captions) + "\n")
-    print(json.dumps(report, indent=2))
-    return state
+    (config.out / "captions.jsonl").write_text("".join(json.dumps(row) + "\n" for row in captions))
+    print(json.dumps({key: value for key, value in report.items() if key != "captions"}, indent=2))
+    return run_dir
 
 
 if __name__ == "__main__":
