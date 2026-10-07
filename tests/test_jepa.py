@@ -97,12 +97,47 @@ def test_masks_are_reproducible_from_a_seed(mask):
     assert not all(jnp.array_equal(x, y) for x, y in zip(a, c, strict=True))
 
 
-def test_block_shapes_and_positions_actually_vary(mask):
-    blocks = np.array(mask.sample(jax.random.PRNGKey(5), 64)[1]).reshape(-1, mask.block_area)
-    corners = {int(block.min()) for block in blocks}
-    widths = {len(np.unique(block % GRID[1])) for block in blocks}
-    assert len(corners) > 1, "every block landed in the same place"
-    assert len(widths) > 1, "every block came out the same shape"
+def test_blocks_and_context_follow_the_documented_distribution(mask):
+    """The static-shape multi-block draw: each block's shape uniform over
+    `block_shapes`, its corner uniform over the corners where that shape
+    fits, and the context a uniform subset of the targets' complement. Over
+    4096 rows, Pearson's chi-square of the shapes and of each shape's
+    corners, and of the context's inclusion rate per complement size, at a
+    one-in-a-million false alarm."""
+    from scipy import stats
+
+    rows = 4096
+    context, targets = (np.asarray(part) for part in mask.sample(jax.random.PRNGKey(5), rows))
+    blocks = targets.reshape(-1, mask.block_area)
+    top, left = np.divmod(blocks.min(axis=1), GRID[1])
+    height = blocks.max(axis=1) // GRID[1] - top + 1
+    shapes = [mask.block_shapes.index((int(h), mask.block_area // int(h))) for h in height]
+
+    def assert_uniform(counts, what):
+        p = stats.chisquare(counts).pvalue
+        assert p > 1e-6, f"{what} is not uniform (p = {p:.1e})"
+
+    assert_uniform(np.bincount(shapes, minlength=len(mask.block_shapes)), "the block shape")
+    for index, (h, w) in enumerate(mask.block_shapes):
+        chosen = np.asarray(shapes) == index
+        corners = top[chosen] * (GRID[1] - w + 1) + left[chosen]
+        assert_uniform(np.bincount(corners, minlength=(GRID[0] - h + 1) * (GRID[1] - w + 1)),
+                       f"the {h}x{w} block's corner")
+    covered = np.zeros((rows, mask.num_patches), bool)
+    covered[np.arange(rows)[:, None], targets.reshape(rows, -1)] = True
+    kept = np.zeros_like(covered)
+    kept[np.arange(rows)[:, None], context] = True
+    assert not (kept & covered).any()
+    # Among rows leaving the same number of tokens free, every free position
+    # is kept at the rate num_context / free, wherever the blocks fell.
+    free = (~covered).sum(axis=1)
+    size = np.bincount(free).argmax()
+    same = free == size
+    chance = mask.num_context / size
+    offered, taken = (~covered[same]).sum(axis=0), kept[same].sum(axis=0)
+    seen = offered > 0
+    statistic = np.sum((taken - offered * chance)[seen] ** 2 / (offered * chance * (1 - chance))[seen])
+    assert stats.chi2.sf(statistic, seen.sum() - 1) > 1e-6, "the context favours some free positions"
 
 
 @pytest.mark.parametrize("scan_order", ["raster", "hilbert", "zigzag"])
