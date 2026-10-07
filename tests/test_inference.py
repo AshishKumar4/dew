@@ -335,32 +335,6 @@ def test_an_unconditional_unet_takes_a_step():
     assert leaves and all(np.all(np.isfinite(np.asarray(leaf))) for leaf in leaves)
 
 
-def test_joint_stream_models_refuse_an_unconditional_run():
-    """SimpleMMDiT and HierarchicalMMDiT run the text as a second stream
-    through every block's joint attention, so with no text there is no
-    sequence to project; `build` raises a ValueError naming the architecture
-    before the first attention softmax over an empty slice."""
-    from dew.config import ModelConfig
-
-    base = DiffusionRunConfig(text=None)
-    for architecture in ("simple_mmdit", "hierarchical_mmdit"):
-        config = dataclasses.replace(base, model=ModelConfig(architecture, {}))
-        with pytest.raises(ValueError, match="unconditional"):
-            config.build()
-
-
-def test_a_discrete_preset_is_refused_by_the_gaussian_objective():
-    """`preset:mdlm` is one subcommand away on the diffusion recipe, and its
-    process has no schedule the Gaussian objective can corrupt with, so the
-    config names the preset and the objective that trains it instead of
-    failing inside the loss."""
-    from dew.diffusion.discrete import MDLM
-
-    config = dataclasses.replace(DiffusionRunConfig(text=None), preset=MDLM(mask_id=0))
-    with pytest.raises(ValueError, match=r"mdlm.*--objective masked_diffusion"):
-        config.build()
-
-
 def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: the
     factories read that grid there, and an image-only metric raises a
@@ -735,6 +709,20 @@ def test_every_saved_text_kind_constructs_through_its_own_task_class(
     np.testing.assert_array_equal(drawn.host().tokens, expected.host().tokens)
     assert direct.decode(drawn) == front.decode(expected)
     assert all(isinstance(row, str) for row in direct.decode(drawn))
+
+
+def test_a_causal_language_model_run_loads_as_neither_a_block_nor_a_masked_task(tmp_path):
+    """A task loads a run's model by what the task runs on it, and names
+    what is missing: a causal language model has no canvas to refine or
+    clean tokens to commit (`BlockDenoiser`), and none of its positions
+    reads the masked ones after it (`TokenModel`)."""
+    from dew.inference import tasks
+
+    make_lm_run(tmp_path)
+    with pytest.raises(TypeError, match=r"block denoiser \(BlockDenoiser\).* has no canvas_length, encode"):
+        tasks.BlockGeneration.from_run(str(tmp_path))
+    with pytest.raises(ValueError, match="bidirectional model, and this CausalTransformer is causal"):
+        tasks.MaskedGeneration.from_run(str(tmp_path))
 
 
 @pytest.mark.parametrize("kind", ["jepa", "unregistered"])

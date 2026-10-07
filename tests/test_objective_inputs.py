@@ -93,9 +93,10 @@ def with_teacher(kind):
     built = {
         "ladd": lambda: AdversarialDistillationObjective(
             *shared, AdversarialDistillation(feature_layers=("dit_block_0",), cmap_dim=4, kernel_size=(1, 1)),
-            teacher=teacher, guidance=None, steps=2),
-        "rcm": lambda: ConsistencyDistillationObjective(*shared, ConsistencyDistillation(), teacher=teacher,
-                                                        guidance=None, steps=2),
+            teacher=base.model, teacher_variables=teacher, guidance=None, steps=2),
+        "rcm": lambda: ConsistencyDistillationObjective(
+            *shared, ConsistencyDistillation(), teacher=base.model, teacher_variables=teacher, guidance=None,
+            steps=2),
         "guidance_distillation": lambda: GuidanceDistillationObjective(
             *shared, teacher=base, teacher_variables=drawn, steps=2),
     }[kind]()

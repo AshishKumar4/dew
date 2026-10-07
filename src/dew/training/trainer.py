@@ -38,9 +38,8 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew.checkpoints import Checkpoints, Ranking
 from dew.coordination import agree_process_phase, agreed
 from dew.data.dataset import Checkpointable, Closeable, DataPartition, Dataset, RampedStream, Reader, rows_of
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import REMAT_POLICIES, RematPolicy
 from dew.nn.kernels.generation import device_generation
+from dew.nn.protocols import Recomputing, TritonGemm
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -276,8 +275,8 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
 
     Only an LM objective gives the tokens per row, its `seq_len`, so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
-    `TRITON_GEMM_OFF_GENERATIONS` measured a win and no mixer of the model needs
-    them.
+    `TRITON_GEMM_OFF_GENERATIONS` measured a win and no module the step runs
+    keeps them (`TritonGemm`).
     """
     generation = device_generation()
     options: dict[str, bool | int] = {}
@@ -285,9 +284,10 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
     if (generation.startswith('sm') and xla_flag('xla_gpu_dot_merger_threshold_mb') is None
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
-    model = _model_of(objective)
+    modules = [entry.module for entry in objective.program_key()]
     if (generation in TRITON_GEMM_OFF_GENERATIONS and xla_flag('xla_gpu_enable_triton_gemm') is None
-            and model is not None and not _keeps_triton_gemm(model)):
+            and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
+                                    for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
     return options or None
 
@@ -348,14 +348,6 @@ def _split_share(params: Variables) -> float:
     return split / total if total else 0.0
 
 
-def _model_of(objective: Objective[Loss, Effects]) -> nn.Module | None:
-    """The one module an objective trains, or None. `Objective` declares no
-    model, since some train none (JEPA's pair, the RL actors' wrappers), so
-    the trainer reads it at this boundary: LM, diffusion and masked
-    objectives name theirs `model`."""
-    return getattr(objective, 'model', None)
-
-
 def _device_tokens(objective: Objective[Loss, Effects], batch: Batch, shards: int) -> float:
     """The tokens one device steps of `batch`, split over `shards` row shards,
     or infinity. An `Objective` declares no tokens in a row, since images and
@@ -383,64 +375,45 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
     }
 
 
-def _keeps_triton_gemm(model: nn.Module) -> bool:
-    """Whether a mixer of the model keeps XLA's Triton GEMM fusions
-    (`MixerBase.keeps_triton_gemm`). Any flax module arrives here, so its
-    mixer fields are read at this boundary: a decoder names its mixer and its
-    layer kinds', and a model without them keeps no mixer."""
-    mixers = [getattr(model, 'mixer', None)]
-    mixers += [kind.mixer for kind in (getattr(model, 'kinds', None) or {}).values()]
-    return any(getattr(mixer, 'keeps_triton_gemm', False) for mixer in mixers)
-
-
-def climb_to(objective, rung: Mapping[str, object]) -> None:
+def climb_to(objective: Objective[Loss, Effects], rung: Mapping[str, object]) -> None:
     """Move `objective` up to the head tile and remat recorded in a checkpoint's `rung` (`Trainer._rung`).
 
-    Each setting is raised only where it is below the recorded one. This takes the
-    ladder `recompute_more` climbs in one move.
+    Each setting is raised only where it is below the recorded one
+    (`Recomputing.restore_recompute`). This takes the ladder `recompute_more`
+    climbs in one move.
     """
     tile = rung.get('head_tile')
     if tile is not None and _head_tile_of(objective) is None:
         rows, columns = integers(tile, 'rung head_tile')
         objective.tile_head((rows, columns))
-    model = _model_of(objective)
-    current = _remat_of(model)
-    ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
-              else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
-    records = [remat_record(remat) for remat in ladder]
-    here, there = (
-        remat_record("dots" if current is True else current),
-        json_value(rung.get("remat"), "rung remat"),
-    )
-    if (
-        model is not None
-        and here in records
-        and there in records
-        and records.index(there) > records.index(here)
-    ):
-        objective.model = model.clone(remat=ladder[records.index(there)])
+    entries = objective.program_key()
+    trained = [index for index, entry in enumerate(entries) if entry.trained]
+    recorded = json_value(rung.get("remat"), "rung remat")
+    # One trained module records its rung alone, several a list in program order.
+    records = [recorded] if len(trained) == 1 else recorded if isinstance(recorded, list) else []
+    rungs = dict(zip(trained, records, strict=False))
+    modules = [entry.module.restore_recompute(rungs[index])
+               if index in rungs and isinstance(entry.module, Recomputing) else entry.module
+               for index, entry in enumerate(entries)]
+    if any(module is not entry.module for module, entry in zip(modules, entries, strict=True)):
+        objective.substitute(modules)
 
 
 def _head_tile_of(objective: Objective[Loss, Effects]) -> tuple[int, int] | None:
-    """The tile an objective's head computes its backward in, read at the
-    boundary with any objective: an LM objective's `head_tile`, and None for
-    a head that keeps its whole logits or an objective with no head."""
-    return getattr(objective, 'head_tile', None)
+    """The tile the objective's vocabulary head computes its backward in
+    (`ProgramModule.head_tile`), or None for a head that keeps its whole
+    logits or an objective with no head."""
+    return next((entry.head_tile for entry in objective.program_key() if entry.head_tile is not None), None)
 
 
-def _remat_of(model: nn.Module | None) -> RematPolicy | bool | str | None:
-    """The model's remat setting, read at the boundary with any flax module:
-    a decoder's `RematPolicy`, a diffusion backbone's bool or name, and
-    None for a model with no remat field."""
-    return getattr(model, 'remat', None)
-
-
-# What a model recomputes in its backward pass when its step does not fit,
-# weakest first; each rung is slower and holds less (docs/performance.md).
-# A model's own remat is where it starts: the trainer moves it up one rung at
-# a time until the compiled step fits, never past a policy the ladder names.
-DECODER_REMAT = (None, REMAT_POLICIES['minimal'], REMAT_POLICIES['full'])
-DIFFUSION_REMAT = (False, 'dots', 'full')
+def recompute_record(objective: Objective[Loss, Effects]) -> JSON:
+    """What the modules the objective trains recompute in their backward
+    pass, as a checkpoint records it (`Recomputing.recompute_record`): one
+    module's record, a list of several in program order, None for a module
+    that does not say and for an objective that trains none."""
+    records = [entry.module.recompute_record() if isinstance(entry.module, Recomputing) else None
+               for entry in objective.program_key() if entry.trained]
+    return records[0] if len(records) == 1 else records or None
 
 
 def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int = 0) -> int | None:
@@ -543,18 +516,6 @@ def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0)
     return fits_everywhere(-1 if executable is None else step_headroom(executable, local, held=held))
 
 
-def remat_record(remat: RematPolicy | bool | str | None) -> JSON:
-    """Return a model's remat as a record stores it.
-
-    That is a policy's name in `REMAT_POLICIES` if it has one, and its two lists
-    otherwise.
-    """
-    if isinstance(remat, RematPolicy):
-        names = [name for name, policy in REMAT_POLICIES.items() if policy == remat]
-        return names[0] if names else {'save': list(remat.save), 'offload': list(remat.offload)}
-    return remat
-
-
 def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
     """Refuse parameters stored in float64 or complex128 on a TPU mesh.
 
@@ -578,12 +539,13 @@ def refuse_wide_floats(state: TrainState, mesh: Mesh) -> None:
             "nextafter. Store the parameters in float32 on a TPU, or train them on a CPU or a GPU.")
 
 
-def recompute_more(objective) -> bool:
+def recompute_more(objective: Objective[Loss, Effects]) -> bool:
     """Move the objective one rung up its ladder, and return whether there was a rung to move to.
 
     A head that keeps its whole logits for the backward pass moves to the
-    generation's tile first (`LMObjective.head_tile`); after that, the model's
-    remat goes up.
+    generation's tile first (`LMObjective.head_tile`); after that, each
+    module the objective trains recomputes one rung more where its own
+    ladder goes on (`Recomputing.recompute_more`).
     """
     moved = objective.tile_head()
     if moved is not None:
@@ -591,22 +553,16 @@ def recompute_more(objective) -> bool:
             "the step does not fit the devices with the whole logits kept; compiling it again with %s", moved
         )
         return True
-    model = _model_of(objective)
-    if model is None:
+    entries = objective.program_key()
+    stronger = [entry.module.recompute_more() if entry.trained and isinstance(entry.module, Recomputing)
+                else None for entry in entries]
+    if all(module is None for module in stronger):
         return False
-    # A decoder always has a remat field; any other model climbs only a
-    # bool or named policy, so a missing field and None both stay put.
-    current = _remat_of(model)
-    ladder = (DECODER_REMAT if isinstance(model, CausalTransformer)
-              else DIFFUSION_REMAT if isinstance(current, bool | str) else ())
-    current = 'dots' if current is True else current
-    if current not in ladder[:-1]:
-        return False
-    stronger = ladder[ladder.index(current) + 1]
-    _log.warning(
-        "the step does not fit the devices under remat %r; compiling it again under %r", current, stronger
-    )
-    objective.model = model.clone(remat=stronger)
+    current = recompute_record(objective)
+    objective.substitute([entry.module if module is None else module
+                          for module, entry in zip(stronger, entries, strict=True)])
+    _log.warning("the step does not fit the devices under remat %r; compiling it again under %r",
+                 current, recompute_record(objective))
     return True
 
 
@@ -1054,12 +1010,12 @@ class Trainer(Generic[Loss, Effects]):
 
     def _rung(self) -> JSON:
         """The fit ladder's rung this trainer's step compiles at: the
-        objective's head tile, its model's remat (`remat_record`) and whether
+        objective's head tile, its trained modules' remat (`recompute_record`) and whether
         the step keeps XLA's default options (`fitting_default`). A
         checkpoint records it, since each decides the program a step runs."""
         tile = _head_tile_of(self.objective)
         return {'head_tile': None if tile is None else list(tile),
-                'remat': remat_record(_remat_of(_model_of(self.objective))),
+                'remat': recompute_record(self.objective),
                 'xla_defaults': self._xla_defaults}
 
     def _climb_to(self, rung: JSON) -> None:
@@ -1716,15 +1672,15 @@ class Trainer(Generic[Loss, Effects]):
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
-        model = _model_of(self.objective)
+        trained = [entry.module for entry in self.objective.program_key() if entry.trained]
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
-        compute = getattr(model, "dtype", None)
+        compute = getattr(trained[0], "dtype", None) if trained else None
         precision = "/".join(stored)
         if compute is not None and [str(jnp.dtype(compute))] != stored:
             precision += f" parameters, {jnp.dtype(compute)} compute"
         shown = {**TRAINER_SHOWN, **self.objective.shown, **_reported(self.rollout, plan.metrics)}
         agreed("training announcement", functools.partial(
-            self._display.start, started, model=type(self.objective if model is None else model).__name__,
+            self._display.start, started, model=type(trained[0] if trained else self.objective).__name__,
             batch=plan.dataset.batch, precision=precision, shown=shown,
             averaged=self.objective.ema is not None and not self.objective._ema_is_reference))
         return False
@@ -2228,10 +2184,9 @@ class Trainer(Generic[Loss, Effects]):
             with region("compile"):
                 compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
             seconds = time.perf_counter() - began
-            remat = _remat_of(_model_of(self.objective))
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
-            self._report(StepCompiled(seconds, remat_record(remat), links), int(state.step))
+            self._report(StepCompiled(seconds, recompute_record(self.objective), links), int(state.step))
         return compiled[shapes]
 
     def _saved_checkpoint(

@@ -14,15 +14,14 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
-from typing import Generic
+from typing import Generic, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import struct
-from typing_extensions import TypeVar
+from flax import linen as nn, struct
+from typing_extensions import TypeVar, get_protocol_members
 
-from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs, Request, continuation_keys, local_rows, mesh_of, prompt_major
 from dew.objectives.base import Variables
 
@@ -70,6 +69,47 @@ class CanvasGeneration(Generic[ArrayT]):
             raise ValueError("this generation has no prompt width")
         rows = self.host()
         return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
+
+
+@runtime_checkable
+class BlockDenoiser(Protocol):
+    """A diffusion language model that `BlockProcess` generates with, as
+    DiffusionGemma is: the operations a canvas request runs on it.
+
+    `init_cache` allocates `batch_size` rows of a prefix cache, and `encode`
+    appends clean tokens to it: a prompt, with its `ModelInputs` fields, or
+    a committed canvas. Calling the model refines a `canvas_length` canvas
+    against that frozen cache and returns its `[B, canvas_length,
+    vocab_size]` logits, self-conditioned on the previous step's
+    (`self_conditioning_logits`, a zero signal in rows whose
+    `self_conditioning_mask` is false). `max_seq_len` bounds the prompt and
+    its canvases. A causal language model scores tokens too, but runs none
+    of these, so it is not one.
+    """
+
+    @property
+    def canvas_length(self) -> int: ...
+
+    @property
+    def vocab_size(self) -> int: ...
+
+    @property
+    def max_seq_len(self) -> int: ...
+
+    def init_cache(self, batch_size: int) -> None: ...
+
+    def encode(self, tokens: jax.Array) -> jax.Array: ...
+
+    def __call__(self, tokens: jax.Array, *, self_conditioning_logits: jax.Array | None = None,
+                 self_conditioning_mask: jax.Array | None = None) -> jax.Array: ...
+
+
+def refuse_non_denoiser(model: nn.Module) -> None:
+    """Raise TypeError naming the `BlockDenoiser` operations `model` lacks, if it lacks any."""
+    if not isinstance(model, BlockDenoiser):
+        missing = sorted(name for name in get_protocol_members(BlockDenoiser) if not hasattr(model, name))
+        raise TypeError(f"block generation runs a block denoiser (BlockDenoiser), and this "
+                        f"{type(model).__name__} has no {', '.join(missing)}")
 
 
 @struct.dataclass
@@ -163,7 +203,7 @@ class BlockProcess:
         return jnp.where(mask, accepted, self.noise(key, jnp.shape(accepted)))
 
     @partial(jax.jit, static_argnames=("self", "model", "batch"))
-    def refine(self, model: DiffusionGemma, variables: Variables, cache: Variables,
+    def refine(self, model: nn.Module, variables: Variables, cache: Variables,
                key: jax.Array, batch: int, finished: jax.Array) -> CanvasState:
         """Refines one canvas without updating its prefix cache."""
         shape = (batch, self.canvas_length)
@@ -204,7 +244,7 @@ class BlockProcess:
         return jax.lax.fori_loop(0, self.max_steps, step, initial)
 
 
-    def generate(self, model: DiffusionGemma, variables: Variables,
+    def generate(self, model: nn.Module, variables: Variables,
                  inputs: ModelInputs | jax.typing.ArrayLike | Sequence[Sequence[int]],
                  max_new_tokens: int, *, key: int | jax.Array | None = None,
                  n: int = 1, eos_token_ids: tuple[int, ...] = (), pad_token_id: int = 0) -> CanvasGeneration:
@@ -288,9 +328,10 @@ def through_eos(tokens: jax.Array, available: jax.typing.ArrayLike, eos_ids: tup
     return kept, lengths, jnp.any(is_eos, axis=-1)
 
 
-def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs, max_new_tokens: int,
+def _validated(model: nn.Module, process: BlockProcess, inputs: ModelInputs, max_new_tokens: int,
                eos_token_ids: tuple[int, ...], pad_token_id: int, n: int) -> None:
     """Raises for whatever a rank can get wrong before the compiled loop."""
+    refuse_non_denoiser(model)
     if type(max_new_tokens) is not int or max_new_tokens < 0:
         raise ValueError("max_new_tokens must be a nonnegative integer")
     if type(n) is not int or n < 1:
@@ -309,7 +350,7 @@ def _validated(model: DiffusionGemma, process: BlockProcess, inputs: ModelInputs
         raise ValueError("prompt plus rounded-up canvases exceeds max_seq_len")
 
 
-def _begin(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
+def _begin(model: nn.Module, variables: Variables, inputs: ModelInputs,
            plan: CanvasPlan) -> CanvasDecodeState:
     """The deterministic prefill state: the encoded prompt and an empty result."""
     batch, prompt_length = inputs.tokens.shape
@@ -329,7 +370,7 @@ def _begin(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
     return CanvasDecodeState(cache, generation, jnp.asarray(0, jnp.int32))
 
 
-def _advance(model: DiffusionGemma, variables: Variables, state: CanvasDecodeState,
+def _advance(model: nn.Module, variables: Variables, state: CanvasDecodeState,
              key: jax.Array, plan: CanvasPlan) -> CanvasDecodeState:
     cache, generation, index = state.cache, state.result, state.index
     process, length = plan.process, plan.process.canvas_length
@@ -361,7 +402,7 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
     return replace(state.result, tokens=state.result.tokens[:, :prompt_length + max_new_tokens])
 
 
-def _generate(model: DiffusionGemma, variables: Variables, inputs: ModelInputs,
+def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
               key: jax.Array, plan: CanvasPlan, n: int) -> CanvasGeneration:
     initial = _begin(model, variables, inputs, plan)
     prompt_length = inputs.tokens.shape[1]

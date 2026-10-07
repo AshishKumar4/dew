@@ -31,57 +31,22 @@ from .sessions import (
 type Reward = Callable[[str, str, str, str], float]
 """A function that scores `(data_source, completion, ground_truth, extra_info)` and returns the reward."""
 
-def _texts(rows: np.ndarray) -> list[str]:
-    """Decode fixed-width UTF-8 byte rows stored as int32."""
-    return [bytes(row[row != 0].astype(np.uint8)).decode("utf-8")
-            for row in np.asarray(rows, np.int32)]
-
-
 def prompt_rows(batch) -> tuple[np.ndarray, np.ndarray, list[str], list[str], list[str]]:
     """Read one host prompt batch: left-padded ids, lengths and the three reward strings.
 
-    Every row needs a length between one and the width.
+    Every row needs a length between one and the width. The strings arrive
+    as fixed-width UTF-8 byte rows stored as int32.
     """
     prompts = local_rows(batch[PROMPT_KEY])
     prompt_lengths = local_rows(batch[LENGTH_KEY])
-    sources, truths, infos = (_texts(local_rows(batch[name])) for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
+    sources, truths, infos = ([bytes(row[row != 0].astype(np.uint8)).decode("utf-8")
+                               for row in np.asarray(local_rows(batch[name]), np.int32)]
+                              for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY))
     rows, width = prompts.shape
     if (prompt_lengths.shape != (rows,) or not np.issubdtype(prompt_lengths.dtype, np.integer)
             or np.any(prompt_lengths < 1) or np.any(prompt_lengths > width)):
         raise ValueError("prompt_length must contain one valid integer length per row")
     return prompts, prompt_lengths, sources, truths, infos
-
-
-def completion_rows(prompts: np.ndarray, prompt_lengths: np.ndarray, sampled: np.ndarray,
-                    lengths: np.ndarray, terminated: np.ndarray, behavior: np.ndarray,
-                    rewards: np.ndarray, versions: np.ndarray, estimator: str,
-                    truncation: str) -> dict[str, np.ndarray]:
-    """Pack `[rows, groups, ...]` completions as one-call sessions through `pack`.
-
-    `prompts` is `[rows, width]` left-padded ids with `prompt_lengths` real
-    tokens each; `sampled` and `behavior` are `[rows, groups, R]` with
-    `lengths` valid actions per draw, `terminated` whether each stopped at
-    EOS; `rewards` and `versions` are `[rows, groups]`. Each prompt's group
-    is advantaged by the `estimator` family. A draw that did not stop at EOS
-    is TRUNCATED, as `PromptSource` records it, and `truncation` decides
-    whether it trains. The batch is `rows * groups` rows
-    of `width + R` ids, the packed layout every GRPO batch has; session
-    `row * groups + group` is that draw, which is what `sampled_values`
-    hands its callback.
-    """
-    rows, groups, budget = sampled.shape
-    width = prompts.shape[1]
-    sessions = []
-    for row in range(rows):
-        prompt = tuple(int(token) for token in prompts[row, width - int(prompt_lengths[row]):])
-        for group in range(groups):
-            count = int(lengths[row, group])
-            call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
-                        tuple(float(value) for value in behavior[row, group, :count]),
-                        "stop" if bool(terminated[row, group]) else "length", int(versions[row, group]))
-            status = Status.COMPLETED if bool(terminated[row, group]) else Status.TRUNCATED
-            sessions.append(Session(str(row), "", group, 0, (call,), status, float(rewards[row, group])))
-    return pack(sessions, width + budget, rows=rows * groups, estimator=estimator, truncation=truncation)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -176,9 +141,20 @@ class SampledRollout:
                          :int(lengths[row, group]) - int(terminated[row, group])].tolist()),
                          truths[row], infos[row]) for group in range(self.groups)]
             for row in range(rows)], np.float32)
-        versions = np.full((rows, self.groups), int(state.updates), np.int32)
-        packed = completion_rows(prompts, prompt_lengths, sampled, lengths, terminated, behavior,
-                                    rewards, versions, self.estimator, self.truncation)
+        sessions, version = [], int(state.updates)
+        for row in range(rows):
+            prompt = tuple(int(token) for token in prompts[row, width - int(prompt_lengths[row]):])
+            for group in range(self.groups):
+                count, stopped = int(lengths[row, group]), bool(terminated[row, group])
+                call = Call(prompt, tuple(int(token) for token in sampled[row, group, :count]),
+                            tuple(float(value) for value in behavior[row, group, :count]),
+                            "stop" if stopped else "length", version)
+                sessions.append(Session(str(row), "", group, 0, (call,),
+                                        Status.COMPLETED if stopped else Status.TRUNCATED,
+                                        float(rewards[row, group])))
+        # Session `row * groups + group` is that draw, which is what `sampled_values` hands its callback.
+        packed = pack(sessions, width + sampled.shape[2], rows=rows * self.groups,
+                      estimator=self.estimator, truncation=self.truncation)
         packed[OLD_LOG_PROBS_KEY] = sampled_values(
             packed, lambda index, _: raw[index // self.groups, index % self.groups,
                                          :int(lengths[index // self.groups, index % self.groups])].tolist())

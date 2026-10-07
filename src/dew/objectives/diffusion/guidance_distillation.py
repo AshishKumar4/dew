@@ -23,7 +23,7 @@ from flax import linen as nn
 from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, ProgramModule, Step, Variables
 from dew.registry import objectives, trainings
@@ -74,7 +74,7 @@ class GuidanceDistillation(Training):
             raise ValueError("guidance distillation distills a teacher; name its run directory")
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None,
+                  base: nn.Module, autoencoder: AutoEncoder | None,
                   variables: Variables | None) -> GuidanceDistillationObjective:
         """Return the student objective over the teacher run's objective and its variables.
 
@@ -118,7 +118,6 @@ class GuidanceDistillationObjective(DiffusionObjective):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "
                              "two share the process's schedule and prediction")
         _own_loss("guidance distillation", kwargs)
-        kwargs.setdefault("guidance", None)
         super().__init__(model, process, inputs, **kwargs)
         if teacher.latent_shape != self.latent_shape:
             raise ValueError(f"the teacher denoises {teacher.latent_shape} and the student "
@@ -133,23 +132,15 @@ class GuidanceDistillationObjective(DiffusionObjective):
                 *(program._replace(trained=False) for program in self.teacher.program_key()))
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
-        count = len(super().program_key())
-        super().substitute(modules[:count])
-        self.teacher.substitute(modules[count:])
+        self.model, *teacher = modules
+        self.teacher.substitute(teacher)
 
     def held_variables(self) -> Variables:
         return {**super().held_variables(), TEACHER: self.teacher_variables}
 
-    def init(self, key, variables: Variables | None = None) -> Variables:
-        state = dict(super().init(key, variables))
-        state.setdefault(TEACHER, self.teacher_variables)
-        return state
-
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         low, high = self.scales
         scale = jax.random.uniform(scale_key, (count,), minval=low, maxval=high)

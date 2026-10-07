@@ -108,6 +108,18 @@ def _biased_logits(logits, bias):
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
 
 
+def model_logits(model, variables, hidden) -> jax.Array:
+    """`model`'s logits of its final states `hidden` over `variables`: the
+    matrix `AffineHead.output_table` gives, contracted as the chunked head
+    contracts it (`head_logits`), or the model's exact head
+    (`LogitsFromHidden`) where no matrix alone is the head."""
+    table = model.apply(variables, method="output_table")
+    if table is None:
+        return model.apply(variables, hidden, method="logits_from_hidden")
+    return head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
+                       vocab_major=table.vocab_major, bias=table.bias)
+
+
 def head_logits(hidden, head_weight, *, softcap: float | None,
                 precision: PrecisionLike, vocab_major: bool = False,
                 temperature: float = 1.0, bias=None) -> jax.Array:
@@ -607,6 +619,31 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                          predict=predict)
 
 
+def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
+                       tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
+                       temperature: float = 1.0, excluded: int | None = None):
+    """`chunked_cross_entropy` of `hidden` against `model`'s head over `variables`.
+
+    The head is the matrix `AffineHead.output_table` gives, its bias,
+    softcap and precision included. Where no matrix alone is the head (a
+    prediction head past the final states, an adapter's factors on it), the
+    model's exact logits (`LogitsFromHidden`) are scored whole: that holds
+    the fp32 `[..., vocab]` logits for the backward pass, a vocabulary-sized
+    row per token, which the tiled head never does.
+    """
+    table = model.apply(variables, method="output_table")
+    if table is not None:
+        return chunked_cross_entropy(
+            hidden, table.matrix, targets, chunks, softcap=table.softcap, precision=table.precision,
+            tile=tile, vocab_major=table.vocab_major, predict=predict, temperature=temperature,
+            excluded=excluded, bias=table.bias)
+    logits = model.apply(variables, hidden, method="logits_from_hidden").astype(jnp.float32) / temperature
+    logits = _without(logits, 0, None if excluded is None else jnp.asarray(excluded, jnp.int32))
+    log_z = jax.nn.logsumexp(logits, axis=-1)
+    picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
+    return log_z - picked, jnp.argmax(logits, axis=-1) if predict else None, log_z
+
+
 def _sharded_head(mesh, hidden, table, targets, excluded, cap, bias, head, column_logits, *, predict: bool):
     """`head` on a mesh: each device scores its own tokens in a `shard_map`,
     against the head's own columns where they stay split (`_vocabulary_split`)
@@ -717,7 +754,7 @@ SUPPORT_BLOCK = 1 << 15
 
 def support_log_probs(hidden, head_weight, targets, support_ids, support_columns, *,
                       temperature: float = 1.0, softcap: float | None = None,
-                      precision: PrecisionLike = None, bias=None):
+                      precision: PrecisionLike = None, vocab_major: bool = False, bias=None):
     """Each target's log-probability renormalized over its recorded sampling support.
 
     Keep-sampling-mask (DeepSeek-V3.2 section 3.1; slime 5bae5bb `loss.py`
@@ -731,11 +768,13 @@ def support_log_probs(hidden, head_weight, targets, support_ids, support_columns
     row's kept ids back to back and `support_columns` `[B, C]` the column of
     the target each belongs to, both -1 on padding, so the arrays shard with
     their rows. Only those columns of the head are scored, `SUPPORT_BLOCK`
-    entries at a time and rematerialized in the backward pass. Returns the log-probs,
-    `-inf` for a target outside its support, and whether each target had one;
-    a target with none scores 0.0 here.
+    entries at a time and rematerialized in the backward pass. `head_weight`
+    is `[features, vocab]`, or `[vocab, features]` with `vocab_major`, as in
+    `chunked_cross_entropy`. Returns the log-probs, `-inf` for a target
+    outside its support, and whether each target had one; a target with none
+    scores 0.0 here.
     """
-    table = jnp.asarray(head_weight).T
+    table = jnp.asarray(head_weight) if vocab_major else jnp.asarray(head_weight).T
     width = targets.shape[1]
     kept = support_ids.shape[1]
     block = max(1, min(kept, SUPPORT_BLOCK // targets.shape[0]))

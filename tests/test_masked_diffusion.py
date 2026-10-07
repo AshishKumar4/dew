@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax import linen as nn
 from model_support import flat_tree
 
 from dew.checkpoints import Checkpoints
@@ -27,6 +28,7 @@ from dew.inference import RunProcessor, pipeline
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import BATCH_AXES, ModelInputs
+from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.registry import models, with_precision
@@ -57,6 +59,39 @@ def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     # The same 1e-5 relative loss contract as the bias-free chunked head.
     assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
     np.testing.assert_array_equal(predicted, logits.argmax(-1))
+
+
+class _MediaReader(nn.Module):
+    """A bidirectional model whose every state reads how many media slots its row holds."""
+
+    causal = False
+    mask_token_id = None
+
+    @nn.compact
+    def hidden_states(self, tokens, train=False, image_indices=None):
+        media = jnp.zeros(tokens.shape) if image_indices is None else (image_indices >= 0) * 1.0
+        return nn.Embed(32, 8)(tokens) + media.sum(-1)[:, None, None] * self.param("media", nn.zeros, (8,))
+
+    def output_table(self):
+        return OutputTable(self.variables["params"]["Embed_0"]["embedding"], vocab_major=True)
+
+    def __call__(self, tokens, **fields):
+        return self.hidden_states(tokens, **fields)
+
+
+def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
+    tokens = jnp.tile(jnp.arange(1, 9, dtype=jnp.int32), (8, 1))
+    slots = jnp.where(jnp.arange(8) < 2, jnp.arange(8), -1) * jnp.ones((8, 1), jnp.int32)
+    objective = MaskedDiffusionObjective(_MediaReader(), MDLM(mask_id=31)(), seq_len=8, ema_decay=None)
+    params = objective.init(jax.random.key(0))
+    params["params"]["media"] = jnp.ones(8)
+    media = {"text": ModelInputs(tokens, {"image_indices": slots})}
+    _, losses, _, counted, _, real = objective._token_losses(params, media, jax.random.key(1), train=False)
+    plain = objective._token_losses(params, {"text": tokens}, jax.random.key(1), train=False)[1]
+
+    np.testing.assert_array_equal(real, slots < 0)
+    assert not counted[:, :2].any() and counted[:, 2:].any()
+    assert not np.allclose(losses[:, 2:], plain[:, 2:])
 
 
 def loaded(name: str):
@@ -338,14 +373,9 @@ def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_
         np.testing.assert_array_equal(left, right)
 
 
-def test_masked_task_refuses_media_and_non_scalar_logical_positions(masked_source):
+def test_masked_task_refuses_non_scalar_logical_positions(masked_source):
     source, inputs = masked_source
     task = source.text_generation()
-    with pytest.raises(ValueError, match="conditioning"):
-        task(replace(inputs, conditioning={"pixel_values": jnp.zeros((3, 1, 3, 4, 4))}), 8, key=7)
-    for name in ("image_indices", "image_groups", "audio_indices"):
-        with pytest.raises(ValueError, match=name):
-            task(replace(inputs, token_fields={**inputs.token_fields, name: jnp.full((3, 4), -1)}), 8, key=7)
     with pytest.raises(ValueError, match="positions"):
         task(
             replace(inputs, token_fields={**inputs.token_fields, "positions": jnp.zeros((3, 4, 3))}), 8, key=7

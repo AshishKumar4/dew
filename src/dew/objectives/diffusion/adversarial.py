@@ -33,10 +33,10 @@ from dew.diffusion.presets import Flow
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
-from dew.inputs import InputSpec, unit_range
+from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.dit import TextContext, masked_mean
-from dew.objectives.base import Aux, Batch, Objective, Step, Variables
+from dew.objectives.base import Aux, Batch, Objective, ProgramModule, Step, Variables
 from dew.registry import objectives, trainings
 from dew.sampling.solvers import Consistency
 
@@ -46,7 +46,8 @@ from .objective import (
     TEACHER,
     DiffusionObjective,
     Training,
-    _unadapted,
+    _from_teacher,
+    _own_loss,
     teacher_variables,
 )
 
@@ -222,8 +223,8 @@ class AdversarialDistillation(Training):
     the fields, and `feature_layers` must name at least one layer.
 
     `teacher` is the teacher run's directory, which a run loads; a run without one
-    is refused. The teacher's model is this run's `model`. An objective built in
-    code is given the teacher's weights directly.
+    is refused. The teacher's model is this run's `model` without the run's adapter.
+    An objective built in code is given the teacher's model and weights directly.
     """
 
     preset_class = Flow
@@ -254,24 +255,25 @@ class AdversarialDistillation(Training):
             raise ValueError("adversarial distillation distills a teacher; name its run directory")
 
     def objective(self, run: DiffusionRunConfig, model: nn.Module, process: Process, inputs: InputSpec, *,
-                  autoencoder: AutoEncoder | None,
+                  base: nn.Module, autoencoder: AutoEncoder | None,
                   variables: Variables | None) -> AdversarialDistillationObjective:
         return AdversarialDistillationObjective(
-            model, process, inputs, self, teacher=teacher_variables(self.teacher, variables),
-            autoencoder=autoencoder, variables=variables, unconditional_prob=run.unconditional_prob,
-            ema_decay=run.ema_decay, solver=run.solver, guidance=None, steps=run.sampling_steps)
+            model, process, inputs, self, teacher=base,
+            teacher_variables=teacher_variables(self.teacher, variables), autoencoder=autoencoder,
+            variables=variables, unconditional_prob=run.unconditional_prob, ema_decay=run.ema_decay,
+            solver=run.solver, guidance=None, steps=run.sampling_steps)
 
 
 @objectives("ladd")
 class AdversarialDistillationObjective(DiffusionObjective):
     """Trains LADD, with ADD's R1 penalty and its distillation term.
 
-    `teacher` is the teacher model's variables, frozen under `TEACHER`. The
-    student starts from them, and a `Head` reads the teacher's token grid
-    after each layer in `feature_layers`. The student's time is drawn from
-    `student_times`, and the renoising level from LADD's logit-normal with
-    `renoise_times` (mean 1, std 1, the high-noise setting the paper uses for
-    images).
+    `teacher` is the teacher's model and `teacher_variables` its variables,
+    frozen under `TEACHER`. The student starts from them, and a `Head` reads
+    the teacher's token grid after each layer in `feature_layers`. The
+    student's time is drawn from `student_times`, and the renoising level
+    from LADD's logit-normal with `renoise_times` (mean 1, std 1, the
+    high-noise setting the paper uses for images).
 
     The discriminator and the student train in the same step, each through
     its own loss with the other stopped. StyleGAN-T, whose heads these are,
@@ -287,48 +289,46 @@ class AdversarialDistillationObjective(DiffusionObjective):
     over the sample. LADD itself drops that term when it trains on synthetic
     data, and on CIFAR-10 at 32 pixels the term at 2.5 dominated and the
     student did better without it. Sampling runs `Consistency`.
-
-    The teacher runs through the student's model, so a LoRA-adapted student,
-    whose model asks every tree for its factors, is refused.
     """
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec,
-                 distillation: AdversarialDistillation, *, teacher: Variables, time_features: int = 256,
-                 **kwargs):
+                 distillation: AdversarialDistillation, *, teacher: nn.Module, teacher_variables: Variables,
+                 time_features: int = 256, **kwargs):
         schedule = process.schedule
         if not (isinstance(schedule, FlowMatchingScheduler) and not process.interval
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError("LADD distills a velocity model on the linear path; build the process with "
                              "presets.Flow()")
-        unused = sorted(key for key in ("uncertainty", "alignment", "end_to_end")
-                        if kwargs.get(key) is not None)
-        if unused:
-            raise ValueError(f"LADD trains on its own losses, which read none of {unused}")
-        _unadapted("LADD", model, "teacher")
-        kwargs.setdefault("guidance", None)
+        _own_loss("LADD", kwargs)
         kwargs.setdefault("solver", Consistency())
         kwargs.setdefault("steps", 2)
         super().__init__(model, process, inputs, **kwargs)
         self.teacher = teacher
+        self.teacher_variables = teacher_variables
         self.distillation = distillation
         self.time_features = time_features
         self.heads = Heads(len(distillation.feature_layers), distillation.cmap_dim, distillation.kernel_size)
 
-    def held_variables(self) -> Variables:
-        return {**super().held_variables(), TEACHER: self.teacher}
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The student, then the frozen teacher the discriminator reads."""
+        return (*super().program_key(), ProgramModule(self.teacher, None, trained=False))
 
-    def init(self, key, variables: Variables | None = None) -> Variables:
-        state = dict(super().init(key, variables))
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        self.model, self.teacher = modules
+
+    def held_variables(self) -> Variables:
+        return {**super().held_variables(), TEACHER: self.teacher_variables}
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Start the student as the tree's teacher and draw the heads, unless it holds them."""
+        state = super().complete_variables(key, tree)
         if DISCRIMINATOR in state["params"]:
             return state
-        # The student starts as the teacher, in buffers of its own, since the
-        # step donates them.
-        for collection, tree in self.teacher.items():
-            state[collection] = {**state.get(collection, {}), **jax.tree.map(jnp.copy, tree)}
-        state[TEACHER] = self.teacher
+        teacher = state[TEACHER]
+        state = dict(_from_teacher(state, teacher))
         given = jax.tree.map(lambda value: value[:1], self.unconditional_conditions)
         x = jnp.zeros((1, *self.latent_shape))
-        features = jax.eval_shape(lambda: self._features(self.teacher, x, jnp.ones((1,)), given))
+        features = jax.eval_shape(lambda: self._features(teacher, x, jnp.ones((1,)), given))
         condition = self._condition(jnp.ones((1,)), given)
         heads = self.heads.init(jax.random.fold_in(key, 3), [jnp.zeros(f.shape, f.dtype) for f in features],
                                 condition, update=False, batch={})
@@ -348,10 +348,10 @@ class AdversarialDistillationObjective(DiffusionObjective):
         """The teacher's token grid after each feature layer at `(x, t)`."""
         schedule = self.process.schedule
         layers = self.distillation.feature_layers
-        _, captured = self.model.apply(teacher, x, schedule.model_time(t), **conditions,
-                                       capture_intermediates=lambda module, method: (
-                                           method == "__call__" and module.name in layers),
-                                       mutable=["intermediates"])
+        _, captured = self.teacher.apply(teacher, x, schedule.model_time(t), **conditions,
+                                         capture_intermediates=lambda module, method: (
+                                             method == "__call__" and module.name in layers),
+                                         mutable=["intermediates"])
         kept = captured["intermediates"]
         missing = [name for name in self.distillation.feature_layers if name not in kept]
         if missing:
@@ -366,10 +366,8 @@ class AdversarialDistillationObjective(DiffusionObjective):
         return grids
 
     def loss(self, variables, batch, step: Step):
-        samples = unit_range(batch[self.inputs.sample.key])
         encode_key, drop_key, time_key, noise_key, renoise_key = jax.random.split(step.key, 5)
-        if self.autoencoder is not None:
-            samples = self.autoencoder.encode(variables["autoencoder"], samples, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
         assert self.process.prediction is not None
@@ -417,7 +415,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
             metrics["r1"] = jnp.mean(r1)
             total = total + self.distillation.r1_weight * r1
         if self.distillation.distillation_weight > 0:
-            target, _ = self.process.denoiser(self.model, self.model_variables(teacher), conditions)(
+            target, _ = self.process.denoiser(self.teacher, teacher, conditions)(
                 renoised(jax.lax.stop_gradient(clean)), level)
             distance = jnp.sum(jnp.square(clean - jax.lax.stop_gradient(target)),
                                axis=tuple(range(1, clean.ndim)))
