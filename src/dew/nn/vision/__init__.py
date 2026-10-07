@@ -38,21 +38,26 @@ the classes a caller constructs or subclasses, and keeps where each kind's
 tensors sit and which map reads them.
 """
 
+import functools
 from collections.abc import Callable, Mapping
 
 import numpy as np
 
+from dew.interop.weights import translate_parameters
 from dew.objectives.base import Variables
 
-from .common import ProjectorBase as ProjectorBase, TowerBase as TowerBase, TowerGeometry as TowerGeometry
+from .common import (
+    ProjectorBase as ProjectorBase,
+    TowerBase as TowerBase,
+    TowerGeometry as TowerGeometry,
+    projector_weight_path,
+)
 from .deepseek_v41 import (
     DeepseekV41Projector as DeepseekV41Projector,
     DeepseekV41ProjectorModule as DeepseekV41ProjectorModule,
     DeepseekV41Vision as DeepseekV41Vision,
     DeepseekV41VisionTransformer as DeepseekV41VisionTransformer,
     deepseek_v41_vision_path,
-    translate_deepseek_v41_projector_weights,
-    translate_deepseek_v41_vision_weights,
 )
 from .gemma3n import (
     Gemma3nProjector as Gemma3nProjector,
@@ -60,7 +65,6 @@ from .gemma3n import (
     Gemma3nVision as Gemma3nVision,
     gemma3n_vision_path,
     translate_gemma3n_projector_weights,
-    translate_gemma3n_vision_weights,
 )
 from .gemma4 import (
     Gemma4Projector as Gemma4Projector,
@@ -69,7 +73,6 @@ from .gemma4 import (
     Gemma4VisionTransformer as Gemma4VisionTransformer,
     gemma4_vision_path,
     translate_gemma4_projector_weights,
-    translate_gemma4_vision_weights,
 )
 from .llama4 import (
     Llama4Projector as Llama4Projector,
@@ -77,8 +80,6 @@ from .llama4 import (
     Llama4Vision as Llama4Vision,
     Llama4VisionTransformer as Llama4VisionTransformer,
     llama4_vision_path,
-    translate_llama4_projector_weights,
-    translate_llama4_vision_weights,
 )
 from .qwen35 import (
     Qwen35Projector as Qwen35Projector,
@@ -86,7 +87,6 @@ from .qwen35 import (
     Qwen35Vision as Qwen35Vision,
     Qwen35VisionTransformer as Qwen35VisionTransformer,
     qwen35_vision_path,
-    translate_qwen35_projector_weights,
     translate_qwen35_vision_weights,
 )
 from .siglip import (
@@ -96,7 +96,6 @@ from .siglip import (
     SiglipVisionTransformer as SiglipVisionTransformer,
     siglip_vision_path,
     translate_gemma_projector_weights,
-    translate_siglip_vision_weights,
 )
 
 # Where each tower and projector kind's tensors sit in a media checkpoint, and
@@ -109,31 +108,30 @@ PROJECTOR_PREFIX = {"gemma": "multi_modal_projector.", "llama4": "multi_modal_pr
 TOWER_PATHS: dict[str, Callable[[str], tuple[str, ...] | None]] = {
     "siglip": siglip_vision_path, "llama4": llama4_vision_path, "gemma4": gemma4_vision_path,
     "qwen3_5": qwen35_vision_path, "gemma3n": gemma3n_vision_path, "deepseek_v41": deepseek_v41_vision_path}
-# Gemma 4 is absent: its tower's map returns whole collections, not one params tree.
-_TOWER_WEIGHTS = {"siglip": translate_siglip_vision_weights, "llama4": translate_llama4_vision_weights,
-                  "qwen3_5": translate_qwen35_vision_weights, "gemma3n": translate_gemma3n_vision_weights,
-                  "deepseek_v41": translate_deepseek_v41_vision_weights}
-_PROJECTOR_WEIGHTS = {
+# Qwen 3.5's tower reshapes its patch convolution, and three projectors check
+# their tensors; every other map reads one tensor to one leaf.
+_PROJECTOR_WEIGHTS: dict[str, Callable[..., Variables]] = {
     "gemma": translate_gemma_projector_weights,
-    "llama4": translate_llama4_projector_weights,
     "gemma4": translate_gemma4_projector_weights,
-    "qwen3_5": translate_qwen35_projector_weights,
     "gemma3n": translate_gemma3n_projector_weights,
-    "deepseek_v41": translate_deepseek_v41_projector_weights,
 }
 
 
 def tower_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:
     """One vision tower's variables, in the requested storage."""
-    if kind == "gemma4":
-        return translate_gemma4_vision_weights(hf_tensors, param_dtype=param_dtype)
-    if kind not in _TOWER_WEIGHTS:
+    if kind == "qwen3_5":
+        return {"params": translate_qwen35_vision_weights(hf_tensors, param_dtype=param_dtype)}
+    if kind not in TOWER_PATHS:
         raise ValueError(f"tower kind {kind!r} has no weight map here")
-    return {"params": _TOWER_WEIGHTS[kind](hf_tensors, param_dtype=param_dtype)}
+    tree = translate_parameters(hf_tensors, TOWER_PATHS[kind], param_dtype)
+    # Gemma 4's map names whole collections, its frozen buffers beside its params.
+    return tree if kind == "gemma4" else {"params": tree}
 
 
 def projector_variables(kind: str, hf_tensors: Mapping[str, np.ndarray], param_dtype: str) -> Variables:
     """One projector kind's tensors, in the requested storage."""
-    if kind not in _PROJECTOR_WEIGHTS:
+    if kind in _PROJECTOR_WEIGHTS:
+        return _PROJECTOR_WEIGHTS[kind](hf_tensors, param_dtype=param_dtype)
+    if kind not in PROJECTOR_PREFIX:
         raise ValueError(f"projector kind {kind!r} has no weight map here")
-    return _PROJECTOR_WEIGHTS[kind](hf_tensors, param_dtype=param_dtype)
+    return translate_parameters(hf_tensors, functools.partial(projector_weight_path, kind), param_dtype)

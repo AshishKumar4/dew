@@ -22,6 +22,7 @@ from dew.interop.hf_decoders import _export_config, translate_config, translate_
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
+from dew.nn.vision import tower_variables as vision_variables
 from dew.nn.vision.gemma4 import (
     Gemma4Projector,
     Gemma4Vision,
@@ -29,7 +30,6 @@ from dew.nn.vision.gemma4 import (
     translate_gemma4_projector_config,
     translate_gemma4_projector_weights,
     translate_gemma4_vision_config,
-    translate_gemma4_vision_weights,
 )
 from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
@@ -116,7 +116,7 @@ def translate_weights(
     if config.get("vision_config") is not None:
         if not vision or not projection:
             raise ValueError("vision_config requires both vision_tower and embed_vision tensors")
-        tower_variables = translate_gemma4_vision_weights(vision, param_dtype=param_dtype)
+        tower_variables = vision_variables("gemma4", vision, param_dtype)
         params["conditioner"] = {
             "tower": tower_variables["params"],
             "projector": translate_gemma4_projector_weights(projection, param_dtype=param_dtype)}
