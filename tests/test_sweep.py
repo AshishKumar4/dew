@@ -13,7 +13,7 @@ import pytest
 from test_instrumentation import Regression, batches
 
 from dew.config import RunConfig, TrainerConfig
-from dew.config.sweep import grid_search, optuna_search, override, random_search
+from dew.config.sweep import GridSearch, OptunaSearch, RandomSearch
 from dew.data import Dataset
 from dew.telemetry.records import TrialFinished
 from dew.training import LocalTracker
@@ -43,7 +43,7 @@ def journal(directory, name):
 def test_four_trials_train_their_own_points_and_reach_the_callers_tracker(tmp_path):
     with LocalTracker(tmp_path / 'sweep') as tracker:
         trials = config(tmp_path).sweep(SPACE, train=train, trials=4,
-                                        ledger=tmp_path / 'ledger.json', tracker=tracker, search=grid_search)
+                                        ledger=tmp_path / 'ledger.json', tracker=tracker, search=GridSearch())
 
     assert [trial.name for trial in trials] == [f'sweep/trial-{index}' for index in range(4)]
     # Every point of the grid was trained, each under its own run.
@@ -75,7 +75,7 @@ def test_an_interrupted_sweep_continues_at_the_trial_it_stopped_on(tmp_path):
         return float(len(trained))
 
     arguments = {'train': counted, 'trials': 4, 'ledger': tmp_path / 'ledger.json',
-                     'search': grid_search}
+                     'search': GridSearch()}
     with LocalTracker(tmp_path / 'sweep') as tracker:
         with pytest.raises(KeyboardInterrupt):
             config(tmp_path).sweep(SPACE, tracker=tracker, **arguments)
@@ -103,16 +103,16 @@ def test_a_ledger_of_another_space_is_refused(tmp_path):
 
 def test_a_path_the_run_record_does_not_declare_is_refused(tmp_path):
     with pytest.raises(KeyError, match='names no field'):
-        override(config(tmp_path), {'optim.learn_rate': 0.1})
+        config(tmp_path).override({'optim.learn_rate': 0.1})
     with pytest.raises(KeyError, match='names no group'):
-        override(config(tmp_path), {'optimizer.learning_rate': 0.1})
-    assert override(config(tmp_path), {'optim.learning_rate': 0.1}).optim.learning_rate == 0.1
+        config(tmp_path).override({'optimizer.learning_rate': 0.1})
+    assert config(tmp_path).override({'optim.learning_rate': 0.1}).optim.learning_rate == 0.1
 
 
 def test_random_search_repeats_a_trial_numbers_draw_and_moves_over_the_space():
     def point(index):
-        return random_search(SPACE, [TrialFinished(number, f'sweep/trial-{number}', {}, 1.0)
-                                     for number in range(index)], 3)
+        return RandomSearch(3)(SPACE, [TrialFinished(number, f'sweep/trial-{number}', {}, 1.0)
+                                       for number in range(index)])
 
     assert point(1) == point(1)
     drawn = [point(index) for index in range(6)]
@@ -128,12 +128,12 @@ def test_the_optuna_backend_asks_within_the_space_and_takes_the_ledgers_trials(t
     with LocalTracker(tmp_path / 'sweep') as tracker:
         trials = config(tmp_path).sweep(SPACE, train=lambda run: run.optim.learning_rate,
                                         trials=3, ledger=tmp_path / 'ledger.json', tracker=tracker,
-                                        search=optuna_search)
+                                        search=OptunaSearch())
     assert [trial.index for trial in trials] == [0, 1, 2]
     assert all(trial.overrides[path] in values
                for trial in trials for path, values in SPACE.items())
     # The ask after two told trials is the study's, not a redraw of trial one.
-    assert optuna_search(SPACE, trials[:2], 0) == optuna_search(SPACE, trials[:2], 0)
+    assert OptunaSearch()(SPACE, trials[:2]) == OptunaSearch()(SPACE, trials[:2])
 
 
 def test_a_sweep_without_a_run_name_is_refused(tmp_path):

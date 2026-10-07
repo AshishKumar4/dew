@@ -16,7 +16,6 @@ from affine_run import Affine, Data
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
-from dew.config.sweep import assigned
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import VALID_ROWS, Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
@@ -99,7 +98,7 @@ def test_a_run_stating_another_objectives_arguments_refuses_to_train():
 
 
 def test_set_reads_each_value_as_its_field_reads_a_flag():
-    run = assigned(supervised_run(CrossEntropy()), [
+    run = supervised_run(CrossEntropy()).assigned([
         "trainer.steps=2000", "optim.learning_rate=1e-3", "data.image_size=96", "trainer.eval_every=None",
         'objective.loss={"class": "dew.objectives.supervised:CrossEntropy", "fields": {"labels": "y"}}'])
     assert run.trainer.steps == 2000 and run.optim.learning_rate == 0.001
@@ -108,7 +107,7 @@ def test_set_reads_each_value_as_its_field_reads_a_flag():
 
     lm = RunConfig(model=ModelConfig("causal_transformer", {"vocab_size": 8}),
                    objective=ObjectiveConfig("lm"))
-    lm = assigned(lm, ["model.num_layers=12", "model.dtype=bfloat16", "objective.ema_decay=0.99"])
+    lm = lm.assigned(["model.num_layers=12", "model.dtype=bfloat16", "objective.ema_decay=0.99"])
     assert lm.model.fields == {"vocab_size": 8, "num_layers": 12, "dtype": "bfloat16"}
     assert lm.objective.fields == {"ema_decay": 0.99}
 
@@ -116,13 +115,13 @@ def test_set_reads_each_value_as_its_field_reads_a_flag():
 def test_set_refuses_a_path_the_run_does_not_declare_and_a_value_its_type_does_not_read():
     run = supervised_run(CrossEntropy())
     with pytest.raises(KeyError, match="names no field"):
-        assigned(run, ["trainer.stepz=3"])
+        run.assigned(["trainer.stepz=3"])
     with pytest.raises(KeyError, match="names no argument"):
-        assigned(run, ["objective.los=3"])
+        run.assigned(["objective.los=3"])
     with pytest.raises(ValueError, match="sets no value"):
-        assigned(run, ["trainer.steps"])
+        run.assigned(["trainer.steps"])
     with pytest.raises(SystemExit):
-        assigned(run, ["trainer.steps=many"])
+        run.assigned(["trainer.steps=many"])
 
 
 def test_a_model_whose_call_needs_more_than_the_sample_is_refused_by_name():

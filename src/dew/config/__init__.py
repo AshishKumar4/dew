@@ -43,7 +43,7 @@ import dew.io
 from dew import registry
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
-from dew.config.sweep import Search, Space, _read, _write, override, random_search
+from dew.config.sweep import RandomSearch, Search, Space, _parsed, _placed, _read, _within, _write
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import Reader, ramped, record_argument
@@ -700,6 +700,9 @@ class Prepared:
     after: Callable[[TrainState, str], None] | None = None
 
 
+_RANDOM_SEARCH = RandomSearch()
+
+
 @dataclasses.dataclass(frozen=True)
 class RunConfig:
     """A whole run's configuration. A kind of run subclasses it with its own
@@ -742,6 +745,42 @@ class RunConfig:
         """Read back what `to_dict` wrote, for subclasses too. A field the
         record lacks takes its default; an unknown field raises."""
         return from_record(cls, values, dtypes=False)
+
+    def override(self, point: Mapping[str, JSON]) -> Self:
+        """This config with each dotted path in `point` replaced, through its record.
+
+        A path walks the run's fields and the fields of the values they hold.
+        Under `model` or `objective`, a name the config does not declare is an
+        argument of the class it names, as `--model.num_layers` is on the
+        command line. A path the run does not declare raises, rather than
+        training the unchanged config.
+        """
+        config = self
+        for path, value in point.items():
+            record = config.to_dict()
+            *groups, field = _placed(config, path)[0]
+            node = record
+            for group in groups:
+                node = _within(node, group)
+            node[field] = value
+            config = type(config).from_dict(record)
+        return config
+
+    def assigned(self, assignments: Sequence[str]) -> Self:
+        """This config with each `path=value` in `assignments` set (`override`).
+
+        The value is read as the field's annotation reads a flag: a number, a
+        string, a literal or a tuple of them as its type parses it on the
+        command line, None for an optional field, and anything else (a record,
+        a list of records) as JSON, or as the text itself when it is not JSON.
+        """
+        config = self
+        for assignment in assignments:
+            path, equals, text = assignment.partition("=")
+            if not equals:
+                raise ValueError(f"{assignment!r} sets no value; write path=value, as trainer.steps=2000")
+            config = config.override({path: _parsed(path, text, _placed(config, path)[1])})
+        return config
 
     def save(self, directory: str) -> str:
         """Write this config as `run.json` in `directory` and return the path.
@@ -998,7 +1037,7 @@ class RunConfig:
             _closed(tracker, sys.exception())
 
     def sweep(self, space: Space, *, train: Callable[[Self], float], trials: int, ledger: str | Path,
-              tracker: Tracker, search: Search = random_search, seed: int = 0) -> list[TrialFinished]:
+              tracker: Tracker, search: Search = _RANDOM_SEARCH) -> list[TrialFinished]:
         """Train `trials` trials of this config over `space` and return the ledger.
 
         Each trial draws a point from `space` and trains under the run name
@@ -1015,9 +1054,9 @@ class RunConfig:
                              "resume from each other")
         finished = _read(path, space)
         for index in range(len(finished), trials):
-            point = search(space, finished, seed)
+            point = search(space, finished)
             name = f"{self.trainer.name}/trial-{index}"
-            value = train(override(self, {**point, "trainer.name": name}))
+            value = train(self.override({**point, "trainer.name": name}))
             trial = TrialFinished(index, name, point, value)
             finished.append(trial)
             _write(path, space, finished)
