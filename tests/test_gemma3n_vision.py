@@ -21,7 +21,7 @@ from dew.interop.pretrained import Pretrained
 from dew.nn import vision as V
 from dew.nn.inputs import ModelInputs
 from dew.nn.mobilenet import MobileConvNormAct
-from dew.registry import models, projectors, towers, with_precision
+from dew.registry import models, projectors, towers
 from dew.training import Layout, MeshSpec
 from dew.training.optim import muon_weight_dimension_numbers
 
@@ -37,8 +37,7 @@ def bundle():
     precision = jax.lax.Precision.HIGHEST
     tower = towers.from_record(record["tower"]).build().clone(precision=precision)
     projector = projectors.from_record(record["projector"]).build().clone(precision=precision)
-    decoder = models.build("causal_transformer", **with_precision(
-        "causal_transformer", record["text"], dtype="float32", attention_impl="reference"))
+    decoder = models.build("causal_transformer", record["text"], dtype="float32", attention_impl="reference")
     decoder = decoder.clone(precision=precision)
     return record, variables, tower, projector, decoder
 

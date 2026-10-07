@@ -66,7 +66,7 @@ def test_a_packages_model_and_its_own_kind_build_and_record_by_import_path(tmp_p
                           "built = models.build('toypackage.models:PackageMLP', record)\n"
                           "print(type(built).__name__, built.features, built.activation.scale)\n"
                           "saved = ModelConfig.from_model(built)\n"
-                          "print(saved.architecture, saved.config['activation'])\n"
+                          "print(saved.name, saved.fields['activation'])\n"
                           "print(saved.build() == built)\n")
     assert done.returncode == 0, done.stderr[-2000:]
     assert done.stdout.splitlines() == [

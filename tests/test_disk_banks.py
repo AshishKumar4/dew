@@ -12,7 +12,7 @@ import pytest
 from dew.inference.banks import HeldBanks
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.interop.safetensors_io import read_weights, save_sharded
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.sampling.text import Sampling, generate
 from dew.training import Layout, MeshSpec
 
@@ -28,8 +28,7 @@ def single_mesh():
 
 
 def decoder(config, bank_layers):
-    record = with_precision("causal_transformer", translate_config(config),
-                            dtype="float32", attention_impl="reference")
+    record = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
     return models.build("causal_transformer", {**record, "scan_layers": True,
                                                "bank_layers": bank_layers})
 

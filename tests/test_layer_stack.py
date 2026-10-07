@@ -24,7 +24,7 @@ from dew.interop.hf_decoders import translate_config
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import shard_batch
 
@@ -105,8 +105,7 @@ def gemma4_shaped(dtype=jnp.float32, **overrides):
         + ("sliding_attention",) * 5 + ("full_attention",),
         kv_shared_layers=(8, 9, 10, 11), max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", **{**with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
+    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
 
 
 def gemma3n_shaped(dtype=jnp.float32, **overrides):
@@ -120,8 +119,7 @@ def gemma3n_shaped(dtype=jnp.float32, **overrides):
         mlp_features=(48,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
         kv_shared_layers=(8, 9), max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", **{**with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
+    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
 
 
 def deepseek_shaped(dtype=jnp.float32, **overrides):
@@ -130,8 +128,7 @@ def deepseek_shaped(dtype=jnp.float32, **overrides):
     config.update(num_layers=6, layer_types=("full_attention",) * 6, max_seq_len=16)
     config["mixture"] = {**config["mixture"], "layers": (1, 2, 3, 4, 5)}
     config.update(overrides)
-    return models.build("causal_transformer", **{**with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"), "dtype": dtype})
+    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
 
 
 # Gemma 3n keeps the initialized forward check but checks gradients at
@@ -291,8 +288,7 @@ def tiny(**overrides):
 
 
 def bf16(**overrides):
-    return models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**TINY, **overrides}, dtype="bfloat16", attention_impl="xla"))
+    return models.build("causal_transformer", {**TINY, **overrides}, dtype="bfloat16", attention_impl="xla")
 
 
 def test_a_scanned_stack_under_a_bf16_policy_scores_as_the_plain_loop_does():

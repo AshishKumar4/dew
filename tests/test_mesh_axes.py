@@ -27,7 +27,7 @@ from dew.nn.conv import Conv
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import batch_shardings, shard_batch
 
@@ -627,9 +627,9 @@ def test_a_vocabulary_split_head_keeps_its_table_where_it_is(dtype):
     bf16, which XLA's CPU compiler widens to fp32: it aborted there ("Invalid
     binary instruction opcode copy") on the reducer JAX lowers inside a map
     that leaves axes automatic."""
-    model = models.build("causal_transformer", **with_precision("causal_transformer", {
+    model = models.build("causal_transformer", {
         "vocab_size": 4096, "emb_features": 32, "num_layers": 1, "num_heads": 4, "num_kv_heads": 2,
-        "mlp_features": 64, "max_seq_len": SEQ_LEN}, dtype=dtype, attention_impl="xla"))
+        "mlp_features": 64, "max_seq_len": SEQ_LEN}, dtype=dtype, attention_impl="xla")
     table = 4096 * 32 * 4
     moved = collective_bytes(MeshSpec(fsdp=4), model, {"all-gather", "reduce-scatter", "all-reduce"})
 

@@ -21,7 +21,7 @@ from model_support import TINY_DECODER
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers import AttentionMixer
-from dew.registry import models, with_precision
+from dew.registry import models
 
 VOCAB = 37
 SEQ = 12
@@ -88,8 +88,8 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
 
     config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
                   "mlp_features": 16, "max_seq_len": 8}
-    model = ModelConfig("causal_transformer", config=config, dtype="float32",
-                        matmul_precision="highest", attention_impl="reference").build()
+    model = ModelConfig("causal_transformer", {**config, "dtype": "float32",
+                                              "precision": "highest", "attention_impl": "reference"}).build()
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
     directory = Path(__file__).with_name("fixtures")
     held = np.load(directory / "decoder-default-dropout.npz")
@@ -329,12 +329,10 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
         scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation='cudnn')
 
 
-def test_registry_builds_the_backbone_and_takes_the_precision_policy():
+def test_registry_builds_the_backbone_with_its_own_compute_fields():
     assert models['causal_transformer'] is CausalTransformer
-    config = with_precision(
-        'causal_transformer', {'vocab_size': VOCAB, 'emb_features': 32,
-                               'num_layers': 2, 'num_heads': 4, 'max_seq_len': 16},
-        dtype='bfloat16', attention_impl='reference')
+    config = {'vocab_size': VOCAB, 'emb_features': 32, 'num_layers': 2, 'num_heads': 4,
+              'max_seq_len': 16, 'dtype': 'bfloat16', 'attention_impl': 'reference'}
     model = models.build('causal_transformer', **config)
     assert model.dtype is jnp.bfloat16
     assert model.attention_impl == 'reference'

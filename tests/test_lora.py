@@ -699,8 +699,8 @@ def _registry_decoder():
     no published checkpoint, so no weight layouts to resolve names through."""
     from dew.config import ModelConfig
 
-    config = ModelConfig("causal_transformer", dict(REGISTRY_FIELDS), dtype="float32",
-                         attention_impl="reference")
+    config = ModelConfig("causal_transformer", {**REGISTRY_FIELDS,
+                                              "dtype": "float32", "attention_impl": "reference"})
     model = config.build()
     return config, model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
 
@@ -1121,8 +1121,8 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
     modulation frozen at zero only the output projection carries a gradient;
     it is the one target."""
     config, state = _recipe_run(
-        tmp_path, 8, "--model.architecture", "simple_dit", "--model.config",
-        '{"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2}',
+        tmp_path, 8, "--model", "simple_dit", "--model.patch_size", "2", "--model.emb_features", "16",
+        "--model.num_layers", "1", "--model.num_heads", "2",
         "--text.encoder", "char_table", "--text.checkpoint", "char_table", "--lora.rank", "2",
         "--lora.modules", "final_proj")
     assert config.lora == LoRA(rank=2, modules=("final_proj",))

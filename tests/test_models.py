@@ -715,7 +715,7 @@ def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
     block = stage_attention(stage, 8, "reference", dtype, None, "attention")
     explicit = stage_attention(
         Stage(heads=2, dtype=expected_dtype), 8, "reference", dtype, None, "attention")
-    x = jnp.ones((1, 2, 2, 8), expected_dtype)
+    x = jnp.ones((1, 4, 8), expected_dtype)
     variables = block.init(rng, x)
     output = block.apply(variables, x)
 

@@ -31,7 +31,7 @@ from dew.nn.inputs import BATCH_AXES, ModelInputs
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.sampling import Sampling, sample
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -101,8 +101,7 @@ def loaded(name: str):
     directory = FIXTURES / name
     config = translate_config(json.loads((directory / "config.json").read_text()))
     assert config["mask_token_id"] == 120
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"))
+    model = models.build("causal_transformer", config, dtype="float32", attention_impl="reference")
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
     return model, variables
 

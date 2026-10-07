@@ -30,7 +30,7 @@ import pytest
 from safetensors.numpy import load_file
 
 from dew.interop.hf_decoders import translate_config, translate_wrapper_config, translate_wrapper_weights
-from dew.registry import models, projectors, towers, with_precision
+from dew.registry import models, projectors, towers
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -256,8 +256,7 @@ def _multimodal_logits(name, image_id, shift=0):
         # The reference conditional applies no logit cap (only its causal-LM
         # head path does), so the decoder builds without the text record's.
         fields["final_logit_softcap"] = None
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", fields, dtype="float32", attention_impl="reference"))
+    model = models.build("causal_transformer", fields, dtype="float32", attention_impl="reference")
     language = variables["language_model"]
     embedded = model.apply(language, ids, method=lambda decoder, ids: decoder.scaled_embeddings(
         decoder.token_embeddings(ids)))

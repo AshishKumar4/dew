@@ -51,12 +51,12 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
         "--data.image-size", "64", "--data.augmentation", "flip_only",
         "preset:flow", "--preset.shift", "3.0", "solver:heun",
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
-        "--model.architecture", "simple_dit", "--model.config", '{"scan_order": "hilbert"}'])
+        "--model", "simple_dit", "--model.scan_order", "hilbert"])
 
     assert config.data == TFDSImages(image_size=64, augmentation="flip_only")
     assert config.preset == Flow(shift=3.0) and config.solver == Heun()
     assert config.trainer.batch_size == 8 and config.trainer.mesh == MeshSpec(fsdp=2)
-    assert config.model.fields()["scan_order"] == "hilbert"
+    assert config.model.fields["scan_order"] == "hilbert"
 
 
 def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
@@ -163,8 +163,9 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.name", "run",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--model.architecture", "simple_dit", "--model.dtype", "float32",
-        "--model.config", '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2}',
+        "--trainer.log-every", "1", "--model", "simple_dit", "--model.dtype", "float32",
+        "--model.patch_size", "4", "--model.emb_features", "16",
+        "--model.num_layers", "1", "--model.num_heads", "2",
         "--sampling-steps", "2"])
     # A validation pass needs a consumer; psnr scores samples against the
     # batch and downloads nothing, unlike the default clip metric.
@@ -238,12 +239,12 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
             "1",
             "--trainer.eval-every",
             "None",  # no probes, so no validation pass
-            "--model.architecture",
+            "--model",
             "jepa_encoder",
             "--model.dtype",
             "float32",
-            "--model.config",
-            '{"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 2}',
+            "--model.patch_size", "4", "--model.emb_features", "16",
+            "--model.num_layers", "1", "--model.num_heads", "2", "--model.mlp_ratio", "2",
         ],
     )
 

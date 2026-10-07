@@ -41,7 +41,7 @@ def test_a_composite_model_record_nests_its_part_and_rebuilds_it():
 
     original = DiffusionGemma(model().clone(layer_scalar="frozen"), canvas_length=4)
     record = ModelConfig.from_model(original)
-    assert record.dtype is None and record.config["text"]["layer_scalar"] == "frozen"
+    assert "dtype" not in record.fields and record.fields["text"]["layer_scalar"] == "frozen"
     assert record.build() == original.clone(text=original.text.clone(dtype=jnp.float32))
 
 
@@ -80,7 +80,7 @@ def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, mo
     checkpoints.wait()
 
     recorded = checkpoints.artifact()["model"]
-    assert (recorded["architecture"], recorded["config"]) == ("mymodels:ResidualMLP", {"features": 16})
+    assert (recorded["name"], recorded["fields"]) == ("mymodels:ResidualMLP", {"features": 16})
     restored = TextToImage.from_run(str(tmp_path / "run"))
     assert type(restored.model) is mymodels.ResidualMLP and restored.model.features == 16
     np.testing.assert_array_equal(restored([""], key=3).host().images,
@@ -166,7 +166,7 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
         data, steps=2, checkpoint_every=1)
     checkpoints.wait()
     record = checkpoints.artifact()['model']
-    assert record['architecture'] == 'dew.nn.backbones.causal_transformer:CausalTransformer'
+    assert record['name'] == 'dew.nn.backbones.causal_transformer:CausalTransformer'
     assert record['adapter'] == {'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
         'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
         f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight', 'shape': [16, 16],

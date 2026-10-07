@@ -48,13 +48,25 @@ def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=N
     return root
 
 
+def model_flags(record):
+    """Give each constructor field its typed flag; nested records take one JSON value."""
+    flags = []
+    for key, value in json.loads(record).items():
+        if isinstance(value, bool):
+            flags.append(f"--model.{'' if value else 'no-'}{key}")
+        else:
+            flags.extend((f"--model.{key}", json.dumps(value)
+                          if isinstance(value, (dict, list)) else str(value)))
+    return flags
+
+
 def run_config(recipe, tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'):
     # A dataset subcommand has to come before its flags, so `args` leads.
     return recipe.LmRunConfig.cli([
         *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.log-every", "1", "--model.dtype", "float32", "--model.config", model])
+        "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)])
 
 
 def test_the_sampling_budget_decides_the_context_the_model_is_built_for():
@@ -110,7 +122,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     # run.json is the resolved spec: the model as built, vocabulary and
     # context included, so the front door rebuilds it without the recipe.
     recorded = recipe.LmRunConfig.load(str(run))
-    assert recorded.model.config["vocab_size"] == 256 and recorded.model.config["max_seq_len"] == SEQ
+    assert recorded.model.fields["vocab_size"] == 256 and recorded.model.fields["max_seq_len"] == SEQ
     assert dataclasses.replace(recorded, model=config.model) == config
     task = dew.pipeline(str(run))
     assert isinstance(task, TextGeneration) and task.max_new_tokens == 4
@@ -142,7 +154,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.steps", "2", "--trainer.name", "mixed", "--sample-tokens", "0",
         "--model.dtype", "float32",
-        "--model.config", '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'])
+        "--model.emb_features", "16", "--model.num_layers", "1", "--model.num_heads", "2"])
     assert config.data.path == {str(first): 0.7, str(second): 0.3}
 
     state = recipe.main(config)
@@ -150,7 +162,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     assert int(state.step) == 2
     recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "mixed"))
     assert recorded.data.path == config.data.path
-    assert recorded.model.config["vocab_size"] == 256
+    assert recorded.model.fields["vocab_size"] == 256
 
 
 def test_weighted_corpora_from_different_vocabularies_are_refused(tmp_path):
@@ -208,7 +220,7 @@ def test_the_recipe_trains_a_quantized_trunk(tmp_path):
     assert all(bool(jnp.all(jnp.isfinite(leaf)))
                for leaf in jax.tree.leaves(state.variables["params"]))
     recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "quant"))
-    assert recorded.model.config["vocab_size"] == 256
+    assert recorded.model.fields["vocab_size"] == 256
     assert dataclasses.replace(recorded, model=config.model) == config
 
 
@@ -237,7 +249,7 @@ def recipe_args(tokens, *args, model_config="{}"):
             "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
             "--trainer.log-every", "1", "--model.dtype", "float32",
-            "--model.config", model_config]
+            *model_flags(model_config)]
 
 
 def pretrained_config(recipe, tokens, pretrained, *args, model_config="{}"):
@@ -264,7 +276,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
 
     assert int(state.step) == 1
     recorded = recipe.LmRunConfig.load(str(tmp_path / "runs" / "continued"))
-    assert recorded.model.config["vocab_size"] == 256
+    assert recorded.model.fields["vocab_size"] == 256
     assert dataclasses.replace(recorded, model=config.model) == config
     kernel = state.variables["params"]["layers_0"]["self_attn"]["q_proj"]["kernel"]
     assert kernel.shape == (16, 16)

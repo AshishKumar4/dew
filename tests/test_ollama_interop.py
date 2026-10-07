@@ -57,7 +57,7 @@ from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.inputs import ModelInputs
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.sampling.text import Sampling, generate
 
 pytestmark = pytest.mark.network
@@ -137,6 +137,12 @@ def train_and_export(root: Path) -> Path:
     tokenizer = HFTokenizer(str(TOKENIZER))
     tokens = root / "tokens"
     meta = write_token_files(tokens, tokenizer)
+    model_args = []
+    for key, value in FIELDS.items():
+        if isinstance(value, bool):
+            model_args.append(f"--model.{'' if value else 'no-'}{key}")
+        else:
+            model_args.extend((f"--model.{key}", str(value)))
     config = recipe.LmRunConfig.cli( [
         "--data.path", str(tokens), "--data.seq-len", str(SEQ),
         "--data.loading.workers", "0", "--tokenizer", str(TOKENIZER),
@@ -147,13 +153,12 @@ def train_and_export(root: Path) -> Path:
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--model.dtype", "float32", "--sample-tokens", "0", "--ema-decay", "None",
         "--optim.learning-rate", "3e-3",
-        "--model.config", json.dumps(FIELDS)])
+        *model_args])
     state = recipe.main(config)
     assert int(state.step) == STEPS
 
-    model = models.build(config.model.architecture, **with_precision(
-        config.model.architecture, {**FIELDS, "vocab_size": meta["vocab_size"]},
-        dtype="float32", attention_impl="xla"))
+    model = models.build(config.model.name, {**FIELDS, "vocab_size": meta["vocab_size"]},
+                         dtype="float32", attention_impl="xla")
     export = root / "export"
     PretrainedDecoder.from_model(model, state.variables, tokenizer=tokenizer).save(str(export))
     return export

@@ -16,7 +16,7 @@ from test_hf_decoders import DEEPSEEK, fixture_config, fp32_decoder, scaled_diff
 
 from dew.interop import PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.registry import models, with_precision
+from dew.registry import models
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -230,8 +230,7 @@ def test_sharing_layers_own_no_kv_and_name_their_provider(rng):
     cutoff keep q_proj, o_proj and q_norm but lose k_proj, v_proj and k_norm;
     the provider map follows the layer type, not the position."""
     config = translate_config(gemma4_config("gemma4-kvshare"))
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="xla"))
+    model = models.build("causal_transformer", config, dtype="float32", attention_impl="xla")
     params = model.init(rng, jnp.ones((1, 4), jnp.int32))["params"]
 
     assert set(model.kv_sharing) == {2, 3}
@@ -246,8 +245,7 @@ def test_sharing_layers_own_no_kv_and_name_their_provider(rng):
 
 def test_sharing_without_a_provider_and_sharing_everything_are_refused():
     config = translate_config(gemma4_config("gemma4-kvshare"))
-    base = with_precision("causal_transformer", config,
-                          dtype="float32", attention_impl="xla")
+    base = {**config, "dtype": "float32", "attention_impl": "xla"}
     with pytest.raises(ValueError, match="no earlier full_attention layer"):
         _ = models.build("causal_transformer", **{**base, "kv_shared_layers": (1, 2, 3)}).kv_sharing
     with pytest.raises(ValueError, match="leave a provider"):
@@ -257,10 +255,9 @@ def test_sharing_without_a_provider_and_sharing_everything_are_refused():
 def test_the_features_leave_a_plain_tree_unchanged(rng):
     """Off by default: no PLE leaves, no missing K/V, same leaves as before."""
     config = translate_config(gemma4_config("gemma4-ple"))
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**config, "per_layer_input_dim": None,
-                               "kv_shared_layers": None, "v_norm": False},
-        dtype="float32", attention_impl="xla"))
+    model = models.build("causal_transformer", {**config, "per_layer_input_dim": None,
+                                              "kv_shared_layers": None, "v_norm": False},
+                         dtype="float32", attention_impl="xla")
     assert model.kv_sharing == {}
     flat = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
     assert not [name for name in flat if "per_layer" in name]
@@ -274,9 +271,8 @@ def test_new_leaves_are_declared():
     from dew.nn.sharding import declared_axes
 
     config = translate_config(gemma4_config("gemma4-kvshare"))
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**config, "per_layer_input_dim": 8},
-        dtype="float32", attention_impl="xla"))
+    model = models.build("causal_transformer", {**config, "per_layer_input_dim": 8},
+                         dtype="float32", attention_impl="xla")
     variables = jax.eval_shape(
         model.init, jax.random.key(0), jnp.ones((1, 8), jnp.int32))
     uncovered = []
@@ -292,9 +288,8 @@ def test_a_sharing_model_decodes_like_it_prefills(rng):
     """The decode path of sharing: prefill writes the provider's cache, each
     single-token step reads it, and the tokens match a full forward."""
     config = translate_config(gemma4_config("gemma4-e2b"))
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**config, "max_seq_len": 16},
-        dtype="float32", attention_impl="xla"))
+    model = models.build("causal_transformer", {**config, "max_seq_len": 16},
+                         dtype="float32", attention_impl="xla")
     params = model.init(rng, jnp.ones((1, 4), jnp.int32))
     prompt = jax.random.randint(rng, (1, 3), 0, 64)
 
@@ -448,9 +443,8 @@ def test_the_v32_fixture_is_the_sparse_model():
     generator that lost the eager mask fold again would fail here."""
     directory = FIXTURES / "deepseek-v32-tiny"
     _, variables = fp32_decoder(directory)
-    built = with_precision('causal_transformer',
-                           translate_config(fixture_config("deepseek-v32-tiny")),
-                           dtype='float32', attention_impl='reference')
+    built = {**translate_config(fixture_config("deepseek-v32-tiny")),
+             "dtype": "float32", "attention_impl": "reference"}
     dense = models.build('causal_transformer', **{
         **built, 'mixer': {'class': 'mla', 'fields': {**built['mixer']['fields'], 'index_topk': None,
                                                      'index_n_heads': None, 'index_head_dim': None}}})
@@ -476,10 +470,9 @@ def test_export_refuses_a_mixer_and_a_mixture_by_name(name, tmp_path, rng):
         PretrainedDecoder.from_model(model, variables).save(str(tmp_path))
 
     config = translate_config(fixture_config(name))
-    routed = models.build("causal_transformer", **with_precision(
-        "causal_transformer", {**config, "mixer": None, "head_dim": None,
-                               "layer_types": None, "kinds": {}},
-        dtype="float32", attention_impl="reference"))
+    routed = models.build("causal_transformer", {**config, "mixer": None, "head_dim": None,
+                                               "layer_types": None, "kinds": {}},
+                          dtype="float32", attention_impl="reference")
     variables = routed.init(rng, jnp.ones((1, 4), jnp.int32))
     with pytest.raises(ValueError, match="lacks 'num_local_experts'"):
         PretrainedDecoder.from_model(routed, variables).save(str(tmp_path))
@@ -602,8 +595,7 @@ def test_qwen35_weights_are_exactly_the_models_param_tree(rng):
     from dew.interop.sources import load_shards
 
     config = translate_config(fixture_config("qwen35-tiny"))
-    built = with_precision("causal_transformer", dict(config),
-                           dtype="float32", attention_impl="reference")
+    built = {**config, "dtype": "float32", "attention_impl": "reference"}
     model = models.build("causal_transformer", **built)
     expected = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
     loaded = flat_tree(translate_weights(
@@ -793,8 +785,7 @@ def test_qwen3_next_weights_are_exactly_the_models_param_tree(rng):
     from dew.interop.sources import load_shards
 
     config = translate_config(fixture_config("qwen3-next-tiny"))
-    built = with_precision("causal_transformer", dict(config),
-                           dtype="float32", attention_impl="reference")
+    built = {**config, "dtype": "float32", "attention_impl": "reference"}
     model = models.build("causal_transformer", **built)
     expected = flat_tree(model.init(rng, jnp.ones((1, 4), jnp.int32))["params"])
     loaded = flat_tree(translate_weights(load_shards(QWEN3_NEXT), config)["params"])
