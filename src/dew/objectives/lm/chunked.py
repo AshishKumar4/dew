@@ -43,6 +43,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.kernels.generation import device_generation
 from dew.nn.precision import at_least_fp32, head_product, rounded_operand, rounded_to, rounds_to_bf16
+from dew.nn.protocols import AffineHead, HiddenStates, LogitsFromHidden
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -108,12 +109,20 @@ def _biased_logits(logits, bias):
     return logits if bias is None else logits + jnp.asarray(bias, logits.dtype)
 
 
+def reads_states(model) -> bool:
+    """Whether `model` scores its final states (`HiddenStates`) through a head
+    that takes them: a matrix (`AffineHead`) or its exact head
+    (`LogitsFromHidden`). One that does not gives its logits only from its
+    tokens (`Logits`), which a loss then scores whole (`logits_cross_entropy`)."""
+    return isinstance(model, HiddenStates) and isinstance(model, AffineHead | LogitsFromHidden)
+
+
 def model_logits(model, variables, hidden) -> jax.Array:
     """`model`'s logits of its final states `hidden` over `variables`: the
     matrix `AffineHead.output_table` gives, contracted as the chunked head
     contracts it (`head_logits`), or the model's exact head
     (`LogitsFromHidden`) where no matrix alone is the head."""
-    table = model.apply(variables, method="output_table")
+    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
     if table is None:
         return model.apply(variables, hidden, method="logits_from_hidden")
     return head_logits(hidden, table.matrix, softcap=table.softcap, precision=table.precision,
@@ -631,14 +640,23 @@ def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
     the fp32 `[..., vocab]` logits for the backward pass, a vocabulary-sized
     row per token, which the tiled head never does.
     """
-    table = model.apply(variables, method="output_table")
+    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
     if table is not None:
         return chunked_cross_entropy(
             hidden, table.matrix, targets, chunks, softcap=table.softcap, precision=table.precision,
             tile=tile, vocab_major=table.vocab_major, predict=predict, temperature=temperature,
             excluded=excluded, bias=table.bias)
-    logits = model.apply(variables, hidden, method="logits_from_hidden").astype(jnp.float32) / temperature
-    logits = _without(logits, 0, None if excluded is None else jnp.asarray(excluded, jnp.int32))
+    return logits_cross_entropy(model.apply(variables, hidden, method="logits_from_hidden"), targets,
+                                predict=predict, temperature=temperature, excluded=excluded)
+
+
+def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: float = 1.0,
+                         excluded: int | None = None):
+    """`chunked_cross_entropy`'s per-token losses, top-1 columns and log
+    partitions, of whole `[..., vocab]` logits, in fp32 and over `temperature`,
+    with column `excluded` given no mass."""
+    logits = _without(logits.astype(jnp.float32) / temperature, 0,
+                      None if excluded is None else jnp.asarray(excluded, jnp.int32))
     log_z = jax.nn.logsumexp(logits, axis=-1)
     picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
     return log_z - picked, jnp.argmax(logits, axis=-1) if predict else None, log_z

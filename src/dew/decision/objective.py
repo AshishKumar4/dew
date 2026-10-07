@@ -1,5 +1,6 @@
 """`DecisionObjective`: training a decision model on labelled questions."""
 
+import dataclasses
 import functools
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
@@ -173,16 +174,18 @@ class _Encode(pygrain.RandomMapTransform):
 
 def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
     """The tokenizer a loaded model's text processor encodes with: a run's
-    own, or a checkpoint's Hugging Face tokenizer read from the directory it
-    was loaded from, at the revision the model was. A processor that is not
-    a tokenizer's gives none, and `tokenizer=` names one."""
-    from transformers import PreTrainedTokenizerBase
+    own, or a checkpoint's Hugging Face tokenizer, alone or inside a
+    multimodal processor, read from the directory it was loaded from, at the
+    revision the model was. A processor without a tokenizer gives none, and
+    `tokenizer=` names one."""
+    from transformers import PreTrainedTokenizerBase, ProcessorMixin
 
     match processor:
         case RunProcessor():
             return processor.tokenizer
-        case Processor(reference=PreTrainedTokenizerBase() as reference):
-            return HFTokenizer(str(reference.name_or_path), local_files_only=True)
+        case (Processor(reference=PreTrainedTokenizerBase() as tokenizer)
+              | Processor(reference=ProcessorMixin(tokenizer=PreTrainedTokenizerBase() as tokenizer))):
+            return HFTokenizer(str(tokenizer.name_or_path), local_files_only=True)
         case _:
             return None
 
@@ -282,9 +285,7 @@ class DecisionObjective(Objective[Ratio]):
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         backbone, head = modules
-        if not isinstance(head, Head):
-            raise TypeError(f"a decision model's second module is its head, not a {type(head).__name__}")
-        self.model = DecisionModel(backbone, head)
+        self.model = dataclasses.replace(self.model, backbone=backbone, head=head)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         """Nothing beyond the held parts: `complete_variables` draws the part the tree lacks."""
@@ -299,8 +300,8 @@ class DecisionObjective(Objective[Ratio]):
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
-            states = jnp.zeros((1, self.layout.max_len, self.model.backbone.emb_features),
-                               self.model.backbone.dtype or jnp.float32)
+            width, dtype = DecisionModel.head_size(self.model.backbone)
+            states = jnp.zeros((1, self.layout.max_len, width), dtype or jnp.float32)
             one = jnp.ones((1, 1), bool)
             inputs = DecisionInputs(tokens=tokens, valid=jnp.ones_like(tokens, bool),
                                     kinds=jnp.zeros((1, 1), jnp.int32), questions=one,
