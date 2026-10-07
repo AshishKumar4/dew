@@ -15,19 +15,11 @@ from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import CLIPEncoderLayer
+from dew.nn.text_encoders import CLIPEncoderLayer, _encoder_layer_path
 from dew.objectives.base import Variables
 from dew.registry import Record
 
-from .common import (
-    _PROJECTOR_PATHS,
-    ProjectorBase,
-    TowerBase,
-    TowerGeometry,
-    _encoder_layer_path,
-    _image_size,
-    _vision_section,
-)
+from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
 
 
 class SiglipVisionTransformer(nn.Module):

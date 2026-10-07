@@ -17,10 +17,10 @@ from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import inverse_frequencies
-from dew.nn.text_encoders import MLP
+from dew.nn.text_encoders import MLP, _encoder_layer_path
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _encoder_layer_path, _image_size, _vision_section
+from .common import ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
 
 
 def _llama4_vision_tables(grid: int, head_dim: int, theta: float, *,
