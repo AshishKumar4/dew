@@ -88,12 +88,17 @@ class Row:
     """'ms', lower is better, or 'items/s', higher is better."""
     tool: str
     """The tools/ file the row runs, or '' for a script of this file's."""
+    gated: bool = True
+    """Whether a regression of this row fails the gate, or is only shown."""
 
 
 BATTERY = [
     *[Row(name, "ms", "benchmark_step.py") for name in STEP_CASES],
     Row("serve qwen3-0.6b 32 slots", "items/s", "benchmark_lm_serving.py"),
     Row("serve qwen3-0.6b 128 slots", "items/s", "benchmark_lm_serving.py"),
+    # The median of the same repeats: the stalls best-of-five hides (a recompile, a pause), shown.
+    Row("serve qwen3-0.6b 32 slots, median repeat", "items/s", "benchmark_lm_serving.py", gated=False),
+    Row("serve qwen3-0.6b 128 slots, median repeat", "items/s", "benchmark_lm_serving.py", gated=False),
     Row("attention cudnn S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py"),
     Row("attention xla S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py"),
     Row("image pipeline flowers 128px, device crop+flip+jitter", "items/s", "benchmark_image_pipeline.py"),
@@ -127,9 +132,12 @@ def _probes(args: argparse.Namespace, out: Path):
            ["--backend", "dew", "--model", args.model, "--slots", "32,128", "--repeats", "5",
             "--out", str(out)],
            # The best repeat: a host-bound row's noise only ever slows it (32 slots spread 33% by median).
-           lambda _: {f"serve qwen3-0.6b {entry['slots']} slots":
-                      max(r["output_tokens_per_second"] for r in entry["repeats"])
-                      for entry in json.loads(out.read_text())["sweep"]})
+           lambda _: {name: value for entry in json.loads(out.read_text())["sweep"]
+                      for name, value in (
+                          (f"serve qwen3-0.6b {entry['slots']} slots",
+                           max(r["output_tokens_per_second"] for r in entry["repeats"])),
+                          (f"serve qwen3-0.6b {entry['slots']} slots, median repeat",
+                           statistics.median(r["output_tokens_per_second"] for r in entry["repeats"])))})
     yield ([row.name for row in BATTERY if row.name.startswith("attention")], "benchmark_attention.py",
            ["--implementations", "cudnn", "xla", "--sequence-lengths", "2048", "--head-dims", "128",
             "--causal", "True", "--json-out", str(out)],
@@ -183,10 +191,21 @@ def run(args: argparse.Namespace) -> int:
 
 
 def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
-    """Whether `row` regressed from the `base` samples to the `head` ones, and the numbers that say so."""
+    """Whether `row` regressed from the `base` samples to the `head` ones, and the numbers that say so.
+
+    A row moves when its median moves by more than the larger of the two trees' spreads (at
+    least FLOOR) and the two trees' samples do not overlap at all. With three rounds each, the
+    samples separate by chance 1 time in 20 when nothing changed (1 / C(6, 3)), and the band
+    lowers that further; it is also the smallest change the row can see. A row the base cannot
+    run (a tree older than its tool) is not compared; one the base runs and the head does not is
+    broken; one neither runs leaves the battery incomplete."""
     base, head = [x for x in base if isinstance(x, float)], [x for x in head if isinstance(x, float)]
-    if not base or not head:
+    if not base and not head:
+        return "incomplete", {}
+    if not base:
         return "not compared", {}
+    if not head:
+        return "broken", {}
     worse = 1.0 if row.unit == "ms" else -1.0
 
     def spread(xs):
@@ -194,7 +213,8 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
     band = max(spread(base), spread(head), FLOOR)
     change = worse * (statistics.median(head) - statistics.median(base)) / statistics.median(base)
     separated = (min(head) > max(base)) if worse > 0 else (max(head) < min(base))
-    state = "regressed" if change > band and separated else "faster" if -change > band else "level"
+    faster = (max(head) < min(base)) if worse > 0 else (min(head) > max(base))
+    state = "regressed" if change > band and separated else "faster" if -change > band and faster else "level"
     return state, {"base": statistics.median(base), "head": statistics.median(head), "change": change,
                    "band": band}
 
@@ -204,13 +224,15 @@ def report(args: argparse.Namespace) -> int:
     base, head = results["base"], results["head"]
     lines = [f"| row | unit | {base} | {head} | change | band | verdict |",
              "|---|---|---:|---:|---:|---:|---|"]
-    regressed = []
+    failed = []
     for spec in results["rows"]:
         row = Row(**spec)
         state, numbers = verdict(row, [s.get(row.name) for s in results["samples"][base]],
                                  [s.get(row.name) for s in results["samples"][head]])
-        if state == "regressed":
-            regressed.append(row.name)
+        if state in ("broken", "incomplete") or (state == "regressed" and row.gated):
+            failed.append(f"{row.name} ({state})")
+        if not row.gated:
+            state = f"{state}, not gated"
         cells = (["-"] * 4 if not numbers else
                  [f"{numbers['base']:.2f}", f"{numbers['head']:.2f}", f"{numbers['change']:+.1%}",
                   f"{numbers['band']:.1%}"])
@@ -219,9 +241,9 @@ def report(args: argparse.Namespace) -> int:
     print(table)
     if args.table:
         Path(args.table).write_text(table)
-    if regressed:
-        print(f"regressed: {', '.join(regressed)}")
-    return 1 if regressed else 0
+    if failed:
+        print(f"failed: {', '.join(failed)}")
+    return 1 if failed else 0
 
 
 def main() -> int:
