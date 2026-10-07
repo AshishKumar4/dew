@@ -1,11 +1,13 @@
-"""Masked diffusion against MDLM's own loss and reverse step.
+"""Masked diffusion against MDLM's own loss, reverse step and sampler.
 
 tests/fixtures/mdlm/loss.npz holds kuleshov-group/mdlm's `_loss` (SUBS,
 continuous time, antithetic times floored at 1e-3, as configs/config.yaml
 trains) and `_ddpm_update`, executed as published by tools/mdlm_reference.py
 around a backbone whose logits are `hidden @ head`, with the two uniforms
 `MaskedDiffusionObjective` draws from `jax.random.key(0)` replayed into the
-loss's `torch.rand` calls.
+loss's `torch.rand` calls. tests/fixtures/mdlm/continuation.npz holds the
+responses MDLM's `_sample` draws after a prompt
+(tools/mdlm_sampling_reference.py).
 """
 
 from pathlib import Path
@@ -20,6 +22,7 @@ from dew.diffusion.discrete import MDLM, DiscreteDenoiser, Unmask
 from dew.nn.protocols import OutputTable
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+from dew.sampling import sample
 
 REFERENCE = dict(np.load(Path(__file__).parent / "fixtures" / "mdlm" / "loss.npz"))
 MASK = REFERENCE["head"].shape[1] - 1
@@ -130,3 +133,42 @@ def test_the_reverse_step_draws_from_mdlms_categorical():
     assert counts.size - counts.shape[0] == 352
     # scipy.stats.chi2.isf(1e-9, 352): the statistic a correct sampler exceeds once in a billion runs.
     assert statistic < 535.1, statistic
+
+
+CONTINUATION = dict(np.load(Path(__file__).parent / "fixtures" / "mdlm" / "continuation.npz"))
+
+
+class Reader(nn.Module):
+    """Logits from the mean token embedding of the row plus each position's own."""
+
+    @nn.compact
+    def __call__(self, tokens):
+        embed, position, head = (self.param(name, lambda _, name=name: jnp.asarray(CONTINUATION[name]))
+                                 for name in ("embed", "position", "head"))
+        return (jnp.mean(embed[tokens], axis=1, keepdims=True) + position) @ head
+
+
+def test_a_continuation_draws_the_responses_mdlms_sampler_draws():
+    """MDLM's `_sample` from the prompt and a masked response, for the
+    fixture's steps, and `sample` over the masked process for as many steps
+    with only the response mutable, draw the same distribution of responses:
+    the reveal grid, each step's reveal and token draws and the closing
+    argmax that removes the noise left. The stand-in reads the whole row, so
+    the order positions are revealed in shapes the outcome. The two samples'
+    counts over every response agree by the two-sample chi-square, at a
+    one-in-a-billion false alarm, and the prompt is kept as given."""
+    process = MDLM(mask_id=int(CONTINUATION["embed"].shape[0]) - 1)()
+    prompt, response, rows = CONTINUATION["prompt"], int(CONTINUATION["response"]), int(CONTINUATION["rows"])
+    row = jnp.concatenate([jnp.asarray(prompt, jnp.int32), jnp.full((response,), process.mask_id, jnp.int32)])
+    variables = Reader().init(jax.random.key(0), row[None])
+    mutable = (jnp.arange(row.shape[0]) >= len(prompt))[None]
+    denoise = DiscreteDenoiser(process, Reader(), variables, mutable_mask=mutable)
+    drawn = np.asarray(sample(denoise, jnp.tile(row, (rows, 1)), int(CONTINUATION["steps"]), solver=Unmask(),
+                              key=jax.random.key(5)))
+    np.testing.assert_array_equal(drawn[:, :len(prompt)], np.broadcast_to(prompt, (rows, len(prompt))))
+    index = drawn[:, len(prompt):] @ (process.mask_id ** np.arange(response - 1, -1, -1))
+    ours, theirs = np.bincount(index, minlength=process.mask_id ** response), CONTINUATION["counts"]
+    assert ours.size == theirs.size == 64 and np.all(ours + theirs > 0)
+    statistic = float(np.sum(np.square(ours - theirs) / (ours + theirs)))
+    # scipy.stats.chi2.isf(1e-9, 63): the statistic two samples of one distribution exceed once in a billion.
+    assert statistic < 155.07, statistic
