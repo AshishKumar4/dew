@@ -81,16 +81,17 @@ The first update includes compilation. The run logs a loss at steps 1 and 2 and 
 
 ## Configuration
 
-Every recipe's configuration extends `RunConfig` with four parts:
+Every recipe's configuration extends `RunConfig` with five parts:
 
 | Part | Holds | CLI example |
 | --- | --- | --- |
 | `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | `--model causal_transformer --model.num-layers 12` |
+| `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | `--objective lm --objective.ema-decay 0.999` |
 | `data` | A dataset specification and its loading settings. | `data:token-windows --data.seq-len 16` |
 | `optim` (`OptimConfig`) | Optimizer, learning rate, schedule, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, batch size, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
-A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a dataset type by its alias and makes its flags available. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), not model fields.
+A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a dataset type by its alias and makes its flags available. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. `--objective` works the same way: it picks the objective's class, and each argument of its constructor is a flag, `--objective.<argument>`, except those it takes positionally without a default, which the recipe builds from the model and the data. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), not model fields.
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -110,7 +111,7 @@ Loader workers and threads control how the host reads data; they do not change t
 
 An `epoch` interval needs a dataset with a known size. A stream that cannot save and restore its read position cannot produce a resumable checkpoint, so `fit` refuses a checkpoint interval for it and you have to set `--trainer.checkpoint-every None`. A configured checkpointer still writes the final state.
 
-Muon treats matrix parameters separately from embedding, head and normalization parameters. MuonClip also needs attention QK statistics for its clipping step. The LM recipe turns them on (`qk_stats`) when the optimizer is `muonclip`, and a new objective has to emit them itself. MuonClip clips by rescaling the query and key kernels. A layer that normalizes its queries and keys divides that scale back out of the logits, so MuonClip refuses such a layer. The causal transformer normalizes them by default, so to train it with MuonClip, pass `--optim.optimizer muonclip --model.config '{..., "qk_norm": false}'`.
+Muon treats matrix parameters separately from embedding, head and normalization parameters. MuonClip also needs attention QK statistics for its clipping step. The LM recipe turns them on (`qk_stats`) when the optimizer is `muonclip`, and a new objective has to emit them itself. MuonClip clips by rescaling the query and key kernels. A layer that normalizes its queries and keys divides that scale back out of the logits, so MuonClip refuses such a layer. The causal transformer normalizes them by default, so to train it with MuonClip, pass `--optim.optimizer muonclip --model.no-qk-norm`.
 
 `--optim.state-dtype bfloat16` halves the memory the optimizer state takes. Its effect on step time depends on the device ([Performance measurements](performance.md)).
 
@@ -122,9 +123,9 @@ To train on your own text, replace `corpus.txt` with a UTF-8 file or a directory
 
 For whole documents, tokenize with `--pack` and select `data:packed-tokens`. `--pack` treats each input file as one document and writes the tokenizer's EOS ID after it. The byte tokenizer's EOS is ID 255, a byte that never occurs in UTF-8 text. The packed loader then resets attention boundaries and positions between documents.
 
-`--pretrained` takes a supported Hugging Face model directory, a Hub ID, or `repo@revision` for a branch, tag or commit. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so `--model.config` may hold `max_seq_len` and nothing else. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
+`--pretrained` takes a supported Hugging Face model directory, a Hub ID, or `repo@revision` for a branch, tag or commit. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its fields `--model.max-seq-len` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
 
-The LM recipe's `--objective` takes `lm`, `masked_diffusion` or `block_diffusion`. `masked_diffusion` trains a bidirectional masked-denoising model. With `--pretrained` it continues from a LLaDA or Dream checkpoint. Without it, the model starts from a fresh initialization, and `--model.config` needs `mask_token_id` as well as `causal=False`. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and needs both `--pretrained` and `data:token-windows`. The recipe does not run SFT, DPO or GRPO; those run in Python ([Post-training](concepts/post_training.md)).
+The LM recipe's `--objective` takes `lm`, `masked_diffusion` or `block_diffusion`, each with its own constructor's arguments as flags: `--objective.mtp-weight 0.3` for `LMObjective`, say. `masked_diffusion` trains a bidirectional masked-denoising model, with an EMA (`--objective.ema-decay`, 0.999) unless set to `None`. With `--pretrained` it continues from a LLaDA or Dream checkpoint. Without it, the model starts from a fresh initialization, and needs `--model.mask-token-id` as well as `--model.no-causal`. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and needs both `--pretrained` and `data:token-windows`, and `--objective.prompt-length`, the clean prefix of each row. The recipe does not run SFT, DPO or GRPO; those run in Python ([Post-training](concepts/post_training.md)).
 
 ## Diffusion and JEPA recipes
 
@@ -145,7 +146,33 @@ To train one of these published architectures from scratch, name it with `--mode
 
 `mode:flow-grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--mode.groups` images through the flow SDE and scores them with the image metric named by `--mode.reward`. That metric has to give better images higher scores, as `clip_score` does.
 
-A JEPA configuration adds predictor fields, target-mask settings, an EMA momentum schedule for the target encoder, and optional representation probes. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
+A JEPA configuration adds predictor fields, target-mask settings and optional representation probes; the target encoder's EMA momentum is the objective's (`--objective.momentum 0.996 1.0`), ramped over the whole run unless `--objective.momentum-steps` says otherwise. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
+
+## Python experiments
+
+`dew train` trains a run written in Python, with no recipe. The file builds a `RunConfig`, `run`, or a function `run` returning one, and the objective it names is built around its model:
+
+```python
+from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
+from dew.data import HFOptions, HubDataset
+from dew.inputs import Field, InputSpec
+from dew.objectives.supervised import Accuracy, CrossEntropy
+
+run = RunConfig(
+    model=ModelConfig.from_model(MLP(hidden=32)),
+    data=HubDataset(name="json", options=HFOptions(data_files="rows.jsonl")),
+    objective=ObjectiveConfig("supervised", {
+        "loss": CrossEntropy(), "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
+    trainer=TrainerConfig(steps=300, batch_size=64))
+```
+
+```bash
+dew train experiment.py --set trainer.steps=2000 --set model.hidden=64
+```
+
+Each `--set path=value` changes the field at a dotted path, read as the field's own flag reads it: `trainer.steps=2000` is an int, `trainer.eval_every=None` is None, `objective.momentum=0.9 0.99` is a tuple, and a record (`objective.loss={"function": "pkg.losses:hinge"}`) is JSON. Under `model` and `objective`, a path names a constructor argument of the class the run names. A path the run does not declare is refused. Sweeps override the same paths.
+
+`dew train` imports the file as the module its name names, so the model, loss and metrics it defines are recorded by import path (`experiment:MLP`), and a lambda is refused when the run is saved. Reading a record constructs only what its field declares: a model is a Flax module, an objective an `Objective`, and a loss or metric a function, or a class whose instances are called from Dew, Flax, the experiment's own module or a package `--trust` names. `dew train <checkpoint-dir>/<name>/run.json --trust experiment` rebuilds the run from its record alone, with `experiment.py` importable (`PYTHONPATH`); it continues from the run's checkpoints, or trains it again elsewhere with `--set trainer.checkpoint_dir=...`. A recipe's run, whose configuration extends `RunConfig`, trains through its recipe. [`examples/train_supervised.py`](../examples/train_supervised.py) is a complete experiment.
 
 To run a recipe from Python, call its `main(config)`. The configurations are frozen dataclasses that extend `RunConfig`. You can import `DiffusionRunConfig` from `dew.objectives.diffusion.config`, while `JepaRunConfig` and `LmRunConfig` are defined in the recipe files. A recipe's `main` sets up the process and builds the matching objective and data. The [diffusion](guides/diffusion.md) and [representation learning](guides/representation-learning.md) guides cover task-specific settings.
 

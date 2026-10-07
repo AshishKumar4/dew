@@ -249,7 +249,7 @@ def _chosen(given: list[str], field: str) -> str | None:
     return given.pop(index).removeprefix(f"--{field}").removeprefix("=") or given.pop(index)
 
 
-def _given[C: (ModelConfig, ObjectiveConfig)](start: C, parsed: DataclassInstance,
+def _given[C: (ModelConfig, ObjectiveConfig)](start: C, parsed: "DataclassInstance",
                                               declared: Mapping[str, object]) -> C:
     """`start` with the fields its flags `parsed`: those it started from, and
     those the command line set to something other than the class's default.

@@ -104,21 +104,23 @@ class Train:
         from dew.training import prepare_process
 
         path = Path(self.run)
+        trust = self.trust
         if path.suffix == ".json":
             record = json.loads(path.read_text())
-            registry.import_trusted(record, self.trust)
-            run = RunConfig.from_dict(record)
         else:
             # The file imports as the module its name names, as `python -m`
             # imports one beside it, so a record names what it defines by that
-            # module: `dew train run.json --trust <name>` rebuilds it.
+            # module, which the run trusts: `dew train run.json --trust <name>`.
             sys.path.insert(0, str(path.resolve().parent))
-            run = importlib.import_module(path.stem).run
-            run = run() if callable(run) else run
-        if type(run) is not RunConfig:
-            raise TypeError(f"{self.run}'s run is {run!r}; dew train trains a RunConfig, and a recipe's "
-                            "own config trains through its recipe")
-        run = assigned(run, self.set)
+            built = importlib.import_module(path.stem).run
+            built = built() if callable(built) else built
+            if type(built) is not RunConfig:
+                raise TypeError(f"{self.run}'s run is {built!r}; dew train trains a RunConfig, and a "
+                                "recipe's own config trains through its recipe")
+            record, trust = built.to_dict(), (*trust, path.stem)
+        # What trains is what the record reads back as, so its run.json trains the same run.
+        registry.import_trusted(record, trust)
+        run = assigned(RunConfig.from_dict(record), self.set)
         objective = run.objective
         if objective is None or run.lora is not None:
             raise ValueError("dew train builds the objective the run names around its whole model; "

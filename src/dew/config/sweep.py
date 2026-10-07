@@ -23,7 +23,8 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 import tyro
 
-from dew.registry import Annotation, Configured, _declared_type, models, objectives, wants_tuple
+from dew.records import JSON
+from dew.registry import Annotation, _declared_type, models, objectives, wants_tuple
 from dew.telemetry.records import TrialFinished, json_value
 
 if TYPE_CHECKING:
@@ -51,7 +52,7 @@ class Search(Protocol):
     def __call__(self, space: Space, finished: Sequence[TrialFinished], seed: int) -> Point: ...
 
 
-def override[C: RunConfig](config: C, point: Point) -> C:
+def override[C: RunConfig](config: C, point: Mapping[str, JSON]) -> C:
     """Return `config` with each dotted path in `point` replaced, through its record.
 
     A path walks the run's fields and the fields of the values they hold.
@@ -65,11 +66,20 @@ def override[C: RunConfig](config: C, point: Point) -> C:
         *groups, field = _placed(config, path)[0]
         node = record
         for group in groups:
-            # A field declaring a base or a union records its value's class beside its fields.
-            node = node[group]["fields"] if "class" in node[group] else node[group]
+            node = _within(node, group)
         node[field] = value
         config = type(config).from_dict(record)
     return config
+
+
+def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
+    """The record `node` holds under `key`. A field declaring a base or a
+    union records its value's class beside its fields, and this is the fields."""
+    held = node[key]
+    held = held["fields"] if isinstance(held, dict) and "class" in held else held
+    if not isinstance(held, dict):
+        raise KeyError(f"{key} holds {held!r}, not a record of fields")
+    return held
 
 
 def assigned[C: RunConfig](config: C, assignments: Sequence[str]) -> C:
@@ -116,14 +126,15 @@ def _names(held: DataclassInstance | type[DataclassInstance]) -> set[str]:
     return {field.name for field in dataclasses.fields(held)}
 
 
-def _parsed(path: str, text: str, annotation: Annotation) -> Configured:
-    """`text` as the flag of `annotation` reads it (`assigned`)."""
+def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
+    """`text` as the flag of `annotation` reads it (`assigned`), a tuple as
+    the list its record holds."""
     from dew.config import _scalar
 
     if annotation is not None and _scalar(annotation):
         holder = dataclasses.make_dataclass("Set", [("value", tyro.conf.Positional[annotation])])
         given = shlex.split(text) if wants_tuple(annotation) else [text]
-        return tyro.cli(holder, args=given, prog=f"--set {path}").value
+        return json.loads(json.dumps(tyro.cli(holder, args=given, prog=f"--set {path}").value))
     try:
         return json.loads(text)
     except json.JSONDecodeError:

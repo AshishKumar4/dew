@@ -14,7 +14,28 @@ An `Objective` defines what a run learns. It creates the variables, computes the
 | `optimizer(tx, *, accumulation)` | No | The optimizer the trainer steps `params` with; `tx` by default |
 | `averages(update)` | No | Whether an update moves the EMA; every update by default |
 
-You pass `Trainer` an instance of the objective. A configuration file or a saved run names it by its import path.
+You pass `Trainer` an instance of the objective. A configuration file or a saved run names it by its import path and the constructor arguments it states (`ObjectiveConfig`).
+
+## Supervised
+
+A model trained on a loss over its outputs needs no objective of its own. `Supervised(model, loss, metrics=(), *, inputs)` applies any Flax module to the batch field `inputs.sample` names, and `loss(outputs, batch)` returns one loss per example (any trailing axes are averaged too):
+
+```python
+import optax
+
+from dew import Supervised
+from dew.inputs import Field, InputSpec
+from dew.objectives.supervised import Accuracy
+
+
+def cross_entropy(outputs, batch):
+    return optax.softmax_cross_entropy_with_integer_labels(outputs, batch["label"])
+
+
+objective = Supervised(MLP(), cross_entropy, (Accuracy(),), inputs=InputSpec(Field("x", (2,))))
+```
+
+The loss is the mean over the batch's rows, `Objective.row_mean`, so a validation batch's repeated rows count for nothing. Each metric is called the same way and reported as its own mean, under its function's name or its class's (`accuracy`). A loss or metric is a module-level function or a configured callable object, such as `CrossEntropy(labels="label")`: a run's record names it by import path, and saving a run whose loss is a lambda raises. Reading the record back builds a callable object only of a class from Dew, Flax or a package the reader trusts (`RunConfig.load(directory, trust=("mypackage",))`). [Recipes](../recipes.md#python-experiments) trains this objective from a Python experiment file.
 
 ## init
 

@@ -5,8 +5,12 @@ import dataclasses
 from typing import TYPE_CHECKING
 
 import pytest
+from flax import linen as nn
 
-from dew.registry import Aliases
+from dew import registry
+from dew.config import ModelConfig, ObjectiveConfig
+from dew.inputs import Field, InputSpec
+from dew.registry import Aliases, import_trusted
 
 if TYPE_CHECKING:
     from decimal import Decimal
@@ -123,3 +127,47 @@ def unresolved(size: int) -> Decimal:
 def test_an_annotation_its_module_imports_for_the_checker_alone_is_named():
     with pytest.raises(ValueError, match="unresolved's annotation of return names what"):
         circuits.build("circuit", wiring={"class": path("unresolved"), "fields": {"size": 1}})
+
+
+@dataclasses.dataclass(frozen=True)
+class Scaled:
+    """A configured loss of a package outside Dew."""
+
+    factor: float
+
+    def __call__(self, outputs, batch):
+        return outputs * self.factor
+
+
+def supervised(loss: dict) -> ObjectiveConfig:
+    return ObjectiveConfig("supervised", {"loss": loss, "inputs": InputSpec(Field("x", (3,)))})
+
+
+def test_a_record_constructs_nothing_its_field_does_not_declare(monkeypatch):
+    """A record may name anything imported. A callable field takes a class
+    whose instances are called, of Dew's or a trusted package's, and a model
+    or an objective names a class of that kind. `subprocess.Popen`, imported
+    here, runs its command in its constructor, and each is refused before it
+    is constructed."""
+    import subprocess
+
+    def constructed(self, *args, **kwargs):
+        raise AssertionError("a record constructed subprocess.Popen")
+
+    monkeypatch.setattr(subprocess.Popen, "__init__", constructed)
+    popen = {"class": "subprocess:Popen", "fields": {"args": ["true"]}}
+    with pytest.raises(ValueError, match="whose instances are called"):
+        supervised(popen).build(model=nn.Dense(2))
+    with pytest.raises(ValueError, match="which is no model"):
+        ModelConfig("subprocess:Popen", {"args": ["true"]}).build()
+    with pytest.raises(ValueError, match="which is no objective"):
+        ObjectiveConfig("subprocess:Popen", {"args": ["true"]}).build()
+
+
+def test_a_callable_class_outside_dew_is_built_once_its_package_is_trusted(monkeypatch):
+    monkeypatch.setattr(registry, "_TRUSTED", set(registry._TRUSTED))
+    objective = supervised({"class": path("Scaled"), "fields": {"factor": 2.0}})
+    with pytest.raises(ValueError, match="trusted package"):
+        objective.build(model=nn.Dense(2))
+    import_trusted({}, (__name__.partition(".")[0],))
+    assert objective.build(model=nn.Dense(2)).criterion == Scaled(2.0)
