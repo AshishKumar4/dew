@@ -581,13 +581,13 @@ def _reading(record: Configured | Mapping[str, object]) -> Iterator[None]:
         return
     defined: dict[int, Mapping[str, object]] = {}
 
-    def scan(node: Configured | Mapping[str, object]) -> None:
+    def scan(node) -> None:  # any value a record holds, a record of records or not
         if isinstance(node, Mapping):
             number = _sharing(node)
             if number is not None and "share" in node:
                 if number in defined:
                     raise ValueError(f"the record defines its shared module {number} twice")
-                defined[number] = node
+                defined[number] = {str(key): entry for key, entry in node.items() if key != "share"}
             for entry in node.values():
                 scan(entry)
         elif isinstance(node, (list, tuple)):
@@ -621,8 +621,7 @@ def _shared(annotation: Annotation, value: Mapping[str, object], *, dtypes: bool
     if number not in shared.built:
         if number not in shared.defined:
             raise ValueError(f"the record refers to its shared module {number} and defines none")
-        record = {key: entry for key, entry in shared.defined[number].items() if key != "share"}
-        shared.built[number] = _rebuilt(annotation, record, dtypes=dtypes)
+        shared.built[number] = _rebuilt(annotation, shared.defined[number], dtypes=dtypes)
     return shared.built[number]
 
 
