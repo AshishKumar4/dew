@@ -113,10 +113,14 @@ def _biased_logits(logits, bias):
 def head_table(model: nn.Module, variables) -> OutputTable | None:
     """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
     or None for a model whose head no matrix alone is, or that names none."""
-    return model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    if table is not None and not isinstance(table, OutputTable):
+        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
+                        f"not an OutputTable")
+    return table
 
 
-def reads_states(model: nn.Module) -> bool:
+def reads_states(model) -> bool:
     """Whether `model` scores its final states (`HiddenStates`) through a head
     that takes them: a matrix (`AffineHead`) or its exact head
     (`LogitsFromHidden`). One that does not gives its logits only from its
@@ -124,7 +128,7 @@ def reads_states(model: nn.Module) -> bool:
     return isinstance(model, HiddenStates) and isinstance(model, AffineHead | LogitsFromHidden)
 
 
-def model_logits(model: nn.Module, variables, hidden) -> jax.Array:
+def model_logits(model, variables, hidden) -> jax.Array:
     """`model`'s logits of its final states `hidden` over `variables`: the
     matrix `AffineHead.output_table` gives, contracted as the chunked head
     contracts it (`head_logits`), or the model's exact head
@@ -635,7 +639,7 @@ def chunked_cross_entropy(hidden, head_weight, targets, chunks: int, *,
                          predict=predict)
 
 
-def head_cross_entropy(model: nn.Module, variables, hidden, targets, chunks: int, *,
+def head_cross_entropy(model, variables, hidden, targets, chunks: int, *,
                        tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
                        temperature: float = 1.0, excluded: int | None = None):
     """`chunked_cross_entropy` of `hidden` against `model`'s head over `variables`.

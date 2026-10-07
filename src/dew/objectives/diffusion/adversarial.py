@@ -353,7 +353,7 @@ class AdversarialDistillationObjective(DiffusionObjective):
                                              method == "__call__" and module.name in layers),
                                          mutable=["intermediates"])
         # Flax opens the collection only when a layer was captured.
-        kept = captured.get("intermediates", {})
+        kept = dict(captured).get("intermediates", {})
         missing = [name for name in self.distillation.feature_layers if name not in kept]
         if missing:
             raise ValueError(f"the teacher has no layers {missing} to read features after")
