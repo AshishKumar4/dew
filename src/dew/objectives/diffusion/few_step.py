@@ -32,6 +32,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.protocols import IntervalModel
 from dew.objectives.base import Aux, Step, Variables
 from dew.registry import objectives, trainings
 from dew.sampling.solvers import Euler
@@ -125,6 +126,21 @@ default 16 against 0.002 was MeanFlow 23% against 99%, an sCM student 11%
 against 98.6%."""
 
 
+def _interval_velocity(model: nn.Module, process: Process, method: str, preset: str) -> None:
+    """Refuse what an interval method cannot train: a process other than the
+    unshifted linear path's interval velocity, or a model that embeds no
+    duration (`IntervalModel` with `interval` set)."""
+    schedule = process.schedule
+    if not (process.interval and isinstance(schedule, FlowMatchingScheduler) and schedule.shift == 1.0
+            and isinstance(process.prediction, FlowMatchPredictionTransform)):
+        raise ValueError(f"{method} trains an interval model of velocity on the unshifted linear path; "
+                         f"build the process with {preset}")
+    if not (isinstance(model, IntervalModel) and model.interval):
+        raise TypeError(f"{method} hands its model each interval's duration, and a "
+                        f"{type(model).__name__} embeds none: train an IntervalModel with interval set, "
+                        f"as simple_dit(interval=True)")
+
+
 @trainings("mean_flow")
 @dataclasses.dataclass(frozen=True)
 class MeanFlowTraining(Training):
@@ -210,11 +226,7 @@ class MeanFlowObjective(DiffusionObjective):
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, mean_flow: MeanFlowTraining,
                  **kwargs):
-        schedule = process.schedule
-        if not (process.interval and isinstance(schedule, FlowMatchingScheduler) and schedule.shift == 1.0
-                and isinstance(process.prediction, FlowMatchPredictionTransform)):
-            raise ValueError("MeanFlow trains an interval model of velocity on the unshifted linear "
-                             "path; build the process with presets.MeanFlow")
+        _interval_velocity(model, process, "MeanFlow", "presets.MeanFlow")
         _own_loss("MeanFlow", kwargs)
         kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
@@ -302,11 +314,7 @@ class ShortcutObjective(DiffusionObjective):
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, shortcut: ShortcutTraining,
                  **kwargs):
-        schedule = process.schedule
-        if not (process.interval and isinstance(schedule, FlowMatchingScheduler) and schedule.shift == 1.0
-                and isinstance(process.prediction, FlowMatchPredictionTransform)):
-            raise ValueError("a shortcut model is an interval model of velocity on the unshifted "
-                             "linear path; build the process with presets.Shortcut")
+        _interval_velocity(model, process, "a shortcut model", "presets.Shortcut")
         _own_loss("a shortcut model", kwargs)
         kwargs.setdefault("solver", Euler())
         kwargs.setdefault("steps", 2)
