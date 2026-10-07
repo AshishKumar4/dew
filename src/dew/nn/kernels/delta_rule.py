@@ -31,12 +31,31 @@ WARPS = 8
 
 
 def fits(state: jax.Array) -> bool:
-    """Whether the kernel takes this `[rows, heads, Dk, Dv]` state: CUDA, fp32,
-    and power-of-two widths with Dv a multiple of `BLOCK` (Triton's blocks)."""
+    """Whether the kernel takes this `[rows, heads, Dk, Dv]` state: CUDA, held
+    in fp32 or bf16, and power-of-two widths with Dv a multiple of `BLOCK`
+    (Triton's blocks)."""
     dk, dv = state.shape[-2:]
     power = dk > 0 and dk & (dk - 1) == 0
-    return (jax.default_backend() == "gpu" and state.dtype == jnp.float32 and power
+    return (jax.default_backend() == "gpu" and state.dtype in (jnp.float32, jnp.bfloat16) and power
             and dv % BLOCK == 0 and (dv // BLOCK) & (dv // BLOCK - 1) == 0)
+
+
+def round_to_bf16(state, key, value):
+    """`state` `[..., Dk, Dv]` fp32 rounded to bf16 stochastically: up in
+    magnitude with the probability of the dropped low 16 bits, so a decay
+    smaller than half a bf16 step still moves the state on average, where
+    rounding to nearest would hold it. The noise is a hash of the value's
+    bits and the token's `key` `[..., Dk]` and `value` `[..., Dv]`, so it is
+    deterministic and differs from token to token."""
+    bits = jax.lax.bitcast_convert_type(state, jnp.uint32)
+    salt = (jax.lax.bitcast_convert_type(key, jnp.uint32)[..., :, None] * jnp.uint32(0x9E3779B1)
+            + jax.lax.bitcast_convert_type(value, jnp.uint32)[..., None, :] * jnp.uint32(0x85EBCA77))
+    mixed = bits ^ salt
+    mixed = (mixed ^ (mixed >> 16)) * jnp.uint32(0x7FEB352D)
+    mixed = (mixed ^ (mixed >> 15)) * jnp.uint32(0x846CA68B)
+    mixed = mixed ^ (mixed >> 16)
+    rounded = (bits + (mixed & jnp.uint32(0xFFFF))) & jnp.uint32(0xFFFF0000)
+    return jax.lax.bitcast_convert_type(rounded, jnp.float32).astype(jnp.bfloat16)
 
 
 def _kernel(active_ref, state_ref, query_ref, key_ref, value_ref, decay_ref, beta_ref, state_out, out_ref):
@@ -44,13 +63,15 @@ def _kernel(active_ref, state_ref, query_ref, key_ref, value_ref, decay_ref, bet
 
     @pl.when(active)
     def _():
-        state = state_ref[...]                                   # [Dk, BLOCK]
+        state = state_ref[...].astype(jnp.float32)               # [Dk, BLOCK]
         query, key, decay = query_ref[...], key_ref[...], decay_ref[...]   # [Dk]
         read_key = jnp.sum((key * decay)[:, None] * state, axis=0)          # [BLOCK]
         read_query = jnp.sum((query * decay)[:, None] * state, axis=0)
         delta = (value_ref[...] - read_key) * beta_ref[...]
         out_ref[...] = read_query + jnp.sum(query * key) * delta
-        state_out[...] = state * decay[:, None] + key[:, None] * delta[None, :]
+        updated = state * decay[:, None] + key[:, None] * delta[None, :]
+        state_out[...] = (round_to_bf16(updated, key, value_ref[...]) if state_out.dtype == jnp.bfloat16
+                          else updated.astype(state_out.dtype))
 
     # An idle row's state is neither read nor written: the output aliases it.
     @pl.when(jnp.logical_not(active))
@@ -59,10 +80,12 @@ def _kernel(active_ref, state_ref, query_ref, key_ref, value_ref, decay_ref, bet
 
 
 def step(state, query, key, value, decay, beta, active=None):
-    """`(state', out)` for one token: `state` `[rows, heads, Dk, Dv]` fp32,
-    `query` (already scaled), `key` and `decay` (`exp(g)`, per key dimension)
-    `[rows, heads, Dk]`, `value` `[rows, heads, Dv]`, `beta` `[rows, heads]`,
-    all fp32. The state is updated in place where the caller lets it go.
+    """`(state', out)` for one token: `state` `[rows, heads, Dk, Dv]`, fp32
+    or bf16 and read and written as it is held (a bf16 one rounded by
+    `round_to_bf16`), `query` (already scaled),
+    `key` and `decay` (`exp(g)`, per key dimension) `[rows, heads, Dk]`,
+    `value` `[rows, heads, Dv]`, `beta` `[rows, heads]`, all fp32, which the
+    rule runs in. The state is updated in place where the caller lets it go.
 
     A row `active` `[rows]` marks False draws nothing: its state stays as
     it was without being read, and its output is zeros. A serving step
@@ -81,7 +104,7 @@ def step(state, query, key, value, decay, beta, active=None):
         in_specs=[flagged, held, keyed, keyed, valued, keyed, valued],
         out_specs=[held, valued],
         out_shape=[jax.ShapeDtypeStruct((flat, dk, dv), state.dtype),
-                   jax.ShapeDtypeStruct((flat, dv), state.dtype)],
+                   jax.ShapeDtypeStruct((flat, dv), query.dtype)],
         input_output_aliases={1: 0},
         compiler_params=plgpu.CompilerParams(num_warps=WARPS),
     )(jnp.repeat(jnp.ones(rows, jnp.int32) if active is None else active.astype(jnp.int32), heads)[:, None],
