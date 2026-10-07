@@ -20,11 +20,9 @@ from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
 from dew.inference.tasks import _sized
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import Admitted, ModelInputs
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, as_words, from_words, grouped, is_paged, leaf_name
-from dew.nn.mixers.attention import CausalSelfAttention
-from dew.nn.rope import LongRopeScaling
+from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec
 from dew.objectives.base import Variables
@@ -316,26 +314,18 @@ def _mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement
                    width: int) -> str | None:
     """Why a server's admitting step keeps the prompts' prefill in a forward
     of its own, or None when one mixed forward (`_mixed_step`) runs the model
-    as the two would. `width` is a row's pages in its table."""
-    if not isinstance(model, CausalTransformer):
-        return f"{type(model).__name__} is not a CausalTransformer"
-    if isinstance(model.rope_scaling, LongRopeScaling):
-        return (f'LongRoPE crossing position {model.rope_scaling.original_max_position_embeddings} '
-                'requires separate admission so each request keeps its own table and rebuild history')
+    as the two would. The model answers for its layers (`Serving`),
+    and one that does not keeps the two forwards. `width` is a row's pages
+    in its table."""
+    if not isinstance(model, Serving):
+        return f"{type(model).__name__} does not say its layers run a mixed step (Serving)"
+    refusal = model.mixed_admission_refusal()
+    if refusal is not None:
+        return refusal
     if placement.groups > 1:
         return "its slots split into the mesh's row groups"
-    if prediction_depths(model):
-        return "it runs prediction depths"
     if shapes.decoder.positions is not None:
         return "its rows carry their own rotary positions"
-    if model.position_embedding == "learned" or model.engram is not None or model.hash_layers:
-        return "a learned position embedding, n-gram or hash routing reads beyond the token"
-    owners = _cache_owners(model, params)
-    for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache):
-        owner = owners.get(tuple(str(key.key) for key in path[:-1] if isinstance(key, jax.tree_util.DictKey)))
-        if owner not in MIXED_LAYERS:
-            held_by = "a layer the walk does not reach" if owner is None else owner.__name__
-            return f"{jax.tree_util.keystr(path)} is {held_by}'s, which a mixed step does not run"
     rows = shapes.decoder.logits.shape[0]
     try:
         jax.eval_shape(lambda params, decoder: _mixed_step(
@@ -346,28 +336,6 @@ def _mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement
             raise
         return str(refused)
     return None
-
-
-MIXED_LAYERS: frozenset[type[nn.Module]] = frozenset({CausalSelfAttention})
-"""The layers that run a mixed call (`dew.nn.inputs.Admitted`) as the
-separate decode and prefill calls would; a cache any other layer holds keeps
-the two forwards, since a layer that does not read the metadata would treat
-the step's one row of tokens as one sequence."""
-
-
-def _cache_owners(model: nn.Module, params: Variables) -> dict[tuple[str, ...], type[nn.Module]]:
-    """Each submodule's type by its path, so a cache leaf's holder can be named."""
-    owners: dict[tuple[str, ...], type[nn.Module]] = {}
-
-    def visit(module: nn.Module) -> None:
-        module._try_setup()
-        owners[tuple(module.path)] = type(module)
-        for child in module._state.children.values():
-            if isinstance(child, nn.Module):
-                visit(child)
-
-    visit(model.bind(params))
-    return owners
 
 
 def _probe_admission(width: int) -> Admission:

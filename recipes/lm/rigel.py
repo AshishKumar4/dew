@@ -86,7 +86,7 @@ def optim_config(width: int, steps: int, batch: int, seq_len: int) -> OptimConfi
     boundaries rescaled from 725,000 steps to `steps`."""
     scale = steps / STEPS
     return OptimConfig(
-        optimizer="adamw", optimizer_opts={"b1": 0.9, "b2": 0.95, "eps": 1e-10},
+        optimizer="adamw", b1=0.9, b2=0.95, optimizer_opts={"eps": 1e-10},
         schedule=Power(peak=0.01, warmup_steps=max(round(5_000 * scale), 1),
                        a=4.0 * batch, b=-0.51, c=float(batch * seq_len),
                        tail=PowerTail(start=round(DECAY_START * scale))),

@@ -61,7 +61,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 if TYPE_CHECKING:
     from dew.diffusion.process import Conditioning
-    from dew.objectives.base import Variables
+    from dew.objectives.base import Objective, Variables
 
 QuantizedDtype = Literal["int8", "fp8"]
 """The gemm dtypes a run trains with: int8 on any backend, fp8 where the
@@ -810,16 +810,6 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
 
 
 @runtime_checkable
-class ModelObjective(Protocol):
-    """An objective that trains one module, which is what `--trainer.quantization` can wrap.
-
-    The module is the objective's `model` attribute, and every trace the
-    objective runs reads it from there."""
-
-    model: nn.Module
-
-
-@runtime_checkable
 class _Quantized(Protocol):
     """Marks a module class `Quantization.apply` wrapped: Qwix's subclass of
     the model's own class, and the spec that wrapped it."""
@@ -828,27 +818,28 @@ class _Quantized(Protocol):
     _dew_quantization: ClassVar[Quantization]
 
 
-def _quantize(objective: object, spec: Quantization) -> None:
-    """Quantize the trunk matmuls of the module `objective` trains, in place.
+def _quantize[LossT, EffectsT](objective: Objective[LossT, EffectsT], spec: Quantization) -> None:
+    """Quantize the trunk matmuls of the modules `objective` trains, in place.
 
     This is `RunConfig.train`'s step, not a user's. `Quantization.apply`
     wraps a module before an objective is built, which is what a recipe or
     a script that builds its own model does. A run that names
     `--trainer.quantization` has handed `RunConfig.train` the objective
-    already, so the wrap lands on the objective's own model instead, before
-    anything has initialised or traced it; the wrapped module is a copy of
-    the same class, so what the objective read off the model at construction
-    still holds.
+    already, so the wrap lands on the modules the objective runs instead
+    (`Objective.substitute`), before anything has initialised or traced
+    them; each wrapped module is a copy of the same class, so what the
+    objective read off it at construction still holds. A frozen teacher or
+    reference keeps its own numerics.
 
-    An objective that trains something other than one module has nothing to
-    wrap and is refused by name.
+    An objective that trains no module has nothing to wrap and is refused by name.
     """
-    if not isinstance(objective, ModelObjective):
+    entries = objective.program_key()
+    if not any(entry.trained for entry in entries):
         raise ValueError(
-            f"--trainer.quantization quantizes the module an objective trains, and "
-            f"{type(objective).__name__} keeps no `model`; train an objective that "
-            f"holds one, or leave the quantization unset")
-    objective.model = spec.apply(objective.model)
+            f"--trainer.quantization quantizes the modules an objective trains, and "
+            f"{type(objective).__name__} trains none; train an objective that holds a model, "
+            f"or leave the quantization unset")
+    objective.substitute([spec.apply(entry.module) if entry.trained else entry.module for entry in entries])
 
 
-__all__ = ["ModelObjective", "Quantization"]
+__all__ = ["Quantization"]

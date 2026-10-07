@@ -17,7 +17,7 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.data import DecisionTable, Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
-from dew.decision.model import DecisionModel, Ordered
+from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, Weights, laid_out
@@ -26,12 +26,14 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
+from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
     Batch,
     Objective,
     Omitted,
+    ProgramModule,
     Ratio,
     Source,
     Step,
@@ -221,6 +223,7 @@ class DecisionObjective(Objective[Ratio]):
 
     artifact = Decisions
     saved_task = Decide
+    _held_parts = True
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,
@@ -229,19 +232,20 @@ class DecisionObjective(Objective[Ratio]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0):
         held: Variables | None = None
+        self.image_processor = None
         match backbone:
             case Decide():
                 model, held = backbone.model, backbone.variables
+                self.image_processor = backbone.processor
                 head = head or model.head
                 layout = layout or backbone.layout
                 tokenizer = tokenizer or backbone.tokenizer
                 specials = specials or backbone.specials
                 module = model.backbone
-            case Adapter():
+            case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
-            case Source():
-                module, held = backbone.model, joined({"backbone": backbone.variables})
-                tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
+                if isinstance(backbone, Source):
+                    tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
         if variables is not OMITTED:
@@ -257,7 +261,7 @@ class DecisionObjective(Objective[Ratio]):
             head = DecisionHead(width, dtype=dtype)
         self.model = DecisionModel(module, head)
         if layout is None:
-            if not isinstance(module, Ordered):
+            if not isinstance(module, TokenModel):
                 raise ValueError(f"a {type(module).__name__} does not say whether it reads its tokens in "
                                  "order; pass layout= (StateFirstLayout if it does, MarkerLayout if not)")
             layout = StateFirstLayout() if module.causal else MarkerLayout()
@@ -271,15 +275,27 @@ class DecisionObjective(Objective[Ratio]):
         self.none_of_the_above = none_of_the_above
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
-    def held_variables(self) -> Variables | None:
-        return self.variables
+    def program_key(self) -> tuple[ProgramModule, ...]:
+        """The backbone, then the head, both trained."""
+        return (ProgramModule(self.model.backbone, None, trained=True),
+                ProgramModule(self.model.head, None, trained=True))
 
-    def init(self, key: jax.Array, variables: Variables | None = None) -> Variables:
-        given = self.held_variables() if variables is None else variables
+    def substitute(self, modules: Sequence[nn.Module]) -> None:
+        backbone, head = modules
+        if not isinstance(head, Head):
+            raise TypeError(f"a decision model's second module is its head, not a {type(head).__name__}")
+        self.model = DecisionModel(backbone, head)
+
+    def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
+        """Nothing beyond the held parts: `complete_variables` draws the part the tree lacks."""
+        return held or {}
+
+    def complete_variables(self, key: jax.Array, tree: Variables) -> Variables:
+        """Draw whichever of the backbone and the head `tree` does not hold."""
         backbone_key, head_key = jax.random.split(key)
         tokens = jnp.zeros((1, self.layout.max_len), jnp.int32)
-        parts = {name: part(given, name) for name in ("backbone", "head")
-                 if given is not None and any(name in tree for tree in given.values())}
+        parts = {name: part(tree, name) for name in ("backbone", "head")
+                 if any(name in collection for collection in tree.values())}
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
@@ -314,7 +330,7 @@ class DecisionObjective(Objective[Ratio]):
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:
         inputs = laid_out(batch)
-        weights = params if step.ema is None else step.ema
+        weights = self.evaluation_variables(params, step)
         logits = self._logits(weights, inputs)
         empty = ~jnp.any(inputs.options, axis=-1, keepdims=True)
         probabilities = jax.nn.softmax(jnp.where(empty, 0.0, logits), axis=-1)
@@ -387,11 +403,13 @@ class DecisionObjective(Objective[Ratio]):
         """Return the trained model as a `Decide` task over the state's weights.
 
         A `Decide` encodes with the objective's own tokenizer and layout, so it
-        takes no processor.
+        takes no processor; it reads images with the backbone's own processor,
+        which a task the objective fine-tunes brings.
         """
         if processor is not OMITTED:
             raise TypeError("a Decide task encodes with the objective's tokenizer and takes no processor")
         averaged = not (ema is False or (ema is None and state.ema is None))
         return Decide(self.model, self._pipeline_weights(state, ema), self.layout, self.tokenizer,
-                      self.specials, weights=Weights(int(state.step), averaged))
+                      self.specials, weights=Weights(int(state.step), averaged),
+                      processor=self.image_processor)
 

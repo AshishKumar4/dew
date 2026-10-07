@@ -25,7 +25,6 @@ from dew.objectives.rl.sessions import (
     Status,
     advantages,
     chain_lengths,
-    chains,
     pack,
     rows_needed,
     sampled_values,
@@ -265,14 +264,6 @@ def test_group_advantages_match_hand_computed_values_across_uneven_groups():
     for index, value in enumerate(expected):
         mine = batch[SESSION_INDEX_KEY] == index
         np.testing.assert_allclose(batch[ADVANTAGES_KEY][mine], value, atol=1e-4)
-
-
-def test_chains_report_the_ids_pack_would_place():
-    first = Call((1, 2), (3,), (-.1,), "tool_calls", 0)
-    appended = Call((1, 2, 3, 4), (5,), (-.2,), "stop", 0)
-    rewritten = Call((1, 9), (6,), (-.3,), "stop", 0)
-    session = Session("t", "g", 0, 0, (first, appended, rewritten), Status.COMPLETED, 1.0)
-    assert chains(session, 8) == ((1, 2, 3, 4, 5), (1, 9, 6))
 
 
 @pytest.mark.parametrize("value", [None, "1.0", True, float("nan")])

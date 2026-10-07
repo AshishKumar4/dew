@@ -300,6 +300,135 @@ def test_a_packed_window_scores_as_its_documents_would_one_by_one(rng, monkeypat
 
 
 ############################################################################################################
+# Masked generation runs on what a model reads, not on its class
+############################################################################################################
+
+class Reversed(nn.Module):
+    """A user's own token model, no Dew class: each slot scores how many
+    slots follow it in the row, which it knows only by reading to the end."""
+
+    vocab_size: int = VOCAB
+    max_seq_len: int = 8
+
+    def setup(self):
+        self.scale = self.param("scale", nn.initializers.constant(30.0), ())
+
+    def __call__(self, tokens, **fields):
+        return self.logits(tokens, **fields)
+
+    def logits(self, tokens, *, train=False, **fields):
+        following = tokens.shape[1] - 1 - jnp.arange(tokens.shape[1])
+        return self.scale * jnp.broadcast_to(jax.nn.one_hot(following % MASK, VOCAB), (*tokens.shape, VOCAB))
+
+
+class Mirrored(Reversed):
+    """`Reversed`, saying that it reads the whole row (`TokenModel`)."""
+
+    causal: bool = False
+    mask_token_id: int | None = None
+
+
+def test_a_user_bidirectional_model_fills_a_masked_response():
+    """Masked generation needs full-sequence logits that read the whole row,
+    not a CausalTransformer: a user module that says so fills each response
+    slot with what it scores there, the slots after it."""
+    from dew.inference import MaskedGeneration
+
+    model = Mirrored()
+    task = MaskedGeneration(model, model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
+                            DiscreteProcess(LogLinear(), mask_id=MASK), steps=8)
+    generated = task([[1, 2, 3], [4, 5, 0]], 4, key=0)
+    np.testing.assert_array_equal(generated.tokens, [[1, 2, 3, 3, 2, 1, 0], [4, 5, 0, 3, 2, 1, 0]])
+    np.testing.assert_array_equal(generated.lengths, [4, 4])
+
+
+@pytest.mark.parametrize("model,lacks", [
+    (transformer(causal=True), "this CausalTransformer is causal"),
+    (Reversed(), r"this Reversed does not say whether a position reads the ones after it \(TokenModel\)"),
+    (Peaked(), r"this Peaked gives no full-sequence logits \(Logits\)")])
+def test_masked_generation_names_what_a_model_lacks(rng, model, lacks):
+    """A causal decoder has every capability masked generation reads but one
+    of its positions never sees the masked ones after it; a model that does
+    not say how it reads, or gives no full-sequence logits, is refused for
+    that, by name."""
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    with pytest.raises(ValueError, match=f"requires a bidirectional model, and {lacks}"):
+        process.generate(model, model.init(rng, jnp.zeros((1, 4), jnp.int32)), [[1, 2]], 3, key=0)
+
+
+class FieldReader(nn.Module):
+    """A user's bidirectional model that spells out what each slot is handed:
+    a text slot scores its logical position, one past it when the row
+    carries pixels, and a media slot scores 14."""
+
+    vocab_size: int = 16
+    max_seq_len: int = 16
+    causal: bool = False
+    mask_token_id: int | None = None
+
+    def setup(self):
+        self.scale = self.param("scale", nn.initializers.constant(30.0), ())
+
+    def __call__(self, tokens, **fields):
+        return self.logits(tokens, **fields)
+
+    def logits(self, tokens, *, train=False, positions=None, image_indices=None, conditioning=None,
+               **fields):
+        text = (positions + (conditioning is not None)) % 14
+        target = text if image_indices is None else jnp.where(image_indices < 0, text, 14)
+        return self.scale * jax.nn.one_hot(target, self.vocab_size)
+
+
+def test_a_masked_response_continues_the_prompts_fields_and_keeps_its_media():
+    """A media prompt fills a masked response too (`ModelInputs.extended`):
+    the response's slots are text at the logical positions after the
+    prompt's last real token, and the row keeps its pixels. Each row here
+    reads back as its next positions, shifted by the pixels it holds; a
+    left-padded row with an image continues from its own positions."""
+    from dew.nn.inputs import ModelInputs
+
+    model = FieldReader()
+    inputs = ModelInputs(jnp.array([[0, 1, 3], [2, 4, 6]]),
+                         {"attention_mask": jnp.array([[False, True, True], [True, True, True]]),
+                          "positions": jnp.array([[0, 7, 8], [0, 1, 2]]),
+                          "image_indices": jnp.array([[-1, 0, -1], [-1, -1, -1]])},
+                         {"pixel_values": jnp.ones((2, 1, 3, 2, 2))})
+    variables = model.init(jax.random.key(0), inputs.tokens, **inputs.kwargs())
+    generated = DiscreteProcess(LogLinear(), mask_id=15).generate(model, variables, inputs, 3, key=0, steps=4)
+    np.testing.assert_array_equal(generated.tokens, [[0, 1, 3, 10, 11, 12], [2, 4, 6, 4, 5, 6]])
+    unruled = ModelInputs(inputs.tokens, {"token_type_ids": jnp.zeros((2, 3), jnp.int32)})
+    with pytest.raises(ValueError, match=r"cannot extend token fields \['token_type_ids'\]"):
+        DiscreteProcess(LogLinear(), mask_id=15).generate(model, variables, unruled, 3, key=0)
+
+
+def test_a_bidirectional_media_wrapper_fills_a_response_after_an_image():
+    """A multimodal wrapper around a bidirectional decoder answers the same
+    capabilities its decoder does, so it fills a masked response after an
+    image prompt: the prompt stays, and the response holds real tokens."""
+    from dew.inference import MaskedGeneration
+    from dew.nn.inputs import ModelInputs
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+
+    text = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                             mlp_features=32, max_seq_len=16, causal=False, mask_token_id=31)
+    model = MultimodalTransformer(
+        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                           image_size=8, patch_size=4),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1)
+    tokens = jnp.array([[2, 1, 3, 4]])
+    inputs = ModelInputs(tokens, {"image_indices": jnp.where(tokens == 1, 0, -1)},
+                         {"pixel_values": jnp.linspace(-0.5, 0.5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8)})
+    task = MaskedGeneration(model, model.init(jax.random.key(0), tokens, **inputs.kwargs()),
+                            DiscreteProcess(LogLinear(), mask_id=31), steps=4)
+    generated = task(inputs, 5, key=0).host()
+    np.testing.assert_array_equal(generated.tokens[:, :4], tokens)
+    assert generated.tokens.shape == (1, 9) and not np.any(generated.tokens == 31)
+    np.testing.assert_array_equal(generated.lengths, [5])
+
+
+############################################################################################################
 # A masked diffusion LM trains on the LM data path with no trainer change
 ############################################################################################################
 

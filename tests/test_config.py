@@ -27,7 +27,7 @@ def test_to_dict_and_from_dict_round_trip_a_run():
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
         data=datasets["tfds_images"](image_size=64),
-        optim=OptimConfig(optimizer="muon", learning_rate=1e-3, weight_decay=0.1),
+        optim=OptimConfig(optimizer="lamb", learning_rate=1e-3, weight_decay=0.1, b1=0.8, b2=0.99),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
     )
