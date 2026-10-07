@@ -618,146 +618,36 @@ def dtype_name(value: DTypeLike | None) -> DtypeName | None:
     raise ValueError(f"{value!r} is not a dtype a config can name")
 
 
-# The flag each precision field is set by, for the error a model config that
-# carries one of them raises.
-_PRECISION_FLAGS = {"dtype": "--model.dtype", "attention_impl": "--model.attention-impl",
-                    "param_dtype": "--model.param-dtype",
-                    "precision": "--model.matmul-precision"}
+def with_dtype(name: str, fields: Mapping[str, object], dtype: str | None) -> Mapping[str, object]:
+    """`fields`, the model `name` builds from, computing in `dtype`.
 
+    The dtype is written into the model's own `dtype` field, or, for a
+    composite that declares none (DiffusionGemma around its text decoder),
+    into each model part it holds that declares one, as a record or built.
+    A model with neither refuses a dtype. None leaves `fields` as they are."""
+    from flax import linen as nn
 
-class PrecisionFields(TypedDict, total=False):
-    """Names what a run's precision settings write into a model config.
-
-    Only the keys the named member declares are written, so the bag is
-    partial by construction; `attention_configs` is the UNets' per-stage
-    settings, which carry the dtype into each stage a config named. Its
-    entries are a stage record, a built `Stage` or None, which is what a
-    model config carries and what `build` narrows against the field.
-    """
-
-    dtype: str | None
-    attention_impl: str
-    param_dtype: str
-    precision: str
-    attention_configs: list[object]
-
-
-def precision_fields(name: str, config: Mapping[str, object], *,
-                     dtype: str | None, attention_impl: str, param_dtype: str | None = None,
-                     matmul_precision: str | None = None) -> PrecisionFields:
-    """Return the run's compute dtype and attention kernel as the fields a model takes.
-
-    `with_precision` is the same settings merged into the config they belong
-    to; this is them on their own, for a caller holding a typed field bag.
-
-    `attention_impl` is an `AttentionImpl` and travels as it is written; the
-    kernel resolves 'auto' against each call, so the name a run recorded is
-    the name the model holds.
-
-    `dtype` is the compute dtype; `param_dtype` is where the parameters are
-    stored and `matmul_precision` what every matmul asks XLA for. Each is
-    written into the field the model declares for it (`dtype`, `param_dtype`,
-    `precision`), and a run that names neither of the last two writes
-    neither. Unset, parameters stay float32 and the model keeps its own
-    precision. A setting the model declares no field for raises ValueError
-    naming the model and the field, since the run would not compute as it
-    says; a composite that declares no `dtype` takes the run's dtype when a
-    registered part in its config declares one (`with_precision`).
-
-    The UNets keep per-stage attention settings in `attention_configs`,
-    which do not inherit the model dtype and default `force_fp32_for_softmax`
-    off, which no fused kernel can honour, so the knobs reach into them.
-
-    A stage arrives either way: as a record, whose `dtype` name `build`
-    resolves at the boundary with every other field, or as a built `Stage`,
-    which nothing resolves afterwards, so its dtype is resolved here. The two
-    agree once built, which `tests/test_models.py` asserts.
-    """
-    member = models[name]
-    declared = {f.name for f in dataclasses.fields(member) if f.init}
-    named = {"dtype": dtype, "param_dtype": param_dtype, "precision": matmul_precision}
-    unreached = [field for field, value in named.items() if value is not None and field not in declared
-                 and not (field == "dtype" and any(_part_takes_dtype(member, key, configured(part))
-                                                    for key, part in config.items()))]
-    if unreached:
-        settings = ", ".join(f"{_PRECISION_FLAGS[field]} {named[field]}" for field in unreached)
-        raise ValueError(
-            f"the model {name!r} declares no {' or '.join(unreached)} field, so the run's {settings} "
-            f"would not reach it; set {', '.join(_PRECISION_FLAGS[field] for field in unreached)} "
-            f"to None")
-    written: PrecisionFields = {}
-    if "dtype" in declared:
-        written["dtype"] = dtype
-    if "attention_impl" in declared:
-        written["attention_impl"] = attention_impl
-    if param_dtype is not None and "param_dtype" in declared:
-        written["param_dtype"] = param_dtype
-    if matmul_precision is not None and "precision" in declared:
-        written["precision"] = matmul_precision
-    duplicate = sorted(set(config) & set(written))
-    if duplicate:
-        raise ValueError(
-            f"the model config carries {duplicate}, which the run's precision "
-            f"settings own; set {', '.join(_PRECISION_FLAGS[held] for held in duplicate)} instead")
-    fields: PrecisionFields = {**written}
-    stages = {f.name: f for f in dataclasses.fields(member)}.get("attention_configs")
-    if stages is not None:
-        carried = config.get("attention_configs", stages.default)
-        if not isinstance(carried, (list, tuple)):
-            raise ValueError(
-                f"attention_configs is {carried!r}; a unet takes one entry per "
-                f"resolution stage, each a record, a Stage, or None for a stage "
-                f"that does not attend")
-        resolved: list[object] = []
-        for stage in carried:
-            if stage is None:
-                resolved.append(None)
-            elif isinstance(stage, Mapping):
-                resolved.append({**stage, "dtype": dtype, "force_fp32_for_softmax": True})
-            elif dataclasses.is_dataclass(stage) and not isinstance(stage, type):
-                resolved.append(dataclasses.replace(
-                    stage, dtype=resolve_dtype(dtype), force_fp32_for_softmax=True))
-            else:
-                raise ValueError(
-                    f"attention_configs carries {stage!r}; a stage is a record or "
-                    f"a Stage")
-        fields["attention_configs"] = resolved
-    return fields
-
-
-def float64_twin(config: Mapping[str, object]) -> Mapping[str, object]:
-    """`config`, a model config `with_precision` wrote, computing in float64:
-    its dtype and the dtype `precision_fields` wrote into each stage of the
-    UNets' `attention_configs`, the only nested dtypes the policy writes.
-    Under x64 the model computes in float64 throughout
-    (`dew.nn.precision.at_least_fp32`): the twin a float64 reference runs. A
-    run's dtype knob names no float64; only a reference computes in it."""
-    twin: dict[str, object] = {**config, "dtype": jnp.float64}
-    stages = config.get("attention_configs")
-    if isinstance(stages, list | tuple):
-        twin["attention_configs"] = [
-            {**stage, "dtype": jnp.float64} if isinstance(stage, Mapping)
-            else dataclasses.replace(stage, dtype=jnp.float64)
-            if dataclasses.is_dataclass(stage) and not isinstance(stage, type) else stage
-            for stage in stages]
-    return twin
-
-
-def with_precision(name: str, config: Mapping[str, object], *,
-                   dtype: str | None, attention_impl: str, param_dtype: str | None = None,
-                   matmul_precision: str | None = None) -> Mapping[str, object]:
-    """Return a model config with the run's compute dtype and attention kernel in it.
-
-    A composite that declares no `dtype` of its own, such as DiffusionGemma
-    around its text decoder, passes the run's compute dtype on to the
-    registered model parts nested in its record that declare one."""
-    fields = {**config, **precision_fields(
-        name, config, dtype=dtype, attention_impl=attention_impl,
-        param_dtype=param_dtype, matmul_precision=matmul_precision)}
-    member = models[name]
-    if dtype is None or "dtype" in {field.name for field in dataclasses.fields(member)}:
+    if dtype is None:
         return fields
-    return {key: _with_part_dtype(member, key, configured(value), dtype) for key, value in fields.items()}
+    member = models[name]
+    if isinstance(member, type) and "dtype" in {field.name for field in dataclasses.fields(member)}:
+        return {**fields, "dtype": dtype}
+    assert isinstance(member, type)
+    parts = {}
+    for key, value in fields.items():
+        part = _part_type(member, key, configured(value))
+        if part is None or "dtype" not in {field.name for field in dataclasses.fields(part)}:
+            continue
+        if isinstance(value, nn.Module):
+            parts[key] = value.clone(dtype=resolve_dtype(dtype))
+        elif isinstance(value, Mapping) and (named := _class_record(value)) is not None:
+            parts[key] = {"class": named[0], "fields": {**named[1], "dtype": dtype}}
+        elif isinstance(value, Mapping):
+            parts[key] = {**value, "dtype": dtype}
+    if not parts:
+        raise ValueError(f"{member.__qualname__} declares no dtype field and holds no part that does, so "
+                         f"it cannot compute in {dtype}")
+    return {**fields, **parts}
 
 
 def _part_type(member: type, field: str, value: Configured) -> type | None:
@@ -775,29 +665,6 @@ def _part_type(member: type, field: str, value: Configured) -> type | None:
     if isinstance(value, Mapping) and isinstance(declared, type) and issubclass(declared, nn.Module):
         return declared
     return None
-
-
-def _part_takes_dtype(member: type, field: str, value: Configured) -> bool:
-    """Whether a composite's `field` is a model, recorded or built, that
-    declares a compute dtype."""
-    held = _part_type(member, field, value)
-    return held is not None and "dtype" in {f.name for f in dataclasses.fields(held)}
-
-
-def _with_part_dtype(member: type, field: str, value: Configured, dtype: str) -> Configured:
-    """A composite's part with the run's compute dtype, where the part is a
-    model, recorded or built, that declares one."""
-    from flax import linen as nn
-
-    if not _part_takes_dtype(member, field, value):
-        return value
-    if isinstance(value, nn.Module):
-        return value.clone(dtype=resolve_dtype(dtype))
-    assert isinstance(value, Mapping)
-    named = _class_record(value)
-    if named is not None:
-        return {"class": named[0], "fields": {**named[1], "dtype": dtype}}
-    return {**{str(key): configured(entry) for key, entry in value.items()}, "dtype": dtype}
 
 
 # Each kind's aliases, for the command line and the records a person writes.
@@ -991,5 +858,5 @@ __all__ = [
     "solvers",
     "to_record",
     "towers",
-    "with_precision",
+    "with_dtype",
 ]
