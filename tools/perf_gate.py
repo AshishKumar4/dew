@@ -65,7 +65,9 @@ state = jax.block_until_ready(jax.jit(trainer.initial_state, out_shardings=shard
 template = jax.tree.map(lambda leaf, where: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=where),
                         abstract, shardings)
 saves, restores = [], []
-for step in range(1, 4):
+# A train state is checkpointed under its own step, which a restore checks.
+step = int(state.step)
+for _ in range(3):
     with tempfile.TemporaryDirectory() as directory:
         checkpoints = Checkpoints(directory)
         started = time.perf_counter()
@@ -153,6 +155,8 @@ def measure(tree: Path, args: argparse.Namespace, newer: Path) -> dict[str, floa
     with tempfile.TemporaryDirectory() as scratch:
         out = Path(scratch) / "out.json"
         for names, tool, argv, read in _probes(args, out):
+            if args.only and not any(word in name for name in names for word in args.only):
+                continue
             try:
                 values = read(_run(tree, tool, argv, newer, 3600))
                 sample.update({name: float(values[name]) for name in names})
@@ -165,7 +169,8 @@ def measure(tree: Path, args: argparse.Namespace, newer: Path) -> dict[str, floa
 def run(args: argparse.Namespace) -> int:
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
-    results = {"base": base, "head": head, "rows": [row.__dict__ for row in BATTERY],
+    rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)]
+    results = {"base": base, "head": head, "rows": [row.__dict__ for row in rows],
                "samples": {base: [], head: []}}
     for round_ in range(args.rounds):
         order = [(base, base_path), (head, head_path)]
@@ -228,6 +233,8 @@ def main() -> int:
     running.add_argument("--model", required=True, help="a local Qwen3-0.6B snapshot")
     running.add_argument("--flowers", required=True, help="the TFDS oxford_flowers102 directory")
     running.add_argument("--out", required=True)
+    running.add_argument("--only", nargs="*", default=[],
+                         help="measure only the rows whose names hold one of these words")
     reporting = operations.add_parser("report")
     reporting.add_argument("results")
     reporting.add_argument("--table")
