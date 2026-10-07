@@ -265,7 +265,7 @@ class TextToImage:
                                                                                'autoencoder')
         compute = dtype_name(resolve_dtype(dtype))
         if compute is not None:
-            config = replace(config, dtype=compute)
+            config = config.with_dtype(compute)
             conditions = {keyword: fields(condition, keyword) for keyword, condition
                           in fields(inputs_record['conditions'], 'conditions').items()}
             inputs_record = {**inputs_record, 'conditions': {

@@ -62,6 +62,7 @@ ATTENTION = {"heads": 8}
 DEFAULT_MODEL_CONFIG = {
     "attention_configs": [None, ATTENTION, ATTENTION, ATTENTION],
     "precision": "default",
+    "dtype": "bfloat16",
 }
 
 
@@ -294,10 +295,14 @@ class DiffusionRunConfig(RunConfig):
         self.mode.check(self)
 
         if self.pretrained is not None:
+            # The pipeline's own denoiser trains; the model flags it reads are
+            # its compute dtype and attention kernel.
             scratch = ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG))
+            reads = ("dtype", "attention_impl")
             chosen = [name for name, named in (
-                ("model.architecture", self.model.architecture != scratch.architecture),
-                ("model.config", self.model.config != scratch.config),
+                ("model", self.model.name != scratch.name or any(
+                    self.model.fields.get(key) != scratch.fields.get(key)
+                    for key in set(self.model.fields) | set(scratch.fields) if key not in reads)),
                 ("text", self.text not in (None, TextCondition())),
                 ("audio", self.audio is not None),
                 ("autoencoder", self.autoencoder is not None)) if named]
@@ -358,16 +363,16 @@ class DiffusionRunConfig(RunConfig):
         process, and MeanFlow, whose loss differentiates in time, turns a `TimeScaled`
         model's time features at `SMOOTH_TIME_SCALE` unless `model.config` names a scale.
         """
-        fields = dict(self.model.fields())
-        if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.architecture])}:
+        fields = dict(self.model.fields)
+        if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.name])}:
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
-        model = models.build(self.model.architecture, fields)
+        model = models.build(self.model.name, fields)
         if isinstance(model, IntervalModel) and self.preset is not None:
             built = self.preset()
             fields["interval"] = isinstance(built, Process) and built.interval
         if isinstance(self.mode, MeanFlowTraining) and isinstance(model, TimeScaled) \
-                and "time_scale" not in self.model.config:
+                and "time_scale" not in self.model.fields:
             fields["time_scale"] = SMOOTH_TIME_SCALE
         return fields
 
@@ -494,12 +499,12 @@ class DiffusionRunConfig(RunConfig):
             keyword = encoders[self.context.encoder].keyword
             params = None if variables is None else variables["encoders"][keyword]
             if self.text is not None:
-                conditions[keyword] = self.text.build(params=params, dtype=self.model.dtype)
+                conditions[keyword] = self.text.build(params=params, dtype=self._compute)
             else:
                 # __post_init__ holds audio to a VideoDataset.
                 assert self.audio is not None and isinstance(self.data, VideoDataset)
-                conditions[keyword] = self.audio.build(self.data, params=params, dtype=self.model.dtype)
-        model = models.build(self.model.architecture, self.model_fields(autoencoder))
+                conditions[keyword] = self.audio.build(self.data, params=params, dtype=self._compute)
+        model = models.build(self.model.name, self.model_fields(autoencoder))
         return model, conditions, autoencoder
 
     def _autoencoder_params(self, variables: Variables) -> Variables:
@@ -510,6 +515,13 @@ class DiffusionRunConfig(RunConfig):
             return variables["params"][AUTOENCODER]
         return variables["autoencoder"]
 
+    @property
+    def _compute(self) -> str | None:
+        """The compute dtype the model's record names, which the text and audio
+        encoders and a pretrained pipeline compute in too."""
+        held = self.model.fields.get("dtype")
+        return None if held is None else str(held)
+
     def _source(self, variables: Variables | None):
         """The `pretrained` pipeline at the data's resolution: its own
         weights, or `variables` bound over its metadata."""
@@ -518,9 +530,9 @@ class DiffusionRunConfig(RunConfig):
         assert self.pretrained is not None
         name, revision = split_revision(self.pretrained)
         return load_diffusion_source(
-            name, revision=revision, dtype=self.model.dtype or "bfloat16",
-            param_dtype=self.model.param_dtype or "float32",
-            attention_impl=self.model.attention_impl, size=self.sample_field().shape[:-1],
+            name, revision=revision, dtype=self._compute or "bfloat16", param_dtype="float32",
+            attention_impl=str(self.model.fields.get("attention_impl", "auto")),
+            size=self.sample_field().shape[:-1],
             variables=variables)
 
     def _process(self, convention: Process | None) -> Process:

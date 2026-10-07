@@ -39,7 +39,7 @@ import numpy as np
 
 from dew import records
 from dew.interop import hf_decoders as decoders, sources
-from dew.registry import models, with_precision
+from dew.registry import models
 
 if TYPE_CHECKING:
     import torch
@@ -301,8 +301,7 @@ def _built(model_type: str, convention: str, family: decoders.DecoderFamily,
     """A candidate's model at the probe's sizes, its record, the fields it
     left unread and its parameter count."""
     record, inert = _translate({**fields, 'model_type': model_type}, convention, family)
-    model = models.build("causal_transformer", with_precision(
-        "causal_transformer", record, dtype="float32", attention_impl="reference"))
+    model = models.build("causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"})
     try:
         template = jax.eval_shape(lambda: model.init(jax.random.PRNGKey(0), jnp.zeros((1, 2), jnp.int32)))
     except ValueError as error:

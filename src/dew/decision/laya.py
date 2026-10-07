@@ -31,7 +31,7 @@ from dew.interop.weights import translate_parameters
 from dew.lora import FACTORS
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables, joined, part, thaw
-from dew.registry import from_record, with_precision
+from dew.registry import from_record
 
 # Laya's head, as nn.TransformerEncoderLayer and its nn.Sequential scorer name it.
 _HEAD = re.compile(r"head\.layers\.(\d+)\.(.+)")
@@ -149,8 +149,8 @@ class LayaCheckpoint:
         # The encoder ships ModernBertModel's tensors under a masked-LM config.
         for field in ("head_transform", "head_bias"):
             record.pop(field, None)
-        backbone = from_record(CausalTransformer, with_precision(
-            "causal_transformer", record, dtype=dtype, attention_impl=attention_impl))
+        backbone = from_record(CausalTransformer,
+                               {**record, "dtype": dtype, "attention_impl": attention_impl})
         head = DecisionHead(features=backbone.emb_features,
                             layers=records.integer(config.get("head_layers", 2), "head_layers"),
                             dtype=backbone.dtype, attention_impl=attention_impl)

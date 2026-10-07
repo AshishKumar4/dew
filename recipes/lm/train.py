@@ -117,7 +117,7 @@ def context_length(config: LmRunConfig, samples: Samples | None) -> int:
 def model_fields(config: LmRunConfig, vocab_size: int, max_seq_len: int) -> dict:
     """The fields the registry builds the model from."""
     # Data decides the vocabulary. Training and sampling decide the context.
-    return {**config.model.fields(), "max_seq_len": max_seq_len, "vocab_size": vocab_size}
+    return {**config.model.fields, "max_seq_len": max_seq_len, "vocab_size": vocab_size}
 
 
 def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: int,
@@ -128,8 +128,9 @@ def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: in
     reference returned pins a Hub repo to the commit it resolved to, so the
     run.json that records it names those exact weights.
 
-    The checkpoint decides every architecture field, so the only thing
-    --model.config may still say is how far the KV cache reaches. The fields
+    The checkpoint decides every architecture field, so the model flags may
+    still say only how far the KV cache reaches, the compute dtype and the
+    attention kernel. The fields
     that come back are dew's, not the checkpoint's, so a pretrained run logs
     the same vocabulary a fresh one does, compute dtype and kernel included.
     The tokenizer of the token files has to be the one the checkpoint was
@@ -138,20 +139,22 @@ def pretrained_source(pretrained: str, model_config: ModelConfig, vocab_size: in
     """
     from dew.interop import Pretrained, split_revision
 
-    overridden = sorted(set(model_config.config) - {"max_seq_len"})
+    choices = ("max_seq_len", "dtype", "attention_impl")
+    overridden = sorted(set(model_config.fields) - set(choices))
     if overridden:
         raise ValueError(
-            f"--model.config carries {overridden}, which the checkpoint at "
-            f"{pretrained} decides. Only max_seq_len is still a choice.")
+            f"--model sets {overridden}, which the checkpoint at {pretrained} decides. "
+            f"Only {', '.join(choices)} are still choices.")
 
-    context = model_config.config.get("max_seq_len", max_seq_len)
+    context = model_config.fields.get("max_seq_len", max_seq_len)
     if context is not None and not isinstance(context, int):
         raise ValueError(
-            f"--model.config max_seq_len is {context!r}; the context a checkpoint "
+            f"--model.max_seq_len is {context!r}; the context a checkpoint "
             f"is reloaded at is a number of tokens")
     name, revision = split_revision(pretrained)
     loaded = Pretrained.load(
-        name, dtype=model_config.dtype, attention_impl=model_config.attention_impl,
+        name, dtype=model_config.fields.get("dtype"),
+        attention_impl=str(model_config.fields.get("attention_impl", "auto")),
         max_seq_len=context, revision=revision)
     if not same_vocabulary(str(meta["tokenizer"]), loaded, name):
         raise ValueError(
@@ -210,7 +213,7 @@ def run_summary(config: LmRunConfig, fields: Mapping[str, object]) -> dict:
     """Flat view of the run, for the tracker."""
     return {
         **fields,
-        "architecture": config.model.architecture,
+        "architecture": config.model.label,
         "dataset": read_corpora(config.data),
         "sequence_length": config.data.seq_len,
         "tokenizer": config.tokenizer,
@@ -292,7 +295,7 @@ def main(config: LmRunConfig) -> TrainState:
     source = None
     if config.pretrained is None:
         fields = model_fields(config, vocab_size, context)
-        model = models.build(config.model.architecture, **fields)
+        model = models.build(config.model.name, **fields)
     else:
         source, reference = pretrained_source(
             config.pretrained, config.model, vocab_size, context, meta)

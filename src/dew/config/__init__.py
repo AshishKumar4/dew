@@ -18,8 +18,10 @@ file lacks takes its declared default, and a field the class does not have
 raises an error.
 """
 
+import copy
 import dataclasses
 import datetime
+import functools
 import hashlib
 import json
 import os
@@ -46,7 +48,6 @@ from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import Reader, ramped, record_argument
 from dew.lora import LoRA, _Adapted, adapted
-from dew.nn.attention import AttentionImpl
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import _declared_type, datasets, from_record, models, schedules, to_record
@@ -130,11 +131,19 @@ class ModelConfig:
         if isinstance(model_type, _Quantized):
             quantization = model_type._dew_quantization
             model_type = model_type._unquantized_type
-        fields = {field.name: to_record(getattr(model, field.name), _declared_type(model_type, field.name))
-                  for field in dataclasses.fields(model)
-                  if field.init and field.name not in ('parent', 'name')
-                  and not (callable(getattr(model, field.name)) and getattr(model, field.name) is field.default)}
+        fields = {}
+        for field in dataclasses.fields(model):
+            value = getattr(model, field.name)
+            if field.init and field.name not in ('parent', 'name') and not (
+                    callable(value) and value is field.default):
+                fields[field.name] = to_record(value, _declared_type(model_type, field.name))
         return cls(registry.import_path(model_type), fields, adapter=adapter, quantization=quantization)
+
+    @property
+    def label(self) -> str:
+        """The model's alias, or its class's name where it has none, for a run's name."""
+        return next((alias for alias, path in models.paths.items() if path == self.name),
+                    self.name.rpartition(":")[2])
 
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
@@ -149,19 +158,20 @@ class ModelConfig:
 
 
 def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, dict[str, object]]:
-    """A dataclass of `member`'s own fields, one optional flag each, defaulting
-    to `given` over the class's defaults, and those class defaults.
+    """A dataclass of `member`'s own fields, one flag each, defaulting to
+    `given` over the class's defaults, and those class defaults.
 
     Scalars, literals and tuples of them are typed as declared; dtypes read
     their names and precision its level. Any other field (a sequence of
-    records, a nested model) takes one JSON value, the record `build` reads."""
+    records, a nested model) takes one JSON value, the record `build` reads.
+    A field with no default also takes None, for leaving it to the recipe."""
     flags, defaults = [], {}
     for field in dataclasses.fields(member):
         if not field.init or field.name in ("parent", "name"):
             continue
         declared = (field.default if field.default is not dataclasses.MISSING
-                    else field.default_factory() if field.default_factory is not dataclasses.MISSING else None)
-        annotation = _declared_type(member, field.name)
+                    else field.default_factory() if callable(field.default_factory) else None)
+        annotation = registry.resolve_alias(_declared_type(member, field.name))
         if field.name in ("dtype", "param_dtype"):
             flag = registry.DtypeName | None
             declared = None if declared is None else registry.dtype_name(declared)
@@ -169,35 +179,38 @@ def _model_flags(member: type, given: Mapping[str, object]) -> tuple[type, dict[
             flag = Literal["default", "high", "highest"] | None
             declared = None if declared is None else str(declared).lower().removeprefix("precision.")
         elif _scalar(annotation):
-            flag = annotation | None
+            flag = annotation if declared is not None else annotation | None
         else:
             flag = Annotated[object, _JSON_FLAG]
             try:
-                declared = json_value(to_record(declared, annotation), field.name)
+                declared = json.loads(json.dumps(to_record(declared, annotation)))
             except (TypeError, ValueError):
-                continue
+                continue  # a field no record carries keeps its class default
         defaults[field.name] = declared
-        flags.append((field.name, flag, dataclasses.field(default=given.get(field.name, declared))))
+        value = given.get(field.name, declared)
+        copied = functools.partial(copy.deepcopy, value)
+        flags.append((field.name, flag, dataclasses.field(default_factory=copied)))
     return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), defaults
 
 
 def _scalar(annotation: object) -> bool:
     """Whether tyro reads `annotation` as one typed flag: a bool, number,
     string, literal or enum, a tuple of those, or an optional one."""
-    annotation = registry.resolve_alias(annotation)
     origin = typing.get_origin(annotation)
     if origin in (Union, types.UnionType):
         return all(_scalar(member) for member in typing.get_args(annotation) if member is not type(None))
     if origin is Literal:
         return True
     if origin in (tuple, Sequence):
-        return all(_scalar(member) for member in typing.get_args(annotation) if member is not Ellipsis)
-    return annotation in (bool, int, float, str) or (isinstance(annotation, type) and issubclass(annotation, Enum))
+        return all(_scalar(registry.resolve_alias(member)) for member in typing.get_args(annotation)
+                   if member is not Ellipsis)
+    return annotation in (bool, int, float, str) or (isinstance(annotation, type)
+                                                      and issubclass(annotation, Enum))
 
 
 _JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
-    nargs=1, metavar="JSON", instance_from_str=lambda args: json.loads(args[0]),
-    is_instance=lambda value: True, str_from_instance=lambda value: [json.dumps(value)])
+    nargs=1, metavar="JSON", instance_from_str=lambda given: json.loads(given[0]),
+    is_instance=lambda given: True, str_from_instance=lambda given: [json.dumps(given)])
 """A model field tyro cannot type, written as the JSON record `build` reads."""
 
 
@@ -655,16 +668,40 @@ class RunConfig:
         example, `--lora.rank 16 --lora.modules q_proj` stands for
         `lora:lora --lora.rank 16 ...`, and with no `--lora.` flag the run
         trains without an adapter.
+
+        `--model <alias or import path>` picks the model's class, and every
+        field the class declares is a flag, `--model.<field>`, typed by its
+        annotation (`ModelConfig`). Naming the class the run defaults to keeps
+        the default's fields; naming another starts from that class's own.
         """
         given = list(sys.argv[1:] if args is None else args)
         for field, subcommand in cls._FLAG_SELECTED.items():
             flags = [index for index, arg in enumerate(given) if arg.startswith(f"--{field}.")]
             if flags and not any(arg.startswith(f"{field}:") for arg in given):
                 given.insert(flags[0], f"{field}:{subcommand}")
-        parser = tyro.conf.CascadeSubcommandArgs[cls]
-        if default is None:
-            return tyro.cli(parser, args=given)
-        return tyro.cli(parser, args=given, default=default)
+        factory = cls.__dataclass_fields__["model"].default_factory
+        start = default.model if default is not None else factory() if callable(factory) else ModelConfig()
+        chosen = next((index for index, arg in enumerate(given)
+                       if arg == "--model" or arg.startswith("--model=")), None)
+        if chosen is not None:
+            name = given.pop(chosen).removeprefix("--model").removeprefix("=") or given.pop(chosen)
+            if registry.import_path(models[name]) != start.name:
+                start = ModelConfig(name)
+        member = models[start.name]
+        flags, declared = _model_flags(member, start.fields)
+        # The run parses with its model as those flags, and validates once
+        # it holds the model they name.
+        parser = dataclasses.make_dataclass(
+            cls.__name__, [("model", flags, dataclasses.field(default_factory=flags))], bases=(cls,),
+            frozen=True, namespace={"__post_init__": lambda self: None})
+        held = None if default is None else parser(
+            **{field.name: getattr(default, field.name) for field in dataclasses.fields(cls)
+               if field.name != "model"}, model=flags())
+        parsed = tyro.cli(tyro.conf.CascadeSubcommandArgs[parser], args=given, default=held)
+        chosen_fields = {key: value for key, value in dataclasses.asdict(parsed.model).items()
+                         if key in start.fields or value != declared[key]}
+        return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)},
+                   model=dataclasses.replace(start, fields=chosen_fields))
 
     @classmethod
     def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:

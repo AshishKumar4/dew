@@ -73,15 +73,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
-from dew.registry import (
-    dtype_name,
-    from_record,
-    precision_fields,
-    projectors,
-    resolve_dtype,
-    towers,
-    with_precision,
-)
+from dew.registry import dtype_name, from_record, projectors, resolve_dtype, towers
 from dew.sampling.guidance import CFG
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
@@ -381,7 +373,7 @@ class Pretrained:
             Sampling(**sampling), budget if isinstance(budget, int) else None)
         tokenizer = declaration.get('tokenizer')
         tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
-        trained = models[model_config.architecture]
+        trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
             bundle = PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
@@ -396,7 +388,7 @@ class Pretrained:
             block = from_record(DiffusionGemma, model)
             bundle = PretrainedBlockDecoder(
                 block, variables, None, diffusion_gemma.published_config(block), None,
-                model_config.fields(), {}, export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
+                model_config.fields, {}, export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
         else:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
                             "load diffusion runs with TextToImage.from_run")
@@ -1654,8 +1646,7 @@ def _qwen_image_conditioning(directory: Path, index: Mapping[str, object], compu
     named = dtype_name(compute)
     if named is None:
         raise ValueError("Qwen-Image's Qwen3-VL encoder computes in a named dtype; pass dtype")
-    built = with_precision("causal_transformer", record, dtype=named, attention_impl=attention_impl)
-    decoder = from_record(CausalTransformer, built)
+    decoder = from_record(CausalTransformer, {**record, "dtype": named, "attention_impl": attention_impl})
     layouts: tuple[WeightLayout, ...] = ()
     if params is None:
         tower, layouts = checkpoint_weights.record_layouts(
@@ -1729,8 +1720,7 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     named = dtype_name(compute)
     if named is None:
         raise ValueError(f"The {pipeline} text encoder computes in a named dtype; pass dtype")
-    decoder = from_record(CausalTransformer, with_precision("causal_transformer", record, dtype=named,
-                                                            attention_impl=attention_impl))
+    decoder = from_record(CausalTransformer, {**record, "dtype": named, "attention_impl": attention_impl})
     if pipeline == "z_image":
         layers = (decoder.num_layers - 1,)
     if max(layers) >= decoder.num_layers:
@@ -2134,8 +2124,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
             and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
         text_fields['num_nextn_predict_layers'] = 0
         record['text']['num_nextn_predict_layers'] = 0
-    text = NativeFields(CausalTransformer, {**text_fields, **precision_fields(
-        "causal_transformer", text_fields, dtype=dtype, attention_impl=attention_impl)})
+    text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
     wrapper: decoders.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
@@ -2178,7 +2167,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
-    built = with_precision("causal_transformer", record, dtype=dtype, attention_impl=attention_impl)
+    built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)

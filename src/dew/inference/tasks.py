@@ -294,8 +294,7 @@ def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> Model
     from dew.registry import dtype_name, resolve_dtype
 
     config = ModelConfig.from_dict(named_fields(record["model"], "model"))
-    compute = dtype_name(resolve_dtype(dtype))
-    return config if compute is None else replace(config, dtype=compute)
+    return config.with_dtype(dtype_name(resolve_dtype(dtype)))
 
 
 def recorded_tokenizer(processor: Processor | None) -> str | None:
