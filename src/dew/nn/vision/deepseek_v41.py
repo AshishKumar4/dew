@@ -8,27 +8,16 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import translate_parameters
 from dew.nn.activations import gelu_exact
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Variables
 from dew.registry import Record
 
-from .common import (
-    ProjectorBase,
-    TowerBase,
-    TowerGeometry,
-    _grid_rope,
-    _grid_rope_tables,
-    _vision_section,
-    projector_weight_path,
-)
+from .common import ProjectorBase, TowerBase, TowerGeometry, _grid_rope, _grid_rope_tables, _vision_section
 
 
 class DeepseekV41VisionBlock(nn.Module):
@@ -199,21 +188,6 @@ def deepseek_v41_vision_path(hf_name: str) -> tuple[str, ...]:
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
-
-
-def translate_deepseek_v41_vision_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """DeepSeek-V4.1 ViT parameters at the requested storage precision."""
-    return translate_parameters(hf_tensors, deepseek_v41_vision_path, param_dtype)
-
-
-def translate_deepseek_v41_projector_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """DeepSeek-V4.1's aligner and span vectors at the requested storage precision."""
-    return translate_parameters(hf_tensors, lambda name: projector_weight_path("deepseek_v41", name),
-                                 param_dtype)
 
 
 def translate_deepseek_v41_vision_config(hf_config: Mapping[str, object]) -> Record:
