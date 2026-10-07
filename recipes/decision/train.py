@@ -21,97 +21,10 @@ are held out (`--data.held-out`); validation scores them, and after
 training they fit the temperatures the task divides its logits by, saved
 into the run, so `Decide.from_run` and `dew.pipeline` answer calibrated.
 A question type's temperature needs ten held-out answers and a bucket's
-2000, Laya's floors.
+2000, Laya's floors (`dew.decision.config.DecisionRunConfig`).
 """
 
-import json
-from dataclasses import dataclass, field, replace
-
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig
-from dew.data.text import HFTokenizer
-from dew.decision import AURC, ECE, Accuracy, Decide, DecisionTable, LayaCheckpoint, LogLoss
-from dew.interop import Pretrained
-from dew.training import TrainState, prepare_process, run_timestamp
-
-
-@dataclass(frozen=True)
-class DecisionRunConfig(RunConfig):
-    """A run, plus the decision objective's own knobs."""
-
-    objective: ObjectiveConfig = field(default_factory=lambda: ObjectiveConfig("decision"))
-    """The decision objective and its arguments: its scoring rule (`loss`),
-    label smoothing, option shuffling and none-of-the-above rate."""
-    data: DecisionTable = field(default_factory=DecisionTable)
-    optim: OptimConfig = field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
-    model: ModelConfig = field(
-        default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
-    pretrained: str = "convaiinnovations/laya"
-    """A Laya-style repository, read whole, or a Hugging Face model, read as the backbone."""
-    subfolder: str | None = None
-    """The checkpoint's folder inside a repository that bundles several, such as `multilingual`."""
-    revision: str | None = None
-    calibrate: bool = True
-    """Fit the task's temperatures on the held-out rows after training."""
-    max_len: int | None = None
-    """The row's length in tokens; None keeps the checkpoint's (Laya's 512)."""
-    head_max_len: int | None = None
-    """The tokens the question and its options share; None keeps the
-    checkpoint's (Laya's 192). A question of many options wants more, or
-    its options are cut to a few tokens each."""
-
-
-def backbone(config: DecisionRunConfig) -> Decide | Pretrained:
-    """Laya's checkpoint whole, or a Hugging Face model as the backbone, adapted when `--lora` asks.
-
-    The checkpoint decides the backbone; the model flags choose only its
-    compute dtype and attention kernel."""
-    settings = ("dtype", "attention_impl")
-    decided = sorted(set(config.model.fields) - set(settings))
-    if decided:
-        raise ValueError(f"--model sets {decided}, which {config.pretrained} decides; only "
-                         f"{', '.join(settings)} are choices")
-    dtype = str(config.model.fields.get("dtype") or "float32")
-    attention_impl = str(config.model.fields.get("attention_impl", "auto"))
-    if LayaCheckpoint.exists(config.pretrained, subfolder=config.subfolder, revision=config.revision):
-        if config.lora is not None:
-            raise ValueError("--lora adapts a Hugging Face backbone; a Laya checkpoint trains whole")
-        return Decide.from_pretrained(config.pretrained, subfolder=config.subfolder, revision=config.revision,
-                                      dtype=dtype, attention_impl=attention_impl)
-    source = Pretrained.load(config.pretrained, revision=config.revision, dtype=dtype,
-                             attention_impl=attention_impl)
-    return source if config.lora is None else source.adapt(config.lora, key=config.trainer.key)
-
-
-def main(config: DecisionRunConfig) -> TrainState:
-    prepare_process(config.trainer.wandb, config.trainer.multi_host,
-                    config.trainer.xla_flags, config.trainer.compilation_cache_dir,
-                    layout=config.trainer.layout)
-    start = backbone(config)
-    tokenizer = None if isinstance(start, Decide) else HFTokenizer(config.pretrained)
-    layout = start.layout if isinstance(start, Decide) else None
-    if layout is not None:
-        layout = replace(layout, max_len=config.max_len or layout.max_len,
-                         head_max_len=config.head_max_len or layout.head_max_len)
-    elif config.max_len or config.head_max_len:
-        raise ValueError("--max-len and --head-max-len resize a Laya checkpoint's layout; "
-                         "another backbone takes the default layout")
-    objective = config.objective.build(backbone=start, tokenizer=tokenizer, layout=layout)
-    train, held_out = config.data.examples()
-    data = objective.dataset(train, batch=config.trainer.batch_size, validation=held_out or None,
-                             seed=config.data.seed, loading=config.data.loading)
-    name = config.trainer.name or (
-        f"decision-{config.pretrained.replace('/', '-')}/{config.data.path.replace('/', '-')}/"
-        f"lr-{config.optim.learning_rate}/date-{run_timestamp()}")
-    validation = (Accuracy(), ECE(), AURC(), LogLoss())
-    summary = {"pretrained": config.pretrained, "records": data.records, "loss": objective.loss_rule.name}
-    state = config.train(objective, data, name=name, metrics=validation, summary=summary)
-    if config.calibrate and held_out:
-        run = f"{config.trainer.checkpoint_dir}/{name}"
-        calibrated = replace(objective.pipeline(state).calibrated(held_out), name=name.rsplit("/", 1)[-1])
-        calibrated.save(run)
-        print(json.dumps({"temperatures": dict(calibrated.calibration.temperatures.types)}))
-    return state
-
+from dew.decision.config import DecisionRunConfig
 
 if __name__ == "__main__":
-    main(DecisionRunConfig.cli())
+    DecisionRunConfig.cli().run()
