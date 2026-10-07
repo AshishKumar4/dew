@@ -13,9 +13,17 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import Decisions
-from dew.data.dataset import Dataset, Loading, train_stream, validation_pass
+from dew.data.dataset import (
+    Corpus,
+    Dataset,
+    Loading,
+    mixed_records,
+    mixed_stream,
+    train_stream,
+    validation_pass,
+)
 from dew.data.text import HFTokenizer, Tokenizer
-from dew.decision.data import DecisionTable, Example
+from dew.decision.data import DecisionTable, Example, Weighted
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
 from dew.decision.model import DecisionModel
@@ -48,6 +56,9 @@ if TYPE_CHECKING:
     from dew.training.state import TrainState
 
 NONE_OF_THE_ABOVE = "none of the above"
+
+type Labelled = Iterable[Example | Mapping[str, object]]
+"""Labelled examples: `Example`s, or rows `Example.of` reads."""
 _SCORE = KINDS.index(Score)
 
 
@@ -60,11 +71,14 @@ class Encoding:
     joint layout lays out every question of the example, scoring the answered
     ones. With `shuffle`, a choice's options are laid out in a fresh random order
     every time the row is read (Laya's `--shuffle-options`), while a score's
-    levels and a noul's two answers keep their order. With `none_of_the_above`
-    p, an answered choice gains a "none of the above" option with probability p,
-    and half of those also lose their right option, which makes "none of the
-    above" the right answer. That teaches the model to say that no option fits
-    instead of picking the nearest wrong one.
+    levels and a noul's two answers keep their order, and a joint row asks its
+    questions in a fresh order too, as Clef's training permutes field orders.
+    With `none_of_the_above` p, a choice with a single right answer gains a
+    "none of the above" option with probability p, and half of those also lose
+    their right option, which makes "none of the above" the right answer. That
+    teaches the model to say that no option fits instead of picking the nearest
+    wrong one. Each scored slot's target is its gold distribution (`Example.distribution`)
+    in the order the row shows the options.
     """
 
     layout: Layout
@@ -77,16 +91,20 @@ class Encoding:
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
         labels = example.labels()
+        if rng is not None and self.shuffle and self.layout.joint:
+            names = [names[index] for index in rng.permutation(len(names))]
         asked: dict[str, Question] = {}
-        answers: dict[str, int] = {}
+        golds: dict[str, np.ndarray] = {}
         for name in names:
-            question, label = example.questions[name], labels.get(name)
-            if (label is not None and isinstance(question, Choice) and rng is not None
+            question = example.questions[name]
+            gold = example.distribution(name) if name in labels else None
+            if (name in example.answers and isinstance(question, Choice) and rng is not None
                     and rng.random() < self.none_of_the_above):
-                question, label = _none_of_the_above(question, label, drop=rng.random() < 0.5)
+                question, label = _none_of_the_above(question, labels[name], drop=rng.random() < 0.5)
+                gold = np.eye(len(question.options))[label]
             asked[name] = question
-            if label is not None:
-                answers[name] = label
+            if gold is not None:
+                golds[name] = gold
         orders = ({name: [int(slot) for slot in rng.permutation(len(question.options))]
                    for name, question in asked.items() if isinstance(question, Choice)}
                   if rng is not None and self.shuffle else None)
@@ -104,6 +122,7 @@ class Encoding:
             "option_spans": np.zeros((self.questions, self.width, 2), np.int32),
             "options": np.zeros((self.questions, self.width), bool),
             "labels": np.zeros(self.questions, np.int32), "scored": np.zeros(self.questions, bool),
+            "targets": np.zeros((self.questions, self.width), np.float32),
         }
         for slot, laid in enumerate(encoded.questions):
             count = len(asked[laid.name].options)
@@ -115,8 +134,10 @@ class Encoding:
             row["kinds"][slot], row["questions"][slot], row["spans"][slot] = laid.kind, True, laid.span
             row["option_spans"][slot, :count] = laid.options
             row["options"][slot, :count] = True
-            if laid.name in answers:
-                row["labels"][slot] = laid.order.index(answers[laid.name])
+            if laid.name in golds:
+                shown = golds[laid.name][list(laid.order)]
+                row["targets"][slot, :count] = shown
+                row["labels"][slot] = int(np.argmax(shown))
                 row["scored"][slot] = True
         if encoded.positions is not None and encoded.slots is not None:
             row["positions"] = _padded(encoded.positions, length, 0)
@@ -145,17 +166,18 @@ def _padded(values: Sequence[int | bool], length: int, fill: int | bool = 0) -> 
 
 class _Rows:
     """The rows of a set of examples, each an example and the questions it lays
-    out, read by index as `{"row": i}`."""
+    out, read by index as `{"corpus": c, "row": i}`, c naming the set in a mixture."""
 
-    def __init__(self, rows: Sequence[tuple[Example, tuple[str, ...]]], origin: str):
+    def __init__(self, rows: Sequence[tuple[Example, tuple[str, ...]]], origin: str, corpus: int = 0):
         self.rows = rows
         self.origin = origin
+        self.corpus = corpus
 
     def __len__(self) -> int:
         return len(self.rows)
 
     def __getitem__(self, index: int) -> Batch:
-        return {"row": np.int64(index)}
+        return {"corpus": np.int64(self.corpus), "row": np.int64(index)}
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.origin})"
@@ -164,11 +186,11 @@ class _Rows:
 class _Encode(pygrain.RandomMapTransform):
     """`Encoding` as the grain step that lays out each row inside the workers."""
 
-    def __init__(self, encoding: Encoding, rows: _Rows, *, augment: bool):
-        self.encoding, self.rows, self.augment = encoding, rows, augment
+    def __init__(self, encoding: Encoding, corpora: Sequence[_Rows], *, augment: bool):
+        self.encoding, self.corpora, self.augment = encoding, corpora, augment
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        example, names = self.rows.rows[int(element["row"])]
+        example, names = self.corpora[int(element["corpus"])].rows[int(element["row"])]
         return self.encoding(example, names, rng if self.augment else None)
 
 
@@ -320,8 +342,8 @@ class DecisionObjective(Objective[Ratio]):
         empty = ~jnp.any(options, axis=-1, keepdims=True)
         logits, options = jnp.where(empty, 0.0, logits), options | empty
         count = jnp.sum(options, axis=-1, keepdims=True)
-        right = jax.nn.one_hot(batch["labels"], options.shape[-1])
-        target = jnp.where(options, (1.0 - self.label_smoothing) * right + self.label_smoothing / count, 0.0)
+        gold = jnp.asarray(batch["targets"])
+        target = jnp.where(options, (1.0 - self.label_smoothing) * gold + self.label_smoothing / count, 0.0)
         charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
@@ -341,40 +363,57 @@ class DecisionObjective(Objective[Ratio]):
     def _logits(self):
         return jax.jit(lambda variables, inputs: self.model.logits(variables, inputs))
 
-    def dataset(self, examples: Iterable[Example | Mapping[str, object]] | DecisionTable, *, batch: int,
-                validation: Iterable[Example | Mapping[str, object]] | None = None, seed: int = 0,
-                loading: Loading | None = None) -> Dataset:
+    def dataset(self, examples: Labelled | DecisionTable | Mapping[str, Weighted], *, batch: int,
+                validation: Labelled | None = None, seed: int = 0, loading: Loading | None = None) -> Dataset:
         """Return the training stream and validation pass over labelled questions.
 
         The training stream holds one row for each answered question in `examples`,
         augmented afresh on every read, and the validation pass holds `validation`'s
         rows as they are. A `DecisionTable` provides both, with its held-out rows as
-        the second. The option slots fit the widest question either one holds.
+        the second. A mapping of names to `Weighted` sets is a mixture: every step
+        takes each set's share of its rows, whatever the sets' lengths, and each set
+        comes round again at its own rate (`dew.data.dataset.mixed_stream`). The
+        option slots fit the widest question any of them holds.
         """
-        if isinstance(examples, DecisionTable):
-            if validation is not None:
-                raise ValueError("a decision table holds out its own validation rows")
-            examples, validation = examples.examples()
+        match examples:
+            case DecisionTable():
+                if validation is not None:
+                    raise ValueError("a decision table holds out its own validation rows")
+                examples, validation = examples.examples()
+                weighted = {"examples": Weighted(examples, 1.0)}
+            case Mapping():
+                weighted = dict(examples)
+            case _:
+                weighted = {"examples": Weighted(list(examples), 1.0)}
         loading = Loading() if loading is None else loading
         joint = self.layout.joint
-        train = _laid_rows(examples, joint=joint)
+        names = sorted(weighted)
+        corpora = []
+        for corpus, name in enumerate(names):
+            laid = _laid_rows(weighted[name].examples, joint=joint)
+            corpora.append(_Rows(laid, f"{name}: {len(laid)} rows", corpus))
         held = None if validation is None else _laid_rows(validation, joint=joint)
+        every = [row for rows in corpora for row in rows.rows] + (held or [])
         width = max(len(example.questions[name].options) + (self.none_of_the_above > 0)
-                    for example, names in train + (held or []) for name in names)
-        questions = max(len(names) for _, names in train + (held or []))
+                    for example, names in every for name in names)
+        questions = max(len(names) for _, names in every)
         encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
                             self.shuffle_options, self.none_of_the_above)
-        rows = _Rows(train, f"{len(train)} rows")
-        if len(rows) < batch:
-            raise ValueError(f"{len(rows)} rows of answered questions, fewer than one batch of {batch}")
+        records = sum(len(rows) for rows in corpora)
+        if records < batch:
+            raise ValueError(f"{records} rows of answered questions, fewer than one batch of {batch}")
         scoring = None
         if held is not None:
             held_rows = _Rows(held, f"{len(held)} held-out rows")
-            scoring = validation_pass(held_rows, [_Encode(encoding, held_rows, augment=False)], batch=batch,
+            scoring = validation_pass(held_rows, [_Encode(encoding, [held_rows], augment=False)], batch=batch,
                                       seed=seed, loading=loading)
-        return Dataset(train=train_stream(rows, [_Encode(encoding, rows, augment=True)], batch=batch,
-                                          seed=seed, loading=loading),
-                       val=scoring, records=len(rows), batch=batch)
+        encode = [_Encode(encoding, corpora, augment=True)]
+        if len(corpora) == 1:
+            return Dataset(train=train_stream(corpora[0], encode, batch=batch, seed=seed, loading=loading),
+                           val=scoring, records=len(corpora[0]), batch=batch)
+        mixed = [Corpus(name, rows, weighted[name].weight) for name, rows in zip(names, corpora, strict=True)]
+        return Dataset(train=mixed_stream(mixed, encode, batch=batch, seed=seed, loading=loading),
+                       val=scoring, records=mixed_records(mixed), batch=batch)
 
     def inference_record(self):
         """Return what a saved run rebuilds its task from.
