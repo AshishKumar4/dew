@@ -62,8 +62,11 @@ class Example:
             if isinstance(label, bool) or not isinstance(label, (str, int)):
                 raise ValueError(f"answers.{name} names an option by its key or index, got {label!r}")
             answers[name] = label
-        targets = {name: _distribution(questions[name], target, f"targets.{name}")
-                   for name, target in record(row.get("targets", {}), "targets").items() if name in questions}
+        targets = {}
+        for name, target in record(row.get("targets", {}), "targets").items():
+            if name in questions:
+                where = f"targets.{name}"
+                targets[name] = _distribution(questions[name], json_value(target, where), where)
         return cls(json_value(row.get("state"), "state"), questions, answers, targets)
 
     def labels(self) -> dict[str, int]:
@@ -90,7 +93,8 @@ class Weighted:
     each set at its share whatever its length (`dew.data.dataset.mixture`).
     """
 
-    examples: Sequence[Example]
+    examples: Sequence["Example | Mapping[str, object]"]
+    """`Example`s, or rows `Example.of` reads."""
     weight: float
 
 
