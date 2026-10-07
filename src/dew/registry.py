@@ -174,6 +174,11 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
     def __repr__(self) -> str:
         return f"Aliases({self.kind!r}, {sorted(self.paths)})"
 
+    def label(self, path: str) -> str:
+        """The alias of the class at import `path`, or its class name where
+        it has none, for a run's human-readable name."""
+        return next((alias for alias, held in self.paths.items() if held == path), path.rpartition(":")[2])
+
     def alias_of(self, member: Importable) -> str:
         """The alias of `member`, for a run's human-readable name; KeyError
         for a class this kind has no alias for."""
