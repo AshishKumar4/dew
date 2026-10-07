@@ -22,9 +22,11 @@ than leaving the task without a verdict.
 """
 
 import argparse
+import contextlib
 import heapq
 import json
 import math
+import os
 import signal
 import subprocess
 import sys
@@ -107,33 +109,60 @@ def file_of(case: ET.Element) -> str:
     return "/".join(parts[:module + 1]) + ".py"
 
 
-def task(python: str, tests: list[str], split: str, out: Path, deadline: float) -> int:
-    """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds."""
+def signal_group(leader: int, number: signal.Signals) -> None:
+    """`number` to every process left in the group `leader` led."""
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(leader, number)
+
+
+def shown(output: str) -> str:
+    """The end of a task's output, and the stack faulthandler printed for a test that hung, if one did."""
+    stack = output.rfind("Timeout (")
+    hung = output[stack:stack + 6000] + "\n...\n" if 0 <= stack < len(output) - 4000 else ""
+    return hung + output[-4000:]
+
+
+def task(python: str, tests: list[str], split: str, out: Path, deadline: float, grace: float = 60.0) -> int:
+    """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
+    killing them `grace` seconds after that."""
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
     grouping = ["--splits", split.split("/")[1], "--group", split.split("/")[0], "--splitting-algorithm",
                 "duration_based_chunks", "--durations-path", str(DURATIONS)] if split else []
-    # faulthandler prints every thread's stack when a test runs ten minutes.
-    command = [f".venv-{python}/bin/python", "-m", "pytest", "-q", "-m", "not network", "-rfE", "--tb=short",
-               "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
+    # faulthandler prints every thread's stack when a test runs ten minutes. Unbuffered (-u), so the
+    # log holds every test that finished when a task is cut short.
+    command = [f".venv-{python}/bin/python", "-u", "-m", "pytest", "-q", "-m", "not network", "-rfE",
+               "--tb=short", "--continue-on-collection-errors", "-o", "faulthandler_timeout=600",
                "-p", "no:cacheprovider", f"--junitxml={report}", *tests, *grouping]
-    # Streamed as it comes, so a task armada stops at its timeout still shows where it was.
-    lines = []
-    expired = threading.Event()
-    with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True) as done:
-        def interrupt() -> None:
-            expired.set()
-            done.send_signal(signal.SIGINT)
-            threading.Timer(60, done.kill).start()
+    # pytest leads a process group of its own, so what its tests start ends with it. Its output is
+    # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
+    # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
+    lines: list[str] = []
+    done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                            start_new_session=True)
 
-        timer = threading.Timer(deadline, interrupt)
-        timer.start()
+    def read() -> None:
         for line in done.stdout or ():
             sys.stdout.write(line)
             sys.stdout.flush()
             lines.append(line)
-        done.wait()
-        timer.cancel()
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    expired = False
+    try:
+        done.wait(deadline)
+    except subprocess.TimeoutExpired:
+        # ^C first, so pytest reports what ran; a test stuck in C ignores it, and the group is killed.
+        expired = True
+        signal_group(done.pid, signal.SIGINT)
+        try:
+            done.wait(grace)
+        except subprocess.TimeoutExpired:
+            signal_group(done.pid, signal.SIGKILL)
+            done.wait()
+    signal_group(done.pid, signal.SIGKILL)
+    reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
     rows = []
@@ -146,11 +175,11 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float) 
                 if "could not import" in f"{node.get('message')} {node.text}"]
         if not own and done.returncode not in (0, 5):
             red.append(f"pytest exited {done.returncode} with no report of {name}")
-        if expired.is_set():
+        if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
         seconds = sum(float(case.get("time") or 0) for case in own)
         rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
-                     "output": "\n".join(red + ([output[-4000:]] if red else [])),
+                     "output": "\n".join(red + ([shown(output)] if red else [])),
                      **({} if split else {"timings": {name: seconds}})})
     out.write_text(json.dumps({"rows": rows}))
     return 0
