@@ -92,7 +92,7 @@ class Encoding:
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
         labels = example.labels()
         if rng is not None and self.shuffle and self.layout.joint:
-            names = [names[index] for index in rng.permutation(len(names))]
+            names = [names[int(index)] for index in rng.permutation(len(names))]
         asked: dict[str, Question] = {}
         golds: dict[str, np.ndarray] = {}
         for name in names:
@@ -382,7 +382,13 @@ class DecisionObjective(Objective[Ratio]):
                 examples, validation = examples.examples()
                 weighted = {"examples": Weighted(examples, 1.0)}
             case Mapping():
-                weighted = dict(examples)
+                weighted: dict[str, Weighted] = {}
+                for name, entry in examples.items():
+                    match name, entry:
+                        case str(), Weighted():
+                            weighted[name] = entry
+                        case _:
+                            raise TypeError("a mixture maps names to Weighted example sets")
             case _:
                 weighted = {"examples": Weighted(list(examples), 1.0)}
         loading = Loading() if loading is None else loading
