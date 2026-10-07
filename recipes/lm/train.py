@@ -309,7 +309,8 @@ def main(config: LmRunConfig) -> TrainState:
         resolved["max_seq_len"] = model.max_seq_len
     config = replace(config, model=replace(config.model, fields=resolved))
     name = config.trainer.name or (
-        f"{objectives.label(str(config.objective))}-{'+'.join(d.name for d in token_directories(read_corpora(config.data)))}/"
+        f"{objectives.label(str(config.objective))}-"
+        f"{'+'.join(d.name for d in token_directories(read_corpora(config.data)))}/"
         f"seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"
         f"date-{run_timestamp()}")
