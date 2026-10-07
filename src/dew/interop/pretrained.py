@@ -972,70 +972,43 @@ class _TextTowers:
 
 
 @dataclass(frozen=True)
-class _QwenImageText:
-    """Qwen-Image's Qwen3-VL text encoder, which `QwenImageConditioner` runs
-    over its pipeline's chat template, padded to the call's token budget."""
+class _LanguageText:
+    """The one language-model encoder a pipeline's conditioner runs, padded to
+    the call's token budget: Qwen-Image's Qwen3-VL over its chat template
+    (`QwenImageConditioner`), the encoder FLUX.2 (Mistral-3 for [dev], Qwen3
+    for [klein]) or Z-Image (Qwen3) reads hidden states from
+    (`HiddenStatesConditioner`), or Wan's UMT5 (`WanConditioner`), which
+    reads no geometry. `embeds_guidance` marks FLUX.2 [dev]'s transformer,
+    which reads the guidance scale as an input. Its unconditional row is the
+    empty prompt, encoded the same way."""
 
-    conditioner: ClassVar[type[QwenImageConditioner]] = QwenImageConditioner
-
-    def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
-              policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
-              attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
-              ) -> tuple[QwenImageConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
-        """Construct `QwenImageConditioner` at the pipeline's prompt budget."""
-        return _qwen_image_conditioning(directory, index, compute, size, tokens=policy.sequence,
-                                        param_dtype=param_dtype, attention_impl=attention_impl,
-                                        params=params, lazy=lazy)
-
-    def unconditional(self, index: Mapping[str, object]) -> dict:
-        """The empty prompt, encoded through the same template."""
-        return {"text": ""}
-
-
-@dataclass(frozen=True)
-class _HiddenStatesText:
-    """The text encoder FLUX.2 (`pipeline="flux2"`: Mistral-3 for [dev],
-    Qwen3 for [klein]) or Z-Image (`"z_image"`: Qwen3) reads hidden states
-    from, which `HiddenStatesConditioner` runs, padded to the call's token
-    budget. `embeds_guidance` marks FLUX.2 [dev]'s transformer, which reads
-    the guidance scale as an input."""
-
-    pipeline: Literal["flux2", "z_image"]
+    pipeline: Literal["qwen_image", "flux2", "z_image", "wan"]
     embeds_guidance: bool = False
-    conditioner: ClassVar[type[HiddenStatesConditioner]] = HiddenStatesConditioner
+
+    @property
+    def conditioner(self) -> type[QwenImageConditioner | HiddenStatesConditioner | WanConditioner]:
+        return {"qwen_image": QwenImageConditioner, "wan": WanConditioner}.get(
+            self.pipeline, HiddenStatesConditioner)
 
     def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
               policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
               attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
-              ) -> tuple[HiddenStatesConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
-        """Construct `HiddenStatesConditioner` at the pipeline's prompt budget."""
+              ) -> tuple[QwenImageConditioner | HiddenStatesConditioner | WanConditioner,
+                         tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
+        """Construct the conditioner at the pipeline's prompt budget."""
+        if self.pipeline == "qwen_image":
+            return _qwen_image_conditioning(directory, index, compute, size, tokens=policy.sequence,
+                                            param_dtype=param_dtype, attention_impl=attention_impl,
+                                            params=params, lazy=lazy)
+        if self.pipeline == "wan":
+            return _wan_conditioning(directory, compute, tokens=policy.sequence, param_dtype=param_dtype,
+                                     params=params, lazy=lazy)
         return _hidden_states_conditioning(
             directory, index, compute, size, pipeline=self.pipeline, tokens=policy.sequence,
             guidance=policy.guidance if self.embeds_guidance else None, param_dtype=param_dtype,
             attention_impl=attention_impl, params=params, lazy=lazy)
 
     def unconditional(self, index: Mapping[str, object]) -> dict:
-        """The empty prompt a guided call encodes as its negative."""
-        return {"text": ""}
-
-
-@dataclass(frozen=True)
-class _WanText:
-    """Wan's UMT5 encoder, which `WanConditioner` runs at its pipeline's
-    prompt budget; it reads no geometry."""
-
-    conditioner: ClassVar[type[WanConditioner]] = WanConditioner
-
-    def build(self, directory: Path, index: Mapping[str, object], denoiser: _Denoiser,
-              policy: _Call, compute, size: tuple[int, int], *, param_dtype: str,
-              attention_impl: str = "auto", params: Variables | None = None, lazy: bool = False
-              ) -> tuple[WanConditioner, tuple[WeightLayout, ...], dict[str, Mapping[str, object]]]:
-        """Construct `WanConditioner` at the pipeline's prompt budget."""
-        return _wan_conditioning(directory, compute, tokens=policy.sequence, param_dtype=param_dtype,
-                                 params=params, lazy=lazy)
-
-    def unconditional(self, index: Mapping[str, object]) -> dict:
-        """The empty negative prompt `WanPipeline` encodes by default."""
         return {"text": ""}
 
 
@@ -1054,7 +1027,7 @@ class _Denoiser:
     weights: Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]]
     built: Mapping[str, object]
     config: Mapping[str, object]
-    text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText
+    text: _TextTowers | _LanguageText
     patch: int
     latent_input: int
     sample_size: tuple[int, int]
@@ -1306,7 +1279,7 @@ def _transformer_weights(directory: Path, translate: Callable[..., tuple[LazyTre
 def _transformer_denoiser(name: str, model: nn.Module, fields: Mapping[str, object], config: dict,
                          dtype: str | None,
                          weights: Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]],
-                         text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText, *,
+                         text: _TextTowers | _LanguageText, *,
                          patch: int, latent_input: int, sample_size: tuple[int, int], context_width: int,
                          pipeline: str, origin: Origin = "scheduler", frames: int | None = None) -> _Denoiser:
     """Build the native record with the pipeline's already resolved conditioning and geometry."""
@@ -1371,7 +1344,7 @@ def _qwen_image_denoiser(config: dict, directory: Path, *, dtype: str | None,
     model = fields.value
     return _transformer_denoiser(
         "qwen_image_transformer", model, fields, config, dtype,
-        _transformer_weights(directory, diffusion.translate_qwen_image_weights), _QwenImageText(),
+        _transformer_weights(directory, diffusion.translate_qwen_image_weights), _LanguageText("qwen_image"),
         patch=1, latent_input=model.in_channels, sample_size=(64, 64),
         context_width=model.context_in_dim, pipeline="QwenImage21Pipeline", origin="linspace")
 
@@ -1391,7 +1364,7 @@ def _flux2_denoiser(config: dict, directory: Path, *, dtype: str | None, attenti
     weights = _transformer_weights(directory, diffusion.translate_flux2_weights)
     return _transformer_denoiser(
         "flux2_transformer", model, fields, config, dtype, weights,
-        _HiddenStatesText("flux2", embeds_guidance=guided), patch=1, latent_input=model.in_channels,
+        _LanguageText("flux2", embeds_guidance=guided), patch=1, latent_input=model.in_channels,
         sample_size=(64, 64), context_width=model.joint_attention_dim,
         pipeline="Flux2Pipeline" if guided else "Flux2KleinPipeline", origin="empirical")
 
@@ -1409,7 +1382,7 @@ def _z_image_denoiser(config: dict, directory: Path, *, dtype: str | None, atten
     weights = _transformer_weights(directory, diffusion.translate_z_image_weights)
     return _transformer_denoiser(
         "z_image_transformer", model, fields, config, dtype, weights,
-        _HiddenStatesText("z_image"), patch=2, latent_input=model.in_channels, sample_size=(128, 128),
+        _LanguageText("z_image"), patch=2, latent_input=model.in_channels, sample_size=(128, 128),
         context_width=model.cap_feat_dim, pipeline="ZImagePipeline", origin="linspace")
 
 
@@ -1426,8 +1399,8 @@ def _wan_denoiser(config: dict, directory: Path, *, dtype: str | None, attention
     weights = _transformer_weights(directory, diffusion.translate_wan_weights)
     return _transformer_denoiser(
         "wan_transformer", model, fields, config, dtype, weights,
-        _WanText(), patch=model.patch_size[-1], latent_input=model.in_channels, sample_size=(60, 104),
-        context_width=model.text_dim, pipeline="WanPipeline", frames=81)
+        _LanguageText("wan"), patch=model.patch_size[-1], latent_input=model.in_channels,
+        sample_size=(60, 104), context_width=model.text_dim, pipeline="WanPipeline", frames=81)
 
 
 _DENOISERS: Mapping[str, Callable[..., _Denoiser]] = MappingProxyType({
@@ -1440,7 +1413,7 @@ _DENOISERS: Mapping[str, Callable[..., _Denoiser]] = MappingProxyType({
 })
 
 
-def _text_components(text: _TextTowers | _QwenImageText | _HiddenStatesText | _WanText,
+def _text_components(text: _TextTowers | _LanguageText,
                      index: Mapping[str, object]) -> tuple[str, ...]:
     """The components a pipeline's text conditioning reads its weights from."""
     return text.components(index) if isinstance(text, _TextTowers) else ("text_encoder",)

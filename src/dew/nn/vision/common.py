@@ -93,22 +93,6 @@ def _grid_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
     return values * cos + jnp.concatenate([-second, first], axis=-1) * sin
 
 
-def _encoder_layer_path(parts, root: str, norms: tuple[str, ...],
-                        projections: tuple[str, ...]) -> tuple[str, ...] | None:
-    """`<root>.layers.N...` into the path of a CLIP-style encoder layer: two
-    layer norms, biased attention maps and a biased fc1/fc2 MLP."""
-    if (len(parts) < 5 or parts[:2] != [root, "layers"] or not parts[2].isdigit()
-            or parts[-1] not in ("weight", "bias")):
-        return None
-    layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in norms:
-        return (layer, module, "scale" if leaf == "weight" else "bias")
-    if len(parts) == 6 and ((module == "self_attn" and parts[4] in projections)
-                            or (module == "mlp" and parts[4] in ("fc1", "fc2"))):
-        return (layer, module, parts[4], "kernel" if leaf == "weight" else "bias")
-    return None
-
-
 _PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
     "gemma": {
         "mm_soft_emb_norm.weight": ("mm_soft_emb_norm", "scale"),
