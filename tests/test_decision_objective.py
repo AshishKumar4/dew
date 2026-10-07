@@ -174,6 +174,92 @@ def test_an_encoding_keeps_levels_in_order_and_adds_none_of_the_above():
     assert NONE_OF_THE_ABOVE == "none of the above"
 
 
+def test_a_soft_target_follows_its_options_through_the_shuffle():
+    """A target distribution is laid out in the order the row shows the
+    options, its most likely option is the row's label, and a choice whose
+    gold is a distribution gains no "none of the above" option."""
+    soft = Example("charged twice", {"team": INTENT}, targets={"team": (0.6, 0.3, 0.1)})
+    encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, width=4, none_of_the_above=1.0)
+    rng = np.random.default_rng(1)
+    seen = set()
+    for _ in range(20):
+        row = encoding(soft, ("team",), rng)
+        assert int(row["options"].sum()) == 3
+        shown = row["targets"][0, :3]
+        assert sorted(shown.tolist()) == pytest.approx([0.1, 0.3, 0.6])
+        assert int(row["labels"][0]) == int(np.argmax(shown))
+        for slot in range(3):
+            marker = int(row["option_spans"][0, slot, 0])
+            text = bytes(int(token) for token in row["tokens"][marker - 24:marker]).decode()
+            key = {0.6: "billing", 0.3: "technical", 0.1: "sales"}[round(float(shown[slot]), 1)]
+            # The layout keeps each option's first `option_tokens` bytes.
+            assert text.endswith(f" {key}: {INTENT.criteria[key]}"[:LAYOUT.option_tokens])
+        seen.add(tuple(np.round(shown, 1).tolist()))
+    assert len(seen) > 1
+    with pytest.raises(ValueError, match="distribution over the question's 3 options"):
+        Example("x", {"team": INTENT}, targets={"team": (0.5, 0.5)})
+    with pytest.raises(ValueError, match="both an answer and a target"):
+        Example("x", {"team": INTENT}, {"team": "billing"}, {"team": (1.0, 0.0, 0.0)})
+
+
+def test_the_loss_scores_a_soft_target_as_its_rule_does():
+    """The log loss of a row whose gold is a distribution is the cross-entropy
+    against that distribution, not against its most likely option."""
+    from dew.decision.task import laid_out
+    from dew.objectives.base import Step
+
+    soft = [Example(f"charged twice {index}", {"team": INTENT}, targets={"team": (0.6, 0.3, 0.1)})
+            for index in range(8)]
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                  shuffle_options=False)
+    data = objective.dataset(soft, batch=8, validation=soft)
+    (batch,) = list(data.val(DataPartition()))
+    batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
+    variables = objective.init(jax.random.key(0))
+    loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
+    logits = np.asarray(objective.model.logits(variables, laid_out(batch)))[:, 0, :3]
+    expected = -np.mean(np.sum(np.array([0.6, 0.3, 0.1]) * jax.nn.log_softmax(logits), axis=-1))
+    assert float(loss) == pytest.approx(float(expected), rel=1e-5)
+
+
+def test_a_joint_row_asks_its_questions_in_a_fresh_order():
+    """Clef's layout reads every question in one row; each read asks them in
+    a new order, and each slot's target is its own question's."""
+    from dew.decision import JointLayout
+
+    example = Example("charged twice", {"team": INTENT, "urgent": Noul("Is it urgent?")},
+                      {"team": "billing", "urgent": "true"})
+    encoding = Encoding(JointLayout(max_len=4096), TOKENIZER, SPECIALS, width=3, questions=2)
+    rng = np.random.default_rng(0)
+    orders = set()
+    for _ in range(12):
+        row = encoding(example, ("team", "urgent"), rng)
+        widths = tuple(int(count) for count in row["options"].sum(axis=-1))
+        orders.add(widths)
+        for slot, width in enumerate(widths):
+            target = row["targets"][slot, :width]
+            assert target.sum() == 1.0 and int(row["labels"][slot]) == int(np.argmax(target))
+    assert orders == {(3, 2), (2, 3)}
+
+
+def test_a_mixture_fills_each_step_at_its_weights():
+    """Two sets of very different lengths, mixed three to one: every batch of
+    eight holds six rows of the first and two of the second."""
+    from dew.decision import Weighted
+
+    small = [Example(f"zz {index}", {"team": INTENT}, {"team": "sales"}) for index in range(3)]
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    data = objective.dataset({"large": Weighted(EXAMPLES * 5, 3.0), "small": Weighted(small, 1.0)},
+                             batch=8, validation=EXAMPLES)
+    stream = iter(data.train(DataPartition()))
+    for _ in range(4):
+        batch = next(stream)
+        firsts = [bytes([int(row[0])]).decode() for row in np.asarray(batch["tokens"])]
+        assert firsts.count("z") == 2
+    # A pass reads every set at least once: the large one's 40 rows at three quarters of each step.
+    assert data.records == 54
+
+
 def tiny_backbone() -> CausalTransformer:
     return CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
                              max_seq_len=128, attention_impl="xla")

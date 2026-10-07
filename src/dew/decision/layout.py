@@ -106,6 +106,8 @@ class Encoded:
     state_kept: int
     media: tuple[int, int] | None = None
     """Where the row holds a request's images, as a [start, end) span of its tokens."""
+    trimmed: bool = False
+    """Whether the layout shortened the question's instructions or options to fit its budgets."""
 
 
 def render(value: JSON) -> str:
@@ -205,23 +207,27 @@ class QuestionLayout(Layout):
         slots = _slots(len(texts), order)
         instructions = render(question.instructions).replace(specials.marker_text, " ")
         head = encoder.encode(f"{question.kind} question: {instructions}", add_special_tokens=False)
-        options = [encoder.encode(" " + texts[slot].replace(specials.marker_text, " "),
-                                  add_special_tokens=False)[:self.option_tokens] for slot in slots]
+        whole = [encoder.encode(" " + texts[slot].replace(specials.marker_text, " "),
+                                add_special_tokens=False) for slot in slots]
+        options = [option[:self.option_tokens] for option in whole]
         # Each option's budget counts its marker.
         budget = self.head_max_len - sum(len(option) + 1 for option in options)
         if budget < 16:
             each = max(4, (self.head_max_len - 16) // max(1, len(options)))
             options = [option[:each - 1] for option in options]
             budget = self.head_max_len - sum(len(option) + 1 for option in options)
-        tokens, span, markers, spans, kept = self._row(specials, head[:max(8, budget)], options, state,
-                                                       conversation)
+        kept_head = head[:max(8, budget)]
+        trimmed = len(kept_head) < len(head) or any(
+            len(kept) < len(full) for kept, full in zip(options, whole, strict=True))
+        tokens, span, markers, spans, kept = self._row(specials, kept_head, options, state, conversation)
         positions, option_slots = (_parallel(spans, len(tokens)) if self.parallel else (None, None))
         laid = Laid(name, kind_of(question), span,
                     tuple((marker, marker + 1) for marker in markers if marker < self.max_len), tuple(slots))
         return Encoded(
             tuple(tokens[:self.max_len]), (laid,),
             None if positions is None else positions[:self.max_len],
-            None if option_slots is None else option_slots[:self.max_len], len(state), kept)
+            None if option_slots is None else option_slots[:self.max_len], len(state), kept,
+            trimmed=trimmed)
 
     def _row(self, specials: Specials, head: list[int], options: list[list[int]], state: Sequence[int],
              conversation: bool) -> tuple[list[int], tuple[int, int], list[int], list[tuple[int, int]], int]:
@@ -370,8 +376,8 @@ class JointLayout(Layout):
             state_ids = state_ids[:self.max_state_tokens]
         fixed = len(prefix) + len(schema) + len(suffix)
         if fixed > self.max_len:
-            raise ValueError(f"the schema needs {fixed} tokens before the state, "
-                             f"and max_len is {self.max_len}")
+            raise ValueError(f"the schema needs {fixed} tokens before the state, more than the "
+                             f"maximum context length, max_len={self.max_len}")
         state_ids = state_ids[:self.max_len - fixed]
         offset = len(prefix) + len(state_ids)
 
