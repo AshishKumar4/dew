@@ -140,13 +140,8 @@ class ModelConfig:
         if isinstance(model_type, _Quantized):
             quantization = model_type._dew_quantization
             model_type = model_type._unquantized_type
-        fields = {}
-        for field in dataclasses.fields(model):
-            value = getattr(model, field.name)
-            if field.init and field.name not in ('parent', 'name') and not (
-                    callable(value) and value is field.default):
-                fields[field.name] = to_record(value, _declared_type(model_type, field.name))
-        return cls(registry.import_path(model_type), fields, adapter=adapter, quantization=quantization)
+        return cls(registry.import_path(model_type), registry.record_fields(model, model_type),
+                   adapter=adapter, quantization=quantization)
 
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
