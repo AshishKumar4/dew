@@ -669,9 +669,12 @@ class RunConfig:
         return tyro.cli(parser, args=given, default=default)
 
     @classmethod
-    def load(cls, directory: str) -> Self:
-        """Read the config a run in `directory` was built from, as this class."""
-        return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))
+    def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
+        """Read the config a run in `directory` was built from, as this class.
+        `trust` names the packages outside Dew the record may import."""
+        record = json.loads((epath.Path(directory) / RUN_FILE).read_text())
+        registry.import_trusted(record, trust)
+        return cls.from_dict(record)
 
     def _naming(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config with `objective` named the way the record spells it.

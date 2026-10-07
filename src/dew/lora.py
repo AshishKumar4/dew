@@ -206,20 +206,20 @@ class Adapter:
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
-                 ema: bool | None = None) -> Adapter:
+                 ema: bool | None = None, trust: Sequence[str] = ()) -> Adapter:
         """Return the adapter a run trained, rebuilt from the run's own record and checkpoint.
 
         It holds the adapted model, the checkpoint's variables and the bindings the
         run recorded, so `save` writes the factors under the source's names without
         the source at hand. A recorded binding whose shapes do not fit the restored
-        factors is refused by name.
+        factors is refused by name. `trust` is as `TextGeneration.from_run` takes it.
         """
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
         from dew.records import record, text
         from dew.registry import objectives
 
-        declaration = run_record(str(directory), step)
+        declaration = run_record(str(directory), step, trust)
         config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         if config.adapter is None:
             raise ValueError(f"{directory} trained no adapter")

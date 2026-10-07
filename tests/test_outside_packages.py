@@ -1,6 +1,7 @@
 """Classes from packages outside Dew, named by their import paths: built,
 recorded and loaded back with nothing registered, each checked in a fresh
-process against a toy package on the path."""
+process against a toy package on the path. A record imports such a package
+only once it is imported or the loader trusts it."""
 
 import os
 import subprocess
@@ -50,16 +51,18 @@ class PackageMLP(nn.Module):
 
 
 def test_a_packages_model_and_its_own_kind_build_and_record_by_import_path(tmp_path):
-    """The model builds by its path, importing the package only then; its
-    field typed with the package's own base class takes a record of a class
-    derived from it, and the model records both by path."""
+    """The model builds by its path once its package is trusted, which imports
+    the module the record names; its field typed with the package's own base
+    class takes a record of a class derived from it, and the model records
+    both by path."""
     _install(tmp_path, "toypackage", PACKAGE_MODEL)
     done = _run(tmp_path, "import sys\n"
                           "from dew.config import ModelConfig\n"
-                          "from dew.registry import models\n"
+                          "from dew.registry import import_trusted, models\n"
                           "assert 'toypackage' not in sys.modules\n"
                           "record = {'features': 7, 'activation': {'class': 'toypackage.models:ScaledTanh',\n"
                           "                                        'fields': {'scale': 2.0}}}\n"
+                          "import_trusted(record, ('toypackage',))\n"
                           "built = models.build('toypackage.models:PackageMLP', record)\n"
                           "print(type(built).__name__, built.features, built.activation.scale)\n"
                           "saved = ModelConfig.from_model(built)\n"
@@ -74,7 +77,8 @@ def test_a_packages_model_and_its_own_kind_build_and_record_by_import_path(tmp_p
 
 def test_a_path_naming_nothing_is_refused_by_what_it_names(tmp_path):
     _install(tmp_path, "toypackage", PACKAGE_MODEL)
-    done = _run(tmp_path, "from dew.registry import models\n"
+    done = _run(tmp_path, "import toypackage.models\n"
+                          "from dew.registry import models\n"
                           "for name in ('toypackage.models:Nope', 'no_such_model'):\n"
                           "    try:\n"
                           "        models[name]\n"
@@ -124,10 +128,11 @@ class Shift(Objective):
 '''
 
 
-def test_dew_pipeline_loads_a_packages_objectives_saved_task(tmp_path):
-    """A package's objective declares its task the way Dew's do, and a run of
-    it trained in one process loads, by the objective's import path, as that
-    task in another that has not imported the package, equal to the task
+def test_dew_pipeline_loads_a_packages_run_only_when_trusted(tmp_path):
+    """A package's objective declares its task the way Dew's do. A run of it,
+    as a Hub download would hold it, is refused in a process that has not
+    imported the package, naming the module and the flag; trusted, it loads
+    by the objective's import path as that task, equal to the task
     `pipeline` returns in place."""
     _install(tmp_path, "toypackage", PACKAGE_OBJECTIVE)
     run = tmp_path / "run"
@@ -144,9 +149,12 @@ def test_dew_pipeline_loads_a_packages_objectives_saved_task(tmp_path):
              "print(trainer.objective.pipeline(state).value)\n")
     trained = _run(tmp_path, train)
     assert trained.returncode == 0, trained.stderr[-2000:]
-    load = ("import sys\n"
-            "import dew\n"
-            f"task = dew.pipeline({str(run)!r})\n"
+    refused = _run(tmp_path, f"import dew\ndew.pipeline({str(run)!r})\n")
+    assert refused.returncode != 0
+    assert ("names toypackage.models, which is outside Dew and not imported" in refused.stderr
+            and "trust=('toypackage',), --trust toypackage" in refused.stderr)
+    load = ("import dew\n"
+            f"task = dew.pipeline({str(run)!r}, trust=('toypackage',))\n"
             "print(type(task).__module__, type(task).__name__, task.value)\n")
     loaded = _run(tmp_path, load)
     assert loaded.returncode == 0, loaded.stderr[-2000:]

@@ -268,13 +268,17 @@ def _pulled(repo_id: str, revision: str | None) -> str:
     return os.fspath(pull_from_hub(repo_id, revision=revision))
 
 
-def run_record(directory: str, step: int | str | None = None) -> Mapping[str, object]:
+def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()
+               ) -> Mapping[str, object]:
     """The inference declaration of the selected checkpoint, not training
     configuration. A task loaded from it compiles into the persistent cache
-    (`persist_compilations`)."""
+    (`persist_compilations`). `trust` names the packages outside Dew whose
+    modules the record may import (`dew.registry.imported`)."""
     from dew.checkpoints import Checkpoints
+    from dew.registry import import_trusted
     persist_compilations()
     record = Checkpoints(directory).artifact(step)
+    import_trusted(record, trust)
     if record is None:
         raise ValueError("this checkpoint's objective declares no inference record; declare "
                          "Objective.inference_record, or call objective.pipeline(state)")
@@ -326,10 +330,10 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
     return budget
 
 
-def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None
+def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None, trust: Sequence[str]
                ) -> tuple[Mapping[str, object], ModelConfig, Processor | None]:
     """Read a run's record, its model config at `dtype`, and its host processor."""
-    record = run_record(directory, step)
+    record = run_record(directory, step, trust)
     return record, _saved_model(record, dtype), _saved_processor(record)
 
 
@@ -466,7 +470,8 @@ class TextGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> TextGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                 trust: Sequence[str] = ()) -> TextGeneration:
         """Load the causal language-model run in `directory` as a task.
 
         The task rebuilds the model that the run's `run.json` records, the
@@ -481,11 +486,12 @@ class TextGeneration:
         weights are restored directly onto that mesh under `layout`, the way
         the trainer places them. `dtype` overrides the computation dtype and
         `param_dtype` the parameter storage dtype; None keeps what the
-        checkpoint stored.
+        checkpoint stored. `trust` names the packages outside Dew the run's
+        record may import, as `trust_remote_code` does in transformers.
         """
         from dew.registry import objectives
 
-        record, model_config, processor = _saved_run(directory, dtype, step)
+        record, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
@@ -498,7 +504,7 @@ class TextGeneration:
                         ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None) -> TextGeneration:
+                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> TextGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         You publish one by uploading the run directory itself with
@@ -506,7 +512,7 @@ class TextGeneration:
         other arguments work as in `from_run`.
         """
         return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype)
+                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
@@ -568,7 +574,8 @@ class BlockGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> BlockGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                 trust: Sequence[str] = ()) -> BlockGeneration:
         """Load the block-diffusion run in `directory` as a task.
 
         The task rebuilds the block denoiser that the run's `run.json`
@@ -584,7 +591,7 @@ class BlockGeneration:
         """
         from dew.diffusion.block import BlockProcess
         from dew.registry import objectives
-        record, model_config, processor = _saved_run(directory, dtype, step)
+        record, model_config, processor = _saved_run(directory, dtype, step, trust)
         model = model_config.build()
         refuse_non_denoiser(model)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
@@ -598,7 +605,7 @@ class BlockGeneration:
                         ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None) -> BlockGeneration:
+                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> BlockGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         You publish one by uploading the run directory itself with
@@ -606,7 +613,7 @@ class BlockGeneration:
         other arguments work as in `from_run`.
         """
         return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype)
+                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
@@ -662,7 +669,8 @@ class MaskedGeneration:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: MeshSpec | None = None, layout: Layout | None = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> MaskedGeneration:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                 trust: Sequence[str] = ()) -> MaskedGeneration:
         """Load the masked-diffusion run in `directory` as a task.
 
         The task rebuilds the bidirectional model that the run's `run.json`
@@ -679,7 +687,7 @@ class MaskedGeneration:
         from dew.diffusion.discrete import DiscreteProcess
         from dew.registry import objectives, solvers
 
-        record, model_config, processor = _saved_run(directory, dtype, step)
+        record, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
         model = model_config.build()
         refuse_causal(model)
@@ -706,7 +714,7 @@ class MaskedGeneration:
                         ema: bool | None = None, step: int | str | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None,
                         dtype: DTypeLike | None = None,
-                        param_dtype: DTypeLike | None = None) -> MaskedGeneration:
+                        param_dtype: DTypeLike | None = None, trust: Sequence[str] = ()) -> MaskedGeneration:
         """Load a run directory published to the Hugging Face Hub.
 
         You publish one by uploading the run directory itself with
@@ -714,7 +722,7 @@ class MaskedGeneration:
         other arguments work as in `from_run`.
         """
         return cls.from_run(_pulled(repo_id, revision), ema=ema, step=step, mesh=mesh, layout=layout,
-                            dtype=dtype, param_dtype=param_dtype)
+                            dtype=dtype, param_dtype=param_dtype, trust=trust)
 
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
