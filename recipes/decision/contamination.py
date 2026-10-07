@@ -40,9 +40,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+from sources import Value
 
 from dew.decision import Example
-from dew.records import JSON
 
 GRAM = 13
 WHOLE = 4
@@ -57,7 +57,7 @@ def _hash(text: str) -> int:
     return int.from_bytes(hashlib.blake2b(text.encode(), digest_size=8).digest(), "big")
 
 
-def texts(value: JSON) -> Iterator[str]:
+def texts(value: Value) -> Iterator[str]:
     """Every text a JSON value holds: a string, or each string inside a structure, and the
     structure itself rendered as JSON with sorted keys."""
     match value:
@@ -89,7 +89,7 @@ def _fingerprints(text: str, *, natural: bool = True) -> tuple[list[int], list[i
     return wholes, grams
 
 
-def request_texts(state: JSON, questions: JSON) -> Iterator[str]:
+def request_texts(state: Value, questions: Value) -> Iterator[str]:
     """A Jev request's content: its state, or, with an empty state, each question's instructions."""
     if state not in (None, "", {}, []):
         yield from texts(state)
@@ -199,7 +199,7 @@ def hub_rows(reference: str, columns: Sequence[str]) -> Iterator[str]:
             yield from texts(_decoded(row[column]))
 
 
-def _decoded(value: JSON) -> JSON:
+def _decoded(value: Value) -> Value:
     """A cell that holds JSON text, as the value it encodes; any other cell as it is."""
     if isinstance(value, str) and value[:1] in ('{', '[', '"'):
         try:

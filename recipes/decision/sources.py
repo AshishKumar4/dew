@@ -28,7 +28,9 @@ from dataclasses import dataclass, field, fields
 from typing import ClassVar
 
 from dew.decision import Choice, Example, Noul, Question, Score, Weighted
-from dew.records import JSON
+
+type Value = str | int | float | bool | None | list["Value"] | dict[str, "Value"]
+"""A JSON value, as `json.loads` returns one."""
 
 
 def _download(repo: str, revision: str, path: str) -> str:
@@ -83,7 +85,14 @@ class Source:
 
 @dataclass(frozen=True)
 class Framed(Source):
-    """A set of benchmark-style items, framed both ways (the module's description)."""
+    """A set of benchmark-style items, framed both ways (the module's description).
+
+    With `most`, an item of more options asks the right one and `most - 1`
+    others drawn by a hash of the item, so every option keeps its whole text
+    within a row's budget; which others varies from item to item.
+    """
+
+    most: int | None = None
 
     def example(self, content: str, instructions: str, options: Sequence[str], answer: int,
                 descriptions: Sequence[str] | None = None) -> Example:
@@ -92,13 +101,19 @@ class Framed(Source):
         Without `descriptions` the options' text is what they say; with them,
         each option is named by its own text and described by its description.
         """
+        if self.most is not None and len(options) > self.most:
+            others = [index for index in range(len(options)) if index != answer]
+            drawn = random.Random(int(_unit(content, "options") * 2**53)).sample(others, self.most - 1)
+            kept = sorted([answer, *drawn])
+            options, answer = [options[index] for index in kept], kept.index(answer)
+            descriptions = None if descriptions is None else [descriptions[index] for index in kept]
         lettered = _unit(content, "keys") < 0.5 or len(set(options)) < len(options)
         if lettered:
             keys = [chr(65 + index) if len(options) <= 26 else f"option_{index}"
                     for index in range(len(options))]
             texts = (list(options) if descriptions is None
                      else [f"{option}: {text}" for option, text in zip(options, descriptions, strict=True)])
-            criteria: dict[str, JSON] = dict(zip(keys, texts, strict=True))
+            criteria: dict[str, Value] = dict(zip(keys, texts, strict=True))
         else:
             criteria = dict(zip(options, descriptions or [None] * len(options), strict=True))
         if _unit(content, "state") < 0.5:
@@ -193,7 +208,7 @@ class TypedDecisions(Source):
         return examples
 
 
-def _state(text: str) -> JSON:
+def _state(text: str) -> Value:
     """A state stored as JSON text, or as plain text."""
     try:
         return json.loads(text)
@@ -212,6 +227,8 @@ class GliClass(Source):
 
     weight: float = 0.20
     limit: int | None = 200_000
+    most: int = 24
+    """A text of more candidates asks its true ones and others drawn up to this many."""
     revision: str = "93d3cdc82257a9e821f4b21d08e3dc81979bb653"
     shard: str = "data/train-00000-of-00003.parquet"
 
@@ -219,8 +236,13 @@ class GliClass(Source):
         examples = []
         for row in _rows("knowledgator/gliclass-v2.0", self.revision, self.shard):
             labels, true = list(dict.fromkeys(row["all_labels"])), set(row["true_labels"])
-            if not 2 <= len(labels) <= 255 or not true <= set(labels):
+            if len(labels) < 2 or not true <= set(labels):
                 continue
+            if len(labels) > self.most:
+                others = [label for label in labels if label not in true]
+                drawn = random.Random(int(_unit(row["text"], "labels") * 2**53)).sample(
+                    others, max(0, self.most - len(true)))
+                labels = [label for label in labels if label in true or label in drawn]
             if len(true) == 1:
                 question = Choice("Which label fits the text?", labels)
                 examples.append(Example(row["text"], {"label": question}, {"label": next(iter(true))}))
@@ -236,6 +258,7 @@ class GliClass(Source):
 class Intents(Framed):
     """BANKING77's training requests (mteb/banking77, CC BY 4.0), each asking its intent among all 77."""
 
+    most: int | None = 24
     weight: float = 0.04
     revision: str = "18072d2685ea682290f7b8924d94c62acc19c0b2"
 
@@ -250,6 +273,7 @@ class Intents(Framed):
 class Clinc(Framed):
     """CLINC150's training queries (clinc/clinc_oos `plus`, CC BY 3.0): 150 intents and out-of-scope."""
 
+    most: int | None = 24
     weight: float = 0.04
     revision: str = "155b9c710419136e17307b80d0a13e68cd46b4ec"
 
@@ -324,7 +348,7 @@ class BoolQ(Source):
         examples = []
         for row in _rows("google/boolq", self.revision, "data/train-00000-of-00001.parquet"):
             question = Noul(f"{row['question'].rstrip('?')}?")
-            state: JSON = row["passage"]
+            state: Value = row["passage"]
             if _unit(row["passage"], "state") >= 0.5:
                 state, question = "", Noul(f"{question.instructions}\nPassage: {row['passage']}")
             answer = "true" if row["answer"] else "false"
