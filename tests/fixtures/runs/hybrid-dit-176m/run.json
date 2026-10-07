@@ -72,7 +72,10 @@
     "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
     "quantization": null
   },
-  "objective": "dew.objectives.diffusion.objective:DiffusionObjective",
+  "objective": {
+    "fields": {},
+    "name": "dew.objectives.diffusion.objective:DiffusionObjective"
+  },
   "optim": {
     "b1": null,
     "b2": null,

@@ -2,7 +2,7 @@
 
     python recipes/jepa/train.py --data.path ~/.cache/dew/datasets/oxford_flowers102/2.1.1 \\
         --data.image-size 224 --trainer.batch-size 64 --trainer.epochs 300 --probe-classes 102 \\
-        --model.config '{"patch_size": 16, "emb_features": 384, "num_layers": 12, "num_heads": 6}'
+        --model.patch-size 16 --model.emb-features 384 --model.num-layers 12 --model.num-heads 6
 
 The encoder is --model, the predictor takes the encoder's width and heads plus
 --predictor, and the probes score the frozen encoder at every validation.
@@ -11,10 +11,10 @@ The encoder is --model, the predictor takes the encoder's width and heads plus
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from dew.config import JsonDict, ModelConfig, OptimConfig, RunConfig
+from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, RunConfig
 from dew.data import ImageDataset, VideoDataset
 from dew.inputs import Field
-from dew.objectives.jepa import JepaObjective, KnnProbe, LinearProbe, MultiBlockMask
+from dew.objectives.jepa import KnnProbe, LinearProbe, MultiBlockMask
 from dew.registry import datasets, models
 from dew.training import TrainState, prepare_process, run_timestamp
 
@@ -32,7 +32,9 @@ SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ra
 class JepaRunConfig(RunConfig):
     """A run, plus the JEPA objective's own knobs."""
 
-    objective: str = "jepa"
+    objective: ObjectiveConfig = field(default_factory=lambda: ObjectiveConfig("jepa"))
+    """The JEPA objective and its arguments (`--objective.momentum 0.996 1.0`).
+    Its EMA ramps over the whole run unless it names `momentum_steps`."""
     model: ModelConfig = field(
         default_factory=lambda: ModelConfig("jepa_encoder", dict(DEFAULT_ENCODER_CONFIG)))
     optim: OptimConfig = field(
@@ -43,18 +45,12 @@ class JepaRunConfig(RunConfig):
     num_target_blocks: int = 4
     target_scale: tuple[float, float] = (0.15, 0.2)
     target_aspect: tuple[float, float] = (0.75, 1.5)
-    momentum: tuple[float, float] = (0.996, 1.0)
-    """Target-encoder EMA momentum, ramped over momentum_steps."""
-    momentum_steps: int | None = None
-    """Defaults to the full training run."""
     probe_classes: int | None = None
     """Number of classes for the frozen-encoder probes, which are what a
     validation pass scores; a run without them schedules no pass."""
-    probe_label_key: str = 'label'
     knn_k: int = 20
 
     def __post_init__(self) -> None:
-        super().__post_init__()
         if self.probe_classes is None and self.trainer.eval_every is not None:
             raise ValueError(
                 "a JEPA validation pass scores the frozen-encoder probes; set probe_classes, "
@@ -134,15 +130,8 @@ def main(config: JepaRunConfig) -> TrainState:
     print(f"Mask geometry: {mask.block_area} tokens per target block "
           f"({mask.block_shapes}), {mask.num_context} context tokens of {mask.num_patches}")
 
-    objective = JepaObjective(
-        encoder=encoder,
-        predictor=predictor,
-        mask=mask,
-        sample=sample,
-        momentum=config.momentum,
-        momentum_steps=config.momentum_steps or steps,
-        label_key=config.probe_label_key,
-    )
+    ramp = {} if "momentum_steps" in config.objective.fields else {"momentum_steps": steps}
+    objective = config.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample, **ramp)
 
     probes = ()
     if config.probe_classes:

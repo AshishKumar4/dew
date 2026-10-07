@@ -11,7 +11,7 @@ takes the vocabulary from the data, not the command line.
         --out data/shakespeare-byte --tokenizer byte
     python recipes/lm/train.py --data.path data/shakespeare-byte \\
         --data.seq-len 256 --trainer.batch-size 32 --trainer.epochs 10 \\
-        --model.config '{"emb_features": 384, "num_layers": 6, "num_heads": 6}'
+        --model.emb-features 384 --model.num-layers 6 --model.num-heads 6
 
 `data:packed-tokens` packs whole documents into the windows instead.
 """
@@ -28,7 +28,7 @@ import jax.numpy as jnp
 from dew.config import ModelConfig
 from dew.data import ByteTokenizer, HFTokenizer, PackedTokens, TokenWindows
 from dew.inference import RunProcessor
-from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity, Samples
+from dew.objectives.lm import LMRunConfig, Perplexity, Samples
 from dew.registry import datasets, models, objectives
 from dew.training import TrainState, prepare_process, run_timestamp
 
@@ -60,7 +60,8 @@ class LmRunConfig(LMRunConfig):
             raise ValueError(
                 "the language model recipe trains on token files: "
                 "data:token-windows or data:packed-tokens")
-        if self.objective == objectives.paths["block_diffusion"] and not isinstance(self.data, TokenWindows):
+        if (self.objective.name == objectives.paths["block_diffusion"]
+                and not isinstance(self.data, TokenWindows)):
             raise ValueError("block_diffusion requires data:token-windows, not packed documents")
 
 
@@ -107,7 +108,7 @@ def context_length(config: LmRunConfig, samples: Samples | None) -> int:
     budget longer than the training context is what decides the model's
     max_seq_len; the sequence length being trained on is the floor.
     """
-    if config.objective == objectives.paths["block_diffusion"]:
+    if config.objective.name == objectives.paths["block_diffusion"]:
         return config.data.seq_len + 1
     if samples is None:
         return config.data.seq_len
@@ -227,45 +228,43 @@ def build_masked_objective(config: LmRunConfig, model, fields, pretrained):
 
     A --pretrained diffusion checkpoint carries mask_token_id in the fields it
     was built from and its weights in `pretrained`, so the run continues from
-    them; a from-scratch run names the mask id in --model.config beside
-    causal=False and draws its tree from the key. The validation text is the
-    unmasked rows decoded with the run's tokenizer, or bare ids when
-    --sample-tokens is 0.
+    them; a from-scratch run names the mask id beside --model.no-causal and
+    draws its tree from the key. The validation text is the unmasked rows
+    decoded with the run's tokenizer, or bare ids when --sample-tokens is 0.
 
     A token window is `--data.seq-len + 1` ids wide: the LM objective spends
     the extra id on the shift, and masked diffusion has no shift, so it
     denoises the whole row rather than dropping a token off every window."""
     from dew.diffusion.discrete import MDLM
-    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 
     mask = fields.get("mask_token_id")
     if mask is None:
         raise ValueError(
             "masked_diffusion trains a model with a mask token id: continue a "
             "--pretrained diffusion checkpoint, which carries one, or name "
-            "mask_token_id in --model.config beside causal=False")
+            "--model.mask-token-id beside --model.no-causal")
     decode = None if config.sample_tokens <= 0 else run_tokenizer(config.tokenizer).decode
-    return MaskedDiffusionObjective(
-        model, MDLM(mask_id=int(mask))(), config.data.seq_len + 1,
-        ema_decay=config.ema_decay, decode=decode, variables=pretrained,
-        processor=RunProcessor(run_tokenizer(config.tokenizer)))
+    return config.objective.build(
+        model=model, process=MDLM(mask_id=int(mask))(), seq_len=config.data.seq_len + 1, decode=decode,
+        variables=pretrained, processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
 def build_block_objective(config: LmRunConfig, model, pretrained):
-    """Split each complete token-window row into a clean prompt and response canvases."""
+    """Split each complete token-window row into the clean prompt the run
+    names (`--objective.prompt-length`) and response canvases."""
     from dew.nn.diffusion_gemma import DiffusionGemma
-    from dew.objectives.diffusion.block import BlockDiffusionObjective
 
     if not isinstance(model, DiffusionGemma):
         raise ValueError("block_diffusion requires a DiffusionGemma checkpoint")
-    width = model.canvas_length if config.block_canvas_size is None else config.block_canvas_size
-    response = config.data.seq_len + 1 - config.block_prompt_tokens
+    prompt = config.objective.fields.get("prompt_length")
+    width = config.objective.fields.get("canvas_size") or model.canvas_length
+    if not isinstance(prompt, int) or not isinstance(width, int):
+        raise ValueError("block_diffusion splits each row at --objective.prompt-length")
+    response = config.data.seq_len + 1 - prompt
     if width < 1 or response < width or response % width:
-        raise ValueError("seq_len + 1 must equal block_prompt_tokens plus whole training canvases")
-    return BlockDiffusionObjective(
-        model, prompt_length=config.block_prompt_tokens, num_canvases=response // width,
-        canvas_size=width, variables=pretrained, ema_decay=config.ema_decay,
-        processor=RunProcessor(run_tokenizer(config.tokenizer)))
+        raise ValueError("seq_len + 1 must equal prompt_length plus whole training canvases")
+    return config.objective.build(model=model, num_canvases=response // width, variables=pretrained,
+                                  processor=RunProcessor(run_tokenizer(config.tokenizer)))
 
 
 def main(config: LmRunConfig) -> TrainState:
@@ -289,7 +288,7 @@ def main(config: LmRunConfig) -> TrainState:
             f"{config.trainer.batch_size}, so an epoch is no steps at all: read "
             "more data or lower --trainer.batch-size")
 
-    samples = None if config.objective == objectives.paths["block_diffusion"] else build_samples(config)
+    samples = None if config.objective.name == objectives.paths["block_diffusion"] else build_samples(config)
     context = context_length(config, samples)
 
     source = None
@@ -305,11 +304,11 @@ def main(config: LmRunConfig) -> TrainState:
     # run.json records the resolved model as
     # built, vocabulary and context included, so `dew.pipeline` rebuilds it.
     resolved = dict(fields)
-    if config.objective == objectives.paths["block_diffusion"]:
+    if config.objective.name == objectives.paths["block_diffusion"]:
         resolved["max_seq_len"] = model.max_seq_len
     config = replace(config, model=replace(config.model, fields=resolved))
     name = config.trainer.name or (
-        f"{objectives.label(str(config.objective))}-"
+        f"{objectives.label(config.objective.name)}-"
         f"{'+'.join(d.name for d in token_directories(read_corpora(config.data)))}/"
         f"seq-{config.data.seq_len}/"
         f"lr-{config.optim.learning_rate}/"
@@ -332,30 +331,17 @@ def main(config: LmRunConfig) -> TrainState:
         else:
             source = source.adapt(config.lora, key=config.trainer.key)
             model, pretrained = source.model, source.variables
-    if config.objective == objectives.paths["masked_diffusion"]:
-        return config.train(build_masked_objective(config, model, fields, pretrained), data,
-                            name=name, metrics=validation, summary=summary)
-    if config.objective == objectives.paths["block_diffusion"]:
-        return config.train(build_block_objective(config, model, pretrained), data,
-                            name=name, metrics=validation, summary=summary)
-    options = {
-        "ema_decay": config.ema_decay,
-        "samples": samples,
+    if config.objective.name == objectives.paths["masked_diffusion"]:
+        objective = build_masked_objective(config, model, fields, pretrained)
+    elif config.objective.name == objectives.paths["block_diffusion"]:
+        objective = build_block_objective(config, model, pretrained)
+    else:
         # The run's tokenizer, which its checkpoints record for every loader.
-        "processor": RunProcessor(run_tokenizer(config.tokenizer)),
-        "balance_rate": config.balance_rate,
-        "aux_loss_alpha": config.aux_loss_alpha,
-        "seq_aux": config.seq_aux,
-        "router_z_loss": config.router_z_loss,
-        "mtp_weight": config.mtp_weight,
-        "indexer": config.indexer,
-        "qk_stats": config.optim.optimizer == "muonclip",
-        "token_accuracy": config.token_accuracy,
-    }
-    objective = LMObjective(model if source is None else source, config.data.seq_len,
-                            variables=pretrained, **options)
+        objective = config.objective.build(
+            model=model if source is None else source, seq_len=config.data.seq_len, variables=pretrained,
+            samples=samples, processor=RunProcessor(run_tokenizer(config.tokenizer)),
+            qk_stats=config.optim.optimizer == "muonclip")
     return config.train(objective, data, name=name, metrics=validation, summary=summary)
-
 
 if __name__ == '__main__':
     main(LmRunConfig.cli())

@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from dew.config import RunConfig, TrainerConfig
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.lm.config import LMRunConfig
 from dew.training.quantization import Quantization
@@ -53,8 +53,9 @@ def test_a_record_keeps_what_it_states_and_defaults_what_it_lacks():
     quantized = dataclasses.replace(run, trainer=dataclasses.replace(
         run.trainer, quantization=Quantization(dtype="fp8", patterns=(".*mlp.*",), weight_only=True)))
     assert DiffusionRunConfig.from_dict(written(quantized)) == quantized
-    assert LMRunConfig.from_dict({"ema_decay": 0.99}) == LMRunConfig(ema_decay=0.99)
-    assert LMRunConfig.from_dict({}).ema_decay is None
+    stated = LMRunConfig(objective=ObjectiveConfig("lm", {"ema_decay": 0.99}))
+    assert LMRunConfig.from_dict({"objective": {"name": "lm", "fields": {"ema_decay": 0.99}}}) == stated
+    assert LMRunConfig.from_dict({}).objective == ObjectiveConfig("lm")
 
 
 def test_an_unknown_field_is_refused():

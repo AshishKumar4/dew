@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
-from dew.config import RunConfig, ScheduleSpec
+from dew.config import ObjectiveConfig, RunConfig, ScheduleSpec
 from dew.data import Dataset, OnlineImages, PackedTokens, TFDSImages
 from dew.data.dataset import record_argument, tokenized
 from dew.diffusion.presets import Flow
@@ -83,8 +83,8 @@ def test_a_recipe_config_round_trips_through_its_json_record(name):
     recipe = load_recipe(name)
     cls = {"diffusion": "DiffusionRunConfig", "lm": "LmRunConfig", "jepa": "JepaRunConfig"}[name]
     args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6", "--guidance.scale", "2.5"],
-            "lm": ["--data.path", "d", "--sample-tokens", "4", "--ema-decay", "0.9"],
-            "jepa": ["--probe-classes", "7", "--momentum", "0.9", "0.99"]}[name]
+            "lm": ["--data.path", "d", "--sample-tokens", "4", "--objective.ema-decay", "0.9"],
+            "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
     config = parse(getattr(recipe, cls), [*args, "--trainer.steps", "5"])
 
     record = json.loads(json.dumps(config.to_dict()))
@@ -174,7 +174,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     state = recipe.main(config)
 
     assert int(state.step) == 2
-    trained = dataclasses.replace(config, objective=import_path(DiffusionObjective))
+    trained = dataclasses.replace(config, objective=ObjectiveConfig(import_path(DiffusionObjective)))
     assert recipe.DiffusionRunConfig.load(str(tmp_path / "run")) == trained
     assert config.to_dict()["preset"] == {"class": "dew.diffusion.presets:EDM", "fields": {
         "sigma_min": 0.002, "sigma_max": 80.0, "rho": 7.0, "sigma_data": 0.5,

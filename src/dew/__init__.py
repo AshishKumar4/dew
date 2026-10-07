@@ -39,6 +39,7 @@ if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
     from dew.inputs import Condition, Field, InputSpec
     from dew.objectives import Objective
     from dew.objectives.base import Aux, EMASpec, Step
+    from dew.objectives.supervised import Supervised
     from dew.sampling import CFG, sample
     from dew.telemetry.profile import Profiler
     from dew.training import (
@@ -71,7 +72,7 @@ _EXPORTS = {
     "MLflowTracker": "dew.training", "TensorBoardTracker": "dew.training",
     "Evaluation": "dew.training",
     "ProfileWindow": "dew.training",
-    "Objective": "dew.objectives",
+    "Objective": "dew.objectives", "Supervised": "dew.objectives.supervised",
     "Dataset": "dew.data",
     "Process": "dew.diffusion",
     "Mean": "dew.eval",
@@ -124,6 +125,7 @@ __all__ = [
     "Profiler",
     "Representations",
     "Step",
+    "Supervised",
     "TensorBoardTracker",
     "TextSamples",
     "TokenScores",

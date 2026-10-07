@@ -299,7 +299,6 @@ class DiffusionRunConfig(RunConfig):
     """
 
     def __post_init__(self) -> None:
-        super().__post_init__()
         # A record carries every sequence as a JSON list and a command line
         # writes one too; the field is a tuple, so the value is one.
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))

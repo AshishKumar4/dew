@@ -19,21 +19,19 @@ from __future__ import annotations
 
 import dataclasses
 
-from dew.config import DataSpec, ModelConfig, OptimConfig, RunConfig
+from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, RunConfig
 from dew.data import TokenWindows
 from dew.registry import objectives
 from dew.sampling.text import Sampling
-
-from .objective import IndexerTraining
 
 
 @dataclasses.dataclass(frozen=True)
 class LMRunConfig(RunConfig):
     """A `RunConfig` plus the settings specific to language models."""
 
-    objective: str = "lm"
-    """The loss convention: lm, masked_diffusion (MDLM), or block_diffusion
-    (the official DiffusionGemma fine-tuning objective)."""
+    objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("lm"))
+    """The objective and its arguments: lm, masked_diffusion (MDLM), or
+    block_diffusion (the official DiffusionGemma fine-tuning objective)."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     data: DataSpec = dataclasses.field(default_factory=TokenWindows)
@@ -43,9 +41,6 @@ class LMRunConfig(RunConfig):
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""
-    ema_decay: float | None = None
-    """The decay of an EMA copy that validation and previews read. None keeps
-    no copy, and 1.0 keeps a frozen copy."""
     sample_prompt: str = ""
     """The prompt that validation samples continue; an empty prompt continues a newline."""
     sample_tokens: int = 128
@@ -57,48 +52,16 @@ class LMRunConfig(RunConfig):
     """The Hugging Face decoder to continue training from: a hub repo id,
     `repo@revision` (a branch, tag or commit), or a local directory in that
     layout. A run records a hub repo as `repo@commit`, with the commit it
-    resolved to. The checkpoint sets the architecture, so --model.config may
-    then give max_seq_len alone."""
-    balance_rate: float | None = None
-    """How far a sparse run moves each router's balancing bias against its
-    load every step (DeepSeek's aux-loss-free balancing). It needs a mixture
-    with bias=True; unset leaves the bias unchanged."""
-    aux_loss_alpha: float | None = None
-    """The weight of the expert balance loss (`LMObjective.aux_loss_alpha`).
-    With --no-seq-aux it is the Switch loss over the step's routed positions,
-    which is lm-engine's `router_aux_loss_coef`. Unset adds no balance loss."""
-    seq_aux: bool = True
-    """Whether the balance loss is computed within each sequence (DeepSeek V2).
-    False computes it over the whole step."""
-    router_z_loss: float = 0.0
-    """The routers' z-loss weight (`LMObjective.router_z_loss`). lm-engine
-    uses 0.1 times its aux coefficient. Zero adds nothing."""
-    mtp_weight: float | None = None
-    """DeepSeek's lambda on the multi-token-prediction term. It needs a model
-    with num_nextn_predict_layers above zero; unset leaves the term out."""
-    indexer: IndexerTraining | None = None
-    """DeepSeek-V3.2's lightning-indexer training phase. `indexer:indexer-training
-    --indexer.phase warmup` freezes everything except the indexer, on a model
-    whose mla mixer names the indexer's heads and no top-k. `sparse` trains
-    the whole model on its top-k, with the KL term beside the cross entropy.
-    Unset trains no indexer term."""
-    token_accuracy: bool = True
-    """Whether to report the argmax accuracy beside the loss. False skips that
-    argmax over every logit."""
-    block_prompt_tokens: int = 256
-    """The length of the clean prompt prefix in a block-diffusion token row."""
-    block_canvas_size: int | None = None
-    """The training canvas width; None uses the checkpoint's canvas length."""
+    resolved to. The checkpoint sets the architecture, so of its fields
+    --model.max-seq-len alone may be set."""
 
     def __post_init__(self) -> None:
-        super().__post_init__()
-        if self.objective not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
-                                                                        "block_diffusion")):
+        if self.objective.name not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
+                                                                             "block_diffusion")):
             raise ValueError(
-                f"--objective {self.objective!r} is not lm, masked_diffusion or block_diffusion")
-        if self.objective == objectives.paths["block_diffusion"]:
+                f"--objective {self.objective.name!r} is not lm, masked_diffusion or block_diffusion")
+        if self.objective.name == objectives.paths["block_diffusion"]:
             if self.pretrained is None:
                 raise ValueError("block_diffusion fine-tuning requires --pretrained")
-            if (self.balance_rate is not None or self.mtp_weight is not None
-                    or self.trainer.quantization is not None):
-                raise ValueError("block_diffusion has no balancing, MTP or quantized-training term")
+            if self.trainer.quantization is not None:
+                raise ValueError("block_diffusion has no quantized-training term")

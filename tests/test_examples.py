@@ -261,6 +261,39 @@ def test_train_lm_example_samples_what_it_trained(tmp_path):
 # The end-to-end scripts, run the way their docstrings say to run them
 # ---------------------------------------------------------------------------------
 
+def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_new_process(tmp_path):
+    """`dew train examples/train_supervised.py --set ...` trains the run the
+    file builds, each `--set` read as its field's type reads it. A new
+    process given only the run's `run.json`, trusting the file's module,
+    rebuilds the same model, loss and data and trains the same loss, step
+    for step: the record carries the run exactly."""
+    environment = {**single_device(), "XDG_CACHE_HOME": str(tmp_path / "cache"),
+                   "PYTHONPATH": os.pathsep.join([str(REPO_ROOT / "src"), str(REPO_ROOT / "examples")])}
+
+    def train(*arguments):
+        finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
+                                  cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
+        assert finished.returncode == 0, (
+            f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
+
+    def losses(directory):
+        rows = (directory / "train_supervised" / "tracking" / "scalars.jsonl").read_text().splitlines()
+        scalars = [json.loads(row)["scalars"] for row in rows]
+        return [row["train/loss"] for row in scalars if "train/loss" in row]
+
+    train(str(REPO_ROOT / "examples" / "train_supervised.py"),
+          "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}", "--set", "trainer.steps=6",
+          "--set", "trainer.log_every=1", "--set", "model.hidden=8")
+    record = tmp_path / "first" / "train_supervised" / "run.json"
+    written = json.loads(record.read_text())
+    assert written["trainer"]["steps"] == 6 and written["model"]["fields"]["hidden"] == 8
+    assert written["objective"]["fields"]["loss"] == {"function": "train_supervised:cross_entropy"}
+
+    train(str(record), "--trust", "train_supervised", "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
+    assert len(losses(tmp_path / "first")) == 6
+    assert losses(tmp_path / "again") == losses(tmp_path / "first")
+
+
 def test_train_flowers_tpu_smoke_samples_a_grid_and_scores_it(tmp_path):
     """The diffusion run's whole arc: synthetic ArrayRecords in, a run
     directory with its record and checkpoint, a samples grid out of
@@ -299,7 +332,7 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
         "config.json", "generation_config.json", "model.safetensors"}
     run = tmp_path / "checkpoints" / tmp_path.name
     objective = json.loads((run / "run.json").read_text())["objective"]
-    assert objective == "dew.objectives.lm.objective:LMObjective"
+    assert objective["name"] == "dew.objectives.lm.objective:LMObjective"
     assert (export / "tokenizer_config.json").is_file()
     assert "tokenizer_name" not in json.loads((export / "generation_config.json").read_text())
 
