@@ -13,8 +13,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
-from dew.nn.attention import cudnn_attention, cudnn_runs, scaled_dot_product_attention
+from dew.nn.attention import cudnn_attention, scaled_dot_product_attention
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kv_cache import (
     KVCache,
@@ -168,14 +169,15 @@ def test_an_int8_cache_refuses_a_head_width_no_hadamard_matrix_fits():
 def test_only_supported_bfloat16_pools_take_the_paged_kernel(monkeypatch, backend):
     """The TPU kernel casts every page to bfloat16 and broadcasts int8
     scales to the pool's width, so a float32 or quantized pool takes the
-    gather there; a GPU additionally needs cuDNN's dtype/device support."""
+    gather there; a GPU's Pallas kernel reads a bfloat16 pool whose page
+    fits one of its blocks."""
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
 
     def kernel(layout, dtype):
         return KVStore(nn.Module(), layout, 2, 32, 2, 64, jnp.dtype(dtype)).kernel()
 
-    query = jax.ShapeDtypeStruct((2, 1, 2, 64), jnp.bfloat16)
-    assert kernel(KVCache(page_size=16), jnp.bfloat16) == (backend == "tpu" or cudnn_runs(query))
+    assert kernel(KVCache(page_size=16), jnp.bfloat16)
+    assert kernel(KVCache(page_size=64), jnp.bfloat16) == (backend == "tpu")
     assert not kernel(KVCache(page_size=16), jnp.float32)
     assert not kernel(KVCache(quantized="int8", page_size=16), jnp.bfloat16)
     assert not kernel(KVCache(), jnp.bfloat16)
@@ -195,9 +197,11 @@ class Decoder(nn.Module):
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu" or not bf16_dot_runs(),
-                    reason="native cuDNN paged BF16 forward needs CUDA sm80+")
+                    reason="the paged BF16 decode kernel needs CUDA sm80+")
 def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_deterministic_ops):
-    """Reordered/shared pages, distinct key counts, gradients and float64 truth."""
+    """Over reordered and shared pages and distinct key counts, the Pallas
+    kernel's value is as exact as the gathered cuDNN attention's, measured
+    from float64, and its gradients are that attention's."""
     q = jax.random.normal(jax.random.key(3), (2, 4, 64), jnp.bfloat16)
     k = jax.random.normal(jax.random.key(4), (2, 4, 16, 64), jnp.bfloat16)
     v = jax.random.normal(jax.random.key(5), k.shape, jnp.bfloat16)
@@ -219,7 +223,7 @@ def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_dete
                                                      argnums=(0, 1, 2), has_aux=True))(q, k, v)
     (_, prior), previous = jax.jit(jax.value_and_grad(lambda q, k, v: loss(old, q, k, v),
                                                      argnums=(0, 1, 2), has_aux=True))(q, k, v)
-    for actual, expected in zip((out, *gradients), (prior, *previous), strict=True):
+    for actual, expected in zip(gradients, previous, strict=True):
         np.testing.assert_array_equal(actual, expected)
 
     with jax.enable_x64():
@@ -239,6 +243,8 @@ def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_dete
         for actual, expected in zip((out, *gradients), (truth, *derivatives), strict=True):
             expected = np.asarray(expected)
             assert np.abs(np.asarray(actual, np.float64) - expected).max() <= 2 ** -6 * np.abs(expected).max()
+    assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(prior, np.float32),
+                                     np.asarray(truth), "paged decode kernel")
 
 
 @pytest.mark.parametrize("tokens", [32, 48])
@@ -264,6 +270,8 @@ def test_the_tpu_paged_kernel_attends_what_the_stored_pool_holds(tokens, monkeyp
         return kernel(*args, pages_per_compute_block=pages_per_compute_block, **kwargs)
 
     monkeypatch.setattr(kernels, "paged_attention", recorded)
+    # A GPU host's decode reads its pages through the GPU's own kernel.
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
     rows, heads, width = 2, 2, 128
     # The interpreter's callbacks dispatch computations to the device they run
     # on, and each takes one of the device's 32 computations in flight. The

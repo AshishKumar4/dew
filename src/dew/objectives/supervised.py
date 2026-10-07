@@ -16,6 +16,7 @@ path (`ObjectiveConfig`), and writing the record refuses a lambda.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import types
 from collections.abc import Callable, Mapping, Sequence
 
@@ -52,6 +53,12 @@ class Supervised(Objective[Ratio]):
             raise ValueError(f"the metrics' names {sorted(named)} repeat or include loss; each reports under "
                              "its own name")
         self.model = self.bind_model(model)
+        call = inspect.signature(type(self.model).__call__).parameters.values()
+        needed = [parameter.name for parameter in list(call)[2:] if parameter.default is parameter.empty
+                  and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)]
+        if needed:
+            raise TypeError(f"Supervised calls its model on the sample alone, and "
+                            f"{type(self.model).__name__}'s call also needs {', '.join(needed)}")
         self.criterion = loss
         self.metrics: Mapping[str, Criterion] = named
         self.sample = inputs.sample

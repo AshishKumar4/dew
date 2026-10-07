@@ -301,8 +301,17 @@ def fetch_rows(rows: Dataset, sink: multiprocessing.queues.Queue, *, workers: in
             finish(error)
             # Queue.get's timeout covers readiness, not a partial packet.
             # Keep writers alive until the iteration owner has left next.
-            # Only close, never request_stop, permits destructive teardown.
+            # Only close, never request_stop, permits the teardown.
             shutdown.wait()
+            # close set `stop`, so each worker ends its shard within a fetch's
+            # timeout and exits on the pool's sentinel. Pool.terminate, which
+            # leaving the `with` would run, kills workers first and then joins
+            # its task handler: a worker killed while it held the result
+            # queue's lock, sending its shard's result, left that handler
+            # waiting on the lock for good (a 10-minute hang in
+            # test_abandoned_full_image_queue_releases_real_spawned_workers).
+            pool.close()
+            pool.join()
 
 
 class UrlStream:
@@ -398,7 +407,7 @@ class UrlStream:
             return
         self._shutdown.set()
         self.fetcher.join()
-        # Pool termination can interrupt queue writers. Do not drain/reuse
+        # A worker's exit can abandon its last queue write. Do not drain/reuse
         # their pipe, or wait for abandoned payloads to flush.
         samples = self.samples
         if samples is not None:

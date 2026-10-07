@@ -3,6 +3,7 @@
 import importlib.util
 import json
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -60,7 +61,7 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
     out = tmp_path / "verdict.json"
-    ci.task("3.12", [f"tests/{name}" for name in files], "", out)
+    ci.task("3.12", [f"tests/{name}" for name in files], "", out, 600.0)
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_pass.py": 0, "3.12:tests/test_fail.py": 1, "3.12:tests/test_missing.py": 1,
@@ -84,3 +85,23 @@ def test_the_plan_weighs_a_split_file_by_its_groups_and_the_rest_by_armadas_pace
     assert ci.weights(files, timings, "3.12") == {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0,
                                                   "tests/test_paced.py": 60.0, "tests/test_split.py": 350.0}
     assert ci.weights(files, timings, "3.14")["tests/test_split.py"] == 30.0
+
+
+def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
+    """A hang is graded: the task interrupts pytest at its deadline, short of
+    armada's own timeout, and writes a red row for each of its files, the
+    one that finished first included."""
+    (tmp_path / "tests/test_quick.py").write_text("def test_ok(): pass\n")
+    (tmp_path / "tests/test_hangs.py").write_text("import time\ndef test_forever(): time.sleep(600)\n")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    out = tmp_path / "verdict.json"
+    began = time.monotonic()
+    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0)
+    assert time.monotonic() - began < 60
+    rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
+    assert {name: row["exitCode"] for name, row in rows.items()} == {
+        "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+    assert "ran past its deadline of 3 s" in rows["3.12:tests/test_hangs.py"]["output"]

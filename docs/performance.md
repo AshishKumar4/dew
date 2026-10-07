@@ -1771,6 +1771,23 @@ in it from the start (`perf/paged-layout`, not adopted) left the step at
 8.207 ms and the generations bitwise equal. A one-layer program compiled
 alone does transpose the pools, so a probe of one layer misleads here.
 
+A GPU decode step now reads the pages through Dew's own Pallas decode
+kernel (`decode_attention.attend_paged`, the dense decode kernel's
+arithmetic over a page table), not cuDNN's paged attention. On the same
+A100 at integration `703201b5`, two rounds alternating, the paged cache
+served 12372-12387 tokens a second closed loop at 128 slots against
+cuDNN's 11400-11406 (+8.6%), and 7387-7397 against 7041-7265 at 32; at 32
+requests a second on 128 slots a token gap's p50 fell from 8.82-8.88 to
+7.99-8.03 ms. The traced step took 7.50 against 8.19 ms, the attention
+about 4.4 against 5.13. The dense cache's programs, throughput and tokens
+are unchanged (14567-14592 tokens a second at 128 slots, generations
+bitwise equal), so it stays the faster cache at 0.85 of it. The kernel's
+error from float64 is within twice cuDNN's (`tests/reference_error.py`),
+but its sums run in another order: the paged generations, which cuDNN kept
+bitwise equal to the dense cache's, part from them in 28 of 64 rows at 32
+slots and 102 of 256 at 128, each at a near-tie (the two tokens' log
+probabilities 0.05 apart at the median, at most 0.15).
+
 Under `--xla_gpu_deterministic_ops` (the CUDA test lane's flag), the paged
 write put a dropped token's keys at another head's kept slot (jax 0.11.2, an
 RTX 4080). The write is a scatter into the pool's page and offset axes past
@@ -2339,7 +2356,7 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 | fused-weight SwiGLU (tokamax `xla` formulation, one contraction for gate and up) | every GPU | 1.47x (A100), 1.47x (L4), 1.55x (RTX 4080), 1.21x (T4) over two XLA matmuls; no gain on TPU | a change to the MLP's parameter layout. |
 | tokamax `xla` head plus cross entropy | sm89 speed | 73.0 ms (L4) and 36.8 ms (RTX 4080), 1.55x and 1.58x over Dew's chunked head | tokamax dependency, and it holds 1.6-3.2 GiB where the chunked head holds 131-355 MiB. |
 | JAX's Pallas-Triton `mha` (`jax.experimental.pallas.ops.gpu.attention`), 2026-10-01 | sm89, training attention | forward plus backward, bf16, against cuDNN: 0.38 against 0.64 ms (batch 32, 256 tokens, 12 heads of 64), 0.43 against 0.81 (causal, batch 16, 512 tokens), 1.12 against 1.36 (causal, batch 4, 1024 tokens, 16 heads of 128); in the step, routed where a call has no bias, mask, window or lengths: the 768-wide SimpleDiT 76.10 to 74.81 ms, the small decoder 63.61 to 62.86 | deprecated in JAX 0.11 for tokamax; against an fp32 reference its dq and dk errors reach 8.5e-3 of their maximum where cuDNN's reach 5.3e-3 (causal, 512 tokens); no grouped-query heads. |
-| JAX's Pallas GPU `paged_attention` | sm80 and later, decode | 1.75-1.84x (A100), 1.85-2.1x (L4), 2.1-2.8x (RTX 4080) over the XLA gather | a decode-path change; on TPU the XLA gather wins at batch 8 and up to 2k context. |
+| JAX's Pallas GPU `paged_attention` | sm80 and later, decode | 1.75-1.84x (A100), 1.85-2.1x (L4), 2.1-2.8x (RTX 4080) over the XLA gather | it keeps its unnormalized sums and split partials in the query's dtype and divides by a bf16 denominator; Dew's own paged decode kernel (above) rounds once. On TPU the XLA gather wins at batch 8 and up to 2k context. |
 
 ### The Mamba-2 SSD scan: `ssd_kernel_runs`
 
