@@ -38,6 +38,10 @@ def request(payload):
                 if "result" in message:
                     return message["result"]
                 from IPython.display import display
+                if "text" in message:
+                    text = {"dew-text": message["text"], "first_token_seconds": message["first_token_seconds"]}
+                    display({"text/plain": json.dumps(text)}, raw=True)
+                    continue
                 data = {"text/plain": json.dumps({"dew-progress": message["progress"]})}
                 if message.get("png"):
                     data["image/png"] = message["png"]

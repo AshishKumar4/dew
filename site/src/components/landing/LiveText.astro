@@ -45,6 +45,7 @@ const { models, cell, recorded } = Astro.props;
 		let session: LiveSession | undefined;
 		let running = false;
 		let stopping = false;
+		let streamed = '';
 		onKernelClose((message) => {
 			session = undefined;
 			if (!running) status.textContent = `${message} Press Run to start a new one.`;
@@ -63,6 +64,7 @@ const { models, cell, recorded } = Astro.props;
 			stopping = false;
 			run.textContent = 'Stop';
 			output.replaceChildren();
+			streamed = '';
 			if (output.getBoundingClientRect().bottom > innerHeight) output.scrollIntoView({ block: 'center', behavior: 'smooth' });
 			let timer: number | undefined;
 			let phase = 'Starting';
@@ -81,12 +83,18 @@ const { models, cell, recorded } = Astro.props;
 				const result = await session.run(editor.value, (message) => {
 					if (message.type === 'display' && message.text) {
 						try {
-							const progress = JSON.parse(message.text)['dew-progress'];
+							const packet = JSON.parse(message.text);
+							if (typeof packet['dew-text'] === 'string') {
+								streamed = packet['dew-text'];
+								output.textContent = streamed;
+								return;
+							}
+							const progress = packet['dew-progress'];
 							if (progress?.stage === 'load') { setPhase(`Loading ${progress.model}`); return; }
 							if (progress?.stage === 'generate') { setPhase(progress.first ? 'Compiling the first generation' : 'Generating'); return; }
 						} catch { /* Ordinary text output, not a progress report. */ }
 					}
-					renderOutput(output, message);
+					if (message.type !== 'stream' || !streamed || message.text.trimEnd() !== streamed) renderOutput(output, message);
 				});
 				window.clearInterval(timer);
 				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
