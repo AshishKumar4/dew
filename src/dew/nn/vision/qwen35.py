@@ -20,7 +20,7 @@ from dew.nn.attention import LayerNorm, scaled_dot_product_attention
 from dew.nn.precision import at_least_fp32
 from dew.nn.text_encoders import MLP
 from dew.objectives.base import Variables
-from dew.registry import Record, projectors, towers
+from dew.registry import Record
 
 from .common import (
     ProjectorBase,
@@ -203,7 +203,6 @@ class Qwen35VisionTransformer(nn.Module):
         return hidden_states
 
 
-@towers("qwen3_5")
 @dataclasses.dataclass(frozen=True)
 class Qwen35Vision(TowerBase):
     """A Qwen 3.5 trunk's geometry, under the reference's field names."""
@@ -261,7 +260,6 @@ class Qwen35ProjectorModule(nn.Module):
         return self.fc2(gelu_exact(self.fc1(grouped)))
 
 
-@projectors("qwen3_5")
 @dataclasses.dataclass(frozen=True)
 class Qwen35Projector(ProjectorBase):
     """Qwen 3.5's projector fields: the trunk width, the merge size, the
@@ -366,7 +364,7 @@ def translate_qwen35_vision_config(hf_config: Mapping[str, object]) -> Record:
             f"hidden_act {activation!r} is not expressible: this trunk runs the "
             "shared MLP's activations")
     return {
-        "name": "qwen3_5", "fields": {
+        "class": "qwen3_5", "fields": {
         "depth": records.integer(vision["depth"], "depth"),
         "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
         "hidden_act": activation,
@@ -394,7 +392,7 @@ def translate_qwen35_projector_config(hf_config: Mapping[str, object],
             f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
             "the merger output enters the text embeddings as it is")
     return {
-        "name": "qwen3_5", "fields": {
+        "class": "qwen3_5", "fields": {
         "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
         "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
         "out_width": merged,

@@ -60,7 +60,6 @@ from dew.objectives.base import (
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment, RepresentationAlignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.records import JSON
-from dew.registry import objectives, trainings
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.sample import sample
@@ -239,7 +238,6 @@ class PipelineSource(Protocol):
     def task(self) -> _SourceCall: ...
 
 
-@objectives("diffusion")
 class DiffusionObjective(Objective[Ratio]):
     """Trains a denoising diffusion model: draw a noise level, corrupt, predict, and weight the loss."""
 
@@ -374,7 +372,7 @@ class DiffusionObjective(Objective[Ratio]):
         from dew.registry import to_record
         return {'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
-                'solver': to_record(self.solver, type(self.solver)),
+                'solver': to_record(self.solver, Solver),
                 'guidance': to_record(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
                 'condition_precision': self._condition_precision,
                 # A tuned autoencoder's weights and statistics sit in the run's own tree.
@@ -786,9 +784,8 @@ class DiffusionObjective(Objective[Ratio]):
 class Training(ABC):
     """How a diffusion run trains: the denoising loss, or a loss of its own in its place.
 
-    A run holds one (`DiffusionRunConfig.mode`), registered in
-    `dew.registry.trainings` under the name of the objective it builds, which is
-    the name the run's record gives that objective. `preset_class` is the preset
+    A run holds one (`DiffusionRunConfig.mode`), aliased in
+    `dew.registry.trainings` under the alias of the objective it builds. `preset_class` is the preset
     the objective's loss trains under, None for any, and `guided` is whether
     validation samples with the run's guidance, which a few-step student or a
     model with its guidance trained in does not.
@@ -811,7 +808,7 @@ class Training(ABC):
         That is a run under another preset than `preset_class`, or a guided one when
         this mode samples unguided.
         """
-        name = trainings.name_of(type(self))
+        name = type(self).__name__
         if self.preset_class is not None and not isinstance(run.preset, self.preset_class):
             raise ValueError(f"{name} trains on its own loss under the {self.preset_class.__name__} preset; "
                              f"the run names {type(run.preset).__name__ if run.preset else None}")
@@ -826,7 +823,6 @@ class Training(ABC):
         return
 
 
-@trainings("diffusion")
 @dataclasses.dataclass(frozen=True)
 class Denoising(Training):
     """The denoising loss, `DiffusionObjective`'s training mode.
@@ -866,7 +862,7 @@ class Distillation(Training):
     def check(self, run: DiffusionRunConfig) -> None:
         super().check(run)
         if not self.teacher:
-            raise ValueError(f"{trainings.name_of(type(self))} distills a teacher; name its run directory")
+            raise ValueError(f"{type(self).__name__} distills a teacher; name its run directory")
 
     def teacher_variables(self, variables: Variables | None) -> Variables:
         """Return the teacher's model variables: a saved distilled tree's own copy, else the teacher
@@ -895,7 +891,7 @@ class FlowDistillationObjective(DiffusionObjective):
 
     def __init__(self, model: nn.Module, process: Process, inputs: InputSpec, *, teacher: nn.Module,
                  teacher_variables: Variables, **kwargs):
-        name = objectives.name_of(type(self))
+        name = type(self).__name__
         if not (isinstance(process.schedule, FlowMatchingScheduler) and not process.interval
                 and isinstance(process.prediction, FlowMatchPredictionTransform)):
             raise ValueError(f"{name} distills a velocity model on the linear path; build the process with "

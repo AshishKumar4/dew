@@ -5,9 +5,9 @@ optimize it, and how the trainer runs. Recipes parse it with tyro, build the
 objective and the data it names, and pass both to `RunConfig.train`, so
 `to_dict()` is a full record of a run and `from_dict()` rebuilds it.
 
-Model kwargs are an opaque JSON dict, and the registry knows which
-architecture takes which fields. A dataset is the registered spec itself,
-which tyro turns into a subcommand (`data:token-windows --data.path ...`).
+Model kwargs are an opaque JSON dict, and the model's class declares which
+fields it takes. A dataset is the spec itself, which tyro turns into a
+subcommand over the aliased specs (`data:token-windows --data.path ...`).
 
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
@@ -32,9 +32,7 @@ import optax
 import tyro
 from etils import epath
 
-import dew.data  # registers the datasets a config names
 import dew.io
-import dew.nn.backbones  # registers the models a config names
 from dew import registry
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
@@ -80,7 +78,7 @@ command line. The registry knows which architecture takes which field and
 narrows each one where it builds it, so the values are read there."""
 
 if TYPE_CHECKING:
-    # tyro reads the runtime annotation, a Union of the registered specs, and a
+    # tyro reads the runtime annotation, a Union of the aliased specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
     type DataSpec = DatasetSpec
@@ -103,7 +101,7 @@ class ModelConfig:
     dtype: registry.DtypeName | None = "bfloat16"
     """The compute dtype; parameter storage is set separately.
 
-    A model that declares no `dtype` field, and holds no registered part that
+    A model that declares no `dtype` field, and holds no model part that
     does, refuses any value but None (`dew.registry.precision_fields`).
     """
     param_dtype: registry.DtypeName | None = None
@@ -156,10 +154,7 @@ class ModelConfig:
     def from_model(cls, model) -> Self:
         """Return the module's constructor fields, with its actual compute settings.
 
-        A registered class is recorded under its registered name. A class that no
-        registry names is recorded under its own name in lower case, and a loader asks
-        the user to register it under that name: `build` needs the name, but training,
-        checkpointing and resuming do not.
+        The class is recorded by its import path, which `build` imports.
         """
         model_type = type(model)
         adapter, quantization = None, None
@@ -169,7 +164,7 @@ class ModelConfig:
         if isinstance(model_type, _Quantized):
             quantization = model_type._dew_quantization
             model_type = model_type._unquantized_type
-        architecture = _architecture(model_type)
+        architecture = registry.import_path(model_type)
         fields = {}
         compute, storage, attention = None, None, 'auto'
         precision: Literal['default', 'high', 'highest'] | None = None
@@ -206,20 +201,6 @@ class ModelConfig:
         if self.quantization is not None:
             model = self.quantization.apply(model)
         return model if self.adapter is None else adapted(model, self.adapter)
-
-
-def _architecture(model_type: type) -> str:
-    """The name a model class is recorded under: its registered name, or its
-    own name in lower case for a class no registry names yet."""
-    for name, member in models.items():
-        if member is model_type:
-            return name
-    name = model_type.__name__.lower()
-    if name in models:
-        raise ValueError(f"{model_type.__qualname__} is unregistered and {name!r} names "
-                         f"{models[name].__qualname__}; register it under a name of its own")
-    return name
-
 
 
 @dataclasses.dataclass(frozen=True)
@@ -620,6 +601,8 @@ class RunConfig:
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: str | None = None
+    """The objective's class: an alias on the command line, held and recorded
+    as its import path, which `train` writes from the objective it trains."""
     lora: Annotated[LoRA, tyro.conf.subcommand("lora")] | None = None
     """The low-rank adapter the run trains instead of the whole model.
 
@@ -630,10 +613,19 @@ class RunConfig:
     factors, and the run's record stores the model with the adapter attached.
     """
 
+    def __post_init__(self) -> None:
+        if self.objective is not None:
+            try:
+                trained = registry.objectives[self.objective]
+            except KeyError as error:
+                raise ValueError(f"--objective: {error.args[0]}") from None
+            object.__setattr__(self, "objective", registry.import_path(trained))
+
     def to_dict(self) -> dict[str, JSON]:
         """Return a JSON-safe record of the run.
 
-        A registered member is written as its name and its fields.
+        A value of a subclass of the field's type is written as its class's
+        import path and its fields.
         """
         return {field.name: to_record(getattr(self, field.name),
                                      _declared_type(type(self), field.name))
@@ -677,20 +669,20 @@ class RunConfig:
         return tyro.cli(parser, args=given, default=default)
 
     @classmethod
-    def load(cls, directory: str) -> Self:
-        """Read the config a run in `directory` was built from, as this class."""
-        return cls.from_dict(json.loads((epath.Path(directory) / RUN_FILE).read_text()))
+    def load(cls, directory: str, *, trust: Sequence[str] = ()) -> Self:
+        """Read the config a run in `directory` was built from, as this class.
+        `trust` names the packages outside Dew the record may import."""
+        record = json.loads((epath.Path(directory) / RUN_FILE).read_text())
+        registry.import_trusted(record, trust)
+        return cls.from_dict(record)
 
     def _naming(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config with `objective` named the way the record spells it.
 
-        A registered objective is written under its registry name and anything
-        else under its import path, so a record always says what was trained.
+        The record names the objective's class by its import path, so it says
+        what was trained and loads in a process that imported nothing.
         """
-        objective_type = type(objective)
-        kind = (registry.objectives.name_of(objective_type) if objective_type in registry.objectives.values()
-                else f"{objective_type.__module__}.{objective_type.__qualname__}")
-        return dataclasses.replace(self, objective=kind)
+        return dataclasses.replace(self, objective=registry.import_path(type(objective)))
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,

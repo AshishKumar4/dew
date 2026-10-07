@@ -34,7 +34,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.records import JSON
-from dew.registry import from_record, mixers, models
+from dew.registry import from_record, mixers
 
 from ..activations import ungated_activation
 from ..attention import RMSNorm
@@ -114,7 +114,6 @@ def layer_output(intermediates: Mapping[str, Mapping[str, Sequence[jax.Array]]],
     return kept["__call__"][0]
 
 
-@models("causal_transformer")
 @logical_axes({
     ("embed_tokens",): ("vocab", "embed"),
     ("embed_positions",): (None, "embed"),

@@ -164,7 +164,7 @@ def test_what_an_objective_cannot_train_or_sample_is_refused_at_construction():
     mmdit = SimpleMMDiT(patch_size=2, emb_features=8, num_layers=1, num_heads=2)
     unipc = UniPC(3, lower_order_final=False)
     for error, fragment, model, process, settings in (
-            (ValueError, "mdlm.*--objective masked_diffusion", Zero(), MDLM(mask_id=1), {}),
+            (ValueError, "MDLM.*--objective masked_diffusion", Zero(), MDLM(mask_id=1), {}),
             (ValueError, "GeneralizedNoiseScheduler", Zero(), presets.Cosine(), {"solver": RK4()}),
             (TypeError, "names a solver", Zero(), flow, {"solver": "euler"}),
             (ValueError, "sigma=0 target", Zero(), flow, {"solver": unipc, "steps": 7}),

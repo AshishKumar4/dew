@@ -32,7 +32,6 @@ from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rat
 from dew.inputs import InputSpec
 from dew.nn.protocols import IntervalModel
 from dew.objectives.base import Aux, Step, Variables
-from dew.registry import objectives, trainings
 from dew.sampling.solvers import Euler
 
 from .objective import DiffusionObjective, Training, _own_loss
@@ -136,7 +135,6 @@ def _interval_velocity(model: nn.Module, process: Process, method: str, preset: 
                         f"as simple_dit(interval=True)")
 
 
-@trainings("mean_flow")
 @dataclasses.dataclass(frozen=True)
 class MeanFlowTraining(Training):
     """MeanFlow training under the `MeanFlow` preset, for a model that samples in one step.
@@ -164,7 +162,6 @@ class MeanFlowTraining(Training):
         return MeanFlowObjective(mean_flow=self, variables=variables, **run)
 
 
-@trainings("shortcut")
 @dataclasses.dataclass(frozen=True)
 class ShortcutTraining(Training):
     """Shortcut-model training under the `Shortcut` preset.
@@ -187,7 +184,6 @@ class ShortcutTraining(Training):
         return ShortcutObjective(shortcut=self, variables=variables, **run)
 
 
-@objectives("mean_flow")
 class MeanFlowObjective(DiffusionObjective):
     """Trains MeanFlow on an interval process (`presets.MeanFlow`).
 
@@ -281,7 +277,6 @@ class MeanFlowObjective(DiffusionObjective):
 _NOISE_FLOOR = 1e-5
 
 
-@objectives("shortcut")
 class ShortcutObjective(DiffusionObjective):
     """Trains a shortcut model on an interval process (`presets.Shortcut`).
 

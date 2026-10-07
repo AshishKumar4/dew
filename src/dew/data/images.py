@@ -25,8 +25,6 @@ import grain.python as pygrain
 import jax
 import numpy as np
 
-from dew.registry import datasets
-
 from .dataset import (
     CAPTION,
     Batch,
@@ -462,7 +460,6 @@ class ImageDataset(DatasetSpec):
         )
 
 
-@datasets("tfds_images")
 @dataclasses.dataclass(frozen=True)
 class TFDSImages(ImageDataset):
     """Reads the ArrayRecords of a prepared TFDS image dataset and captions
@@ -534,7 +531,6 @@ class TFDSImages(ImageDataset):
         return element["image"], template.format(class_names(labels)[label]), label
 
 
-@datasets("hf_images")
 @dataclasses.dataclass(frozen=True)
 class HFImages(ImageDataset):
     """Reads a Hugging Face hub dataset of images by index.
@@ -600,7 +596,6 @@ class HFImages(ImageDataset):
         return as_rgb(element[self.image_column]), caption, None if label is None else int(label)
 
 
-@datasets("array_record_images")
 @dataclasses.dataclass(frozen=True)
 class ArrayRecordImages(ImageDataset):
     """Reads image and caption pairs from arrayrecord shards under

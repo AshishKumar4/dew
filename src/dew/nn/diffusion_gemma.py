@@ -30,7 +30,6 @@ from dew.nn.moe import gated_product
 from dew.nn.multimodal import VisionConditioner
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import OutputTable
-from dew.registry import models
 
 if TYPE_CHECKING:
     from dew.records import JSON
@@ -80,7 +79,6 @@ def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.Array
                       preferred_element_type=wide) * jnp.asarray(scale, wide)
 
 
-@models("diffusion_gemma")
 class DiffusionGemma(nn.Module):
     """Reads one text parameter tree causally for the context and bidirectionally for canvases.
 

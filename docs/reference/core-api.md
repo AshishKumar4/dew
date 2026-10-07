@@ -659,7 +659,7 @@ Prepared `DenoisingInputs` can supply encoded native conditions and initial late
 
 ## Configuration and registries
 
-Code builds every model, preset, solver, dataset and metric from its class. `dew.registry` maps the names that configuration files, the command line and run records use to those classes and back; `RunConfig.from_dict` and `ModelConfig.build` read a record through it.
+Code builds every model, preset, solver, dataset and metric from its class. A record names a class by its import path, `{"class": "dew.nn.backbones.dit:SimpleDiT", "fields": {...}}`, and a function as `{"function": "optax:adamw"}`; `RunConfig.from_dict` and `ModelConfig.build` import what a record names. Where a person writes a record or a flag, `dew.registry` maps short aliases (`simple_dit`) to those paths.
 
 `RunConfig.save` writes the run configuration. It is separate from the state checkpoint. [Recipes](../recipes.md) describes the configuration entry points and their side effects.
 

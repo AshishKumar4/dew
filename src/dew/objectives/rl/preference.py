@@ -17,13 +17,11 @@ from dew.artifacts import TokenScores
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Variables
-from dew.registry import objectives
 from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm import LMObjective
 
 
-@objectives("dpo")
 class DPOObjective(LMObjective):
     """Trains a policy on preference pairs with the DPO loss (arXiv:2305.18290, equation 7).
 

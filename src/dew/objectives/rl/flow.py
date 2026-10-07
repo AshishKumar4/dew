@@ -32,7 +32,6 @@ from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.objectives.base import Aux, Batch, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
-from dew.registry import objectives
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
@@ -65,7 +64,6 @@ _DEFAULT_GUIDANCE = CFG(3.0)
 _DEFAULT_SOLVER = Euler()
 
 
-@objectives("flow_grpo")
 class FlowGRPOObjective(DiffusionObjective):
     """Trains a rectified-flow policy with a clipped policy gradient, normalized per coordinate.
 

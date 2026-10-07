@@ -29,8 +29,6 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.registry import models
-
 from ..attention import LayerNorm
 from ..dit import ROPE_THETA, ModulatedBlock, _JepaStackOptions, build_block_pattern, scan_ordered_pos_embed
 from ..precision import at_least_fp32
@@ -103,7 +101,6 @@ class FactorizedTokenStack(_JepaStackOptions):
         return tokens.reshape(B, T, N, F)
 
 
-@models("jepa_encoder")
 class JepaEncoder(_JepaStackOptions):
     """ViT over an image, optionally restricted to a subset of its patches."""
     patch_size: int = 16
@@ -139,7 +136,6 @@ class JepaEncoder(_JepaStackOptions):
         return self(x, token_idx, train=train)
 
 
-@models("jepa_video_encoder")
 class JepaVideoEncoder(JepaEncoder):
     """Factorized spatial-temporal encoder over (B, T, H, W, C).
 
@@ -158,7 +154,6 @@ class JepaVideoEncoder(JepaEncoder):
         return self.norm(self.stack(tokens, train=train))
 
 
-@models("jepa_predictor")
 class JepaPredictor(_JepaStackOptions):
     """A narrow transformer that maps context embeddings to target embeddings.
 

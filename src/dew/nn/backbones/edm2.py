@@ -22,7 +22,6 @@ from flax.typing import Dtype
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.mp import MPConv, MPFourier, mp_cat, mp_silu, mp_sum, normalize
-from dew.registry import models
 
 
 def _resample(x: jax.Array, mode: str) -> jax.Array:
@@ -83,7 +82,6 @@ class Block(nn.Module):
         return x
 
 
-@models("edm2_unet")
 class EDM2UNet(nn.Module):
     """Runs EDM2's U-Net.
 

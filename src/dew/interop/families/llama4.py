@@ -71,11 +71,11 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     }
     chunk = hf_config.get('attention_chunk_size')
     full = native_fields(LayerKind)(mixer=None)
-    full['mixer'] = {'name': 'llama4', 'fields': {**rule, 'use_rope': False}}
+    full['mixer'] = {'class': 'llama4', 'fields': {**rule, 'use_rope': False}}
     chunked = native_fields(LayerKind)(chunk=None if chunk is None else records.integer(chunk,
                                                                                     'attention_chunk_size'),
                                       mixer=None)
-    chunked['mixer'] = {'name': 'llama4', 'fields': {**rule, 'use_rope': True}}
+    chunked['mixer'] = {'class': 'llama4', 'fields': {**rule, 'use_rope': True}}
     kinds: dict[str, KindFields] = {'full_attention': full, 'chunked_attention': chunked}
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')

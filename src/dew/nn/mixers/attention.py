@@ -37,7 +37,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import Admitted, AttentionMetadata
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
-from dew.nn.mixer_base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import (
@@ -875,7 +875,6 @@ class CausalSelfAttention(nn.Module):
             self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim)), 'o_proj')
 
 
-@mixers("attention")
 @dataclasses.dataclass(frozen=True)
 class AttentionMixer(MixerBase):
     """Grouped-query attention with optional image-block masking and M-RoPE.

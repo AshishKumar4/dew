@@ -44,6 +44,7 @@ def pipeline(
     ema: bool | None = None,
     step: int | str | None = None,
     revision: str | None = None,
+    trust: Sequence[str] = (),
 ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration | SavedTask:
     """Load the inference task for `source`, with its weights placed once.
 
@@ -63,7 +64,8 @@ def pipeline(
     and its live weights otherwise, and True always reads them. `step`
     selects a run's checkpoint and `revision` pins a Hub source; passing
     `revision` for a run directory or `step` for a source raises
-    `ValueError`.
+    `ValueError`. `trust` names the packages outside Dew a run's record may
+    import, as `trust_remote_code` does in transformers.
 
     Loading a task also points XLA at the on-disk executable cache, unless a
     cache directory is already set, so a restarted process reuses what it
@@ -78,7 +80,8 @@ def pipeline(
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
-                         param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step)
+                         param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
+                         trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
@@ -87,13 +90,13 @@ def pipeline(
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
-              step: int | str | None) -> SavedTask:
+              step: int | str | None, trust: Sequence[str]) -> SavedTask:
     """The task the run's recorded objective declares (`Objective.saved_task`)."""
     from dew.inference.tasks import run_record
     from dew.records import text
     from dew.registry import objectives
 
-    kind = text(run_record(str(root), step)['objective'], 'objective')
+    kind = text(run_record(str(root), step, trust)['objective'], 'objective')
     task = objectives[kind].saved_task
     if task is None:
         raise TypeError(f"a run of the {kind!r} objective ({objectives[kind].__name__}) loads as no task: "

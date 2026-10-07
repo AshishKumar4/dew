@@ -21,7 +21,6 @@ import optax
 from dew.artifacts import Representations
 from dew.eval.common import metric_device
 from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
-from dew.registry import metrics
 
 type ProbeParams = dict[str, jax.Array]
 """The linear probe's weight matrix under "w" and its bias under "b"."""
@@ -99,7 +98,6 @@ def knn_probe_accuracy(embeddings, labels, num_classes: int, k: int = 20):
     return accuracy
 
 
-@metrics("linear_probe")
 @dataclass(frozen=True)
 class LinearProbe:
     """Reports linear-probe accuracy on each validation batch, averaged over the pass.
@@ -126,7 +124,6 @@ class LinearProbe:
     finalize = staticmethod(mean_of_totals)
 
 
-@metrics("knn_probe")
 @dataclass(frozen=True)
 class KnnProbe:
     """Reports cosine k-NN accuracy on each validation batch, averaged over the pass.

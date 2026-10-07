@@ -12,7 +12,6 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.records import JSON
-from dew.registry import models
 
 from ..attention import LayerNorm
 from ..conv import Conv
@@ -32,7 +31,6 @@ from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
 from .unet_condition import sinusoidal_time
 
 
-@models("uvit")
 class UViT(_TransformerOptions):
     """Denoises patches as U-ViT does, following baofff/U-ViT's libs/uvit_t2i.py.
 
@@ -152,7 +150,6 @@ class UViT(_TransformerOptions):
         return self.final_layer(image) if self.conv else image
 
 
-@models("simple_udit")
 class SimpleUDiT(_TransformerOptions):
     """A U-shaped DiT: `SimpleDiT`'s adaLN-Zero blocks with the first half's
     outputs skipping into the second half through a dense layer over the

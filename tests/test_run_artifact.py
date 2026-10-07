@@ -2,6 +2,7 @@
 import dataclasses
 import inspect
 
+import flax.linen
 import grain.python as grain
 import jax
 import jax.numpy as jnp
@@ -40,7 +41,7 @@ def test_a_composite_model_record_nests_its_part_and_rebuilds_it():
 
     original = DiffusionGemma(model().clone(layer_scalar="frozen"), canvas_length=4)
     record = ModelConfig.from_model(original)
-    assert record.dtype is None and record.config["text"]["name"] == "causal_transformer"
+    assert record.dtype is None and record.config["text"]["layer_scalar"] == "frozen"
     assert record.build() == original.clone(text=original.text.clone(dtype=jnp.float32))
 
 
@@ -53,20 +54,22 @@ def documented_block(page, after):
     return text[start:text.index("```", start)]
 
 
-def test_the_documented_registration_line_records_the_model_and_its_run_loads_back(tmp_path, monkeypatch):
-    """docs/key-concepts.md's registration example, run as written: the
-    decorator is the whole of it, the constructor fields are the record, and
-    a run of the model loads back by that record."""
+def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, monkeypatch):
+    """docs/key-concepts.md's example, run as written in a module of its own:
+    nothing registers it, its import path names it, its constructor fields
+    are the record, and a run of the model loads back by that record."""
+    import importlib
+
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.registry import models
     from dew.sampling import TextToImage
 
-    monkeypatch.setattr(models, "_members", dict(models._members))
-    scope: dict = {}
-    exec(documented_block("docs/key-concepts.md", "Your own model registers with one line"), scope)
-    model = scope["ResidualMLP"](features=16)
+    (tmp_path / "mymodels.py").write_text(
+        documented_block("docs/key-concepts.md", "Your own model needs nothing to be recorded"))
+    monkeypatch.syspath_prepend(str(tmp_path))
+    mymodels = importlib.import_module("mymodels")
+    model = mymodels.ResidualMLP(features=16)
     objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (4, 4, 3))),
                                    guidance=None, steps=2)
     rows = [{"image": np.full((4, 4, 3), 128, np.uint8)} for _ in range(8)]
@@ -77,19 +80,18 @@ def test_the_documented_registration_line_records_the_model_and_its_run_loads_ba
     checkpoints.wait()
 
     recorded = checkpoints.artifact()["model"]
-    assert (recorded["architecture"], recorded["config"]) == ("residual_mlp", {"features": 16})
+    assert (recorded["architecture"], recorded["config"]) == ("mymodels:ResidualMLP", {"features": 16})
     restored = TextToImage.from_run(str(tmp_path / "run"))
-    assert type(restored.model) is scope["ResidualMLP"] and restored.model.features == 16
+    assert type(restored.model) is mymodels.ResidualMLP and restored.model.features == 16
     np.testing.assert_array_equal(restored([""], key=3).host().images,
                                   objective.pipeline(state)([""], key=3).host().images)
 
 
-def test_an_unregistered_model_trains_and_saves_and_loads_once_registered(tmp_path, monkeypatch, caplog):
-    """A class no registry names trains and checkpoints as any other; loading
-    the run by its record names the line that registers it, and after that
-    line the same run loads."""
+def test_a_model_with_no_import_path_trains_and_saves_and_loading_says_why(tmp_path, caplog):
+    """A class defined inside a function trains and checkpoints as any other;
+    its record cannot name it, which the first checkpoint warns and loading
+    the run raises."""
     from dew.inference import TextGeneration
-    from dew.registry import models
 
     class Custom(type(model())):
         pass
@@ -105,33 +107,31 @@ def test_an_unregistered_model_trains_and_saves_and_loads_once_registered(tmp_pa
         Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1,
                                                                                checkpoint_every=1)
     checkpoints.wait()
-    assert "`@dew.registry.models('custom')` above the class" in caplog.text
-    with pytest.raises(ValueError, match=r"`@dew.registry.models\('custom'\)` above the class"):
+    assert "has no import path a record can name" in caplog.text
+    with pytest.raises(ValueError, match="has no import path a record can name"):
         TextGeneration.from_run(str(tmp_path / 'run'))
-    monkeypatch.setitem(models._members, "custom", Custom)
-    assert type(TextGeneration.from_run(str(tmp_path / 'run')).model) is Custom
 
 
-def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(tmp_path, monkeypatch, caplog):
-    import flax.linen as nn
+class Opaque:
+    pass
 
+
+class Noted(flax.linen.Module):
+    """A denoiser holding a field no record can carry."""
+
+    note: object = Opaque()
+
+    @flax.linen.compact
+    def __call__(self, x, temb, textcontext=None, train=False):
+        return flax.linen.Dense(x.shape[-1])(x)
+
+
+def test_a_model_no_record_can_describe_still_checkpoints_and_loading_says_why(tmp_path, caplog):
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.registry import models
     from dew.sampling import TextToImage
 
-    class Opaque:
-        pass
-
-    class Noted(nn.Module):
-        note: object = Opaque()
-
-        @nn.compact
-        def __call__(self, x, temb, textcontext=None, train=False):
-            return nn.Dense(x.shape[-1])(x)
-
-    monkeypatch.setitem(models._members, "noted", Noted)
     objective = DiffusionObjective(Noted(), Flow(), InputSpec(Field("image", (4, 4, 3))), guidance=None,
                                    steps=2)
     rows = [{"image": np.zeros((4, 4, 3), np.uint8)} for _ in range(8)]
@@ -166,7 +166,7 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
         data, steps=2, checkpoint_every=1)
     checkpoints.wait()
     record = checkpoints.artifact()['model']
-    assert record['architecture'] == 'causal_transformer'
+    assert record['architecture'] == 'dew.nn.backbones.causal_transformer:CausalTransformer'
     assert record['adapter'] == {'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
         'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
         f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight', 'shape': [16, 16],
@@ -248,24 +248,22 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
         np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, tokens)), expected)
 
 
-def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path, monkeypatch):
-    import flax.linen as nn
+class TinyDenoiser(flax.linen.Module):
+    features: int = 8
 
+    @flax.linen.compact
+    def __call__(self, x, temb, textcontext=None, train=False):
+        hidden = flax.linen.Dense(self.features, name="hidden")(x)
+        return x + flax.linen.Dense(x.shape[-1], name="out")(flax.linen.gelu(hidden))
+
+
+def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
     from dew.lora import LoRA
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.registry import models
     from dew.sampling import TextToImage
 
-    class TinyDenoiser(nn.Module):
-        features: int = 8
-
-        @nn.compact
-        def __call__(self, x, temb, textcontext=None, train=False):
-            return x + nn.Dense(x.shape[-1], name="out")(nn.gelu(nn.Dense(self.features, name="hidden")(x)))
-
-    monkeypatch.setitem(models._members, "tiny_denoiser", TinyDenoiser)
     base = TinyDenoiser()
     sample = jnp.zeros((1, 4, 4, 3))
     adapter = LoRA(rank=2, modules=("hidden", "out")).apply(
@@ -296,7 +294,7 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
     checkpoints.wait()
     assert not (tmp_path / 'run' / 'run.json').exists()
     record = Checkpoints(str(tmp_path / 'run')).artifact(2)
-    assert record['objective'] == 'lm'
+    assert record['objective'] == 'dew.objectives.lm.objective:LMObjective'
     assert record['seq_len'] == 8
     from dew.interop import Pretrained, PretrainedDecoder, PretrainedMaskedDecoder
     bundle = Pretrained.from_run(tmp_path / 'run')

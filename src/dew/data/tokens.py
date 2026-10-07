@@ -28,8 +28,6 @@ from typing import Annotated, overload
 import grain.python as pygrain
 import numpy as np
 
-from dew.registry import datasets
-
 from .dataset import (
     Batch,
     Corpus,
@@ -92,7 +90,6 @@ def bounded(stream: Reader, batches: int | None) -> Reader:
     return first
 
 
-@datasets("token_windows")
 @dataclasses.dataclass(frozen=True)
 class TokenWindows(DatasetSpec):
     """Reads fixed windows of `seq_len + 1` ids from the token stream.
@@ -324,7 +321,6 @@ class PackedWindows(_WrappingDataset):
         return {**fields, f"{ids}_segment_ids": segment_ids, f"{ids}_positions": positions}
 
 
-@datasets("packed_tokens")
 @dataclasses.dataclass(frozen=True)
 class PackedTokens(DatasetSpec):
     """Packs whole documents into windows of `seq_len + 1` tokens.

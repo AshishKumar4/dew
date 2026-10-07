@@ -14,7 +14,6 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.records import JSON
-from dew.registry import models
 
 from ..attention import LayerNorm, RMSNorm, scaled_dot_product_attention
 from ..dit import (
@@ -155,7 +154,6 @@ class MMDiTBlock(nn.Module):
         return img, txt
 
 
-@models("simple_mmdit")
 class SimpleMMDiT(_DiTStackOptions):
     """SD3-style MM-DiT: a plain stack of dual-stream blocks."""
     def setup(self):
@@ -263,7 +261,6 @@ class PatchExpanding(nn.Module):
         return expanded, new_H, new_W
 
 
-@models("hierarchical_mmdit")
 class HierarchicalMMDiT(_AttentionStackOptions):
     """U-shaped MM-DiT: dual-stream blocks per stage with patch merging on the
     way down and expansion + skip fusion on the way up.

@@ -34,7 +34,6 @@ from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
-from dew.registry import models
 
 from .decoder_block import GatedMLP
 from .joint import JointAttention, embedding, layer_norm
@@ -149,7 +148,6 @@ class _Block(nn.Module):
         return x
 
 
-@models("qwen_image_transformer")
 @logical_axes({("img_in",): (None, "embed"), ("proj_out",): ("embed", None),
                ("modulation",): (None, "embed"), ("norm_out_linear",): (None, "embed"),
                ("txt_in", "in_layer"): (None, "embed"), ("txt_in", "out_layer"): (None, "embed"),

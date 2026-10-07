@@ -64,17 +64,14 @@ This is the output with stdout piped to a file; on a terminal, `fit` draws the s
 
 ## Model
 
-A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. Build one from its class, `from dew.nn.backbones import CausalTransformer`. Each class is also registered under a name (`causal_transformer`), which is how recipes and saved runs rebuild a model from a configuration file.
+A model is a `flax.linen.Module` with `init` and `apply`. Its variables are a nested dictionary of arrays, and it has no knowledge of training. Build one from its class, `from dew.nn.backbones import CausalTransformer`. A saved run records the class by its import path, and a configuration file may name it by a short alias (`causal_transformer`) instead.
 
-Your own model registers with one line, and its constructor fields are then its record:
+Your own model needs nothing to be recorded: its import path names it, and its constructor fields are its record. Put it in a module, here `mymodels.py`:
 
 ```python
 import flax.linen as nn
 
-from dew.registry import models
 
-
-@models("residual_mlp")
 class ResidualMLP(nn.Module):
     """A denoiser `DiffusionObjective` can train: it maps a noisy sample, the
     noise level's embedding and optional text context to its prediction."""
@@ -86,11 +83,11 @@ class ResidualMLP(nn.Module):
         return x + nn.Dense(x.shape[-1])(nn.gelu(nn.Dense(self.features)(x)))
 ```
 
-Every checkpoint a run of this model writes records `"architecture": "residual_mlp"` and `"config": {"features": 64}`, and `TextToImage.from_run` and `dew.pipeline` rebuild the model from that record. A decoder's run loads the same way through `TextGeneration.from_run` and `Pretrained.from_run`. A composite model records each registered part inside its own record, and an adapted model records its base model with the adapter's rank, alpha and modules.
+Every checkpoint a run of this model writes records `"architecture": "mymodels:ResidualMLP"` and `"config": {"features": 64}`, and `TextToImage.from_run` and `dew.pipeline` rebuild the model from that record in any process that can import `mymodels`. A decoder's run loads the same way through `TextGeneration.from_run` and `Pretrained.from_run`. A composite model records each part inside its own record, and an adapted model records its base model with the adapter's rank, alpha and modules.
 
-A package outside Dew registers its members the same way and names the module that registers them under the `dew.plugins` entry-point group in its `pyproject.toml` (`[project.entry-points."dew.plugins"]`, `mypackage = "mypackage"`). When Dew meets a name it has not registered, it imports every such entry once and looks again, so a run recorded with the package's model loads in a process that has not imported the package. A kind of the package's own is a `Registry("activation").share()`, made in the module that defines its base class, whose members a record names as `{"name": ..., "fields": {...}}`. A member can be a class or a function. A field typed with a class takes the record of a member that derives from it or of a function declared to return it, and a function member's record fields are its parameters, converted to their annotations as a dataclass's fields are. An objective of its own uses `saved_task` to name the task its runs load as through `dew.pipeline`, as Dew's objectives do.
+A package outside Dew works the same way, with nothing to register: a field typed with a class takes the record `{"class": "mypackage.layers:Gate", "fields": {...}}` of any class that derives from it or function declared to return it, and a function as `{"function": "mypackage.layers:gate"}`. Where a person writes a record, the class may be one of Dew's short aliases instead (`"simple_dit"`, `"mla"`), which `dew.registry` lists by kind.
 
-Registration is only needed to load a run by its record. An unregistered model trains, checkpoints and resumes the same way, and its run records it under its class name in lower case. The first checkpoint's warning and any attempt to load the run both name the line that registers it, and once that line is in place, the same run loads.
+A model defined where no import path reaches it, in `__main__` or inside a function, trains, checkpoints and resumes the same way. The first checkpoint warns, and loading the run says, that its model has no import path.
 
 Dew's modules name the logical axes of their parameters, such as `embed`, `heads` and `mlp`. The trainer maps those names onto the device mesh, so the model code does not change when the mesh does. [Distributed training](concepts/distributed.md) describes the mapping.
 

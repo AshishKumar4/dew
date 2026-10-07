@@ -33,7 +33,6 @@ from dew.nn.backbones.unet_condition import sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
-from dew.registry import models
 
 from .joint import FeedForward, Modulation, apply_rotary, embedding, layer_norm, modulate, rotary_table
 
@@ -149,7 +148,6 @@ class WanBlock(nn.Module):
         return (x.astype(wide) + fed.astype(wide) * gate_mlp[:, None]).astype(x.dtype)
 
 
-@models("wan_transformer")
 @logical_axes({("text_embedder_linear_1",): (None, "embed"), ("text_embedder_linear_2",): (None, "embed"),
                ("time_embedder_linear_1",): (None, "embed"), ("time_embedder_linear_2",): (None, "embed"),
                ("patch_embedding_3d",): (None, None, None, None, "embed"), ("proj_out",): ("embed", None)})

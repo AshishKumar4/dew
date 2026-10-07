@@ -1,6 +1,6 @@
 """Datasets a provider already holds: `datasets["tfds"]`, `datasets["hf"]`.
 
-Each provider is a registered spec like every other dataset, so a run config
+Each provider is a spec like every other dataset, so a run config
 can name one, `to_dict` can write it and `from_dict` can load it back. Both
 return the same `Dataset` every spec returns, over the same grain plumbing:
 `train_stream` for the order, the sharding and the position,
@@ -44,8 +44,6 @@ from typing import TYPE_CHECKING
 import grain.python as pygrain
 import jax
 import numpy as np
-
-from dew.registry import datasets
 
 from .dataset import (
     Batch,
@@ -345,7 +343,6 @@ class ProviderDataset(DatasetSpec):
             val_batches=self.val_batches, records=self.records)
 
 
-@datasets("tfds")
 @dataclasses.dataclass(frozen=True)
 class PreparedTFDS(ProviderDataset):
     """Reads the splits of a prepared TFDS builder from where its preparation
@@ -365,7 +362,6 @@ class PreparedTFDS(ProviderDataset):
         return self.random_access(batch=batch)
 
 
-@datasets("hf")
 @dataclasses.dataclass(frozen=True)
 class HubDataset(ProviderDataset):
     """Reads a Hugging Face split, either Arrow-backed and read by index or
@@ -473,7 +469,7 @@ def load(source: Named, *, batch: int,
     """Return the `Dataset` for `source`, read from where its provider
     already stores it.
 
-    This builds the registered spec, so `load("hf/wiki", batch=32,
+    This builds the spec, so `load("hf/wiki", batch=32,
     options=HFOptions(config="20231101.en"))` and
     `datasets["hf"](name="wiki", options=HFOptions(config="20231101.en"))
     .load(batch=32)` are the same dataset. To put the dataset in a run's

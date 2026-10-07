@@ -9,13 +9,13 @@ trainer has just written.
 
 import dataclasses
 import json
-from importlib import import_module
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_stubs import STUB_TEXT
 from steady_state import steady_state
 
 import dew
@@ -34,8 +34,6 @@ from dew.sampling import CFG, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
-import_module("test_diffusion_objective")  # registers "stub_text"
-
 RES = 8
 MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1}
 
@@ -43,7 +41,7 @@ MODEL = {"patch_size": 4, "emb_features": 16, "num_layers": 1, "num_heads": 2, "
 _DEFAULT_RUN_CONFIG_PRESET = EDM()
 
 
-def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder="stub_text", checkpoint="stub-clip"):
+def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, checkpoint="stub-clip"):
     """The resolved config of a tiny conditional DiT run in `directory`; the
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
@@ -58,7 +56,7 @@ _DEFAULT_MAKE_RUN_PRESET = EDM()
 
 
 def make_run(
-    directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder="stub_text", checkpoint="stub-clip", steps=2
+    directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder=STUB_TEXT, checkpoint="stub-clip", steps=2
 ):
     """`steps` training steps of the tiny conditional DiT, its checkpoint and
     its `run.json` in `directory`, as the recipe leaves them: the objective is

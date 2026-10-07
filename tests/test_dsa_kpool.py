@@ -32,7 +32,8 @@ from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttenti
 
 from dew.nn.dsa_kpool import KPoolSparseAttention, KPoolSparseAttentionMixer
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.mixers import MixerContext, mixers
+from dew.nn.mixers import MixerContext
+from dew.registry import mixers
 from tools.hf_reference import scatter_weights
 
 BOUND = 1e-4
@@ -265,7 +266,7 @@ def test_a_padded_prefill_decodes_like_the_padded_parallel_block():
 
 
 def test_the_kind_builds_from_the_configs_fields_and_is_nope():
-    record = {"name": "kpool_sparse_attention", "fields": {**SETTINGS}}
+    record = {"class": "kpool_sparse_attention", "fields": {**SETTINGS}}
     mixer = mixers.from_record(record)
     assert isinstance(mixer, KPoolSparseAttentionMixer)
     assert mixers["kpool_sparse_attention"] is KPoolSparseAttentionMixer

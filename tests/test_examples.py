@@ -298,7 +298,8 @@ def test_sft_gemma4_smoke_trains_on_chat_rows_and_exports_the_decoder(tmp_path):
     assert {entry.name for entry in export.iterdir()} >= {
         "config.json", "generation_config.json", "model.safetensors"}
     run = tmp_path / "checkpoints" / tmp_path.name
-    assert json.loads((run / "run.json").read_text())["objective"] == "lm"
+    objective = json.loads((run / "run.json").read_text())["objective"]
+    assert objective == "dew.objectives.lm.objective:LMObjective"
     assert (export / "tokenizer_config.json").is_file()
     assert "tokenizer_name" not in json.loads((export / "generation_config.json").read_text())
 

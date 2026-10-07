@@ -9,7 +9,6 @@ from dew.data.dataset import Dataset, DatasetSpec, Tokenize
 from dew.data.sources.hf import HFDatasetSource, HFOptions
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
-from dew.registry import datasets
 
 
 @dataclass(frozen=True)
@@ -59,7 +58,6 @@ class Example:
 _FORMATS = {".csv": "csv", ".json": "json", ".jsonl": "json", ".parquet": "parquet"}
 
 
-@datasets("decision_table")
 @dataclass(frozen=True)
 class DecisionTable(DatasetSpec):
     """A table of labelled text, read as examples of one choice question.

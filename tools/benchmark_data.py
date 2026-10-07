@@ -83,7 +83,7 @@ def report(latencies: List[float], batch_size: int) -> None:
 
 def main(config: Benchmark) -> None:
     dataset = config.data.load(batch=config.batch)
-    print(f"{datasets.name_of(type(config.data))}: {dataset.records} records, "
+    print(f"{datasets.alias_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
     from dew.data import DataPartition
     from dew.training import MeshSpec

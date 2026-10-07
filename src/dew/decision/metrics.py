@@ -14,7 +14,6 @@ import numpy as np
 from dew.artifacts import Artifact, Decisions
 from dew.eval.common import metric_device
 from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
-from dew.registry import metrics
 
 
 @dataclass(frozen=True)
@@ -46,7 +45,6 @@ def _tops(artifact: Artifact) -> tuple[np.ndarray, np.ndarray]:
     return probabilities.max(axis=-1), probabilities.argmax(axis=-1) == answered.labels
 
 
-@metrics("accuracy")
 @dataclass(frozen=True)
 class Accuracy:
     """The share of rows whose most likely option is the right one."""
@@ -69,7 +67,6 @@ class Accuracy:
         return mean_of_totals(accumulated)
 
 
-@metrics("ece")
 @dataclass(frozen=True)
 class ECE:
     """Expected calibration error: the gap between the top probability and the accuracy.
@@ -100,7 +97,6 @@ class ECE:
         return float(np.sum(np.abs(confidence[filled] - correct[filled])) / rows.sum())
 
 
-@metrics("aurc")
 @dataclass(frozen=True)
 class AURC:
     """The area under the risk-coverage curve.

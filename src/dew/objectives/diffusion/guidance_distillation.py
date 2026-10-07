@@ -24,7 +24,6 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.objectives.base import Aux, ProgramModule, Step, Variables
-from dew.registry import objectives, trainings
 
 from .objective import TEACHER, DiffusionObjective, Distillation, _own_loss
 
@@ -43,7 +42,6 @@ def guided_target(conditional: jax.Array, unconditional: jax.Array, scale: jax.A
     return unconditional + expand(scale, conditional) * (conditional - unconditional)
 
 
-@trainings("guidance_distillation")
 @dataclasses.dataclass(frozen=True)
 class GuidanceDistillation(Distillation):
     """Distillation of a saved run's classifier-free guidance into this run's model.
@@ -78,7 +76,6 @@ class GuidanceDistillation(Distillation):
                                              variables=variables, **run)
 
 
-@objectives("guidance_distillation")
 class GuidanceDistillationObjective(DiffusionObjective):
     """Distills `teacher`'s classifier-free guidance into this model.
 

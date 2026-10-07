@@ -46,7 +46,7 @@ from .attention import (
 )
 from .inputs import AttentionMetadata, PredictionPhase
 from .kv_cache import KVCache
-from .mixer_base import MixerBase, MixerContext, mixers
+from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, open_mla_cache
 from .precision import at_least_fp32
 from .sharding import RESIDUAL, constrain, down_projection
@@ -383,7 +383,6 @@ class KPoolSparseAttention(nn.Module):
             batch, length, self.num_heads * self.v_head_dim)), 'o_proj')
 
 
-@mixers("kpool_sparse_attention")
 @dataclasses.dataclass(frozen=True)
 class KPoolSparseAttentionMixer(MixerBase):
     """The `kpool_sparse_attention` kind, by GLM-5.3-Flash's config fields

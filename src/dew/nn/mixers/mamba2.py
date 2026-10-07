@@ -57,7 +57,7 @@ from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
-from dew.nn.mixer_base import MixerBase, MixerContext, mixers
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
@@ -546,7 +546,6 @@ def _inverse_softplus_step(key, shape):
     return step + jnp.log(-jnp.expm1(-step))
 
 
-@mixers("mamba2")
 @dataclasses.dataclass(frozen=True)
 class Mamba2Mixer(MixerBase):
     """The `mamba2` kind, by the reference config's field names

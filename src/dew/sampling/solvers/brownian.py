@@ -9,8 +9,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from dew.registry import solvers
-
 from .common import _sigma_integrator
 
 
@@ -92,7 +90,6 @@ def _sde_step(x, denoised, sigma, target):
     return (target / sigma) * x - jnp.expm1(jnp.log(target) - jnp.log(sigma)) * denoised
 
 
-@solvers("dpmsolver_sde")
 @dataclass(frozen=True)
 class DPMSolverSDE:
     """Diffusers 0.34.0's `DPMSolverSDEScheduler`, k-diffusion's

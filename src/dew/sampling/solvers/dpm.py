@@ -9,8 +9,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from dew.registry import solvers
-
 from .common import Multistep, _check_endpoint_domain, _half_log_snr, _lambda_step, _multistep, _tapered_order
 
 Algorithm = Literal["dpmsolver++", "dpmsolver", "sde-dpmsolver++", "sde-dpmsolver"]
@@ -47,7 +45,6 @@ def _dpm_terms(algorithm: str, alpha_s, sigma_s, alpha_t, sigma_t, h):
             -2.0 * sigma_t * (psi / h - 1.0), None, sigma_t * jnp.sqrt(jnp.exp(2 * h) - 1.0))
 
 
-@solvers("dpmsolver_multistep")
 @dataclass(frozen=True)
 class DPMSolverMultistep:
     """DPM-Solver and DPM-Solver++ as multistep integrators in lambda = log(alpha) - log(sigma).
@@ -155,7 +152,6 @@ class Singlestep(NamedTuple):
     orders: jax.Array
 
 
-@solvers("dpmsolver_singlestep")
 @dataclass(frozen=True)
 class DPMSolverSinglestep:
     """Diffusers 0.34.0's grouped DPM-Solver updates from each group's anchor.
@@ -334,7 +330,6 @@ def _deis_third(t, b, c, d):
     return jnp.where(infinite_b, 0.0, integral)
 
 
-@solvers("deis")
 @dataclass(frozen=True)
 class DEIS:
     """DEIS (Zhang and Chen 2023, arXiv 2204.13902) in its log-rho multistep
