@@ -28,7 +28,7 @@ class DPOObjective(LMObjective):
     The reference is the starting policy, frozen. `beta` is the KL strength
     and must be positive. `model` and `seq_len` are as in `LMObjective`, with
     `seq_len` one less than the row width. The reference never moves, so an
-    `ema_decay` argument is refused, and so is `loss_role`, because the
+    `ema_decay` other than None is refused, and so is `loss_role`, because the
     completion mask already says which targets count. Validation scores the
     chosen responses' perplexity under the policy.
     """
@@ -40,7 +40,7 @@ class DPOObjective(LMObjective):
     def __init__(self, model, seq_len: int, beta: float = 0.1, **kwargs):
         if beta <= 0:
             raise ValueError(f"beta scales the KL term, so it is positive, got {beta}")
-        if "ema_decay" in kwargs:
+        if kwargs.get("ema_decay") is not None:
             raise ValueError(
                 "the DPO reference is frozen at unit decay, so ema_decay is refused")
         if kwargs.get("loss_role") is not None:
