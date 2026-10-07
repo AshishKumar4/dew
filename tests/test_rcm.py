@@ -304,7 +304,7 @@ def distilled(monkeypatch, optimizer, prefix=""):
     config = json.loads(str(TRAINING["config"]))
     pixels, labels = TRAINING["pixels"], TRAINING["label"]
     names = [str(row) for row in range(pixels.shape[0])]
-    table = label_table(dict(zip(names, labels, strict=True)))
+    table = label_table(labels)
     inputs = InputSpec(Field("image", pixels.shape[1:]), {"textcontext": Condition(table)})
     (mean_g, std_g), (mean_d, std_d) = config["times"]["G"], config["times"]["D"]
     teacher = {"params": {"weights": jnp.asarray(TRAINING["teacher"])}}
