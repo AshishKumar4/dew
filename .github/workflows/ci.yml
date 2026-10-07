@@ -1,6 +1,5 @@
 # Installs dewml, checks for syntax errors and undefined names, lints and type
-# checks src/dew, and runs the CPU test lane split into shards, each its own
-# check. For more information see:
+# checks src/dew, and runs the CPU test lane on armada. For more information see:
 # https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-python
 
 name: CI
@@ -26,8 +25,9 @@ concurrency:
 
 env:
   # Every optional dependency a test file imports, so no test skips for want of
-  # one: the test job fails a shard where one does (`Refuse a test skipped on
-  # a missing import`).
+  # one: the lint job type checks against them, and tools/armada/install.sh
+  # installs the same set for the suite, which fails a test that skips on a
+  # missing import.
   EXTRAS: test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
 
 jobs:
@@ -147,103 +147,25 @@ jobs:
 
   test:
     runs-on: ubuntu-latest
-    # A shard's share is about fifteen minutes of tests; a hung test fails its shard
-    # instead of holding a runner for the default six hours.
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        # A ci/** branch runs the compatibility floor alone: 16 shards with
-        # lint, package and Tutorials fit GitHub's 20 concurrent jobs; main
-        # runs both Pythons.
-        python-version: ${{ fromJSON(startsWith(github.ref, 'refs/heads/ci/') && '["3.12"]' || '["3.14", "3.12"]') }}
-        # pytest-split cuts the collected order into chunks of equal time by
-        # tests/test_durations.json, which tools/ci_durations.py rewrites from
-        # a run's reports. Contiguous chunks keep a module's tests, and the
-        # fixtures and compilations they share, in one process: splitting
-        # modules across every shard cost 60% more test time (run 35945550831).
-        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-    name: test (${{ matrix.python-version }}, ${{ matrix.shard }}/16)
+    # The suite runs on armada (.armada.json, tools/armada/ci.py): both
+    # Pythons as tasks of about five minutes each on Dew's own armada
+    # deployment (armada-dew, 150 containers), whose URL and token are the
+    # ARMADA_URL and ARMADA_TOKEN secrets.
+    # This job sends the commit, waits, and prints each red row's output; a
+    # failed test, a test skipped on a missing import and a file left
+    # unreported each fail it.
+    timeout-minutes: 40
     steps:
     - uses: actions/checkout@v4
-    - uses: actions/setup-python@v5
       with:
-        python-version: ${{ matrix.python-version }}
-        cache: pip
-        cache-dependency-path: pyproject.toml
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        # The jax constraints.txt names: the patched 0.11.2 the multi-process
-        # cache tests need. The package job runs the release users install.
-        # tokamax is not a dependency (docs/installation.md); the commit
-        # constraints.txt names runs the MoE tests of its grouped matmul.
-        pip install -e ".[$EXTRAS]" tokamax -c constraints.txt
-    # conftest.py persists XLA's compilations under ~/.cache/dew/xla; every
-    # run restores the latest one main saved for this shard.
-    - name: Restore the compilation cache
-      uses: actions/cache/restore@v4
-      with:
-        path: ~/.cache/dew/xla
-        key: xla-${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('pyproject.toml') }}-${{ github.run_id }}
-        restore-keys: xla-${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('pyproject.toml') }}-
-    - name: Test with pytest
-      run: |
-        # The lint job runs tests/test_gen_api.py, under the griffe it pins.
-        /usr/bin/time -v env JAX_PLATFORMS=cpu PYTHONFAULTHANDLER=1 pytest -m "not network" -vv \
-          --ignore=tests/test_gen_api.py \
-          --capture=tee-sys -ra --junitxml=pytest-report.xml \
-          --splits 16 --group ${{ matrix.shard }} --splitting-algorithm duration_based_chunks \
-          --durations-path tests/test_durations.json
-    - name: Save the compilation cache
-      if: always() && github.ref == 'refs/heads/main'
-      uses: actions/cache/save@v4
-      with:
-        path: ~/.cache/dew/xla
-        key: xla-${{ matrix.python-version }}-${{ matrix.shard }}-${{ hashFiles('pyproject.toml') }}-${{ github.run_id }}
-    - name: Annotate failures
-      if: always()
-      run: |
-        python - <<'EOF'
-        import xml.etree.ElementTree as ET
-        from pathlib import Path
-        def escape(value):
-            return value.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
-
-        if not Path("pytest-report.xml").is_file():
-            print("::notice::No pytest report was produced; inspect earlier CI steps.")
-            raise SystemExit(0)
-        root = ET.parse("pytest-report.xml").getroot()
-        for case in root.iter("testcase"):
-            for kind in ("failure", "error"):
-                node = case.find(kind)
-                if node is not None:
-                    title = escape(f"{case.get('classname')}.{case.get('name')}")
-                    title = title.replace(":", "%3A").replace(",", "%2C")
-                    detail = escape(node.text or node.get("message") or "Test failed")
-                    print(f"::error title={title}::{detail}")
-        EOF
-    - name: Refuse a test skipped on a missing import
-      if: always() && hashFiles('pytest-report.xml') != ''
-      run: |
-        python - <<'EOF'
-        # pytest.importorskip skips a test, or a whole file, whose dependency did
-        # not install, and the shard still passes: a test CI never ran. Install
-        # the dependency (EXTRAS) or leave the file to the job that has it.
-        import xml.etree.ElementTree as ET
-        missing = sorted({
-            f"{case.get('classname') or case.get('name')}: {skipped.text or skipped.get('message')}"
-            for case in ET.parse("pytest-report.xml").getroot().iter("testcase")
-            for skipped in case.iter("skipped")
-            if "could not import" in f"{skipped.get('message')} {skipped.text}"})
-        for line in missing:
-            print(f"::error title=Skipped on a missing import::{line}")
-        raise SystemExit(1 if missing else 0)
-        EOF
-    - name: Upload the test report
-      if: always() && hashFiles('pytest-report.xml') != ''
-      uses: actions/upload-artifact@v4
-      with:
-        name: pytest-report-${{ matrix.python-version }}-${{ matrix.shard }}
-        path: pytest-report.xml
+        # armada sends what the commit adds to its environment's commit,
+        # which it finds in the history.
+        fetch-depth: 0
+    - uses: oven-sh/setup-bun@v2
+    - name: Run the suite on armada
+      env:
+        ARMADA_URL: ${{ secrets.ARMADA_URL }}
+        ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
+      run: >-
+        bunx --bun github:AshishKumar4/armada#ed10c4543dd7b40419473340059c938b6389c66f
+        run ${{ github.sha }} --label="${{ github.ref_name }}"
