@@ -376,8 +376,8 @@ class JointLayout(Layout):
             state_ids = state_ids[:self.max_state_tokens]
         fixed = len(prefix) + len(schema) + len(suffix)
         if fixed > self.max_len:
-            raise ValueError(f"the schema needs {fixed} tokens before the state, "
-                             f"and max_len is {self.max_len}")
+            raise ValueError(f"the schema needs {fixed} tokens before the state, more than the "
+                             f"maximum context length, max_len={self.max_len}")
         state_ids = state_ids[:self.max_len - fixed]
         offset = len(prefix) + len(state_ids)
 

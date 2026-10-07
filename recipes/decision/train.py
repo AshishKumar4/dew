@@ -37,13 +37,16 @@ from dew.decision import (
     Accuracy,
     Decide,
     DecisionModel,
+    DecisionObjective,
     DecisionTable,
+    Example,
     JointLayout,
     JointSchemaHead,
     LayaCheckpoint,
     LogLoss,
     MarkerLayout,
     StateFirstLayout,
+    Weighted,
 )
 from dew.interop import Pretrained
 from dew.nn.backbones.decoder_block import remat_policy
@@ -162,6 +165,36 @@ def layout_of(config: DecisionRunConfig, start: Decide | Pretrained):
     return (StateFirstLayout if start.model.causal else MarkerLayout)(**budgets)
 
 
+def fitting(objective: DecisionObjective, weighted: dict[str, Weighted],
+            held: list[Example]) -> tuple[dict[str, Weighted], list[Example], dict[str, int]]:
+    """The examples a joint layout can lay out, and how many of each set it cannot.
+
+    A joint row holds every question of an example, and one whose questions
+    alone pass the layout's `max_len` cannot be laid out at all; it is dropped
+    here and counted, rather than stopping the run when a worker reaches it.
+    A layout of one row per question lays out every example, so nothing is
+    dropped for it.
+    """
+    if not objective.layout.joint:
+        return weighted, held, {}
+
+    def fits(example: Example) -> bool:
+        try:
+            objective.layout.rows(objective.tokenizer, objective.specials, example.state, example.questions)
+        except ValueError:
+            return False
+        return True
+
+    unfit, kept = {}, {}
+    for name, entry in weighted.items():
+        examples = [example for example in entry.examples if fits(example)]
+        unfit[name] = len(entry.examples) - len(examples)
+        kept[name] = Weighted(examples, entry.weight)
+    held_kept = [example for example in held if fits(example)]
+    unfit["held out"] = len(held) - len(held_kept)
+    return kept, held_kept, unfit
+
+
 def main(config: DecisionRunConfig) -> TrainState:
     prepare_process(config.trainer.wandb, config.trainer.multi_host,
                     config.trainer.xla_flags, config.trainer.compilation_cache_dir,
@@ -179,8 +212,10 @@ def main(config: DecisionRunConfig) -> TrainState:
         derived["head"] = JointSchemaHead(hidden_size=width, dtype=dtype, **dataclasses.asdict(config.head))
     objective = config.objective.build(**derived)
     overlaps = None if config.decontaminate is None else Overlaps.load(config.decontaminate)
+    unfit: dict[str, int] = {}
     if config.mixture is not None:
-        train, held_out = config.mixture.read(None if overlaps is None else overlaps.keep)
+        weighted, held_out = config.mixture.read(None if overlaps is None else overlaps.keep)
+        train, held_out, unfit = fitting(objective, weighted, held_out)
         source_name = "mixture"
     else:
         table_train, held_out = config.data.examples()
@@ -197,6 +232,8 @@ def main(config: DecisionRunConfig) -> TrainState:
         summary["mixture"] = dict(weights(config.mixture))
     if overlaps is not None:
         summary["decontamination"] = overlaps.report
+    if unfit:
+        summary["unfit"] = unfit
     state = config.train(objective, data, name=name, metrics=validation, summary=summary)
     if config.calibrate and held_out:
         run = f"{config.trainer.checkpoint_dir}/{name}"
