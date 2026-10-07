@@ -89,17 +89,25 @@ def test_the_plan_weighs_a_split_file_by_its_groups_and_the_rest_by_armadas_pace
 
 def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(ci, tmp_path):
     """A hang is graded: the task interrupts pytest at its deadline, short of
-    armada's own timeout, and writes a red row for each of its files, the
-    one that finished first included."""
+    armada's own timeout, kills its process group where the interrupt is not
+    heard, and writes a red row for each of its files, the one that finished
+    first included."""
     (tmp_path / "tests/test_quick.py").write_text("def test_ok(): pass\n")
-    (tmp_path / "tests/test_hangs.py").write_text("import time\ndef test_forever(): time.sleep(600)\n")
+    # A hang that ignores ^C, beside a child that holds pytest's output open:
+    # neither may keep the task from writing its verdict.
+    (tmp_path / "tests/test_hangs.py").write_text(
+        "import signal, subprocess, sys, time\n"
+        "def test_forever():\n"
+        "    subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(600)'])\n"
+        "    signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "    time.sleep(600)\n")
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
     out = tmp_path / "verdict.json"
     began = time.monotonic()
-    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0)
+    ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
     assert time.monotonic() - began < 60
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
