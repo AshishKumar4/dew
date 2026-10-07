@@ -331,6 +331,27 @@ def _batch_text(batch) -> ModelInputs:
                      None if positions is None else jnp.asarray(positions, jnp.int32))
 
 
+def _text_preview[S](phase: str, setup: Callable[[], S | None],
+                     generate: Callable[[S], tuple[jax.Array, jax.Array | None]],
+                     decode: Callable[[list[int]], str] | None) -> TextSamples | None:
+    """A text preview, on every process: agree on `setup`, generate the rows
+    and the prompt they continue (None for none) from what it returns, gather
+    both to the host, and decode them into `TextSamples` on process zero. The
+    other processes return None, as every process does when `setup` returns
+    None, which draws no preview. Without `decode`, the artifact holds the
+    ids alone."""
+    prepared = agreed(f"{phase} setup", setup)
+    drawn = agreed(f"{phase} generation", lambda: None if prepared is None else generate(prepared))
+    drawn = collective_host(drawn, phase=phase)
+    if drawn is None or jax.process_index() != 0:
+        return None
+    tokens, prompt = drawn
+    if decode is None:
+        return TextSamples(tokens=tokens)
+    return TextSamples(tokens=tokens, prompt="" if prompt is None else decode(np.asarray(prompt)[0].tolist()),
+                       texts=tuple(decode(row.tolist()) for row in np.asarray(tokens)))
+
+
 # The `moe` leaf a balanced router keeps. DeepSeek V4's hash router keeps
 # the frozen token-to-expert table it selects by in the same collection
 # (dew.nn.moe.Router), and no load-balance update moves that.
@@ -1206,25 +1227,13 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             if settings is None or settings.max_new_tokens <= 0:
                 return None
             weights = self.evaluation_variables(params, step)
-            return (self.policy(weights, settings.sampling), self._prompt, settings.max_new_tokens)
+            return self.policy(weights, settings.sampling), settings.max_new_tokens
 
-        def generate():
-            if prepared is None:
-                return None, None
-            policy, prompt, max_new_tokens = prepared
-            return policy(prompt, max_new_tokens, key=step.key).host().tokens, prompt
+        def generate(prepared):
+            policy, max_new_tokens = prepared
+            return policy(self._prompt, max_new_tokens, key=step.key).host().tokens, self._prompt
 
-        prepared = agreed("LM preview setup", setup)
-        generated, prompt = agreed("LM preview generation", generate)
-        generated, prompt = collective_host((generated, prompt), phase="LM preview")
-        if settings is None or jax.process_index() != 0:
-            return None
-        assert generated is not None and prompt is not None
-        decode = settings.decode
-        return TextSamples(
-            tokens=generated,
-            prompt=decode(np.asarray(prompt)[0].tolist()),
-            texts=tuple(decode(row.tolist()) for row in np.asarray(generated)))
+        return _text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 
 
 class Perplexity:
