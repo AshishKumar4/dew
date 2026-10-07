@@ -681,7 +681,8 @@ class RunConfig:
         `--model <alias or import path>` picks the model's class, and every
         field the class declares is a flag, `--model.<field>`, typed by its
         annotation (`ModelConfig`). Naming the class the run defaults to keeps
-        the default's fields; naming another starts from that class's own.
+        the default's fields; naming another starts from that class's own and
+        the default's compute dtype.
         """
         given = list(sys.argv[1:] if args is None else args)
         for field, subcommand in cls._FLAG_SELECTED.items():
@@ -695,7 +696,11 @@ class RunConfig:
         if chosen is not None:
             name = given.pop(chosen).removeprefix("--model").removeprefix("=") or given.pop(chosen)
             if registry.import_path(models[name]) != start.name:
-                start = ModelConfig(name)
+                # Another class starts from its own fields and the run's
+                # compute dtype, where it declares one.
+                kept = {"dtype": start.fields["dtype"]} if "dtype" in start.fields and "dtype" in {
+                    field.name for field in dataclasses.fields(models[name])} else {}
+                start = ModelConfig(name, kept)
         member = models[start.name]
         flags, declared = _model_flags(member, start.fields)
         # The run parses with its model as those flags, and validates once
