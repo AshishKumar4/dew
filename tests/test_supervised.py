@@ -3,6 +3,9 @@ names it, its loss and its metrics in a record that builds it again;
 `--set` changes one field of a run, read as that field's type reads it."""
 
 import json
+import os
+import subprocess
+import sys
 
 import jax
 import jax.numpy as jnp
@@ -132,3 +135,58 @@ def test_a_model_whose_call_needs_more_than_the_sample_is_refused_by_name():
 
     with pytest.raises(TypeError, match="sample alone, and Timed's call also needs time"):
         Supervised(Timed(), squared, inputs=INPUTS)
+
+
+class Heads(nn.Module):
+    """Logits beside the features they are read from."""
+
+    @nn.compact
+    def __call__(self, x):
+        features = nn.Dense(4)(x)
+        return {"logits": nn.Dense(2)(features), "features": features}
+
+
+def test_criteria_read_the_output_their_path_selects_from_a_model_with_several():
+    objective = Supervised(Heads(), CrossEntropy(output=("logits",)), (Accuracy(output=("logits",)),),
+                           inputs=INPUTS)
+    variables = objective.init(jax.random.key(0))
+    _, aux = objective.scalar_loss(variables, batch(), STEP)
+    logits = Heads().apply(variables, batch()["x"])["logits"]
+    np.testing.assert_allclose(aux.metrics["accuracy"], np.mean(np.argmax(logits, -1) == batch()["label"]),
+                               rtol=1e-6)
+    with pytest.raises(TypeError, match="selects a dict"):
+        Supervised(Heads(), CrossEntropy(), inputs=INPUTS).scalar_loss(variables, batch(), STEP)
+
+
+def test_an_autoencoder_with_two_outputs_trains_and_its_record_trains_it_again_in_a_new_process(tmp_path):
+    """A model returning its reconstruction and its latent trains through
+    `dew train` on a loss reading both; a new process given only the run's
+    `run.json` rebuilds the same run and trains the same loss, step for step."""
+    from test_examples import REPO_ROOT, single_device
+
+    (tmp_path / "tmp").mkdir()
+    environment = {**single_device(), "TMPDIR": str(tmp_path / "tmp"),
+                   "PYTHONPATH": os.pathsep.join([str(REPO_ROOT / "src"), str(REPO_ROOT / "tests")])}
+
+    def train(*arguments):
+        finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
+                                  cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
+        assert finished.returncode == 0, (
+            f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
+
+    def losses(directory):
+        rows = (directory / "autoencoder_experiment" / "tracking" / "scalars.jsonl").read_text().splitlines()
+        scalars = [json.loads(row)["scalars"] for row in rows]
+        return [row["train/loss"] for row in scalars if "train/loss" in row]
+
+    train(str(REPO_ROOT / "tests" / "autoencoder_experiment.py"),
+          "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}")
+    record = tmp_path / "first" / "autoencoder_experiment" / "run.json"
+    loss = json.loads(record.read_text())["objective"]["fields"]["loss"]
+    assert loss == {"function": "autoencoder_experiment:evidence_bound"}
+    trained = losses(tmp_path / "first")
+    assert len(trained) == 40 and np.mean(trained[-5:]) < 0.5 * np.mean(trained[:5])
+
+    train(str(record), "--trust", "autoencoder_experiment",
+          "--set", f"trainer.checkpoint_dir={tmp_path / 'again'}")
+    assert losses(tmp_path / "again") == trained
