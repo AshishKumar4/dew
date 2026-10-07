@@ -278,7 +278,8 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
 
     def losses(directory):
         rows = (directory / "train_supervised" / "tracking" / "scalars.jsonl").read_text().splitlines()
-        return [row["train/loss"] for row in map(json.loads, rows) if "train/loss" in row]
+        scalars = [json.loads(row)["scalars"] for row in rows]
+        return [row["train/loss"] for row in scalars if "train/loss" in row]
 
     train(str(REPO_ROOT / "examples" / "train_supervised.py"),
           "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}", "--set", "trainer.steps=6",

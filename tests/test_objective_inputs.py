@@ -23,6 +23,7 @@ from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
+from dew.inputs import Field, InputSpec
 from dew.nn.backbones import CausalTransformer, SimpleDiT
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.objectives import DistillationObjective
@@ -42,6 +43,7 @@ from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, Multi
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
 from dew.objectives.rl.sessions import Call, Session, Status, pack
+from dew.objectives.supervised import CrossEntropy, Supervised
 from dew.registry import objectives
 from dew.sampling.solvers import Euler
 from recipes.jepa.train import JepaRunConfig, sample_field
@@ -187,6 +189,9 @@ def cases(windows):
         "guidance_distillation": lambda: with_teacher("guidance_distillation"),
         "jepa": jepa,
         "decision": decision,
+        "supervised": lambda: (Supervised(decoder(), CrossEntropy(labels="text"),
+                                          inputs=InputSpec(Field("text", (windows.seq_len + 1,)))),
+                               first(windows)),
     }
 
 
