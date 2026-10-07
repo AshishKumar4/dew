@@ -253,7 +253,7 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
 
 
 def test_a_pretrained_run_refuses_a_model_of_its_own():
-    with pytest.raises(ValueError, match=r"leave model.architecture, model.config, text unset"):
+    with pytest.raises(ValueError, match=r"leave model, text unset"):
         DiffusionRunConfig(pretrained="some/pipeline", model=ModelConfig("simple_dit"),
                            text=TextCondition(encoder="t5"))
 
@@ -267,8 +267,8 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
         model=ModelConfig("flux_transformer", {
             "in_channels": 12, "out_channels": 12, "num_layers": 1, "num_single_layers": 1,
             "heads": 2, "head_dim": 12, "joint_attention_dim": 16, "pooled_projection_dim": 10,
-            "guidance_embeds": True, "axes_dims_rope": [4, 4, 4]},
-            dtype="float32", attention_impl="xla"),
+            "guidance_embeds": True, "axes_dims_rope": [4, 4, 4],
+            "dtype": "float32", "attention_impl": "xla"}),
         data=TFDSImages(image_size=8), preset=Flow(), solver=Euler(),
         guidance=None, sampling_steps=2, ema_decay=None, val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(directory)))
@@ -286,7 +286,7 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
 def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRunConfig:
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
-                                         "num_heads": 2}, dtype="float32", attention_impl="xla"),
+                                         "num_heads": 2, "dtype": "float32", "attention_impl": "xla"}),
         data=TFDSImages(image_size=4), preset=Flow(), solver=Euler(),
         guidance=None, sampling_steps=2, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),

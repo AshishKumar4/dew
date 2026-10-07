@@ -138,9 +138,8 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     config = DiffusionRunConfig(
         model=ModelConfig(
             "simple_dit",
-            {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2},
-            dtype="float32",
-            attention_impl="xla",
+            {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
+             "dtype": "float32", "attention_impl": "xla"},
         ),
         data=TFDSImages(image_size=4),
         preset=presets.MeanFlow(),

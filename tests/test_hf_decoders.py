@@ -128,7 +128,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mixers.mlp import MLPMixer
 from dew.nn.moe import Situ
-from dew.registry import models, with_precision
+from dew.registry import models
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 # The committed byte-level BPE an export can name without a download.
@@ -781,8 +781,7 @@ def test_translated_weights_are_exactly_the_models_variables(name, rng):
     initialised model: `params` for every family, and the `moe` collection
     DeepSeek's routers keep their bias in."""
     config = translate_config(fixture_config(name))
-    built = with_precision('causal_transformer', dict(config),
-                                   dtype='float32', attention_impl='reference')
+    built = {**config, 'dtype': 'float32', 'attention_impl': 'reference'}
     model = models.build('causal_transformer', **built)
     initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
 
@@ -1202,8 +1201,7 @@ def biased_qwen3(rng):
     through the round-trip, so every bias gets its own draw.
     """
     config = {**translate_config(fixture_config("qwen3-tiny")), 'attention_bias': True}
-    built = with_precision('causal_transformer', dict(config),
-                                   dtype='float32', attention_impl='reference')
+    built = {**config, 'dtype': 'float32', 'attention_impl': 'reference'}
     model = models.build('causal_transformer', **built)
     leaves, structure = jax.tree_util.tree_flatten_with_path(
         model.init(rng, jnp.zeros((1, 4), jnp.int32)))
@@ -1241,8 +1239,7 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
 
     table = json.loads((REAL / "tensors.json").read_text())
     config = translate_config(json.loads((REAL / "config.json").read_text()))
-    built = with_precision('causal_transformer', dict(config),
-                                   dtype='float32', attention_impl='reference')
+    built = {**config, 'dtype': 'float32', 'attention_impl': 'reference'}
     model = models.build('causal_transformer', **built)
 
     expected = {}
@@ -1398,8 +1395,7 @@ def _diffusion_fp32(name):
     directory = FIXTURES / name
     config = translate_config(fixture_config(name))
     assert config["mask_token_id"] == 120
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="float32", attention_impl="reference"))
+    model = models.build("causal_transformer", config, dtype="float32", attention_impl="reference")
     assert model.mask_token_id == 120
     variables = translate_weights(load_file(str(directory / "model.safetensors")), config)
     return (model, variables, np.load(directory / "input_ids.npy"),

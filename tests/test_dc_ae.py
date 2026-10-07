@@ -234,9 +234,8 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     config = DiffusionRunConfig(
         model=ModelConfig(
             "simple_dit",
-            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1},
-            dtype="float32",
-            attention_impl="reference",
+            {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
+             "dtype": "float32", "attention_impl": "reference"},
         ),
         data=TFDSImages(image_size=16),
         trainer=TrainerConfig(batch_size=8, steps=2),

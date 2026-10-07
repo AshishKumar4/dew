@@ -6,7 +6,6 @@ import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
-import jax
 import jax.numpy as jnp
 import pytest
 from flax import linen as nn

@@ -38,7 +38,7 @@ from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import families, translate_config
 from dew.nn.inputs import ModelInputs
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import cached_run, decided, forward
 
@@ -125,8 +125,7 @@ def test_every_released_tensor_lands_on_one_leaf_of_the_released_tree():
     config = json.loads((RELEASED / "config.json").read_text())
     record = translate_config(config)
     model = models.build("causal_transformer",
-                         **with_precision("causal_transformer", record, dtype="float32",
-                                        attention_impl="reference"))
+                         record, dtype="float32", attention_impl="reference")
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))
     family = families()["deepseek_v4"]
     names = []

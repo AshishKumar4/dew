@@ -45,7 +45,7 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     """The resolved config of a tiny conditional DiT run in `directory`; the
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
-        model=ModelConfig("simple_dit", dict(MODEL), dtype="float32", attention_impl="reference"),
+        model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
         data=TFDSImages(image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
         preset=preset, solver=Euler(), sampling_steps=3,
@@ -295,7 +295,7 @@ def test_the_text_encoder_follows_the_models_compute_dtype(tmp_path):
     storage, and `param_dtype` still governs that. A set dtype is kept."""
     config = dataclasses.replace(
         run_config(tmp_path),
-        model=ModelConfig("simple_dit", dict(MODEL), dtype="bfloat16", attention_impl="reference"),
+        model=ModelConfig("simple_dit", {**MODEL, "dtype": "bfloat16", "attention_impl": "reference"}),
         text=TextCondition(encoder="char_table", checkpoint="char_table"))
     encoder = config.build().inputs.conditions["textcontext"].encoder
     assert encoder.dtype == jnp.bfloat16
@@ -315,7 +315,7 @@ def test_an_unconditional_unet_takes_a_step():
     unet = {"emb_features": 32, "feature_depths": [8, 16], "num_res_blocks": 1,
             "norm_groups": 4, "attention_configs": [None, {"heads": 2}]}
     config = DiffusionRunConfig(
-        model=ModelConfig("unet", unet, dtype="float32", attention_impl="reference"),
+        model=ModelConfig("unet", {**unet, "dtype": "float32", "attention_impl": "reference"}),
         data=TFDSImages(image_size=16), text=None)
     objective = config.build()
     images = np.zeros((8, 16, 16, 3), np.uint8)
@@ -388,7 +388,8 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
 
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
                   "mlp_features": 32, "max_seq_len": max_seq_len}
-    model_config = ModelConfig("causal_transformer", fields, dtype="float32", attention_impl="reference")
+    model_config = ModelConfig("causal_transformer", {**fields,
+                                                    "dtype": "float32", "attention_impl": "reference"})
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
                             samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)),
                             processor=RunProcessor(ByteTokenizer()))
@@ -554,8 +555,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
             self.position = int(state.decode())
 
     config = LmRun(
-        model=ModelConfig("causal_transformer", fields, dtype="float32",
-                          attention_impl="reference"),
+        model=ModelConfig("causal_transformer", {**fields,
+                                               "dtype": "float32", "attention_impl": "reference"}),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=batch, steps=1,
                               eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                               quantization=Quantization()))
@@ -807,8 +808,8 @@ def test_saved_diffusion_precision_reconstructs_owners_without_source_weights(
     directory = tmp_path / "run"
     config = dataclasses.replace(
         run_config(directory),
-        model=ModelConfig("simple_dit", {**MODEL, "patch_size": 2},
-                          dtype="float32", attention_impl="reference"),
+        model=ModelConfig("simple_dit", {**MODEL, "patch_size": 2,
+                                       "dtype": "float32", "attention_impl": "reference"}),
         text=TextCondition(encoder="clip_text", checkpoint=str(fixtures / "clip/tiny"), dtype="float32"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "source/sd/vae"), dtype="float32"))
     objective = config.build()

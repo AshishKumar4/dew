@@ -21,7 +21,7 @@ from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn import vision as V
 from dew.nn.audio import Gemma3nAudio, audio_config, audio_weights
 from dew.nn.vision import gemma3n, gemma4
-from dew.registry import models, projectors, with_precision
+from dew.registry import models, projectors
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 HIGHEST = jax.lax.Precision.HIGHEST
@@ -43,7 +43,7 @@ class _Wrapper:
         text["lm_head.weight"] = tensors["lm_head.weight"]
         self.decoder = models.build(
             "causal_transformer",
-            **with_precision("causal_transformer", text_config, dtype="float32", attention_impl="reference"),
+            text_config, dtype="float32", attention_impl="reference",
         ).clone(precision=HIGHEST)
         self.text_variables = translate_weights(text, text_config)
         self.audio = audio_config(self.config["audio_config"])

@@ -174,8 +174,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
 
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
-                                         "time_scale": 0.002},
-                          dtype="float32", attention_impl="xla"),
+                                         "time_scale": 0.002, "dtype": "float32", "attention_impl": "xla"}),
         data=TFDSImages(image_size=4), preset=Flow(), solver=Euler(), guidance=None,
         sampling_steps=2, ema_decay=None, val_metrics=(), trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"))
@@ -197,14 +196,14 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
         teacher_run,
         model=dataclasses.replace(
             teacher_run.model,
-            config={key: value for key, value in teacher_run.model.config.items() if key != "time_scale"},
+            fields={key: value for key, value in teacher_run.model.fields.items() if key != "time_scale"},
         ),
     ).save(str(fast))
     with pytest.raises(ValueError, match="time_scale=16"):
         dataclasses.replace(teacher_run, mode=ConsistencyDistillation(teacher=str(fast))).build()
     # A teacher whose time features turn slower still is as smooth to differentiate.
     dataclasses.replace(teacher_run, model=dataclasses.replace(
-        teacher_run.model, config={**teacher_run.model.config, "time_scale": 0.001})).save(str(fast))
+        teacher_run.model, fields={**teacher_run.model.fields, "time_scale": 0.001})).save(str(fast))
     ConsistencyDistillation(teacher=str(fast)).check_teacher()
 
     config = dataclasses.replace(teacher_run, mode=ConsistencyDistillation(

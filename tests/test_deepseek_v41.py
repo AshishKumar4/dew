@@ -45,7 +45,7 @@ from dew.interop.hf_decoders import _wrapper_sources, families, translate_config
 from dew.nn.engram import Engram
 from dew.nn.fake_quant import fake_quant_fp4, fake_quant_fp8
 from dew.nn.inputs import ModelInputs
-from dew.registry import models, with_precision
+from dew.registry import models
 from dew.sampling import Sample, Sampling, Speculative, generate
 from tools.deepseek_v41_numerics import (
     QUANTIZERS,
@@ -637,8 +637,7 @@ def test_consecutive_reindex_layers_publish_their_selections_under_scan_layers()
     config = json.loads((TINY / "config.json").read_text())
     text = config["text_config"]
     config = {**config, "text_config": {**text, "index_source_layer_ids": [2, 4, 6, 7, 8, 10]}}
-    fields = with_precision("causal_transformer", translate_config(config), dtype="float32",
-                            attention_impl="reference")
+    fields = {**translate_config(config), "dtype": "float32", "attention_impl": "reference"}
     ids = jnp.asarray(np.load(TINY / "reference.npz")["input_ids"])
     unrolled, scanned = (models.build("causal_transformer", **{**fields, "scan_layers": scan})
                          for scan in (False, True))

@@ -20,7 +20,7 @@ from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.registry import models, with_precision
+from dew.registry import models
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
@@ -1344,8 +1344,7 @@ def test_the_deepseek_v4_tree_is_exactly_the_models_variables(rng):
     from dew.interop.sources import load_shards
 
     config = translate_config(fixture_config("deepseek-v4-tiny"))
-    built = with_precision("causal_transformer", dict(config),
-                           dtype="float32", attention_impl="reference")
+    built = {**config, "dtype": "float32", "attention_impl": "reference"}
     model = models.build("causal_transformer", **built)
     initialised = flat_tree(model.init(rng, jnp.zeros((1, 4), jnp.int32)))
     loaded = flat_tree(translate_weights(load_shards(DEEPSEEK_V4), config))
@@ -1755,8 +1754,7 @@ def test_the_released_diffusiongemma_26b_builds_its_split_global_geometry():
     the checkpoint cannot load.
     """
     config = translate_config(fixture_config("diffusiongemma-26b")["text_config"])
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="bfloat16", attention_impl="reference"))
+    model = models.build("causal_transformer", config, dtype="bfloat16", attention_impl="reference")
     params = jax.eval_shape(
         lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))["params"]
 
@@ -1822,8 +1820,7 @@ def test_the_released_e2b_config_translates_and_shares_the_layers_it_names():
     assert config["final_logit_softcap"] == 30.0
     assert config["rope_theta"] == 1000000.0
 
-    model = models.build("causal_transformer", **with_precision(
-        "causal_transformer", config, dtype="bfloat16", attention_impl="reference"))
+    model = models.build("causal_transformer", config, dtype="bfloat16", attention_impl="reference")
     params = jax.eval_shape(
         lambda: model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)))["params"]
     shared = [index for index in range(config["num_layers"])
