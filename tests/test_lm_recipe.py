@@ -12,6 +12,7 @@ import numpy as np
 import pytest
 
 import dew
+from dew.config import ObjectiveConfig
 from dew.data import PackedTokens, TokenWindows
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, Samples
@@ -489,7 +490,7 @@ def test_a_pretrained_run_refuses_a_checkpoint_too_narrow_for_the_ids(tmp_path):
 
 
 def test_the_recipe_balances_a_sparse_run(tmp_path):
-    """--balance-rate reaches the objective: a sparse run moves every
+    """--objective.balance-rate reaches the objective: a sparse run moves every
     router's bias by the rate each step, which the recipe could not ask for
     before, and an unbalanced run leaves it at zero."""
     recipe = load_recipe()
@@ -507,7 +508,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
         return np.asarray(state.variables["moe"]["layers_1"]["mlp"]["gate"]
                           ["e_score_correction_bias"])
 
-    balanced = run("balanced", "--balance-rate", "0.01")
+    balanced = run("balanced", "--objective.balance-rate", "0.01")
     assert np.any(balanced != 0), "the bias never moved"
     np.testing.assert_allclose(np.abs(balanced) / 0.01,
                                np.round(np.abs(balanced) / 0.01), atol=1e-4)
@@ -515,7 +516,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
 
 
 def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
-    """--mtp-weight reaches the objective: with the term on, a prediction
+    """--objective.mtp-weight reaches the objective: with the term on, a prediction
     depth's fused projection ends two steps somewhere else than the same run
     without it, whose depth sees no gradient; and the flag on a model
     without depths raises a ValueError naming num_nextn_predict_layers."""
@@ -533,17 +534,19 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
         state = recipe.main(config)
         return np.asarray(state.variables["params"]["mtp_0"]["eh_proj"]["kernel"])
 
-    assert np.any(run("mtp", "--mtp-weight", "0.3") != run("plain")), \
+    assert np.any(run("mtp", "--objective.mtp-weight", "0.3") != run("plain")), \
         "the term never reached the depth"
     with pytest.raises(ValueError, match="num_nextn_predict_layers"):
-        run("dense", "--mtp-weight", "0.3",
+        run("dense", "--objective.mtp-weight", "0.3",
             model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}')
 
 
-def test_an_unknown_objective_is_refused():
+def test_an_objective_the_recipe_does_not_train_is_refused():
     recipe = load_recipe()
+    with pytest.raises(KeyError, match="no objective named 'ctc'"):
+        recipe.LmRunConfig(data=TokenWindows(seq_len=64), objective=ObjectiveConfig("ctc"))
     with pytest.raises(ValueError, match="--objective"):
-        recipe.LmRunConfig(data=TokenWindows(seq_len=64), objective="ctc")
+        recipe.LmRunConfig(data=TokenWindows(seq_len=64), objective=ObjectiveConfig("jepa"))
 
 
 def test_masked_diffusion_trains_on_packed_documents(tmp_path):
@@ -573,7 +576,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--ema-decay", "None", "--sample-tokens", "0"])
+        "--objective.ema-decay", "None", "--sample-tokens", "0"])
 
     state = recipe.main(config)
 
@@ -590,7 +593,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
 def test_the_masked_objective_is_reachable_by_name(tmp_path):
     recipe = load_recipe()
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
-    assert run_config(recipe, tokens, "--objective", "masked_diffusion").objective == \
+    assert run_config(recipe, tokens, "--objective", "masked_diffusion").objective.name == \
         "dew.objectives.diffusion.masked:MaskedDiffusionObjective"
 
 
@@ -605,7 +608,7 @@ def test_masked_diffusion_without_a_mask_id_is_refused():
     with pytest.raises(ValueError, match="mask token id"):
         recipe.build_masked_objective(
             recipe.LmRunConfig(data=TokenWindows(seq_len=SEQ),
-                               objective="masked_diffusion"),
+                               objective=ObjectiveConfig("masked_diffusion")),
             model, {}, None)
 
 
@@ -620,7 +623,7 @@ def test_masked_diffusion_on_a_causal_model_is_refused():
     with pytest.raises(ValueError, match="causal=False"):
         recipe.build_masked_objective(
             recipe.LmRunConfig(data=TokenWindows(seq_len=SEQ),
-                               objective="masked_diffusion"),
+                               objective=ObjectiveConfig("masked_diffusion")),
             model, {"mask_token_id": 5}, None)
 
 
@@ -652,7 +655,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
+        "--objective.ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
 
     state = recipe.main(config)
 
@@ -686,12 +689,12 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
     config = recipe.LmRunConfig.cli( [
         "--pretrained", str(checkpoint), "--objective", "block_diffusion",
         "--tokenizer", str(checkpoint), "--data.path", str(directory), "--data.seq-len", "11",
-        "--block-prompt-tokens", "4", "--data.loading.workers", "0",
+        "--objective.prompt-length", "4", "--data.loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
+        "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
     state = recipe.main(config)
     assert int(state.updates) == 1
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla",
@@ -761,13 +764,15 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     from dew.objectives.lm import LMRunConfig
 
     chat = ChatMessages(tokenizer="byte", path="chat.parquet", seq_len=16)
-    config = LMRunConfig(data=chat, tokenizer="gpt2", sample_tokens=8, ema_decay=None,
+    config = LMRunConfig(data=chat, tokenizer="gpt2", sample_tokens=8,
+                         objective=ObjectiveConfig("lm", {"ema_decay": 0.99}),
                          sampling=Sampling(temperature=0.5, top_k=7))
 
     record = config.to_dict()
 
     assert record["tokenizer"] == "gpt2" and record["sample_tokens"] == 8
-    assert record["ema_decay"] is None and record["objective"] == "dew.objectives.lm.objective:LMObjective"
+    assert record["objective"] == {"name": "dew.objectives.lm.objective:LMObjective",
+                                   "fields": {"ema_decay": 0.99}}
     assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
     assert LMRunConfig.from_dict(record) == config
     with pytest.raises(ValueError, match="trains on token files"):

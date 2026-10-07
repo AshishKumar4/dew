@@ -151,7 +151,7 @@ def train_and_export(root: Path) -> Path:
         "--trainer.checkpoint-every", "None", "--trainer.name", "ollama-interop",
         "--trainer.checkpoint-dir", str(root / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--model.dtype", "float32", "--sample-tokens", "0", "--ema-decay", "None",
+        "--model.dtype", "float32", "--sample-tokens", "0",
         "--optim.learning-rate", "3e-3",
         *model_args])
     state = recipe.main(config)

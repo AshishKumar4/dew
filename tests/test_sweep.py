@@ -102,7 +102,7 @@ def test_a_ledger_of_another_space_is_refused(tmp_path):
 
 
 def test_a_path_the_run_record_does_not_declare_is_refused(tmp_path):
-    with pytest.raises(ValueError, match="unknown fields \\['learn_rate'\\]"):
+    with pytest.raises(KeyError, match='names no field'):
         override(config(tmp_path), {'optim.learn_rate': 0.1})
     with pytest.raises(KeyError, match='names no group'):
         override(config(tmp_path), {'optimizer.learning_rate': 0.1})
