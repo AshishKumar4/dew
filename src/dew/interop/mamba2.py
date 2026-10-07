@@ -139,20 +139,23 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
     raise ValueError(f"{name!r} has no place in a Mamba-2 CausalTransformer")
 
 
-def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
+def export_path(dew_name: str, config: Mapping[str, object], *,
+                layer_names: Mapping[tuple[str, ...], str] = _LAYER_NAMES,
+                family: str = "Mamba-2") -> str | None:
     """Return the `Mamba2ForCausalLM` tensor name for one flattened dew parameter path.
 
     The inverse of `weight_path`. The tied head comes back as None, since its
-    embedding copy is written instead.
+    embedding copy is written instead. A hybrid on the same `backbone` trunk
+    (Nemotron-H) passes its own `layer_names`.
     """
     parts = tuple(dew_name.split("."))
     if parts in _TRUNK_NAMES:
         return _TRUNK_NAMES[parts]
     if parts == ("lm_head", "kernel"):
         return None if config.get("tie_embeddings") else "lm_head.weight"
-    if parts[0].startswith("layers_") and parts[1:] in _LAYER_NAMES:
-        return f"backbone.layers.{parts[0].removeprefix('layers_')}.{_LAYER_NAMES[parts[1:]]}"
-    raise ValueError(f"{dew_name!r} is not a Mamba-2 CausalTransformer parameter")
+    if parts[0].startswith("layers_") and parts[1:] in layer_names:
+        return f"backbone.layers.{parts[0].removeprefix('layers_')}.{layer_names[parts[1:]]}"
+    raise ValueError(f"{dew_name!r} is not a {family} CausalTransformer parameter")
 
 
 # mamba_ssm's own checkpoint format (state-spaces/mamba2-*): a config.json

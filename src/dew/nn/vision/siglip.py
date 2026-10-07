@@ -12,22 +12,14 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import checkpoint_array, translate_parameters
+from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import CLIPEncoderLayer
+from dew.nn.text_encoders import CLIPEncoderLayer, _encoder_layer_path
 from dew.objectives.base import Variables
 from dew.registry import Record
 
-from .common import (
-    _PROJECTOR_PATHS,
-    ProjectorBase,
-    TowerBase,
-    TowerGeometry,
-    _encoder_layer_path,
-    _image_size,
-    _vision_section,
-)
+from .common import _PROJECTOR_PATHS, ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
 
 
 class SiglipVisionTransformer(nn.Module):
@@ -189,13 +181,6 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
-
-
-def translate_siglip_vision_weights(
-    hf_tensors: Mapping[str, np.ndarray], *, param_dtype: str = "float32"
-) -> Variables:
-    """SigLIP vision parameters at the requested storage precision."""
-    return translate_parameters(hf_tensors, siglip_vision_path, param_dtype)
 
 
 def translate_gemma_projector_weights(
