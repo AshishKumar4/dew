@@ -78,7 +78,7 @@ async function createSession(request: Request, env: Env, ctx: ExecutionContext, 
 	const token = await sign(env.SESSION_SECRET, opened.id, expires);
 	const socket = `wss://${new URL(request.url).host}/v1/sessions/${opened.id}/ws?token=${encodeURIComponent(token)}`;
 	return reply(
-		{ id: opened.id, token, socket, warm: opened.warm, limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
+		{ id: opened.id, token, socket,  limits: { idleSeconds: limits.idleSeconds, wallSeconds: limits.wallSeconds } },
 		201,
 		cors,
 	);
@@ -94,7 +94,10 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 	const image = await pool.image();
 	if (!image) return new Response('queued for a warm model host', { status: 503 });
 	const host = await pool.allocate(id, image);
-	await coordinatorOf(env).started(id, Date.now(), image);
+	if (!(await coordinatorOf(env).started(id, Date.now(), image))) {
+		await pool.close(id);
+		return new Response('this session is over', { status: 410 });
+	}
 	return env.SHARED.get(env.SHARED.idFromName(host)).fetch(forwarded);
 }
 
