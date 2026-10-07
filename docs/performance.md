@@ -1891,15 +1891,67 @@ rows that changed are near-ties: 3 of 64 at 32 slots (at most 0.93 bf16
 spacings apart in fp32, and all three now pick fp32's argmax) and 20 of 256
 at 128 (at most 1.74 apart; fp32's argmax sided with each version in 10).
 
-Dew keeps the recurrent state in fp32, as transformers does. vLLM 0.30.0
+#### The hybrid's bf16 state, 2026-10-07
+
+Dew kept the recurrent state in fp32, as transformers does. vLLM 0.30.0
 keeps it in the model's dtype: for a gated delta net,
 `mamba_ssm_cache_dtype="auto"` means the conv state's dtype, bf16 here
-(`MambaStateDtypeCalculator._mamba_state_dtype`). At 32 slots Dew's state is
-604 MB, read and written each decode step, so 1.2 GB moves against vLLM's
-0.6. At the RTX 4080's bandwidth that is about 0.85 ms of the step, a large
-part of the median token gap: Dew 5.6 ms against vLLM's 3.5. Dew keeps fp32
-anyway. A bf16 state rounds every row's memory at every token, and the
-reference does not.
+(`MambaStateDtypeCalculator._mamba_state_dtype`). At 32 slots Dew's fp32
+state is 604 MB, read and written each decode step, so 1.2 GB moves against
+vLLM's 0.6. At the RTX 4080's bandwidth that is about 0.85 ms of the step,
+a large part of the median token gap: Dew 5.6 ms against vLLM's 3.5.
+
+A bf16 model now holds the state in bf16 too, and the rule still runs in
+fp32: each decode token reads the state, steps it in fp32 and rounds it
+once. The conv state holds the projections' own bf16 values, so it is now
+held in their dtype at no loss. Rounding to nearest broke over long decodes.
+A head whose decay moves the state by less than half a bf16 step per token
+never decays, because every token rounds it back to where it was. So the
+state is rounded stochastically (`delta_rule.round_to_bf16`): up with the
+probability of the dropped bits, with noise hashed from the token's key and
+value.
+
+On a Colab A100, each rounding was compared with the float64 model by the
+RMS error of the log-probabilities at the float64 model's 64 likeliest tokens
+of each position. That error comes mostly from bf16 weights and activations,
+0.059-0.070 with the fp32 state. Decoding 8 wikitext-2 prompts for 1024
+tokens, teacher-forced on the same tokens:
+
+| tokens | fp32 state | bf16, to nearest | bf16, stochastic |
+|---|---:|---:|---:|
+| 0-127 | 0.0587 | 0.0831 (1.42x) | 0.0618 (1.05x) |
+| 256-383 | 0.0649 | 0.3811 (5.87x) | 0.0881 (1.36x) |
+| 512-639 | 0.0681 | 0.5567 (8.17x) | 0.0928 (1.36x) |
+| 896-1023 | 0.0658 | 0.7190 (10.93x) | 0.0978 (1.49x) |
+
+Rounded to nearest, the error grows with every token. Rounded
+stochastically, it stays within 1.05 to 1.49 times the fp32 state's over
+1024 tokens, inside tests/reference_error.py's factor of 2, though it still
+edges up. The error of the next token's log-probability is 0.00381 against
+fp32's 0.00385, and every position's likeliest token is the float64
+model's. That is the cost of the default: 3 of 8 greedy continuations of
+1024 tokens part from the fp32 state's somewhere along them. A model asked
+for more than the default matmul precision keeps an fp32 state, the way
+`matmul_precision` "highest" already keeps the vocabulary head fp32. So a
+run that sets `JAX_DEFAULT_MATMUL_PRECISION=highest`, or allocates its
+cache under `jax.default_matmul_precision("highest")`, decodes as before.
+
+Serving, closed loop with 256-token prompts and 128 output tokens, gave
+these tokens a second:
+
+| device | slots | fp32 state | bf16, to nearest | bf16, stochastic | vLLM 0.30.0 |
+|---|---:|---:|---:|---:|---:|
+| A100 40 GB | 128 | 9838-9883 | 10943-10981 | 10782-10789 | |
+| A100 40 GB | 32 | 6498-6507 | 6819-6830 | | |
+| RTX 4080 | 128 | 5703-5769 | 7253-7254 | | 6527-6618 |
+| RTX 4080 | 32 | 4603 | 4767-4878 | | 4145-4549 |
+
+The A100 rows come from two sessions: 128 slots with three trees alternating
+and two rounds, and 32 slots, with two rounds. The RTX 4080 rows are one process
+each, with the recurrent state alone in bf16 and rounded to nearest. On the
+A100 at 128 slots, stochastic rounding serves 98.4% of the nearest
+rounding's throughput, 9.1-9.7% more than the fp32 state. It is not
+measured on the RTX 4080.
 
 Not adopted: the mixed admitting step for a gated delta net, 2026-10-05.
 A hybrid server keeps two forwards for an admitting step: a prefill
@@ -1997,8 +2049,8 @@ TTFTs and token-gap tails, and a median gap 0.1-0.4 ms longer. At 128
 slots Dew serves 0.85 of vLLM's closed-loop throughput, its TTFTs and
 tails are level or shorter, and its median gap is 3.4-4.9 ms longer. Two
 causes of the 128-slot gap remain. The first, which its bytes account for,
-is the fp32 recurrent state described above, twice vLLM's bytes per drawing
-row. The second, which the trace's per-program costs suggest but no A/B has
+was the fp32 recurrent state, twice vLLM's bytes per drawing row, which the
+bf16 state above has since halved. The second, which the trace's per-program costs suggest but no A/B has
 isolated, is that a step still runs all 128 slots' rows through the
 projections, the MLP, the vocabulary head and the full-attention layers'
 cache reads, while vLLM batches only the rows that are running. To
