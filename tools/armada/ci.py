@@ -70,9 +70,9 @@ MULTIHOST = {"name": "multihost", "gang": 4, "python": "3.12", "tests": "tests/t
 DURATIONS = Path("tests/test_durations.json")
 
 
-def weights(files: list[str], timings: dict, python: str) -> dict[str, float | None]:
-    """Each file's seconds on armada at `python`: its median, a split file's
-    as the sum of its last complete set of groups; else its tests' sum in
+def weights(files: list[str], timings: dict) -> dict[str, float | None]:
+    """Each file's seconds on armada: its median (a split task
+    reports its whole file's, `task`); else its tests' sum in
     tests/test_durations.json, scaled by how much slower armada ran the
     files measured both ways; else None, for a file nothing has timed."""
     recorded: dict[str, float] = {}
@@ -80,16 +80,6 @@ def weights(files: list[str], timings: dict, python: str) -> dict[str, float | N
         for node, seconds in json.loads(DURATIONS.read_text()).items():
             recorded[node.split("::")[0]] = recorded.get(node.split("::")[0], 0.0) + seconds
     measured = dict(timings.get("files", {}))
-    groups: dict[tuple[str, int], dict[int, float]] = {}
-    for name, seconds in timings.get("rows", {}).items():
-        own, _, rest = name.partition(":")
-        file, _, split = rest.partition("#")
-        if own == python and split and split != COLLECT:
-            group, count = (int(part) for part in split.split("/"))
-            groups.setdefault((file, count), {})[group] = seconds
-    for (file, count), seconds in sorted(groups.items()):
-        if len(seconds) == count:
-            measured[file] = sum(seconds.values())
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
@@ -108,7 +98,7 @@ def plan(target: float, timings: dict) -> list[dict]:
     entries = []
     for python in PYTHONS:
         files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
-        timed = weights(files, timings, python)
+        timed = weights(files, timings)
         weighed = {name: target if seconds is None else seconds for name, seconds in timed.items()}
         tasks: list[tuple[list[str], str]] = [
             ([name], "") for name, seconds in timed.items() if seconds is None]
@@ -136,6 +126,24 @@ def plan(target: float, timings: dict) -> list[dict]:
                         "tests": " ".join(names), "split": COLLECT,
                         "rows": [row(PYTHONS[1], name, COLLECT) for name in names], "weight": target})
     return entries
+
+
+def node_of(case: ET.Element) -> str:
+    """A JUnit case's pytest node id, as tests/test_durations.json keys it."""
+    parts = (case.get("classname") or "").split(".")
+    module = next((index for index, part in enumerate(parts) if part.startswith("test_")), len(parts) - 1)
+    return "/".join(parts[:module + 1]) + ".py::" + "::".join([*parts[module + 1:], case.get("name") or ""])
+
+
+def file_share(name: str, cases: list[ET.Element]) -> float | None:
+    """How many times its `cases`' recorded durations the whole file `name`'s are, or None where the
+    durations do not cover them."""
+    if not DURATIONS.is_file():
+        return None
+    recorded = json.loads(DURATIONS.read_text())
+    group = sum(recorded.get(node_of(case), 0.0) for case in cases)
+    whole = sum(seconds for node, seconds in recorded.items() if node.split("::")[0] == name)
+    return whole / group if group > 0 else None
 
 
 def file_of(case: ET.Element) -> str:
@@ -249,9 +257,12 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
         seconds = own_seconds[name] * pace if pace else wall / len(tests)
+        # A group's time scaled by its share of the file's recorded durations: its whole file's, whichever
+        # way the file was split, so armada's median of a file holds across splits.
+        whole = (seconds * share if (share := file_share(name, own)) else None) if split else seconds
         rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
-                     **({} if split else {"timings": {name: seconds}})})
+                     **({} if whole is None else {"timings": {name: whole}})})
     out.write_text(json.dumps({"rows": rows}))
     # A gang's task reports rank 0's rows; another rank says its own red by its exit, which the gang's
     # outcome takes.

@@ -122,7 +122,7 @@
 		"IDLE_SECONDS": "300",
 		"CPU_SECONDS": "900",
 		"IP_WINDOW_SECONDS": "600",
-		"IP_STARTS": "3"
+		"IP_STARTS": "10"
 	},
 	"observability": {
 		"enabled": true

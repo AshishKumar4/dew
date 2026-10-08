@@ -1,7 +1,7 @@
 <div align="center">
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
-  <img src="docs/assets/banner-light.svg" alt="Dew" width="960">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/AshishKumar4/dew/main/docs/assets/banner-dark.svg">
+  <img src="https://raw.githubusercontent.com/AshishKumar4/dew/main/docs/assets/banner-light.svg" alt="Dew" width="960">
 </picture>
 
 # Dew
@@ -9,9 +9,9 @@
 Model training with JAX and Flax
 
 [![CI](https://github.com/AshishKumar4/dew/actions/workflows/ci.yml/badge.svg)](https://github.com/AshishKumar4/dew/actions/workflows/ci.yml)
-[![License: MIT](https://img.shields.io/badge/license-MIT-2aa7a1)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-2aa7a1)](https://github.com/AshishKumar4/dew/blob/main/LICENSE)
 
-[Documentation](docs/index.md) · [Installation](#installation) · [Examples](examples/) · [API reference](docs/reference/core-api.md)
+[Documentation](https://dewml.dev) · [Installation](#installation) · [Examples](https://github.com/AshishKumar4/dew/tree/main/examples) · [API reference](https://github.com/AshishKumar4/dew/blob/main/docs/reference/core-api.md)
 </div>
 
 Dew is a JAX framework for training language models, image and video diffusion models, and JEPA encoders. It comes with common model architectures and training objectives, and one trainer handles optimization, sharding across devices, evaluation and checkpoints for all of them.
@@ -69,7 +69,7 @@ print(builder.data_dir)
 PY
 ```
 
-Here is an abridged [`examples/train_flowers.py`](examples/train_flowers.py). The full file adds command-line options and the sampling step:
+Here is an abridged [`examples/train_flowers.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers.py). The full file adds command-line options and the sampling step:
 
 ```python
 from pathlib import Path
@@ -133,7 +133,7 @@ CUDA_VISIBLE_DEVICES=0 JAX_PLATFORMS=cuda python examples/train_flowers.py \
 
 Use `--steps 20` for a short run, or increase `--steps` to train longer.
 
-[`examples/train_diffusion.py`](examples/train_diffusion.py) adds pretrained CLIP text conditioning, and [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py) runs the same job across a TPU slice and scores the result. For an offline run with no dataset download, [`examples/readme_demo.py`](examples/readme_demo.py) covers language modeling, resuming from a checkpoint, DPO and flow matching.
+[`examples/train_diffusion.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_diffusion.py) adds pretrained CLIP text conditioning, and [`examples/train_flowers_tpu.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers_tpu.py) runs the same job across a TPU slice and scores the result. For an offline run with no dataset download, [`examples/readme_demo.py`](https://github.com/AshishKumar4/dew/blob/main/examples/readme_demo.py) covers language modeling, resuming from a checkpoint, DPO and flow matching.
 
 ### Change the training setup
 
@@ -244,7 +244,7 @@ dtype. State that is not a parameter keeps its declared precision.
 When exported, Kimi K2 keeps its own model type, vocabulary, RoPE settings and
 routing widths. Small fixtures test loading, a `Trainer` update, export, and
 reloading in the reference implementation; their
-[source record](tests/fixtures/hf/kimi-k2-tiny/source.json) pins the released
+[source record](https://github.com/AshishKumar4/dew/blob/main/tests/fixtures/hf/kimi-k2-tiny/source.json) pins the released
 configuration. Kimi K2.5 wraps the same decoder in a vision model. Dew loads and
 trains the text decoder and writes the vision tower and projector tensors back
 byte for byte, but it does not run the vision part.
@@ -265,7 +265,7 @@ trained experts with the library's own rule
 (`dew.interop.codecs.quantize_packed_mxfp4`). The vision tower tensors are
 written back unchanged. A tiny fixture built from the released remote code
 tests parity, an update, export and greedy decoding, and the
-[source record](tests/fixtures/hf/kimi-k3-source/source.json) lists the shape
+[source record](https://github.com/AshishKumar4/dew/blob/main/tests/fixtures/hf/kimi-k3-source/source.json) lists the shape
 of every released tensor.
 
 Kimi Linear (KDA and NoPE MLA layers with DeepSeek's routed experts) computes
@@ -274,7 +274,7 @@ adds the balancing bias to its scores in place, so the routing weights include
 the bias. Dew weights the chosen experts by the unbiased scores, as vLLM and
 K3's revision of the same file do. A tiny fixture from the released code, with
 that line patched, tests parity, an update, export and greedy decoding; the
-[source record](tests/fixtures/hf/kimi-linear-source/source.json) lists the
+[source record](https://github.com/AshishKumar4/dew/blob/main/tests/fixtures/hf/kimi-linear-source/source.json) lists the
 shape of every released tensor.
 
 ### Native multimodal models
@@ -293,7 +293,7 @@ chat template, so template controls such as `reasoning_effort` and
 processor also does the image, video and waveform preprocessing, and Dew
 arranges its outputs row by row. DeepSeek-V4.1 ships without a processor, so
 you build its pixel values and image positions yourself
-([language models](docs/concepts/language_models.md#multimodal-checkpoints)).
+([language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md#multimodal-checkpoints)).
 
 Qwen 3.8 uses the Qwen 3.5 model types. `Qwen/Qwen3.8-27B` loads as a
 `qwen3_5` conditional model with a dense hybrid decoder and image and video
@@ -442,7 +442,7 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-To pack whole documents into the windows instead, set `TokenWindows(pack=True)`. It adds segment IDs and positions, and splits the stream at the EOS ID that `dew tokenize --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+To pack whole documents into the windows instead, set `TokenWindows(pack=True)`. It adds segment IDs and positions, and splits the stream at the EOS ID that `dew tokenize --pack` records. `ChatMessages` reads conversations from a parquet file, a JSONL file or a Hub dataset ID, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
@@ -505,9 +505,9 @@ dpo_state = Trainer(dpo, optax.adam(0.001), key=jax.random.key(2)).fit(
 
 `DPOObjective` keeps the starting policy as a frozen reference and raises the likelihood of the chosen response relative to the rejected one. `PreferencePairs.seq_len` is the width of the whole ID row, and shorter pairs are padded to it. The objective scores one position fewer because of the next-token shift.
 
-`FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](docs/concepts/post_training.md) has a complete example with an image reward.
+`FlowGRPOObjective` applies group-relative rewards to stochastic flow trajectories. `FlowRollout` samples groups of images, computes their rewards, and records the transition densities that the clipped policy objective uses. [FlowGRPO](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) has a complete example with an image reward.
 
-For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](docs/concepts/post_training.md) covers reward callbacks and rollout settings.
+For online reinforcement learning, `SampledRollout` generates groups of responses and calls a reward function on them. `GRPOObjective` then trains on their advantages, old log probabilities and response masks. [`recipes/chain.py`](https://github.com/AshishKumar4/dew/blob/main/recipes/chain.py) connects SFT, DPO, and GRPO stages. The [post-training guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md) covers reward callbacks and rollout settings.
 
 ### Reinforcement learning with a reward function
 
@@ -703,7 +703,7 @@ result = generate(
 print(tokenizer.decode(result.tokens[0], skip_special_tokens=True))
 ```
 
-To train from those weights, pass the bundle in place of the model (`LMObjective(pretrained, seq_len=512)`, or a post-training objective), and tokenize the training data with the checkpoint's own tokenizer. `pretrained.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)` adds a low-rank adapter first, so the objective trains only the adapter's factors ([language models](docs/concepts/language_models.md#pretrained-checkpoints)). [Generating and serving](#generating-and-serving) shows how to sample from and export the result.
+To train from those weights, pass the bundle in place of the model (`LMObjective(pretrained, seq_len=512)`, or a post-training objective), and tokenize the training data with the checkpoint's own tokenizer. `pretrained.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)` adds a low-rank adapter first, so the objective trains only the adapter's factors ([language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md#pretrained-checkpoints)). [Generating and serving](#generating-and-serving) shows how to sample from and export the result.
 
 ### Composing a native decoder
 
@@ -790,7 +790,7 @@ print(objective.model.apply(state.variables, jnp.array([[0.0], [1.0]])))
 
 The predictions approach `1` and `3`. `init` creates the variables, `loss` returns a differentiable scalar, and `Aux` holds metrics and any updates to mutable variables. You can pass a custom objective straight to `Trainer`, and a configuration names it by its import path.
 
-The [objective guide](docs/concepts/objectives.md) also covers BatchNorm state and EMA selection.
+The [objective guide](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/objectives.md) also covers BatchNorm state and EMA selection.
 
 ### Evaluation and checkpoints
 
@@ -798,7 +798,7 @@ Pass `eval_every` and metrics to `fit` to score the validation data, and set `pr
 
 `Checkpoints` saves the training state and the data position with Orbax. To continue a run, rebuild it with the same checkpoint directory. `fit(steps=1200)` is a total: a run restored at step 1000 trains to step 1200, not 2200. The recipe configuration is saved separately; `RunConfig.save` writes it to `run.json`.
 
-See [checkpointing and resume](docs/guides/checkpoints.md) for restore requirements, local checkpoints, and current recovery limitations.
+See [checkpointing and resume](https://github.com/AshishKumar4/dew/blob/main/docs/guides/checkpoints.md) for restore requirements, local checkpoints, and current recovery limitations.
 
 Which call continues a run depends on the artifact you kept:
 
@@ -814,7 +814,7 @@ Which call continues a run depends on the artifact you kept:
 `Pretrained.save` writes the weights, the config it derives, and the
 tokenizer or processor files. It does not include optimizer state or data
 position, so keep the native checkpoint if you want to resume training.
-[`examples/sft_gemma4.py`](examples/sft_gemma4.py) trains a run and exports
+[`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py) trains a run and exports
 it with `PretrainedDecoder.from_run(...).save(...)`, the last row of the table.
 
 To reproduce a run bit for bit on CUDA you need deterministic GPU reductions.
@@ -883,7 +883,7 @@ with LocalTracker("runs/lm-report", plots=True) as tracker:
     print(result.scores)
 ```
 
-This run reports a perplexity of about 1.002 and saves the training-loss curve, the scalar journal and the generated text under `runs/lm-report`. The tracker draws the plots once, when it closes. Use `plots=False` to record only scalars and artifacts, or call `tracker.plot()` yourself. [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
+This run reports a perplexity of about 1.002 and saves the training-loss curve, the scalar journal and the generated text under `runs/lm-report`. The tracker draws the plots once, when it closes. Use `plots=False` to record only scalars and artifacts, or call `tracker.plot()` yourself. [`examples/evaluate_and_serve.py`](https://github.com/AshishKumar4/dew/blob/main/examples/evaluate_and_serve.py) scores a finished run the same way and adds an lm-eval-harness suite, image metrics, and a served-model comparison.
 
 `Trackers` sends the same reports to several backends. To switch backends, change the constructor. Install `dewml[wandb]`, `dewml[mlflow]` or `dewml[tensorboard]` for the backend you want:
 
@@ -976,7 +976,7 @@ A `Process` combines a noise schedule, a prediction transform and a loss weighti
 
 Training and sampling can use different schedules; EDM, for example, trains on a log-normal distribution of noise levels and samples on a Karras grid. `sample` runs the solver under `jax.lax.scan`, and you can change the solver without retraining. `MultiStepDPM` integrates in sigma space and keeps the previous denoiser outputs to raise the order of each step.
 
-`TextToImage` runs text encoding, denoising and, for latent models, decoding. See [diffusion](docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
+`TextToImage` runs text encoding, denoising and, for latent models, decoding. See [diffusion](https://github.com/AshishKumar4/dew/blob/main/docs/guides/diffusion.md) for text conditioning, latent models, and sampling.
 
 For SD and SDXL checkpoints, `dew.pipeline(source)` rebuilds the source's own
 scheduler rather than choosing a solver by name. It supports the source's
@@ -1248,11 +1248,11 @@ Compute dtypes are configurable, and the attention kernel depends on the hardwar
 
 Set `remat` on a decoder to a policy name such as `"full"`, `"minimal"` or `"save_qkv_proj"` to recompute block activations in the backward pass. A policy such as `"save_qkv_proj"` keeps the projections it names. Offloaded policies such as `"minimal_offloaded"` keep those residuals in pinned host memory, and `Layout(host=("opt_state", "ema"))` keeps the optimizer state and the EMA copy there between steps. Both save device memory at the cost of extra compute or transfers, and both work with layer scanning.
 
-Start with [distributed training](docs/concepts/distributed.md) and the [TPU guide](docs/tpu.md). [Benchmarks](docs/benchmarks.md) and [performance notes](docs/performance.md) record workload sizes, hardware, memory, and timing.
+Start with [distributed training](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/distributed.md) and the [TPU guide](https://github.com/AshishKumar4/dew/blob/main/docs/tpu.md). [Benchmarks](https://github.com/AshishKumar4/dew/blob/main/docs/benchmarks.md) and [performance notes](https://github.com/AshishKumar4/dew/blob/main/docs/performance.md) record workload sizes, hardware, memory, and timing.
 
 ### Multiple hosts
 
-Every host runs the same script. The example below uses two hosts with two GPUs each and shards the model state over all four devices. Both hosts must see the same token files and checkpoint directory. [Training on several nodes](docs/guides/multi-node.md) covers Slurm, hybrid sharding and long sequences.
+Every host runs the same script. The example below uses two hosts with two GPUs each and shards the model state over all four devices. Both hosts must see the same token files and checkpoint directory. [Training on several nodes](https://github.com/AshishKumar4/dew/blob/main/docs/guides/multi-node.md) covers Slurm, hybrid sharding and long sequences.
 
 Prepare byte-token data from your corpus and place it on shared storage:
 
@@ -1329,7 +1329,7 @@ dew launch --hosts 10.0.0.1,10.0.0.2 \
     -- /opt/dew/.venv/bin/python train_multihost.py
 ```
 
-`batch=16` is the global batch, so each process reads four rows. Without `--hosts`, the same command runs on this machine's GPUs. Inside a Slurm allocation it starts `srun`, and with `--tpu NAME` it runs on every worker of a Cloud TPU. [Training on several nodes](docs/guides/multi-node.md) covers each case. To rehearse the launch on a machine without GPUs, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories. Two processes with two simulated devices each make up the same `MeshSpec(fsdp=4)`, and each process prints `20 updates`.
+`batch=16` is the global batch, so each process reads four rows. Without `--hosts`, the same command runs on this machine's GPUs. Inside a Slurm allocation it starts `srun`, and with `--tpu NAME` it runs on every worker of a Cloud TPU. [Training on several nodes](https://github.com/AshishKumar4/dew/blob/main/docs/guides/multi-node.md) covers each case. To rehearse the launch on a machine without GPUs, run `dew launch --processes-per-host 2 --env JAX_PLATFORMS=cpu --env XLA_FLAGS=--xla_force_host_platform_device_count=2 --env DEW_STEPS=20 ...` with local directories. Two processes with two simulated devices each make up the same `MeshSpec(fsdp=4)`, and each process prints `20 updates`.
 
 ### Generating text with Gemma 4 on one GPU
 
@@ -1392,7 +1392,7 @@ if __name__ == "__main__":
     main()
 ```
 
-`MeshSpec(fsdp=jax.device_count())` shards eligible weights over the slice; small leaves, and leaves that don't divide evenly, may stay replicated. On Cloud TPU, `jax.distributed.initialize()` can find the coordinator by itself. On a cluster you manage yourself, pass the coordinator address, process count and process ID, as in the training example. Authenticate each worker through its environment or credential store, and keep tokens out of launch arguments. Save the script on every worker, then preview the launch on every worker (see [Cloud TPUs](docs/tpu.md)):
+`MeshSpec(fsdp=jax.device_count())` shards eligible weights over the slice; small leaves, and leaves that don't divide evenly, may stay replicated. On Cloud TPU, `jax.distributed.initialize()` can find the coordinator by itself. On a cluster you manage yourself, pass the coordinator address, process count and process ID, as in the training example. Authenticate each worker through its environment or credential store, and keep tokens out of launch arguments. Save the script on every worker, then preview the launch on every worker (see [Cloud TPUs](https://github.com/AshishKumar4/dew/blob/main/docs/tpu.md)):
 
 ```bash
 dew launch --tpu dew-16 --zone us-central2-b --dry-run \
@@ -1405,7 +1405,7 @@ Each worker needs access to the checkpoint and tokenizer files. A shared downloa
 
 Dew's dataset specifications build batches with Grain. The token loaders read fixed windows or packed documents, and the chat, preference and prompt loaders read post-training data. Image and video data can come from local files, Hugging Face datasets, TFDS, ArrayRecord shards or URL streams.
 
-`Loading` sets the number of workers, read threads and buffers. `Dataset` also accepts your own iterator factories, as in the fine-tuning examples above. [Data loading](docs/concepts/data.md) covers transforms, deterministic randomness, batching and who owns the iterators.
+`Loading` sets the number of workers, read threads and buffers. `Dataset` also accepts your own iterator factories, as in the fine-tuning examples above. [Data loading](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/data.md) covers transforms, deterministic randomness, batching and who owns the iterators.
 
 The recipes turn dataclass configurations into command-line options with tyro. `ModelConfig`, `OptimConfig` and `TrainerConfig` hold the model, optimizer and run settings, and task-specific configurations add diffusion or language-model options. `--help` lists the options:
 
@@ -1415,57 +1415,57 @@ python recipes/diffusion/train.py --help
 python recipes/jepa/train.py --help
 ```
 
-The [recipe guide](docs/recipes.md) walks through preparing a text corpus and training on it.
+The [recipe guide](https://github.com/AshishKumar4/dew/blob/main/docs/recipes.md) walks through preparing a text corpus and training on it.
 
 ## Installation
 
-I recommend Python 3.14. Dew requires Python 3.12 or later, and CI tests both versions. Install from the repository with [uv](https://docs.astral.sh/uv/getting-started/installation/):
+I recommend Python 3.14. Dew requires Python 3.12 or later, and CI tests both versions. Install the release from PyPI with [uv](https://docs.astral.sh/uv/getting-started/installation/), with the extra for your hardware. Each extra installs the accelerator build of the JAX version Dew requires:
+
+| Hardware | Install |
+|---|---|
+| CPU | `uv pip install dewml` |
+| NVIDIA GPU | `uv pip install "dewml[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
+| Google TPU | `uv pip install "dewml[tpu]"` |
+
+To work on Dew itself, install it from a clone instead:
 
 ```bash
 git clone https://github.com/AshishKumar4/dew.git
 cd dew
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install -e .
+uv pip install -e ".[cuda12]"
 ```
 
-Then add the extra for your hardware. Each one installs the accelerator build of the JAX version Dew requires:
+To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#process-pools-across-gpus) explains how to install it. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
 
-| Hardware | Install |
-|---|---|
-| CPU | `uv pip install -e .` |
-| NVIDIA GPU | `uv pip install -e ".[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
-| Google TPU | `uv pip install -e ".[tpu]"` |
-
-To install from the repository without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](docs/installation.md#process-pools-across-gpus) explains how to install it. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
-
-The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `plots`, `profile`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision` and `wandb`. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](docs/installation.md) covers development dependencies and dataset preparation.
+The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `mutation`, `plots`, `profile`, `quantization`, `serve`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision`, `wan` and `wandb`. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
 
 ## Documentation and examples
 
-- [Getting started](docs/getting-started.md): training a custom model.
-- [Custom objectives](docs/concepts/objectives.md): loss functions and mutable model state.
-- [Language models](docs/concepts/language_models.md): tokens, checkpoints, and generation.
-- [Post-training](docs/concepts/post_training.md): SFT, DPO, GRPO, and rewards.
-- [Diffusion](docs/guides/diffusion.md): image, video, conditioning, and latents.
-- [Representation learning](docs/guides/representation-learning.md): JEPA encoders and predictors.
-- [API reference](docs/reference/core-api.md): constructors, arguments, and state contracts.
-- [Examples](examples/) and [recipes](docs/recipes.md): complete programs to adapt.
+- [Getting started](https://github.com/AshishKumar4/dew/blob/main/docs/getting-started.md): training a custom model.
+- [Custom objectives](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/objectives.md): loss functions and mutable model state.
+- [Language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md): tokens, checkpoints, and generation.
+- [Post-training](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/post_training.md): SFT, DPO, GRPO, and rewards.
+- [Diffusion](https://github.com/AshishKumar4/dew/blob/main/docs/guides/diffusion.md): image, video, conditioning, and latents.
+- [Representation learning](https://github.com/AshishKumar4/dew/blob/main/docs/guides/representation-learning.md): JEPA encoders and predictors.
+- [API reference](https://github.com/AshishKumar4/dew/blob/main/docs/reference/core-api.md): constructors, arguments, and state contracts.
+- [Examples](https://github.com/AshishKumar4/dew/tree/main/examples) and [recipes](https://github.com/AshishKumar4/dew/blob/main/docs/recipes.md): complete programs to adapt.
 
-Each of the five scripts below runs a whole job, from data to scored weights. By default they use settings for real hardware; `--smoke` swaps those for the repository's tiny fixtures, a few steps and one CPU device. [End-to-end examples](docs/guides/end-to-end.md) gives both command lines for each.
+Each of the five scripts below runs a whole job, from data to scored weights. By default they use settings for real hardware; `--smoke` swaps those for the repository's tiny fixtures, a few steps and one CPU device. [End-to-end examples](https://github.com/AshishKumar4/dew/blob/main/docs/guides/end-to-end.md) gives both command lines for each.
 
-- [`examples/train_flowers_tpu.py`](examples/train_flowers_tpu.py): a text-to-image DiT trained on Oxford Flowers across a TPU slice, then sampled and scored with FID and CLIPScore.
-- [`examples/sft_diffusion_gemma.py`](examples/sft_diffusion_gemma.py): LoRA SFT of DiffusionGemma with the base weights held in host memory, publishing a PEFT adapter directory.
-- [`examples/sft_gemma4.py`](examples/sft_gemma4.py): full-weight SFT of a Gemma 4 decoder on a Hub chat dataset, exported to the Hugging Face layout.
-- [`examples/train_rlvr.py`](examples/train_rlvr.py): GRPO with verifiable rewards, where each completion is a program run against hidden tests in a sandbox fleet, and rollouts come from Dew's own server or a vLLM or SGLang server one update ahead of training.
-- [`examples/evaluate_and_serve.py`](examples/evaluate_and_serve.py): perplexity, an lm-eval-harness suite, image metrics, and a served-model comparison over one finished run.
+- [`examples/train_flowers_tpu.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_flowers_tpu.py): a text-to-image DiT trained on Oxford Flowers across a TPU slice, then sampled and scored with FID and CLIPScore.
+- [`examples/sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py): LoRA SFT of DiffusionGemma with the base weights held in host memory, publishing a PEFT adapter directory.
+- [`examples/sft_gemma4.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_gemma4.py): full-weight SFT of a Gemma 4 decoder on a Hub chat dataset, exported to the Hugging Face layout.
+- [`examples/train_rlvr.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_rlvr.py): GRPO with verifiable rewards, where each completion is a program run against hidden tests in a sandbox fleet, and rollouts come from Dew's own server or a vLLM or SGLang server one update ahead of training.
+- [`examples/evaluate_and_serve.py`](https://github.com/AshishKumar4/dew/blob/main/examples/evaluate_and_serve.py): perplexity, an lm-eval-harness suite, image metrics, and a served-model comparison over one finished run.
 
 ## Contributing and acknowledgements
 
-Questions, bug reports, and contributions are welcome. Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting changes. For numerical issues, include the model configuration, dependency versions, dtype, hardware, and a small reproduction.
+Questions, bug reports, and contributions are welcome. Read [CONTRIBUTING.md](https://github.com/AshishKumar4/dew/blob/main/CONTRIBUTING.md) before submitting changes. For numerical issues, include the model configuration, dependency versions, dtype, hardware, and a small reproduction.
 
 Dew grew out of [FlaxDiff](https://github.com/AshishKumar4/FlaxDiff). This project is partially supported by [Google TPU Research Cloud](https://sites.research.google/trc/about/). I would like to thank the Google Cloud TPU team for providing resources for the larger text-conditional experiments.
 
-Dew builds on JAX, Flax, Optax, Grain, Orbax, tyro, and Weights & Biases. [References and attribution](docs/references.md) lists the papers and upstream implementations used by its models and algorithms.
+Dew builds on JAX, Flax, Optax, Grain, Orbax, tyro, and Weights & Biases. [References and attribution](https://github.com/AshishKumar4/dew/blob/main/docs/references.md) lists the papers and upstream implementations used by its models and algorithms.
 
-Dew is licensed under [MIT](LICENSE). Adapted components, model weights, and datasets retain their applicable notices and licenses. If you use Dew in research, cite the repository and the papers for the models and methods you use.
+Dew is licensed under [MIT](https://github.com/AshishKumar4/dew/blob/main/LICENSE). Adapted components, model weights, and datasets retain their applicable notices and licenses. If you use Dew in research, cite the repository and the papers for the models and methods you use.

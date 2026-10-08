@@ -15,7 +15,7 @@ from dew import records
 from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
-from dew.nn.text_encoders import CLIPEncoderLayer, _encoder_layer_path
+from dew.nn.text_encoders import _encoder_layer_path, clip_layer
 from dew.objectives.base import Variables
 from dew.registry import Record
 
@@ -52,10 +52,9 @@ class SiglipVisionTransformer(nn.Module):
         self.position_embedding = nn.Embed(patches, cfg.hidden_size,
                                            dtype=self.dtype, name="position_embedding")
         self.layers = [
-            CLIPEncoderLayer(
-                cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, causal=False,
-                layer_norm_eps=cfg.layer_norm_eps, dtype=self.dtype, precision=self.precision,
-                activation=cfg.hidden_act, name=f"layers_{index}")
+            clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, patches,
+                       activation=cfg.hidden_act, eps=cfg.layer_norm_eps, dtype=self.dtype,
+                       precision=self.precision, name=f"layers_{index}")
             for index in range(cfg.num_layers)]
         self.post_layernorm = LayerNorm(
             epsilon=cfg.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
@@ -175,9 +174,7 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """
     if hf_name == "embeddings.position_ids" or hf_name.split(".")[0] == "head":
         return None
-    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(
-        hf_name.split("."), "encoder", ("layer_norm1", "layer_norm2"),
-        ("q_proj", "k_proj", "v_proj", "out_proj"))
+    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(hf_name.split("."), "encoder")
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

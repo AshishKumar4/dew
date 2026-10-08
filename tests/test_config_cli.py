@@ -71,7 +71,7 @@ def test_a_run_config_round_trips_through_its_json_record(name):
     cls = {"diffusion": DiffusionRunConfig, "lm": LMRunConfig, "jepa": JepaRunConfig}[name]
     args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6",
                           "--objective.unconditional-prob", "0.2"],
-            "lm": ["--data.path", "d", "--sample-tokens", "4", "--objective.ema-decay", "0.9"],
+            "lm": ["--data.path", "d", "--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
             "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
     config = parse(cls, [*args, "--trainer.steps", "5"])
 

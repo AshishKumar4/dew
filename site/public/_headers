@@ -3,6 +3,11 @@
   Referrer-Policy: strict-origin-when-cross-origin
   X-Frame-Options: DENY
 
+# The live sampler is also the demo on the model's Hugging Face page (deploy/space).
+/sample/
+  ! X-Frame-Options
+  Content-Security-Policy: frame-ancestors https://huggingface.co https://*.hf.space
+
 /_astro/*
   Cache-Control: public, max-age=31536000, immutable
 

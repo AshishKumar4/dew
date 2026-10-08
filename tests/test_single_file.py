@@ -110,16 +110,16 @@ def test_another_diffusers_converts_again(
 
 def test_a_failed_load_caches_nothing(tmp_path: Path, cache: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     repo = _repo(tmp_path, "sd")
-    load = pretrained._load_diffusion_source
+    load = pretrained.assemble_pipeline
 
     def interrupted(*args: object, **kwargs: object) -> None:
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(pretrained, "_load_diffusion_source", interrupted)
+    monkeypatch.setattr(pretrained, "assemble_pipeline", interrupted)
     with pytest.raises(KeyboardInterrupt):
         _load(repo, "sd")
     assert list(cache.iterdir()) == []
-    monkeypatch.setattr(pretrained, "_load_diffusion_source", load)
+    monkeypatch.setattr(pretrained, "assemble_pipeline", load)
     _load(repo, "sd")
     assert [entry.name.startswith(".") for entry in cache.iterdir()] == [False]
 

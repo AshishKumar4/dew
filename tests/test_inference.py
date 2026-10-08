@@ -30,7 +30,7 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-from dew.sampling import CFG, Euler, Heun, TextToImage
+from dew.sampling import APG, CFG, CFGPlusPlus, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
@@ -62,13 +62,13 @@ _DEFAULT_MAKE_RUN_PRESET = EDM()
 
 
 def make_run(
-    directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder=STUB_TEXT, checkpoint="stub-clip", steps=2
+    directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder=STUB_TEXT, checkpoint="stub-clip", steps=2, **stated
 ):
     """`steps` training steps of the tiny conditional DiT, its checkpoint and
     its `run.json` in `directory`, as the recipe leaves them: the objective is
-    the config's own build. A directory that already holds the run resumes
-    it to `steps`."""
-    config = run_config(directory, preset, encoder, checkpoint)
+    the config's own build, stating `stated` beside its own fields. A
+    directory that already holds the run resumes it to `steps`."""
+    config = stating(run_config(directory, preset, encoder, checkpoint), **stated)
     objective = config.build()
     encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
@@ -100,6 +100,31 @@ def make_run(
     checkpoints.wait()
     config.save(str(directory))
     return objective, state
+
+
+@pytest.mark.parametrize("guidance", [CFG(4.0, interval=(0.1, 0.9)), CFGPlusPlus(0.6, interval=(0.2, 1.0)),
+                                      APG(5.0, eta=0.5, norm_threshold=2.0, momentum=-0.5), None],
+                         ids=["cfg", "cfg++", "apg", "none"])
+def test_a_run_reloads_the_guidance_it_evaluated_with(tmp_path, guidance):
+    """The checkpoint records its guidance by class, so the task a run
+    reloads guides as its evaluation did, whichever kind, or not at all."""
+    objective, _ = make_run(tmp_path, guidance=guidance)
+    assert objective.guidance == guidance
+    assert TextToImage.from_run(str(tmp_path)).guidance == guidance
+
+
+def test_a_guidance_from_outside_dew_reloads_when_its_package_is_trusted(tmp_path, monkeypatch):
+    from diffusion_stubs import OutsideGuidance
+
+    import dew.registry as registry
+
+    untrusted = set(registry._TRUSTED)
+    monkeypatch.setattr(registry, "_TRUSTED", untrusted | {"diffusion_stubs"})
+    make_run(tmp_path, guidance=OutsideGuidance(3.0))
+    monkeypatch.setattr(registry, "_TRUSTED", set(untrusted))
+    with pytest.raises(ValueError, match=r"trust=\('diffusion_stubs',\)"):
+        TextToImage.from_run(str(tmp_path))
+    assert TextToImage.from_run(str(tmp_path), trust=("diffusion_stubs",)).guidance == OutsideGuidance(3.0)
 
 
 def test_pipeline_generates_from_a_run_directory(tmp_path):
@@ -426,7 +451,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
         "objective": "lm", "model": dataclasses.asdict(model_config), "tokenizer": "byte",
-        "sample_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
+        "max_new_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
         "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
 
@@ -500,6 +525,60 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         task("the ", seed=2)
     with pytest.raises(ValueError, match="max_new_tokens is required"):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
+
+
+def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
+    """A Hub repository holding a run, as `HfApi().upload_folder` publishes
+    it, loads as that run: pulled whole at the commit its metadata resolved
+    (the name of the snapshot directory), with checkpoints selected by step."""
+    import huggingface_hub
+
+    import dew.interop.hub as hub
+    from dew.sampling import Sampling
+
+    snapshot = tmp_path / "3f2a9c"
+    make_lm_run(snapshot)
+    resolved, pulled = [], []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo_id, revision, allow_patterns: resolved.append(revision) or snapshot)
+    monkeypatch.setattr(hub, "snapshot_download",
+                        lambda repo_id, revision: pulled.append(revision) or snapshot)
+    task = dew.pipeline("user/byte-lm", revision="main", step=2)
+    assert isinstance(task, TextGeneration)
+    assert (resolved, pulled) == (["main"], ["3f2a9c"])
+    greedy = Sampling(temperature=0, eos_id=255)
+    local = dew.pipeline(str(snapshot), step=2)
+    np.testing.assert_array_equal(task("the ", key=2, sampling=greedy).host().tokens,
+                                  local("the ", key=2, sampling=greedy).host().tokens)
+
+
+def test_a_run_loads_one_step_whole_while_a_later_step_is_saved(tmp_path, monkeypatch):
+    """A step committed after the latest declaration is read, before the
+    weights are, does not move the load: the task holds the declared step's
+    weights, not the new step's."""
+    _, state = make_lm_run(tmp_path)
+    moved = jax.tree.map(lambda leaf: leaf + 1 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, state)
+    read = Checkpoints.artifact
+    saved = []
+
+    def read_then_save(self, step=None):
+        record = read(self, step)
+        if not saved:
+            saved.append(step)
+            writer = Checkpoints(str(tmp_path), keep=2)
+            writer.save(4, moved, None, artifact=record)
+            writer.wait()
+        return record
+
+    monkeypatch.setattr(Checkpoints, "artifact", read_then_save)
+    task = dew.pipeline(str(tmp_path))
+    monkeypatch.setattr(Checkpoints, "artifact", read)
+    assert Checkpoints(str(tmp_path)).latest == 4
+    for name, step in (("declared", 2), ("later", 4)):
+        pinned = dew.pipeline(str(tmp_path), step=step)
+        same = all(np.array_equal(loaded, expected) for loaded, expected in zip(
+            jax.tree.leaves(task.variables), jax.tree.leaves(pinned.variables), strict=True))
+        assert same == (name == "declared"), name
 
 
 def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
@@ -773,7 +852,7 @@ def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
     policy = Sampling(temperature=0.37, top_k=3, eos_id=255)
     checkpoints = Checkpoints(str(tmp_path / "unbudgeted"))
     checkpoints.save(int(state.step), state, None, artifact={
-        **objective.inference_record(), "sample_tokens": 0, "sampling": dataclasses.asdict(policy)})
+        **objective.inference_record(), "max_new_tokens": 0, "sampling": dataclasses.asdict(policy)})
     checkpoints.wait()
     task = dew.pipeline(str(tmp_path / "unbudgeted"))
     assert task.max_new_tokens is None

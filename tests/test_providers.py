@@ -548,6 +548,28 @@ def test_a_streamed_validation_pass_is_ordered_whatever_the_tuning(
         passed.close()
 
 
+@pytest.mark.parametrize("batch", [5, 30])
+def test_a_streamed_pass_scores_its_last_rows_and_marks_what_fills_their_batch(jsonl, batch):
+    """24 rows at batch 5 end in four rows and one repeat; at batch 30, one
+    batch of all 24 and six repeats. Every row is read once as a real row,
+    every batch is whole, and `VALID_ROWS` marks the repeats."""
+    from dew.objectives.base import VALID_ROWS
+
+    data = dew.data.load("hf/json", batch=batch, split="train", val_split="train", streaming=True,
+                         preprocess=just_index, options=HFOptions(data_files=jsonl), **READ)
+    assert data.val is not None
+    passed = data.val(DataPartition())
+    try:
+        batches = list(passed)
+    finally:
+        passed.close()
+    assert {len(read["index"]) for read in batches} == {batch}
+    real = [int(index) for read in batches
+            for index, kept in zip(read["index"], read.get(VALID_ROWS, np.ones(batch, bool)), strict=True)
+            if kept]
+    assert real == list(range(ROWS))
+
+
 def test_a_streamed_pass_ends_and_a_bounded_one_ends_sooner(jsonl):
     data = dew.data.load("hf/json", batch=4, split="train", val_split="train",
                          val_batches=2, streaming=True, preprocess=just_index,

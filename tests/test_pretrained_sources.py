@@ -19,7 +19,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 
-from dew.interop import codecs, hf_decoders, pretrained, sources
+from dew.interop import codecs, decoder_parts, hf_decoders, pretrained, sources
 
 safetensors_numpy = pytest.importorskip("safetensors.numpy")
 
@@ -102,8 +102,10 @@ def test_a_pipeline_downloads_only_the_component_files_it_reads(hub, monkeypatch
     OpenVINO copy, and no folder model_index.json does not declare
     (SDXL's vae_1_0): the non-variant weights of each declared component."""
     fake = hub(name)
-    monkeypatch.setattr(pretrained, "_load_diffusion_source", lambda directory, index, **kwargs:
-                        pretrained.Pretrained(None, {}, None, index, directory, {}))
+    monkeypatch.setattr(pretrained, "assemble_pipeline", lambda directory, index, **kwargs: {
+        "model": None, "variables": {}, "config": index, "source": directory, "model_config": {},
+        "weight_layouts": (), "process": None, "inputs": None, "autoencoder": None, "schedule": None,
+        "finish": None, "task": None})
 
     loaded = pretrained.Pretrained.load(repo)
 
@@ -326,7 +328,7 @@ def test_a_config_whose_extra_fields_the_reference_ignores_translates(name, iner
     hf_decoders.translate_config(config)
 
     assert inert <= set(config)
-    assert hf_decoders._inert(config["model_type"], config) == inert
+    assert decoder_parts._inert(config["model_type"], config) == inert
 
 
 def test_mamba2s_open_time_step_bound_reads_as_infinity():
@@ -366,7 +368,7 @@ def test_every_inert_field_is_one_the_reference_config_class_does_not_declare():
         return {name for klass in cls.__mro__ for name in getattr(klass, "__annotations__", {})}
 
     assert {"expand", "time_step_limit"} <= declared(CONFIG_MAPPING["mamba2"])
-    for model_type, fields in hf_decoders._INERT_FIELDS.items():
+    for model_type, fields in decoder_parts._INERT_FIELDS.items():
         cls = transformers.PreTrainedConfig if model_type is None else CONFIG_MAPPING[model_type]
         assert not set(fields) & declared(cls), (model_type, set(fields) & declared(cls))
 

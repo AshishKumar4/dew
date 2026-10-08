@@ -14,7 +14,6 @@ import math
 import os
 import re
 import secrets
-import tempfile
 from collections.abc import Callable, Collection, Iterator, Mapping
 from pathlib import Path
 
@@ -22,6 +21,7 @@ import jax
 import ml_dtypes
 import numpy as np
 
+from dew.files import replacing, write_atomically
 from dew.interop.weights import ParamTree, insert
 from dew.records import JSON
 
@@ -103,22 +103,14 @@ def _publish(
     or replacement leaves the old file intact and removes the temporary.
     """
     _, backend = _safetensors()
-    destination = Path(path)
-    descriptor, temporary = tempfile.mkstemp(
-        dir=destination.parent, prefix=".dew-weights-", suffix=".safetensors"
-    )
-    try:
-        os.close(descriptor)
+    with replacing(path) as temporary:
         backend.save_file(
             {name: _host_array(array) for name, array in tensors().items()},
-            temporary,
+            os.fspath(temporary),
             metadata=None if metadata is None else dict(metadata),
         )
         if metadata is not None and len(metadata) > 1:
-            _sort_metadata(temporary)
-        os.replace(temporary, destination)
-    finally:
-        Path(temporary).unlink(missing_ok=True)
+            _sort_metadata(os.fspath(temporary))
 
 
 def _sort_metadata(path: str) -> None:
@@ -169,13 +161,13 @@ def _host_array(leaf) -> np.ndarray:
     return array if array.flags.c_contiguous else np.ascontiguousarray(array)
 
 
-def _flatten(params) -> dict[str, np.ndarray]:
+def flatten(params) -> dict[str, np.ndarray]:
     """The leaves under their '/'-joined names; `_publish` brings each to the host."""
     leaves, _ = jax.tree_util.tree_flatten_with_path(params)
     return {_leaf_name(path): leaf for path, leaf in leaves}
 
 
-def _unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
+def unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
     tree: ParamTree = {}
     for name, tensor in tensors.items():
         insert(tree, tuple(name.split(SEPARATOR)), tensor, name)
@@ -184,7 +176,7 @@ def _unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
 
 def save_params(params, path) -> None:
     """Write a parameter tree to a safetensors file, one tensor per leaf."""
-    _publish(lambda: _flatten(params), path)
+    _publish(lambda: flatten(params), path)
 
 
 def load_params(path) -> ParamTree:
@@ -194,7 +186,7 @@ def load_params(path) -> ParamTree:
     is placed on a device until the caller asks for it.
     """
     tensors, _ = read_file(path)
-    return _unflatten(tensors)
+    return unflatten(tensors)
 
 
 WEIGHT_STEMS = ("diffusion_pytorch_model", "model")
@@ -351,11 +343,9 @@ class LazyTensors(Mapping[str, np.ndarray]):
 
 def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int | None = None) -> None:
     """Publish `model.safetensors.index.json` naming each tensor's shard file."""
-    index = directory / INDEX_FILE
-    temporary = index.with_name(f".{index.name}.tmp")
     metadata = {} if total_size is None else {"total_size": total_size}
-    temporary.write_text(json.dumps({"metadata": metadata, "weight_map": dict(weight_map)}, indent=2))
-    os.replace(temporary, index)
+    write_atomically(directory / INDEX_FILE,
+                     json.dumps({"metadata": metadata, "weight_map": dict(weight_map)}, indent=2))
 
 
 _REPLACED = re.compile(r"model\.safetensors|model-(?:[0-9a-f]{8}-)?\d{5}-of-\d{5}\.safetensors")
@@ -438,7 +428,7 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     os.makedirs(directory, exist_ok=True)
     if not isinstance(params, LazyTensors):
         # Leaves stay where they are; `save_sharded` brings one shard at a time to the host.
-        params = _flatten(params)
+        params = flatten(params)
     save_sharded(params, directory, max_shard_size)
     with open(os.path.join(directory, CONFIG_FILE), "w") as handle:
         json.dump(config, handle, indent=2)

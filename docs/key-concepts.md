@@ -93,6 +93,7 @@ A model defined where no import path reaches it, in `__main__` or inside a funct
 
 A model written in Flax NNX trains through Flax's own bridge, `flax.nnx.bridge.ToLinen`, which turns an NNX module into a Linen one with its parameters, its other state (a `BatchNorm`'s `batch_stats`) and its random streams (the `dropout` stream an objective passes to `apply`). The bridge runs the module's `__call__`, which is all `DiffusionObjective` calls on a denoiser: `bridge.ToLinen(MyDenoiser, args=(channels,))` is the model. An objective that reads another method, such as `hidden_states` and `logits` for `LMObjective`, needs a Linen class that names it, a few lines of your own:
 
+<!-- not run: a fragment; MyNNXLanguageModel and vocab_size are your NNX model's -->
 ```python
 from flax.nnx import bridge
 

@@ -234,9 +234,9 @@ def test_klein_pipeline_walk_matches_the_source(klein, arrays, record):
 def test_a_step_distilled_klein_samples_unguided(source):
     """The published [klein] marks itself step-distilled, and its call then
     ignores its guidance scale."""
-    from dew.interop.pretrained import _call_policy, _denoiser
+    from dew.interop.pipeline_assembly import _call_policy, pipeline_denoiser
 
-    denoiser = _denoiser(source / "pipeline", dtype="float32", attention_impl="xla")
+    denoiser = pipeline_denoiser(source / "pipeline", dtype="float32", attention_impl="xla")
     index = json.loads((source / "pipeline" / "model_index.json").read_text())
     assert _call_policy(index, denoiser).guided
     assert not _call_policy({**index, "is_distilled": True}, denoiser).guided
@@ -258,7 +258,7 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, arrays, record):
     on the right, the hidden states after layers 10, 20 and 30 stacked, and
     the guidance [dev] embeds. The vision tower is carried, not run, and
     exports as it came."""
-    from dew.interop.pretrained import _hidden_states_conditioning
+    from dew.interop.pipeline_assembly import _hidden_states_conditioning
 
     directory = source / "mistral3"
     encoder, layouts, _ = _hidden_states_conditioning(

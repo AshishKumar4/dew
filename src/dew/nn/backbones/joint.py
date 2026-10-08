@@ -10,47 +10,17 @@ family's own module keeps what only that family does.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
-
-
-def rotary_table(positions: np.ndarray, axes: Sequence[int], *, theta: float = 10000.0,
-                 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return `FluxPosEmbed`'s cosines and sines for the ids in `positions`.
-
-    There is one angle per channel pair, per axis.
-
-    The source computes its frequencies and their cosines in float64 from a
-    static id grid, so this function does the same computation on the host.
-    The two channels that share an angle are adjacent, not half a width apart.
-    """
-    cosines, sines = [], []
-    for index, dim in enumerate(axes):
-        frequencies = 1.0 / (theta ** (np.arange(0, dim, 2, dtype=np.float64)[: dim // 2] / dim))
-        angles = np.outer(positions[:, index].astype(np.float64), frequencies)
-        cosines.append(np.repeat(np.cos(angles), 2, axis=1))
-        sines.append(np.repeat(np.sin(angles), 2, axis=1))
-    return (np.concatenate(cosines, axis=1).astype(np.float32),
-            np.concatenate(sines, axis=1).astype(np.float32))
-
-
-def apply_rotary(x: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
-    """Apply the rotation that `apply_rotary_emb` applies with `use_real_unbind_dim=-1`.
-
-    Adjacent channels form one complex pair, so the rotated copy is
-    `(-x1, x0)` within each pair.
-    """
-    pairs = x.reshape(*x.shape[:-1], -1, 2)
-    rotated = jnp.stack([-pairs[..., 1], pairs[..., 0]], axis=-1).reshape(x.shape)
-    return x * cos + rotated * sin
 
 
 class Modulation(nn.Module):
@@ -62,13 +32,18 @@ class Modulation(nn.Module):
     features: int
     pieces: int
     bias: bool = True
+    zero_init: bool = False
+    """Whether the projection starts at zero, adaLN-Zero's identity block, which
+    Dew's own MM-DiT trains from; the published families load their weights."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, conditioning):
         projected = nn.Dense(self.pieces * self.features, use_bias=self.bias, dtype=self.dtype,
-                             precision=self.precision, name="linear")(nn.silu(conditioning))
+                             precision=self.precision, name="linear",
+                             kernel_init=(nn.initializers.zeros if self.zero_init
+                                          else nn.initializers.lecun_normal()))(nn.silu(conditioning))
         return jnp.split(projected, self.pieces, axis=-1)
 
 
@@ -135,9 +110,9 @@ class JointAttention(nn.Module):
     goes through its own output projection. SD3's `JointAttnProcessor2_0`
     puts the image first in the joined sequence, and Flux's processor puts
     the context first. Without a context, it is self-attention over the
-    image. The rotation is the cosines and sines of every joined token laid
-    out against the heads, `[B or 1, S, 1, D]`, and `lengths` is the number
-    of real keys in each row.
+    image. The rotation is the cosines and sines of every joined token, one
+    angle per channel pair, `[B or 1, S, D // 2]`, and `lengths` is the
+    number of real keys in each row.
     """
 
     heads: int
@@ -156,9 +131,13 @@ class JointAttention(nn.Module):
     context_out: bool = True
     """Whether the context's output is projected and returned. SD3's last block
     reads no context back, so it has no `to_add_out`."""
+    rotary_pairs: Literal["half", "adjacent"] = "adjacent"
+    """The channels each angle turns (`dew.nn.rope.rotate`): the published
+    families' adjacent pairs, or the rotate-half halves of Dew's own MM-DiT."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
+    force_fp32_for_softmax: bool = True
 
     def _heads(self, name: str, x):
         projected = nn.Dense(self.heads * self.head_dim, use_bias=self.bias, dtype=self.dtype,
@@ -171,7 +150,8 @@ class JointAttention(nn.Module):
     def attend(self, query, key, value, lengths):
         """Return one softmax attention over the joined sequence, masking each row's keys past `lengths`."""
         return scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
-                                            precision=self.precision, key_value_seq_lengths=lengths)
+                                            precision=self.precision, key_value_seq_lengths=lengths,
+                                            force_fp32_for_softmax=self.force_fp32_for_softmax)
 
     @nn.compact
     def __call__(self, image, context=None, rotation=None, lengths=None):
@@ -185,7 +165,7 @@ class JointAttention(nn.Module):
             streams = (added, (query, key, value)) if self.context_first else ((query, key, value), added)
             query, key, value = (jnp.concatenate(pair, axis=1) for pair in zip(*streams, strict=True))
         if rotation is not None:
-            query, key = apply_rotary(query, *rotation), apply_rotary(key, *rotation)
+            query, key = (rotate(part, *rotation, pairs=self.rotary_pairs) for part in (query, key))
         attended = self.attend(query, key, value, lengths)
         inner = self.heads * self.head_dim
         attended = attended.reshape(attended.shape[0], attended.shape[1], inner)
@@ -246,7 +226,7 @@ class SwiGLU(nn.Module):
 
 
 class DoubleStreamBlock(nn.Module):
-    """Runs one double-stream block of SD3, Flux or FLUX.2.
+    """Runs one double-stream block of SD3, Flux, FLUX.2 or Dew's own MM-DiT.
 
     It matches SD3's `JointTransformerBlock`, Flux's `FluxTransformerBlock`
     and FLUX.2's `Flux2TransformerBlock`. The image and the context each
@@ -256,6 +236,8 @@ class DoubleStreamBlock(nn.Module):
     output. A block's modulation is its own projection of the conditioning
     vector (`norm1`, `norm1_context`): six pieces per stream, a shift, scale
     and gate before the attention and again before the feed-forward.
+    `dropout_rate` drops each projected attention and feed-forward output
+    while `train`, before its gate.
     """
 
     features: int
@@ -267,11 +249,18 @@ class DoubleStreamBlock(nn.Module):
     bias: bool = True
     """Whether the projections have biases. FLUX.2's have none."""
     epsilon: float = 1e-6
+    qk_epsilon: float | None = None
+    """The query and key norms' epsilon, None for `epsilon`. Dew's MM-DiT norms
+    its streams at its stack's epsilon and its queries and keys at 1e-6."""
     mlp_hidden: int | None = None
-    """FLUX.2's SwiGLU width. None gives the GELU feed-forward at four times the width."""
+    """The feed-forward's hidden width, four times the width for None."""
+    swiglu: bool = False
+    """Whether the feed-forward is FLUX.2's SwiGLU rather than the tanh GELU."""
     shared_modulation: bool = False
     """Whether the conditioning is the model's shared modulation, as in FLUX.2: an
     (image, context) pair of six pieces each, which every block reads."""
+    zero_modulation: bool = False
+    """Whether each modulation starts at zero (`Modulation.zero_init`)."""
     context_pre_only: bool = False
     """Whether this is SD3's last block, which reads the context and returns it
     unchanged. Its context norm then takes only a scale and a shift, and it has
@@ -279,58 +268,66 @@ class DoubleStreamBlock(nn.Module):
     dual_attention: bool = False
     """Whether the block runs SD3.5's second self-attention over the same
     normalized input, modulated by three more image pieces."""
+    rotary_pairs: Literal["half", "adjacent"] = "adjacent"
+    """The channels each angle turns (`JointAttention.rotary_pairs`)."""
+    dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
+    force_fp32_for_softmax: bool = True
 
     def _modulation(self, conditioning):
         def projected(pieces: int, name: str):
-            return Modulation(self.features, pieces, dtype=self.dtype, precision=self.precision,
-                              name=name)(conditioning)
+            return Modulation(self.features, pieces, zero_init=self.zero_modulation, dtype=self.dtype,
+                              precision=self.precision, name=name)(conditioning)
 
         return (projected(9 if self.dual_attention else 6, "norm1"),
                 projected(2 if self.context_pre_only else 6, "norm1_context"))
 
     def _feed_forward(self, name: str):
-        if self.mlp_hidden is None:
-            return FeedForward(self.features, dtype=self.dtype, precision=self.precision, name=name)
-        return SwiGLU(self.features, self.mlp_hidden, dtype=self.dtype, precision=self.precision, name=name)
+        hidden = self.mlp_hidden or 4 * self.features
+        if self.swiglu:
+            return SwiGLU(self.features, hidden, dtype=self.dtype, precision=self.precision, name=name)
+        return FeedForward(self.features, hidden, dtype=self.dtype, precision=self.precision, name=name)
 
     def _attention(self, name: str, *, context_out: bool = True):
         return JointAttention(self.heads, self.head_dim, bias=self.bias, qk_norm=self.qk_norm,
-                              epsilon=self.epsilon, context_first=self.context_first, context_out=context_out,
-                              dtype=self.dtype, precision=self.precision, attention_impl=self.attention_impl,
-                              name=name)
+                              epsilon=self.epsilon if self.qk_epsilon is None else self.qk_epsilon,
+                              context_first=self.context_first, context_out=context_out,
+                              rotary_pairs=self.rotary_pairs, dtype=self.dtype, precision=self.precision,
+                              attention_impl=self.attention_impl,
+                              force_fp32_for_softmax=self.force_fp32_for_softmax, name=name)
 
     @nn.compact
-    def __call__(self, image, context, conditioning, rotation=None):
+    def __call__(self, image, context, conditioning, rotation=None, train: bool = False):
         image_mods, context_mods = conditioning if self.shared_modulation else self._modulation(conditioning)
         shift, scale, gate, shift_mlp, scale_mlp, gate_mlp = image_mods[:6]
         # A last block's continuous norm emits its scale before its shift; the
         # zero-initialized one emits shift, scale and then the gates.
         context_scale, context_shift = context_mods[:2] if self.context_pre_only else context_mods[1::-1]
         norm = layer_norm(self.dtype, self.epsilon)
+        dropout = nn.Dropout(self.dropout_rate, deterministic=not train)
         normalized = norm(image)
         attention = self._attention("attn", context_out=not self.context_pre_only)
         context_input = modulate(norm(context), context_shift, context_scale)
         attended, context_attended = attention(modulate(normalized, shift, scale), context_input, rotation)
-        image = image + gate[:, None] * attended
+        image = image + gate[:, None] * dropout(attended)
         if self.dual_attention:
             shift2, scale2, gate2 = image_mods[6:]
             attended2, _ = self._attention("attn2")(modulate(normalized, shift2, scale2))
             image = image + gate2[:, None] * attended2
-        image = image + gate_mlp[:, None] * self._feed_forward("ff")(
-            modulate(norm(image), shift_mlp, scale_mlp))
+        image = image + gate_mlp[:, None] * dropout(self._feed_forward("ff")(
+            modulate(norm(image), shift_mlp, scale_mlp)))
         if self.context_pre_only:
             return image, context
         # A block that keeps its context is the one whose attention returns it.
         assert context_attended is not None
         context_gate, context_shift_mlp, context_scale_mlp, context_gate_mlp = context_mods[2:]
-        context = context + context_gate[:, None] * context_attended
-        context = context + context_gate_mlp[:, None] * self._feed_forward("ff_context")(
-            modulate(norm(context), context_shift_mlp, context_scale_mlp))
+        context = context + context_gate[:, None] * dropout(context_attended)
+        context = context + context_gate_mlp[:, None] * dropout(self._feed_forward("ff_context")(
+            modulate(norm(context), context_shift_mlp, context_scale_mlp)))
         return image, context
 
 
-__all__ = ["DoubleStreamBlock", "FeedForward", "JointAttention", "Modulation", "SwiGLU", "apply_rotary",
-           "embedding", "guided_time", "layer_norm", "modulate", "rotary_table"]
+__all__ = ["DoubleStreamBlock", "FeedForward", "JointAttention", "Modulation", "SwiGLU", "embedding",
+           "guided_time", "layer_norm", "modulate"]

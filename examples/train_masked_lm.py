@@ -67,7 +67,7 @@ class Config:
     val_batches: int | None = 32
     """Held-out batches each periodic evaluation scores; the final score reads them all."""
     sample_steps: int = 128
-    sample_tokens: int = 160
+    max_new_tokens: int = 160
     prompts: tuple[str, ...] = ("Once upon a time", "Tom and Lily went to the park.",
                                 "The little bird was sad because")
     out: Path = Path("runs/mdlm-tinystories")
@@ -84,7 +84,7 @@ def smoke_config(config: Config) -> tuple[Config, HFOptions]:
     options = HFOptions(data_files=str(rows), cache_dir=str(config.out / "hf-cache"))
     return replace(config, dataset="json", tokenizer="byte", sequence_length=32, batch_size=8,
                    steps=4, warmup_steps=1, model={"emb_features": 32, "num_layers": 1, "num_heads": 2},
-                   eval_every=2, val_batches=1, sample_steps=4, sample_tokens=8,
+                   eval_every=2, val_batches=1, sample_steps=4, max_new_tokens=8,
                    prompts=("The cat", "A small boat")), options
 
 
@@ -128,7 +128,7 @@ def main(config: Config) -> Path:
     scored = Evaluation.run(MaskedDiffusionObjective(task.model, task.process, config.sequence_length),
                             task.variables, whole.val, key=jax.random.key(0), metrics=[Perplexity()],
                             loss=True)
-    generated = task(list(config.prompts), config.sample_tokens, key=1)
+    generated = task(list(config.prompts), config.max_new_tokens, key=1)
     samples = [prompt + text for prompt, text in zip(config.prompts, task.decode(generated), strict=True)]
     corpus = TokenCorpus.read(data.hub.tokenized())
     report = {"dataset": config.dataset, "config": config.config, "tokenizer": config.tokenizer,

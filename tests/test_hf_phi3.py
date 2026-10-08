@@ -47,12 +47,12 @@ def test_phi3_cached_greedy_crosses_the_longrope_boundary():
 
 def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_the_crossing():
     from dew.nn.inputs import ModelInputs
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
     generated = np.load(DIRECTORY / 'generated.npy')
-    ops = _operations(loaded.model, loaded.variables, 0, 0)
-    state, _ = _prefill(loaded.model, loaded.variables,
+    ops = decode_ops(loaded.model, loaded.variables, 0, 0)
+    state, _ = prefill_state(loaded.model, loaded.variables,
                         ModelInputs(jnp.asarray(generated[:, :4], jnp.int32)), ops)
     outputs = []
     for step in range(6):

@@ -8,15 +8,18 @@
     "smoke": ".venv-3.12/bin/python -c 'import dew' && .venv-3.14/bin/python -c 'import dew'"
   },
   "history": "commit",
-  "env": { "JAX_PLATFORMS": "cpu", "PYTHONFAULTHANDLER": "1" },
+  "env": { "JAX_PLATFORMS": "cpu", "PYTHONFAULTHANDLER": "1",
+           "DEW_XLA_CACHE_URL": "https://dew-xla-cache.ashishkmr472.workers.dev" },
   "pool": 150,
   "size": "auto",
   "target": 180,
-  "plan": { "command": ["python3", "tools/armada/ci.py", "plan", "--target={target}", "--timings={timings}"] },
+  "plan": { "command": ["python3", "tools/armada/ci.py", "plan", "--target={target}", "--timings={timings}"],
+            "local": true },
   "task": {
     "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
                 "--out={out}"],
     "timeout": 1800,
-    "speculative": true
+    "speculative": true,
+    "secrets": ["DEW_XLA_CACHE_TOKEN"]
   }
 }

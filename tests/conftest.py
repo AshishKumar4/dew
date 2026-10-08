@@ -5,6 +5,7 @@ import os
 import lane_environment  # configures the backend before JAX reads the environment
 import jax
 import pytest
+import remote_cache
 
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 
@@ -12,10 +13,13 @@ from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 # worker. XLA's persistent cache is keyed by the executable, so a second run
 # reuses the first one's compilations. DEW_TEST_NO_CACHE=1 measures the cold
 # cost; the numbers in docs/performance.md were taken with it set.
+_remote = None
 if not os.environ.get("DEW_TEST_NO_CACHE"):
     _cache = default_compilation_cache_dir()
     if _cache:
         enable_compilation_cache(_cache)
+        # On armada, where each task's container starts cold, a cache the tasks share.
+        _remote = remote_cache.install_from_environment()
 
 # XLA parses XLA_FLAGS once, at the first compile, not when the backend
 # opens. A test that edits the variable, such as `without_deterministic_ops`
@@ -24,6 +28,11 @@ if not os.environ.get("DEW_TEST_NO_CACHE"):
 # --xla_gpu_deterministic_ops and its bitwise checks see two compilations of
 # one forward disagree. Compiling here fixes the flags set above.
 jax.jit(lambda x: x + 1)(0).block_until_ready()
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _remote is not None:
+        _remote.drain()
 
 
 def pytest_runtest_setup(item):

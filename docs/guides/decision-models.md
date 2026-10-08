@@ -78,6 +78,7 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 
 `DecisionObjective` trains a decision head over any backbone that has hidden states. The backbone can be Laya's own checkpoint (head and layout included), a pretrained language model, adapted with LoRA or partly frozen, or a model built from scratch:
 
+<!-- not run: fine-tunes Qwen3-0.6B on BANKING77 for 2,000 steps, a GPU job -->
 ```python
 from dew import Trainer
 from dew.config import OptimConfig
@@ -105,6 +106,7 @@ Any model that gives its final states is a backbone (`dew.nn.protocols.HiddenSta
 
 The head is a value too. Laya's `DecisionHead` scores one question per row at its markers. Clef's `JointSchemaHead`, with its `JointLayout`, reads every question of a request in one row and decides them together: it pools each question's instructions and each option's tokens, adds a lexical prior from the backbone's output table, and lets the questions attend to each other. `Decide.from_pretrained("Cloudflare/clef-flash")` reads a Clef release, its Qwen 3.5 backbone with the head beside it and the backbone's processor, and answers as Clef's own model does, images included, which the processor lays out before the state (`tests/test_decision_clef.py` holds the layout, the head and the two together to Clef's code, with and without images). Clef reports an answer's top probability as its confidence, where `systemone` reports Jev's; `replace(decide, confidence=TopProbability())` answers with Clef's. A release fine-tunes like Laya's, its head and layout coming with it. Training pads every row to the layout's `max_len`, and Clef's is the 16384 tokens it serves, so set one that fits the data:
 
+<!-- not run: loads Clef, a 9B model, beyond a CI container's memory -->
 ```python
 objective = DecisionObjective(Decide.from_pretrained("Cloudflare/clef-flash"), layout=JointLayout(max_len=2048))
 ```
@@ -113,6 +115,7 @@ The loss is a proper scoring rule: its expected value is smallest when the forec
 
 Other backbones are one line each:
 
+<!-- not run: loads Qwen3-8B, beyond a CI container's memory -->
 ```python
 DecisionObjective(Decide.from_pretrained("convaiinnovations/laya"))           # Laya, fully fine-tuned
 DecisionObjective(CausalTransformer(vocab_size=50368, num_layers=12, causal=False),

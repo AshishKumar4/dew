@@ -88,7 +88,7 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
                           loading=Loading(workers=0, threads=1, read_buffer=2,
                                           worker_buffer=1) if smoke else Loading(workers=4)),
         tokenizer=tokenizer,
-        sample_tokens=4 if smoke else 64,
+        max_new_tokens=4 if smoke else 64,
         optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
                           clip_grads=1.0),
         # A smoke run stays out of any process pool; a real run joins one
@@ -121,14 +121,14 @@ def main(config: Config) -> Path:
 
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
                                     attention_impl="xla" if config.smoke else "auto",
-                                    max_seq_len=config.sequence_length + run.sample_tokens)
+                                    max_seq_len=config.sequence_length + run.max_new_tokens)
     words = HFTokenizer(tokenizer)
     # The run decodes through this tokenizer, so its checkpoints record its name.
     objective = LMObjective(
         source, config.sequence_length,
         loss_role=Role.ASSISTANT,
         processor=RunProcessor(words),
-        samples=Samples(words.encode("user : hello "), run.sample_tokens,
+        samples=Samples(words.encode("user : hello "), run.max_new_tokens,
                         sampling=run.sampling, decode=words.decode))
 
     # run.json records the model as loaded, so `dew.pipeline` and the export

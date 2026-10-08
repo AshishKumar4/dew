@@ -54,7 +54,7 @@ def test_the_language_model_flow_trains_exports_loads_and_generates(tmp_path):
          "--model.num_heads", "2", "--model.mlp_features", "32",
          "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
          "--trainer.eval-every", "2", "--trainer.checkpoint-every", "2", "--trainer.checkpoint-dir", "runs",
-         "--trainer.name", "byte-demo", "--trainer.multi-host", "False", "--sample-tokens", "0",
+         "--trainer.name", "byte-demo", "--trainer.multi-host", "False", "--max-new-tokens", "0",
          "--sampling.temperature", "0.5", "--sampling.top-k", "7")
     step(tmp_path, "-m", "dew.cli.main", "export", "runs/byte-demo", "export")
     generated = step(tmp_path, "-c", (

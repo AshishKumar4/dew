@@ -84,7 +84,7 @@ def frames_from_cast(cast: str, count: int = 41) -> dict:
     elapsed = 0
     for previous, frame in zip([None, *frames[:-1]], frames, strict=True):
         if previous is not None:
-            elapsed += min(0.4, max(0.3, (frame["time"] - previous["time"]) / 2))
+            elapsed += min(0.25, max(0.15, (frame["time"] - previous["time"]) / 2))
         frame["at"] = elapsed
     return {"columns": header["width"], "seconds": seconds,
             "duration": elapsed, "frames": frames,

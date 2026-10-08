@@ -5,7 +5,7 @@ gate and up projections, read the same input; packed into one kernel each,
 a decode step multiplies once where it would three or two times. The model
 names the groups it reads packed (`dew.nn.protocols.Serving`), and
 the loader (`dew.inference.pipeline`) and the server pack those whose stored
-members concatenate, through `_inference_projections`.
+members concatenate, through `inference_projections`.
 """
 
 
@@ -41,19 +41,19 @@ def _concatenates(variables: Variables, group: ProjectionGroup) -> bool:
         for projection in held for field in fields))
 
 
-def _projection_groups(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
+def projection_groups(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
     """The groups `model` reads packed (`Serving`) that `variables`
     can serve packed. A model that names none, or is adapted, packs none: an
     adapter's LoRA branches bind the members' own paths."""
-    from dew.lora import _Adapted
+    from dew.lora import AdaptedClass
 
-    if isinstance(type(model), _Adapted) or not isinstance(model, Serving):
+    if isinstance(type(model), AdaptedClass) or not isinstance(model, Serving):
         return ()
     return tuple(group for group in model.inference_projection_groups(variables)
                  if _concatenates(variables, group))
 
 
-def _pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
+def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
     """Move the concatenation of constant serving weights out of the decode step."""
     if not groups:
         return variables
@@ -76,11 +76,11 @@ def _pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) -
     return packed
 
 
-def _inference_projections(model: nn.Module, variables: Variables) -> Variables:
+def inference_projections(model: nn.Module, variables: Variables) -> Variables:
     """Pack a decoder's constant projections during placement.
 
     A model that does not decode autoregressively names no groups, so other
     task kinds retain their own parameter layouts; adapted decoders retain
     the original projection paths their LoRA branches bind.
     """
-    return _pack_projections(variables, _projection_groups(model, variables))
+    return pack_projections(variables, projection_groups(model, variables))

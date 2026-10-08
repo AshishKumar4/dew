@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
 
-from dew.interop.safetensors_io import SEPARATOR, _flatten, _unflatten, read_file, write_file
+from dew.interop.safetensors_io import SEPARATOR, flatten, read_file, unflatten, write_file
 from dew.interop.weights import ParamTree
 from dew.objectives.base import Variables
 
@@ -204,7 +204,7 @@ def convert(pickle_path) -> Variables:
             raise ValueError(
                 f"{pickle_path} carries {SEPARATOR.join(leaf)}, which the extractor "
                 "has no module for")
-    return _unflatten(converted)
+    return unflatten(converted)
 
 
 def save(variables: Variables, path, divisor: int = 1) -> None:
@@ -214,7 +214,7 @@ def save(variables: Variables, path, divisor: int = 1) -> None:
     parameter has to be the shape its module declares: whoever applies the file
     has to build the extractor the same way, and the file is what says so.
     """
-    write_file(_flatten(variables), path,
+    write_file(flatten(variables), path,
                {"format": "flax", "module": "dew.eval.inception.InceptionV3",
                 "channel_divisor": str(divisor)})
 

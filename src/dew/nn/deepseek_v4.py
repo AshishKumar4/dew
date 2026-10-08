@@ -51,7 +51,7 @@ from jax.typing import DTypeLike
 
 from dew.nn.attention import (
     RMSNorm,
-    _cache_positions,
+    cache_positions,
     cached_validity,
     causal_attention_mask,
     document_mask,
@@ -62,7 +62,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
-from dew.nn.rope import YarnScaling, rotary_freqs, yarn_inv_freq
+from dew.nn.rope import YarnScaling, rotary_freqs, rotate, yarn_inv_freq
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, selection_mask, top_k_keys, top_k_selection
 
@@ -95,26 +95,11 @@ def rope_freqs(positions, rope_dim: int, theta: float, yarn: YarnScaling | None,
     return jnp.cos(angles), jnp.sin(angles)
 
 
-def rotate_trailing(x, cos, sin):
-    """Rotate the trailing `2 * cos.shape[-1]` channels of `x` in interleaved
-    pairs, the leading channels untouched (modeling_deepseek_v4.py:326-350).
-
-    `x` is `[B, S, H, D]` or `[B, S, D]`; `cos`/`sin` are `[S, P]` or
-    `[B, S, P]` with `P` pairs. The pair `(x[2i], x[2i+1])` turns by one
-    angle and lands back in place, so a rotation by the negated sine undoes
-    it, which the attention output relies on.
-    """
-    pairs = cos.shape[-1]
-    lead = x.shape[:-1]
-    if cos.ndim == 2:
-        cos = jnp.broadcast_to(cos, (lead[0], *cos.shape))
-        sin = jnp.broadcast_to(sin, (lead[0], *sin.shape))
-    if x.ndim == 4:
-        cos, sin = cos[:, :, None, :], sin[:, :, None, :]
-    rope = x[..., -2 * pairs:].astype(at_least_fp32(x.dtype)).reshape(*lead, pairs, 2)
-    first, second = rope[..., 0], rope[..., 1]
-    rotated = jnp.stack([first * cos - second * sin, second * cos + first * sin], axis=-1)
-    return jnp.concatenate([x[..., :-2 * pairs], rotated.reshape(*lead, 2 * pairs).astype(x.dtype)], axis=-1)
+_rotate_rope = functools.partial(rotate, pairs='adjacent', span='trailing')
+"""V4's rotary: the trailing rope channels of a head or an entry turn in
+interleaved pairs that land back in place, the nope channels before them
+untouched (modeling_deepseek_v4.py:326-350), so a rotation by the negated
+sine undoes it, which the attention output relies on."""
 
 
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
@@ -302,7 +287,7 @@ class CompressedEntries(nn.Module):
         """Rotate each entry at its window's first position, `window * rate`."""
         cos, sin = rope_freqs(windows * self.rate, self.rope_dim, self.rope_theta, self.yarn,
                               dtype=at_least_fp32(latents.dtype))
-        return rotate_trailing(latents, cos, sin)
+        return _rotate_rope(latents, cos, sin)
 
     def entries(self, x):
         """The rotated entries `[B, T, width]`, `T = S // rate`."""
@@ -419,7 +404,7 @@ class LightningIndexer(CompressedEntries):
         q_resid = jax.lax.stop_gradient(q_resid)
         batch, length, _ = x.shape
         keys = self.entries(x) if cache is None else self.cached_entries(x, *cache)[0]
-        query = rotate_trailing(
+        query = _rotate_rope(
             self.q_b_proj(q_resid).reshape(batch, length, self.n_heads, self.width), cos, sin)
         scores = self.scorer(query, keys, x)
         return top_k_keys(scores, entries_visible(positions, keys.shape[1], self.rate), self.top_k)
@@ -488,13 +473,13 @@ class Csa2Indexer(nn.Module):
     def keys(self, latents, cos, sin):
         """Index keys `[B, T, head_dim]` off the latents, rotated at their
         windows' positions (v41:537-547)."""
-        return self._fp4(rotate_trailing(self.k_norm(self.wk(jax.lax.stop_gradient(latents))), cos, sin))
+        return self._fp4(_rotate_rope(self.k_norm(self.wk(jax.lax.stop_gradient(latents))), cos, sin))
 
     def scores(self, x, q_resid, keys, cos, sin):
         """Every query's score of every entry, `[B, S, T]` (v41:550-557)."""
         x, q_resid = jax.lax.stop_gradient(x), jax.lax.stop_gradient(q_resid)
         batch, length, _ = x.shape
-        query = rotate_trailing(
+        query = _rotate_rope(
             self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim), cos, sin)
         return _index_scores(self._fp4(query), jax.lax.stop_gradient(keys), self.weights_proj(x),
                             self.precision)
@@ -725,7 +710,7 @@ class DeepseekV4Attention(nn.Module):
                 raise ValueError("decode accepts row validity, not packed segment_ids")
             if valid is None and length > self.max_seq_len:
                 raise ValueError(f"{length} tokens exceed max_seq_len={self.max_seq_len}")
-            slots, allocated = _cache_positions(self, batch, length, valid)
+            slots, allocated = cache_positions(self, batch, length, valid)
             cache = (slots, self.max_seq_len, allocated)
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
@@ -747,7 +732,7 @@ class DeepseekV4Attention(nn.Module):
             batch, length, self.num_heads, self.head_dim)
         if self.query_norm:
             query = unweighted_rmsnorm(query, self.norm_eps)
-        query = rotate_trailing(query, cos, sin)
+        query = _rotate_rope(query, cos, sin)
         # V4.1's window cache keeps FP8, RoPE included (v41:700-707)
         keys = self._window_keys(x, cos, sin, place)
 
@@ -787,7 +772,7 @@ class DeepseekV4Attention(nn.Module):
         """The shared key head, projected where `place` puts it and gathered
         for the query heads the tensor axis splits."""
         projected = constrain(self.kv_norm(self.kv_proj(constrain(x, place))), place)
-        keys = constrain(rotate_trailing(checkpoint_name(projected, 'kv_proj'), cos, sin), RESIDUAL)
+        keys = constrain(_rotate_rope(checkpoint_name(projected, 'kv_proj'), cos, sin), RESIDUAL)
         return fake_quant_fp8(keys, 32) if self.kv_qat else keys
 
     def _attend(self, query, keys, allowed, cos, sin):
@@ -804,7 +789,7 @@ class DeepseekV4Attention(nn.Module):
         context = jnp.einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
-        context = rotate_trailing(checkpoint_name(context, 'context'), cos, -sin)
+        context = _rotate_rope(checkpoint_name(context, 'context'), cos, -sin)
         mixed = self.o_a_proj(context.reshape(batch, length, self.o_groups, -1))
         return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
 
@@ -839,7 +824,7 @@ class DSparkAttention(DeepseekV4Attention):
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
             if main is not None:
-                slots, allocated = _cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
+                slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
                         main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,
@@ -868,7 +853,7 @@ class DSparkAttention(DeepseekV4Attention):
             batch, length, self.num_heads, self.head_dim)
         if self.query_norm:
             query = unweighted_rmsnorm(query, self.norm_eps)
-        query = rotate_trailing(query, cos, sin)
+        query = _rotate_rope(query, cos, sin)
         slots = jnp.arange(main_keys.shape[1])
         window = (slots[None] <= last[:, None]) & (slots[None] > last[:, None] - self.sliding_window)
         allowed = jnp.concatenate([

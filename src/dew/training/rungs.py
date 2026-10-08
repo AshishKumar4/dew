@@ -21,6 +21,7 @@ from pathlib import Path
 import jax
 from jax.sharding import Mesh
 
+from dew.files import write_atomically
 from dew.records import JSON, json_value, record
 
 
@@ -66,6 +67,4 @@ def recorded_rung(program: jax.stages.Lowered, mesh: Mesh) -> tuple[Path | None,
 def keep_rung(path: Path, key: Mapping[str, JSON], rung: JSON) -> None:
     """Record `rung` for `key` at `path`, whole or not at all."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(f".{os.getpid()}.tmp")
-    temporary.write_text(json.dumps({'key': dict(key), 'rung': rung}, sort_keys=True))
-    os.replace(temporary, path)
+    write_atomically(path, json.dumps({'key': dict(key), 'rung': rung}, sort_keys=True))

@@ -34,7 +34,7 @@ class Config:
     model: dict = field(default_factory=lambda: {
         "emb_features": 384, "num_layers": 6, "num_heads": 6})
     prompt: str = "ROMEO:"
-    sample_tokens: int = 300
+    max_new_tokens: int = 300
     out: Path = Path("runs/shakespeare")
 
 
@@ -47,14 +47,14 @@ def main(config: Config):
 
     prompt = tokenizer.encode(config.prompt)
     model = CausalTransformer(**config.model, vocab_size=corpus.vocab_size,
-                              max_seq_len=max(config.sequence_length, len(prompt) + config.sample_tokens),
+                              max_seq_len=max(config.sequence_length, len(prompt) + config.max_new_tokens),
                               dtype=jnp.bfloat16)
     objective = LMObjective(
         model,
         config.sequence_length,
         samples=Samples(
             prompt,
-            config.sample_tokens,
+            config.max_new_tokens,
             sampling=Sampling(temperature=0.8, top_k=40),
             decode=tokenizer.decode,
         ),

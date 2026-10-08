@@ -80,7 +80,7 @@ class Processor(Protocol):
     def bos_id(self) -> int | None: ...
 
 
-def _prepared(processor: Processor | None, request: Request, *, images: Media | None) -> ModelInputs:
+def prepared_inputs(processor: Processor | None, request: Request, *, images: Media | None) -> ModelInputs:
     """Turn a request into `ModelInputs`, tokenizing text through `processor`.
 
     Token rows pass through with their ids and row order unchanged; only text
@@ -125,7 +125,7 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
     def prepared() -> tuple[ModelInputs, int, jax.Array]:
         """Tokenize the request, size its budget and draw its key."""
         random_key = request_key(key)
-        inputs = _prepared(processor, request, images=images)
+        inputs = prepared_inputs(processor, request, images=images)
         return inputs, _budget(max_new_tokens, default_tokens, max_length,
                                inputs.tokens.shape[1]), random_key
 
@@ -143,7 +143,7 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
     return held
 
 
-def _decoded(
+def decoded_rows(
     processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int
 ) -> tuple[str, ...]:
     if processor is None:
@@ -165,7 +165,7 @@ def _budget(requested: int | None, default: int | None, max_length: int | None, 
     raise ValueError("max_new_tokens is required; the source declares no default budget")
 
 
-def _bucket(value: int, smallest: int) -> int:
+def shape_bucket(value: int, smallest: int) -> int:
     """Return the smallest shape bucket that holds `value`, never below `smallest`."""
     for bucket in SHAPE_BUCKETS:
         if bucket >= value and bucket >= smallest:
@@ -173,7 +173,7 @@ def _bucket(value: int, smallest: int) -> int:
     return value
 
 
-def _ceiling(model: nn.Module) -> int | None:
+def cache_ceiling(model: nn.Module) -> int | None:
     """Return the largest cache the model admits, or None where it declares none.
 
     A `Bounded` decoder declares `max_seq_len`, and a wrapper answers for
@@ -202,9 +202,9 @@ def _bucketed(inputs: ModelInputs, budget: int, ceiling: int | None
     if (set(inputs.token_fields) - {"attention_mask", "positions"} or inputs.conditioning
             or (positions is not None and positions.shape != inputs.tokens.shape)):
         return inputs, budget, None
-    width = _bucket(inputs.tokens.shape[1], 64)
-    trips = _bucket(budget, 1)
-    capacity = _bucket(width + trips, 64)
+    width = shape_bucket(inputs.tokens.shape[1], 64)
+    trips = shape_bucket(budget, 1)
+    capacity = shape_bucket(width + trips, 64)
     if capacity > ceiling:
         return inputs, budget, None
     return _padded(inputs, width), trips, capacity
@@ -225,7 +225,7 @@ def _padded(inputs: ModelInputs, width: int) -> ModelInputs:
 
 
 @functools.cache
-def _sized(model: nn.Module, capacity: int | None) -> nn.Module:
+def cache_sized(model: nn.Module, capacity: int | None) -> nn.Module:
     """Return `model` with a decode cache of `capacity` slots, one model per capacity.
 
     A `CacheCapacity` model gives the same model at another cache size, a
@@ -269,15 +269,19 @@ def _pulled(repo_id: str, revision: str | None) -> str:
 
 
 def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()
-               ) -> Mapping[str, object]:
+               ) -> tuple[Mapping[str, object], int]:
     """The inference declaration of the selected checkpoint, not training
-    configuration. A task loaded from it compiles into the persistent cache
-    (`persist_compilations`). `trust` names the packages outside Dew whose
-    modules the record may import (`dew.registry.imported`)."""
+    configuration, and the exact step it is, which a loader reads the
+    weights at too, so a step saved meanwhile cannot pair one step's
+    declaration with another's weights. A task loaded from it compiles into
+    the persistent cache (`persist_compilations`). `trust` names the packages
+    outside Dew whose modules the record may import (`dew.registry.imported`)."""
     from dew.checkpoints import Checkpoints
     from dew.registry import import_trusted
     persist_compilations()
-    record = Checkpoints(directory).artifact(step)
+    checkpoints = Checkpoints(directory)
+    step = checkpoints.pinned(step)
+    record = checkpoints.artifact(step)
     import_trusted(record, trust)
     if record is None:
         raise ValueError("this checkpoint's objective declares no inference record; declare "
@@ -285,10 +289,10 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     record = named_fields(record, 'checkpoint artifact')
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    return record
+    return record, step
 
 
-def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
+def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
     from dew.config import ModelConfig
     from dew.registry import dtype_name, resolve_dtype
@@ -321,19 +325,19 @@ def _saved_processor(record: Mapping[str, object]) -> Processor | None:
 
 def _saved_budget(record: Mapping[str, object]) -> int | None:
     """Return how many tokens the run's own previews drew, where it drew any."""
-    budget = record.get("sample_tokens")
+    budget = record.get("max_new_tokens")
     if budget is None:
         return None
     if type(budget) is not int or budget < 0:
-        raise ValueError("sample_tokens must be a nonnegative integer")
+        raise ValueError("max_new_tokens must be a nonnegative integer")
     return budget
 
 
 def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None, trust: Sequence[str]
-               ) -> tuple[Mapping[str, object], ModelConfig, Processor | None]:
-    """Read a run's record, its model config at `dtype`, and its host processor."""
-    record = run_record(directory, step, trust)
-    return record, _saved_model(record, dtype), _saved_processor(record)
+               ) -> tuple[Mapping[str, object], int, ModelConfig, Processor | None]:
+    """Read a run's record, the exact step it is, its model config at `dtype`, and its host processor."""
+    record, step = run_record(directory, step, trust)
+    return record, step, saved_model(record, dtype), _saved_processor(record)
 
 
 def _freeze_variables(task: TextGeneration | BlockGeneration | MaskedGeneration,
@@ -358,7 +362,7 @@ def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
         if generation.prompt_width is None:
             raise ValueError("this generation has no prompt width")
         rows = generation.host()
-        return _decoded(processor, rows.tokens, rows.lengths, generation.prompt_width)
+        return decoded_rows(processor, rows.tokens, rows.lengths, generation.prompt_width)
 
 
 def _saved_sampling(record: Mapping[str, object], budget: int | None) -> Sampling:
@@ -461,7 +465,7 @@ class TextGeneration:
         """
         from dew.training.quantization import quantize_for_serving
 
-        inputs = _prepared(None, example, images=None)
+        inputs = prepared_inputs(None, example, images=None)
         model, variables = quantize_for_serving(self.model, self.variables, spec,
                                                 inputs.tokens, **inputs.kwargs())
         return replace(self, model=model, variables=variables)
@@ -490,7 +494,7 @@ class TextGeneration:
         """
         from dew.registry import objectives
 
-        record, model_config, processor = _saved_run(directory, dtype, step, trust)
+        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
@@ -524,12 +528,12 @@ class TextGeneration:
                                           collective=mesh_of(self.variables) is not None,
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
-            shaped, trips, capacity = _bucketed(inputs, budget, _ceiling(self.model))
+            shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
             policy, chain, criteria = self._controls(sampling, logits, stopping)
-            generated = generate(_sized(self.model, capacity), self.variables, shaped, trips, key=random_key,
-                              sampling=policy, n=self.n if n is None else n, logits=chain, stopping=criteria,
-                              strategy=self.strategy if strategy is None else strategy)
-            decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+            generated = generate(cache_sized(self.model, capacity), self.variables, shaped, trips,
+                                 key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
+                                 stopping=criteria, strategy=self.strategy if strategy is None else strategy)
+            decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return replace(_requested(generated, budget, padding), decoder=decoder)
 
@@ -537,7 +541,7 @@ class TextGeneration:
         """Return each row's valid continuation as text, empty without a processor."""
         with region("inference.text.decode"):
             rows = generation.host()
-            return _decoded(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+            return decoded_rows(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
 
 
 @dataclass(frozen=True)
@@ -590,7 +594,7 @@ class BlockGeneration:
         """
         from dew.diffusion.block import BlockProcess
         from dew.registry import objectives
-        record, model_config, processor = _saved_run(directory, dtype, step, trust)
+        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         model = model_config.build()
         refuse_non_denoiser(model)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
@@ -626,7 +630,7 @@ class BlockGeneration:
                 self.model, self.variables, inputs, budget, key=random_key,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
-            decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+            decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
             return replace(generated, decoder=decoder)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
@@ -686,7 +690,7 @@ class MaskedGeneration:
         from dew.diffusion.discrete import DiscreteProcess
         from dew.registry import objectives, solvers
 
-        record, model_config, processor = _saved_run(directory, dtype, step, trust)
+        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
         model = model_config.build()
         refuse_causal(model)
@@ -735,7 +739,7 @@ class MaskedGeneration:
                 solver=self.solver, steps=self.steps if steps is None else steps,
                 n=self.n if n is None else n,
                 eos_token_ids=self.eos_token_ids, pad_token_id=self.pad_token_id)
-            decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+            decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
             return replace(generated, decoder=decoder)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:

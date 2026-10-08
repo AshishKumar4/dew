@@ -24,21 +24,13 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.blocks import sinusoidal_time
 from dew.nn.precision import at_least_fp32
+from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import pixel_shuffle, pixel_unshuffle
 from dew.nn.sharding import logical_axes
 
-from .joint import (
-    DoubleStreamBlock,
-    JointAttention,
-    Modulation,
-    embedding,
-    guided_time,
-    layer_norm,
-    modulate,
-    rotary_table,
-)
+from .joint import DoubleStreamBlock, JointAttention, Modulation, embedding, guided_time, layer_norm, modulate
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -175,8 +167,10 @@ class FluxTransformer(nn.Module):
         image = nn.Dense(self.features, name="x_embedder", **dense)(packed)
         conditioned = self._conditioning(time, conditioning.guidance, conditioning.pooled)
         context = nn.Dense(self.features, name="context_embedder", **dense)(conditioning.context)
-        tables = rotary_table(flux_positions(rows, columns, context.shape[1]), self.axes_dims_rope)
-        rotation = tuple(jnp.asarray(table[None, :, None], image.dtype) for table in tables)
+        # `FluxPosEmbed` computes its angles in float64 from the static ids.
+        tables = axis_tables(flux_positions(rows, columns, context.shape[1]), self.axes_dims_rope, 10000.0,
+                             dtype=np.float64)
+        rotation = tuple(jnp.asarray(table[None], at_least_fp32(image.dtype)) for table in tables)
         block = {"attention_impl": self.attention_impl, **dense}
         for index in range(self.num_layers):
             image, context = DoubleStreamBlock(

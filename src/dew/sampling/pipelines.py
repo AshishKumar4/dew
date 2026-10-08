@@ -214,11 +214,11 @@ class TextToImage:
         """Build a task over the objective's model and `variables` that samples the way its evaluation does.
 
         A loss-only head the objective trains is dropped."""
-        from dew.objectives.diffusion.objective import _without_loss_heads
+        from dew.objectives.diffusion.objective import without_loss_heads
 
         autoencoder, variables = objective.published_autoencoder(variables)
         return cls(objective.model, objective.process, objective.inputs,
-                   _without_loss_heads(variables), autoencoder,
+                   without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
                    blank=objective._fixed_blank.rebind(variables.get("encoders", {})))
 
@@ -254,11 +254,11 @@ class TextToImage:
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
-        from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
-        from dew.records import integer, record as fields, text
+        from dew.objectives.diffusion.objective import FixedBlank, without_loss_heads
+        from dew.records import integer, json_value, record as fields, text
         from dew.registry import from_record, objectives, solvers
 
-        record = run_record(directory, step, trust)
+        record, step = run_record(directory, step, trust)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
         inputs_record = fields(record['inputs'], 'inputs')
         autoencoder_record = None if record['autoencoder'] is None else fields(record['autoencoder'],
@@ -290,12 +290,12 @@ class TextToImage:
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['class'], 'solver class'),
                                 fields(solver_record['fields'], 'solver fields'))
-        guidance = (None if record['guidance'] is None
-                    else from_record(CFG, fields(record['guidance'], 'guidance'), dtypes=False))
+        recorded = json_value(record['guidance'], 'guidance')
+        guidance = None if recorded is None else from_record(Guidance, recorded, dtypes=False)
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
-                   inputs, _without_loss_heads(params), autoencoder,
+                   inputs, without_loss_heads(params), autoencoder,
                    steps=integer(record['sampling_steps'], 'sampling_steps'),
                    guidance=guidance, solver=solver,
                    blank=FixedBlank(inputs, params.get("encoders", {}), precision))

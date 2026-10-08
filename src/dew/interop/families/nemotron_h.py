@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from dew import records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import Packed
+from dew.interop.decoder_parts import DecoderFamily, Packed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -24,7 +24,7 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mixers.mlp import MLPMixer
 
 if TYPE_CHECKING:
-    from dew.interop.hf_decoders import DecoderFields
+    from dew.interop.decoder_parts import DecoderFields
 
 _PATTERN = {"M": "linear_attention", "*": "full_attention", "-": "mlp", "E": "moe"}
 _LEGACY = {"mamba": "linear_attention", "attention": "full_attention"}
@@ -35,7 +35,7 @@ _ALIASES = {
 }
 # Mamba-2's trunk and layer names, and the attention, MLP and expert layers beside them.
 _LAYER: Mapping[str, tuple[str, ...]] = {
-    **mamba2._LAYER,
+    **mamba2.LAYER,
     **{f"mixer.{linear}.{kind}": ("self_attn", linear, "kernel" if kind == "weight" else "bias")
        for linear in ("q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj")
        for kind in ("weight", "bias")},
@@ -168,8 +168,8 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Map independent mixers and the router's balancing buffer to their collections."""
-    if name in mamba2._TRUNK:
-        return ("params", *mamba2._TRUNK[name])
+    if name in mamba2.TRUNK:
+        return ("params", *mamba2.TRUNK[name])
     if name == "lm_head.weight":
         return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
     parts = name.split(".")
@@ -187,3 +187,18 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
 def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
     """Invert the checkpoint's tensor names for source-layout exports."""
     return mamba2.export_path(dew_name, config, layer_names=_LAYER_NAMES, family="Nemotron-H")
+
+
+NEMOTRON_H = DecoderFamily(
+    ("nemotron_h",),
+    config_from_hf,
+    matches,
+    "nemotron_h",
+    "NemotronHForCausalLM",
+    lambda model: {},
+    weight_path=weight_path,
+    export_path=export_path,
+    packed=PACKED,
+    preserve_source_layout=True,
+    tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
+)

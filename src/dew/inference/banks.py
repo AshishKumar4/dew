@@ -302,13 +302,8 @@ class SafetensorsBanks(LayerBanks):
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
-        from dew.interop.hf_decoders import (
-            DecoderFamily,
-            _check_tree,
-            families,
-            translate_config,
-            translate_weights,
-        )
+        from dew.interop.decoder_parts import DecoderFamily, check_decoder_tree
+        from dew.interop.hf_decoders import families, translate_config, translate_weights
         from dew.interop.safetensors_io import read_weights
         from dew.registry import dtype_name, models
 
@@ -326,8 +321,8 @@ class SafetensorsBanks(LayerBanks):
                              "this family's preparation can materialize checkpoint weights")
         tensors = read_weights(folder)
         if param_dtype == "auto":
-            from dew.interop.pretrained import _checkpoint_dtype
-            storage = _checkpoint_dtype(self.config, tensors)
+            from dew.interop.pretrained import checkpoint_dtype
+            storage = checkpoint_dtype(self.config, tensors)
         else:
             storage = dtype_name(param_dtype)
         self._variables: Variables = translate_weights(
@@ -335,7 +330,7 @@ class SafetensorsBanks(LayerBanks):
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
-        _check_tree(self._shapes, models.build(
+        check_decoder_tree(self._shapes, models.build(
             "causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"}))
         self.cache_limit = cache_bytes
         self.read_ahead = read_ahead

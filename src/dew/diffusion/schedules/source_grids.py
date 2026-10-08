@@ -30,7 +30,7 @@ from dew.diffusion.transforms import PredictionTransform
 from dew.records import JSON
 
 if TYPE_CHECKING:
-    from dew.diffusion.schedules.source_policy import Origin, _Flow, _Policy
+    from dew.diffusion.schedules.source_policy import FlowShift, Origin, SourcePolicy
 
 
 class TabulatedVP(DiscreteNoiseScheduler):
@@ -203,7 +203,7 @@ class VPGrid(_UniformGrid):
         return alpha, sigma * alpha
 
 
-def _choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT, ...]) -> ChoiceT:
+def named_choice[ChoiceT: str](value: object, name: str, allowed: tuple[ChoiceT, ...]) -> ChoiceT:
     if not isinstance(value, str):
         raise ValueError(f"{name} must name one of {', '.join(allowed)}, not {value!r}")
     for choice in allowed:
@@ -253,7 +253,7 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
     else:
         first = records.number(start, "beta_start")
         final = records.number(end, "beta_end")
-        kind = _choice(schedule, "beta_schedule", schedules)
+        kind = named_choice(schedule, "beta_schedule", schedules)
         if kind == "linear":
             betas = _published_linspace(first, final, length)
         elif kind == "scaled_linear":
@@ -294,13 +294,13 @@ def empirical_mu(tokens: int, steps: int) -> float:
     return float(slope * steps + m_200 - 200.0 * slope)
 
 
-def _shifted(flow: _Flow, sigmas: np.ndarray, tokens: int | None, mu: float | None = None) -> np.ndarray:
+def _shifted(flow: FlowShift, sigmas: np.ndarray, tokens: int | None, mu: float | None = None) -> np.ndarray:
     """The sigmas after this file's shift."""
     base = flow.base(tokens, mu)
     return base * sigmas / (1 + (base - 1) * sigmas)
 
 
-def _stretched(flow: _Flow, sigmas: np.ndarray) -> np.ndarray:
+def _stretched(flow: FlowShift, sigmas: np.ndarray) -> np.ndarray:
     """`stretch_shift_to_terminal`, which the source applies once in
     `set_timesteps` and never to the constructor's own seed."""
     if flow.terminal is None:
@@ -367,7 +367,7 @@ def _distilled_times(train_steps: int, original_steps: int, steps: int) -> np.nd
     return distilled[indices].astype(np.float64)
 
 
-def _training_sigmas(betas: np.ndarray, policy: _Policy) -> tuple[np.ndarray, np.ndarray]:
+def _training_sigmas(betas: np.ndarray, policy: SourcePolicy) -> tuple[np.ndarray, np.ndarray]:
     """The training sigma table sigma/alpha and its logarithm, with the
     near-zero terminal alpha the zero-SNR classes substitute.
 
@@ -386,7 +386,7 @@ def _training_sigmas(betas: np.ndarray, policy: _Policy) -> tuple[np.ndarray, np
     return base, np.log(base, dtype=np.float32)
 
 
-def _transformed_grid(policy: _Policy, steps: int, log_base: np.ndarray, low: float,
+def _transformed_grid(policy: SourcePolicy, steps: int, log_base: np.ndarray, low: float,
                       high: float) -> tuple[np.ndarray, np.ndarray]:
     """The class's own sigma grid over `[low, high]`, and the model times
     its log-linear inverse recovers for those sigmas.
@@ -400,7 +400,7 @@ def _transformed_grid(policy: _Policy, steps: int, log_base: np.ndarray, low: fl
     return sigmas, times
 
 
-def _lambda_grid(policy: _Policy, betas: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
+def _lambda_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
     """The paired sigma and model-time tables of a log-SNR class, with the
     terminal sigma its `final_sigmas_type` appends. Model times end as
     integers: the source stores them as int64."""
@@ -426,7 +426,7 @@ def _lambda_grid(policy: _Policy, betas: np.ndarray, steps: int) -> tuple[np.nda
     return np.append(sigmas, terminal), np.trunc(times), 1.0
 
 
-def _flow_sigmas(policy: _Policy, steps: int, sigma_min: float) -> tuple[np.ndarray, np.ndarray, float]:
+def _flow_sigmas(policy: SourcePolicy, steps: int, sigma_min: float) -> tuple[np.ndarray, np.ndarray, float]:
     """`use_flow_sigmas`: the shifted flow path from 1 - 1/T down, one point
     dropped at the clean end, whatever the spacing and lambda clipping.
 
@@ -442,7 +442,7 @@ def _flow_sigmas(policy: _Policy, steps: int, sigma_min: float) -> tuple[np.ndar
     return np.append(sigmas, terminal), np.trunc(sigmas * policy.train_steps), 1.0
 
 
-def _sigma_grid(policy: _Policy, betas: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
+def _sigma_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
     """The paired tables of a variance-exploding class: its spacing
     interpolated out of the training table, then whatever sigma
     transformation it applies to that interpolated subset."""
@@ -463,7 +463,7 @@ def _sigma_grid(policy: _Policy, betas: np.ndarray, steps: int) -> tuple[np.ndar
     return np.append(sigmas, terminal), times, prior
 
 
-def _stage_grid(policy: _Policy, betas: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
+def _stage_grid(policy: SourcePolicy, betas: np.ndarray, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
     """The same tables refined with the stage row each interval evaluates.
 
     KDPM2 reads the geometric mean of the interval's ends, its ancestral
@@ -509,7 +509,7 @@ def _check_unique_start(times: np.ndarray) -> None:
             "looks its starting step up by that value and finds the second")
 
 
-def _flow_grid(policy: _Policy, flow: _Flow, steps: int, tokens: int | None,
+def _flow_grid(policy: SourcePolicy, flow: FlowShift, steps: int, tokens: int | None,
                origin: Origin) -> tuple[np.ndarray, np.ndarray, float]:
     """`FlowMatchEulerDiscreteScheduler.set_timesteps` in its own order.
 
@@ -546,7 +546,7 @@ def _flow_grid(policy: _Policy, flow: _Flow, steps: int, tokens: int | None,
     return np.append(sigmas, 0.0), np.asarray(sigmas, np.float64) * count, 1.0
 
 
-def _edm_grid(policy: _Policy, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
+def _edm_grid(policy: SourcePolicy, steps: int) -> tuple[np.ndarray, np.ndarray, float]:
     """EDM's own grid, rho or exponential spacing between the sigma extremes.
 
     The model time is c_noise = log(sigma) / 4 and the prior is unit data
@@ -561,7 +561,7 @@ def _edm_grid(policy: _Policy, steps: int) -> tuple[np.ndarray, np.ndarray, floa
             float(np.sqrt(high ** 2 + 1)))
 
 
-def sampling_grid(policy: _Policy, betas: np.ndarray, prediction: PredictionTransform,
+def sampling_grid(policy: SourcePolicy, betas: np.ndarray, prediction: PredictionTransform,
                   steps: int, tokens: int | None, origin: Origin) -> tuple[Process, jax.Array]:
     """Build one family's native tables and descending times from already resolved controls."""
     if type(steps) is not int or steps < 1:
@@ -601,7 +601,7 @@ def sampling_grid(policy: _Policy, betas: np.ndarray, prediction: PredictionTran
             jnp.arange(len(sigmas) - 1, -1, -1, dtype=jnp.float32))
 
 
-def _tabulated(policy: _Policy, betas: np.ndarray, prediction: PredictionTransform,
+def _tabulated(policy: SourcePolicy, betas: np.ndarray, prediction: PredictionTransform,
                steps: int) -> tuple[Process, jax.Array]:
     """A class that steps between integer indices of the training table."""
     if policy.distilled:

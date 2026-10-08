@@ -123,7 +123,7 @@ def teacher_weights(variables: Variables | None, run: str | None, *, whole: bool
     return thaw(tree) if whole else model_part(tree)
 
 
-def _without_loss_heads(variables: Variables) -> Variables:
+def without_loss_heads(variables: Variables) -> Variables:
     """`variables` without what the model never reads: the uncertainty head,
     the alignment projector, the frozen representation encoder, an
     autoencoder trained end to end with its latent statistics, perceptual
@@ -137,7 +137,7 @@ def _without_loss_heads(variables: Variables) -> Variables:
 def model_part(tree: Variables) -> Variables:
     """The model's own collections of `tree`, a frozen split merged back: the
     frozen towers and the loss's own heads left out."""
-    return _without_loss_heads({name: value for name, value in thaw(tree).items()
+    return without_loss_heads({name: value for name, value in thaw(tree).items()
                                 if name not in ("encoders", "autoencoder")})
 
 
@@ -405,7 +405,7 @@ class DiffusionObjective(Objective[Ratio]):
         return {'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
                 'solver': to_record(self.solver, Solver),
-                'guidance': to_record(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
+                'guidance': to_record(self.guidance, Guidance | None), 'sampling_steps': self.steps,
                 'condition_precision': self._condition_precision,
                 # A tuned autoencoder's weights and statistics sit in the run's own tree.
                 'end_to_end': None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd)}
