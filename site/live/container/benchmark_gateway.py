@@ -128,8 +128,9 @@ def main():
                     "finally:\n sock.close()")
         for _, client, _ in kernels:
             execute(client,
-                "from model_client import from_pretrained, CFG, DPMSolverMultistep, text_model\n"
-                "pipe = from_pretrained('dewml/hybrid-dit-176m')\n"
+                "import model_client\nmodel_client.install()\n"
+                "from dew.sampling import CFG, DPMSolverMultistep, TextToImage\n"
+                "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m')\n"
                 "result = pipe(['a lake beneath the northern lights'], key=3, steps=15, "
                 "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9)))\n"
                 "assert result.pil()[0].size == (256, 256)\n"
@@ -144,8 +145,10 @@ def main():
                 stdout = execute(client,
                     f"assert __measurement == {identifier!r}\n"
                     f"assert Path('/work/context').read_text() == {identifier!r}\n"
-                    "from model_client import text_model\n"
-                    "assert text_model('HuggingFaceTB/SmolLM2-135M-Instruct')("
+                    "from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sampling\n"
+                    "model = PretrainedDecoder.load('HuggingFaceTB/SmolLM2-135M-Instruct', "
+                    "dtype='float32', max_seq_len=256)\n"
+                    "assert model.text_generation(sampling=Sampling(temperature=0))("
                     "'The capital of France is', 24, key=0).text[0]\n"
                     "import json, os\nfrom pathlib import Path\n"
                     "pss = next(line for line in Path('/proc/self/smaps_rollup').read_text().splitlines() "
