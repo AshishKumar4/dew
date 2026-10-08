@@ -38,7 +38,7 @@ from dew.interop.hf_decoders import (
     refuse_encoder_fields,
     renamed_name,
     renamed_path,
-    translate_config,
+    translated,
     yarn_record,
 )
 from dew.nn.backbones.decoder_block import Mixture
@@ -432,7 +432,8 @@ def _kimi_k25_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
                  'use_unified_vision_chunk', 'video_placeholder', 'ignore_index'))
     nested = {key: value for key, value in text.items()
               if key not in SERIALIZED_TEXT_FIELDS and key not in SERIALIZED_ENCODER_FIELDS}
-    config = translate_config({**nested, 'model_type': model_type, 'tie_word_embeddings': tied})
+    text_family = {'kimi_k2': KIMI_K2, 'deepseek_v3': DEEPSEEK_V3}[model_type]
+    config = translated({**nested, 'model_type': model_type, 'tie_word_embeddings': tied}, text_family)
     placeholders = []
     for key, default in (('image_token_id', 163605), ('video_token_id', 163840)):
         value = hf_config.get(key, default)

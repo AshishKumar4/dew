@@ -794,7 +794,14 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     if model_type not in families():
         refuse(f"model_type {model_type!r}",
                 f"expected one of {', '.join(repr(name) for name in families())}")
-    config, unknown = translate_family_config(hf_config, families()[records.text(model_type, 'model_type')])
+    return translated(hf_config, families()[records.text(model_type, 'model_type')])
+
+
+def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> DecoderFields:
+    """Translate a config as `family` reads it, refusing a drafter and any
+    setting Dew does not compute."""
+    _refuse_drafter(hf_config)
+    config, unknown = translate_family_config(hf_config, family)
     if unknown:
         refuse(f"config fields {sorted(unknown)}",
                 "CausalTransformer has no counterpart, so translating them "
@@ -1714,10 +1721,10 @@ def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
                        'tie_embeddings'))
     if tied != model.tie_embeddings:
         raise ValueError('tie_word_embeddings disagrees with the native model')
-    return family.export_weights(model, variables, {**config, 'tie_word_embeddings': tied})
+    return family.export_weights(family, model, variables, {**config, 'tie_word_embeddings': tied})
 
 
-def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
+def _dense_decoder_weights(family: "DecoderFamily", model: CausalTransformer, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     if model.per_layer_input_dim or model.sharing_layers or model.v_norm:
         raise ValueError(
@@ -1730,21 +1737,19 @@ def _dense_decoder_weights(model: CausalTransformer, variables: Mapping[str, obj
         raise ValueError(
             'the attention output gate, a partial rotary and a mixer other than attention '
             'have no counterpart in this dense tensor encoder')
-    family = families()[records.text(config['model_type'], 'model_type')]
-    if model.mixture is not None and family.export_path is hf_tensor_name:
+    if model.mixture is not None and family.export_path is None:
         raise ValueError('a model with a mixture has no routed tensor writer in this family')
-    return decoder_tensors(model, variables, config)
+    return decoder_tensors(family, model, variables, config)
 
 
-def decoder_tensors(model: CausalTransformer, variables: Mapping[str, object],
-                     config: Mapping[str, object]) -> LazyTensors:
-    """Write every leaf under the name the family's `export_path` gives it.
+def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables: Mapping[str, object],
+                    config: Mapping[str, object]) -> LazyTensors:
+    """Write every leaf under the name `family` gives it (`DecoderFamily.tensor_name`).
 
     Each leaf is stored as the load oriented it, a 2-D kernel transposed, and
     the family's `packed` tensors are built from their parts. Gemma 4's layer
     scalars are read from the collection `model.layer_scalar` names.
     """
-    family = families()[records.text(config['model_type'], 'model_type')]
     params = variables.get('params', variables)
     if not isinstance(params, Mapping):
         raise ValueError('params must contain the decoder parameter tree')
@@ -1756,7 +1761,7 @@ def decoder_tensors(model: CausalTransformer, variables: Mapping[str, object],
                       if name.endswith('.layer_scalar'))
     layouts: dict[str, WeightLayout] = {}
     for name, value in leaves.items():
-        target = family.export_path(name, config)
+        target = family.tensor_name(name, config)
         if target is None:
             continue
         if not isinstance(value, (jax.Array, np.ndarray)):
@@ -1976,10 +1981,12 @@ def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) 
         )
 
 
-def hf_tensor_name(dew_name: str, config: Mapping[str, object]) -> str | None:
+def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
+                   sandwich_norms: bool = False) -> str | None:
     """Map one flattened dew param path to its HF tensor name, or None.
 
     None is the tied lm_head, whose embedding copy is written instead.
+    `sandwich_norms` names the norms around each block as Gemma 2's family does.
     """
     parts = dew_name.split('.')
     if tuple(parts) in _TRUNK_NAMES:
@@ -2000,9 +2007,7 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object]) -> str | None:
                         + ('weight' if leaf == 'kernel' else 'bias'))
             if module == 'self_attn' and parts[2] in _HEAD_NORMS and leaf == 'scale':
                 return f'model.layers.{index}.self_attn.{parts[2]}.weight'
-        theirs = {ours: hf for hf, ours in
-                  _norm_names(families()[records.text(config['model_type'],
-                                             'model_type')].sandwich_norms).items()}
+        theirs = {ours: hf for hf, ours in _norm_names(sandwich_norms).items()}
         if len(parts) == 3 and module in theirs and leaf in ('scale', 'bias'):
             return f'model.layers.{index}.{theirs[module]}.' + ('weight' if leaf == 'scale' else 'bias')
     raise ValueError(f"unknown parameter path {dew_name!r}")
@@ -2094,11 +2099,12 @@ class DecoderFamily:
     preserve_source_layout: bool = field(kw_only=True)
     """Bind source tensor names/config for export instead of deriving them from the model."""
     weight_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None] = dew_path
-    export_path: Callable[[str, Mapping[str, object]], str | None] = hf_tensor_name
-    export_weights: Callable[[CausalTransformer, Mapping[str, object], Mapping[str, object]],
+    export_path: Callable[[str, Mapping[str, object]], str | None] | None = None
+    """The source name of a dew path; None is the shared names (`hf_tensor_name`)."""
+    export_weights: Callable[["DecoderFamily", CausalTransformer, Mapping[str, object], Mapping[str, object]],
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
-    """Whole-variable encoder; the families with one add their checks or
-    storage to the shared writer (`decoder_tensors`)."""
+    """Whole-variable encoder, given its family; the families with one add
+    their checks or storage to the shared writer (`decoder_tensors`)."""
     sandwich_norms: bool = False
     prepare: WeightPreparer = field(default=lambda tensors, _config=None: dict(tensors))
     """Storage the path map cannot read as stored that no `packed` entry
@@ -2136,6 +2142,12 @@ class DecoderFamily:
             packing = self.packing(name)
             split.update({name: tensor} if packing is None else packing.split(name, tensor, config))
         return split
+
+    def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
+        """The source name the dew path `name` exports under."""
+        if self.export_path is None:
+            return hf_tensor_name(name, config, sandwich_norms=self.sandwich_norms)
+        return self.export_path(name, config)
 
     def packing(self, name: str) -> Packed | None:
         """The `packed` entry the source tensor `name` is, if any."""

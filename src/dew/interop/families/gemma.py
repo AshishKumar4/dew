@@ -509,7 +509,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def gemma4_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+def gemma4_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> LazyTensors:
     """Return the Gemma 4 checkpoint tensors for `model` and `variables`.
 
@@ -533,7 +533,7 @@ def gemma4_export_weights(model: CausalTransformer, variables: Mapping[str, obje
     if held != scalars or stray:
         raise ValueError(f"layer_scalar={mode} keeps every layer scalar in "
                          f"{'constants' if mode == 'frozen' else 'params'} alone")
-    return decoder_tensors(model, variables, config)
+    return decoder_tensors(family, model, variables, config)
 
 
 def _gemma2_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -585,7 +585,7 @@ def gemma4_export_path(name: str, config: Mapping[str, object]) -> str | None:
             return stem + '.'.join(_GEMMA4_MOE_NAMES[tail])
         if len(tail) == 4 and tail[:2] == ('moe', 'experts') and tail[3] == 'kernel':
             return f'{stem}experts.{tail[2]}'
-    return hf_tensor_name(name, config)
+    return hf_tensor_name(name, config, sandwich_norms=True)
 
 
 GEMMA3N_TEXT = DecoderFamily(

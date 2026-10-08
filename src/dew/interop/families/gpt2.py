@@ -166,9 +166,9 @@ def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def _gptj_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+def _gptj_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
                          config: Mapping[str, object]) -> LazyTensors:
-    tensors = decoder_tensors(model, variables, config)
+    tensors = decoder_tensors(family, model, variables, config)
     rotated = int(model.features_per_head * (model.partial_rotary_factor or 1.))
     order = np.argsort(_gptj_order(model.features_per_head, rotated))
 
