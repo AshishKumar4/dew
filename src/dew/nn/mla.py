@@ -27,7 +27,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
-    _cache_positions,
+    cache_positions,
     cached_validity,
     causal_attention_mask,
     document_mask,
@@ -69,7 +69,7 @@ def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, ind
     if index_keys is not None:
         cached_index = module.variable("cache", "cached_index", jnp.zeros,
                                        (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
-    positions, allocated = _cache_positions(module, batch, length, valid)
+    positions, allocated = cache_positions(module, batch, length, valid)
 
     def append(new_first, new_second, new_index_keys):
         if allocated:

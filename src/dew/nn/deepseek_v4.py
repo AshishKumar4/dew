@@ -51,7 +51,7 @@ from jax.typing import DTypeLike
 
 from dew.nn.attention import (
     RMSNorm,
-    _cache_positions,
+    cache_positions,
     cached_validity,
     causal_attention_mask,
     document_mask,
@@ -725,7 +725,7 @@ class DeepseekV4Attention(nn.Module):
                 raise ValueError("decode accepts row validity, not packed segment_ids")
             if valid is None and length > self.max_seq_len:
                 raise ValueError(f"{length} tokens exceed max_seq_len={self.max_seq_len}")
-            slots, allocated = _cache_positions(self, batch, length, valid)
+            slots, allocated = cache_positions(self, batch, length, valid)
             cache = (slots, self.max_seq_len, allocated)
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
@@ -839,7 +839,7 @@ class DSparkAttention(DeepseekV4Attention):
             cached_key = self.variable('cache', 'cached_key', jnp.zeros,
                                        (batch, self.max_seq_len, self.head_dim), x.dtype)
             if main is not None:
-                slots, allocated = _cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
+                slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
                         main, *rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,

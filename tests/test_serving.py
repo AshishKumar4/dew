@@ -113,11 +113,11 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
     """Serving holds the same weight bytes; reloading casts and repacks the trained tree."""
     from flax.core import freeze
 
-    from dew.inference.projections import _inference_projections
+    from dew.inference.projections import inference_projections
 
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(np.asarray, bound.variables)
-    packed_task = TextGeneration(bound.model, jax.device_put(_inference_projections(bound.model, source)),
+    packed_task = TextGeneration(bound.model, jax.device_put(inference_projections(bound.model, source)),
                                  bound.processor, sampling=bound.sampling)
     server = Server.from_task(packed_task, slots=2, capacity=128)
     before = server(["12", "34"], 5, key=3)
@@ -145,7 +145,7 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
 
 @pytest.mark.parametrize("case", ["kv_shared", "k_eq_v", "output_gate"])
 def test_inference_projection_layout_preserves_special_attention_logits(case):
-    from dew.inference.projections import _inference_projections
+    from dew.inference.projections import inference_projections
 
     with jax.enable_x64():
         model = CausalTransformer(
@@ -158,7 +158,7 @@ def test_inference_projection_layout_preserves_special_attention_logits(case):
         tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
         variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64),
                                  model.init(jax.random.key(13), tokens))
-        packed = _inference_projections(model, variables)
+        packed = inference_projections(model, variables)
         expected = jax.jit(model.apply)(variables, tokens)
         actual = jax.jit(model.apply)(packed, tokens)
         # Both run in float64; 64 epsilon covers the tiny decoder's few
@@ -237,11 +237,11 @@ def test_host_task_and_server_preserve_nonzero_lora_branches():
 
 def test_reload_normalizes_source_precision_before_concatenating_projections():
     """A float64 value just above an FP16 midpoint must not double-round through FP32."""
-    from dew.inference.projections import _inference_projections
+    from dew.inference.projections import inference_projections
 
     bound = task(Sampling(temperature=0, eos_id=None))
     source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
-    host = TextGeneration(bound.model, jax.device_put(_inference_projections(bound.model, source)),
+    host = TextGeneration(bound.model, jax.device_put(inference_projections(bound.model, source)),
                           bound.processor, sampling=bound.sampling)
     server = Server.from_task(host, slots=2, capacity=128)
     incoming = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), source)
@@ -332,12 +332,12 @@ def test_a_step_without_admission_draws_from_its_own_logits_without_merging_ever
     keeps a held row's (on an RTX 4080 at 64 slots, 136 us of an 8.4 ms
     step). A step that seats rows still merges, since those draw from their
     prompt's logits."""
-    from dew.inference.serving_kernel import _advanced, _joined
+    from dew.inference.serving_kernel import _advanced, joined
 
     server = Server.from_task(task(Sampling(temperature=0, eos_id=None)), slots=2, capacity=64, admission=1)
     server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
     admission = server._admit()
-    state = _joined(server._resident, server._carried)
+    state = joined(server._resident, server._carried)
 
     def merges(admission):
         jaxpr = jax.make_jaxpr(lambda state: _advanced(
@@ -789,17 +789,17 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
     at their paths in its variables: a user's module around a decoder that
     names the decoder's is packed, draws what the unpacked weights draw, and
     is served and reloaded from them; one that names none keeps its layout."""
-    from dew.inference.projections import _inference_projections
+    from dew.inference.projections import inference_projections
 
     bound = task(Sampling(temperature=0, eos_id=None))
     answering = wrapped(AnsweringDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
     plain = wrapped(UserDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
     members = {"q_proj", "k_proj", "v_proj"}
-    packed = _inference_projections(answering.model, answering.variables)
+    packed = inference_projections(answering.model, answering.variables)
     attention = set(packed["params"]["decoder"]["layers_0"]["self_attn"])
     assert "qkv_proj" in attention and not members & attention
     assert members <= set(
-        _inference_projections(plain.model, plain.variables)["params"]["decoder"]["layers_0"]["self_attn"])
+        inference_projections(plain.model, plain.variables)["params"]["decoder"]["layers_0"]["self_attn"])
     served = TextGeneration(answering.model, packed, bound.processor, sampling=bound.sampling)
     for index, prompt in enumerate(PROMPTS[:3]):
         assert_same_generation(served(prompt, 5, key=index), bound(prompt, 5, key=index))

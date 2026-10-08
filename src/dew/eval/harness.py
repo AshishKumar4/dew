@@ -35,7 +35,7 @@ from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
-from dew.inference.tasks import TextGeneration, _ceiling
+from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.nn.inputs import pad_token_rows
 from dew.objectives.likelihood import token_log_probs
 from dew.sampling.text import Sampling
@@ -168,8 +168,8 @@ class DewLM(TemplateLM):
         Generation sizes its cache from the same declared field, so a
         harness row and a generated row have the same bound.
         """
-        # _ceiling is the read a generation call makes to size its cache.
-        declared = _ceiling(self.task.model)
+        # cache_ceiling is the read a generation call makes to size its cache.
+        declared = cache_ceiling(self.task.model)
         return DEFAULT_CONTEXT if declared is None else declared
 
     def tok_encode(self, string: str, add_special_tokens: bool | None = None,

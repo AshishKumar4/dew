@@ -600,13 +600,13 @@ def test_the_decode_ops_draft_what_dspark_drafts_over_the_history(source):
     uncached over each row's real history: the prompt's and the stretch's
     context reach its windows at their own positions. Two runs each within
     FACTOR of the reference's rounding lie within twice that of each other."""
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     loaded, plain, reference = source
     ids, prompt = jnp.asarray(reference["input_ids"]), int(reference["decode_prompt"])
-    ops = _operations(plain, loaded.variables, 0, 0)
+    ops = decode_ops(plain, loaded.variables, 0, 0)
     assert ops.record is not None and ops.draft is not None and ops.verify is not None
-    state, _ = _prefill(plain, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
+    state, _ = prefill_state(plain, loaded.variables, ModelInputs(ids[:, :prompt]), ops)
     kept = jnp.asarray([3, 1])
     keep = jnp.arange(3)[None, :] < kept[:, None]
     state, _, context = ops.verify(state, ids[:, prompt:prompt + 3], keep)

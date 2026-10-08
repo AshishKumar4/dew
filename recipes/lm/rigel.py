@@ -141,7 +141,7 @@ def run_config(args: RigelArgs) -> LMRunConfig:
         trainer=TrainerConfig(batch_size=args.batch_size, steps=args.steps,
                               eval_every=None, checkpoint_every=5_000),
         objective=ObjectiveConfig("lm", {"aux_loss_alpha": 0.001, "seq_aux": False, "router_z_loss": 0.0001}),
-        tokenizer=args.tokenizer, sample_tokens=0)
+        tokenizer=args.tokenizer, max_new_tokens=0)
 
 
 if __name__ == "__main__":

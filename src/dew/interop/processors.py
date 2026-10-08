@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import records
-from dew._model_types import _QWEN35_TYPES
+from dew._model_types import QWEN35_TYPES
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.records import JSON
@@ -51,7 +51,7 @@ class HostProcessor(Protocol):
     def batch_decode(self, sequences: list[list[int]], *, skip_special_tokens: bool) -> list[str]: ...
 
 
-def _hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
+def hosts(reference: PreTrainedTokenizerBase) -> TypeGuard[HostProcessor]:
     """Whether `reference` offers every HostProcessor operation, checked by
     name because a tokenizer's own annotations are narrower than what dew
     passes (see `data.chat._token_ids`)."""
@@ -280,11 +280,11 @@ class Processor:
         conditioning: dict[str, jax.Array] = {}
         if "pixel_values" in values or "pixel_values_videos" in values:
             if ("pixel_values_videos" in values
-                    and self.config.get("model_type") not in (*_QWEN35_TYPES, "gemma4")):
+                    and self.config.get("model_type") not in (*QWEN35_TYPES, "gemma4")):
                 raise ValueError("video patch inputs require a Qwen3.5 or Gemma4 visual tower")
             image_fields, conditioning = self._images(values, tokens)
             token_fields.update(image_fields)
-            if self.config.get("model_type") in _QWEN35_TYPES:
+            if self.config.get("model_type") in QWEN35_TYPES:
                 token_fields["rotary_positions"] = self._image_rotary_positions(
                     tokens, valid, image_fields["image_groups"], conditioning["image_grid_thw"])
         if ("input_features" in values) != ("input_features_mask" in values):
@@ -313,7 +313,7 @@ class Processor:
         The three branches are the three source layouts: Qwen's packed patch
         runs, a per-patch position stream, and a fixed tokens-per-image grid.
         """
-        qwen = self.config.get("model_type") in _QWEN35_TYPES
+        qwen = self.config.get("model_type") in QWEN35_TYPES
         gemma = self.config.get("model_type") == "gemma4"
         image_id, video_id = _media_token_ids(self.record, self.config, qwen=qwen, gemma=gemma)
         pixels = np.asarray(values.get("pixel_values", values.get("pixel_values_videos")))

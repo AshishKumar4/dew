@@ -258,7 +258,7 @@ class Kept:
     rankings: Mapping[str, dict] = dataclasses.field(default_factory=dict)
 
 
-def _frozen_entries(step_directory: str) -> list[str]:
+def frozen_entries(step_directory: str) -> list[str]:
     """The `FROZEN_STORE` entries the step at `step_directory` records,
     relative to its run directory, which `dew.io.publish` carries beside it."""
     metadata = epath.Path(step_directory) / "_CHECKPOINT_METADATA"
