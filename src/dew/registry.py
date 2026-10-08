@@ -676,7 +676,10 @@ def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, d
     held = _record_class(member)
     if held is not None:
         return _construct(held, fields, dtypes=dtypes)
-    return configured(member(**_arguments(member, fields, dtypes=dtypes)))
+    built = member(**_arguments(member, fields, dtypes=dtypes))
+    # A plain class of Dew's or a trusted package's is the value its record
+    # describes (`to_record` writes it from its constructor's parameters).
+    return built if isinstance(member, type) and _owned(member, called=False) else configured(built)
 
 
 def _key(annotation: Annotation, key: str) -> RecordKey:
