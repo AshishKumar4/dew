@@ -126,8 +126,12 @@ BATTERY = [
 
 
 def _tools(tree: Path, tool: str, newer: Path) -> Path:
-    """The tree's own tools/ where it has `tool`, else the head's (`newer`)."""
-    return tree / "tools" if (tree / "tools" / tool).is_file() else newer
+    """The tree's own tools/ where it has `tool`, else the head's (`newer`), else this file's own
+    directory, where a gate run outside a checkout keeps the tools no tree has yet."""
+    for tools in (tree / "tools", newer, Path(__file__).resolve().parent):
+        if (tools / tool).is_file():
+            return tools
+    return newer
 
 
 def _run(tree: Path, tool: str, argv: list[str], newer: Path, timeout: float) -> str:
