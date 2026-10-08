@@ -1,5 +1,7 @@
 """A file written through dew.files is the old one or the new one, never part of one."""
 
+import os
+import stat
 import threading
 
 import pytest
@@ -48,3 +50,21 @@ def test_a_directory_whose_block_fails_is_not_published(tmp_path):
         (staging / "weights").write_text("half")
         raise RuntimeError("crash")
     assert list(tmp_path.iterdir()) == []
+
+
+def test_what_is_published_has_the_mode_a_plain_write_gives(tmp_path):
+    """Under the usual umask a new file is 0644 and a directory 0755, as
+    open and mkdir make them, and a rewrite keeps the mode the file had."""
+    previous = os.umask(0o022)
+    try:
+        write_atomically(tmp_path / "run.json", "{}")
+        write_atomically(tmp_path / "ledger.json", "{}")
+        with staged(tmp_path / "entry") as staging:
+            (staging / "weights").write_text("w")
+        os.chmod(tmp_path / "run.json", 0o640)
+        write_atomically(tmp_path / "run.json", "{}")
+        (tmp_path / "plain").write_text("{}")
+    finally:
+        os.umask(previous)
+    modes = {path.name: stat.S_IMODE(path.stat().st_mode) for path in tmp_path.iterdir()}
+    assert modes == {"run.json": 0o640, "ledger.json": 0o644, "entry": 0o755, "plain": 0o644}
