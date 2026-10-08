@@ -161,9 +161,9 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     from dew.data import TFDSImages
     from dew.diffusion.presets import Flow
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN, Step
+    from dew.objectives.base import FROZEN, TEACHER, Step
     from dew.objectives.diffusion import ConsistencyDistillationObjective, DiffusionRunConfig, TextCondition
-    from dew.objectives.diffusion.objective import FAKE_SCORE, TEACHER
+    from dew.objectives.diffusion.objective import FAKE_SCORE
     from dew.sampling import Consistency, Euler, TextToImage
     from dew.training import Trainer
 
@@ -284,8 +284,9 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     from dew.data import TFDSImages
     from dew.diffusion.presets import Flow
     from dew.interop.pretrained import load_diffusion_source
+    from dew.objectives.base import TEACHER
     from dew.objectives.diffusion import DiffusionRunConfig
-    from dew.objectives.diffusion.objective import TEACHER, model_part
+    from dew.objectives.diffusion.objective import model_part
 
     with tarfile.open(Path(__file__).resolve().parent / "fixtures" / "flux_source.tar.xz") as archive:
         archive.extractall(tmp_path, filter="data")
@@ -321,9 +322,9 @@ def distilled(monkeypatch, optimizer, prefix=""):
 
     from dew.diffusion import presets
     from dew.inputs import Condition, Field, InputSpec
+    from dew.objectives.base import TEACHER
     from dew.objectives.diffusion import ConsistencyDistillationObjective
     from dew.objectives.diffusion.consistency import _Draws
-    from dew.objectives.diffusion.objective import TEACHER
     from dew.training import Trainer
     from dew.training.posthoc import power_decay
 

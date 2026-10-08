@@ -11,12 +11,12 @@ ids; anything else fails naming the row.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
 from .dataset import Batch, Dataset, DatasetSpec, Tokenize
-from .rows import json_records, parquet_names, parquet_rows, row_dataset
+from .rows import json_records, known_row, parquet_names, parquet_rows, row_dataset
 
 IDS_KEY = "input_ids"
 """Batch key holding the `[B, 2, S]` pair ids, chosen at index 0."""
@@ -69,14 +69,9 @@ class PreferenceSource:
         if seq_len < 1:
             raise ValueError(f"seq_len is {seq_len}: pairs need at least one token")
         normalized: list[tuple[list[int], list[int], list[int], list[int]]] = []
-        for index, row in enumerate(rows):
+        for index, held in enumerate(rows):
             where = f"{origin} row {index}"
-            if not isinstance(row, Mapping):
-                raise ValueError(f"{where}: a row is an object, got {row!r}")
-            unknown = sorted(key for key in row if key not in FIELDS)
-            if unknown:
-                raise ValueError(
-                    f"{where}: unknown fields {unknown}; the fields are {list(FIELDS)}")
+            row = known_row(held, FIELDS, where)
             if row.get("chosen") is None or row.get("rejected") is None:
                 raise ValueError(f"{where}: a pair needs both chosen and rejected ids")
             chosen = _ids(row["chosen"], "chosen", where)

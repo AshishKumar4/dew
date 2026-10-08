@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.coordination import agree_process_phase
+from dew.coordination import agreed
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown
@@ -115,17 +115,8 @@ class SampledRollout:
         group. The returned columns are the batch a GRPO loss reads.
         """
         # Validation completes on every rank before generation enters collectives.
-        prepared = None
-        error = None
-        try:
-            prepared = self._prepared(batch, key)
-        except BaseException as failure:
-            error = failure
-        if mesh_of(state.variables) is not None:
-            agree_process_phase(error, phase="rollout input preparation")
-        elif error is not None:
-            raise error
-        assert prepared is not None
+        prepared = (agreed("rollout input preparation", lambda: self._prepared(batch, key))
+                    if mesh_of(state.variables) is not None else self._prepared(batch, key))
         prompts, prompt_lengths, sources, truths, infos, inputs = prepared
         rows, width = prompts.shape
         policy = self.objective.policy(state.variables, self.sampling)

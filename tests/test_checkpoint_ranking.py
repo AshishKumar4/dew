@@ -241,10 +241,11 @@ def test_aggregate_never_reuses_missing_metrics_and_preserves_first_tracker(tmp_
     first = Value('first', Shown(better='lower'))
     second = Value('second', Shown(better='higher'))
     run = trainer(tmp_path / 'run')
+    from dew.training import EvalSuite
     from dew.training.trainer import _FitPlan
     plan = _FitPlan(data(), 1, 1, 1, 1, None, [first, second], preview=False,
                     best=(Best(lambda m: m[first] - m[second]), Best(second, mode='max', split='val')),
-                    validation=True)
+                    suites={'val': EvalSuite(data().val, (first, second), 1)})
     ranks = run._ranking(plan, {'val/second': .5})
     assert np.isnan(ranks[0].value)
     assert ranks[1].value == .5

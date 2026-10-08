@@ -716,8 +716,6 @@ class TrainerConfig:
             if value.total_seconds() <= 0:
                 raise ValueError("checkpoint_every duration must be positive")
             return value
-        if isinstance(value, str) and value != 'epoch':
-            return duration(value)
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod

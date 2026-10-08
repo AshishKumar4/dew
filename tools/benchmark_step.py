@@ -61,7 +61,7 @@ from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
-from dew.training.trainer import recompute_record
+from dew.training.memory import recompute_record
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import (
