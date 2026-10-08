@@ -95,6 +95,8 @@ uv pip install 'dewml[interop,vision] @ git+https://github.com/AshishKumar4/dew'
 
 The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
+FlashAttention-2 comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax. It is not on PyPI yet: install the wheel the FlashAttention workflow builds with `uv pip install dew_flash_attn_cu13-0.1.0-py3-none-manylinux_2_28_x86_64.whl`. With it installed, `"auto"` runs it on an A100 (sm80) for calls without a window, mask, bias or softcap and heads up to 256 wide (`dew.nn.attention.flash_runs`).
+
 tokamax is not a dependency. With it installed, `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Install it with `uv pip install 'tokamax>=0.0.15'`. Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one breaks every recipe's command line.
 
 ## Development install

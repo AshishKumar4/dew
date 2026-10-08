@@ -38,7 +38,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew.checkpoints import Checkpoints, Ranking
 from dew.coordination import agree_process_phase, agreed
 from dew.data.dataset import Checkpointable, Closeable, DataPartition, Dataset, RampedStream, Reader, rows_of
-from dew.nn.kernels.generation import device_generation
+from dew.nn.kernels.generation import measured_kernel
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -102,7 +102,7 @@ from dew.training.memory import (
     step_compiler_options,
     step_fits,
 )
-from dew.training.narrow import NARROW_COPY_GENERATIONS, narrowed, narrowed_paths
+from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.rungs import keep_rung, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
@@ -1099,7 +1099,7 @@ class Trainer(Generic[Loss, Effects]):
         (`dew.training.narrow`), by path under `params`: on the CUDA
         generations measured to gain, for a step this trainer composes that
         commits every microbatch without a loss scale."""
-        if (device_generation() not in NARROW_COPY_GENERATIONS or self.step is not None
+        if (measured_kernel('narrow_copies', 'off') == 'off' or self.step is not None
                 or self.accumulation != 1 or self.dynamic_scale or FROZEN in state.variables):
             return {}
         variables = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
