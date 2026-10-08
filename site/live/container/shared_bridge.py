@@ -71,7 +71,12 @@ class Context:
             }))
             reply, idle, size = None, False, 0
             while reply is None or not idle:
-                message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
+                try:
+                    message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
+                except TimeoutError:
+                    raise TimeoutError("this cell's Python context sent nothing for 95 seconds, so it "
+                                       "was stopped; the shared host may be busy, so try again in a "
+                                       "minute") from None
                 kind, content = message["msg_type"], message["content"]
                 # The gateway announces a kernel that died, and restarts it, outside any request.
                 if kind == "status" and content["execution_state"] in ("restarting", "dead"):
@@ -154,8 +159,12 @@ class Gateway:
             channels = None
             try:
                 url = f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels"
-                channels = await connect(url, max_size=MAX_OUTPUT,
-                                         additional_headers={"Authorization": "token " + self.token})
+                try:
+                    channels = await connect(url, max_size=MAX_OUTPUT, open_timeout=60,
+                                             additional_headers={"Authorization": "token " + self.token})
+                except TimeoutError:
+                    raise TimeoutError("this cell's Python context did not start within a minute; the "
+                                       "shared host may be busy, so try again in a minute") from None
                 context = Context(kernel["id"], channels)
                 result = await context.execute(kernel["preload"], lambda _: asyncio.sleep(0))
                 if result["status"] != "ok":
