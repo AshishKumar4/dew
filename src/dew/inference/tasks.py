@@ -135,8 +135,10 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
 def decoded_rows(
     processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int
 ) -> tuple[str, ...]:
+    """Each row's `lengths` tokens past `width`, as text: what a task's `decode` and a generation's
+    `text` both return. Without a processor there is no text to return, and it raises."""
     if processor is None:
-        return ()
+        raise ValueError("this generation carries no processor to decode with")
     rows, counts = np.asarray(tokens), np.asarray(lengths)
     return tuple(processor.decode(rows[row:row + 1, width:width + int(counts[row])])[0]
                  for row in range(rows.shape[0]))
@@ -534,7 +536,7 @@ class TextGeneration:
             return replace(_requested(generated, budget, padding), decoder=decoder)
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
-        """Return each row's valid continuation as text, empty without a processor."""
+        """Return each row's valid continuation as text; raises ValueError without a processor."""
         with region("inference.text.decode"):
             rows = generation.host()
             return decoded_rows(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
@@ -630,7 +632,7 @@ class BlockGeneration:
             return replace(generated, decoder=decoder)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
-        """Return each row's valid continuation as text, empty without a processor."""
+        """Return each row's valid continuation as text; raises ValueError without a processor."""
         return _canvas_text(self.processor, generation, "inference.block.decode")
 
 
@@ -739,7 +741,7 @@ class MaskedGeneration:
             return replace(generated, decoder=decoder)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
-        """Return each row's valid response as text, empty without a processor."""
+        """Return each row's valid response as text; raises ValueError without a processor."""
         return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 

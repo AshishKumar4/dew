@@ -52,7 +52,10 @@ def test_a_bound_task_draws_from_the_weights_it_was_bound_to():
     assert_same_generation(task(rows, 5, key=jax.random.key(1)), before)
     greedy = task(ModelInputs(jnp.asarray(rows)), 5, key=jax.random.key(2), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(greedy.behavior_log_probs, 0)
-    assert task.decode(greedy) == ()
+    # Without a processor there is no text: the task's decode refuses as the generation's text does.
+    for decoded in (lambda: task.decode(greedy), lambda: greedy.text):
+        with pytest.raises(ValueError, match="no processor to decode with"):
+            decoded()
 
 
 def test_prepared_rows_and_text_requests_are_kept_apart():
