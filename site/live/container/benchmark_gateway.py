@@ -22,6 +22,17 @@ def dump_processes():
         except OSError:
             pass
 
+def request(path, data=None, method=None):
+    token = pathlib.Path("/run/dew/gateway-token").read_text()
+    body = None if data is None else json.dumps(data).encode()
+    req = urllib.request.Request("http://127.0.0.1:8890" + path, data=body, method=method,
+                                 headers={"Authorization": "token " + token,
+                                          "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=40) as response:
+        raw = response.read()
+        return json.loads(raw) if raw else None
+
+
 def execute(client, code):
     return collect(client, client.execute(code, allow_stdin=False))
 
@@ -40,21 +51,70 @@ def collect(client, message):
             return stdout
 
 
+TRAINING_PROBE = """
+import live_training
+live_training.install()
+import urllib.request
+from pathlib import Path
+try:
+    urllib.request.urlopen("https://huggingface.co", timeout=5)
+except OSError:
+    pass
+else:
+    raise AssertionError("a training context reached the network")
+for path in ("/opt/train/escape", "/opt/live/escape", "/work/../escape"):
+    try:
+        Path(path).write_text("x")
+    except OSError:
+        pass
+    else:
+        raise AssertionError(f"a training context wrote {path}")
+Path("/tmp/inside").write_text("x")
+try:
+    bytearray(7 * 1024 * 1024 * 1024)
+except MemoryError:
+    pass
+else:
+    raise AssertionError("a training context exceeded its memory allowance")
+from dew import Trainer
+from dew.config import OptimConfig
+from dew.data import load
+from dew.nn.backbones import CausalTransformer
+from dew.objectives.lm import LMObjective
+data = load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=32)
+model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
+                          mlp_features=64, max_seq_len=64)
+state = Trainer(LMObjective(model, seq_len=32), OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=1000)
+assert int(state.step) == 20
+from dew.interop import PretrainedDecoder
+from dew.sampling import Sampling
+model = PretrainedDecoder.load("HuggingFaceTB/SmolLM2-135M-Instruct", dtype="float32", max_seq_len=256)
+assert model.text_generation(sampling=Sampling(temperature=0))("ROMEO:", 4, key=0).text[0]
+"""
+
+
+def training():
+    """A training context reaches neither the network nor any path outside its scratch, reads the
+    prepared corpus offline, and says first what its caps changed."""
+    kernel = request("/api/kernels", {"name": "dew-train"})
+    client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
+    client.load_connection_file()
+    client.start_channels()
+    try:
+        client.wait_for_ready(timeout=30)
+        lines = execute(client, TRAINING_PROBE).splitlines()
+        assert lines[0] == "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host.", lines
+        assert lines[1] == ("Live run: steps 1000 -> 20, log_every 100 -> 5, "
+                            "so it finishes in about two minutes."), lines
+    finally:
+        client.stop_channels()
+        request("/api/kernels/" + kernel["id"], method="DELETE")
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("count", type=int, choices=(1, 10, 50))
     args = parser.parse_args()
-    token = pathlib.Path("/run/dew/gateway-token").read_text()
-
-    def request(path, data=None, method=None):
-        body = None if data is None else json.dumps(data).encode()
-        req = urllib.request.Request("http://127.0.0.1:8890" + path, data=body, method=method,
-                                     headers={"Authorization": "token " + token,
-                                              "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=40) as response:
-            raw = response.read()
-            return json.loads(raw) if raw else None
-
     kernels = []
     try:
         for _ in range(min(args.count, 8)):
@@ -202,3 +262,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    training()

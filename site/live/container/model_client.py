@@ -55,7 +55,8 @@ def request(payload):
                 from IPython.display import display
                 if "text" in message:
                     # The text so far, each time the server reads a step's tokens back.
-                    text = {"dew-text": message["text"], "first_token_seconds": message["first_token_seconds"]}
+                    text = {"dew-text": message["text"],
+                            "first_token_seconds": message["first_token_seconds"]}
                     display({"text/plain": json.dumps(text)}, raw=True)
                     continue
                 data = {"text/plain": json.dumps({"dew-progress": message["progress"]})}
