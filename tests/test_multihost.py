@@ -184,8 +184,8 @@ def test_a_checkpoint_directory_on_each_hosts_own_disk_is_refused_on_every_host(
         output = "still running after ten minutes"
     refusal = next((line for line in output.splitlines() if "is not shared" in line), output[-2000:])
     parts = exchange(sequence, [process.returncode, refusal])[:2]
-    assert all(code not in (0, None) and "is not shared: process(es) [1] of 2" in said for code, said in parts), \
-        "\n".join(f"rank {rank} exited {code}: {said}" for rank, (code, said) in enumerate(parts))
+    refused = [code not in (0, None) and "is not shared: process(es) [1] of 2" in said for code, said in parts]
+    assert all(refused), "\n".join(f"rank {rank} exited {code}: {said}" for rank, (code, said) in enumerate(parts))
 
 
 @pytest.mark.distributed
