@@ -291,8 +291,10 @@ def offline(out):
 
     # The cells tokenize into dew's cache, which must not keep these fixtures.
     os.environ["XDG_CACHE_HOME"] = str(out / "cache")
+    # More images than the four validation batches HFImages holds out.
+    images = [Image.new("RGB", (32, 32), (255, 0, 255))] * 320
     tables = {"winglian/tiny-shakespeare": {"text": ["dew trains jax models. " * 100] * 4},
-              "uoft-cs/cifar10": {"img": [Image.new("RGB", (32, 32), (255, 0, 255))] * 8, "label": [0] * 8}}
+              "uoft-cs/cifar10": {"img": images, "label": [0] * len(images)}}
     HFOptions.load = lambda self, path, split, *, streaming: datasets.Dataset.from_dict(tables[path])
     tokenizer_for = dew.data.text.tokenizer_for
     dew.data.text.tokenizer_for = lambda name: tokenizer_for("byte" if name == "Qwen/Qwen3-0.6B" else name)
