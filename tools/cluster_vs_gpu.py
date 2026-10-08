@@ -16,11 +16,11 @@ rank0 and the mesh is the shape's layout over every host's device; on one host, 
 runs on the one device.
 
 The shapes:
-  dense   a 10M-parameter decoder, data parallel.
-  fsdp    a 1.2B-parameter decoder, its parameters and optimizer state sharded over every device
+  dense   a 14M-parameter decoder, data parallel.
+  fsdp    a 1.6B-parameter decoder, its parameters and optimizer state sharded over every device
           (19 GB of fp32 parameters and Adam moments: more than one 12 GiB container holds).
   moe     a decoder of 64 experts, top 2, an expert per device.
-  pipe    a 32-layer decoder in stages over the hosts, 16 microbatches.
+  pipe    a 32-layer decoder in stages over the hosts, 16 microbatches (more than one device).
 
 Rank 0 writes one JSON record: the shape, the platform and its devices, the parameter count, the
 steps run, each step's loss and seconds, the step and the time the target was reached, and
