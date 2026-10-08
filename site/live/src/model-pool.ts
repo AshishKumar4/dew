@@ -35,7 +35,9 @@ export class ModelPool extends DurableObject<Env> {
 	async configure(generation: SnapshotGeneration): Promise<void> {
 		await this.ctx.storage.transaction(async (storage) => {
 			const pool = (await storage.get<Pool>('pool')) ?? { hosts: [], sessions: {} };
-			if (pool.desired?.snapshot.id === generation.snapshot.id) return;
+			// A handoff that arrives after a newer one, or again, changes nothing: RPCs from different
+			// stubs keep no order, and a registry sends a generation again until the pool has it.
+			if (pool.desired && pool.desired.created >= generation.created) return;
 			pool.desired = generation;
 			await storage.put('pool', pool);
 			await storage.setAlarm(Date.now() + 1000);
