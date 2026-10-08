@@ -49,16 +49,12 @@ class AutoEncoder(ABC):
         """
         from .sd_vae import StableDiffusionVAE
         if record['name'] == 'sd_vae':
-            from dew.registry import resolve_dtype
+            from dew.registry import from_record
 
             from .kl import AutoencoderKL
             fields = dict(record['fields'])
-            model = dict(fields.pop('model'))
-            model['dtype'] = resolve_dtype(model['dtype'])
-            for name in ('channels', 'decoder_channels'):
-                if model.get(name) is not None:
-                    model[name] = tuple(model[name])
-            return StableDiffusionVAE(model=AutoencoderKL(**model), params=params, **fields)
+            return StableDiffusionVAE(model=from_record(AutoencoderKL, fields.pop('model')), params=params,
+                                      **fields)
         raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
 
     @abstractmethod

@@ -370,7 +370,8 @@ def to_record(value, annotation) -> JSON:
 
     if isinstance(value, datetime.timedelta):
         return recorded_duration(value)
-    if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
+    if isinstance(value, np.dtype) or (isinstance(value, type)
+                                       and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes')):
         return dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         with recording() as written:

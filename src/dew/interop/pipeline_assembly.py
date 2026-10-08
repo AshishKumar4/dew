@@ -666,7 +666,6 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
     """Build the published autoencoder, its parameters and their source layouts;
     supplied `params` are bound without a weight read, and `lazy` leaves read
     ones `SourceLeaf`s."""
-    from dew.interop import diffusion
     from dew.nn.autoencoders import AutoencoderKL, StableDiffusionVAE
     from dew.nn.autoencoders.vae import _vae_path
 
@@ -680,16 +679,7 @@ def _diffusion_vae(directory: Path, compute, *, param_dtype: str = "float32",
     if config.get("_class_name") == "AutoencoderKLFlux2":
         from dew.nn.autoencoders.flux2 import load_flux2_vae
         return load_flux2_vae(directory, compute, param_dtype=param_dtype, params=params, lazy=lazy)
-    model = AutoencoderKL(
-        channels=tuple(config["block_out_channels"]),
-        latent_channels=config["latent_channels"],
-        image_channels=config["in_channels"],
-        blocks_per_level=config["layers_per_block"],
-        norm_groups=config["norm_num_groups"],
-        quantize=diffusion.flag(config, "use_quant_conv", default=True),
-        post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True),
-        dtype=compute,
-    )
+    model = AutoencoderKL.from_diffusers(config, compute)
     return bind_component(
         directory / "vae", "vae", config, model, _vae_path,
         lambda bound: StableDiffusionVAE(str(directory), dtype=compute, params=bound, model=model,

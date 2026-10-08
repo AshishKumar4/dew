@@ -404,6 +404,27 @@ def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | N
     return rope.theta
 
 
+def plain_partial_rope(hf_config: Mapping[str, object], *, default_factor: float, reference: str,
+                       layout: tuple[str, ...] = ()) -> tuple[float, float]:
+    """(rope_theta, partial_rotary_factor) of a config whose rotary is plain:
+    `rope_parameters` or the flat fields, the entry's value winning, and
+    `layout` the entry's fields that place the rotated pairs. A scaled type
+    or any other field refuses, naming `reference`'s rotary."""
+    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
+    rope_type = entry.get('rope_type', entry.get('type', 'default'))
+    if rope_type not in ('default', 'none'):
+        refuse(f"rope_parameters (rope_type {rope_type!r})", f"{reference} is the plain rotary")
+    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor', *layout})
+    if scaling:
+        refuse(f"rope_parameters scaling fields {scaling}", f"{reference} is the plain rotary")
+    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
+                           'rope_parameters rope_theta')
+    factor = records.number(entry.get('partial_rotary_factor',
+                                      hf_config.get('partial_rotary_factor', default_factor)),
+                            'rope_parameters partial_rotary_factor')
+    return theta, factor
+
+
 @dataclass(frozen=True)
 class Ropes:
     """Holds what the shared rope readers hand a family: the model's base and

@@ -74,7 +74,6 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
     supplied, since they are the latent normalization, not parameters.
     `lazy` leaves the parameters `SourceLeaf`s for a placement to read
     (`dew.interop.weights.record_layouts`)."""
-    from dew.interop import diffusion
     from dew.interop.safetensors_io import read_weights
     from dew.nn.autoencoders.vae import _vae_path
 
@@ -87,19 +86,7 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
     if not config.get("mid_block_add_attention", True) or config.get("act_fn", "silu") != "silu":
         raise ValueError("the port computes the published VAE: SiLU and mid-block attention")
-    model = AutoencoderKL(
-        channels=tuple(config["block_out_channels"]),
-        latent_channels=config["latent_channels"],
-        image_channels=config["in_channels"],
-        blocks_per_level=config["layers_per_block"],
-        norm_groups=config["norm_num_groups"],
-        quantize=diffusion.flag(config, "use_quant_conv", default=True),
-        post_quantize=diffusion.flag(config, "use_post_quant_conv", default=True),
-        decoder_channels=tuple(config["decoder_block_out_channels"])
-        if config.get("decoder_block_out_channels")
-        else None,
-        dtype=compute,
-    )
+    model = AutoencoderKL.from_diffusers(config, compute)
     tensors = read_weights(directory)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)

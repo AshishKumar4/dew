@@ -1,6 +1,8 @@
 """A convolutional variational autoencoder with explicit latent sampling."""
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import jax
 import jax.numpy as jnp
 from flax import linen as nn
@@ -41,6 +43,24 @@ class AutoencoderKL(nn.Module):
     """The decoder's widths where they differ from the encoder's, as a
     distilled decoder's do; None uses `channels`."""
     dtype: Dtype = jnp.float32
+
+    @classmethod
+    def from_diffusers(cls, config: Mapping[str, object], dtype: Dtype) -> AutoencoderKL:
+        """The model a diffusers `AutoencoderKL` config describes, computing in `dtype`."""
+        from dew import records
+        from dew.interop.diffusion import flag
+
+        decoder = config.get("decoder_block_out_channels")
+        return cls(channels=records.integers(config["block_out_channels"], "block_out_channels"),
+                   latent_channels=records.integer(config["latent_channels"], "latent_channels"),
+                   image_channels=records.integer(config["in_channels"], "in_channels"),
+                   blocks_per_level=records.integer(config["layers_per_block"], "layers_per_block"),
+                   norm_groups=records.integer(config["norm_num_groups"], "norm_num_groups"),
+                   quantize=flag(config, "use_quant_conv", default=True),
+                   post_quantize=flag(config, "use_post_quant_conv", default=True),
+                   decoder_channels=(None if not decoder
+                                     else records.integers(decoder, "decoder_block_out_channels")),
+                   dtype=dtype)
 
     @property
     def downscale_factor(self) -> int:
