@@ -14,13 +14,15 @@ from typing import ClassVar
 GIB = 1024 * 1024 * 1024
 INFINITY = resource.RLIM_INFINITY
 # A page cell's context only sends requests to the model process, in a small
-# address space. A training context runs Dew itself, and JAX reserves more
-# address space than it ever touches (11 GiB for the 3.8 GiB fine-tune cell),
-# so its bound is on writable memory instead; the bridge runs one per host.
+# address space. A training context runs Dew itself, and XLA reserves far more
+# than it touches: one step of the page's train.py asks for a 6.2 GB buffer on
+# these hosts and keeps 1.6 GiB resident. Its memory is bounded where it is
+# used instead: the bridge kills the largest guest when the host runs short
+# (shared_bridge.py), and the OOM killer takes guests first (gateway_manager.py).
 PROFILES = {
     "cell": {"address_space": GIB * 3 // 4, "data": INFINITY, "cpu_seconds": 10, "processes": 32,
              "files": 128},
-    "train": {"address_space": INFINITY, "data": 6 * GIB, "cpu_seconds": 600, "processes": 256,
+    "train": {"address_space": INFINITY, "data": INFINITY, "cpu_seconds": 600, "processes": 256,
               "files": 1024},
 }
 
