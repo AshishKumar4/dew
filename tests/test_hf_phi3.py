@@ -62,15 +62,17 @@ def test_greedy_decoding_forwards_the_prompt_once_and_one_token_a_step(monkeypat
     forward = CausalTransformer.hidden_and_mtp_inputs
 
     def counted(self, tokens, *args, **kwargs):
-        widths.append(tokens.shape[1])
+        # A forward run on values; tracing one for its shapes computes nothing.
+        if not isinstance(tokens, jax.core.Tracer):
+            widths.append(tokens.shape[1])
         return forward(self, tokens, *args, **kwargs)
 
     monkeypatch.setattr(CausalTransformer, 'hidden_and_mtp_inputs', counted)
     with jax.disable_jit():
         generate(loaded.model, loaded.variables, ids, budget, key=jax.random.key(0),
                  sampling=Sampling(temperature=0))
-    assert widths[0] == 4 and widths.count(48) == rebuilds, widths
-    assert sorted(widths[1:]) == [1] * budget + [48] * rebuilds, widths
+    said = " ".join(map(str, widths))
+    assert widths[0] == 4 and sorted(widths[1:]) == [1] * budget + [48] * rebuilds, said
 
 
 def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_the_crossing():
