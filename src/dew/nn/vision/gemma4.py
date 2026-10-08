@@ -155,6 +155,8 @@ class Gemma4VisionTransformer(nn.Module):
         metadata = AttentionMetadata(valid=valid, rotary_positions=pixel_position_ids)
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
+        # A block without hyper-connections hands on the plain residual.
+        assert isinstance(hidden_states, jax.Array)
         output_length = pixels.shape[1] // kernel ** 2
         width = safe[..., 0].max(axis=-1, keepdims=True) + 1
         indices = safe[..., 0] // kernel + (width // kernel) * (safe[..., 1] // kernel)

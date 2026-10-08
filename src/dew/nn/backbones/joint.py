@@ -42,8 +42,8 @@ class Modulation(nn.Module):
     def __call__(self, conditioning):
         projected = nn.Dense(self.pieces * self.features, use_bias=self.bias, dtype=self.dtype,
                              precision=self.precision, name="linear",
-                             **({"kernel_init": nn.initializers.zeros} if self.zero_init else {}))(
-            nn.silu(conditioning))
+                             kernel_init=(nn.initializers.zeros if self.zero_init
+                                          else nn.initializers.lecun_normal()))(nn.silu(conditioning))
         return jnp.split(projected, self.pieces, axis=-1)
 
 
