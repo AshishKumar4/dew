@@ -16,10 +16,15 @@ async def main():
     headers = {"Authorization": "Bearer " + secret}
     async with connect(f"ws://127.0.0.1:8888/contexts/{session}/ws", additional_headers=headers) as socket:
         assert json.loads(await socket.recv())["type"] == "ready"
+        # The page's cells, as Dew code the context's model_client stands in for.
         cells = [
-            "task = text_model('HuggingFaceTB/SmolLM2-135M-Instruct')\n"
+            "from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sampling\n"
+            "model = PretrainedDecoder.load('HuggingFaceTB/SmolLM2-135M-Instruct', dtype='float32', "
+            "max_seq_len=256)\n"
+            "task = model.text_generation(sampling=Sampling(temperature=0))\n"
             "print(task('The capital of France is', 24, key=0).text[0])",
-            "pipe = from_pretrained('dewml/hybrid-dit-176m')\n"
+            "from dew.sampling import CFG, DPMSolverMultistep, TextToImage\n"
+            "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m')\n"
             "pipe(['a lake beneath the northern lights'], key=3, steps=15, "
             "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9))).pil()[0]",
         ]
