@@ -4,6 +4,7 @@ import argparse
 import concurrent.futures
 import json
 import pathlib
+import queue
 import re
 import statistics
 import time
@@ -38,14 +39,27 @@ def execute(client, code):
     return collect(client, client.execute(code, allow_stdin=False))
 
 
+class Silent(TimeoutError):
+    """The kernel sent nothing for the timeout; `output` is what it had sent."""
+
+    def __init__(self, output):
+        super().__init__(f"the kernel went silent after: {output[-1500:]!r}")
+        self.output = output
+
+
 def collect(client, message, timeout=30):
     stdout = ""
     while True:
-        result = client.get_iopub_msg(timeout=timeout)
+        try:
+            result = client.get_iopub_msg(timeout=timeout)
+        except queue.Empty:
+            raise Silent(stdout) from None
         if result["parent_header"].get("msg_id") != message:
             continue
         if result["msg_type"] == "stream":
             stdout += result["content"]["text"]
+        if result["msg_type"] in ("display_data", "update_display_data"):
+            stdout += result["content"]["data"].get("text/plain", "") + "\n"
         if result["msg_type"] == "error":
             raise RuntimeError(str(result["content"]))
         if result["msg_type"] == "status" and result["content"]["execution_state"] == "idle":
@@ -134,7 +148,7 @@ def cells():
         print(f"{name} starts; memory {memory()}", flush=True)
         try:
             client.wait_for_ready(timeout=30)
-            output = collect(client, client.execute(code, allow_stdin=False), timeout=400)
+            output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
         except Exception as error:
             raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
                                  f"memory {memory()}") from None
