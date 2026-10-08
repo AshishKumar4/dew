@@ -112,8 +112,9 @@ class JointAttention(nn.Module):
     puts the image first in the joined sequence, and Flux's processor puts
     the context first. Without a context, it is self-attention over the
     image. The rotation is the cosines and sines of every joined token, one
-    angle per channel pair, `[B or 1, S, D // 2]`, and `lengths` is the
-    number of real keys in each row.
+    angle per channel pair, `[B or 1, S, D // 2]`, or of the image's tokens
+    alone, which turn before the join and leave the context as it is (Dew's
+    MM-DiT); `lengths` is the number of real keys in each row.
     """
 
     heads: int

@@ -79,8 +79,8 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     """One encoder layer of CLIP, SigLIP, Llama 4's vision tower or Qwen 3.5's
     as the decoder block runs it: a layer norm with its bias before the
     attention and before the MLP, both residual. The norms take flax's
-    one-pass variance (`decoder_norm`'s 'fast_layer'): torch's exact one
-    reduces twice, which cost SigLIP-so400m's forward 3% on an A100.
+    one-pass variance (`decoder_norm`'s 'fast_layer'), as Dew's towers
+    always ran; torch's exact one reduces twice.
 
     The attention is causal in CLIP's text tower and full elsewhere, with a
     bias on all four maps and `positions` the longest sequence it reads. The
