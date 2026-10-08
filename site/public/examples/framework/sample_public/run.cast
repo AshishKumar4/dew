@@ -1,2 +1,2 @@
-{"version": 2, "width": 96, "height": 200, "timestamp": 1791418454, "env": {"TERM": "xterm-256color"}}
-[136.751197, "o", "{\r\n  \"shape\": [\r\n    1,\r\n    256,\r\n    256,\r\n    3\r\n  ],\r\n  \"image\": \"sample.png\"\r\n}\r\n"]
+{"version": 2, "width": 96, "height": 200, "timestamp": 1791423757, "env": {"TERM": "xterm-256color"}}
+[69.764854, "o", "{\r\n  \"shape\": [\r\n    1,\r\n    256,\r\n    256,\r\n    3\r\n  ],\r\n  \"image\": \"sample.png\"\r\n}\r\n"]
