@@ -1,9 +1,10 @@
 """Encode text with the CLIP towers and the T5 encoder as linen modules.
 
 transformers 5 ships no Flax classes, so the towers are vendored the way
-`dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE: the reference
-layout, each weight read from the checkpoint's safetensors under its
-reference tensor name.
+`dew/nn/autoencoders/vae.py` vendors the Stable Diffusion VAE, each weight
+read from the checkpoint's safetensors under its reference tensor name. Each
+layer is the decoder block every Dew transformer stacks (`DecoderBlock`),
+bidirectional or causal, with the family's norms, biases and activation.
 
 The CLIP port is `openai/clip-vit-large-patch14`, following transformers
 5.16.1 `models/clip/modeling_clip.py`. The text tower is what a diffusion
@@ -31,7 +32,7 @@ import json
 import math
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import NamedTuple, TypedDict
+from typing import Literal, NamedTuple, TypedDict
 
 import jax
 import jax.numpy as jnp
@@ -42,9 +43,11 @@ from flax.typing import Dtype, PrecisionLike
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.weights import ParamTree, translate_parameters
-from dew.nn.activations import activation
-from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, RMSNorm
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
 from dew.nn.conv import Conv
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -63,99 +66,40 @@ class CLIPTowerOutput(NamedTuple):
     pooler_output: jax.Array
 
 
-@logical_axes(
-    {
-        ("q_proj",): ("embed", "heads"),
-        ("k_proj",): ("embed", "kv"),
-        ("v_proj",): ("embed", "kv"),
-        ("out_proj",): ("attention", "embed"),
-    }
-)
-class CLIPAttention(nn.Module):
-    """Self-attention with a bias on all four projections.
+_ACTIVATIONS = {"quick_gelu": "quick_gelu", "gelu_pytorch_tanh": "gelu", "gelu": "gelu_exact"}
+"""A tower's `hidden_act` as the ungated feed-forward names it
+(`dew.nn.activations.UNGATED`): torch's erf GELU for 'gelu'."""
 
-    The text tower is causal and its padding mask is built once by the tower,
-    the way the reference builds one mask for every layer. The vision tower
-    attends over every patch.
+
+def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: bool = False,
+               activation: str = "quick_gelu", eps: float = 1e-5, rotary_axes: tuple[int, ...] | None = None,
+               rotary_pairs: Literal["half", "adjacent"] = "half", rope_theta: float = 10000.0,
+               packed: bool = False, dtype: Dtype | None = None, precision: PrecisionLike = None,
+               name: str | None = None) -> DecoderBlock:
+    """One encoder layer of CLIP, SigLIP, Llama 4's vision tower or Qwen 3.5's
+    as the decoder block runs it: a layer norm with its bias before the
+    attention and before the MLP, both residual.
+
+    The attention is causal in CLIP's text tower and full elsewhere, with a
+    bias on all four maps and `positions` the longest sequence it reads. The
+    vision towers rotate it by their patch grid (`rotary_axes`, Llama 4's in
+    adjacent pairs), and Qwen 3.5's stores its queries, keys and values in one
+    map (`packed`). The MLP is two biased maps around the checkpoint's
+    `hidden_act`, `activation`.
     """
-    hidden_size: int
-    num_heads: int
-    causal: bool
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, features=self.hidden_size,
-                                  dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(name="q_proj")
-        self.k_proj = dense(name="k_proj")
-        self.v_proj = dense(name="v_proj")
-        self.out_proj = dense(name="out_proj")
-
-    def __call__(self, hidden_states, mask=None):
-        batch, length, _ = hidden_states.shape
-        heads = (batch, length, self.num_heads, self.hidden_size // self.num_heads)
-        attended = scaled_dot_product_attention(
-            self.q_proj(hidden_states).reshape(heads),
-            self.k_proj(hidden_states).reshape(heads),
-            self.v_proj(hidden_states).reshape(heads),
-            dtype=self.dtype, precision=self.precision, causal=self.causal, mask=mask)
-        return self.out_proj(attended.reshape(batch, length, self.hidden_size))
-
-
-@logical_axes({("fc1",): ("embed", "mlp"), ("fc2",): ("mlp", "embed")})
-class MLP(nn.Module):
-    """Two biased maps with an activation between: the feed-forward of a CLIP,
-    SigLIP or Llama 4 vision layer, which differ only in the activation.
-    `activation` is the reference's `hidden_act`: 'quick_gelu' (CLIP),
-    'gelu_pytorch_tanh' (SigLIP) or 'gelu' (Llama 4's exact form), computed
-    as `dew.nn.activations.activation` computes it."""
-    hidden_size: int
-    intermediate_size: int
-    activation: str = "quick_gelu"
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=True,
-                                  dtype=self.dtype, precision=self.precision)
-        self.fc1 = dense(self.intermediate_size, name="fc1")
-        self.fc2 = dense(self.hidden_size, name="fc2")
-
-    def __call__(self, hidden_states):
-        if self.activation not in ("quick_gelu", "gelu_pytorch_tanh", "gelu"):
-            raise ValueError(
-                f"activation {self.activation!r} is not expressible: this MLP "
-                "runs quick_gelu, gelu_pytorch_tanh or gelu")
-        return self.fc2(activation(self.activation)(self.fc1(hidden_states)))
-
-
-class CLIPEncoderLayer(nn.Module):
-    """One layer: pre-norm attention, then pre-norm MLP, both with residuals."""
-    hidden_size: int
-    num_heads: int
-    intermediate_size: int
-    causal: bool
-    layer_norm_eps: float = 1e-5
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    activation: str = "quick_gelu"
-
-    def setup(self):
-        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
-                                 dtype=self.dtype)
-        self.layer_norm1 = norm(name="layer_norm1")
-        self.self_attn = CLIPAttention(
-            self.hidden_size, self.num_heads, self.causal, dtype=self.dtype,
-            precision=self.precision, name="self_attn")
-        self.layer_norm2 = norm(name="layer_norm2")
-        self.mlp = MLP(self.hidden_size, self.intermediate_size, activation=self.activation,
-                       dtype=self.dtype, precision=self.precision, name="mlp")
-
-    def __call__(self, hidden_states, mask=None):
-        hidden_states = hidden_states + self.self_attn(
-            self.layer_norm1(hidden_states), mask)
-        return hidden_states + self.mlp(self.layer_norm2(hidden_states))
+    if activation not in _ACTIVATIONS:
+        raise ValueError(f"activation {activation!r} is not expressible: this layer runs "
+                         f"{', '.join(_ACTIVATIONS)}")
+    attention = functools.partial(
+        CausalSelfAttention, emb_features=width, num_heads=heads, num_kv_heads=heads, head_dim=width // heads,
+        max_seq_len=positions, causal=causal, nope=rotary_axes is None, qk_norm=False, attention_bias=True,
+        rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, rope_theta=rope_theta, packed=packed,
+        dtype=dtype, precision=precision)
+    mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width,
+                            activation=_ACTIVATIONS[activation], use_bias=True, dtype=dtype,
+                            precision=precision)
+    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type="layer", norm_bias=True,
+                        dtype=dtype, precision=precision, name=name)
 
 
 @logical_axes({("token_embedding",): ("vocab", "embed"), ("position_embedding",): (None, "embed")})
@@ -185,10 +129,10 @@ class CLIPTextTransformer(nn.Module):
         self.position_embedding = embed(self.max_position_embeddings,
                                         name="position_embedding")
         self.layers = [
-            CLIPEncoderLayer(
-                self.hidden_size, self.num_heads, self.intermediate_size, causal=True,
-                layer_norm_eps=self.layer_norm_eps, dtype=self.dtype, activation=self.activation,
-                precision=self.precision, name=f"layers_{index}")
+            clip_layer(self.hidden_size, self.num_heads, self.intermediate_size,
+                       self.max_position_embeddings, causal=True, activation=self.activation,
+                       eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision,
+                       name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.final_layer_norm = LayerNorm(
             epsilon=self.layer_norm_eps, dtype=self.dtype, name="final_layer_norm")
@@ -203,11 +147,10 @@ class CLIPTextTransformer(nn.Module):
 
         hidden_states = (self.token_embedding(input_ids)
                          + self.position_embedding(jnp.arange(length)))
-        mask = None
-        if attention_mask is not None:
-            mask = jnp.asarray(attention_mask)[:, None, None, :] != 0
+        metadata = None if attention_mask is None else AttentionMetadata(
+            valid=jnp.asarray(attention_mask) != 0)
         for layer in self.layers:
-            hidden_states = layer(hidden_states, mask)
+            hidden_states = layer(hidden_states, attention_metadata=metadata)
         hidden_states = self.final_layer_norm(hidden_states)
 
         if self.eos_token_id == 2:
@@ -260,10 +203,9 @@ class CLIPVisionTransformer(nn.Module):
                                  dtype=self.dtype)
         self.pre_layernorm = norm(name="pre_layernorm")
         self.layers = [
-            CLIPEncoderLayer(
-                self.hidden_size, self.num_heads, self.intermediate_size, causal=False,
-                layer_norm_eps=self.layer_norm_eps, dtype=self.dtype,
-                precision=self.precision, name=f"layers_{index}")
+            clip_layer(self.hidden_size, self.num_heads, self.intermediate_size, patches + 1,
+                       eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision,
+                       name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.post_layernorm = norm(name="post_layernorm")
 
@@ -287,6 +229,8 @@ class CLIPVisionTransformer(nn.Module):
         hidden_states = self.pre_layernorm(hidden_states)
         for layer in self.layers:
             hidden_states = layer(hidden_states)
+        # A block without hyper-connections hands on the plain residual.
+        assert isinstance(hidden_states, jax.Array)
         return CLIPTowerOutput(hidden_states, self.post_layernorm(hidden_states[:, 0]))
 
 
@@ -400,8 +344,10 @@ def translate_clip_config(hf_config: Mapping[str, object]) -> CLIPFields:
     }
 
 
-_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "out_proj")
-_NORMS = ("layer_norm1", "layer_norm2")
+# CLIP's layer names, as `clip_layer`'s decoder block names them.
+_NORMS = {"layer_norm1": "input_layernorm", "layer_norm2": "post_attention_layernorm"}
+_PROJECTIONS = {"q_proj": "q_proj", "k_proj": "k_proj", "v_proj": "v_proj", "out_proj": "o_proj"}
+_MLP = {"fc1": "up_proj", "fc2": "down_proj"}
 
 # A tower's tensors outside its encoder layers. The reference spells the
 # vision tower's first norm `pre_layrnorm`.
@@ -430,19 +376,21 @@ _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projectio
                           "logit_scale")
 
 
-def _encoder_layer_path(parts, root: str, norms: tuple[str, ...],
-                        projections: tuple[str, ...]) -> tuple[str, ...] | None:
-    """`<root>.layers.N...` into the path of a CLIP-style encoder layer: two
-    layer norms, biased attention maps and a biased fc1/fc2 MLP."""
+def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
+                        projections: Mapping[str, str] = _PROJECTIONS) -> tuple[str, ...] | None:
+    """`<root>.layers.N...` into the path of a `clip_layer`: two layer norms,
+    biased attention maps and a biased fc1/fc2 MLP, each source name mapped
+    by `norms` or `projections` (CLIP's by default) or onto the MLP's up and
+    down maps."""
     if (len(parts) < 5 or parts[:2] != [root, "layers"] or not parts[2].isdigit()
             or parts[-1] not in ("weight", "bias")):
         return None
     layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
     if len(parts) == 5 and module in norms:
-        return (layer, module, "scale" if leaf == "weight" else "bias")
-    if len(parts) == 6 and ((module == "self_attn" and parts[4] in projections)
-                            or (module == "mlp" and parts[4] in ("fc1", "fc2"))):
-        return (layer, module, parts[4], "kernel" if leaf == "weight" else "bias")
+        return (layer, norms[module], "scale" if leaf == "weight" else "bias")
+    names = projections if module == "self_attn" else _MLP if module == "mlp" else {}
+    if len(parts) == 6 and parts[4] in names:
+        return (layer, module, names[parts[4]], "kernel" if leaf == "weight" else "bias")
     return None
 
 
@@ -458,7 +406,7 @@ def _tower_path(hf_name: str, prefix: str,
     name = hf_name.removeprefix(prefix)
     if name == "embeddings.position_ids":
         return None
-    path = tensors.get(name) or _encoder_layer_path(name.split("."), "encoder", _NORMS, _PROJECTIONS)
+    path = tensors.get(name) or _encoder_layer_path(name.split("."), "encoder")
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
@@ -692,164 +640,11 @@ def _t5_relative_position_bucket(relative_position, num_buckets, max_distance):
     return relative_buckets + jnp.where(is_small, relative_position, large)
 
 
-@logical_axes(
-    {
-        ("q_proj",): ("embed", "heads"),
-        ("k_proj",): ("embed", "kv"),
-        ("v_proj",): ("embed", "kv"),
-        ("out_proj",): ("attention", "embed"),
-        ("rel_bias",): (None, "heads"),
-    }
-)
-class T5SelfAttention(nn.Module):
-    """Multi-head self-attention with the relative position bias, no causal
-    mask and no 1/sqrt(d) scale, modeling_t5.py `T5Attention` as the encoder
-    runs it.
-
-    dew's kernel path scales the query by 1/sqrt(head_dim), so the query
-    carries sqrt(head_dim) to cancel it; mathematically exact, and the parity
-    test states what the fp32 rounding costs. The bias table rides the
-    kernel's additive bias and the padding the boolean mask. In T5 only
-    layer 0 holds the table, as `T5Block(..., has_relative_attention_bias=
-    bool(i == 0))` does upstream, and every later layer reuses layer 0's
-    bias; in UMT5 every layer holds and reads its own.
-    """
-    num_heads: int
-    head_dim: int
-    d_model: int
-    has_relative_attention_bias: bool = True
-    num_buckets: int = 32
-    max_distance: int = 128
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision)
-        inner = self.num_heads * self.head_dim
-        self.q_proj = dense(inner, name="q_proj")
-        self.k_proj = dense(inner, name="k_proj")
-        self.v_proj = dense(inner, name="v_proj")
-        self.out_proj = dense(self.d_model, name="out_proj")
-        if self.has_relative_attention_bias:
-            self.rel_bias = nn.Embed(self.num_buckets, self.num_heads, name="rel_bias")
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
-
-    def __call__(self, hidden_states, attention_mask=None, position_bias=None,
-                 train: bool = False):
-        batch, length, _ = hidden_states.shape
-        heads = (batch, length, self.num_heads, self.head_dim)
-        query = self.q_proj(hidden_states).reshape(heads) * math.sqrt(self.head_dim)
-        key = self.k_proj(hidden_states).reshape(heads)
-        value = self.v_proj(hidden_states).reshape(heads)
-        if position_bias is None:
-            relative = (jnp.arange(length)[None, :] - jnp.arange(length)[:, None])
-            buckets = _t5_relative_position_bucket(relative, self.num_buckets, self.max_distance)
-            position_bias = jnp.transpose(self.rel_bias(buckets), (2, 0, 1))[None]
-        mask = None
-        if attention_mask is not None:
-            mask = jnp.asarray(attention_mask)[:, None, None, :] != 0
-        attended = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            mask=mask, bias=position_bias)
-        attended = self.out_proj(attended.reshape(batch, length, -1))
-        return self.dropout(attended, deterministic=not train), position_bias
-
-@logical_axes({("wi",): ("embed", "mlp"), ("wo",): ("mlp", "embed")})
-class T5DenseReluDense(nn.Module):
-    """wi, relu, wo, modeling_t5.py `T5DenseReluDense`."""
-    d_ff: int
-    d_model: int
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision)
-        self.wi = dense(self.d_ff, use_bias=False, name="wi")
-        self.wo = dense(self.d_model, use_bias=False, name="wo")
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
-
-    def __call__(self, hidden_states, train: bool = False):
-        hidden_states = self.wi(hidden_states)
-        hidden_states = jax.nn.relu(hidden_states)
-        hidden_states = self.dropout(hidden_states, deterministic=not train)
-        return self.wo(hidden_states)
-
-@logical_axes({("wi_0",): ("embed", "mlp"), ("wi_1",): ("embed", "mlp"), ("wo",): ("mlp", "embed")})
-class T5DenseGatedGeluDense(nn.Module):
-    """wi_0 through gelu times wi_1, then wo, modeling_t5.py
-    `T5DenseGatedGeluDense`, the T5 v1.1 feed-forward SD3.5 and Flux run."""
-    d_ff: int
-    d_model: int
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision)
-        self.wi_0 = dense(self.d_ff, use_bias=False, name="wi_0")
-        self.wi_1 = dense(self.d_ff, use_bias=False, name="wi_1")
-        self.wo = dense(self.d_model, use_bias=False, name="wo")
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
-
-    def __call__(self, hidden_states, train: bool = False):
-        # transformers' `NewGELUActivation`, 0.5 x (1 + tanh(sqrt(2/pi) (x +
-        # 0.044715 x^3))). The erf GELU rounds differently once |x| passes 5
-        # (4.7e-4 apart at |x| = 11 in fp32, against `ACT2FN["gelu_new"]`).
-        hidden_states = jax.nn.gelu(self.wi_0(hidden_states), approximate=True) * self.wi_1(hidden_states)
-        hidden_states = self.dropout(hidden_states, deterministic=not train)
-        return self.wo(hidden_states)
-
-
-class T5Block(nn.Module):
-    """One encoder layer: pre-norm self-attention, then pre-norm
-    feed-forward, both residual with dropout after, modeling_t5.py
-    `T5LayerSelfAttention` and `T5LayerFF`."""
-    d_model: int
-    d_ff: int
-    num_heads: int
-    head_dim: int
-    has_relative_attention_bias: bool = False
-    num_buckets: int = 32
-    max_distance: int = 128
-    feed_forward_proj: str = "relu"
-    dropout_rate: float = 0.0
-    layer_norm_epsilon: float = 1e-6
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        # modeling_t5.py `T5LayerNorm`: RMS with no mean and no bias. With
-        # fp32 weights it scales before any cast.
-        self.attn_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="attn_norm")
-        self.self_attn = T5SelfAttention(
-            self.num_heads, self.head_dim, self.d_model,
-            self.has_relative_attention_bias, self.num_buckets,
-            self.max_distance, self.dropout_rate,
-            dtype=self.dtype, precision=self.precision, name="self_attn")
-        self.mlp_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="mlp_norm")
-        if self.feed_forward_proj == "relu":
-            feedforward = T5DenseReluDense
-        elif self.feed_forward_proj == "gated-gelu":
-            feedforward = T5DenseGatedGeluDense
-        else:
-            raise ValueError(
-                f"feed_forward_proj {self.feed_forward_proj!r} is not a T5 "
-                "feed-forward this tower implements; 'relu' and 'gated-gelu' are")
-        self.mlp = feedforward(self.d_ff, self.d_model, self.dropout_rate,
-                               dtype=self.dtype, precision=self.precision, name="mlp")
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
-
-    def __call__(self, hidden_states, attention_mask=None, position_bias=None,
-                 train: bool = False):
-        attended, position_bias = self.self_attn(
-            self.attn_norm(hidden_states), attention_mask, position_bias, train)
-        hidden_states = hidden_states + self.dropout(attended, deterministic=not train)
-        fed = self.mlp(self.mlp_norm(hidden_states), train)
-        return (hidden_states + self.dropout(fed, deterministic=not train),
-                position_bias)
+_T5_FEED_FORWARDS = {"relu": "relu", "gated-gelu": "geglu"}
+"""T5's `feed_forward_proj` as the decoder block's feed-forward names it:
+`T5DenseReluDense`'s wi, relu and wo, or T5 v1.1's `T5DenseGatedGeluDense`,
+whose tanh GELU (transformers' `NewGELUActivation`) gates wi_1 by wi_0, the
+feed-forward SD3.5 and Flux run."""
 
 
 @logical_axes({("embed_tokens",): ("vocab", "embed")})
@@ -858,7 +653,23 @@ class T5EncoderTransformer(nn.Module):
     bidirectional relative-bias attention and feed-forward, a final RMS norm,
     modeling_t5.py `T5Stack` as `T5EncoderModel` runs it, or modeling_umt5.py
     `UMT5Stack` as `UMT5EncoderModel` runs it with `per_layer_bias`. Returns
-    the last hidden states; there is no pooled row."""
+    the last hidden states; there is no pooled row.
+
+    Each layer is the decoder block (`DecoderBlock`) with T5's RMS norm
+    (`T5LayerNorm`, no mean and no bias), bias-free maps, no causal mask and
+    no 1/sqrt(d) scale: the query carries sqrt(head_dim), which the kernel's
+    own scale cancels, mathematically exact, and the parity test states what
+    the fp32 rounding costs. The relative position table rides the kernel's
+    additive bias (`AttentionMetadata.position_bias`), the padding its
+    validity. T5 keeps one table, layer 0's (`T5Block(...,
+    has_relative_attention_bias=bool(i == 0))` upstream), which every layer
+    reads; UMT5 keeps one per layer.
+
+    With `train`, `dropout_rate` drops where the reference drops: the
+    embeddings, the attention probabilities (`T5Attention`), each block's two
+    residual branches (`T5LayerSelfAttention`, `T5LayerFF`), the
+    feed-forward's activated units (`T5DenseActDense`) and the final states.
+    """
     vocab_size: int = 32128
     d_model: int = 512
     d_ff: int = 1024
@@ -878,28 +689,41 @@ class T5EncoderTransformer(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
+        if self.feed_forward_proj not in _T5_FEED_FORWARDS:
+            raise ValueError(
+                f"feed_forward_proj {self.feed_forward_proj!r} is not a T5 "
+                "feed-forward this tower implements; 'relu' and 'gated-gelu' are")
         self.embed_tokens = nn.Embed(self.vocab_size, self.d_model, name="embed_tokens")
+        self.relative_attention_bias = [
+            nn.Embed(self.num_buckets, self.num_heads, name=f"relative_attention_bias_{index}")
+            for index in range(self.num_layers if self.per_layer_bias else 1)]
+        attention = functools.partial(
+            CausalSelfAttention, emb_features=self.d_model, num_heads=self.num_heads,
+            num_kv_heads=self.num_heads, head_dim=self.head_dim, max_seq_len=0, causal=False, nope=True,
+            qk_norm=False, attention_scale=1.0, attention_dropout_rate=self.dropout_rate, dtype=self.dtype,
+            precision=self.precision)
+        mlp = functools.partial(GatedMLP, hidden_features=self.d_ff, out_features=self.d_model,
+                                activation=_T5_FEED_FORWARDS[self.feed_forward_proj],
+                                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision)
         self.layers = [
-            T5Block(self.d_model, self.d_ff, self.num_heads, self.head_dim,
-                    index == 0 or self.per_layer_bias, self.num_buckets, self.max_distance,
-                    self.feed_forward_proj, self.dropout_rate, self.layer_norm_epsilon,
-                    dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
+            DecoderBlock(attention, mlp, self.d_model, BlockWiring(), norm_eps=self.layer_norm_epsilon,
+                         dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
+                         name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.final_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="final_layer_norm")
         self.dropout = nn.Dropout(rate=self.dropout_rate)
 
     def __call__(self, input_ids, attention_mask=None, train: bool = False):
-        hidden_states = self.embed_tokens(jnp.asarray(input_ids))
-        hidden_states = self.dropout(hidden_states, deterministic=not train)
-        mask = None
-        if attention_mask is not None:
-            mask = jnp.asarray(attention_mask)
-        position_bias = None
-        for layer in self.layers:
-            hidden_states, shared = layer(hidden_states, mask, position_bias, train)
-            position_bias = None if self.per_layer_bias else shared
-        hidden_states = self.final_norm(hidden_states)
-        return self.dropout(hidden_states, deterministic=not train)
+        hidden_states = self.dropout(self.embed_tokens(jnp.asarray(input_ids)), deterministic=not train)
+        length = hidden_states.shape[1]
+        buckets = _t5_relative_position_bucket(
+            jnp.arange(length)[None, :] - jnp.arange(length)[:, None], self.num_buckets, self.max_distance)
+        tables = [jnp.transpose(table(buckets), (2, 0, 1))[None] for table in self.relative_attention_bias]
+        valid = None if attention_mask is None else jnp.asarray(attention_mask) != 0
+        for index, layer in enumerate(self.layers):
+            metadata = AttentionMetadata(valid=valid, position_bias=tables[index % len(tables)])
+            hidden_states = layer(hidden_states, train, attention_metadata=metadata)
+        return self.dropout(self.final_norm(hidden_states), deterministic=not train)
 
 
 def translate_t5_config(hf_config: Mapping[str, object]) -> NativeFields[T5EncoderTransformer]:
@@ -925,8 +749,9 @@ def translate_t5_config(hf_config: Mapping[str, object]) -> NativeFields[T5Encod
 
 # The names a published T5 stores its one tied token embedding under.
 _T5_EMBEDDING = ("shared.weight", "encoder.embed_tokens.weight")
-_T5_PROJECTIONS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "out_proj"}
-_T5_WIDTHS = {"wi", "wi_0", "wi_1", "wo"}
+_T5_PROJECTIONS = {"q": "q_proj", "k": "k_proj", "v": "v_proj", "o": "o_proj"}
+# T5's feed-forward maps as the decoder block's `GatedMLP` names them.
+_T5_WIDTHS = {"wi": "up_proj", "wi_0": "gate_proj", "wi_1": "up_proj", "wo": "down_proj"}
 
 
 def _t5_path(hf_name: str) -> tuple[str, ...] | None:
@@ -938,7 +763,8 @@ def _t5_path(hf_name: str) -> tuple[str, ...] | None:
     names map to it and both are bound for export, and `t5_embedding` checks
     that a file carrying two copies carries the same one. The decoder and the
     lm_head are not this tower and come back as None; any other name raises
-    ValueError with the tensor name.
+    ValueError with the tensor name. A block's relative position table is the
+    stack's table of that index.
     """
     if hf_name in _T5_EMBEDDING:
         return ("embed_tokens", "embedding")
@@ -954,14 +780,14 @@ def _t5_path(hf_name: str) -> tuple[str, ...] | None:
             if len(rest) == 5 and rest[3] in _T5_PROJECTIONS:
                 return (*layer, "self_attn", _T5_PROJECTIONS[rest[3]], "kernel")
             if rest[3:] == ["relative_attention_bias", "weight"]:
-                return (*layer, "self_attn", "rel_bias", "embedding")
+                return (f"relative_attention_bias_{parts[2]}", "embedding")
         elif rest[:2] == ["layer", "0"] and rest[2] == "layer_norm" and len(rest) == 4:
-            return (*layer, "attn_norm", "scale")
+            return (*layer, "input_layernorm", "scale")
         elif rest[:2] == ["layer", "1"] and rest[2] in ("DenseReluDense", "DenseGatedGeluDense"):
             if len(rest) == 5 and rest[3] in _T5_WIDTHS:
-                return (*layer, "mlp", rest[3], "kernel")
+                return (*layer, "mlp", _T5_WIDTHS[rest[3]], "kernel")
         elif rest[:2] == ["layer", "1"] and rest[2] == "layer_norm" and len(rest) == 4:
-            return (*layer, "mlp_norm", "scale")
+            return (*layer, "post_attention_layernorm", "scale")
     raise ValueError(f"unknown tensor name {hf_name!r}")
 
 

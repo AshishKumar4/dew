@@ -1,18 +1,15 @@
 """Conditional convolutional UNet for SD1/2 and SDXL latent denoising."""
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
-import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.typing import DTypeLike
 
 from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
-from dew.nn.blocks import ResidualBlock, torch_nearest_resize
+from dew.nn.blocks import ResidualBlock, sinusoidal_time, torch_nearest_resize
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import HEADS, constrain, logical_axes, split_positions
@@ -35,28 +32,6 @@ class UNetStage:
     depth: int = 1
     cross_attention: bool = True
     cross_only: bool = False
-
-
-def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
-    """Embed a scalar timestep as `features` sinusoids: `[B]` to `[B, features]`,
-    computed in `dtype` (`at_least_fp32` of the model's).
-
-    `cosine_first` puts the cosines in the leading half, as SD1/2 and SDXL
-    store them. `shift` moves the lowest frequency, the reference's
-    `freq_shift`.
-    """
-    half = features // 2
-    if features % 2 or half <= shift:
-        raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    # Scale the whole exponent before dividing, as the published models do;
-    # the other order moves a sine by 1e-5 near timestep 1000. Take exp on
-    # the host in float64 so the table does not vary with the backend.
-    width = np.dtype(dtype).type
-    exponent = np.arange(half, dtype=width) * width(-math.log(10000.0)) / width(half - shift)
-    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(width))
-    phase = jnp.asarray(time, width).reshape(-1, 1) * frequencies[None]
-    first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
-    return jnp.concatenate([first, second], axis=-1)
 
 
 class _TimeMLP(nn.Module):

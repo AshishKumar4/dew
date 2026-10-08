@@ -24,8 +24,8 @@ repo being gated), against `SD3Transformer2DModel.__init__` in diffusers
   table and crops it to the sampled resolution. `SimpleMMDiT` uses RoPE, so
   its tree holds no `pos_embed.pos_embed`.
 - `dual_attention_layers`: an extra image-stream self-attention in the
-  layers it names, null in 3.5-large and set in 3.5-medium. `MMDiTBlock` has
-  one attention per stream.
+  layers it names, null in 3.5-large and set in 3.5-medium. `SimpleMMDiT`
+  builds its blocks without it.
 
 What does line up: `in_channels` 16 and `patch_size` 2 are what this test
 runs, `caption_projection_dim` is `emb_features` through `txt_embed`,

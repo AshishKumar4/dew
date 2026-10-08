@@ -293,7 +293,7 @@ source lines:
 - The 151936-word head and its loss take about 27 ms in both frameworks.
 - The rotary embedding ran as separate passes: `rotate_half`'s slice and
   negate, the fp32 converts around it, and the split, about 18 ms a step
-  against MaxText's 1.5. `dew.nn.rope.apply_rotary` now rotates the halves
+  against MaxText's 1.5. `dew.nn.rope.rotate` now rotates the halves
   as `x1 cos - x2 sin` and `x2 cos + x1 sin` without the rotated copy.
   Two rounds alternating at integration `a906f011` put Qwen3-0.6B at 140.5-140.7
   ms against 145.5-145.6 (MFU 27.2% against 26.3%), and Qwen3-1.7B at
