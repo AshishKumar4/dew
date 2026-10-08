@@ -114,10 +114,11 @@ test('homepage text and diffusion cells run at once in their own contexts of one
 			sent.push(message);
 			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
 			if (message.cell === 'text') {
-				reply({ type: 'display', text: JSON.stringify({ 'dew-progress': { stage: 'generate', first: false } }) });
+				reply({ type: 'display', text: JSON.stringify({ 'dew-text': ' Par', first_token_seconds: 0.25 }) });
 				// The text cell finishes only after the image cell has run.
 				text.promise.then(() => {
-					reply({ type: 'stream', name: 'stdout', text: 'Paris.\n' });
+					reply({ type: 'display', text: JSON.stringify({ 'dew-text': ' Paris.', first_token_seconds: 0.25 }) });
+					reply({ type: 'stream', name: 'stdout', text: ' Paris.\n' });
 					reply({ type: 'done', status: 'ok', count: 1 });
 				});
 			} else {
@@ -136,9 +137,11 @@ test('homepage text and diffusion cells run at once in their own contexts of one
 	await page.locator('[data-run]').dispatchEvent('click');
 	await page.locator('[data-final]').waitFor({ state: 'visible' });
 	assert.match(await page.locator('[data-text-status]').textContent(), /^Generating/);
+	assert.equal((await page.locator('[data-text-output]').textContent()).trim(), 'Par');
 	text.resolve();
 	await page.waitForFunction(() => document.querySelector('[data-text-status]').textContent.startsWith('Generated in'));
 	assert.equal((await page.locator('[data-text-output]').textContent()).trim(), 'Paris.');
+	assert.match(await page.locator('[data-text-status]').textContent(), /first token came 0\.25 s after/);
 	assert.equal(requests, 1);
 	assert.deepEqual(sent.map((message) => message.cell), ['text', 'image']);
 	assert.equal(sent[0].code, edited);

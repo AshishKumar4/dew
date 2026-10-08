@@ -65,20 +65,26 @@ const { cell, recorded } = Astro.props;
 				if (stopping) throw new Error('Stopped.');
 				const started = performance.now();
 				setPhase('Generating');
+				// The server streams the text so far; the cell then prints all of it, which is already shown.
+				const streamed = document.createElement('pre');
+				let first: number | undefined;
 				const result = await session.run(editor.value, (message) => {
-					if (message.type === 'display' && message.text) {
-						try {
-							const progress = JSON.parse(message.text)['dew-progress'];
-							if (progress?.stage === 'load') { setPhase(`Loading ${progress.model}`); return; }
-							if (progress?.stage === 'generate') { setPhase(progress.first ? 'Compiling the first generation' : 'Generating'); return; }
-						} catch { /* Ordinary text output, not a progress report. */ }
+					if (message.type === 'display' && message.text?.startsWith('{"dew-text"')) {
+						const packet = JSON.parse(message.text);
+						first ??= packet.first_token_seconds;
+						streamed.textContent = packet['dew-text'];
+						if (!streamed.isConnected) output.append(streamed);
+						return;
 					}
+					if (message.type === 'stream' && message.text.trimEnd() === streamed.textContent?.trimEnd()) return;
 					renderOutput(output, message);
 				}, 'text');
 				window.clearInterval(timer);
+				const seconds = ((performance.now() - started) / 1000).toFixed(1);
 				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
-					: result.status === 'ok' ? `Generated in ${((performance.now() - started) / 1000).toFixed(1)} s.`
-					: 'The cell stopped with an error.';
+					: result.status !== 'ok' ? 'The cell stopped with an error.'
+					: first === undefined ? `Generated in ${seconds} s.`
+					: `Generated in ${seconds} s; the first token came ${first.toFixed(2)} s after the request.`;
 			} catch (error) {
 				status.textContent = error instanceof Error ? error.message : String(error);
 			} finally {
