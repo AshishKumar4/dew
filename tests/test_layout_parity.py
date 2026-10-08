@@ -64,3 +64,15 @@ def test_a_changed_benchmark_owner_refuses_the_cached_reference(tmp_path, monkey
         assert path.exists()
     finally:
         tool.source_digest.cache_clear()
+
+
+def test_a_canvas_objective_is_compared_without_reassociating_its_rows(monkeypatch):
+    """DiffusionGemma's canvas draws its noise by row, so reordering the
+    batch changes its step and is not a reassociation; a next-token
+    objective's rows are interchangeable."""
+    monkeypatch.syspath_prepend(str(TOOLS))
+    tool = importlib.import_module("layout_parity")
+    cases = importlib.import_module("benchmark_cases")
+    assert tool.reassociates(cases.Case("causal_transformer", seq_len=2))
+    assert not tool.reassociates(cases.Case("diffusion_gemma", seq_len=2,
+                                            canvas={"prompt_length": 16, "canvas_size": 8}))

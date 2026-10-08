@@ -575,7 +575,7 @@ def _stream(name: str, split: str, *, options: HFOptions,
     where = f"{name!r} split {split!r}" if dataset is None else "the given dataset"
 
     def stream(partition: DataPartition) -> Iterator[Batch]:
-        source = HFRows(open_split, what=where, seed=seed, rank=partition.index,
+        source = HFRows(open_split, where=where, seed=seed, rank=partition.index,
                         world_size=partition.count,
                         shuffle_buffer=shuffle_buffer, epochs=epochs,
                         given=dataset is not None)

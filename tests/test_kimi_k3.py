@@ -129,6 +129,14 @@ def test_situ_matches_the_released_activation():
     np.testing.assert_allclose(np.asarray(actual), reference["situ"], rtol=2e-6, atol=1e-6)
 
 
+def test_situ_computes_its_formula_for_a_beta_of_either_sign():
+    """`beta * tanh(x / beta)` is even in beta, and the released formula
+    holds no sign: a negative beta is computed, not refused."""
+    gate, up = jnp.asarray([-2.0, 1.0]), jnp.asarray([3.0, -4.0])
+    np.testing.assert_allclose(np.asarray(Situ(-4.0, -25.0)(gate, up)), np.asarray(Situ(4.0, 25.0)(gate, up)),
+                               rtol=1e-6, atol=1e-6)
+
+
 def test_forward_matches_the_reference_over_left_padding(source):
     """fp32 logits over 70 tokens (past one KDA chunk), one row left-padded
     by 9, against fla 0.5.2 on CUDA with its intra-chunk solve in IEEE fp32

@@ -326,6 +326,19 @@ def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=seed))
 
 
+def test_a_step_donates_the_slot_matrices_and_rewrites_the_vectors():
+    """XLA copies a donated buffer that is read after the output is written,
+    as every cursor, step count and active flag is, so a step donates only
+    the matrices: the resident half holds the cache, tokens and validity,
+    the carried half each row's vectors."""
+    server = Server.from_task(task(Sampling(temperature=0, eos_id=None)), slots=2, capacity=64)
+    resident, carried = server._resident, server._carried
+    assert jax.tree.leaves(resident) and all(leaf.ndim >= 2 for leaf in jax.tree.leaves(resident))
+    assert all(leaf.ndim < 2 for leaf in jax.tree.leaves(carried))
+    for name in ("step", "budget", "active"):
+        assert getattr(resident, name) is None and getattr(carried, name) is not None
+
+
 def test_a_step_without_admission_draws_from_its_own_logits_without_merging_every_slot():
     """With no admission every drawing row fed this step, so the logits it
     draws from are the model's whole: no select over every slot's vocabulary
