@@ -12,6 +12,7 @@ gang the module is skipped: CI's multihost job runs it on a gang of four.
 import json
 import os
 import socket
+import subprocess
 import sys
 import time
 from itertools import count
@@ -137,8 +138,6 @@ def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
     """`command` as this rank's process of a pool of one process per rank, joined at rank0 as `dew launch`
     leaves a pool (DEW_PROCESS_COUNT, DEW_PROCESS_ID, JAX_COORDINATOR_ADDRESS) on `devices` CPU devices each:
     its output, once it exited 0."""
-    import subprocess
-
     sequence = next(POOLS)
     env = {**worker_env(devices), "DEW_PROCESS_COUNT": str(WORLD), "DEW_PROCESS_ID": str(RANK),
            "JAX_COORDINATOR_ADDRESS": f"rank0:{COORDINATOR + sequence}"}
@@ -221,7 +220,7 @@ def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
     exchange(sequence, "waiting")
     try:
         output = process.communicate(timeout=600)[0]
-    except Exception:
+    except subprocess.TimeoutExpired:
         terminate(process)
         pytest.fail("rank 0's process kept waiting ten minutes after rank 1's host died")
     assert process.returncode != 0, output[-4000:]
