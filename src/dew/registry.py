@@ -643,6 +643,10 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     if not found:
         raise ValueError(f"no class is named {name!r}; a record names one by an alias or "
                          f"its import path, `module:Class`")
+    if any(is_protocol(base) for base in held) and all(isinstance(member, type) for member in found):
+        package = found[0].__module__.split(".")[0]
+        raise ValueError(f"{name!r} names a {wanted} outside Dew, which a record builds only from a "
+                         f"trusted package (trust=({package!r},), --trust {package})")
     raise ValueError(f"{name!r} names {', '.join(map(repr, found))}, not one {wanted}")
 
 
