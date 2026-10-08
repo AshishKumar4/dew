@@ -182,9 +182,10 @@ def test_a_checkpoint_directory_on_each_hosts_own_disk_is_refused_on_every_host(
     except subprocess.TimeoutExpired:
         terminate(process)
         output = "still running after ten minutes"
-    parts = exchange(sequence, [process.returncode, output[-4000:]])[:2]
-    assert all(code not in (0, None) for code, _ in parts), parts
-    assert all("is not shared: process(es) [1] of 2" in text for _, text in parts), parts
+    refusal = next((line for line in output.splitlines() if "is not shared" in line), output[-2000:])
+    parts = exchange(sequence, [process.returncode, refusal])[:2]
+    assert all(code not in (0, None) and "is not shared: process(es) [1] of 2" in said for code, said in parts), \
+        "\n".join(f"rank {rank} exited {code}: {said}" for rank, (code, said) in enumerate(parts))
 
 
 @pytest.mark.distributed
