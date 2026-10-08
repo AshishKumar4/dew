@@ -37,7 +37,12 @@ def capped_fit(fit):
 
 
 def install():
+    import warnings
+
     import dew.data
     from dew.training import Trainer
+
+    # tqdm.auto falls back to text bars in a kernel without ipywidgets, and says so on import.
+    warnings.filterwarnings("ignore", message="IProgress not found")
 
     dew.data.load, Trainer.fit = capped_load(dew.data.load), capped_fit(Trainer.fit)
