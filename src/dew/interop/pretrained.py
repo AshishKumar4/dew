@@ -368,7 +368,7 @@ class Pretrained:
         variables = objectives[kind]._saved_variables(str(directory), step=step, ema=ema)
         # The run's policy and budget, in the format the export's readers read.
         sampling = declaration.get('sampling')
-        budget = declaration.get('sample_tokens')
+        budget = declaration.get('max_new_tokens')
         generation = None if not isinstance(sampling, dict) else generation_config_of(
             Sampling(**sampling), budget if isinstance(budget, int) else None)
         tokenizer = declaration.get('tokenizer')

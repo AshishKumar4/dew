@@ -321,11 +321,11 @@ def _saved_processor(record: Mapping[str, object]) -> Processor | None:
 
 def _saved_budget(record: Mapping[str, object]) -> int | None:
     """Return how many tokens the run's own previews drew, where it drew any."""
-    budget = record.get("sample_tokens")
+    budget = record.get("max_new_tokens")
     if budget is None:
         return None
     if type(budget) is not int or budget < 0:
-        raise ValueError("sample_tokens must be a nonnegative integer")
+        raise ValueError("max_new_tokens must be a nonnegative integer")
     return budget
 
 
