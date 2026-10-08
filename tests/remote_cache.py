@@ -24,13 +24,13 @@ background thread, and the process waits up to `DRAIN_SECONDS` for them at
 exit.
 """
 
-import atexit
-import concurrent.futures
 import json
 import logging
 import os
+import queue
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -53,8 +53,10 @@ class RemoteCache:
         self.headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-xla-cache"}
         self.failures = 0
         self.lock = threading.Lock()
-        self.uploads = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="xla-cache")
-        self.pending: set[concurrent.futures.Future] = set()
+        # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
+        self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
+        for _ in range(2):
+            threading.Thread(target=self._uploading, daemon=True, name="xla-cache").start()
         self.fetched = self.uploaded = 0
         self.names: set[str] = set()
 
@@ -128,21 +130,22 @@ class RemoteCache:
     def put(self, key: str, value: bytes) -> None:
         self.base.put(key, value)
         if self.available and len(value) <= MAX_BYTES and compile_seconds(value) >= REMOTE_SECONDS:
-            future = self.uploads.submit(self._upload, key, bytes(value))
-            with self.lock:
-                self.pending.add(future)
-            future.add_done_callback(self._settled)
+            self.uploads.put((key, bytes(value)))
 
-    def _settled(self, future) -> None:
-        with self.lock:
-            self.pending.discard(future)
+    def _uploading(self) -> None:
+        while True:
+            key, value = self.uploads.get()
+            try:
+                self._upload(key, value)
+            finally:
+                self.uploads.task_done()
 
     def drain(self, seconds: float = DRAIN_SECONDS) -> None:
-        """Wait up to `seconds` for the uploads still running."""
-        with self.lock:
-            pending = set(self.pending)
-        concurrent.futures.wait(pending, timeout=seconds)
-        self.uploads.shutdown(wait=False, cancel_futures=True)
+        """Wait up to `seconds` for the uploads still queued or running, at the end of pytest's
+        session; what is left is abandoned with the process."""
+        began = time.monotonic()
+        while self.uploads.unfinished_tasks and time.monotonic() - began < seconds:
+            time.sleep(0.1)
 
 
 def module(key: str) -> str:
@@ -189,7 +192,6 @@ def install(url: str, token: str) -> RemoteCache | None:
     except Exception as error:  # a jax whose cache has moved runs on its local cache alone
         logger.warning("the shared XLA cache is not installed: %s", error)
         return None
-    atexit.register(remote.drain)
     return remote
 
 

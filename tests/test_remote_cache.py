@@ -185,3 +185,42 @@ print(remote.fetched, remote.uploaded)
     assert all(key.startswith(f"/jax{__import__('jax').__version__}/") for key in stored)
     programs = [key for key in stored if "/names/" not in key]
     assert run("second") == ["18.0", str(len(programs)), "0"]
+
+
+def test_a_slow_remote_never_holds_a_process_exit():
+    """Uploads queued behind a remote that takes a minute a write do not keep
+    the process from exiting: they run on daemon threads, and only the drain
+    at the end of pytest's session waits for them, up to its bound."""
+    import os
+    import subprocess
+    import sys
+
+    class Slow(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_PUT(self):
+            time.sleep(60)
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Slow)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    script = f"""
+import remote_cache
+from jax._src import compilation_cache
+remote_cache.TIMEOUT_SECONDS = 2
+class Local(dict):
+    def put(self, key, value):
+        self[key] = value
+remote = remote_cache.RemoteCache(Local(), "http://127.0.0.1:{server.server_address[1]}", "token", "jax/cpu")
+for index in range(20):
+    remote.put(f"jit_step-{{index}}", compilation_cache.compress_executable(
+        compilation_cache.combine_executable_and_time(b"executable", 5)))
+"""
+    path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
+    began = time.monotonic()
+    done = subprocess.run([sys.executable, "-c", script], env={**os.environ, "PYTHONPATH": path},
+                          capture_output=True, text=True, timeout=120)
+    server.shutdown()
+    assert done.returncode == 0, done.stderr[-2000:]
+    assert time.monotonic() - began < 15
