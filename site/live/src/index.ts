@@ -104,6 +104,12 @@ async function connect(request: Request, env: Env, id: string): Promise<Response
 export default {
 	async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
 		const url = new URL(request.url);
+		if (url.pathname === '/v1/operator/retire' && request.method === 'POST') {
+			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
+			const host = url.searchParams.get('host') ?? '';
+			await env.SHARED.get(env.SHARED.idFromName(host)).retire();
+			return Response.json({ retired: host });
+		}
 		if (url.pathname === '/v1/operator/trial') {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
 			const registry = env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global'));

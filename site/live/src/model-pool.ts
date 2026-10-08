@@ -95,6 +95,21 @@ export class ModelPool extends DurableObject<Env> {
 	}
 
 	override async alarm(): Promise<void> {
+		// A Worker whose POOL binding moved to another script's pool leaves this one running on
+		// its alarm, warming hosts no visitor reaches: it retires them and stops instead.
+		if (!this.env.POOL.idFromName('global').equals(this.ctx.id)) {
+			const pool = await this.state();
+			for (const host of pool.hosts) {
+				try { await this.env.SHARED.get(this.env.SHARED.idFromName(host.id)).retire(); }
+				catch (error) {
+					console.error('orphaned model host did not retire', host.id, error);
+					await this.ctx.storage.setAlarm(Date.now() + CHECK_MS);
+					return;
+				}
+			}
+			await this.ctx.storage.deleteAll();
+			return;
+		}
 		try {
 			let pool = await this.state();
 			if (!pool.desired) return;
