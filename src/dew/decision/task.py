@@ -53,6 +53,7 @@ from dew.decision.questions import (
     Score,
     ScoreAnswer,
 )
+from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
 from dew.nn.inputs import RowPlan, mesh_of
@@ -251,13 +252,10 @@ class Decide:
         if self.weights is None:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
-        target = epath.Path(directory) / TASK_FILE
-        written = target.parent / f"{TASK_FILE}.tmp"
-        written.write_text(json.dumps({
+        write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
-        written.replace(target)
 
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = ()) -> dict[str, Answer]:
