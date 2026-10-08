@@ -253,4 +253,6 @@ def test_phi3_longrope_census_config_loads_natively():
                                         revision='cfbefacb99257ffa30c83adab238a50856ac3083')
     model = translate_config(config.to_dict()).value
     assert isinstance(model.rope_scaling, LongRopeScaling)
-    assert len(model.rope_scaling.short_factor) == model.features_per_head // 2
+    # Phi-4-mini rotates three quarters of each head, one factor per rotated pair.
+    assert model.partial_rotary_factor == 0.75
+    assert len(model.rope_scaling.short_factor) == int(model.features_per_head * 0.75) // 2
