@@ -34,6 +34,8 @@ class Context:
         await send({"type": "stream", "name": "stdout", "text": self.identifier})
         if code == "wait":
             await self.release.wait()
+        if code == "die":
+            raise self.stopped()
         return {"status": "ok", "count": 1}
 
 
@@ -86,6 +88,7 @@ def gateway(monkeypatch):
 
     async def start(session, kernel="python3"):
         started.append(Context(f"{'train' if kernel == 'dew-train' else 'kernel'}-{len(started)}"))
+        started[-1].stopped = bridge.Stopped
         return started[-1]
 
     async def api(path, data=None, method=None):
@@ -172,5 +175,26 @@ def test_training_cells_take_turns_in_fresh_contexts(gateway):
         for handler in handlers:
             with pytest.raises(Closed):
                 await handler
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))
+
+
+def test_a_cell_whose_context_died_is_told_and_its_next_run_starts_a_new_one(gateway):
+    async def scenario():
+        session = str(uuid.uuid4())
+        await gateway.create(session)
+        socket = Socket(session)
+        handler = asyncio.create_task(gateway.websocket(socket))
+        await socket.incoming.put({"op": "execute", "id": "1", "code": "die", "cell": "image"})
+        await until(lambda: socket.done("1"), handler)
+        errors = [m["evalue"] for m in socket.sent if m.get("type") == "error"]
+        assert len(errors) == 1 and errors[0].startswith("This cell's Python context stopped")
+        await socket.incoming.put({"op": "execute", "id": "2", "code": "now", "cell": "image"})
+        await until(lambda: socket.done("2"), handler)
+        outputs = [m["text"] for m in socket.sent if m.get("type") == "stream"]
+        assert outputs == ["kernel-0", "kernel-1"]
+        await socket.incoming.put(None)
+        with pytest.raises(Closed):
+            await handler
 
     asyncio.run(asyncio.wait_for(scenario(), 10))

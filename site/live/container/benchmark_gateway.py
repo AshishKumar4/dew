@@ -54,6 +54,15 @@ def collect(client, message):
 TRAINING_PROBE = """
 import live_training
 live_training.install()
+for score in ("-1000", "-999", "0"):
+    try:
+        with open("/proc/self/oom_score_adj", "w") as file:
+            file.write(score)
+    except PermissionError:
+        pass
+    else:
+        raise AssertionError(f"a guest lowered its OOM score to {score}")
+assert open("/proc/self/oom_score_adj").read().strip() == "1000"
 import urllib.request
 from pathlib import Path
 try:
