@@ -148,10 +148,10 @@ jobs:
   test:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
-    # Pythons as tasks of about five minutes each on Dew's own armada
-    # deployment (armada-dew), on the fewest of up to 150 containers that
-    # finish as soon, sized from the last runs' usage. Its URL and token are
-    # the ARMADA_URL and ARMADA_TOKEN secrets.
+    # Pythons as tasks of about three minutes each on Dew's own armada
+    # deployment (armada-dew), on the fewest of up to 375 containers
+    # (armada's most) that finish as soon, sized from the last runs' usage.
+    # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
@@ -169,5 +169,5 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#bb79432f58abbe0fb44fd9d221c5fa0f714cc666"
+        armada="bunx --bun github:AshishKumar4/armada#2ef68c1352f5cd961cdc54d0b1399edf22a09aec"
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
