@@ -3,14 +3,19 @@
 
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
+    python3 tools/armada/ci.py durations VERDICT
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
 seconds, so a task imports only its own modules. A file heavier than that runs
-as that many pytest-split groups of itself. A file weighs armada's median of
-its last green runs, else its tests' sum in tests/test_durations.json, else
-the mean. Each entry names its rows, one a file (or a file's group), so armada
-grades a task that leaves one out as not green.
+as groups of its tests (`groups`, tools/armada/split.py): runs of consecutive
+tests in node-id order, cut by their times in tests/test_durations.json so the
+heaviest run is as light as it can be, and as many runs as it takes to hold
+each to `target` with a heavier test alone. A file weighs armada's
+median of its last green runs, else its tests' sum in
+tests/test_durations.json, else the mean. Each entry names its rows, one a
+file (or a file's group), so armada grades a task that leaves one out as not
+green, and armada queues the heaviest entries first.
 
 A task runs its files under its Python's environment (tools/armada/install.sh)
 with CI's selection, and writes a verdict row for each. A row is red on a
@@ -18,7 +23,10 @@ failed or erroring test, on a test skipped because its import failed (a file
 CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
 every row it holds is red, so a hang is graded with its stack dump rather
-than leaving the task without a verdict.
+than leaving the task without a verdict. Each row also carries its tests' own
+times, from which `durations` rewrites tests/test_durations.json: given a
+green run's verdict (`armada verdict <sha> --json`), it records every test
+the floor's Python ran.
 """
 
 import argparse
@@ -67,15 +75,21 @@ SKIPPED = {"tests/test_gen_api.py"}
 DURATIONS = Path("tests/test_durations.json")
 
 
+def recorded_tests() -> dict[str, list[float]]:
+    """Each file's tests' times in tests/test_durations.json, in node-id order."""
+    tests: dict[str, list[float]] = {}
+    if DURATIONS.is_file():
+        for node, seconds in sorted(json.loads(DURATIONS.read_text()).items()):
+            tests.setdefault(node.split("::")[0], []).append(seconds)
+    return tests
+
+
 def weights(files: list[str], timings: dict) -> dict[str, float | None]:
     """Each file's seconds on armada: its median (a split task
     reports its whole file's, `task`); else its tests' sum in
     tests/test_durations.json, scaled by how much slower armada ran the
     files measured both ways; else None, for a file nothing has timed."""
-    recorded: dict[str, float] = {}
-    if DURATIONS.is_file():
-        for node, seconds in json.loads(DURATIONS.read_text()).items():
-            recorded[node.split("::")[0]] = recorded.get(node.split("::")[0], 0.0) + seconds
+    recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     measured = dict(timings.get("files", {}))
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
@@ -87,22 +101,66 @@ def row(python: str, name: str, split: str) -> str:
     return f"{python}:{name}" + (f"#{split}" if split else "")
 
 
+def starts(weights: list[int], capacity: int) -> list[int]:
+    """Where each run of consecutive `weights` begins, each run filled up to `capacity`, a heavier
+    weight alone."""
+    begins, held = [0], 0
+    for index, weight in enumerate(weights):
+        if held and held + weight > capacity:
+            begins.append(index)
+            held = 0
+        held += weight
+    return begins
+
+
+def milliseconds(seconds: list[float]) -> list[int]:
+    return [round(max(value, 0.0) * 1000) for value in seconds]
+
+
+def groups(seconds: list[float], count: int) -> list[range]:
+    """`count` runs of consecutive `seconds`, the heaviest as light as `count` runs can be: how every
+    task of a file split `count` ways cuts the file's tests (split.py), in whole milliseconds, so
+    each container cuts them alike. A run past the last test is empty."""
+    weights = milliseconds(seconds)
+    low, high = max(weights, default=0), sum(weights)
+    while low < high:
+        middle = (low + high) // 2
+        low, high = (low, middle) if len(starts(weights, middle)) <= count else (middle + 1, high)
+    bounds = [*starts(weights, low), len(weights)]
+    bounds += [len(weights)] * (count + 1 - len(bounds))
+    return [range(bounds[index], bounds[index + 1]) for index in range(count)]
+
+
+def split(tests: list[float], seconds: float, target: float) -> list[float]:
+    """The weights of the groups a file of `seconds` runs as: its recorded `tests`' times scaled to
+    `seconds`, cut (`groups`) into as many runs as it takes to hold each to `target` with a heavier
+    test alone, so no group outweighs both the target and the file's heaviest test. A file with no
+    recorded time runs as equal counts of its tests."""
+    if sum(tests) <= 0:
+        count = math.ceil(seconds / target)
+        return [seconds / count] * count
+    scale = seconds / sum(tests)
+    count = len(starts(milliseconds(tests), round(target / scale * 1000)))
+    return [sum(tests[run.start:run.stop]) * scale for run in groups(tests, count) if run]
+
+
 def plan(target: float, timings: dict) -> list[dict]:
     """The matrix's entries: about `target` seconds of files each, for each Python. A file nothing has
     timed runs alone, so however long it takes it holds up no other file, and its time is known from
     then on."""
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
         files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
         timed = weights(files, timings)
-        weighed = {name: target if seconds is None else seconds for name, seconds in timed.items()}
-        tasks: list[tuple[list[str], str]] = [
-            ([name], "") for name, seconds in timed.items() if seconds is None]
+        tasks: list[tuple[list[str], str, float]] = [
+            ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
-                groups = math.ceil(seconds / target)
-                tasks += [([name], f"{group}/{groups}") for group in range(1, groups + 1)]
+                cut = split(recorded.get(name, []), seconds, target)
+                tasks += [([name], f"{group}/{len(cut)}", weight)
+                          for group, weight in enumerate(cut, start=1)]
         light = {name: seconds for name, seconds in timed.items()
                  if seconds is not None and seconds <= target}
         bins: list[tuple[float, int, list[str]]] = [
@@ -110,12 +168,12 @@ def plan(target: float, timings: dict) -> list[dict]:
         for name, seconds in sorted(light.items(), key=lambda item: (-item[1], item[0])):
             held, index, names = heapq.heappop(bins)
             heapq.heappush(bins, (held + seconds, index, [*names, name]))
-        tasks += [(sorted(names), "") for _, _, names in sorted(bins, key=lambda bin_: bin_[1]) if names]
-        for index, (names, split) in enumerate(tasks, start=1):
-            share = int(split.split("/")[1]) if split else 1
+        tasks += [(sorted(names), "", held) for held, _, names in sorted(bins, key=lambda bin_: bin_[1])
+                  if names]
+        for index, (names, group, weight) in enumerate(tasks, start=1):
             entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
-                            "split": split, "rows": [row(python, name, split) for name in names],
-                            "weight": sum(weighed[name] for name in names) / share})
+                            "split": group, "rows": [row(python, name, group) for name in names],
+                            "weight": weight})
     rest = [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS):
         names = rest[index::COLLECT_TASKS]
@@ -197,8 +255,7 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     began = time.monotonic()
     report = out.with_name(f"{out.name}.junit.xml")
     report.unlink(missing_ok=True)
-    grouping = ["--splits", split.split("/")[1], "--group", split.split("/")[0], "--splitting-algorithm",
-                "duration_based_chunks", "--durations-path", str(DURATIONS)] if split else []
+    grouping = ["-p", "split", f"--ci-group={split}"] if split else []
     # faulthandler prints every thread's stack when a test runs ten minutes. Unbuffered (-u), so the
     # log holds every test that finished when a task is cut short.
     command = [f".venv-{python}/bin/python", "-u", "-m", "pytest", "-q", "-m", "not network", "-rfE",
@@ -208,8 +265,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     # streamed as it comes by a reader of its own, which nothing waits on past pytest's end: a test's
     # child holding the pipe open (a pool worker, a server) cannot keep the verdict from being written.
     lines: list[str] = []
+    # split.py, the plugin that keeps a split file's group, imports from beside this file.
+    path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
     done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True)
+                            start_new_session=True, env={**os.environ, "PYTHONPATH": path})
 
     def read() -> None:
         for line in done.stdout or ():
@@ -252,14 +311,32 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
         seconds = own_seconds[name] * pace if pace else wall / len(tests)
-        # A group's time scaled by its share of the file's recorded durations: its whole file's, whichever
-        # way the file was split, so armada's median of a file holds across splits.
-        whole = (seconds * share if (share := file_share(name, own)) else None) if split else seconds
+        # A group's own tests' time scaled by their share of the file's recorded durations, and the task's
+        # start-up once: its whole file's, however the file was split, so armada's median of a file holds
+        # across splits. Scaling the start-up too let a group of a few short tests weigh its file at far
+        # more than its groups took together: test_multiprocess.py's median read 2224 s, its groups'
+        # sums 1205 to 1558 s.
+        tested = own_seconds[name]
+        share = file_share(name, own) if split else None
+        whole = seconds if not split else wall - tested + tested * share if share else None
         rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
+                     "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      **({} if whole is None else {"timings": {name: whole}})})
     out.write_text(json.dumps({"rows": rows}))
     return 0
+
+
+def durations(verdict: dict) -> dict[str, float]:
+    """Every test's time in a green run's `verdict`, as its floor's Python ran it."""
+    rows = verdict["rows"]
+    red = [row["name"] for row in rows if row["exitCode"] != 0]
+    if red:
+        raise SystemExit(f"{len(red)} rows are red, {red[0]} first: record durations from a green run")
+    floor = [row for row in rows if row["name"].startswith(f"{PYTHONS[0]}:")]
+    if not all("tests" in row for row in floor):
+        raise SystemExit("this verdict's rows carry no test times; record them from a run of this version")
+    return {node: round(seconds, 3) for row in floor for node, seconds in sorted(row["tests"].items())}
 
 
 def main() -> int:
@@ -275,7 +352,14 @@ def main() -> int:
     running.add_argument("--out", type=Path, required=True)
     running.add_argument("--deadline", type=float, default=1680.0,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
+    recording = operations.add_parser("durations")
+    recording.add_argument("verdict", type=Path, help="a green run's verdict: armada verdict <sha> --json")
     args = parser.parse_args()
+    if args.operation == "durations":
+        recorded = durations(json.loads(args.verdict.read_text()))
+        DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
+        print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
+        return 0
     if args.operation == "plan":
         timings = json.loads(args.timings.read_text()) if args.timings.is_file() else {}
         print(json.dumps({"include": plan(args.target, timings)}))

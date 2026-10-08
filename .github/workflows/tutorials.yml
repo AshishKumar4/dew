@@ -24,16 +24,39 @@ permissions:
   contents: read
 
 jobs:
+  # A commit this workflow passed on another push, as one proved on
+  # ci/integration before main takes it, is not run again. The daily run, a
+  # pull request and a dispatch run every notebook.
+  proven:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.find.outputs.run }}
+    steps:
+    - id: find
+      if: github.event_name == 'push'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # A pull request's run tested a merge, not this commit.
+        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/tutorials.yml/runs?head_sha=$GITHUB_SHA&status=success" \
+          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
+        echo "run=$run" >> "$GITHUB_OUTPUT"
+        if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
+
   smoke:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:
-        # Two runners of about four minutes of notebooks each (01 153 s, 03
-        # 72 s; 02 49, 04 45, 05 18, 06 34, 07 18, 08 102 s in run
-        # 37538968124). 04 reads the checkpoint 02 writes, so they share one.
-        notebooks: ["01 03", "02 04 05 06 07 08"]
+        # Three runners of about two and a half minutes of notebooks each (01
+        # 83 s, 03 40; 02 55, 04 47, 05 20, 07 18; 06 35, 08 107 in run
+        # 37786757641). 04 reads the checkpoint 02 writes, so they share one.
+        notebooks: ["01 03", "02 04 05 07", "06 08"]
     name: smoke (${{ matrix.notebooks }})
     steps:
     - uses: actions/checkout@v4
@@ -42,11 +65,14 @@ jobs:
     - uses: actions/setup-python@v5
       with:
         python-version: "3.12"
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        cache-dependency-glob: pyproject.toml
     - name: Install Dew and the notebooks' dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install torch --index-url https://download.pytorch.org/whl/cpu
-        pip install -e ".[streaming,interop,plots]" nbclient nbformat ipykernel
+        uv pip install --system torch --index-url https://download.pytorch.org/whl/cpu
+        uv pip install --system -e ".[streaming,interop,plots]" nbclient nbformat ipykernel
     - name: Cache the datasets and checkpoints the notebooks download
       uses: actions/cache@v4
       with:

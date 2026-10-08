@@ -37,8 +37,8 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     entries = ci.plan(120.0, {"files": {"tests/test_measured.py": 40.0, "tests/test_light.py": 30.0}})
     floor = [(entry["tests"], entry["split"]) for entry in entries if entry["python"] == "3.12"]
     assert sorted(floor) == [("tests/test_config.py tests/test_light.py tests/test_measured.py", ""),
-                             ("tests/test_heavy.py", "1/3"), ("tests/test_heavy.py", "2/3"),
-                             ("tests/test_heavy.py", "3/3"), ("tests/test_new.py", "")]
+                             ("tests/test_heavy.py", "1/2"), ("tests/test_heavy.py", "2/2"),
+                             ("tests/test_new.py", "")]
     newest = [entry for entry in entries if entry["python"] == "3.14"]
     assert [(entry["tests"], entry["split"]) for entry in newest if entry["split"] != ci.COLLECT] == [
         ("tests/test_config.py tests/test_light.py", "")]
@@ -46,7 +46,7 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
                        for name in entry["tests"].split())
     assert collected == ["tests/test_heavy.py", "tests/test_measured.py", "tests/test_new.py"]
     rows = [name for entry in entries for name in entry["rows"]]
-    assert len(rows) == len(set(rows)) == 12
+    assert len(rows) == len(set(rows)) == 11
     assert "3.14:tests/test_heavy.py#collect" in rows
 
 
@@ -103,6 +103,8 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     assert "test_wrong" in rows["3.12:tests/test_fail.py"]["output"]
     assert "SKIPPED on a missing import" in rows["3.12:tests/test_missing.py"]["output"]
     assert rows["3.12:tests/test_pass.py"]["timings"].keys() == {"tests/test_pass.py"}
+    assert rows["3.12:tests/test_pass.py"]["tests"].keys() == {"tests/test_pass.py::test_ok",
+                                                               "tests/test_pass.py::test_skip"}
 
 
 def test_the_plan_weighs_a_file_by_armadas_median_and_the_rest_by_armadas_pace(ci):
@@ -116,6 +118,70 @@ def test_the_plan_weighs_a_file_by_armadas_median_and_the_rest_by_armadas_pace(c
     files = ["tests/test_measured.py", "tests/test_other.py", "tests/test_paced.py"]
     assert ci.weights(files, timings) == {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0,
                                           "tests/test_paced.py": 60.0}
+
+
+def test_a_files_groups_are_consecutive_runs_whose_heaviest_is_least(ci):
+    """Every test lands in exactly one run, the runs keep the tests' order,
+    and the heaviest run is the lightest any cut into that many runs has:
+    5 1 1 1 5 1 in three runs is 5 1 | 1 1 | 5 1. More runs than tests
+    leaves the extra runs empty."""
+    seconds = [5.0, 1.0, 1.0, 1.0, 5.0, 1.0]
+    runs = ci.groups(seconds, 3)
+    assert [index for run in runs for index in run] == list(range(6))
+    assert max(sum(seconds[index] for index in run) for run in runs) == 6.0
+    assert ci.groups([2.0, 3.0], 4) == [range(1), range(1, 2), range(2, 2), range(2, 2)]
+
+
+def test_a_heavy_file_runs_as_the_fewest_groups_that_hold_each_to_the_target(ci):
+    """A file's groups hold its recorded tests' time scaled to its weight, as
+    many as it takes to keep each under the target with a heavier test alone,
+    and no group outweighs both the target and that test. A file with no
+    recorded tests runs as equal counts of them."""
+    assert ci.split([150.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0], 420.0, 100.0) == [300.0, 120.0]
+    assert ci.split([40.0, 40.0, 40.0, 40.0], 160.0, 100.0) == [80.0, 80.0]
+    assert ci.split([], 250.0, 100.0) == [250.0 / 3] * 3
+
+
+def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
+    """Each task of a split file runs its own group (split.py) of the same
+    cut, so the groups together run every test, none twice, a test the
+    durations lack included. A group weighs its file at its tests' share of
+    the recorded time and its start-up once: these tests take no time, so
+    each group weighs the file at about its own wall time."""
+    (tmp_path / "tests/test_split.py").write_text(
+        "import pytest\n@pytest.mark.parametrize('n', range(6))\ndef test_n(n): pass\n"
+        "def test_unrecorded(): pass\n")
+    Path("tests/test_durations.json").write_text(json.dumps(
+        {f"tests/test_split.py::test_n[{n}]": seconds for n, seconds in enumerate([5, 1, 1, 1, 5, 1])}))
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    ran = []
+    for group in ("1/3", "2/3", "3/3"):
+        out = tmp_path / f"verdict-{group.replace('/', '-')}.json"
+        ci.task("3.12", ["tests/test_split.py"], group, out, 120.0)
+        [verdict] = json.loads(out.read_text())["rows"]
+        assert verdict["exitCode"] == 0, verdict["output"]
+        assert verdict.get("timings", {}).get("tests/test_split.py", 0.0) < 1.5 * verdict["seconds"]
+        ran.append(sorted(verdict["tests"]))
+    assert all(ran)
+    every = sorted(node for nodes in ran for node in nodes)
+    assert every == sorted([f"tests/test_split.py::test_n[{n}]" for n in range(6)]
+                           + ["tests/test_split.py::test_unrecorded"])
+
+
+def test_durations_are_recorded_from_a_green_runs_floor(ci):
+    """`durations` reads each test's time from a green verdict's floor rows,
+    and refuses a red run or rows that carry no times."""
+    rows = [{"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 1.2346}},
+            {"name": "3.12:tests/test_a.py#2/2", "exitCode": 0, "tests": {"tests/test_a.py::test_y": 2.0}},
+            {"name": "3.14:tests/test_a.py", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 9.0}}]
+    assert ci.durations({"rows": rows}) == {"tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
+    with pytest.raises(SystemExit, match="red"):
+        ci.durations({"rows": [*rows, {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}]})
+    with pytest.raises(SystemExit, match="no test times"):
+        ci.durations({"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]})
 
 
 def test_a_split_group_scales_to_its_whole_file_by_the_recorded_durations(ci):

@@ -31,9 +31,33 @@ env:
   EXTRAS: test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
 
 jobs:
+  # A commit this workflow passed on another push, as one proved on
+  # ci/integration before main takes it, is not proved again: lint, types and
+  # package skip, and the test job finds armada's verdict. A pull request, a
+  # dispatch and the release's call run everything.
+  proven:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.find.outputs.run }}
+    steps:
+    - id: find
+      if: github.event_name == 'push'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # A pull request's run tested a merge, not this commit.
+        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" \
+          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
+        echo "run=$run" >> "$GITHUB_OUTPUT"
+        if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
+
   # Lint and the site's checks, and the type check beside them: each installs
   # dewml as tools/armada/install.sh does, with uv, from uv's cache.
   lint:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -85,6 +109,8 @@ jobs:
         python site/scripts/gen_examples.py --check
 
   types:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -111,6 +137,8 @@ jobs:
   # refuses and twine passes; the wheel installs from PyPI alone into an
   # empty environment and runs; and the accelerator extras resolve.
   package:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
