@@ -393,13 +393,18 @@ class Gateway:
                     with suppress(ProcessLookupError):
                         os.kill(pid, signal.SIGKILL)
 
+    async def reap(self):
+        """Close each session no page holds whose contexts have been idle too long. A session
+        with no context yet is starting its first (`create`), so is not idle."""
+        for session, cells in list(self.contexts.items()):
+            if (cells and session not in self.connected
+                    and time.monotonic() - max(context.last_used for context in cells.values()) > self.idle):
+                await self.close(session)
+
     async def sweep(self):
         while True:
             await asyncio.sleep(15)
-            for session, cells in list(self.contexts.items()):
-                used = max((context.last_used for context in cells.values()), default=0)
-                if session not in self.connected and time.monotonic() - used > self.idle:
-                    await self.close(session)
+            await self.reap()
 
 
 async def main():
