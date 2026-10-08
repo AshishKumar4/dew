@@ -51,6 +51,7 @@ from .dataset import (
     DataPartition,
     Dataset,
     DatasetSpec,
+    FilledBatch,
     Loading,
     Reader,
     Records,
@@ -583,9 +584,12 @@ def _stream(name: str, split: str, *, options: HFOptions,
                         given=dataset is not None)
         piped: pygrain.IterDataset = (source.map(Formatting()) if preprocess is None
                                       else source.random_map(Preprocessing(preprocess), seed=seed))
-        batches = ThreadPrefetchIterDataset(
-            piped.batch(partition.rows(batch), drop_remainder=True),
-            prefetch_buffer_size=max(1, loading.worker_buffer))
+        rows = partition.rows(batch)
+        # A finite pass scores its last rows too, as the indexed pass does: the
+        # short batch is filled out with repeats that `VALID_ROWS` marks.
+        batched = (piped.batch(rows, drop_remainder=True) if epochs is None
+                   else piped.batch(rows, drop_remainder=False).map(FilledBatch(rows)))
+        batches = ThreadPrefetchIterDataset(batched, prefetch_buffer_size=max(1, loading.worker_buffer))
         reads = iter(batches)
         return reads if source.resumable else Unresumable(reads)
 
