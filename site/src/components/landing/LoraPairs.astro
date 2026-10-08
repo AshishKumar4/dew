@@ -12,7 +12,7 @@ const { pairs } = Astro.props;
 		</div>
 		<div class="lora-labels"><span>Before</span><span>After</span></div>
 		<label class="lora-range">Compare <input type="range" min="0" max="100" value="50" aria-label={`Before and after for seed ${pair.seed}`} /></label>
-		<figcaption>{pair.prompt}<br /><span class="lora-seed">Same seed: {pair.seed}</span></figcaption>
+		<figcaption>{pair.prompt}<br /><span class="lora-seed">Seed {pair.seed}</span></figcaption>
 	</figure>)}
 </div>
 <script>
