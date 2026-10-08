@@ -132,6 +132,17 @@ def _stream_order(valid):
     return rank, source
 
 
+def held_conv1d(x, kernel, valid, held=None):
+    """`[B, D, S]` convolved causally after the `held` history, `[B, D, K - 1]`
+    or None for none, and the history the next call holds: a linear-attention
+    layer's conv over its decode cache, padded slots read and advanced by none
+    (`_masked_conv1d`)."""
+    if valid is not None:
+        return _masked_conv1d(x, kernel, valid, held)
+    history = x if held is None else jnp.concatenate([held, x], axis=2)
+    return causal_conv1d(history, kernel)[..., -x.shape[2]:], history[:, :, -(kernel.shape[-1] - 1):]
+
+
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     """Convolve real tokens without advancing a paused row's history.
 
@@ -566,18 +577,10 @@ class GatedDeltaNet(nn.Module):
                 # call, starts the state.
                 out = jnp.zeros((B, S, self.value_features), self.dtype)
                 return self.out_proj(out)
-            previous = conv_state.value.astype(wide)
-            if valid is not None:
-                mixed, history = _masked_conv1d(conv_input, taps, valid, previous)
-                conv_state.value = history.astype(conv_state.value.dtype)
-            else:
-                history = jnp.concatenate([previous, conv_input], axis=2)
-                conv_state.value = history[:, :, -(self.conv_kernel - 1):].astype(conv_state.value.dtype)
-                mixed = causal_conv1d(history, taps)[..., -S:]
-        elif valid is not None:
-            mixed, _ = _masked_conv1d(conv_input, taps, valid)
+            mixed, history = held_conv1d(conv_input, taps, valid, conv_state.value.astype(wide))
+            conv_state.value = history.astype(conv_state.value.dtype)
         else:
-            mixed = causal_conv1d(conv_input, taps)
+            mixed, _ = held_conv1d(conv_input, taps, valid)
         mixed = jnp.moveaxis(mixed, 2, 1)  # back to [B, S, D]
 
         query, key, value = jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1)

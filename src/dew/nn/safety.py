@@ -3,6 +3,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype
 
+from dew.nn.attention import l2_normalized
 from dew.nn.text_encoders import CLIPVisionTransformer
 
 
@@ -43,11 +44,11 @@ class CLIPSafetyHead(nn.Module):
 
     def __call__(self, pixels):
         images = self.features(pixels)
-        images = images / jnp.maximum(jnp.linalg.norm(images, axis=-1, keepdims=True), 1e-12)
+        images = l2_normalized(images)
 
         def scores(concepts, threshold):
             """Cosine similarity to each concept, less that concept's threshold."""
-            concepts = concepts / jnp.maximum(jnp.linalg.norm(concepts, axis=-1, keepdims=True), 1e-12)
+            concepts = l2_normalized(concepts)
             return images @ concepts.T - threshold
         special = jnp.round(scores(self.special_care_embeds, self.special_care_embeds_weights), 3)
         adjustment = jnp.any(special > 0, axis=-1, keepdims=True) * 0.01

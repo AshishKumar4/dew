@@ -99,14 +99,7 @@ def test_native_sd3_matches_the_source_forward_and_every_gradient(name, source):
         recorded = [key for key in arrays.files if key.startswith(prefix)]
         assert recorded, name
         for key in recorded:
-            entry = layout["transformer/" + key[len(prefix):]]
-            node = gradients[0]
-            for step in entry.paths[0][1:]:
-                node = node[step]
-            value = np.asarray(node)
-            if entry.transpose is not None:
-                value = value.transpose(entry.transpose)
-            assert value.shape == tuple(entry.shape), key
+            value = np.asarray(layout["transformer/" + key[len(prefix):]].export({"params": gradients[0]}))
             assert relative_gap(value, arrays[key]) < 1e-4, key
 
 

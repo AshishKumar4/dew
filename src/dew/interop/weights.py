@@ -5,9 +5,11 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 
-from dew.registry import resolve_dtype
+from dew import records
+from dew.registry import dtype_name, resolve_dtype
 
 if TYPE_CHECKING:
     from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout
@@ -15,6 +17,35 @@ if TYPE_CHECKING:
 type Tree[LeafT] = dict[str, LeafT | Tree[LeafT]]
 type ParamTree = Tree[np.ndarray]
 type TensorPath = Callable[[str], tuple[str, ...] | None]
+
+
+AUTO = "auto"
+"""The param_dtype that stores a checkpoint's parameters in its own dtype."""
+
+
+def auto_storage_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
+    """Return the storage dtype a checkpoint states, for param_dtype 'auto'.
+
+    transformers' dtype='auto' rule (modeling_utils.py `_get_dtype`, 5.16.1):
+    config.json's `dtype` (`torch_dtype` before 5.0), else the dtype of the
+    first floating tensor. Packed FP8 or FP4 payloads are no storage dtype,
+    so the first tensor stored in one is what a quantized checkpoint without
+    a stated dtype resolves to. A diffusers pipeline states none, so its
+    denoiser's tensors decide.
+    """
+    stated = config.get("dtype", config.get("torch_dtype"))
+    if stated is not None:
+        storage = dtype_name(resolve_dtype(records.text(stated, "dtype")))
+        if storage is None:
+            raise ValueError(f"dtype={stated!r} names no floating parameter storage")
+        return storage
+    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
+                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
+    for tensor in tensors.values():
+        if tensor.dtype in storable:
+            return storable[tensor.dtype]
+    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
+                     "float16 tensor in the checkpoint")
 
 
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
