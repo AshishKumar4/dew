@@ -102,8 +102,10 @@ def test_a_pipeline_downloads_only_the_component_files_it_reads(hub, monkeypatch
     OpenVINO copy, and no folder model_index.json does not declare
     (SDXL's vae_1_0): the non-variant weights of each declared component."""
     fake = hub(name)
-    monkeypatch.setattr(pretrained, "_load_diffusion_source", lambda directory, index, **kwargs:
-                        pretrained.Pretrained(None, {}, None, index, directory, {}))
+    monkeypatch.setattr(pretrained, "assemble_pipeline", lambda directory, index, **kwargs: {
+        "model": None, "variables": {}, "config": index, "source": directory, "model_config": {},
+        "weight_layouts": (), "process": None, "inputs": None, "autoencoder": None, "schedule": None,
+        "finish": None, "task": None})
 
     loaded = pretrained.Pretrained.load(repo)
 
