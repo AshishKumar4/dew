@@ -36,10 +36,10 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
 from dew.nn.protocols import TimeScaled
-from dew.objectives.base import Aux, EMASpec, ProgramModule, Step, Variables
+from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step, Variables
 
 from .few_step import SMOOTH_TIME_SCALE
-from .objective import FAKE_SCORE, TEACHER, FlowDistillationObjective
+from .objective import FAKE_SCORE, FlowDistillationObjective
 
 Velocity = Callable[[jax.Array, jax.Array], jax.Array]
 """A rectified-flow velocity v(x, rf) at rf time."""

@@ -25,7 +25,7 @@ import numpy as np
 
 from .chat import Conversation, render_prompt
 from .dataset import Batch, Dataset, DatasetSpec, Tokenize
-from .rows import json_records, parquet_names, parquet_rows, row_dataset
+from .rows import json_records, known_row, parquet_names, parquet_rows, row_dataset
 from .text import load_tokenizer, tokenizer_for
 
 PROMPT_KEY = "prompt"
@@ -157,14 +157,9 @@ class PromptSource:
             raise ValueError(
                 f"max_prompt_len is {max_prompt_len}: prompts need at least one token")
         normalized: list[_Row] = []
-        for index, row in enumerate(rows):
+        for index, held in enumerate(rows):
             where = f"{origin} row {index}"
-            if not isinstance(row, Mapping):
-                raise ValueError(f"{where}: a row is an object, got {row!r}")
-            unknown = sorted(key for key in row if key not in FIELDS)
-            if unknown:
-                raise ValueError(
-                    f"{where}: unknown fields {unknown}; the fields are {list(FIELDS)}")
+            row = known_row(held, FIELDS, where)
             if row.get("prompt") is None:
                 raise ValueError(
                     f"{where}: a row without a prompt has nothing to sample from")

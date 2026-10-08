@@ -24,8 +24,7 @@ from jax.experimental import checkify
 
 from dew.nn.inputs import PredictionPhase, continuation_keys, prompt_major
 from dew.nn.scatter import DROPPED
-from dew.objectives.base import Variables
-from dew.objectives.likelihood import token_log_probs
+from dew.objectives.base import Variables, token_log_probs
 from dew.sampling import decoding
 from dew.sampling.decoding import StepState
 from dew.sampling.guided import Grammar

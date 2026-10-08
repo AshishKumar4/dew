@@ -1,7 +1,6 @@
 """The noise schedules, one module per family."""
 
-from .common import GeneralizedNoiseScheduler, NoiseScheduler, expand
-from .continuous import ContinuousNoiseScheduler
+from .common import ContinuousNoiseScheduler, GeneralizedNoiseScheduler, NoiseScheduler, expand
 from .cosine import CosineNoiseScheduler, cosine_beta_schedule
 from .discrete import DiscreteNoiseScheduler
 from .flow import FlowMatchingScheduler

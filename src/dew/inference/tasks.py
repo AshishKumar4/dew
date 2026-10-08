@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -27,7 +27,7 @@ from flax.core import freeze
 from jax.typing import ArrayLike, DTypeLike
 
 from dew.cache import persist_compilations
-from dew.coordination import agree_process_phase
+from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
@@ -129,18 +129,7 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
         return inputs, _budget(max_new_tokens, default_tokens, max_length,
                                inputs.tokens.shape[1]), random_key
 
-    held = None
-    error = None
-    try:
-        held = prepared()
-    except Exception as failure:
-        error = failure
-    if collective:
-        agree_process_phase(error, phase="inference task input preparation")
-    elif error is not None:
-        raise error
-    assert held is not None
-    return held
+    return agreed("inference task input preparation", prepared) if collective else prepared()
 
 
 def decoded_rows(
@@ -268,14 +257,21 @@ def _pulled(repo_id: str, revision: str | None) -> str:
     return os.fspath(pull_from_hub(repo_id, revision=revision))
 
 
-def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()
-               ) -> tuple[Mapping[str, object], int]:
-    """The inference declaration of the selected checkpoint, not training
-    configuration, and the exact step it is, which a loader reads the
-    weights at too, so a step saved meanwhile cannot pair one step's
-    declaration with another's weights. A task loaded from it compiles into
-    the persistent cache (`persist_compilations`). `trust` names the packages
-    outside Dew whose modules the record may import (`dew.registry.imported`)."""
+class SavedRun(NamedTuple):
+    """One checkpoint of a run, pinned: its inference declaration, not the
+    training configuration, and the exact step it is, which a loader reads
+    the weights at too, so a step saved meanwhile cannot pair one step's
+    declaration with another's weights."""
+
+    record: Mapping[str, object]
+    step: int
+
+
+def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+    """The selected checkpoint of the run in `directory`, pinned (`SavedRun`).
+    A task loaded from it compiles into the persistent cache
+    (`persist_compilations`). `trust` names the packages outside Dew whose
+    modules the record may import (`dew.registry.imported`)."""
     from dew.checkpoints import Checkpoints
     from dew.registry import import_trusted
     persist_compilations()
@@ -289,7 +285,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     record = named_fields(record, 'checkpoint artifact')
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    return record, step
+    return SavedRun(record, step)
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
