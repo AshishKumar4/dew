@@ -1943,15 +1943,22 @@ these tokens a second:
 |---|---:|---:|---:|---:|---:|
 | A100 40 GB | 128 | 9838-9883 | 10943-10981 | 10782-10789 | |
 | A100 40 GB | 32 | 6498-6507 | 6819-6830 | | |
-| RTX 4080 | 128 | 5703-5769 | 7253-7254 | | 6527-6618 |
-| RTX 4080 | 32 | 4603 | 4767-4878 | | 4145-4549 |
+| RTX 4080 | 128 | 5754-5859 | | 7662-7855 | 6796-6962 |
+| RTX 4080 | 32 | 3747-4383 | | 4158-5207 | 4470-4628 |
 
 The A100 rows come from two sessions: 128 slots with three trees alternating
-and two rounds, and 32 slots, with two rounds. The RTX 4080 rows are one process
-each, with the recurrent state alone in bf16 and rounded to nearest. On the
-A100 at 128 slots, stochastic rounding serves 98.4% of the nearest
-rounding's throughput, 9.1-9.7% more than the fp32 state. It is not
-measured on the RTX 4080.
+and two rounds, and 32 slots, with two rounds. On the A100 at 128 slots,
+stochastic rounding serves 98.4% of the nearest rounding's throughput,
+9.1-9.7% more than the fp32 state. The RTX 4080 rows are one session on
+2026-10-07, main `a89d2682` (the fp32 state) against integration `2099dd7e`
+(the state as shipped) and vLLM 0.30.0, two rounds in alternating order. At
+128 slots Dew serves 1.10-1.16 times vLLM, against 0.83-0.86 with the fp32
+state. At 32 slots both Dew trees ran 13-25% faster in the second round than
+in the first, and vLLM did not, so Dew's ratio there is 0.90-1.16. Open loop
+at 128 slots, Dew's median token gap was 5.7-8.4 ms against vLLM's 4.3-10.0,
+and its gap p99 18-28 ms against vLLM's 22-89. An earlier single-process
+4080 run had the state rounded to nearest, at 7253-7254 tokens a second
+against vLLM's 6527-6618 at 128 slots.
 
 Not adopted: the mixed admitting step for a gated delta net, 2026-10-05.
 A hybrid server keeps two forwards for an admitting step: a prefill
