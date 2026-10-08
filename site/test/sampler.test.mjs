@@ -150,6 +150,41 @@ test('homepage text and diffusion cells run at once in their own contexts of one
 	await page.close();
 });
 
+test('a training cell waits its turn on the host, then shows the run', { timeout: 10_000 }, async () => {
+	const page = await browser.newPage();
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => route.fulfill({ json: { socket: SOCKET } }));
+	const sent = [];
+	const turn = Promise.withResolvers();
+	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			sent.push(message);
+			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
+			reply({ type: 'display', text: JSON.stringify({ 'dew-wait': { ahead: 1 } }) });
+			turn.promise.then(() => {
+				reply({ type: 'stream', name: 'stdout', text: 'Live run: steps 1000 -> 20.\nTrained 20 steps\n' });
+				reply({ type: 'done', status: 'ok', count: 1 });
+			});
+		});
+	});
+	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	const panel = page.locator('[data-live-train="finetune"]');
+	await panel.locator('[data-train-run]').click();
+	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent
+		.startsWith('This host trains one run at a time; 1 run is ahead of yours'));
+	turn.resolve();
+	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent.startsWith('Ran in'));
+	assert.match(await panel.locator('[data-train-output]').textContent(), /^Live run: steps 1000 -> 20\./);
+	assert.deepEqual(sent.map(({ cell, kernel }) => [cell, kernel]), [['finetune', 'train']]);
+	await page.close();
+});
+
 test('Try it cards stay readable and the local sampler link opens at both widths', async () => {
 	for (const [width, scheme] of [[1440, 'dark'], [390, 'light']]) {
 		const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: scheme, reducedMotion: 'reduce' });
