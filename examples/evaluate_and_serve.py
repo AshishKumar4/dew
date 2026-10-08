@@ -115,7 +115,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
         data=TokenWindows(path=str(tokens), seq_len=32,
                           loading=Loading(workers=0, threads=1, read_buffer=2,
                                           worker_buffer=1)),
-        sample_tokens=8,
+        max_new_tokens=8,
         optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), batch_size=4, steps=2,
                               log_every=1, eval_every=None, checkpoint_every=2,

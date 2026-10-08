@@ -249,7 +249,7 @@ def test_train_lm_example_samples_what_it_trained(tmp_path):
     example = load_example("train_lm")
     config = example.Config(tokens=tokens, sequence_length=32, batch_size=8, steps=60,
                             learning_rate=1e-2, model={"emb_features": 16, "num_layers": 1, "num_heads": 2},
-                            prompt="ab", sample_tokens=8, out=tmp_path / "run")
+                            prompt="ab", max_new_tokens=8, out=tmp_path / "run")
 
     state = example.main(config)
 

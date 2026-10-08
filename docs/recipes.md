@@ -60,7 +60,7 @@ python "$DEW_REPO/recipes/lm/train.py" data:token-windows \
     --trainer.batch-size 8 --trainer.steps 2 --trainer.log-every 1 \
     --trainer.eval-every 2 --trainer.checkpoint-every 2 \
     --trainer.checkpoint-dir runs --trainer.name byte-demo \
-    --trainer.multi-host False --sample-tokens 0
+    --trainer.multi-host False --max-new-tokens 0
 ```
 
 ```text
@@ -77,7 +77,7 @@ Trained 2 steps in 0:00:01: first step after 0.49 s, then 137.6 step/s
 
 The first update includes compilation. The run logs a loss at steps 1 and 2 and a validation perplexity at step 2. It writes a checkpoint to `runs/byte-demo/2` and the configuration to `runs/byte-demo/run.json`. The checkpoint holds the training state and the position in the data stream ([Checkpoints](guides/checkpoints.md)).
 
-`--sample-tokens 0` turns off text sampling, so validation only scores tokens. In a longer run you can ask for sample continuations with `--sample-prompt "The number after" --sample-tokens 32`. Sampling uses the EMA weights, and the recipe makes the decoder's context long enough for the prompt plus the new tokens. Early in training, random bytes may decode to replacement characters.
+`--max-new-tokens 0` turns off text sampling, so validation only scores tokens. In a longer run you can ask for sample continuations with `--prompt "The number after" --max-new-tokens 32`. Sampling uses the EMA weights, and the recipe makes the decoder's context long enough for the prompt plus the new tokens. Early in training, random bytes may decode to replacement characters.
 
 ## Configuration
 
