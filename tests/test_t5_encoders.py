@@ -95,6 +95,27 @@ def test_each_umt5_layer_reads_its_own_bias():
     assert difference > TOLERANCE, f"layer 0's table in every layer still matches: {difference:.3e}"
 
 
+def test_training_drops_units_and_one_key_drops_the_same_ones():
+    """The config's dropout_rate reaches the tower, and with `train` the
+    encoder drops units: two dropout keys give different states, one key the
+    same states twice, and evaluation stays the reference's."""
+    from dew.nn.text_encoders import T5EncoderModel, translate_t5_config
+
+    config = json.loads((TINY / "config.json").read_text())
+    tower = translate_t5_config({**config, "dropout_rate": 0.25}).value
+    assert tower.dropout_rate == 0.25
+    variables = T5EncoderModel.from_pretrained(str(TINY)).variables
+    expected = reference(TINY)
+
+    def encoded(**kwargs):
+        return np.asarray(tower.apply(variables, expected["input_ids"], expected["attention_mask"], **kwargs))
+
+    dropped = encoded(train=True, rngs={"dropout": jax.random.key(1)})
+    np.testing.assert_array_equal(dropped, encoded(train=True, rngs={"dropout": jax.random.key(1)}))
+    assert not np.array_equal(dropped, encoded(train=True, rngs={"dropout": jax.random.key(2)}))
+    assert largest_difference(encoded(), expected["last_hidden_state"]) < TOLERANCE
+
+
 def test_the_encoder_tokenizes_and_captions():
     """The committed tokenizer turns the fixture prompts into the committed
     ids, and the ids back into the prompts."""

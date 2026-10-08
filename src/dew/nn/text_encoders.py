@@ -663,8 +663,12 @@ class T5EncoderTransformer(nn.Module):
     additive bias (`AttentionMetadata.position_bias`), the padding its
     validity. T5 keeps one table, layer 0's (`T5Block(...,
     has_relative_attention_bias=bool(i == 0))` upstream), which every layer
-    reads; UMT5 keeps one per layer. The encoders run frozen, so the stack
-    has no dropout.
+    reads; UMT5 keeps one per layer.
+
+    With `train`, `dropout_rate` drops where the reference drops: the
+    embeddings, the attention probabilities (`T5Attention`), each block's two
+    residual branches (`T5LayerSelfAttention`, `T5LayerFF`), the
+    feed-forward's activated units (`T5DenseActDense`) and the final states.
     """
     vocab_size: int = 32128
     d_model: int = 512
@@ -675,6 +679,7 @@ class T5EncoderTransformer(nn.Module):
     num_buckets: int = 32
     max_distance: int = 128
     feed_forward_proj: str = "relu"
+    dropout_rate: float = 0.0
     layer_norm_epsilon: float = 1e-6
     per_layer_bias: bool = False
     """UMT5's: every layer holds its own relative bias table (`UMT5Attention`
@@ -695,18 +700,21 @@ class T5EncoderTransformer(nn.Module):
         attention = functools.partial(
             CausalSelfAttention, emb_features=self.d_model, num_heads=self.num_heads,
             num_kv_heads=self.num_heads, head_dim=self.head_dim, max_seq_len=0, causal=False, nope=True,
-            qk_norm=False, attention_scale=1.0, dtype=self.dtype, precision=self.precision)
+            qk_norm=False, attention_scale=1.0, attention_dropout_rate=self.dropout_rate, dtype=self.dtype,
+            precision=self.precision)
         mlp = functools.partial(GatedMLP, hidden_features=self.d_ff, out_features=self.d_model,
-                                activation=_T5_FEED_FORWARDS[self.feed_forward_proj], dtype=self.dtype,
-                                precision=self.precision)
+                                activation=_T5_FEED_FORWARDS[self.feed_forward_proj],
+                                dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision)
         self.layers = [
             DecoderBlock(attention, mlp, self.d_model, BlockWiring(), norm_eps=self.layer_norm_epsilon,
-                         dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
+                         dropout_rate=self.dropout_rate, dtype=self.dtype, precision=self.precision,
+                         name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.final_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="final_layer_norm")
+        self.dropout = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, input_ids, attention_mask=None):
-        hidden_states = self.embed_tokens(jnp.asarray(input_ids))
+    def __call__(self, input_ids, attention_mask=None, train: bool = False):
+        hidden_states = self.dropout(self.embed_tokens(jnp.asarray(input_ids)), deterministic=not train)
         length = hidden_states.shape[1]
         buckets = _t5_relative_position_bucket(
             jnp.arange(length)[None, :] - jnp.arange(length)[:, None], self.num_buckets, self.max_distance)
@@ -714,8 +722,8 @@ class T5EncoderTransformer(nn.Module):
         valid = None if attention_mask is None else jnp.asarray(attention_mask) != 0
         for index, layer in enumerate(self.layers):
             metadata = AttentionMetadata(valid=valid, position_bias=tables[index % len(tables)])
-            hidden_states = layer(hidden_states, attention_metadata=metadata)
-        return self.final_norm(hidden_states)
+            hidden_states = layer(hidden_states, train, attention_metadata=metadata)
+        return self.dropout(self.final_norm(hidden_states), deterministic=not train)
 
 
 def translate_t5_config(hf_config: Mapping[str, object]) -> NativeFields[T5EncoderTransformer]:
@@ -733,6 +741,7 @@ def translate_t5_config(hf_config: Mapping[str, object]) -> NativeFields[T5Encod
         max_distance=records.integer(hf_config.get("relative_attention_max_distance", 128),
                              "relative_attention_max_distance"),
         feed_forward_proj=records.text(hf_config.get("feed_forward_proj", "relu"), "feed_forward_proj"),
+        dropout_rate=records.number(hf_config.get("dropout_rate", 0.0), "dropout_rate"),
         layer_norm_epsilon=records.number(hf_config.get("layer_norm_epsilon", 1e-6), "layer_norm_epsilon"),
         per_layer_bias=hf_config.get("model_type") == "umt5",
     )
