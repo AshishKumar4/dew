@@ -128,7 +128,14 @@ def widened():
     from unittest.mock import patch
 
     from diffusers.schedulers import scheduling_unipc_multistep
+    from torch.utils._device import _device_constructors
 
+    # `torch.device(...)` as a context places only the constructors in a set
+    # torch builds once, on first use. Built inside this block it would hold
+    # the arange below for the rest of the process, and every later
+    # meta-device init (transformers' from_pretrained) would make arange's
+    # tensors on the CPU beside the meta ones; so it is built first.
+    _device_constructors()
     float_, to, arange = torch.Tensor.float, torch.Tensor.to, torch.arange
 
     def wide(dtype):
