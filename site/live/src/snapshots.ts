@@ -20,6 +20,10 @@ interface SnapshotEnv {
 
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 const REBUILD_MS = 15 * 60_000;
+// A failed preparation is retried after 5 minutes, then twice as long each time, up to 6 hours:
+// each attempt may leave a snapshot behind until an operator prunes (snapshot-ledger.ts).
+const RETRY_MS = 5 * 60_000;
+const RETRY_MAX_MS = 6 * 60 * 60_000;
 
 // The wall time an alarm handler may run (developers.cloudflare.com/durable-objects/platform/limits).
 const ALARM_MS = 15 * 60_000;
@@ -64,6 +68,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		if (generation) return { generation, rebuilding: false };
 		if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(commit)) throw new Error('snapshot generation must be pinned');
 		await this.ctx.storage.transaction(async (storage) => {
+			if ((await storage.get<string>('requested')) !== commit) await storage.delete('retries');
 			await storage.put('requested', commit);
 			const lease = await storage.get<{ until: number }>('rebuild');
 			const next = lease && lease.until > Date.now() ? lease.until + 1000 : Date.now() + 1000;
@@ -125,7 +130,9 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			});
 		} catch (error) {
 			console.error('snapshot preparation failed', error);
-			await this.ctx.storage.setAlarm(Date.now() + 5 * 60_000);
+			const retries = (await this.ctx.storage.get<number>('retries')) ?? 0;
+			await this.ctx.storage.put('retries', retries + 1);
+			await this.ctx.storage.setAlarm(Date.now() + Math.min(RETRY_MS * 2 ** retries, RETRY_MAX_MS));
 		}
 	}
 
@@ -150,6 +157,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 				if (lease?.token !== token) throw new Error('snapshot preparation lost its lease');
 				await storage.put('active', candidate);
 				await storage.delete('failure');
+				await storage.delete('retries');
 				await storage.delete('rebuild');
 				await storage.setAlarm(candidate.created + 7 * 24 * 60 * 60_000);
 			});
