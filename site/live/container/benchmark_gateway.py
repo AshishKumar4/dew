@@ -300,7 +300,62 @@ def main():
         ensure_event_loop().close()
 
 
+def busy_cells():
+    """Diagnosis only: three page contexts that sampled text and an image stay open, as on a page,
+    while the fine-tune cell runs; the report is raised so a trial shows it."""
+    pages = []
+    report = [f"start {memory()}"]
+    for _ in range(3):
+        kernel = request("/api/kernels", {"name": "python3"})
+        client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
+        client.load_connection_file()
+        client.start_channels()
+        client.wait_for_ready(timeout=30)
+        execute(client, "import model_client\nmodel_client.install()\n"
+                "from dew.sampling import CFG, DPMSolverMultistep, TextToImage\n"
+                "from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sampling\n"
+                "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m')\n"
+                "pipe(['a lake'], key=3, steps=15, solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9))).pil()[0]\n"
+                "model = PretrainedDecoder.load('HuggingFaceTB/SmolLM2-135M-Instruct', dtype='float32', max_seq_len=256)\n"
+                "print(model.text_generation(sampling=Sampling(temperature=0))('The capital of France is', 24, key=0).text[0])")
+        pages.append((kernel, client))
+    report.append(f"pages ready {memory()}")
+    peak = [10 ** 9]
+    import threading
+    stop = threading.Event()
+
+    def watch():
+        while not stop.is_set():
+            peak[0] = min(peak[0], memory()["MemAvailable"])
+            time.sleep(0.2)
+    watcher = threading.Thread(target=watch)
+    watcher.start()
+    kernel = request("/api/kernels", {"name": "dew-train"})
+    client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
+    client.load_connection_file()
+    client.start_channels()
+    try:
+        client.wait_for_ready(timeout=30)
+        output = collect(client, client.execute(pathlib.Path("/opt/live/cells/finetune.py").read_text(),
+                                                allow_stdin=False), timeout=400)
+        report.append(f"finetune output tail {output[-300:]!r}")
+    except Exception as error:
+        report.append(f"finetune failed {error!r}")
+    stop.set()
+    watcher.join()
+    report.append(f"after {memory()}; lowest MemAvailable {peak[0]} MiB")
+    rss = {}
+    for status in pathlib.Path("/proc").glob("[0-9]*/status"):
+        try:
+            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
+            rss[fields["Name"].strip() + ":" + fields["Uid"].split()[1]] = rss.get(fields["Name"].strip() + ":" + fields["Uid"].split()[1], 0) + (int(fields.get("VmRSS", "0 kB").split()[0]) >> 10)
+        except (OSError, KeyError, ValueError):
+            pass
+    report.append(f"rss by process {sorted(rss.items(), key=lambda item: -item[1])[:12]}")
+    raise SystemExit("DIAGNOSIS\n" + "\n".join(report))
+
+
 if __name__ == "__main__":
     main()
     training()
-    cells()
+    busy_cells()
