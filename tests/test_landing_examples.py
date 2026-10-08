@@ -21,10 +21,11 @@ def test_each_native_landing_cell_defines_its_imports_and_data():
                        'mesh', 'grpo', 'reliability', 'profile'];
         const cells = Object.fromEntries(names.map(name => [name, example(source, name)]));
         cells.hero = trainingExample(readFileSync('site/src/data/hero.py', 'utf8'));
+        cells.finetune = readFileSync('site/src/data/finetune.py', 'utf8');
         process.stdout.write(JSON.stringify(cells));
     """
     cells = json.loads(subprocess.check_output(["node", "--input-type=module", "-e", script], cwd=ROOT))
-    assert len(cells) == 12
+    assert len(cells) == 13
     for name, code in cells.items():
         compile(code, f"{name}.py", "exec")
         imports = [node for node in ast.parse(code).body if isinstance(node, (ast.Import, ast.ImportFrom))]
