@@ -325,7 +325,7 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
 
 
 @overload
-def from_record(annotation: types.UnionType, value: Configured, *, dtypes: bool = True) -> object: ...
+def from_record(annotation: types.UnionType, value: Configured, *, dtypes: bool = True) -> Configured: ...
 
 
 def from_record(annotation, value: Configured, *, dtypes: bool = True):
