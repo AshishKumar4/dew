@@ -66,7 +66,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 | `source` | A run directory (it holds `run.json`), a checkpoint directory in a published layout, or a Hub repository holding either. |
 | `mesh`, `layout` | Where the weights are placed. Without `mesh`, `MeshSpec()` puts the current process pool's devices on data parallelism. |
 | `dtype` | Compute dtype. |
-| `param_dtype` | Parameter storage. `None` keeps a run's stored dtypes and uses float32 master weights for a published source; `"auto"` keeps the stored dtypes for both, which for a published source means its `config.json` `dtype`, or else its first floating tensor's. |
+| `param_dtype` | Parameter storage. `None` and `"auto"` keep each tensor in the dtype it is stored in, for a run or a published source; a quantized source's packed weights decode to the dtype its `config.json` declares. `"float32"` gives a published source float32 master weights. |
 | `ema` | `None` (default): the run's moving-average weights when it stored them, else the live ones. `True` requires the average; `False` reads the live weights. |
 | `step` | Which of a run's checkpoints to load; refused for a source checkpoint. |
 | `revision` | Pins a Hub source; refused for a run directory. |

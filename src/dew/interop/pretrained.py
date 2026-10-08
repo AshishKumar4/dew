@@ -62,7 +62,7 @@ from dew.interop.processors import (
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import SourceLeaf, WeightLayout
-from dew.interop.weights import AUTO, auto_storage_dtype
+from dew.interop.weights import AUTO, declared_dtype
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -415,10 +415,12 @@ class Pretrained:
 
         `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
         dtype of floating parameters. It defaults to FP32 master weights, and 'auto'
-        keeps the checkpoint's own dtype. Each is a dtype (`jnp.bfloat16`) or its
-        name, and the model's record keeps the name. Frozen components (text encoders
-        and the VAE) follow `param_dtype` too, while router, clipping, positional and
-        safety state keep their own FP32 or integer dtypes.
+        keeps each tensor in the dtype the checkpoint stores it in; a quantized
+        source's packed weights decode to the dtype it declares (`declared_dtype`).
+        Each is a dtype (`jnp.bfloat16`) or its name, and the model's record keeps
+        the name. Frozen components (text encoders and the VAE) follow `param_dtype`
+        too, while router, clipping, positional and safety state keep their own FP32
+        or integer dtypes.
 
         Without `mesh` or `layout`, the variables are host arrays. With either, they
         are placed on that mesh (the default `MeshSpec()` when only `layout` is given)
@@ -993,13 +995,8 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     def pipeline(directory: Path) -> PretrainedPipeline:
         with open(directory / "model_index.json") as handle:
             index = json.load(handle)
-        storage = param_dtype
-        if storage == AUTO:
-            from dew.interop import diffusion
-            denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
-            storage = auto_storage_dtype({}, diffusion.component_tensors(directory, denoiser))
         loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
-            directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=storage,
+            directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
             lazy=streaming))
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
@@ -1260,9 +1257,8 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    if param_dtype == AUTO:
-        param_dtype = auto_storage_dtype(config, tensors)
-    tensors, quantized_tensors, scale_dtype, grid = _decoded(tensors, config, param_dtype)
+    tensors, quantized_tensors, scale_dtype, grid = _decoded(
+        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype)
     export_adapter = None
     media = _media_wrapper(config)
     if family == "diffusion_gemma":

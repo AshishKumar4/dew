@@ -43,7 +43,7 @@ from dew.interop.processors import (
     ProcessorCall as ProcessorCall,
 )
 from dew.interop.streaming import LazyTree, WeightLayout
-from dew.interop.weights import ParamTree
+from dew.interop.weights import AUTO, ParamTree
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
@@ -397,7 +397,8 @@ def load_diffusion_conditioner[C: ConditionEncoder](
     from dew.nn.autoencoders import AutoencoderKL
 
     compute = resolve_dtype(dtype)
-    resolve_dtype(param_dtype)
+    if param_dtype != AUTO:
+        resolve_dtype(param_dtype)
     directory = sources.snapshot(checkpoint, revision, weights=False)
     with open(directory / "model_index.json") as handle:
         index = json.load(handle)
