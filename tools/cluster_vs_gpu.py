@@ -170,6 +170,7 @@ def main() -> None:
                                   "temp_GB": memory.temp_size_in_bytes / 1e9,
                                   "arguments_GB": memory.argument_size_in_bytes / 1e9}), flush=True)
             if args.compile_only:
+                args.out.with_suffix(".hlo.txt").write_text(trainer.executable.as_text())
                 return
             start = time.monotonic()
         state, loss, _, _, _ = compiled(state, batch)
