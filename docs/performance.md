@@ -56,6 +56,10 @@ batch and averages them every 50 steps:
 | 8 containers, synchronous | about 85 min, from 26 s a step | |
 | 64 containers, synchronous | about 7.4 h, from 137 s a step | |
 
+A DiLoCo run's loss is the containers' mean training loss at a sync, before the outer step, and a run on one device's
+is the mean of its last ten steps. The two criteria differ, though by far less than the times do. The times leave out
+compilation on both sides.
+
 The synchronous step on 8 containers spends 5 s on one container's 32 rows. Another 18 s goes to the gradient's
 all-reduce, because XLA:CPU runs a combined all-reduce as one gloo ring for each of its 68 buffers: 17.8 s as that
 tuple, against 5.4 s for the same 57 MB as one buffer ([openxla/xla#50283](https://github.com/openxla/xla/issues/50283)).
@@ -72,15 +76,16 @@ Cost, at list prices on 2026-10-08:
   a standard-4 with its CPU busy.
 - An A100 80GB on demand costs from $1.59 an hour ([RunPod](https://www.runpod.io/pricing)) through $2.79
   ([Lambda](https://lambda.ai/pricing)) to $5.07 for GCP's a2-ultragpu-1g in us-central1
-  ([Google Cloud](https://cloud.google.com/products/compute/pricing/accelerator-optimized)).
+  ([Google Cloud](https://cloud.google.com/products/compute/pricing/accelerator-optimized)). The run here was on an
+  A100 40GB, so the 80GB's price is an upper bound on it.
 
 | run | cost |
 |---|---|
 | 64 containers, DiLoCo, 699 s | $4.98 |
 | 32 containers, DiLoCo, 1557 s | $5.55 |
-| A100, 20.5 s with compilation | $0.009 to $0.029 |
+| A100, bfloat16, 11.9 s | $0.005 to $0.017 |
 
-Here the cluster is 59 times slower than one A100 at best, and costs 170 to 600 times as much. It suits tests that
+Here the cluster is 59 times slower than one A100 at best, and costs 300 to 1,100 times as much. It suits tests that
 need separate hosts (`tests/test_multihost.py`), not training.
 
 ## The performance gate, 2026-10-07
