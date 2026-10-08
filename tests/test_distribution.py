@@ -237,13 +237,32 @@ def test_two_gpu_hosts_split_the_data_axis_unless_asked_otherwise():
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_named_device_list_is_laid_out_in_its_own_order():
+@pytest.mark.parametrize("cuda", [False, True])
+def test_a_joined_process_bounds_device_execution_only_where_the_cuda_plugin_is(monkeypatch, cuda):
+    """The execution watchdog is a flag of JAX's CUDA plugin; a TPU host's
+    libtpu need not know it, so a process without the plugin sets none."""
+    import dew.training.runtime as runtime
+
+    applied = []
+    monkeypatch.setattr(runtime, "cuda_plugin", lambda: cuda)
+    monkeypatch.setattr(runtime, "xla_flag", lambda name: None)
+    monkeypatch.setattr(runtime, "apply_xla_flags", applied.append)
+    monkeypatch.setattr(runtime.multihost_utils, "sync_global_devices", lambda name: None)
+    runtime._joined()
+    assert applied == ([f"--xla_gpu_execution_terminate_timeout={runtime.EXECUTION_TIMEOUT}"] if cuda else [])
+
+
+def test_a_named_device_list_is_laid_out_in_its_own_order(monkeypatch):
     """A caller naming the devices chooses which share an axis, as
     benchmark_step's device_order puts a size-2 axis across or along an
     NVLink pair. jax.make_mesh sorts GPU devices by id, which built the same
-    mesh for every order."""
+    mesh for every order; on CPU it keeps their order, so here it sorts them
+    as it does on a GPU."""
     import jax
 
+    laid_out = jax.make_mesh
+    monkeypatch.setattr(jax, "make_mesh", lambda shape, axes, *, devices, **rest: laid_out(
+        shape, axes, devices=sorted(devices, key=lambda device: device.id), **rest))
     order = jax.devices()[:2][::-1]
     mesh = MeshSpec(fsdp=2).build(order)
     assert list(mesh.devices.flat) == order

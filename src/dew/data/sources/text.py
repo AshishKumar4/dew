@@ -54,16 +54,16 @@ def _meta(root: Path) -> Mapping[str, object]:
     if not beside.is_file():
         return {}
     with open(beside) as record:
-        held = json.load(record)
-    if not isinstance(held, dict):
-        raise ValueError(f"{beside} holds {type(held).__name__}, not a JSON object")
-    return held
+        meta = json.load(record)
+    if not isinstance(meta, dict):
+        raise ValueError(f"{beside} holds {type(meta).__name__}, not a JSON object")
+    return meta
 
 
 def _recorded(meta: Mapping[str, object], key: str) -> int | None:
     """One integer meta.json records, or None when it records none."""
-    held = meta.get(key)
-    return None if held is None else int(str(held))
+    value = meta.get(key)
+    return None if value is None else int(str(value))
 
 
 def _dtype(meta: Mapping[str, object]) -> np.dtype:
@@ -541,10 +541,10 @@ class _Documents:
                 "eos tokens `dew tokenize` writes with --pack")
         self.eos_id = int(tokens.eos_id)
 
-        held = tokens[0:len(tokens)]
-        ends = (np.flatnonzero(held == self.eos_id) + 1).astype(np.int64)
-        if len(ends) == 0 or ends[-1] < len(held):
-            ends = np.append(ends, len(held))
+        ids = tokens[0:len(tokens)]
+        ends = (np.flatnonzero(ids == self.eos_id) + 1).astype(np.int64)
+        if len(ends) == 0 or ends[-1] < len(ids):
+            ends = np.append(ends, len(ids))
         starts = np.concatenate([[0], ends[:-1]])
         self.chunk_len = chunk_len
         if chunk_len is not None:

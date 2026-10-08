@@ -158,10 +158,6 @@ def _nemotron_h_moe() -> dict[str, Any]:
     Reproduce with `--models nemotron_h_moe --layouts sequence4 expert4
     --dtype float32 --steps 1 --devices 4 --rounding-orders --out DIR`,
     JAX_PLATFORMS=cpu, JAX_ENABLE_X64=1 and four virtual CPU devices.
-    Raw distances live under
-    ~/.cache/dew/integration/a906f0111d586f67996850929c23b80343345891/ExcitedRook/
-    dew-aux-nemotron-orders-retry-job-1/outputs/out/nemotron_h_orders/;
-    the sibling nemotron_h_orders.log records the run.
     """
     config = _fixture('nemotron-h-moe-tiny')
     config.update(vocab_size=512, num_layers=20, max_seq_len=33,
