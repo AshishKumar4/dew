@@ -146,7 +146,8 @@ def pretrained():
     from dew.objectives.lm import LMObjective
     from dew.sampling import Sampling
 
-    bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16, max_seq_len=128)
+    bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
+                                    max_seq_len=128)
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     print(task("The capital of France is", 12, key=0).text[0])
 
