@@ -340,7 +340,8 @@ def _suites(dataset: Dataset, validation: Mapping[str, Reader | EvalSuite] | Non
     """Every split `fit` validates, by name, with its metrics and cadence
     resolved: `dataset.val` alone is the one suite `val`."""
     if validation is None:
-        validation = {} if dataset.val is None or not (eval_every or metrics) else {"val": dataset.val}
+        # `val` is read only when a pass is scheduled; a dataset need not hold one.
+        validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
     elif not validation:
         raise ValueError("validation must contain a split")
     suites = {}
