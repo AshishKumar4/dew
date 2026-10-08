@@ -24,8 +24,9 @@ from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import FROZEN, Variables, merge
+from dew.objectives.base import Variables, merge
 from dew.registry import (
+    Configured,
     DtypeName,
     datasets,
     dtype_name,
@@ -212,6 +213,8 @@ class DiffusionRunConfig(RunConfig):
     `--model` holds only the precision settings and `text` and `autoencoder` stay
     unset.
     """
+    pretrained_param_dtype: DtypeName = "float32"
+    """The dtype `pretrained`'s parameters are stored and trained in."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Metric aliases or import paths, scored on every validation pass.
 
@@ -224,6 +227,9 @@ class DiffusionRunConfig(RunConfig):
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
+        if self.pretrained is None and self.pretrained_param_dtype != "float32":
+            raise ValueError("--pretrained-param-dtype stores a --pretrained pipeline's parameters; "
+                             "this run loads none")
 
         if self.pretrained is not None:
             # The pipeline's own denoiser trains; the model flags it reads are
@@ -284,21 +290,22 @@ class DiffusionRunConfig(RunConfig):
             return Field("image", (spec.image_size, spec.image_size, 3))
         raise ValueError(f"a diffusion run trains on image or video datasets, not {type(spec).__name__}")
 
-    def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
-        """Return the fields the registry builds the model from.
+    def model_fields(self, autoencoder: AutoEncoder | None) -> dict[str, Configured]:
+        """Return the fields the run derives for the model, which `ModelConfig.build`
+        takes over the model's `arguments`.
 
-        These are the model's `arguments`, plus the channels the model denoises when
-        the architecture takes them as `output_channels`. The published families name
-        theirs as their sources do, in `model.fields`. On the model those build, an
-        `IntervalModel` embeds the duration under an interval process, and MeanFlow,
-        whose loss differentiates in time, turns a `TimeScaled` model's time features
-        at `SMOOTH_TIME_SCALE` unless `model.fields` names a scale.
+        These are the channels the model denoises when the architecture takes them
+        as `output_channels`. The published families name theirs as their sources
+        do, in `model.fields`. On the model those build, an `IntervalModel` embeds
+        the duration under an interval process, and MeanFlow, whose loss
+        differentiates in time, turns a `TimeScaled` model's time features at
+        `SMOOTH_TIME_SCALE` unless `model.fields` names a scale.
         """
-        fields = dict(self.model.arguments)
+        fields: dict[str, Configured] = {}
         if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.name])}:
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
-        model = models.build(self.model.name, fields)
+        model = self.model.build(**fields)
         if isinstance(model, IntervalModel) and self.preset is not None:
             built = self.preset()
             fields["interval"] = isinstance(built, Process) and built.interval
@@ -311,25 +318,6 @@ class DiffusionRunConfig(RunConfig):
     def context(self) -> TextCondition | AudioCondition | None:
         """Return the condition the model reads, text or audio, if any."""
         return self.text if self.text is not None else self.audio
-
-    @property
-    def parameter_roots(self) -> tuple[tuple[str, ...], ...]:
-        """Return which parts of the variables tree this config builds own which parameters."""
-        roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
-        if self.pretrained is not None:
-            # Every published pipeline's conditioner owns a bare tree.
-            from dew.inputs.diffusion import DiffusionConditioner
-
-            return (*roots, ("encoders", DiffusionConditioner.keyword), ("autoencoder",))
-        if self.context is not None:
-            encoder = encoders[self.context.encoder]
-            prefix = ("encoders", encoder.keyword)
-            collections = encoder.parameter_collections
-            roots.extend((prefix,) if collections is None else
-                         ((*prefix, collection) for collection in collections))
-        if self.autoencoder is not None:
-            roots.append(("autoencoder",))
-        return tuple(roots)
 
     def build(self, *, variables: Variables | None = None) -> DiffusionObjective:
         """Build the objective, with each component built around its parameters.
@@ -443,7 +431,7 @@ class DiffusionRunConfig(RunConfig):
                 # __post_init__ holds audio to a VideoDataset.
                 assert self.audio is not None and isinstance(self.data, VideoDataset)
                 conditions[keyword] = self.audio.build(self.data, params=params, dtype=self._compute)
-        model = models.build(self.model.name, self.model_fields(autoencoder))
+        model = self.model.build(**self.model_fields(autoencoder))
         return model, conditions, autoencoder
 
     def _autoencoder_params(self, variables: Variables) -> Variables:
@@ -468,7 +456,8 @@ class DiffusionRunConfig(RunConfig):
         assert self.pretrained is not None
         name, revision = split_revision(self.pretrained)
         return load_diffusion_source(
-            name, revision=revision, dtype=self._compute or "bfloat16", param_dtype="float32",
+            name, revision=revision, dtype=self._compute or "bfloat16",
+            param_dtype=self.pretrained_param_dtype,
             attention_impl=str(self.model.fields.get("attention_impl", "auto")),
             size=self.sample_field().shape[:-1],
             variables=variables)

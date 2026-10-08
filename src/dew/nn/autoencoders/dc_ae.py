@@ -238,7 +238,6 @@ class _Up(nn.Module):
 
 
 class _Encoder(nn.Module):
-    image_channels: int
     latent_channels: int
     head_dim: int
     blocks: tuple[str, ...]
@@ -361,7 +360,6 @@ class DCAE(nn.Module):
 
     def setup(self):
         self.encoder = _Encoder(
-            self.image_channels,
             self.latent_channels,
             self.head_dim,
             self.encoder_blocks,

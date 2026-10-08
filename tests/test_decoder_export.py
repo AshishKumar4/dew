@@ -553,9 +553,10 @@ def test_an_interrupted_re_export_leaves_the_previous_export_whole(tmp_path, mon
 
 @pytest.mark.parametrize("sampling", [
     {"temperature": 0.0},
-    {"temperature": 0.5, "top_k": 7, "eos_id": 3, "pad_id": 0, "min_new_tokens": 2, "stop": ("\n\n",)},
+    {"temperature": 0.5, "top_k": 7, "eos_token_ids": 3, "pad_token_id": 0, "min_new_tokens": 2,
+     "stop": ("\n\n",)},
     {"temperature": 1.3, "top_p": 0.9, "min_p": 0.05, "typical_p": 0.8, "repetition_penalty": 1.2,
-     "no_repeat_ngram_size": 3, "eos_id": (3, 4), "pad_id": 1},
+     "no_repeat_ngram_size": 3, "eos_token_ids": (3, 4), "pad_token_id": 1},
 ], ids=["greedy", "top_k_with_stops", "nucleus_and_penalties"])
 def test_a_runs_policy_exports_as_the_generation_config_transformers_and_dew_read_back(sampling):
     """The generation_config.json an export of a run writes is transformers'
@@ -574,11 +575,12 @@ def test_a_runs_policy_exports_as_the_generation_config_transformers_and_dew_rea
     if parsed.do_sample:
         assert (parsed.temperature, parsed.top_k or None, parsed.top_p) == (
             policy.temperature, policy.top_k, policy.top_p)
-    assert parsed.eos_token_id == (list(policy.eos_id) if isinstance(policy.eos_id, tuple) else policy.eos_id)
+    eos = policy.eos_token_ids
+    assert parsed.eos_token_id == (list(eos) if isinstance(eos, tuple) else eos)
     model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
                               max_seq_len=16)
     read, _, _ = source_decoding({}, written, model, 1, None)
-    assert read == dataclasses.replace(policy, pad_id=policy.pad_id or 0)
+    assert read == dataclasses.replace(policy, pad_token_id=policy.pad_token_id or 0)
 
 
 def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():

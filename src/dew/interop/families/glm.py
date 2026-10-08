@@ -30,6 +30,7 @@ from dew.interop.decoder_parts import (
     fixed_mixture,
     hf_tensor_name,
     kind_mixers,
+    plain_partial_rope,
     record_float,
     record_int,
     refuse,
@@ -357,20 +358,9 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     # The released configs spell the rotary flat (rope_theta beside
     # partial_rotary_factor); a config transformers wrote nests both under
     # rope_parameters, the spelling Glm4MoeRotaryEmbedding reads.
-    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
-    if rope_type not in ('default', 'none') or hf_config.get('rope_scaling') is not None:
-        refuse(f"rope_parameters (rope_type {rope_type!r})",
-                "Glm4MoeRotaryEmbedding is the plain rotary")
-    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor'})
-    if scaling:
-        refuse(f"rope_parameters scaling fields {scaling}",
-                "Glm4MoeRotaryEmbedding is the plain rotary")
-    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
-                   'rope_parameters rope_theta')
-    factor = records.number(entry.get('partial_rotary_factor',
-                              hf_config.get('partial_rotary_factor', 1.0)),
-                    'rope_parameters partial_rotary_factor')
+    if hf_config.get('rope_scaling') is not None:
+        refuse("rope_scaling", "Glm4MoeRotaryEmbedding is the plain rotary")
+    theta, factor = plain_partial_rope(hf_config, default_factor=1.0, reference='Glm4MoeRotaryEmbedding')
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'use_qk_norm',
                  'partial_rotary_factor', 'num_nextn_predict_layers'))
     config = base_config(hf_config, used, rope=Ropes(theta),

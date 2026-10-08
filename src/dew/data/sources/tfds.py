@@ -52,23 +52,23 @@ tfds.builder(name, data_dir=data_dir, config=config, version=version).download_a
 """
 
 
-def prepared(builder: str, *, config: str | None = None, version: str | None = None) -> str:
-    """Dew's own TFDS data_dir, `dew_cache_dir()/tfds`, holding `builder`.
+def prepared(name: str, *, config: str | None = None, version: str | None = None) -> str:
+    """Dew's own TFDS data_dir, `dew_cache_dir()/tfds`, holding `name`.
 
-    A missing builder is prepared there by `download_and_prepare` in a
+    A missing name is prepared there by `download_and_prepare` in a
     separate process of the same interpreter with no GPU visible, since
     TensorFlow imported into a JAX process stays loaded and claims
     accelerator memory. Processes on one host take turns under a file lock.
-    Without TensorFlow, as on Python 3.14, a missing builder raises
+    Without TensorFlow, as on Python 3.14, a missing name raises
     `FileNotFoundError`. The directory is not TFDS's `~/tensorflow_datasets`,
-    where an earlier `tfds.load` may have prepared the builder as TFRecords,
+    where an earlier `tfds.load` may have prepared the name as TFRecords,
     which dew refuses and TFDS would not prepare again.
     """
     directory = os.path.join(dew_cache_dir(), "tfds")
 
     def held() -> bool:
         try:
-            read_only_builder(directory, builder=builder, config=config, version=version)
+            read_only_builder(directory, name=name, config=config, version=version)
         except FileNotFoundError:
             return False
         return True
@@ -77,22 +77,22 @@ def prepared(builder: str, *, config: str | None = None, version: str | None = N
         return directory
     if importlib.util.find_spec("tensorflow") is None:
         raise FileNotFoundError(
-            f"No prepared {builder!r} in {directory}, and preparing it needs TensorFlow, "
+            f"No prepared {name!r} in {directory}, and preparing it needs TensorFlow, "
             f"which this environment does not have. " + PREPARE)
     os.makedirs(directory, exist_ok=True)
     with FileLock(os.path.join(directory, ".prepare.lock")):
         if not held():
             done = subprocess.run(
-                [sys.executable, "-c", _PREPARING, builder, directory, config or "", version or ""],
+                [sys.executable, "-c", _PREPARING, name, directory, config or "", version or ""],
                 env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}, capture_output=True, text=True,
                 check=False)
             if done.returncode:
-                raise RuntimeError(f"preparing {builder!r} into {directory} failed:\n"
+                raise RuntimeError(f"preparing {name!r} into {directory} failed:\n"
                                    + "\n".join(done.stderr.splitlines()[-20:]))
     return directory
 
 
-def read_only_builder(path: str, *, builder: str | None,
+def read_only_builder(path: str, *, name: str | None,
                       config: str | None, version: str | None):
     """The read-only builder over the prepared data at `path`, checked against
     what was asked for.
@@ -131,7 +131,7 @@ def read_only_builder(path: str, *, builder: str | None,
         # them anyway is constraining what it must hold, which the metadata
         # answers below.
         reader = tfds.builder_from_directory(root)
-    elif builder is None:
+    elif name is None:
         raise FileNotFoundError(f"No prepared TFDS metadata at {path!r}. " + PREPARE)
     else:
         from tensorflow_datasets.core.read_only_builder import builder_from_files
@@ -139,11 +139,11 @@ def read_only_builder(path: str, *, builder: str | None,
         asked = "".join(f" {what} {value!r}" for what, value in (("config", config),
                                                                  ("version", version)) if value)
         try:
-            reader = builder_from_files(builder, data_dir=os.fspath(root), config=config,
+            reader = builder_from_files(name, data_dir=os.fspath(root), config=config,
                                         version=version)
         except tfds.core.DatasetNotFoundError as missing:
             raise FileNotFoundError(
-                f"{path!r} holds no prepared {builder!r}{asked}. " + PREPARE) from missing
+                f"{path!r} holds no prepared {name!r}{asked}. " + PREPARE) from missing
     directory = reader.data_path
     dataset_info = reader.info
     if dataset_info.file_format != tfds.core.FileFormat.ARRAY_RECORD:
@@ -152,7 +152,7 @@ def read_only_builder(path: str, *, builder: str | None,
             f"ArrayRecords, which is what needs no TensorFlow in the training "
             f"process. Prepare file_format='array_record' in a directory of its "
             f"own.")
-    for asked, found, what in ((builder, dataset_info.name, "builder"),
+    for asked, found, what in ((name, dataset_info.name, "builder"),
                                (config, dataset_info.config_name or None, "config"),
                                (version, str(dataset_info.version), "version")):
         if asked is not None and asked != found:
@@ -188,7 +188,7 @@ def check_shards(builder, split: str, directory: epath.Path) -> None:
                     f"Copy the complete prepared dataset or prepare it again.")
 
 
-def prepared_source(path: str, split: str, *, builder: str | None = None,
+def prepared_source(path: str, split: str, *, name: str | None = None,
                     config: str | None = None, version: str | None = None,
                     decoders: DecoderTree | None = None) -> Records:
     """Reads one split of a prepared TFDS dataset by index.
@@ -204,7 +204,7 @@ def prepared_source(path: str, split: str, *, builder: str | None = None,
     bare array for a single feature. The run's own `preprocess` is where it
     becomes batch fields.
     """
-    reader = read_only_builder(path, builder=builder, config=config, version=version)
+    reader = read_only_builder(path, name=name, config=config, version=version)
     check_shards(reader, split, epath.Path(reader.data_path))
     return Prepared(reader.as_data_source(split, decoders=decoders),
                     str(reader.data_path), split)
@@ -271,7 +271,7 @@ class TFDSOptions:
     def source(self, name: str, split: str) -> Records:
         """Open `split` of the prepared builder `name` for reading by index."""
         path = self.path or prepared(name, config=self.config, version=self.version)
-        return prepared_source(path, split, builder=name, config=self.config,
+        return prepared_source(path, split, name=name, config=self.config,
                                version=self.version, decoders=self.decoders)
 
 

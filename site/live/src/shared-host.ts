@@ -18,11 +18,32 @@ export class SharedHost extends DurableObject<Env> {
 	}
 
 	async warm(): Promise<void> {
-		if (this.ctx.container?.running && !this.starting && !(await this.available())) await this.ctx.container.destroy();
+		if (this.ctx.container?.running && !this.starting && !(await this.available())) {
+			// A host busy with a run can miss one check; restarting it would end every cell on it.
+			const missed = ((await this.ctx.storage.get<number>('missed')) ?? 0) + 1;
+			await this.ctx.storage.put('missed', missed);
+			const sessions = (await this.ctx.storage.get<string[]>('sessions'))?.length ?? 0;
+			if (sessions && missed < 3) return;
+			console.error('model host restarted after failing its health check', missed, 'times with', sessions, 'contexts');
+			await this.ctx.container.destroy();
+		}
+		await this.ctx.storage.delete('missed');
 		await this.ready();
 	}
 
+	/** The bridge's report of the host's memory and contexts, or null while it is not running. */
+	async health(): Promise<Record<string, unknown> | null> {
+		if (!this.ctx.container?.running) return null;
+		try { return await (await this.ctx.container.getTcpPort(PORT).fetch('http://container/health')).json(); }
+		catch { return null; }
+	}
+
 	async retire(): Promise<void> {
+		// A context that ended without a close through this host stays a member; only the
+		// contexts the container still holds keep it from retiring.
+		for (const session of (await this.ctx.storage.get<string[]>('sessions')) ?? []) {
+			if (!(await this.has(session))) await this.membership(session, false);
+		}
 		if ((await this.ctx.storage.get<string[]>('sessions'))?.length) throw new Error('a model host still has active contexts');
 		if (this.ctx.container?.running) await this.ctx.container.destroy();
 		await this.ctx.storage.deleteAlarm();
@@ -50,6 +71,10 @@ export class SharedHost extends DurableObject<Env> {
 				entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: secret,
 					DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds), DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds) } });
 			await this.ctx.storage.put('started', Date.now());
+			// A container stops only when destroyed or when it fails; say which, and after how long.
+			const started = Date.now();
+			container.monitor().then(() => console.log('model host container exited', generation.snapshot.id, Date.now() - started))
+				.catch((error) => console.error('model host container stopped', generation.snapshot.id, Date.now() - started, String(error)));
 		}
 		await container.setInactivityTimeout((limits.wallSeconds + limits.warmSeconds + 60) * 1000);
 		await this.ctx.storage.setAlarm(Date.now() + 30_000);

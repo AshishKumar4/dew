@@ -7,7 +7,6 @@ import pytest
 
 from dew.checkpoints import _filled
 from dew.nn.kernels.generation import device_generation
-from dew.training import trainer as trainer_module
 from dew.training.narrow import narrowed, narrowed_paths
 
 
@@ -57,10 +56,10 @@ def _trained(monkeypatch, generations, optimizer, steps=3, mesh=None):
     one batch, with copies on the generations named, on `mesh` with every
     parameter split where it divides."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.kernels import KERNELS
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
-
-    monkeypatch.setattr(trainer_module, "NARROW_COPY_GENERATIONS", frozenset(generations))
+    monkeypatch.setitem(KERNELS, "narrow_copies", dict.fromkeys(generations, "on"))
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2, num_kv_heads=1,
                               mlp="swiglu", mlp_features=64, max_seq_len=16, qk_norm=True,
                               tie_embeddings=True, dtype=jnp.bfloat16)
@@ -108,7 +107,7 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
 
 
 def test_no_copy_off_the_measured_generations(monkeypatch):
-    """Off `NARROW_COPY_GENERATIONS` the state holds no copies."""
+    """Off `KERNELS['narrow_copies']` the state holds no copies."""
     state, _ = _trained(monkeypatch, set(), optax.adam(1e-3), steps=1)
     assert state.compute is None
 

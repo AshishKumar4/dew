@@ -651,13 +651,22 @@ def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str
             for problem in unresolved_uses(package, home, pages, code, shown, bound)]
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
-    args = parser.parse_args()
-    package = load()
-    pages, home = documented(package)
+def undocumented(package: griffe.Module, pages: dict[str, Page], home: dict[str, str]) -> list[str]:
+    """Each module declaring __all__ without a page, and each name it exports that no page documents."""
+    problems = []
+    for module in iter_modules(package):
+        if module.exports is None:
+            continue
+        if module.path not in pages:
+            problems.append(f"{module.path} declares __all__ but has no API page; add it to GROUPS")
+        for entry in public_entries(module):
+            if entry.canonical not in home:
+                problems.append(f"{module.path}.__all__ exports {entry.name} ({entry.canonical}), which no API page documents")
+    return problems
 
+
+def linked(pages: dict[str, Page], home: dict[str, str]) -> Linker:
+    """Every documented name's URL: its page and the anchor of its heading there."""
     linker = Linker()
     for path in PAGES:
         linker.add(path, f"/{page_slug(path)}/")
@@ -675,18 +684,21 @@ def main() -> None:
                             method = f"/{page_slug(path)}/#{anchor(f'{entry.name}.{name}')}"
                             linker.add(f"{entry.canonical}.{name}", method, f"{entry.name}.{name}")
                             linker.add(f"{path}.{entry.name}.{name}", method)
+    return linker
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
+    args = parser.parse_args()
+    package = load()
+    pages, home = documented(package)
+
+    linker = linked(pages, home)
 
     # Coverage: every module that declares __all__ has a page, and every exported
     # name and every name the docs import is documented.
-    problems = []
-    for module in iter_modules(package):
-        if module.exports is None:
-            continue
-        if module.path not in pages:
-            problems.append(f"{module.path} declares __all__ but has no API page; add it to GROUPS")
-        for entry in public_entries(module):
-            if entry.canonical not in home:
-                problems.append(f"{module.path}.__all__ exports {entry.name} ({entry.canonical}), which no API page documents")
+    problems = undocumented(package, pages, home)
     for file, module_path, name in usage_imports():
         try:
             module = (module_of(package, module_path) if module_path == "dew"

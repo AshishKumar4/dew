@@ -38,7 +38,6 @@
     },
     "lora": null,
     "model": {
-      "adapter": null,
       "fields": {
         "adaln_silu": false,
         "attention_impl": "auto",
@@ -56,7 +55,7 @@
         "use_2d_fusion": true
       },
       "name": "dew.nn.backbones.ssm_dit:HybridSSMAttentionDiT",
-      "quantization": null
+      "wrappers": []
     },
     "objective": {
       "fields": {

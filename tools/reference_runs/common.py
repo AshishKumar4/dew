@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import gzip
 import hashlib
+import importlib.util
 import json
 import math
 import os
@@ -28,21 +29,20 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from trace_window import device_events, kernel_category, window_split
 
-# Dense bf16 tensor throughput with fp32 accumulation, the figure MFU is
-# taken against. GA102 whitepaper, appendix table: RTX 3090 71 TFLOPS dense
-# (142 with sparsity). DistTrain's instrumentation table carries the same.
-# A TPU v6e chip ("TPU v6 lite") peaks at 918 TFLOPs bf16
-# (cloud.google.com/tpu/docs/v6e, the system architecture table).
-PEAK_BF16 = {"NVIDIA GeForce RTX 3090": 71e12, "NVIDIA GeForce RTX 4080": 97.5e12,
-             "NVIDIA A100": 312e12, "NVIDIA L4": 121e12, "TPU v6 lite": 918e12}
-
 EVIDENCE = Path(os.environ.get(
     "REFERENCE_RUNS_DIR", Path.home() / ".cache/dew/verification-evidence/reference-runs"))
 
 
-def peak_flops(device_name: str) -> float | None:
-    keys = [key for key in PEAK_BF16 if device_name.startswith(key)]
-    return PEAK_BF16[max(keys, key=len)] if keys else None
+def _peaks():
+    """dew.telemetry.peaks, read by path: a reference run's venv need not hold Dew."""
+    path = Path(__file__).resolve().parents[2] / "src/dew/telemetry/peaks.py"
+    spec = importlib.util.spec_from_file_location("dew_telemetry_peaks", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+peak_flops = _peaks().peak_flops
 
 
 def warmup_cosine(step: int, *, init: float, peak: float, warmup: int, decay_steps: int,

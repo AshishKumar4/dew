@@ -373,7 +373,9 @@ class HubDataset(ProviderDataset):
     keeps file order. A stream has no length, so `records` is whatever count
     the caller knows. A validation pass is never shuffled. An Arrow split is
     shuffled whole from `seed`, so a nonzero `shuffle_buffer` without
-    `streaming` raises `TypeError`, and so does streaming a mixture.
+    `streaming` raises `TypeError`, and so does streaming a mixture. A stream
+    is read in one thread of the training process, so of `loading` only
+    `worker_buffer`, the batches it holds ready, applies to it.
     """
 
     streaming: bool = False
@@ -412,16 +414,11 @@ class HubDataset(ProviderDataset):
         """The batches of an Arrow table the caller built, read by index."""
         from .sources.hf import HFDatasetSource
 
-        source = HFDatasetSource(split=self.split, dataset=dataset)
-        return Dataset(
-            train=train_stream(source, self.transforms, batch=batch, seed=self.seed,
-                               loading=self.loading),
-            val=None if self.val_split is None else bounded(
-                validation_pass(HFDatasetSource(split=self.val_split, dataset=dataset),
-                                self.transforms, batch=batch, seed=self.seed,
-                                loading=self.loading), self.val_batches),
-            records=counted(source, self.records, _GIVEN),
-            batch=batch)
+        held = None if self.val_split is None else [
+            Corpus(_GIVEN, HFDatasetSource(split=self.val_split, dataset=dataset), 1.0)]
+        return corpora_dataset([Corpus(_GIVEN, HFDatasetSource(split=self.split, dataset=dataset), 1.0)],
+                               held, self.transforms, batch=batch, seed=self.seed, loading=self.loading,
+                               val_batches=self.val_batches, records=self.records)
 
     def _streamed(self, *, batch: int,
                   dataset: ArrowDataset | IterableDataset | None) -> Dataset:
@@ -578,7 +575,7 @@ def _stream(name: str, split: str, *, options: HFOptions,
     where = f"{name!r} split {split!r}" if dataset is None else "the given dataset"
 
     def stream(partition: DataPartition) -> Iterator[Batch]:
-        source = HFRows(open_split, what=where, seed=seed, rank=partition.index,
+        source = HFRows(open_split, where=where, seed=seed, rank=partition.index,
                         world_size=partition.count,
                         shuffle_buffer=shuffle_buffer, epochs=epochs,
                         given=dataset is not None)

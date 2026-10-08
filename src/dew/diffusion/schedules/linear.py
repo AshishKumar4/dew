@@ -27,3 +27,4 @@ class LinearNoiseScheduler(DiscreteNoiseScheduler):
         super().__init__(linear_beta_schedule(timesteps, beta_start, beta_end),
                          p2_loss_weight_k=p2_loss_weight_k,
                          p2_loss_weight_gamma=p2_loss_weight_gamma)
+        self.timesteps, self.beta_start, self.beta_end = timesteps, beta_start, beta_end

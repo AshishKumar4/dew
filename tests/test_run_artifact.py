@@ -17,6 +17,7 @@ from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
+from dew.registry import from_record, to_record
 from dew.training import Trainer
 
 
@@ -167,10 +168,12 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
     checkpoints.wait()
     record = checkpoints.artifact()['model']
     assert record['name'] == 'dew.nn.backbones.causal_transformer:CausalTransformer'
-    assert record['adapter'] == {'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
-        'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
-        f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight', 'shape': [16, 16],
-                                               'transpose': [1, 0]} for name in ('q_proj', 'v_proj')}}
+    assert record['wrappers'] == [{'class': 'dew.lora:AdapterRecord', 'fields': {
+        'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
+            'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
+            f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight',
+                                                   'shape': [16, 16], 'transpose': [1, 0]}
+            for name in ('q_proj', 'v_proj')}}}]
     assert any(np.abs(np.asarray(leaf)).max() > 0 for path, leaf in jax.tree_util.tree_leaves_with_path(
         state.variables['params']) if 'lora_B' in jax.tree_util.keystr(path))
     task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
@@ -277,7 +280,8 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
         data, steps=2, checkpoint_every=1)
     checkpoints.wait()
-    assert checkpoints.artifact()['model']['adapter']['modules'] == ['params/hidden', 'params/out']
+    (adapter_record,) = checkpoints.artifact()['model']['wrappers']
+    assert adapter_record['fields']['modules'] == ['params/hidden', 'params/out']
     pipe = TextToImage.from_run(str(tmp_path / 'run'), ema=False)
     x, t = jax.random.normal(jax.random.key(2), (2, 4, 4, 3)), jnp.zeros((2,))
     np.testing.assert_array_equal(np.asarray(pipe.model.apply(pipe.variables, x, t)),
@@ -357,7 +361,7 @@ def test_builtin_process_records_preserve_noise_prediction_and_weights():
     from dew.diffusion.presets import EDM, Cosine, Flow
     for preset in (EDM(regime='pixel'), Flow(), Cosine()):
         original = preset()
-        rebuilt = Process.from_json(original.to_json())
+        rebuilt = from_record(Process, to_record(original, Process))
         time = jnp.linspace(.01, .99, 16)
         np.testing.assert_array_equal(original.schedule.rates(time)[0], rebuilt.schedule.rates(time)[0])
         np.testing.assert_array_equal(original.schedule.rates(time)[1], rebuilt.schedule.rates(time)[1])
@@ -450,7 +454,7 @@ def test_every_builtin_process_component_round_trips_nondefaults(component):
     weighting = value if isinstance(value, (transforms.ScheduleWeighting, transforms.MinSNR,
                                             transforms.VelocityLoss)) else transforms.ScheduleWeighting()
     original = Process(schedule=schedule, prediction=prediction, weighting=weighting)
-    rebuilt = Process.from_json(original.to_json())
+    rebuilt = from_record(Process, to_record(original, Process))
     time = jnp.linspace(.01, .99, 16)
     for method in ('rates', 'weight', 'model_time'):
         left, right = getattr(original.schedule, method)(time), getattr(rebuilt.schedule, method)(time)

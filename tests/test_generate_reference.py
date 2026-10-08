@@ -185,8 +185,8 @@ def test_rows_stop_pad_and_count_as_transformers_generate_ends_them(name):
         return generate(pretrained.model, pretrained.variables, prompts(fixture), NEW_TOKENS,
                         key=jax.random.key(0), **fields)
 
-    for path, policy in (("eos", Sampling(temperature=0, eos_id=eos, pad_id=pad)),
-                         ("min_new", Sampling(temperature=0, eos_id=eos, pad_id=pad,
+    for path, policy in (("eos", Sampling(temperature=0, eos_token_ids=eos, pad_token_id=pad)),
+                         ("min_new", Sampling(temperature=0, eos_token_ids=eos, pad_token_id=pad,
                                               min_new_tokens=int(stopping["min_new"])))):
         result = ended(sampling=policy)
         want = stopping[f"{path}_tokens"]
@@ -198,13 +198,13 @@ def test_rows_stop_pad_and_count_as_transformers_generate_ends_them(name):
 
     # generate's greedy path is causal, so its first six tokens are what
     # transformers draws with max_new_tokens 6.
-    result = ended(sampling=Sampling(temperature=0, pad_id=pad), stopping=(decoding.MaxNewTokens(6),))
+    result = ended(sampling=Sampling(temperature=0, pad_token_id=pad), stopping=(decoding.MaxNewTokens(6),))
     tokens = np.asarray(result.tokens)[:, width:]
     np.testing.assert_array_equal(tokens[:, :6], fixture["greedy_tokens"][:, :6])
     assert np.all(tokens[:, 6:] == pad)
     np.testing.assert_array_equal(np.asarray(result.lengths), 6)
 
-    result = ended(sampling=Sampling(temperature=0, pad_id=pad),
+    result = ended(sampling=Sampling(temperature=0, pad_token_id=pad),
                    stopping=(decoding.MaxLength(int(stopping["max_length"])),))
     tokens, lengths = np.asarray(result.tokens)[:, width:], np.asarray(result.lengths)
     for row in range(len(tokens)):

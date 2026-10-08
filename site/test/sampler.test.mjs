@@ -185,6 +185,40 @@ test('a training cell waits its turn on the host, then shows the run', { timeout
 	await page.close();
 });
 
+test('a live stream shows nothing while it is blank, then its text without blank edges', { timeout: 10_000 }, async () => {
+	const page = await browser.newPage();
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => route.fulfill({ json: { socket: SOCKET } }));
+	const printed = Promise.withResolvers();
+	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
+			reply({ type: 'stream', name: 'stdout', text: '\n\n' });
+			printed.promise.then(() => {
+				reply({ type: 'stream', name: 'stdout', text: 'hello\n\n' });
+				reply({ type: 'done', status: 'ok', count: 1 });
+			});
+		});
+	});
+	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	const panel = page.locator('[data-live-train="finetune"]');
+	await panel.locator('[data-train-run]').click();
+	const stream = panel.locator('[data-train-output] pre.nb-stream');
+	await stream.waitFor({ state: 'attached' });
+	assert.deepEqual(await stream.evaluate((pre) => [pre.hidden, pre.textContent]), [true, '']);
+	printed.resolve();
+	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent.startsWith('Ran in'));
+	assert.equal(await stream.count(), 1);
+	assert.deepEqual(await stream.evaluate((pre) => [pre.hidden, pre.textContent]), [false, 'hello']);
+	await page.close();
+});
+
 test('Try it cards stay readable and the local sampler link opens at both widths', async () => {
 	for (const [width, scheme] of [[1440, 'dark'], [390, 'light']]) {
 		const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: scheme, reducedMotion: 'reduce' });

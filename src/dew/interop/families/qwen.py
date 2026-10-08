@@ -27,6 +27,7 @@ from dew.interop.decoder_parts import (
     dew_path,
     kind_mixers,
     kinds_of,
+    plain_partial_rope,
     read_rope,
     record_int,
     refuse,
@@ -69,22 +70,8 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     exactly. Wrapper loading keeps the three-axis layout on its attention mixer
     for visual inputs.
     """
-    entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
-    rope_type = entry.get('rope_type', entry.get('type', 'default'))
-    if rope_type not in ('default', 'none'):
-        refuse(f"rope_parameters (rope_type {rope_type!r})",
-                "the backbone applies plain rotary positions at rope_theta")
-    scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor',
-                                   'mrope_section', 'mrope_interleaved'})
-    if scaling:
-        refuse(f"rope_parameters scaling fields {scaling}",
-                "the backbone applies plain rotary positions at rope_theta")
-    theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
-                   'rope_parameters rope_theta')
-    factor = records.number(entry.get('partial_rotary_factor',
-                              hf_config.get('partial_rotary_factor', 0.25)),
-                    'rope_parameters partial_rotary_factor')
-    return theta, factor
+    return plain_partial_rope(hf_config, default_factor=0.25, reference='Qwen3_5TextRotaryEmbedding',
+                              layout=('mrope_section', 'mrope_interleaved'))
 
 
 _QWEN_READS = frozenset({'layer_types', 'sliding_window', 'attention_bias'})

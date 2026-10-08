@@ -372,6 +372,19 @@ def test_a_gpt_oss_field_with_no_counterpart_is_refused(field, value, message):
         translate_config({**fixture_config("gpt-oss-tiny"), field: value})
 
 
+@pytest.mark.parametrize("changes", [{"mixture": {"experts": 4, "top_k": 2, "expert_features": 16}},
+                                     {"mixture": {"experts": 4, "top_k": 2, "score_function": "sigmoid"}},
+                                     {"mixture": {"experts": 4, "top_k": 2}, "swiglu_limit": 3.0}])
+def test_gpt_oss_experts_refuse_a_knob_they_do_not_read(changes):
+    """GPT OSS's experts route with their own biased softmax and clamp at
+    7.0, so a native mixture or limit they would silently ignore is refused."""
+    model = models.build("causal_transformer", {
+        "vocab_size": 32, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp": "swigluoai",
+        "max_seq_len": 8, **changes})
+    with pytest.raises(ValueError, match="swigluoai's experts take no"):
+        model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+
+
 def test_gpt_oss_logits_match_the_reference_implementation():
     """fp32 parity through xla sink attention: tolerance 1e-4, observed
     max |logit difference| 2.5e-06 with identical argmax."""

@@ -30,7 +30,17 @@ import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, Union, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    Protocol,
+    TypedDict,
+    Union,
+    overload,
+    runtime_checkable,
+)
 
 import jax
 import jax.numpy as jnp
@@ -360,7 +370,8 @@ def to_record(value, annotation) -> JSON:
 
     if isinstance(value, datetime.timedelta):
         return recorded_duration(value)
-    if isinstance(value, type) and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes'):
+    if isinstance(value, np.dtype) or (isinstance(value, type)
+                                       and value.__module__ in ('jax.numpy', 'numpy', 'ml_dtypes')):
         return dtype_name(value)
     if dataclasses.is_dataclass(value) and not isinstance(value, type):
         with recording() as written:
@@ -385,10 +396,29 @@ def to_record(value, annotation) -> JSON:
                 for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if not isinstance(value, (type, Enum)) and _owned(type(value), called=False):
+        # A plain class of Dew's or a trusted package's, rebuilt from its
+        # constructor's parameters as `_built` builds one; it declares no
+        # fields, so its record always names it.
+        return {"class": import_path(type(value)), "fields": _constructed(value)}
     raise TypeError(
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
         f"functions with an import path")
+
+
+def _constructed(value: Configured) -> dict[str, JSON]:
+    """The record of a plain class's instance: each constructor parameter as
+    the attribute of that name holds it, which `_built` passes back."""
+    cls = type(value)
+    named, _ = parameters(cls)
+    fields = {}
+    for name, (_, owner) in named.items():
+        if not hasattr(value, name):
+            raise TypeError(f"{cls.__name__} keeps no attribute {name!r} for its constructor parameter, "
+                            f"so a record cannot rebuild it")
+        fields[name] = to_record(getattr(value, name), parameter_type(owner, name))
+    return fields
 
 
 def _record_key(key: object, declared: Annotation) -> str:
@@ -656,7 +686,10 @@ def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, d
     held = _record_class(member)
     if held is not None:
         return _construct(held, fields, dtypes=dtypes)
-    return configured(member(**_arguments(member, fields, dtypes=dtypes)))
+    built = member(**_arguments(member, fields, dtypes=dtypes))
+    # A plain class of Dew's or a trusted package's is the value its record
+    # describes (`to_record` writes it from its constructor's parameters).
+    return built if isinstance(member, type) and _owned(member, called=False) else configured(built)
 
 
 def _key(annotation: Annotation, key: str) -> RecordKey:
@@ -878,6 +911,41 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
                     and not (callable(held) and held is field.default)):
                 fields[field.name] = to_record(held, declared_type(owner, field.name))
     return fields
+
+
+@runtime_checkable
+class Wrapper(Protocol):
+    """A record that wraps a module in a class of its own and makes that
+    class again over a base: a LoRA adapter (`dew.lora.AdapterRecord`), a
+    run's quantized training or a checkpoint's input quantization
+    (`dew.training.quantization`)."""
+
+    def apply(self, model: nn.Module) -> nn.Module: ...
+
+
+@runtime_checkable
+class WrapperClass(Protocol):
+    """A module class a `Wrapper` made over `_dew_wrapped`; `_dew_wrapper`
+    returns that wrapper, which a model record keeps (`ModelConfig.wrappers`)."""
+
+    _dew_wrapped: ClassVar[type]
+
+    @staticmethod
+    def _dew_wrapper() -> Wrapper: ...
+
+
+def wrapper_layers(model_type: type) -> tuple[type, tuple[WrapperClass, ...]]:
+    """The class `model_type`'s wrappers wrap and its wrapper classes, the
+    outermost first.
+
+    Each layer is a subclass of the one inside it, so it inherits the inner
+    layer's markers too; a layer counts once, where its own class declares
+    `_dew_wrapped`."""
+    layers: list[WrapperClass] = []
+    while isinstance(model_type, WrapperClass) and "_dew_wrapped" in vars(model_type):
+        layers.append(model_type)
+        model_type = model_type._dew_wrapped
+    return model_type, tuple(layers)
 
 
 def _recorded(field: dataclasses.Field) -> bool:

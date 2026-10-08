@@ -27,7 +27,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .kernels import decode_attention
-from .kernels.generation import bf16_dot_runs
+from .kernels.generation import bf16_dot_runs, device_generation, measured_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     at_default_precision,
@@ -52,7 +52,7 @@ from .sharding import (
     split_positions,
 )
 
-AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "tpu"]
+AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
 """Names which kernel an attention call runs.
 
 Every layer that carries the choice spells it the same way: a `ModelConfig`
@@ -63,11 +63,13 @@ field, a module's `attention_impl`, and `scaled_dot_product_attention`'s
 dtype, precision and force_fp32_for_softmax. 'xla' and 'cudnn' are
 `jax.nn.dot_product_attention`'s own two. 'triton' is tokamax's Pallas-Triton
 flash kernel (`triton_attention`), which needs tokamax installed
-(docs/installation.md). 'tpu' is the pallas splash kernel, with the older pallas
-flash kernel behind it for the calls splash's mask descriptor cannot carry.
+(docs/installation.md). 'flash' is FlashAttention-2 (`flash_attention`), from
+the dew_flash_attn wheel (docs/installation.md). 'tpu' is the
+pallas splash kernel, with the older pallas flash kernel behind it for the
+calls splash's mask descriptor cannot carry.
 'auto', every module's default, resolves per trace (`resolve_implementation`):
-triton where cudnn's kernel runs and `triton_runs`; cudnn where its kernel
-runs; tpu where splash's does;
+flash where `flash_runs`; triton where cudnn's kernel runs and
+`triton_runs`; cudnn where its kernel runs; tpu where splash's does;
 the reference path where the call asks for arithmetic only it honours; and
 xla anywhere else.
 """
@@ -308,6 +310,12 @@ def layer_normalized(x, scale, bias, epsilon: float, dtype):
     if bias is not None:
         y = y + jnp.reshape(bias, width)
     return y.astype(dtype)
+
+
+def l2_normalized(x, eps: float = 1e-12):
+    """torch's `F.normalize`: `x` over its L2 norm on the last axis, the norm
+    held at `eps` at least."""
+    return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
 
 
 def unweighted_rmsnorm(x, eps: float):
@@ -786,6 +794,50 @@ def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
             and importlib.util.find_spec('tokamax') is not None)
 
 
+FLASH_MAX_HEAD_DIM = 256
+
+
+def flash_runs(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None) -> bool:
+    """Whether 'auto' sends a call to FlashAttention-2 (`flash_attention`):
+    dew_flash_attn is installed, `KERNELS` names it for the GPU, the query
+    is bf16 or fp16 with heads a multiple of 8 up to 256 wide, a causal call
+    is square, the call has no window, mask, bias or softcap, and no
+    deterministic ops are asked for, which its backward's atomic sum of the
+    query gradient would not keep."""
+    head_dim = query.shape[-1]
+    return (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash'
+            and query.dtype in CUDNN_DTYPES and head_dim % 8 == 0 and head_dim <= FLASH_MAX_HEAD_DIM
+            and (not causal or query.shape[-3] == key.shape[-3])
+            and sliding_window is None and mask is None and bias is None and softcap is None
+            and not deterministic_ops_requested() and importlib.util.find_spec('dew_flash_attn') is not None)
+
+
+def flash_attention(query, key, value, causal: bool):
+    """FlashAttention-2 (dew_flash_attn, kernels/flash_attn) over `[B, S, H, D]`
+    arrays at jax.nn's default scale. Its causal mask is aligned to the last
+    key, where jax.nn's is aligned to the first, so a causal call is square.
+    On a mesh it runs per shard, as `triton_attention` does. The wheel holds
+    sm80 code alone, which compute capability 8.x runs and no other does."""
+    generation = device_generation()
+    if not generation.startswith('sm8'):
+        raise ValueError(f"FlashAttention-2 is built for sm8x and this device is {generation}; "
+                         "use attention_impl 'cudnn' or 'xla'")
+    try:
+        flash = importlib.import_module('dew_flash_attn')
+    except ImportError as e:
+        raise ValueError("attention 'flash' needs dew_flash_attn (docs/installation.md)") from e
+
+    def local(query, key, value):
+        return flash.flash_mha(query, key, value, is_causal=causal)
+
+    if jax.sharding.get_abstract_mesh().empty:
+        return local(query, key, value)
+    kv_heads = math.lcm(key.shape[-2], _tensor_shards(query))
+    key, value = repeat_kv_heads(key, kv_heads), repeat_kv_heads(value, kv_heads)
+    queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    return manual_map(local, (queries, keys, keys), queries)(query, key, value)
+
+
 def triton_attention(query, key, value, causal: bool):
     """tokamax's Pallas-Triton flash kernel over `[B, S, H, D]` arrays, at
     tokamax's heuristic config, with jax.nn's default scale of 1/sqrt(D).
@@ -1131,12 +1183,22 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
                 "bidirectional call windows both sides; use attention_impl 'xla'.")
         out = cudnn_attention(query, key, value, bias, mask, causal, sliding_window,
                               key_value_seq_lengths)
-    elif implementation == 'triton':
+    elif implementation in ('triton', 'flash'):
         if any(x is not None for x in (sinks, softcap, bias, mask, sliding_window, key_value_seq_lengths)):
             raise ValueError(
-                "attention implementation 'triton' takes no sinks, softcap, bias, mask, "
+                f"attention implementation '{implementation}' takes no sinks, softcap, bias, mask, "
                 "window or key lengths; use attention_impl 'cudnn' or 'xla' for this call.")
-        out = triton_attention(query, key, value, causal)
+        if implementation == 'flash' and query.dtype not in CUDNN_DTYPES:
+            raise ValueError(f"flash attention needs bf16 or fp16 inputs, the query is {query.dtype}")
+        if implementation == 'flash' and causal and query.shape[-3] != key.shape[-3]:
+            raise ValueError("flash attention aligns its causal mask to the last key, so a causal call "
+                             f"needs as many queries as keys, not {query.shape[-3]} and {key.shape[-3]}")
+        if implementation == 'flash' and deterministic_ops_requested():
+            raise ValueError("attention implementation 'flash' cannot run under --xla_gpu_deterministic_ops: "
+                             "its backward sums the query gradient with atomics. "
+                             "Use attention_impl 'xla'.")
+        attend = triton_attention if implementation == 'triton' else flash_attention
+        out = attend(query, key, value, causal)
     elif (implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window)
           and key_value_seq_lengths is not None and decode_attention.fits(query, key)):
         out = decode_attention.attend(query, key, value, key_value_seq_lengths)
@@ -1206,7 +1268,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, lengths=lengths)
-    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'tpu'):
+    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'flash', 'tpu'):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
     def fused(query, key, value, bias, sinks):
@@ -1251,9 +1313,9 @@ def _attention_kernel(query, key, value, *, bias, sinks, implementation, dtype, 
         mask = with_documents(mask, segment_ids)
         masked = with_documents(masked, segment_ids)
         # cuDNN would take the document mask as an additive bias
-        # (`kernel_for_materialized_mask`), and the triton route takes no
-        # mask, so a packed call runs on xla.
-        if implementation in ('cudnn', 'triton'):
+        # (`kernel_for_materialized_mask`), and the triton and flash routes
+        # take no mask, so a packed call runs on xla.
+        if implementation in ('cudnn', 'triton', 'flash'):
             implementation = 'xla'
     if sinks is not None and implementation in ('reference', 'xla'):
         mask = combined_attention_mask(
@@ -1334,13 +1396,14 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     backend (both 'auto' and 'xla' take the reference path where jax.nn's
     xla kernel would narrow the call, `_xla_kernel_narrows`): the reference
     path when the call asks for arithmetic no fused kernel performs
-    (`reference_only`), else cudnn where `cudnn_runs` and the call has no
-    sinks and no bidirectional window (triton in its place where
-    `triton_runs`), the tpu kernel where
+    (`reference_only`), else flash where `flash_runs` and the call has no
+    sinks, cudnn where `cudnn_runs` and the call has no sinks and no
+    bidirectional window (triton in its place where `triton_runs`), the tpu
+    kernel where
     `tpu_runs`, and xla anywhere else. Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
-    if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'tpu'):
+    if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'flash', 'tpu'):
         raise ValueError(f"Unknown attention implementation: {implementation}")
     if implementation in ('auto', 'xla') and (_xla_kernel_narrows(query) or _xla_kernel_chains(query, key)):
         return 'reference'
@@ -1348,6 +1411,8 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
         return implementation
     if reference_only(query, dtype, precision, force_fp32_for_softmax):
         return 'reference'
+    if sinks is None and flash_runs(query, key, causal, sliding_window, mask, bias, softcap):
+        return 'flash'
     # cuDNN keeps a window behind the query only (jax.nn.dot_product_attention
     # refuses a right window without the causal mask), so a bidirectional
     # window goes past it.

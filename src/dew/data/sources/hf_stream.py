@@ -83,7 +83,7 @@ GIVEN = (
     "checkpoint_every=None.")
 
 NO_ROWS = (
-    "process {rank} of {world_size} was given none of the rows of {what}. A "
+    "process {rank} of {world_size} was given none of the rows of {where}. A "
     "streamed split is shared out row by row when its shards do not divide "
     "over the processes, so a split with fewer rows than the pool has "
     "processes leaves a rank with nothing to read and no batch to contribute. "
@@ -132,13 +132,13 @@ class _Rows(pygrain.DatasetIterator):
     """
 
     def __init__(self, open_pass: Callable[[int], IterableDataset], *,
-                 epochs: int | None, refused: str | None, what: str, rank: int,
+                 epochs: int | None, refused: str | None, where: str, rank: int,
                  world_size: int):
         super().__init__()
         self._open_pass = open_pass
         self._epochs = epochs
         self._refused = refused
-        self._what = what
+        self._where = where
         self._rank = rank
         self._world_size = world_size
         self._epoch = 0
@@ -168,7 +168,7 @@ class _Rows(pygrain.DatasetIterator):
             if self._read == 0:
                 raise ValueError(NO_ROWS.format(rank=self._rank,
                                                 world_size=self._world_size,
-                                                what=self._what))
+                                                where=self._where))
             self._rows = self._split = None
             self._read = 0
             self._epoch += 1
@@ -219,14 +219,14 @@ class HFRows(pygrain.IterDataset):
     held in memory.
     """
 
-    def __init__(self, open_split: Callable[[], IterableDataset], *, what: str,
+    def __init__(self, open_split: Callable[[], IterableDataset], *, where: str,
                  seed: int, rank: int, world_size: int, shuffle_buffer: int,
                  epochs: int | None, given: bool):
         super().__init__()
         if shuffle_buffer < 0:
             raise ValueError("a shuffle buffer holds no rows or more")
         self._open_split = open_split
-        self.what = what
+        self.where = where
         self.given = given
         self.seed = seed
         self.rank = rank
@@ -237,7 +237,7 @@ class HFRows(pygrain.IterDataset):
         self._answer: tuple[str | None] | None = None
 
     def __repr__(self) -> str:
-        return (f"HFRows({self.what}, seed={self.seed}, "
+        return (f"HFRows({self.where}, seed={self.seed}, "
                 f"share={self.rank}/{self.world_size}, "
                 f"shuffle_buffer={self.shuffle_buffer}, epochs={self.epochs}, "
                 f"given={self.given})")
@@ -270,7 +270,7 @@ class HFRows(pygrain.IterDataset):
 
     def __iter__(self) -> pygrain.DatasetIterator[Row]:
         return _Rows(self._pass, epochs=self.epochs, refused=self.refused,
-                     what=self.what, rank=self.rank, world_size=self.world_size)
+                     where=self.where, rank=self.rank, world_size=self.world_size)
 
 
 class Unresumable:

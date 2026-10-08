@@ -18,6 +18,11 @@ id -u model >/dev/null 2>&1 || useradd --uid 5000 --create-home --shell /usr/sbi
 mkdir -p /opt/live /opt/models /opt/hf /opt/xla /opt/train /run/dew /sessions
 chown model:model /opt/models /opt/hf /opt/xla /opt/train
 chmod 0755 /opt/models /opt/hf /opt/xla
+# The page's training cells, which the context smoke runs as a visitor would (benchmark_gateway.py).
+mkdir -p /opt/live/cells
+for file in finetune.py hero.py; do
+    curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/src/data/$file" -o "/opt/live/cells/$file"
+done
 for file in text-to-image text-models; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/$file" -o "/opt/live/$file"
 done

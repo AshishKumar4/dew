@@ -129,7 +129,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         from dew.registry import to_record
         return {'seq_len': self.seq_len, 'max_new_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': self.process.to_json(), 'solver': to_record(self.solver, Solver),
+                'process': to_record(self.process, DiscreteProcess), 'solver': to_record(self.solver, Solver),
                 'sampling_steps': self.steps}
 
     def build_task(self, variables: Variables, *,

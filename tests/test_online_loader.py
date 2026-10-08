@@ -423,7 +423,7 @@ def _online_spec(monkeypatch, rows, passes):
     monkeypatch.setattr(online_loader, "fetch_rows", _producer_of(rows, passes))
     monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubRows(rows))
     return OnlineImages(sources=("fake_online",), image_size=4,
-                        loading=Loading(workers=1))
+                        workers=1)
 
 
 def test_the_streaming_spec_repeats_its_records_instead_of_ending(monkeypatch):
@@ -491,7 +491,7 @@ def test_the_streaming_spec_stops_when_its_fetcher_is_gone(monkeypatch):
                         functools.partial(UrlStream, queue_timeout=0.05))
     monkeypatch.setattr(online_loader, "load_rows", lambda sources: _StubRows(4))
     with closing(OnlineImages(sources=("fake_online",), image_size=4,
-                          loading=Loading(workers=1)).load(batch=4).train(DataPartition())) as loader:
+                          workers=1).load(batch=4).train(DataPartition())) as loader:
 
         assert len(next(loader)["image"]) == 4
         with pytest.raises(StopIteration):

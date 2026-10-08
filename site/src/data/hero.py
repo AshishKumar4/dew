@@ -24,5 +24,5 @@ state = trainer.fit(data, steps=steps, log_every=100, eval_every=500, metrics=(P
 tokenizer = ByteTokenizer()
 for key, prompt in enumerate(("ROMEO:", "JULIET:")):
     result = generate(model, state.variables, [tokenizer.encode(prompt)], max_new_tokens=200, key=key,
-                      sampling=Sampling(temperature=0.5, top_k=40, eos_id=(46, 33, 63), pad_id=32))
+                      sampling=Sampling(temperature=0.5, top_k=40, eos_token_ids=(46, 33, 63), pad_token_id=32))
     print(tokenizer.decode(result.tokens[0]), end="\n\n")

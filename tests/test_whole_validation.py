@@ -25,9 +25,8 @@ from dew.data.chat import Role
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.base import VALID_ROWS, Objective, Step
+from dew.objectives.base import TEACHER, VALID_ROWS, Objective, Step
 from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
-from dew.objectives.diffusion.objective import TEACHER
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives
 from dew.sampling import Euler

@@ -320,13 +320,9 @@ class SafetensorsBanks(LayerBanks):
             raise ValueError("disk banks require a family with lazy tensor translation; "
                              "this family's preparation can materialize checkpoint weights")
         tensors = read_weights(folder)
-        if param_dtype == "auto":
-            from dew.interop.pretrained import checkpoint_dtype
-            storage = checkpoint_dtype(self.config, tensors)
-        else:
-            storage = dtype_name(param_dtype)
         self._variables: Variables = translate_weights(
-            tensors, record, family, param_dtype=storage, lazy=True)
+            tensors, record, family, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
+            lazy=True)
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )

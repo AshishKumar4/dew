@@ -2,8 +2,9 @@
 
 `dew.data.prompts` and `dew.data.preferences` are the same shape: one file of
 rows, or the same rows written out as JSON for a test, and a training stream
-over whichever of the two a spec names. What they have in common is here, so
-each spec is its own row validation and nothing else.
+over whichever of the two a spec names. What they have in common is here, the
+check that a row holds only its spec's fields included, so each spec is its
+own field validation and nothing else.
 """
 
 from __future__ import annotations
@@ -15,6 +16,16 @@ from dew.records import JSON
 
 from .dataset import Dataset, DatasetSpec, Records, train_stream, validation_pass
 from .tokens import bounded
+
+
+def known_row(row: object, fields: Sequence[str], where: str) -> Mapping[str, object]:
+    """`row` as an object of `fields` alone, or the refusal naming what it holds instead."""
+    if not isinstance(row, Mapping):
+        raise ValueError(f"{where}: a row is an object, got {row!r}")
+    unknown = sorted(key for key in row if key not in fields)
+    if unknown:
+        raise ValueError(f"{where}: unknown fields {unknown}; the fields are {list(fields)}")
+    return row
 
 
 def parquet_names(path: str, what: str) -> list[str]:

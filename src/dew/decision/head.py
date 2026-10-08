@@ -24,7 +24,7 @@ from dew import records
 from dew.decision.layout import DecisionInputs
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
-from dew.nn.attention import NormalAttention
+from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP, decoder_norm
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
@@ -213,11 +213,6 @@ def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
     return summed / counts.astype(values.dtype)
 
 
-def _unit(x: jax.Array, eps: float) -> jax.Array:
-    """torch's `F.normalize`: `x` over its norm, the norm held at `eps` at least."""
-    return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
-
-
 class JointSchemaHead(Head):
     """Clef's joint schema head: decides every question of a row together.
 
@@ -322,12 +317,12 @@ class JointSchemaHead(Head):
             fields = layer(fields, memory, among, onto)
         fields = self.field_norm(fields)
 
-        anchor = _unit(questions + last_state[:, None], 1e-12)
+        anchor = l2_normalized(questions + last_state[:, None], 1e-12)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
-                 * jnp.einsum("bqkd,bqd->bqk", _unit(lexical, 1e-12), anchor))
+                 * jnp.einsum("bqkd,bqd->bqk", l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
         repeated = jnp.broadcast_to(fields[:, :, None], options.shape)
-        cosine = jnp.sum(_unit(repeated, 1e-8) * _unit(options, 1e-8), axis=-1)
+        cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + residual

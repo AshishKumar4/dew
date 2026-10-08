@@ -1,5 +1,4 @@
 """Pretrained variational image autoencoders behind the AutoEncoder seam."""
-import jax
 import jax.numpy as jnp
 
 from .api import ModuleAutoEncoder
@@ -30,11 +29,7 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
             pretrained = load_pretrained_vae(modelname, revision=revision, params=params)
             config = pretrained["config"]
             params = pretrained["params"]
-            model = AutoencoderKL(
-                channels=tuple(config["block_out_channels"]), latent_channels=config["latent_channels"],
-                image_channels=config["in_channels"], blocks_per_level=config["layers_per_block"],
-                norm_groups=config["norm_num_groups"], quantize=config.get("use_quant_conv", True),
-                post_quantize=config.get("use_post_quant_conv", True), dtype=dtype)
+            model = AutoencoderKL.from_diffusers(config, dtype)
             latent_shift = (config.get("shift_factor") or 0.0) if latent_shift is None else latent_shift
             latent_scale = config.get("scaling_factor", 0.18215) if latent_scale is None else latent_scale
         if params is None:
@@ -42,22 +37,13 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
         super().__init__(model, params)
         self.latent_shift = 0.0 if latent_shift is None else latent_shift
         self.latent_scale = 0.18215 if latent_scale is None else latent_scale
-        frame = jax.ShapeDtypeStruct((1, 128, 128, model.image_channels), dtype)
-        latent = jax.eval_shape(self.encode_single_frame, self.params, frame)
-        self._downscale_factor = frame.shape[1] // latent.shape[1]
-        self._latent_channels = latent.shape[-1]
 
     def to_json(self) -> dict:
-        import dataclasses
-
         import numpy as np
 
-        from dew.registry import dtype_name
-        model = {field.name: getattr(self.model, field.name) for field in dataclasses.fields(self.model)
-                 if field.init and field.name not in ('parent', 'name', 'dtype')}
-        model['dtype'] = dtype_name(self.model.dtype)
+        from dew.registry import dtype_name, record_fields
         return {'name': 'sd_vae', 'fields': {
-            'model': model, 'dtype': dtype_name(self.dtype),
+            'model': record_fields(self.model, AutoencoderKL), 'dtype': dtype_name(self.dtype),
             'latent_shift': np.asarray(self.latent_shift).tolist(),
             'latent_scale': np.asarray(self.latent_scale).tolist()}}
 
@@ -71,8 +57,8 @@ class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
 
     @property
     def downscale_factor(self) -> int:
-        return self._downscale_factor
+        return self.model.downscale_factor
 
     @property
     def latent_channels(self) -> int:
-        return self._latent_channels
+        return self.model.latent_channels

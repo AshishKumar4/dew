@@ -299,6 +299,25 @@ def test_splash_runs_inside_the_exchange():
     np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
+@pytest.mark.mesh
+def test_the_exchange_holds_every_automatic_axis_manual():
+    """Mosaic lowers splash only inside a map that holds every mesh axis
+    manual, so the exchange's map takes the axes its operands do not split
+    manual too."""
+    from dew.nn.sharding import manual_map
+
+    held = []
+
+    def local(x):
+        mesh = jax.sharding.get_abstract_mesh()
+        held.append(set(mesh.manual_axes) == set(mesh.axis_names))
+        return x
+
+    with jax.set_mesh(MeshSpec(fsdp=2, sequence=2).build()):
+        jax.jit(manual_map(local, (P("fsdp", "sequence"),), P("fsdp", "sequence")))(jnp.ones((4, 4)))
+    assert held == [True]
+
+
 @pytest.mark.skipif(jax.default_backend() != "gpu" or jax.device_count() < 2,
                     reason="cuDNN's fused attention, split over two GPUs")
 @pytest.mark.parametrize("exchange", sorted(EXCHANGES))

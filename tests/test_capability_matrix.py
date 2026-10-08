@@ -65,7 +65,7 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.encoders import CharTable
 from dew.interop import Pretrained
 from dew.lora import Adapter, LoRA
-from dew.objectives.base import Step
+from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import (
     AdversarialDistillationObjective,
     ConsistencyDistillationObjective,
@@ -77,7 +77,6 @@ from dew.objectives.diffusion import (
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.diffusion.objective import TEACHER
 from dew.objectives.distillation import DistillationObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective

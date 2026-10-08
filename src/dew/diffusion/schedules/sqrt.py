@@ -2,7 +2,7 @@
 
 import jax.numpy as jnp
 
-from .continuous import ContinuousNoiseScheduler
+from .common import ContinuousNoiseScheduler
 
 
 class SqrtContinuousNoiseScheduler(ContinuousNoiseScheduler):

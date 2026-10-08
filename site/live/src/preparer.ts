@@ -67,9 +67,11 @@ export function livePreparation(commit: string, sourceCommit: string): Preparati
 			await phase('browser relay smoke');
 			const browser = await (await container.exec(['/opt/venv/bin/python', '/opt/live/smoke-shared.py'], { stdin: credential })).output();
 			if (browser.exitCode !== 0) throw new Error(`offline relay smoke failed: ${new TextDecoder().decode(browser.stderr).slice(-4000)}`);
+			console.log('relay smoke', new TextDecoder().decode(browser.stdout).slice(-4000));
 			await phase('isolated context smoke');
 			const smoke = await (await container.exec(['/opt/venv/bin/python', '/opt/live/benchmark_gateway.py', '1'])).output();
 			if (smoke.exitCode !== 0) throw new Error(`offline context smoke failed: ${new TextDecoder().decode(smoke.stderr).slice(-4000)}`);
+			console.log('context smoke', new TextDecoder().decode(smoke.stdout).slice(-4000));
 		},
 	};
 }
@@ -106,6 +108,11 @@ export class ManagedPreparer extends DurableObject<Env> {
 export class SnapshotPreparer extends ManagedPreparer {
 	async prepare(commit: string): Promise<SnapshotGeneration> {
 		if (commit !== this.env.SNAPSHOT_COMMIT) throw new Error('requested preparation is not the pinned deploy');
+		return this.runPreparation(async () => livePreparation(commit, commit));
+	}
+
+	/** Any pushed commit, prepared and smoked as a deploy would be; the registry never promotes it. */
+	async trial(commit: string): Promise<SnapshotGeneration> {
 		return this.runPreparation(async () => livePreparation(commit, commit));
 	}
 }

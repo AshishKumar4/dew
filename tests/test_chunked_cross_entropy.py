@@ -1027,7 +1027,7 @@ def test_a_step_that_does_not_fit_tiles_the_head_before_it_recomputes_blocks():
     """The first rung of the fit ladder tiles a head that kept its whole
     logits; only then does the model's remat climb."""
     from dew.objectives.lm import LMObjective
-    from dew.training.trainer import recompute_more
+    from dew.training.memory import recompute_more
 
     objective = LMObjective(small_model(), seq_len=12)
     assert objective.head_tile is None

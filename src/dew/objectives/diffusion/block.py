@@ -26,7 +26,7 @@ from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import BlockDenoiser, LayerScalars
+from dew.nn.protocols import BlockDenoiser, CacheCapacity, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -207,9 +207,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         """The sequence length, canvas budget, tokenizer and block process."""
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import recorded_tokenizer
+        from dew.registry import to_record
         return {'seq_len': self.sequence_length, 'max_new_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json()}
+                'process': to_record(BlockProcess(self.canvas_size, self.model.vocab_size), BlockProcess)}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
@@ -256,7 +257,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return (ProgramModule(self.training_model, None, trained=True),)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
-        (self.training_model,) = modules
+        (trained,) = modules
+        if not (isinstance(trained, BlockDenoiser) and isinstance(trained, CacheCapacity)):
+            raise TypeError(f"the block objective trains a block denoiser with a cache capacity, not a "
+                            f"{type(trained).__name__}")
+        self.training_model = trained
+        # The record and the task read the substitute (a run's quantization, a
+        # remat rung) at the serving capacity.
+        self.model = trained.with_cache_capacity(self.model.max_seq_len)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))

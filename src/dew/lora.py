@@ -54,6 +54,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
+from dew.registry import wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -227,14 +228,14 @@ class Adapter:
         return cls.recorded(config.build(), variables, config.adapter)
 
     @classmethod
-    def recorded(cls, model: nn.Module, variables: Variables, adapter: Mapping) -> Adapter:
+    def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:
         """Return the adapter a model record's `adapter` describes.
 
         It goes over the adapted `model` and a checkpoint's `variables`.
         """
         if not isinstance(type(model), AdaptedClass):
             raise ValueError(f"{type(model).__name__} is not adapted, so it carries no adapter")
-        targets, rslora, dropout, layouts = _read_record(adapter)
+        targets, layouts = adapter.bound()
         whole = thaw(variables)
         for name, layout in layouts.items():
             module = layout.paths[0][:-1]
@@ -249,7 +250,7 @@ class Adapter:
             if found != expected:
                 raise ValueError(f"the recorded binding {name} expects factors {expected}, and the "
                                  f"checkpoint holds {found}")
-        return cls(model, variables, targets, rslora, dropout, layouts)
+        return cls(model, variables, targets, adapter.rslora, adapter.dropout, layouts)
 
     def scale(self, target: Target) -> float:
         return _scale(target, self.rslora)
@@ -415,7 +416,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     `params` and runs under the interceptor; `init` (Flax's dispatches
     through `init_with_output`) runs under it and splits what it draws, the
     factors under `params` and the rest under `FROZEN`. `layouts` are the
-    bindings the class's record (`ModelConfig.adapter`) writes beside the
+    bindings the class's record (`AdapterRecord`) writes beside the
     targets; the record is written when a run asks for it, so an adapter a
     run cannot record (a file's mixed ranks) still loads and computes.
     """
@@ -425,12 +426,12 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
 
     class Adapted(base):
-        # A staticmethod, or Flax would wrap the callable as a module method.
+        # Staticmethods, or Flax would wrap the callables as module methods.
         _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
-        _dew_lora_base: ClassVar[type[nn.Module]] = base
+        _dew_wrapped: ClassVar[type[nn.Module]] = base
 
-        @classmethod
-        def _dew_lora_record(cls) -> dict:
+        @staticmethod
+        def _dew_wrapper() -> AdapterRecord:
             return _record(branch.targets, branch.rslora, branch.dropout, layouts)
 
         def apply(self, variables, *args, **kwargs):
@@ -448,76 +449,70 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
                       if field.init and field.name not in ("parent", "name")})
 
 
+@dataclass(frozen=True)
+class AdapterBinding:
+    """Where a file writes one target's weight: the name, the stored shape and
+    the transpose from the native kernel."""
+
+    name: str
+    shape: tuple[int, ...]
+    transpose: tuple[int, ...] | None
+
+
+@dataclass(frozen=True)
+class AdapterRecord:
+    """A bound adapter as a model's wrapper chain records it
+    (`ModelConfig.wrappers`): one rank and alpha, the targets' native module
+    paths, and each target's binding, so the run's adapter saves with no
+    source at hand. The checkpoint stores the factors."""
+
+    rank: int
+    alpha: float
+    rslora: bool
+    dropout: float
+    modules: tuple[str, ...]
+    layouts: Mapping[str, AdapterBinding]
+
+    def __post_init__(self) -> None:
+        if self.rank < 1 or not math.isfinite(self.alpha):
+            raise ValueError("adapter rank must be positive and alpha must be a finite number")
+        if not 0 <= self.dropout < 1:
+            raise ValueError("adapter dropout must be in [0, 1)")
+        paths = [tuple(module.split('/')) for module in self.modules]
+        if (not paths or len(set(paths)) != len(paths)
+                or any(not name or name in ('.', '..') for path in paths for name in path)):
+            raise ValueError("adapter modules must be a nonempty list of distinct native module names")
+        if not set(self.layouts) <= set(self.modules):
+            raise ValueError("adapter layouts must be keyed by the adapter's own modules")
+
+    def apply(self, model: nn.Module) -> nn.Module:
+        """`model` adapted as this record says, which is how a recorded run's
+        model is rebuilt (`ModelConfig.build`); the checkpoint supplies the factors."""
+        targets, layouts = self.bound()
+        return _adapted(model, _Branch(targets, self.rslora, self.dropout), layouts)
+
+    def bound(self) -> tuple[dict[Path, Target], dict[str, WeightLayout]]:
+        """The targets by native path and the bindings by the name a file writes them under."""
+        targets = {tuple(module.split('/')): Target(self.rank, self.alpha) for module in self.modules}
+        layouts = {binding.name.removesuffix('.weight').replace('/', '.'): WeightLayout(
+                       binding.name, ((*module.split('/'), 'kernel'),), binding.shape, binding.transpose)
+                   for module, binding in self.layouts.items()}
+        return targets, layouts
+
+
 def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
-            layouts: Mapping[str, WeightLayout]) -> dict:
-    """The bound adapter as a model record writes it: one rank and alpha, the
-    targets' module paths, and each target's binding (the name a file writes
-    it under, the weight's stored shape and transpose), so the run's adapter
-    saves with no source at hand. A mixed-rank adapter is refused."""
+            layouts: Mapping[str, WeightLayout]) -> AdapterRecord:
+    """The bound adapter as a model record holds it. A mixed-rank adapter is refused."""
     ranks = {target.rank for target in targets.values()}
     alphas = {target.alpha for target in targets.values()}
     if len(ranks) != 1 or len(alphas) != 1:
         raise ValueError("a recorded LoRA requires one rank and alpha across its modules")
     bindings = {layout.paths[0][:-1]: layout for layout in layouts.values()}
-
-    def binding(layout: WeightLayout) -> dict:
-        transpose = layout.transpose
-        return {'name': layout.name, 'shape': list(layout.shape),
-                'transpose': None if transpose is None else list(transpose)}
-
-    return {'rank': next(iter(ranks)), 'alpha': next(iter(alphas)), 'rslora': rslora, 'dropout': dropout,
-            'modules': ['/'.join(path) for path in sorted(targets)],
-            'layouts': {'/'.join(path): binding(bindings[path])
-                        for path in sorted(targets) if path in bindings}}
-
-
-def _read_record(record: Mapping) -> tuple[dict[Path, Target], bool, float, dict[str, WeightLayout]]:
-    """Read back what `_record` wrote."""
-    from dew.records import integer, text
-
-    if set(record) != {'rank', 'alpha', 'rslora', 'dropout', 'modules', 'layouts'}:
-        raise ValueError("a LoRA record needs rank, alpha, rslora, dropout, modules and layouts")
-    rank = integer(record['rank'], 'adapter rank')
-    alpha = record['alpha']
-    if rank < 1 or isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha):
-        raise ValueError("adapter rank must be positive and alpha must be a finite number")
-    if type(record['rslora']) is not bool:
-        raise ValueError("adapter rslora must be boolean")
-    dropout = record['dropout']
-    if isinstance(dropout, bool) or not isinstance(dropout, (int, float)) or not 0 <= dropout < 1:
-        raise ValueError("adapter dropout must be in [0, 1)")
-    modules = record['modules']
-    if not isinstance(modules, list) or not modules:
-        raise ValueError("adapter modules must be a nonempty list of native module names")
-    targets: dict[Path, Target] = {}
-    for module in modules:
-        path = tuple(text(module, 'adapter module').split('/'))
-        if any(not name or name in ('.', '..') for name in path) or path in targets:
-            raise ValueError("adapter modules must be distinct native module names")
-        targets[path] = Target(rank, float(alpha))
-    bindings = record['layouts']
-    if not isinstance(bindings, dict) or not set(bindings) <= set(modules):
-        raise ValueError("adapter layouts must be keyed by the adapter's own modules")
-    layouts: dict[str, WeightLayout] = {}
-    for module, binding in bindings.items():
-        if not isinstance(binding, dict) or set(binding) != {'name', 'shape', 'transpose'}:
-            raise ValueError(f"the adapter's binding of {module} needs name, shape and transpose")
-        name = text(binding['name'], f'binding of {module}')
-        shape = tuple(integer(size, f'binding of {module}') for size in binding['shape'])
-        transpose = binding['transpose']
-        layout = WeightLayout(name, ((*module.split('/'), 'kernel'),), shape,
-                              None if transpose is None else tuple(integer(axis, f'binding of {module}')
-                                                                   for axis in transpose))
-        layouts[name.removesuffix('.weight').replace('/', '.')] = layout
-    return targets, record['rslora'], float(dropout), layouts
-
-
-def adapted(model: nn.Module, record: Mapping) -> nn.Module:
-    """`model` adapted as the model record `record` says, which is how a
-    recorded run's model is rebuilt (`ModelConfig.build`); the checkpoint
-    supplies the factors."""
-    targets, rslora, dropout, layouts = _read_record(record)
-    return _adapted(model, _Branch(targets, rslora, dropout), layouts)
+    return AdapterRecord(next(iter(ranks)), next(iter(alphas)), rslora, dropout,
+                         tuple('/'.join(path) for path in sorted(targets)),
+                         {'/'.join(path): AdapterBinding(bindings[path].name, bindings[path].shape,
+                                                         bindings[path].transpose)
+                          for path in sorted(targets) if path in bindings})
 
 
 def _node(tree: Mapping, path: Path) -> Mapping:
@@ -883,19 +878,23 @@ def _named(layouts: Mapping[str, WeightLayout], wanted: Sequence[str]) -> dict[s
 
 
 def unadapted(model: nn.Module) -> nn.Module:
-    """`model` without its adapter: its base class over the same fields. A
-    model no adapter wraps is itself."""
-    model_type = type(model)
-    if not isinstance(model_type, AdaptedClass):
+    """`model` without its adapter: its base class over the same fields, in
+    every other wrapper its class wraps that base in (a quantization), in
+    order. A model no adapter wraps is itself."""
+    base, layers = wrapper_layers(type(model))
+    if not any("_dew_lora_interceptor" in vars(layer) for layer in layers):
         return model
-    return model_type._dew_lora_base(**{field.name: getattr(model, field.name)
-                                        for field in dataclasses.fields(model)
-                                        if field.init and field.name not in ("parent", "name")})
+    rebuilt = base(**{field.name: getattr(model, field.name) for field in dataclasses.fields(model)
+                      if field.init and field.name not in ("parent", "name")})
+    for layer in reversed(layers):
+        if "_dew_lora_interceptor" not in vars(layer):
+            rebuilt = layer._dew_wrapper().apply(rebuilt)
+    return rebuilt
 
 
 @runtime_checkable
 class AdaptedClass(Protocol):
-    """Marks a module class an adapter already wrapped.
+    """Marks a module class an adapter already wrapped, at any depth of its wrappers.
 
     The wrapper subclass declares the interceptor its `apply` and `init` run
     under, which is the whole record that a class was adapted: a second
@@ -903,10 +902,6 @@ class AdaptedClass(Protocol):
     """
 
     _dew_lora_interceptor: ClassVar[Interceptor]
-    _dew_lora_base: ClassVar[type[nn.Module]]
-
-    @classmethod
-    def _dew_lora_record(cls) -> dict: ...
 
 
-__all__ = ["Adapter", "LoRA", "PeftConfig", "Target", "unadapted"]
+__all__ = ["Adapter", "AdapterRecord", "LoRA", "PeftConfig", "Target", "unadapted"]

@@ -21,10 +21,10 @@ from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import Step
+from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import AdversarialDistillationObjective, DiffusionRunConfig, TextCondition
 from dew.objectives.diffusion.adversarial import Head
-from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL, TEACHER
+from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL
 from dew.sampling import Consistency, Euler, TextToImage
 from dew.training import Trainer
 

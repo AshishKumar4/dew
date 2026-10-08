@@ -186,13 +186,13 @@ class HFDatasetSource:
         library hands back has to be one table. A directory of splits and a
         streamed split are both refused here rather than indexed into.
         """
-        held = self._dataset
-        if held is None:
+        dataset = self._dataset
+        if dataset is None:
             with self._lock:
-                held = self._dataset
-                if held is None:
-                    held = self._dataset = self._loaded()
-        return held
+                dataset = self._dataset
+                if dataset is None:
+                    dataset = self._dataset = self._loaded()
+        return dataset
 
     def _loaded(self) -> ArrowDataset:
         """One table, from the dataset's name."""

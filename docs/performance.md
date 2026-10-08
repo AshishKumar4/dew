@@ -717,6 +717,42 @@ against 5.8 for torch's elementwise and norm kernels and 8.9 for its copies.
 
 ## Attention kernels
 
+### FlashAttention-2 on the A100, 2026-10-08
+
+Dew builds FlashAttention-2 itself: Dao-AILab's CUDA kernels through
+flash_attn_jax's XLA FFI port, both BSD-3, as a library with no Python ABI
+that `dew_flash_attn` registers as two FFI targets (kernels/flash_attn). The
+FlashAttention workflow builds one wheel per CUDA major on GitHub's runners,
+29 MB each, sm80 code that every compute capability 8.x runs. flash_attn_jax
+itself declares `jax<0.9` and has had no release since 2026-02-28.
+
+With flash_attn_jax 0.6.2, on a Colab A100 40 GB (jax 0.11.2, bf16), against
+what `'auto'` ran before, two rounds each:
+
+| step | before | FlashAttention-2 |
+|---|---:|---:|
+| Qwen3-0.6B, 4 x 1024 (cudnn) | 128.51-129.22 ms | 123.68-124.13 |
+| Qwen3-0.6B, 2 x 2048 (cudnn) | 142.17-142.36 | 134.08-134.10 |
+| Qwen3-0.6B, 1 x 4096 (cudnn) | 166.95-167.40 | 154.17-154.33 |
+| 4-layer decoder, 256-wide heads, 4 x 2048 (xla) | 93.44-94.01 | 77.56-77.68 |
+| SimpleDiT-B, batch 32 (tokamax triton) | 38.41-38.53 | 38.41-38.43 |
+
+Its output and gradient errors from float64 were 1.00 to 1.01 times cudnn's
+at 128-wide heads and 0.89 to 1.18 times xla's at 256-wide heads. Dew's own
+wheel, in a later session, with `'auto'` choosing it: Qwen3-0.6B at 4 x 1024
+took 122.15-122.23 ms against 126.76-126.81 without it, and the 256-wide
+decoder 75.80-75.96 against 91.65-92.49, with its parity tests against xla
+passing at six shapes.
+
+On a Colab L4 (sm89) it gained under 3% on Qwen3-0.6B, ran SimpleDiT-B
+slower than tokamax's Triton kernel, and its backward refuses heads wider
+than 192 off sm80 and sm90, so `KERNELS['attention']` names it for sm80
+alone. `'auto'` sends it a call with no window, mask, bias, softcap or sinks
+and a square causal mask, since FlashAttention-2 aligns its causal mask to
+the last key where jax.nn aligns it to the first. Its backward sums the
+query gradient with atomics, so a run with `--xla_gpu_deterministic_ops`
+stays off it.
+
 ### Splash's tiles on the TPU, 2026-10-02
 
 Splash attention took 34 ms of Dew's 156 ms Qwen3-0.6B step at 8 x 1024
@@ -2315,7 +2351,7 @@ other GPU.
 
 Each kernel's implementation is chosen in one place and keyed by hardware generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`, `v5e`, `v6e`, ...), and a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. Each row is one process with jax 0.11.1 and bf16 compute, on a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, or, for the kernel-level rows, the local RTX 4080. The step rows come from `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), with 30 timed steps after 5 warmup. lm-moe has 321.8M parameters with 8 experts and top-2 routing, and lm-dense has 359.8M; both run at sequence 1024. The batch is 4 (moe) and 1 (dense) on the L4, and 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
-### The MoE grouped matmul: `GROUPED_MATMUL_BY_GENERATION`
+### The MoE grouped matmul: `KERNELS['grouped_matmul']`
 
 | device | path | ms/step | p50 ms | peak GiB |
 |---|---|---|---|---|
@@ -2374,7 +2410,7 @@ To check training quality, I trained for 2000 steps on wikitext-103 Qwen3 tokens
 
 The high half existed for layout parity. With the gradient rounded once, a 4 x RTX 3090 bf16 run read 1.75 times its bound at a dense model's final norm and 5758 times it at an MoE's expert gate_proj, against 0.47 and 0.41 with the high half. Why the MoE's gap is that large is not yet established. A run that compares layouts in bf16 sets `matmul_precision="highest"`, which keeps the head fp32, and `tools/layout_parity.py` does so for bf16 decoders.
 
-On sm80 and sm89 the trainer compiles without XLA's Triton GEMM fusions, unless the run sets that flag explicitly or the model has an SSD mixer (`TRITON_GEMM_OFF_GENERATIONS`). On an A100 (jax 0.11.2, bf16), through the trainer, Qwen3-0.6B at 4 x 512 tokens compiled in 27.1 s against 47.5 s, because there is no Triton GEMM autotuning, and stepped in 161.4 ms against 161.5. Standalone, Qwen3-0.6B at 4 x 1024 tokens went from 162.1 to 153.1 ms, a 99M MoE from 74.6 to 69.4 ms, and a DiT ran 5.8% faster. A Mamba-2 step lost 7.7% (127.9 to 138.6 ms), because its SSD scan's small batched dots gain from the fusions.
+On sm80 and sm89 the trainer compiles without XLA's Triton GEMM fusions, unless the run sets that flag explicitly or the model has an SSD mixer (`KERNELS['xla_triton_gemm']`). On an A100 (jax 0.11.2, bf16), through the trainer, Qwen3-0.6B at 4 x 512 tokens compiled in 27.1 s against 47.5 s, because there is no Triton GEMM autotuning, and stepped in 161.4 ms against 161.5. Standalone, Qwen3-0.6B at 4 x 1024 tokens went from 162.1 to 153.1 ms, a 99M MoE from 74.6 to 69.4 ms, and a DiT ran 5.8% faster. A Mamba-2 step lost 7.7% (127.9 to 138.6 ms), because its SSD scan's small batched dots gain from the fusions.
 
 On the RTX 4080, two-layer steps at 2048, 4080 and 16384 tokens go from 56.7 to 53.5, 103.8 to 94.0 and 420.5 to 406.3 ms, and tiled heads run 3-6% faster. At Qwen3-0.6B's widths with two layers, bf16, vocabulary 151936 and a 0.9 allocator fraction on an RTX 4080 (JAX 0.11.2), this removes a cliff at 4096 tokens, where a training step took 286.0 ms with the fusions and takes 93.4 ms without. At other shapes the unfused step can use more temporary memory, so before tiling the head or recomputing blocks, the trainer tries a step that does not fit with XLA's default options. At 8192 tokens only that whole-logits step fits (178.7 ms, against 211.2 ms after tiling). When tiling is needed, sm89 uses the measured 4096-by-8192 tile. These are two-layer measurements, not full-model times.
 
@@ -2435,7 +2471,7 @@ With the rule, I measured the same steps against XLA's default (the merger on) t
 
 At 128 tokens the shapes disagree. In two more sessions, 1 x 128 ran in 20.65 and 20.65 ms merged against 18.98 and 19.11 with separate dots. 2 x 64 went the other way, 18.72 and 18.63 merged against 18.96 and 19.03, and so did 4 x 32, 18.56 and 18.50 against 18.91 and 18.81. 1 x 96 also ran faster merged (18.22 and 18.22 against 18.41 and 18.43), and 1 x 160 faster with separate dots (22.33 and 21.95 against 20.57 and 20.37). A boundary below 128 would run 2 x 64 and 4 x 32 1.3-2.1% slower than XLA's default, so the boundary includes 128, and 1 x 128 runs at XLA's default, 1.6 ms behind separate dots.
 
-### The forward's bf16 weights: `NARROW_COPY_GENERATIONS`, 2026-10-03
+### The forward's bf16 weights: `KERNELS['narrow_copies']`, 2026-10-03
 
 A bf16 model over fp32 parameters cast each weight to bf16 in the forward,
 one CUDA kernel per weight every step (5.7 ms of casts on Qwen3-0.6B at
@@ -2590,7 +2626,7 @@ I also timed one bf16 `ExpertMLP` layer forward plus backward under `MeshSpec(fs
 
 A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal'` (MaxText's name: every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. Each rung is slower and smaller, so the first that fits is the fastest that runs.
 
-`dew.training.trainer.step_fits` decides whether a step fits. XLA places a GPU step's temporaries in one allocation, so the temporaries, the outputs that do not reuse the donated state and the batches `fit` prefetches next to the step's own all have to fit in a single free block on each device, which can be smaller than the device's total free bytes. The block is the BFC pool's largest, or the part of its limit that a growing pool has not taken yet. An allocator that reports no pool (cuda_async, or a TPU's) is read by its free bytes. Each process reads its own devices, and the pool of processes takes the tightest. Where the allocator can leave the temporaries no block to return to once a batch is prefetched next to them, the check holds room for them twice (`strands_temporaries`). That happens with cuda_async and with XLA's spatially partitioned pool. `import dew` now turns the partitioning off wherever JAX's CUDA plugin is installed; before, only `prepare_process` did. So a Trainer built without `prepare_process`, such as `tools/reference_runs/dew_lm.py` or a notebook, held room for the 99M MoE's 8.34 GiB of temporaries twice in a preallocated pool on the RTX 4080, and tiled its head at 98.2 ms a step. With the partitioning off it keeps the whole logits at 78.3 ms, from a cold compile cache and from a warm one.
+`dew.training.memory.step_fits` decides whether a step fits. XLA places a GPU step's temporaries in one allocation, so the temporaries, the outputs that do not reuse the donated state and the batches `fit` prefetches next to the step's own all have to fit in a single free block on each device, which can be smaller than the device's total free bytes. The block is the BFC pool's largest, or the part of its limit that a growing pool has not taken yet. An allocator that reports no pool (cuda_async, or a TPU's) is read by its free bytes. Each process reads its own devices, and the pool of processes takes the tightest. Where the allocator can leave the temporaries no block to return to once a batch is prefetched next to them, the check holds room for them twice (`strands_temporaries`). That happens with cuda_async and with XLA's spatially partitioned pool. `import dew` now turns the partitioning off wherever JAX's CUDA plugin is installed; before, only `prepare_process` did. So a Trainer built without `prepare_process`, such as `tools/reference_runs/dew_lm.py` or a notebook, held room for the 99M MoE's 8.34 GiB of temporaries twice in a preallocated pool on the RTX 4080, and tiled its head at 98.2 ms a step. With the partitioning off it keeps the whole logits at 78.3 ms, from a cold compile cache and from a warm one.
 
 A pool that grows (`XLA_PYTHON_CLIENT_PREALLOCATE=false`) never gives back a region it has grown (openxla/xla#50052). A process that compiles the step autotunes it, and the pool grows for the autotuner's scratch. A process that loads the step from the persistent cache does not. So the same program can fit in the second process and not in the first: the MoE kept its whole logits from a warm cache and tiled its head from a cold one. A check that ignored where the free bytes lie said it fit in the cold process, which then ran out of memory allocating its 8.34 GiB of temporaries.
 

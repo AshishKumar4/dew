@@ -633,7 +633,7 @@ def test_a_shuffled_streamed_position_says_why_it_cannot_be_restored(jsonl):
         return datasets.load_dataset("json", data_files=jsonl, split="train",
                                      streaming=True)
 
-    shuffled = HFRows(open_split, what="the rows", seed=0, rank=0, world_size=1,
+    shuffled = HFRows(open_split, where="the rows", seed=0, rank=0, world_size=1,
                       shuffle_buffer=4, epochs=1, given=False)
     assert not shuffled.resumable
     rows = iter(shuffled)
@@ -691,7 +691,7 @@ def test_every_pass_over_a_given_streamed_dataset_starts_at_its_beginning():
 def test_a_given_streamed_position_says_which_route_resumes():
     from dew.data.sources.hf_stream import HFRows
 
-    given = HFRows(lambda: _stream_of(range(8)), what="the rows", seed=0, rank=0,
+    given = HFRows(lambda: _stream_of(range(8)), where="the rows", seed=0, rank=0,
                    world_size=1, shuffle_buffer=0, epochs=1, given=True)
     assert not given.resumable
     rows = iter(given)

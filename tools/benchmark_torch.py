@@ -68,6 +68,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import TEXT_FEATURES, TEXT_TOKENS, Case, small_cases
+from reference_runs.common import peak_flops
+from trace_window import kernel_category, length, union
 
 BF16 = torch.bfloat16
 F32 = torch.float32
@@ -76,7 +78,6 @@ P_MEAN, P_STD = -0.4, 1.0
 UNCONDITIONAL_PROB = 0.12
 EMA_DECAY = 0.999
 ADAM = dict(lr=1e-4, betas=(0.9, 0.999), eps=1e-8)
-PEAK_BF16_SPEC = 97.5e12
 
 
 # ----------------------------------------------------------------------------
@@ -680,25 +681,6 @@ def make_batch(case: Case, seed=0):
             'timestep': torch.from_numpy(timestep), 'noise': torch.from_numpy(noise)}
 
 
-def categorize(name):
-    n = name.lower()
-    if any(k in n for k in ('fmha', 'flash', 'attention', 'fused_attn', 'sdpa', 'cudnn::fusion')):
-        return 'attention'
-    if any(k in n for k in ('conv', 'fprop', 'dgrad', 'wgrad', 'cudnn', 'nhwc', 'nchw', 'implicit')):
-        return 'conv'
-    if any(k in n for k in ('gemm', 'cutlass', 'nvjet', 'matmul', 'xmma_gemm', 'cublas')) or \
-            ('triton' in n and ('_mm' in n or 'bmm' in n or 'addmm' in n)):
-        return 'gemm'
-    if any(k in n for k in ('adam', 'multi_tensor', 'foreach', 'lerp')):
-        return 'optimizer'
-    if any(k in n for k in ('cross_entropy', 'nll_loss', 'log_softmax', 'argmax', 'reduce_kernel')) and 'softmax_warp' not in n:
-        return 'loss/reduce'
-    if any(k in n for k in ('memcpy', 'memset', 'copy_', 'cat_', 'catarray', 'transpose', 'index_select',
-                            'indexing', 'gather', 'scatter', 'embedding')):
-        return 'copy/gather'
-    return 'elementwise/norm'
-
-
 def profile_step(step, n_steps):
     from torch.profiler import ProfilerActivity, profile
     torch.cuda.synchronize()
@@ -706,41 +688,25 @@ def profile_step(step, n_steps):
         for _ in range(n_steps):
             step()
         torch.cuda.synchronize()
-    events = [e for e in prof.events() if e.device_type == torch.autograd.DeviceType.CUDA]
-    kernels = []
-    for e in events:
-        name = e.name
-        if name.startswith('Memcpy') or name.startswith('Memset'):
-            kind = 'memcpy/memset'
-        else:
-            kind = None
-        kernels.append((name, e.time_range.start, e.time_range.end, kind))
+    kernels = sorted(((e.name, e.time_range.start, e.time_range.end) for e in prof.events()
+                      if e.device_type == torch.autograd.DeviceType.CUDA), key=lambda kernel: kernel[1])
     if not kernels:
         return None
-    kernels.sort(key=lambda k: k[1])
-    # GPU busy: union of kernel intervals (streams may overlap)
-    busy, cur_s, cur_e = 0.0, kernels[0][1], kernels[0][2]
-    for _, s, e, _ in kernels[1:]:
-        if s > cur_e:
-            busy += cur_e - cur_s
-            cur_s, cur_e = s, e
-        else:
-            cur_e = max(cur_e, e)
-    busy += cur_e - cur_s
+    busy = length(union([(start, end) for _, start, end in kernels]))
     window = kernels[-1][2] - kernels[0][1]
     by_cat, by_name, count_cat, count_name = {}, {}, {}, {}
-    for name, s, e, kind in kernels:
-        cat = kind or categorize(name)
-        by_cat[cat] = by_cat.get(cat, 0.0) + (e - s)
+    for name, start, end in kernels:
+        cat = kernel_category(name)
+        by_cat[cat] = by_cat.get(cat, 0.0) + (end - start)
         count_cat[cat] = count_cat.get(cat, 0) + 1
-        by_name[name] = by_name.get(name, 0.0) + (e - s)
+        by_name[name] = by_name.get(name, 0.0) + (end - start)
         count_name[name] = count_name.get(name, 0) + 1
     top = sorted(by_name.items(), key=lambda kv: -kv[1])[:15]
     per_cat = {}
     for name, us in sorted(by_name.items(), key=lambda kv: -kv[1]):
-        cat = categorize(name) if not (name.startswith('Memcpy') or name.startswith('Memset')) else 'memcpy/memset'
-        if len(per_cat.setdefault(cat, [])) < 4:
-            per_cat[cat].append((name[:80], round(us / n_steps / 1e3, 3), count_name[name] / n_steps))
+        listed = per_cat.setdefault(kernel_category(name), [])
+        if len(listed) < 4:
+            listed.append((name[:80], round(us / n_steps / 1e3, 3), count_name[name] / n_steps))
     return dict(profiled_steps=n_steps, kernels_per_step=len(kernels) / n_steps,
                 gpu_busy_fraction=busy / window, gpu_busy_ms_per_step=busy / n_steps / 1e3,
                 window_ms_per_step=window / n_steps / 1e3,
@@ -945,7 +911,8 @@ def main():
         event_ms_p90=float(np.percentile(per_step, 90)),
         inter_step_gap_ms_median=float(np.median(gaps)) if len(gaps) else None,
         analytic_flops=total_flops, analytic_tflops=total_flops / step_s / 1e12,
-        mfu_spec=total_flops / step_s / PEAK_BF16_SPEC,
+        mfu_spec=(total_flops / step_s / peak if (peak := peak_flops(torch.cuda.get_device_name()))
+                  else None),
         peak_allocated_gib=torch.cuda.max_memory_allocated() / 2 ** 30,
         peak_reserved_gib=torch.cuda.max_memory_reserved() / 2 ** 30,
         loss=float(loss), finite=bool(finite),

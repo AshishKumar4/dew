@@ -64,7 +64,7 @@ MMDIT_MODULES = {"img_ada": ("norm1",), "txt_ada": ("norm1_context",),
                  "txt_out": ("attn", "to_add_out"), "img_q_norm": ("attn", "norm_q"),
                  "img_k_norm": ("attn", "norm_k"), "txt_q_norm": ("attn", "norm_added_q"),
                  "txt_k_norm": ("attn", "norm_added_k"), "img_mlp": ("ff",), "txt_mlp": ("ff_context",)}
-MMDIT_LAYERS = {"ada_proj": "linear", "layers_0": "net_0_proj", "layers_2": "net_2"}
+MMDIT_LAYERS = {"ada_proj": "linear", "layers_0": "up_proj", "layers_2": "down_proj"}
 # FlaxDiff's six modulation pieces (scale_mlp, shift_mlp, gate_mlp, scale,
 # shift, gate) in SD3's order (shift, scale, gate, shift_mlp, scale_mlp, gate_mlp).
 MODULATION_ORDER = (4, 3, 5, 1, 0, 2)

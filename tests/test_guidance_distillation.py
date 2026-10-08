@@ -19,10 +19,9 @@ from dew.data import TFDSImages
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import Flow
 from dew.inputs import unit_range
-from dew.objectives.base import Step
+from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObjective, TextCondition
 from dew.objectives.diffusion.guidance_distillation import with_guidance
-from dew.objectives.diffusion.objective import TEACHER
 from dew.sampling import Euler, TextToImage
 from dew.training import Trainer
 

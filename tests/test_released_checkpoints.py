@@ -273,7 +273,8 @@ def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batc
     inputs, lengths, fill = batch
     ids = np.asarray(inputs.tokens)
     task = bundle.text_generation(
-        sampling=Sampling(temperature=0.0, eos_id=stop_ids(bundle.generation_config), pad_id=fill))
+        sampling=Sampling(temperature=0.0, eos_token_ids=stop_ids(bundle.generation_config),
+                          pad_token_id=fill))
 
     for row, text in enumerate(PROMPTS):
         generation = task(text, NEW_TOKENS, key=jax.random.key(0))

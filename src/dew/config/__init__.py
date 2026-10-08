@@ -51,7 +51,7 @@ from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import Reader, ramped, record_argument
 from dew.files import write_atomically
-from dew.lora import AdaptedClass, LoRA, adapted
+from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import (
@@ -80,7 +80,7 @@ from dew.training.optim import (
     power_profiles,
     weight_decay_mask,
 )
-from dew.training.quantization import Quantization, QuantizedClass, quantize_trunk
+from dew.training.quantization import InputQuantization, Quantization, quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
@@ -113,6 +113,10 @@ else:
     ScheduleSpec = schedules.union
 
 
+ModelWrapper = InputQuantization | AdapterRecord | Quantization
+"""One wrapper a model record keeps (`ModelConfig.wrappers`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class ModelConfig:
     """A model's class and the fields the run gives it.
@@ -123,7 +127,8 @@ class ModelConfig:
     (`RunConfig.cli`); a recipe fills the ones it derives from its data in
     `build`. `defaults` holds every other field the class defaults, as it
     defaulted them when the run was first recorded, so the record builds the
-    same model after a default changes (`arguments`).
+    same model after a default changes (`arguments`). `wrappers` are the
+    classes the model was wrapped in, in the order they were applied.
     """
 
     name: str = "simple_dit"
@@ -132,10 +137,11 @@ class ModelConfig:
     """Each field the class defaults and `fields` leaves out, as a record holds it;
     one a record lacks, as a field the class has since gained, takes the class's
     default now."""
-    adapter: JsonDict | None = None
-    """The bound LoRA record; its factors are stored with the checkpoint variables."""
-    quantization: Quantization | None = None
-    """The quantized training the model was wrapped in, which `build` wraps it in again."""
+    wrappers: tuple[ModelWrapper, ...] = ()
+    """What wraps the built model, innermost first, which `build` applies in
+    order: a checkpoint's input quantization, a bound LoRA (its factors are
+    stored with the checkpoint variables), the quantized training a run
+    wrapped it in."""
 
     def __post_init__(self) -> None:
         member = models[self.name]
@@ -152,19 +158,25 @@ class ModelConfig:
         """Read back the record `RunConfig.to_dict` writes for this field."""
         return from_record(cls, values, dtypes=False)
 
+    @property
+    def adapter(self) -> AdapterRecord | None:
+        """The bound LoRA among the wrappers, or None."""
+        return next((wrapper for wrapper in self.wrappers if isinstance(wrapper, AdapterRecord)), None)
+
     @classmethod
     def from_model(cls, model) -> Self:
-        """Return the module's class and constructor fields, its adapter and quantization apart."""
-        model_type = type(model)
-        adapter, quantization = None, None
-        if isinstance(model_type, AdaptedClass):
-            adapter = model_type._dew_lora_record()
-            model_type = model_type._dew_lora_base
-        if isinstance(model_type, QuantizedClass):
-            quantization = model_type._dew_quantization
-            model_type = model_type._unquantized_type
+        """Return the module's class and constructor fields, and each wrapper
+        its class was made in, in the order they were applied."""
+        model_type, layers = registry.wrapper_layers(type(model))
+        wrappers = []
+        for layer in reversed(layers):
+            wrapper = layer._dew_wrapper()
+            if not isinstance(wrapper, ModelWrapper):
+                raise ValueError(f"{type(wrapper).__name__} wraps {model_type.__name__} where no model "
+                                 f"record can name it")
+            wrappers.append(wrapper)
         return cls(registry.import_path(model_type), registry.record_fields(model, model_type),
-                   adapter=adapter, quantization=quantization)
+                   wrappers=tuple(wrappers))
 
     def with_dtype(self, dtype: str | None) -> Self:
         """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
@@ -173,9 +185,9 @@ class ModelConfig:
     def build(self, **derived: Configured):
         """Build the model from its fields and the ones the recipe `derived`."""
         model = models.build(self.name, {**self.arguments, **derived})
-        if self.quantization is not None:
-            model = self.quantization.apply(model)
-        return model if self.adapter is None else adapted(model, self.adapter)
+        for wrapper in self.wrappers:
+            model = wrapper.apply(model)
+        return model
 
 
 @dataclasses.dataclass(frozen=True)
@@ -704,8 +716,6 @@ class TrainerConfig:
             if value.total_seconds() <= 0:
                 raise ValueError("checkpoint_every duration must be positive")
             return value
-        if isinstance(value, str) and value != 'epoch':
-            return duration(value)
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
     @staticmethod

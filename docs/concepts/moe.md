@@ -70,10 +70,10 @@ Dew sorts tokens into expert order and runs the experts as one grouped matrix mu
 
 | Value | Kernel |
 |---|---|
-| `'auto'` | The one measured fastest on the hardware generation (`dew.nn.kernels.device_generation`, keyed in `dew.nn.moe.GROUPED_MATMUL_BY_GENERATION`): `'pallas'` on sm80 (A100), sm86 (RTX 3090) and sm89 (L4, RTX 4080), `'xla'` on TPU v5e and v6e. Every other generation runs `'xla'`: GPUs older than sm80 cannot compile the kernels, and sm90 and later are unmeasured. |
+| `'auto'` | The one measured fastest on the hardware generation (`dew.nn.kernels.device_generation`, keyed in `dew.nn.kernels.KERNELS['grouped_matmul']`): `'pallas'` on sm80 (A100), sm86 (RTX 3090) and sm89 (L4, RTX 4080), `'xla'` on TPU v5e and v6e. Every other generation runs `'xla'`: GPUs older than sm80 cannot compile the kernels, and sm90 and later are unmeasured. |
 | `'xla'` | `jax.lax.ragged_dot`. On a GPU, XLA runs it as a product over every expert. |
 | `'pallas'` | JAX's own Pallas/Triton grouped-matmul kernels, `gmm` and `tgmm`, vendored in `dew.nn.kernels.ragged_dot` from the jax 0.11.2 source tree because no wheel ships them. |
-| `'tokamax'` | `tokamax.ragged_dot` with the kernel named per generation (`TOKAMAX_KERNEL_BY_GENERATION`): Triton on sm80 and sm89, `mosaic_tpu_v2` on v5e and v6e, tokamax's XLA path elsewhere. Only the forward runs on tokamax; the backward differentiates on XLA. |
+| `'tokamax'` | `tokamax.ragged_dot` with the kernel named per generation (`KERNELS['tokamax_grouped_matmul']`): Triton on sm80 and sm89, `mosaic_tpu_v2` on v5e and v6e, tokamax's XLA path elsewhere. Only the forward runs on tokamax; the backward differentiates on XLA. |
 
 On an L4 the Pallas kernels cut the lm-moe training step from 601.6 ms to 213.1 ms ([Performance measurements](../performance.md)). jax 0.11.2 deprecates the Pallas Triton backend they run on. Dew still uses them on compute capability 8.0 to 8.9, because JAX's Mosaic GPU grouped matmul does not compile there (on sm89 it fails for lack of wgmma), and it leaves the deprecation warning to your warning filters.
 

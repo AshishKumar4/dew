@@ -237,13 +237,32 @@ def test_two_gpu_hosts_split_the_data_axis_unless_asked_otherwise():
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_named_device_list_is_laid_out_in_its_own_order():
+@pytest.mark.parametrize("cuda", [False, True])
+def test_a_joined_process_bounds_device_execution_only_where_the_cuda_plugin_is(monkeypatch, cuda):
+    """The execution watchdog is a flag of JAX's CUDA plugin; a TPU host's
+    libtpu need not know it, so a process without the plugin sets none."""
+    import dew.training.runtime as runtime
+
+    applied = []
+    monkeypatch.setattr(runtime, "cuda_plugin", lambda: cuda)
+    monkeypatch.setattr(runtime, "xla_flag", lambda name: None)
+    monkeypatch.setattr(runtime, "apply_xla_flags", applied.append)
+    monkeypatch.setattr(runtime.multihost_utils, "sync_global_devices", lambda name: None)
+    runtime._joined()
+    assert applied == ([f"--xla_gpu_execution_terminate_timeout={runtime.EXECUTION_TIMEOUT}"] if cuda else [])
+
+
+def test_a_named_device_list_is_laid_out_in_its_own_order(monkeypatch):
     """A caller naming the devices chooses which share an axis, as
     benchmark_step's device_order puts a size-2 axis across or along an
     NVLink pair. jax.make_mesh sorts GPU devices by id, which built the same
-    mesh for every order."""
+    mesh for every order; on CPU it keeps their order, so here it sorts them
+    as it does on a GPU."""
     import jax
 
+    laid_out = jax.make_mesh
+    monkeypatch.setattr(jax, "make_mesh", lambda shape, axes, *, devices, **rest: laid_out(
+        shape, axes, devices=sorted(devices, key=lambda device: device.id), **rest))
     order = jax.devices()[:2][::-1]
     mesh = MeshSpec(fsdp=2).build(order)
     assert list(mesh.devices.flat) == order
@@ -1036,6 +1055,10 @@ def test_two_pools_on_one_machine_take_a_free_port_each():
 
 
 @pytest.mark.mesh(devices=2)
+@pytest.mark.xfail(os.environ.get("DEW_UPSTREAM_JAX") == "1", strict=True, reason=(
+    "jax-ml/jax#40940 on a jax release, which CI's package job runs this on: when it passes "
+    "there, constraints.txt's patched jax and dew.training.runtime's refusal of the cache "
+    "(_pool_keys_alike) can go"))
 def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     """A pool runs twice over one persistent compilation cache, and the second
     run loads its step on every process. jax 0.11.2 keyed an executable by the
@@ -1046,7 +1069,8 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     sharded autotuning then waited for ever for its peer's share. Each process
     here reports a fingerprint of its own, as those two did, whatever devices
     the run has; the jax constraints.txt names hashes the fingerprints of
-    every process a computation spans."""
+    every process a computation spans. CI's package job runs this on PyPI's
+    jax (DEW_UPSTREAM_JAX=1), where it fails until a release has the fix."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"

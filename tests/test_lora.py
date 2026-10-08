@@ -390,16 +390,20 @@ def test_a_run_records_the_spec_it_was_asked_for_and_the_adapter_it_bound(decode
     adapter = decoder.adapt(spec, key=0).adapter
     assert adapter is not None
     model = json.loads(json.dumps(RunConfig(model=ModelConfig.from_model(adapter.model)).to_dict()))["model"]
-    recorded = model["adapter"]
-    assert recorded["layouts"]["params/layers_0/self_attn/q_proj"] == {
+    (wrapper,) = model["wrappers"]
+    assert wrapper["fields"]["layouts"]["params/layers_0/self_attn/q_proj"] == {
         "name": "model.layers.0.self_attn.q_proj.weight", "shape": [64, 64], "transpose": [1, 0]}
-    rebuilt = Adapter.recorded(ModelConfig.from_dict(model).build(), adapter.variables, recorded)
+    config = ModelConfig.from_dict(model)
+    assert config.adapter is not None
+    rebuilt = Adapter.recorded(config.build(), adapter.variables, config.adapter)
     assert (rebuilt.targets, rebuilt.layouts) == (adapter.targets, adapter.layouts)
 
-    narrow = json.loads(json.dumps(recorded))
-    narrow["layouts"]["params/layers_0/self_attn/q_proj"]["shape"] = [32, 64]
+    narrow = json.loads(json.dumps(model))
+    narrow["wrappers"][0]["fields"]["layouts"]["params/layers_0/self_attn/q_proj"]["shape"] = [32, 64]
+    narrowed = ModelConfig.from_dict(narrow).adapter
+    assert narrowed is not None
     with pytest.raises(ValueError, match=r"the recorded binding model\.layers\.0\.self_attn\.q_proj"):
-        Adapter.recorded(adapter.model, adapter.variables, narrow)
+        Adapter.recorded(adapter.model, adapter.variables, narrowed)
 
 
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
@@ -499,10 +503,10 @@ def test_a_per_expert_source_tensor_takes_no_adapter():
 def test_a_target_that_is_not_a_dense_is_refused_when_called(decoder, reference):
     """A record names native module paths, which no binding checks against
     a module's kind; the branch refuses a target that is not a projection."""
-    record = {"rank": 2, "alpha": 2.0, "rslora": False, "dropout": 0.0, "modules": ["params/embed_tokens"],
-              "layouts": {}}
+    record = lora.AdapterRecord(rank=2, alpha=2.0, rslora=False, dropout=0.0,
+                                modules=("params/embed_tokens",), layouts={})
     with pytest.raises(TypeError, match=r"params/embed_tokens.*targets nn.Dense and nn.DenseGeneral kernels"):
-        lora.adapted(decoder.model, record).apply(decoder.variables, jnp.asarray(reference["input_ids"]))
+        record.apply(decoder.model).apply(decoder.variables, jnp.asarray(reference["input_ids"]))
 
 
 def test_freeze_refuses_a_filter_that_splits_nothing(decoder):

@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 TEXT = ("from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sampling\n"
         "model = PretrainedDecoder.load('HuggingFaceTB/SmolLM2-135M-Instruct', dtype='float32', "
@@ -46,9 +47,47 @@ def model_process():
     raise AssertionError("the model process is not running")
 
 
+def memory():
+    """The host's memory and what each process group holds, in MiB, for a failure's message."""
+    lines = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    held = {}
+    for status in Path("/proc").glob("[0-9]*/status"):
+        try:
+            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
+            uid, rss = int(fields["Uid"].split()[1]), int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, KeyError, ValueError):
+            continue
+        held[uid] = held.get(uid, 0) + (rss >> 10)
+    return {"total": int(lines["MemTotal"].split()[0]) >> 10, "available": available(), "by_uid": held}
+
+
+def guests():
+    """Each guest process's uid, state and command line."""
+    found = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            rows = (proc / "status").read_text().splitlines()
+            fields = dict(line.split(":", 1) for line in rows if ":" in line)
+            uid = int(fields["Uid"].split()[1])
+            command = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")[-80:]
+        except (OSError, KeyError, ValueError):
+            continue
+        if 6100 <= uid < 6200:
+            found.append((proc.name, uid, fields["State"].strip(), command))
+    return found
+
+
+def gateway_log():
+    return "\n".join(Path("/run/dew/gateway.log").read_text(errors="replace").splitlines()[-40:])
+
+
 async def page(headers):
     socket = await connect(f"ws://127.0.0.1:8888/contexts/{uuid.uuid4()}/ws", additional_headers=headers)
-    assert json.loads(await socket.recv())["type"] == "ready"
+    try:
+        assert json.loads(await socket.recv())["type"] == "ready"
+    except ConnectionClosed as closed:
+        raise AssertionError(f"the bridge refused a page: {closed.rcvd}; memory {memory()}; "
+                             f"guests {guests()}; gateway log:\n{gateway_log()}") from None
     return socket
 
 
@@ -59,16 +98,32 @@ async def outcomes(socket, count):
         message = json.loads(await asyncio.wait_for(socket.recv(), timeout=600))
         status, errors = seen.get(message["id"], (None, []))
         if message["type"] == "error":
-            errors.append(message["evalue"])
+            errors.append(f"{message['ename']}: {message['evalue']}")
         seen[message["id"]] = (message["status"] if message["type"] == "done" else status, errors)
     return seen
 
 
+def available():
+    lines = Path("/proc/meminfo").read_text().splitlines()
+    return int(next(line for line in lines if line.startswith("MemAvailable:")).split()[1]) >> 10
+
+
+async def closed():
+    """Wait for the bridge to close every context, connection file included, after its page closed."""
+    for _ in range(120):
+        left = sorted(path.name for path in Path("/sessions/connections").glob("kernel-*.json"))
+        if not left:
+            return
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"contexts left open after their pages closed: {left}; memory {memory()}")
+
+
 async def pressure(headers):
     """More memory than the host holds, asked for at once: 24 page cells filling their address
-    space and a training run filling its writable memory. The OOM killer stops guests and never
-    the model process, a stopped cell is told so, and the model still answers afterwards."""
-    model = model_process()
+    space and a training run filling its writable memory. The bridge refuses contexts or stops
+    guests, never the model process, every cell that does not finish says why, and the model
+    still answers afterwards."""
+    model, before = model_process(), available()
     pages = [await page(headers) for _ in range(4)]
     for number, socket in enumerate(pages):
         for cell in range(6):
@@ -79,23 +134,29 @@ async def pressure(headers):
     seen = {}
     for number, socket in enumerate(pages):
         seen.update(await outcomes(socket, 7 if number == 0 else 6))
-    stopped = [name for name, (_, errors) in seen.items()
-               if any(error.startswith("This cell's Python context stopped") for error in errors)]
-    assert stopped, f"nothing ran out of memory: {seen}"
-    # Every other cell either ran to its own limit or was refused a context in words.
-    refusals = ("the shared container has no free Python contexts",
-                "the shared host is short of memory right now; try again in a minute")
-    assert all(status == "ok" or all(error in refusals for error in errors)
-               for name, (status, errors) in seen.items() if name not in stopped), seen
+    # A cell that did not finish was stopped or refused, in words; the pressure must have done one.
+    reasons = ("Stopped: This cell's Python context stopped",
+               "ValueError: the shared container has no free",
+               "ValueError: the shared host is short of memory",
+               "TimeoutError: this cell's Python context sent")
+    unfinished = {name: errors for name, (status, errors) in seen.items() if status != "ok"}
+    report = f"{seen}; MiB available before {before}, now {memory()}"
+    assert unfinished, f"nothing was refused or stopped: {report}"
+    assert all(errors and all(error.startswith(reasons) for error in errors)
+               for errors in unfinished.values()), report
     assert model_process() == model, "the model process was restarted"
     for socket in pages:
         await socket.close()
+    await closed()
     socket = await page(headers)
     await socket.send(json.dumps({"op": "execute", "id": "after", "code": TEXT}))
     (status, errors), = (await outcomes(socket, 1)).values()
     assert status == "ok", errors
     await socket.close()
-    print(f"Memory pressure stopped {len(stopped)} of 25 cells; the model process kept serving.", flush=True)
+    await closed()
+    print(f"Memory pressure: {len(seen) - len(unfinished)} of 25 cells ran, the others were told why; "
+          f"the model process kept serving. Memory before: {before} MiB available; after: {memory()}",
+          flush=True)
 
 
 async def main():

@@ -575,14 +575,15 @@ def test_routing_that_does_not_describe_the_tokens_is_rejected():
 
 
 @pytest.mark.parametrize('generation,gpu,chosen', [
-    ('sm89', True, 'pallas'), ('sm80', True, 'pallas'), ('sm75', False, 'xla'),
+    ('sm89', True, 'pallas'), ('sm86', True, 'pallas'), ('sm80', True, 'pallas'), ('sm75', False, 'xla'),
     ('sm90', True, 'xla'), ('v6e', False, 'xla'), ('cpu', False, 'xla')])
 def test_auto_takes_the_measured_grouped_matmul_and_xla_elsewhere(monkeypatch, generation, gpu,
                                                                   chosen):
     """'auto' runs the Pallas kernels only on a generation they were measured
     on and can compile for; an unmeasured or older one runs XLA."""
     import dew.nn.moe as moe
-    monkeypatch.setattr(moe, 'device_generation', lambda: generation)
+    from dew.nn import kernels
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
     monkeypatch.setattr(moe, 'triton_runs', lambda: gpu)
     assert moe.grouped_matmul_kernel('auto', jnp.bfloat16, (jnp.bfloat16, jnp.float32),
                                      None) == chosen
@@ -592,7 +593,8 @@ def test_pallas_steps_aside_for_a_product_its_kernels_would_change(monkeypatch):
     """The kernels multiply at the operands' dtype and ignore precision, so
     fp32 at HIGHEST runs XLA even where they compile."""
     import dew.nn.moe as moe
-    monkeypatch.setattr(moe, 'device_generation', lambda: 'sm89')
+    from dew.nn import kernels
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: 'sm89')
     monkeypatch.setattr(moe, 'triton_runs', lambda: True)
     assert moe.grouped_matmul_kernel('pallas', jnp.float32, (jnp.float32, jnp.float32),
                                      'highest') == 'xla'

@@ -543,10 +543,10 @@ def main(config: Config) -> dict:
     stock = source.text_generation().sampling
     words = HFTokenizer(tokenizer)
     # An attempt ends on EOS; the committed tiny Qwen2 names none, its tokenizer does.
-    eos = stock.eos_id if stock.eos_id is not None else words.eos_id
+    eos = stock.eos_token_ids if stock.eos_token_ids is not None else words.eos_id
     # Temperature one without filters: the engine's reported likelihoods are
     # then the behavior policy's, on either backend.
-    sampling = Sampling(temperature=1.0, eos_id=eos, pad_id=stock.pad_id)
+    sampling = Sampling(temperature=1.0, eos_token_ids=eos, pad_token_id=stock.pad_token_id)
 
     # Recompute each block's forward in the backward: without it the saved
     # activations of Qwen3-0.6B at 64 rows of 320 ids are 61.6 GiB, with it 3.4 GiB.
@@ -579,7 +579,7 @@ def main(config: Config) -> dict:
         )
     data = Prompts(tokenizer=tokenizer, records=records(config.tasks, config.seed),
                    thinking=config.thinking,
-                   max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_id, val_batches=None,
+                   max_prompt_len=config.prompt_tokens, pad_id=sampling.pad_token_id, val_batches=None,
                    loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
                    seed=config.seed).load(batch=config.prompts)
     # Every session packs as one chain within the width.

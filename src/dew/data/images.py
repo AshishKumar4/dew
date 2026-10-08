@@ -496,7 +496,7 @@ class TFDSImages(ImageDataset):
 
         # The captions read the class names TFDS writes beside the records,
         # so the spec reads the version directory its builder resolves to.
-        reader = read_only_builder(prepared(self.name), builder=self.name, config=None,
+        reader = read_only_builder(prepared(self.name), name=self.name, config=None,
                                    version=None)
         return dataclasses.replace(self, path=str(reader.data_path)).load(
             batch=batch, tokenize=tokenize)
@@ -512,7 +512,7 @@ class TFDSImages(ImageDataset):
 
         from .sources.tfds import prepared_source
 
-        return prepared_source(self.path, split or self.split, builder=self.name,
+        return prepared_source(self.path, split or self.split, name=self.name,
                                decoders={"image": tfds.decode.SkipDecoding()})
 
     def record(self, element: Batch | bytes, rng):

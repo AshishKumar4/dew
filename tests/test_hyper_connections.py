@@ -193,3 +193,6 @@ def test_the_record_refuses_what_the_references_cannot_build():
         HyperConnections(hc_sinkhorn_iters=0)
     with pytest.raises(ValueError, match="head"):
         HyperConnections(head="sum")
+    with pytest.raises(ValueError, match="single_pass"):
+        HyperConnections(head="carried")
+    HyperConnections(head="carried", single_pass=True)

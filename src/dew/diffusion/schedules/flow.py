@@ -6,8 +6,7 @@ from typing import Literal
 import jax
 import jax.numpy as jnp
 
-from .common import times
-from .continuous import ContinuousNoiseScheduler
+from .common import ContinuousNoiseScheduler, times
 
 Density = Literal["logit_normal", "mode", "cosmap", "uniform"]
 """The training time densities of Esser et al. 2024 ("Scaling Rectified Flow

@@ -242,7 +242,7 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.objectives.base import ProgramModule
-    from dew.training.trainer import recompute_more
+    from dew.training.memory import recompute_more
 
     class Holding:
         """An objective that trains one module and has no head to tile."""
@@ -283,7 +283,7 @@ def test_a_distillation_recomputes_more_in_its_student_alone_and_resumes_there()
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.objectives.distillation import DistillationObjective
     from dew.objectives.lm import LMObjective
-    from dew.training.trainer import climb_to, recompute_more, recompute_record
+    from dew.training.memory import climb_to, recompute_more, recompute_record
 
     def distillation():
         decoder = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
@@ -393,17 +393,17 @@ def test_a_step_that_does_not_fit_compiles_again_one_rung_up(monkeypatch, option
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.objectives.lm import LMObjective
-    from dew.training import Trainer, trainer as trainer_module
+    from dew.training import Trainer, memory, trainer as trainer_module
 
     compiled = []
 
     def headroom(executable, devices, held=0):
         rung = (trainer.objective.head_tile is not None,
-                trainer_module.recompute_record(trainer.objective))
+                memory.recompute_record(trainer.objective))
         compiled.append(rung)
         return 0 if rung[1] == 'minimal' else -1
 
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: options)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
@@ -425,18 +425,18 @@ def recording_runs(monkeypatch, fits):
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training import Trainer, trainer as trainer_module
+    from dew.training import Trainer, memory, trainer as trainer_module
 
     compiled, current = [], []
 
     def headroom(executable, devices, held=0):
         trainer = current[-1]
         rung = (trainer.objective.head_tile is not None,
-                trainer_module.recompute_record(trainer.objective))
+                memory.recompute_record(trainer.objective))
         compiled.append(rung)
         return 0 if fits.get(rung, True) else -1
 
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
 
     def run():
@@ -495,21 +495,21 @@ def refusing_trainer(monkeypatch, refused, error="RESOURCE_EXHAUSTED: Ran out of
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training import Trainer, trainer as trainer_module
+    from dew.training import Trainer, memory, trainer as trainer_module
 
     attempts = []
     compile_lowered = jax.stages.Lowered.compile
 
     def compile(self, compiler_options=None):
         rung = (trainer.objective.head_tile is not None,
-                trainer_module.recompute_record(trainer.objective))
+                memory.recompute_record(trainer.objective))
         attempts.append(rung)
         if rung in refused:
             raise jax.errors.JaxRuntimeError(error)
         return compile_lowered(self, compiler_options)
 
     monkeypatch.setattr(jax.stages.Lowered, 'compile', compile)
-    monkeypatch.setattr(trainer_module, 'step_headroom', lambda executable, devices, held=0: 0)
+    monkeypatch.setattr(memory, 'step_headroom', lambda executable, devices, held=0: 0)
     monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)

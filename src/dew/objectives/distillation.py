@@ -41,6 +41,7 @@ from typing_extensions import TypeVar
 from dew.artifacts import Artifacts
 from dew.objectives.base import (
     OMITTED,
+    TEACHER,
     Aux,
     Batch,
     EMASpec,
@@ -59,8 +60,6 @@ Effects = TypeVar("Effects", default=None)
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
 
-TEACHER = "teacher"
-"""The collection holding the teacher's whole variables tree."""
 PROJECTIONS = "distillation"
 """The params subtree holding the feature pairs' width projections."""
 
