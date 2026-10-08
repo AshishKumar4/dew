@@ -110,7 +110,7 @@ def gradient_sync(mesh) -> dict:
             for leaf in jax.tree.leaves(shapes)]
     replicated = NamedSharding(mesh, PartitionSpec())
     tupled = jax.jit(lambda leaves: [leaf.sum(0) for leaf in leaves], out_shardings=replicated)
-    flat = jax.jit(lambda leaves: jnp.concatenate([leaf.reshape(1, -1) for leaf in leaves], 1).sum(0),
+    flat = jax.jit(lambda leaves: jnp.concatenate([leaf.reshape(len(leaf), -1) for leaf in leaves], 1).sum(0),
                    out_shardings=replicated)
     timed = {}
     for name, summed in (("tuple", tupled), ("flat", flat)):
