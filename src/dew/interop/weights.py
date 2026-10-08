@@ -23,15 +23,11 @@ AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 
 
-def auto_storage_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
-    """Return the storage dtype a checkpoint states, for param_dtype 'auto'.
-
-    transformers' dtype='auto' rule (modeling_utils.py `_get_dtype`, 5.16.1):
-    config.json's `dtype` (`torch_dtype` before 5.0), else the dtype of the
-    first floating tensor. Packed FP8 or FP4 payloads are no storage dtype,
-    so the first tensor stored in one is what a quantized checkpoint without
-    a stated dtype resolves to. A diffusers pipeline states none, so its
-    denoiser's tensors decide.
+def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
+    """The compute dtype a checkpoint declares, which its packed FP8 or FP4
+    payloads decode to under param_dtype 'auto': config.json's `dtype`
+    (`torch_dtype` before transformers 5.0), else the dtype of the first
+    floating tensor (transformers' `_get_dtype`, modeling_utils.py, 5.16.1).
     """
     stated = config.get("dtype", config.get("torch_dtype"))
     if stated is not None:
@@ -50,9 +46,12 @@ def auto_storage_dtype(config: Mapping[str, object], tensors: Mapping[str, np.nd
 
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
                      path: tuple[str, ...] = ()) -> np.dtype:
-    """Floating payloads use parameter storage; integer and boolean state keeps its dtype."""
+    """Floating payloads use parameter storage, or under `AUTO` keep the dtype
+    each was stored in; integer and boolean state keeps its dtype."""
     if path and (path[0] == 'constants' or (path[0] == 'params' and path[-1] == 'head_bias')):
         param_dtype = 'float32'
+    if param_dtype == AUTO:
+        return stored
     dtype = resolve_dtype(param_dtype)
     if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
         raise ValueError(f"param_dtype {param_dtype!r} must name floating parameter storage")
