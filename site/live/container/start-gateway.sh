@@ -22,6 +22,10 @@ path = Path('/opt/venv/share/jupyter/kernels/python3/kernel.json')
 spec = json.loads(path.read_text())
 spec['interrupt_mode'] = 'message'
 path.write_text(json.dumps(spec))
+# The same kernel, which gateway_manager.py launches with the training profile.
+train = path.parent.parent / 'dew-train'
+train.mkdir(exist_ok=True)
+(train / 'kernel.json').write_text(json.dumps({**spec, 'display_name': 'Dew training'}))
 PYTHON
 KG_AUTH_TOKEN=$(cat /run/dew/gateway-token)
 export KG_AUTH_TOKEN
