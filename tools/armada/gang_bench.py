@@ -78,11 +78,13 @@ def main() -> None:
     print(f"rank {RANK} started at {time.time():.3f}", file=sys.stderr, flush=True)
     try:
         measured = relay()
-        print(f"rank {RANK} relayed at {time.time():.3f}", file=sys.stderr, flush=True)
+        print(f"rank {RANK} relayed at {time.time():.3f}: {measured}", file=sys.stderr, flush=True)
     except Exception:
         # The relay's own account of what it could not reach.
         print(Path("/armada/relay.log").read_text()[-4000:], file=sys.stderr, flush=True)
         raise
+    if os.environ.get("GANG_RELAY_ONLY"):
+        return
     began = time.monotonic()
     import jax
 
