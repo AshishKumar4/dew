@@ -19,7 +19,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.records import JSON
 
 from ..activations import UNGATED, ungated_activation
-from ..attention import RMSNorm
+from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..blocks import normal_kernel
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
@@ -46,8 +46,7 @@ def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
                  dtype: Dtype | None) -> Callable[..., nn.Module]:
     """The decoder's norm factory, preserving each reference's variance formula."""
     if kind == 'layer':
-        return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
-                                 use_fast_variance=False, dtype=dtype)
+        return functools.partial(LayerNorm, epsilon=epsilon, use_bias=bias, dtype=dtype)
     return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
                              scale_after_cast=scale_after_cast, dtype=dtype)
 
