@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sys
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,8 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
          "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 500.0,
          "tests/test_config.py::test_e": 20.0}))
     monkeypatch.setattr(ci, "NEWEST_FILES", ("tests/test_config.py", "tests/test_light.py"))
-    entries = ci.plan(120.0, {"files": {"tests/test_measured.py": 40.0, "tests/test_light.py": 30.0}})
+    entries = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0,
+                                        "3.12:tests/test_light.py": 30.0}})
     floor = [(entry["tests"], entry["split"]) for entry in entries if entry["python"] == "3.12"]
     assert sorted(floor) == [("tests/test_config.py tests/test_light.py tests/test_measured.py", ""),
                              ("tests/test_heavy.py", "1/2"), ("tests/test_heavy.py", "2/2"),
@@ -102,9 +104,11 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_broken.py": 1}
     assert "test_wrong" in rows["3.12:tests/test_fail.py"]["output"]
     assert "SKIPPED on a missing import" in rows["3.12:tests/test_missing.py"]["output"]
-    assert rows["3.12:tests/test_pass.py"]["timings"].keys() == {"tests/test_pass.py"}
+    assert rows["3.12:tests/test_pass.py"]["timings"].keys() == {"3.12:tests/test_pass.py"}
     assert rows["3.12:tests/test_pass.py"]["tests"].keys() == {"tests/test_pass.py::test_ok",
                                                                "tests/test_pass.py::test_skip"}
+    assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
+        "tests/test_split.py::TestB::test_b"
 
 
 def test_the_plan_weighs_a_file_by_armadas_median_and_the_rest_by_armadas_pace(ci):
@@ -114,30 +118,35 @@ def test_the_plan_weighs_a_file_by_armadas_median_and_the_rest_by_armadas_pace(c
     Path("tests/test_durations.json").write_text(json.dumps(
         {"tests/test_paced.py::test_b": 20.0, "tests/test_measured.py::test_c": 10.0,
          "tests/test_other.py::test_d": 5.0}))
-    timings = {"files": {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0}}
+    timings = {"files": {"3.12:tests/test_measured.py": 30.0, "3.12:tests/test_other.py": 15.0,
+                         "3.14:tests/test_measured.py": 45.0}}
     files = ["tests/test_measured.py", "tests/test_other.py", "tests/test_paced.py"]
+    assert ci.weights(files, timings, "3.14") == {"tests/test_measured.py": 45.0, "tests/test_other.py": 22.5,
+                                                  "tests/test_paced.py": 90.0}
     assert ci.weights(files, timings) == {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0,
                                           "tests/test_paced.py": 60.0}
 
 
-def test_a_files_groups_are_consecutive_runs_whose_heaviest_is_least(ci):
+def test_a_files_groups_are_consecutive_runs_as_light_as_their_count_lets_them_be(ci):
     """Every test lands in exactly one run, the runs keep the tests' order,
-    and the heaviest run is the lightest any cut into that many runs has:
-    5 1 1 1 5 1 in three runs is 5 1 | 1 1 | 5 1. More runs than tests
-    leaves the extra runs empty."""
+    and the heaviest is the lightest any cut into that many runs has: 5 1 1 1
+    5 1 in three runs is 5 1 | 1 1 | 5 1. A test heavier than the rest runs
+    alone and leaves the runs beside it no heavier than they must be. More
+    runs than tests leaves the extra runs empty."""
     seconds = [5.0, 1.0, 1.0, 1.0, 5.0, 1.0]
     runs = ci.groups(seconds, 3)
     assert [index for run in runs for index in run] == list(range(6))
     assert max(sum(seconds[index] for index in run) for run in runs) == 6.0
+    assert ci.groups([1.0, 1.0, 9.0, 1.0, 1.0, 1.0, 1.0], 3) == [range(2), range(2, 3), range(3, 7)]
     assert ci.groups([2.0, 3.0], 4) == [range(1), range(1, 2), range(2, 2), range(2, 2)]
 
 
 def test_a_heavy_file_runs_as_the_fewest_groups_that_hold_each_to_the_target(ci):
     """A file's groups hold its recorded tests' time scaled to its weight, as
-    many as it takes to keep each under the target with a heavier test alone,
-    and no group outweighs both the target and that test. A file with no
-    recorded tests runs as equal counts of them."""
-    assert ci.split([150.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0], 420.0, 100.0) == [300.0, 120.0]
+    many as it takes to keep each under the target, a heavier test alone,
+    beside which the rest still split evenly. A file with no recorded tests
+    runs as equal counts of them."""
+    assert ci.split([150.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0], 420.0, 100.0) == [300.0, 60.0, 60.0]
     assert ci.split([40.0, 40.0, 40.0, 40.0], 160.0, 100.0) == [80.0, 80.0]
     assert ci.split([], 250.0, 100.0) == [250.0 / 3] * 3
 
@@ -145,9 +154,8 @@ def test_a_heavy_file_runs_as_the_fewest_groups_that_hold_each_to_the_target(ci)
 def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
     """Each task of a split file runs its own group (split.py) of the same
     cut, so the groups together run every test, none twice, a test the
-    durations lack included. A group weighs its file at its tests' share of
-    the recorded time and its start-up once: these tests take no time, so
-    each group weighs the file at about its own wall time."""
+    durations lack included. Each group times the file at what it spent,
+    which armada sums over the groups."""
     (tmp_path / "tests/test_split.py").write_text(
         "import pytest\n@pytest.mark.parametrize('n', range(6))\ndef test_n(n): pass\n"
         "def test_unrecorded(): pass\n")
@@ -163,7 +171,7 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
         ci.task("3.12", ["tests/test_split.py"], group, out, 120.0)
         [verdict] = json.loads(out.read_text())["rows"]
         assert verdict["exitCode"] == 0, verdict["output"]
-        assert verdict.get("timings", {}).get("tests/test_split.py", 0.0) < 1.5 * verdict["seconds"]
+        assert verdict["timings"] == {"3.12:tests/test_split.py": verdict["seconds"]}
         ran.append(sorted(verdict["tests"]))
     assert all(ran)
     every = sorted(node for nodes in ran for node in nodes)
@@ -171,10 +179,10 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
                            + ["tests/test_split.py::test_unrecorded"])
 
 
-def test_durations_are_each_tests_median_over_green_runs_floors(ci):
-    """`durations` records each test's median time over green verdicts' floor
-    rows, so one slow run moves nothing, and refuses a red run or rows that
-    carry no times."""
+def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
+    """`durations` records each test's least time over green verdicts' floor
+    rows, so a slow container or run moves nothing, and refuses a red run or
+    rows that carry no times."""
     def verdict(x, y):
         return {"rows": [
             {"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": x}},
@@ -183,29 +191,13 @@ def test_durations_are_each_tests_median_over_green_runs_floors(ci):
 
     assert ci.durations([verdict(1.2346, 2.0)]) == {
         "tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
-    assert ci.durations([verdict(1.0, 2.0), verdict(30.0, 60.0), verdict(1.5, 2.5)]) == {
-        "tests/test_a.py::test_x": 1.5, "tests/test_a.py::test_y": 2.5}
+    assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)]) == {
+        "tests/test_a.py::test_x": 1.0, "tests/test_a.py::test_y": 2.0}
     red = {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}
     with pytest.raises(SystemExit, match="red"):
         ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}])
     with pytest.raises(SystemExit, match="no test times"):
         ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
-
-
-def test_a_split_group_scales_to_its_whole_file_by_the_recorded_durations(ci):
-    """A group of a split file reports the file's time: its own, times the
-    file's recorded durations over its tests' share of them, so the file's
-    median holds however the file is split."""
-    import xml.etree.ElementTree as ET
-
-    Path("tests/test_durations.json").write_text(json.dumps(
-        {"tests/test_split.py::test_a": 1.0, "tests/test_split.py::TestB::test_b": 3.0,
-         "tests/test_other.py::test_c": 9.0}))
-    group = [ET.Element("testcase", classname="tests.test_split", name="test_a")]
-    assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
-        "tests/test_split.py::TestB::test_b"
-    assert ci.file_share("tests/test_split.py", group) == 4.0
-    assert ci.file_share("tests/test_split.py", []) is None
 
 
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
