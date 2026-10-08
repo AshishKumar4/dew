@@ -12,7 +12,7 @@ export interface SnapshotRecord {
 	state: 'preparing' | 'ready' | 'failed';
 }
 
-// A preparation outlives neither its preparer's alarm nor the registry's 15-minute one.
+// A snapshot is preparing from the end of its build to the end of its smoke, a 15-minute alarm (preparer.ts).
 const PREPARING_MS = 20 * 60_000;
 const NEWEST = 2;
 
