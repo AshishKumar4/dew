@@ -87,7 +87,7 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band run" data-reveal>
 			<h2 class="band-title">Training</h2>
-			<p class="band-lede">A small decoder trains on Tiny Shakespeare on {capture.meta.where}, then writes one sample from each of the prompts <code>ROMEO:</code> and <code>JULIET:</code>. Run trains the same script on a shared CPU host, for 20 steps at batch 8.</p>
+			<p class="band-lede">A small decoder trains on Tiny Shakespeare on {capture.meta.where}, then writes one sample from each of the prompts <code>ROMEO:</code> and <code>JULIET:</code>.</p>
 			<div class="run-grid">
 				<LiveTrain code={trainingExample(heroCode)} title="train.py" cell="hero" />
 				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} columns={hero.columns} source_rows={hero.source_rows} playbackSeconds={terminalReplay.duration} />
