@@ -4,7 +4,7 @@ A training context (gateway_manager.py) runs offline over a private overlay of
 /opt/train, so the models, datasets and tokenized corpora each pool cell reads
 must be there already. Running a cell puts there exactly the files it reads;
 every cell reads them before `Trainer.fit`, so the run stops there (`FETCH`),
-and the preparation stays inside the registry's 15-minute alarm. The context
+and the build stays inside its 15-minute alarm (preparer.ts). The context
 smoke then runs each cell whole (benchmark_gateway.py). setup-managed.sh makes
 /opt/train read-only afterwards.
 """
