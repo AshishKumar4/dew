@@ -20,6 +20,7 @@ from dew.diffusion.process import DenoisingCondition
 from dew.nn.attention import LayerNorm, Stage
 from dew.nn.autoencoders.vae import FlaxDecoder, FlaxEncoder, translate_vae_weights
 from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.joint import DoubleStreamBlock
 from dew.nn.backbones.mmdit import SimpleMMDiT
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.backbones.unet import Unet
@@ -399,10 +400,11 @@ def test_a_stack_option_class_forwards_every_control_it_declares(options, forwar
     assert declared - stack_only == keys
 
 
-def test_dropout_is_active_in_train_mode(rng):
+@pytest.mark.parametrize("stack", [SimpleDiT, SimpleMMDiT], ids=["simple_dit", "simple_mmdit"])
+def test_dropout_is_active_in_train_mode(rng, stack):
     """Dropout is applied in train mode, so `dropout_rate` reaches the blocks."""
-    model = SimpleDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2,
-                      mlp_ratio=2, dropout_rate=0.5)
+    model = stack(patch_size=4, emb_features=64, num_layers=2, num_heads=2,
+                  mlp_ratio=2, dropout_rate=0.5)
     x, temb, textcontext = small_inputs(rng)
     params = model.init(rng, x, temb, textcontext)
     # nudge every param off init: the zero-initialized adaLN gates and final
@@ -437,6 +439,30 @@ def test_mmdit_is_dual_stream(rng):
     out_a = model.apply(params, x, temb, text_a)
     out_b = model.apply(params, x, temb, text_b)
     assert not jnp.allclose(out_a, out_b), "text tokens do not reach the image stream"
+
+
+def test_a_fresh_mmdit_block_returns_both_streams_as_they_came(rng):
+    """Dew's MM-DiT starts adaLN-Zero: each block's modulation projects to
+    zero, so its gates are shut and a fresh block hands both streams on
+    exactly. The published families that share the block load their weights
+    and start from Linen's default instead."""
+    model = SimpleMMDiT(patch_size=4, emb_features=64, num_layers=2, num_heads=2, mlp_ratio=2)
+    x, temb, textcontext = small_inputs(rng)
+    variables = model.init(rng, x, temb, textcontext)
+    seen = []
+
+    def record(call, args, kwargs, context):
+        out = call(*args, **kwargs)
+        if isinstance(context.module, DoubleStreamBlock) and context.method_name == "__call__":
+            seen.append((args[:2], out))
+        return out
+
+    with nn.intercept_methods(record):
+        model.apply(variables, x, temb, textcontext)
+    assert len(seen) == 2
+    for streams, returned in seen:
+        for given, out in zip(streams, returned, strict=True):
+            np.testing.assert_array_equal(np.asarray(out), np.asarray(given))
 
 
 def test_attention_impl_parity(rng):
