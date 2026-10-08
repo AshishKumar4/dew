@@ -160,15 +160,19 @@ def test_landing_snippet_runs(section, tmp_path):
         assert (tmp_path / "export/config.json").is_file()
 
 
-def test_recorded_hero_runs_offline(tmp_path, monkeypatch):
-    """Smoke the exact script with a step override and its corpus already in dew's cache."""
-    from dew.data import HubText, TokenCorpus
-
+def test_recorded_hero_runs_offline(tmp_path):
+    """Smoke the exact script with a step override and offline data, not its recorded output."""
     script = tmp_path / "hero.py"
     shutil.copyfile(REPO_ROOT / "site/src/data/hero.py", script)
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    corpus = tmp_path / "tokens"
+    corpus.mkdir()
     text = "ROMEO: I love the moon.\nJULIET: The moon shines tonight.\n" * 1000
-    TokenCorpus.write([text], HubText("winglian/tiny-shakespeare").directory, val_fraction=0.5, pack=True)
+    tokens = np.asarray(list(text.encode()), np.uint16)
+    for split in ("train", "val"):
+        tokens.tofile(corpus / f"{split}.bin")
+    (corpus / "meta.json").write_text(json.dumps({
+        "tokenizer": "byte", "vocab_size": 256, "dtype": "uint16",
+        "train_tokens": len(tokens), "val_tokens": len(tokens), "eos_id": 255}))
     finished = smoke("hero", tmp_path, "--steps", "3", script=script, smoke_args=False)
     assert "ROMEO:" in finished.stdout and "JULIET:" in finished.stdout
 
