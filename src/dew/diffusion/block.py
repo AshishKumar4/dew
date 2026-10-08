@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import functools
 import math
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Generic
@@ -137,14 +137,6 @@ class BlockProcess:
             value = getattr(self, name)
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be positive and finite")
-
-    def to_json(self) -> dict:
-        import dataclasses
-        return dataclasses.asdict(self)
-
-    @classmethod
-    def from_json(cls, record: Mapping) -> BlockProcess:
-        return cls(**record)
 
     def temperature(self, remaining: jax.typing.ArrayLike) -> jax.Array:
         return self.t_min + (self.t_max - self.t_min) * jnp.asarray(remaining) / self.max_steps

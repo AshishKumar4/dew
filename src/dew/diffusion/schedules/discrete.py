@@ -1,5 +1,7 @@
 """The tabulated variance-preserving schedule every beta table shares."""
 
+from collections.abc import Sequence
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -20,12 +22,12 @@ class DiscreteNoiseScheduler(NoiseScheduler):
     prepared in host float64 and rounded once.
     """
 
-    def __init__(self, betas: np.ndarray,
+    def __init__(self, betas: np.ndarray | Sequence[float],
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
-        self._record_fields = {'betas': np.asarray(betas, np.float64).tolist(),
-                               'p2_loss_weight_k': p2_loss_weight_k,
-                               'p2_loss_weight_gamma': p2_loss_weight_gamma}
-        self.T = len(betas)
+        self.betas = tuple(float(beta) for beta in np.asarray(betas, np.float64))
+        self.p2_loss_weight_k = p2_loss_weight_k
+        self.p2_loss_weight_gamma = p2_loss_weight_gamma
+        self.T = len(self.betas)
         # The table is fixed at construction. Device float32 prefix products
         # and roots introduce backend-dependent error into every later step.
         alpha_cumprod = np.cumprod(1 - np.asarray(betas, np.float64), axis=0)

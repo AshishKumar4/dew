@@ -294,7 +294,8 @@ class TextToImage:
         guidance = None if recorded is None else from_record(Guidance, recorded, dtypes=False)
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
-        return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
+        process = from_record(Process, json_value(record['process'], 'process'), dtypes=False)
+        return cls(config.build(), process,
                    inputs, without_loss_heads(params), autoencoder,
                    steps=integer(record['sampling_steps'], 'sampling_steps'),
                    guidance=guidance, solver=solver,
