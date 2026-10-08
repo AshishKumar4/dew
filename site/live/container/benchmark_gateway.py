@@ -4,6 +4,7 @@ import argparse
 import concurrent.futures
 import json
 import pathlib
+import re
 import statistics
 import time
 import urllib.request
@@ -127,6 +128,9 @@ def cells():
     # itself is a display, not a stream.
     for name, ending in (("finetune.py", "After: "), ("hero.py", "JULIET:")):
         code = (pathlib.Path("/opt/live/cells") / name).read_text()
+        # The page shows train.py without its command line (trainingExample, framework-examples.mjs).
+        code = re.sub(r"parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps",
+                      "steps = 1000", code.replace("import argparse\n\n", ""))
         kernel = request("/api/kernels", {"name": "dew-train"})
         client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
         client.load_connection_file()
