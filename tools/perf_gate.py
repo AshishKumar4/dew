@@ -19,8 +19,9 @@ regression.
 The battery is the training step (a dense and an MoE decoder, a DiT, an
 MM-DiT, FLUX.2 and Wan), the forward pass of three vision towers and the SD
 VAE's decoder, LM serving at 32 and 128 slots, attention forward and
-backward, the image input pipeline and a checkpoint's save and restore. docs/performance.md,
-"The performance gate", says how it runs before main takes a commit.
+backward, the image input pipeline and a checkpoint's save and restore.
+docs/performance.md, "The performance gate", says how it runs before main
+takes a commit.
 """
 
 import argparse
@@ -145,9 +146,10 @@ def _probes(args: argparse.Namespace, out: Path):
         yield ([name], "benchmark_step.py",
                ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30", "--json-out", str(out)],
                lambda _, name=name: {name: json.loads(out.read_text())[0]["ms_per_step"]})
-    yield (list(FORWARD_CASES), "benchmark_forward.py",
-           ["--cases", *FORWARD_CASES, "--json-out", str(out)],
-           lambda _: json.loads(out.read_text()))
+    # A process for each forward, so a module one tree lacks costs that row alone.
+    for name in FORWARD_CASES:
+        yield ([name], "benchmark_forward.py", ["--cases", name, "--json-out", str(out)],
+               lambda _, name=name: {name: json.loads(out.read_text())[name]})
     yield ([row.name for row in BATTERY if row.name.startswith("serve")], "benchmark_lm_serving.py",
            ["--backend", "dew", "--model", args.model, "--slots", "32,128", "--repeats", "5",
             "--out", str(out)],
