@@ -13,8 +13,10 @@ def test_the_accelerator_extras_install_what_the_installed_jax_asks_for():
     """`dewml[cuda12]`, `[cuda13]` and `[tpu]` are how one install gets jax's
     accelerator build. Each extra asks for the packages the installed jax's
     extra of the same name asks for, at the same versions, apart from jaxlib,
-    which jax pins itself; a jax that moves without its extras fails here."""
+    which jax pins itself; a jax that moves without its extras fails here. A
+    CUDA extra also brings Dew's own FlashAttention-2 wheel for its major."""
     extras = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text())["project"]["optional-dependencies"]
+    own = {"cuda12": "dew-flash-attn-cu12", "cuda13": "dew-flash-attn-cu13"}
 
     def key(requirement: Requirement) -> tuple[str, frozenset[str], str]:
         return canonicalize_name(requirement.name), frozenset(requirement.extras), str(requirement.specifier)
@@ -29,7 +31,11 @@ def test_the_accelerator_extras_install_what_the_installed_jax_asks_for():
             and requirement.name != "jaxlib"
         }
         assert wanted, f"the installed jax has no {extra} extra"
-        assert {key(Requirement(line)) for line in extras.get(extra, ())} == wanted, extra
+        listed = [Requirement(line) for line in extras.get(extra, ())]
+        jax_asks = {key(requirement) for requirement in listed if requirement.name != own.get(extra)}
+        assert jax_asks == wanted, extra
+        assert [requirement.name for requirement in listed if requirement.name == own.get(extra)] == \
+            ([own[extra]] if extra in own else []), extra
 
 
 def test_every_requirement_names_a_release():
