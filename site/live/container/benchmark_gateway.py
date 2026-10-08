@@ -95,6 +95,12 @@ for path in ("/opt/train/escape", "/opt/live/escape", "/work/../escape"):
     else:
         raise AssertionError(f"a training context wrote {path}")
 Path("/tmp/inside").write_text("x")
+try:
+    bytearray(7 * 1024 * 1024 * 1024)
+except MemoryError:
+    pass
+else:
+    raise AssertionError("a training context exceeded its memory allowance")
 from dew import Trainer
 from dew.config import OptimConfig
 from dew.data import load
@@ -140,7 +146,6 @@ def cells():
         # The page shows train.py without its command line (trainingExample, framework-examples.mjs).
         code = re.sub(r"parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps",
                       "steps = 1000", code.replace("import argparse\n\n", ""))
-        code += "\nimport resource\nprint('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n"
         kernel = request("/api/kernels", {"name": "dew-train"})
         client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
         client.load_connection_file()
@@ -157,11 +162,7 @@ def cells():
             client.stop_channels()
             request("/api/kernels/" + kernel["id"], method="DELETE")
         assert ending in output, output[-2000:]
-        # What a run keeps resident, which the host's memory must hold beside the model process.
-        peak = int(output.rsplit("peak ", 1)[1].split()[0])
-        assert peak < 4608, f"{name} held {peak} MiB; memory {memory()}"
-        print(f"{name} ran in {time.perf_counter() - started:.0f} s, {peak} MiB resident; memory {memory()}",
-              flush=True)
+        print(f"{name} ran in {time.perf_counter() - started:.0f} s; memory {memory()}", flush=True)
 
 
 def memory():
