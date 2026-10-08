@@ -167,10 +167,12 @@ def test_an_adapted_run_records_its_base_and_adapter_and_loads_what_it_trained(t
     checkpoints.wait()
     record = checkpoints.artifact()['model']
     assert record['name'] == 'dew.nn.backbones.causal_transformer:CausalTransformer'
-    assert record['adapter'] == {'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
-        'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
-        f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight', 'shape': [16, 16],
-                                               'transpose': [1, 0]} for name in ('q_proj', 'v_proj')}}
+    assert record['wrappers'] == [{'class': 'dew.lora:AdapterRecord', 'fields': {
+        'rank': 2, 'alpha': 4.0, 'rslora': False, 'dropout': 0.0, 'modules': [
+            'params/layers_0/self_attn/q_proj', 'params/layers_0/self_attn/v_proj'], 'layouts': {
+            f'params/layers_0/self_attn/{name}': {'name': f'layers_0.self_attn.{name}.weight',
+                                                   'shape': [16, 16], 'transpose': [1, 0]}
+            for name in ('q_proj', 'v_proj')}}}]
     assert any(np.abs(np.asarray(leaf)).max() > 0 for path, leaf in jax.tree_util.tree_leaves_with_path(
         state.variables['params']) if 'lora_B' in jax.tree_util.keystr(path))
     task = TextGeneration.from_run(str(tmp_path / 'run'), ema=False)
@@ -277,7 +279,8 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
         data, steps=2, checkpoint_every=1)
     checkpoints.wait()
-    assert checkpoints.artifact()['model']['adapter']['modules'] == ['params/hidden', 'params/out']
+    (adapter_record,) = checkpoints.artifact()['model']['wrappers']
+    assert adapter_record['fields']['modules'] == ['params/hidden', 'params/out']
     pipe = TextToImage.from_run(str(tmp_path / 'run'), ema=False)
     x, t = jax.random.normal(jax.random.key(2), (2, 4, 4, 3)), jnp.zeros((2,))
     np.testing.assert_array_equal(np.asarray(pipe.model.apply(pipe.variables, x, t)),
