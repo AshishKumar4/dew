@@ -39,7 +39,8 @@ class RemoteCache:
 
     def __init__(self, base, url: str, token: str, prefix: str):
         self.base, self.url, self.prefix = base, url.rstrip("/"), prefix.strip("/")
-        self.headers = {"Authorization": f"Bearer {token}"}
+        # Cloudflare refuses urllib's own User-Agent with a 403 (error 1010) before the Worker sees it.
+        self.headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-xla-cache"}
         self.failures = 0
         self.lock = threading.Lock()
         self.uploads = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="xla-cache")
