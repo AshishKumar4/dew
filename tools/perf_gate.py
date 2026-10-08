@@ -16,9 +16,10 @@ trees' spreads across rounds (and at least `FLOOR`), and the head's best
 sample is worse than the base's worst. It writes the table and exits 1 on a
 regression.
 
-The battery is the training step (a dense and an MoE decoder, a DiT), LM
-serving at 32 and 128 slots, attention forward and backward, the image
-input pipeline and a checkpoint's save and restore. docs/performance.md,
+The battery is the training step (a dense and an MoE decoder, a DiT, an
+MM-DiT, FLUX.2 and Wan), the forward pass of three vision towers and the SD
+VAE's decoder, LM serving at 32 and 128 slots, attention forward and
+backward, the image input pipeline and a checkpoint's save and restore. docs/performance.md,
 "The performance gate", says how it runs before main takes a commit.
 """
 
@@ -42,6 +43,12 @@ MOE = {"vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 
        "max_seq_len": 1024,
        "mixture": {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11], "dispatch": "global"}}
 DIT = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_ratio": 4}
+# FLUX.2 and Wan 2.1 1.3B at their head width over a few of their blocks: the
+# rotary, the joint attention and the modulated feed-forwards of the hot path.
+FLUX2 = {"num_layers": 2, "num_single_layers": 4, "heads": 12, "head_dim": 128,
+         "joint_attention_dim": 3 * 768, "axes_dims_rope": [32, 32, 32, 32]}
+WAN = {"num_attention_heads": 12, "attention_head_dim": 128, "text_dim": 768, "ffn_dim": 8960,
+       "num_layers": 4}
 STEP_CASES = {
     "step lm-dense 4x1024": {"architecture": "causal_transformer", "config": DENSE, "dtype": "bfloat16",
                              "batch_size": 4, "seq_len": 1024},
@@ -49,7 +56,16 @@ STEP_CASES = {
                            "batch_size": 4, "seq_len": 1024},
     "step simple-dit-b 32x64px": {"architecture": "simple_dit", "config": DIT, "dtype": "bfloat16",
                                   "batch_size": 32, "image_size": 64},
+    "step simple-mmdit-b 32x64px": {"architecture": "simple_mmdit", "config": DIT, "dtype": "bfloat16",
+                                    "batch_size": 32, "image_size": 64},
+    "step flux2 4x32px": {"architecture": "flux2_transformer", "config": FLUX2, "dtype": "bfloat16",
+                          "batch_size": 4, "image_size": 32, "channels": 128},
+    "step wan 2x5x32px": {"architecture": "wan_transformer", "config": WAN, "dtype": "bfloat16",
+                          "batch_size": 2, "image_size": 32, "channels": 16, "frames": 5},
 }
+# Forward passes of inference modules at their published sizes, random weights.
+FORWARD_CASES = ("vision siglip-400m 384px b8", "vision qwen3.5 448px b8", "vision gemma4 672px b4",
+                 "vae decode sd 512px b4")
 
 # A checkpoint of lm-dense's whole training state, saved and then restored onto its shardings.
 CHECKPOINT = """
@@ -94,6 +110,7 @@ class Row:
 
 BATTERY = [
     *[Row(name, "ms", "benchmark_step.py") for name in STEP_CASES],
+    *[Row(name, "ms", "benchmark_forward.py") for name in FORWARD_CASES],
     Row("serve qwen3-0.6b 32 slots", "items/s", "benchmark_lm_serving.py"),
     Row("serve qwen3-0.6b 128 slots", "items/s", "benchmark_lm_serving.py"),
     # The median of the same repeats: the stalls best-of-five hides (a recompile, a pause), shown.
@@ -128,6 +145,9 @@ def _probes(args: argparse.Namespace, out: Path):
         yield ([name], "benchmark_step.py",
                ["--cases", json.dumps([case]), "--warmup", "10", "--steps", "30", "--json-out", str(out)],
                lambda _, name=name: {name: json.loads(out.read_text())[0]["ms_per_step"]})
+    yield (list(FORWARD_CASES), "benchmark_forward.py",
+           ["--cases", *FORWARD_CASES, "--json-out", str(out)],
+           lambda _: json.loads(out.read_text()))
     yield ([row.name for row in BATTERY if row.name.startswith("serve")], "benchmark_lm_serving.py",
            ["--backend", "dew", "--model", args.model, "--slots", "32,128", "--repeats", "5",
             "--out", str(out)],
