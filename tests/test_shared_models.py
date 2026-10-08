@@ -177,3 +177,32 @@ def test_shared_text_delegates_prompt_preparation_to_dew_server(service):
     request = {"model": "model", "prompt": "hello", "tokens": 2, "key": 0}
     assert models.text([request]) == [{"text": ["ok"]}]
     assert calls == [("hello", 2, 0)]
+
+
+def test_shared_text_emits_prefixes_before_the_final_native_result(service):
+    from types import SimpleNamespace
+
+    import numpy as np
+
+    events = []
+    ticket = SimpleNamespace(tokens=(65,), first=1.01, submitted=1.0,
+                             result=lambda: SimpleNamespace(text=["AB"]))
+    ticket.add_tokens_callback = lambda callback: setattr(ticket, "callback", callback)
+
+    class Server:
+        processor = SimpleNamespace(decode=lambda tokens: ["".join(chr(value) for value in tokens[0])])
+
+        def submit(self, *args, **kwargs):
+            return ticket
+
+        def run(self):
+            ticket.callback(ticket)
+            ticket.tokens = (65, 66)
+            ticket.callback(ticket)
+
+    models = service.NativeModels.__new__(service.NativeModels)
+    models.np = np
+    models.text_servers = {"model": Server()}
+    result = models.text([{"model": "model", "prompt": "hello", "tokens": 2, "key": 0}], [events.append])
+    assert [event["text"] for event in events] == ["A", "AB"]
+    assert result == [{"text": ["AB"]}]
