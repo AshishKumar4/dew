@@ -131,6 +131,7 @@ Weights that are already JAX arrays on devices keep their placement through Qwix
 
 On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser weights in place of 670 MiB. In bf16 with int8 weights and activations, its denoiser forward takes 21% less time, and its CLIP score stays within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). The time saved depends on the device: on an A100 the quantized forward is slower than the unquantized one, and on a TPU v6e int8 halves the fp32 forward's time but not the bf16 forward's. On a GPU, Dew refuses to quantize the activations of a grouped convolution, because XLA:GPU computes it wrongly or cannot compile it. So this example leaves the model's depthwise convolutions out:
 
+<!-- not run: loads the published 176M text-to-image model, 4.3 GiB on CPU, past the docs test's budget -->
 ```python
 import jax.numpy as jnp
 
@@ -215,6 +216,7 @@ A call takes `key`, either an integer seed or a JAX key; `key=n` means `jax.rand
 
 `task.sampling` holds the policy that a loaded checkpoint's `generation_config.json` declares. To change one control, replace it on that value, and the others, including the source's EOS IDs, still apply:
 
+<!-- not run: continues the Qwen3-0.6B task above, whose tokenizer lists the vocabulary stop strings need -->
 ```python
 from dataclasses import replace
 
