@@ -144,6 +144,11 @@ test = [
     # same weights, and its tolerances were measured against this release;
     # HFLM imports accelerate, which the hf extra brings.
     "lm_eval[hf]==0.4.13",
+    # tests/test_tools.py runs tools/run_tutorials.py, which executes the
+    # tutorials through a Jupyter kernel of this interpreter.
+    "nbclient",
+    "nbformat",
+    "ipykernel",
 ]
 # Run mutation tests in CI, one source module at a time. Pin the operators so
 # two reports describe the same mutation population.
