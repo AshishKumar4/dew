@@ -21,7 +21,7 @@ test('concurrent renewals acquire one persisted preparation lease', async () => 
 	const result = await scenario('concurrent');
 	assert.equal(result.calls, 1);
 	assert.ok(result.active.snapshot.id);
-	assert.equal(result.replies.filter((reply) => reply.rebuilding).length, 9);
+	assert.equal(result.started.filter(Boolean).length, 1);
 });
 test('a cold request schedules durable preparation instead of detaching a long RPC', async () => {
 	const result = await scenario('queued');
@@ -30,8 +30,9 @@ test('a cold request schedules durable preparation instead of detaching a long R
 	assert.ok(result.status.alarm > result.now - 1000 && result.status.alarm < result.now + 15_000);
 	assert.equal(result.calls, 0);
 });
-test('the preparation alarm promotes a first dependency-hash generation', async () => {
+test('the preparation alarm leases a first dependency-hash generation and its report promotes it', async () => {
 	const result = await scenario('hash-alarm');
+	assert.ok(result.leased.until);
 	assert.equal(result.generation.commit, 'c'.repeat(64));
 	assert.equal(result.calls, 1);
 });
@@ -51,6 +52,14 @@ test('a failed offline smoke does not replace the previous generation', async ()
 	assert.equal(result.status.failure.commit, 'b'.repeat(40));
 	assert.match(result.status.failure.message, /offline smoke failed/);
 });
+test('a lease that hears nothing fails at its end, and a report after it changes nothing', async () => {
+	const result = await scenario('silent');
+	assert.equal(result.status.rebuild, null);
+	assert.match(result.status.failure.message, /no outcome within its lease/);
+	assert.ok(result.status.alarm >= result.now + 4 * 60_000);
+	assert.equal(result.late.generation, null);
+	assert.deepEqual(result.late.failure, result.status.failure);
+});
 test('an expired or different-commit generation is not eligible for restoration', async () => {
 	const result = await scenario('expiry');
 	assert.equal(result.expired, null);
@@ -59,6 +68,9 @@ test('an expired or different-commit generation is not eligible for restoration'
 test('a trial prepares a branch commit on its own preparer, promotes nothing and keeps the renewal', async () => {
 	const result = await scenario('trial');
 	assert.equal(result.pending.pending, 'b'.repeat(40));
+	// A trial that never reports reads as cut off once both its stages' time is over.
+	assert.equal(result.cut.pending, null);
+	assert.match(result.cut.last.failure, /no outcome in 35 minutes/);
 	assert.equal(result.trialled.pending, null);
 	assert.equal(result.trialled.last.commit, 'b'.repeat(40));
 	assert.equal(result.trialled.last.generation.commit, 'b'.repeat(40));
