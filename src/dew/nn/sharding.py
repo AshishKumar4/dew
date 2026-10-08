@@ -528,14 +528,13 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
                 f"module that holds it, e.g. ('head', '{single[0]}')")
         for suffix, axes in declared.items():
             held = _OWNERS.get(suffix)
-            if held is not None and held[0] != axes and held[1] is not cls:
+            if held is not None and held[0] != axes:
                 raise ValueError(
                     f"{'/'.join(suffix)} is declared {axes} by {_qualified(cls)} and "
                     f"{held[0]} by {_qualified(held[1])}; a suffix has one set of axes")
         for suffix, axes in declared.items():
-            if suffix not in _OWNERS or _OWNERS[suffix][1] is cls:
-                _OWNERS[suffix] = (axes, cls)
-        DECLARED[cls] = declared
+            _OWNERS.setdefault(suffix, (axes, cls))
+        DECLARED.setdefault(cls, {}).update(declared)
         return cls
 
     return decorate
