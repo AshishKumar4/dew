@@ -37,10 +37,10 @@ def execute(client, code):
     return collect(client, client.execute(code, allow_stdin=False))
 
 
-def collect(client, message):
+def collect(client, message, timeout=30):
     stdout = ""
     while True:
-        result = client.get_iopub_msg(timeout=30)
+        result = client.get_iopub_msg(timeout=timeout)
         if result["parent_header"].get("msg_id") != message:
             continue
         if result["msg_type"] == "stream":
@@ -118,6 +118,34 @@ def training():
     finally:
         client.stop_channels()
         request("/api/kernels/" + kernel["id"], method="DELETE")
+
+
+def cells():
+    """The page's training cells, each run in a fresh training context as a visitor's Run does,
+    while the model process holds its models. A failure names the host's memory."""
+    for name in ("finetune.py", "hero.py"):
+        code = (pathlib.Path("/opt/live/cells") / name).read_text()
+        kernel = request("/api/kernels", {"name": "dew-train"})
+        client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
+        client.load_connection_file()
+        client.start_channels()
+        started = time.perf_counter()
+        try:
+            client.wait_for_ready(timeout=30)
+            output = collect(client, client.execute(code, allow_stdin=False), timeout=400)
+        except Exception as error:
+            raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
+                                 f"memory {memory()}") from None
+        finally:
+            client.stop_channels()
+            request("/api/kernels/" + kernel["id"], method="DELETE")
+        assert "Trained 20 steps" in output, output[-2000:]
+        print(f"{name} ran in {time.perf_counter() - started:.0f} s; memory {memory()}", flush=True)
+
+
+def memory():
+    lines = dict(line.split(":", 1) for line in pathlib.Path("/proc/meminfo").read_text().splitlines())
+    return {key: int(lines[key].split()[0]) >> 10 for key in ("MemTotal", "MemAvailable", "Shmem")}
 
 
 def main():
@@ -272,3 +300,4 @@ def main():
 if __name__ == "__main__":
     main()
     training()
+    cells()

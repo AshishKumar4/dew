@@ -55,6 +55,10 @@ export class SharedHost extends DurableObject<Env> {
 				entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: secret,
 					DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds), DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds) } });
 			await this.ctx.storage.put('started', Date.now());
+			// A container stops only when destroyed or when it fails; say which, and after how long.
+			const started = Date.now();
+			container.monitor().then(() => console.log('model host container exited', generation.snapshot.id, Date.now() - started))
+				.catch((error) => console.error('model host container stopped', generation.snapshot.id, Date.now() - started, String(error)));
 		}
 		await container.setInactivityTimeout((limits.wallSeconds + limits.warmSeconds + 60) * 1000);
 		await this.ctx.storage.setAlarm(Date.now() + 30_000);
