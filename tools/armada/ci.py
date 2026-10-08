@@ -3,7 +3,7 @@
 
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
-    python3 tools/armada/ci.py durations VERDICT
+    python3 tools/armada/ci.py durations VERDICT...
 
 The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
@@ -24,9 +24,9 @@ CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
 every row it holds is red, so a hang is graded with its stack dump rather
 than leaving the task without a verdict. Each row also carries its tests' own
-times, from which `durations` rewrites tests/test_durations.json: given a
-green run's verdict (`armada verdict <sha> --json`), it records every test
-the floor's Python ran.
+times, from which `durations` rewrites tests/test_durations.json: given green
+runs' verdicts (`armada verdict <sha> --json`), it records each test's median
+time as the floor's Python ran it.
 """
 
 import argparse
@@ -37,6 +37,7 @@ import math
 import os
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import threading
@@ -327,16 +328,22 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
     return 0
 
 
-def durations(verdict: dict) -> dict[str, float]:
-    """Every test's time in a green run's `verdict`, as its floor's Python ran it."""
-    rows = verdict["rows"]
-    red = [row["name"] for row in rows if row["exitCode"] != 0]
-    if red:
-        raise SystemExit(f"{len(red)} rows are red, {red[0]} first: record durations from a green run")
-    floor = [row for row in rows if row["name"].startswith(f"{PYTHONS[0]}:")]
-    if not all("tests" in row for row in floor):
-        raise SystemExit("this verdict's rows carry no test times; record them from a run of this version")
-    return {node: round(seconds, 3) for row in floor for node, seconds in sorted(row["tests"].items())}
+def durations(verdicts: list[dict]) -> dict[str, float]:
+    """Each test's median time over green runs' `verdicts`, as their floor's Python ran it: a run
+    whose compilations missed the shared cache moves no test's time where two others did not."""
+    times: dict[str, list[float]] = {}
+    for verdict in verdicts:
+        rows = verdict["rows"]
+        red = [row["name"] for row in rows if row["exitCode"] != 0]
+        if red:
+            raise SystemExit(f"{len(red)} rows are red, {red[0]} first: record durations from green runs")
+        floor = [row for row in rows if row["name"].startswith(f"{PYTHONS[0]}:")]
+        if not all("tests" in row for row in floor):
+            raise SystemExit("a verdict's rows carry no test times; record them from runs of this version")
+        for row in floor:
+            for node, seconds in row["tests"].items():
+                times.setdefault(node, []).append(seconds)
+    return {node: round(statistics.median(seconds), 3) for node, seconds in sorted(times.items())}
 
 
 def main() -> int:
@@ -353,10 +360,11 @@ def main() -> int:
     running.add_argument("--deadline", type=float, default=1680.0,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     recording = operations.add_parser("durations")
-    recording.add_argument("verdict", type=Path, help="a green run's verdict: armada verdict <sha> --json")
+    recording.add_argument("verdicts", type=Path, nargs="+",
+                           help="green runs' verdicts: armada verdict <sha> --json")
     args = parser.parse_args()
     if args.operation == "durations":
-        recorded = durations(json.loads(args.verdict.read_text()))
+        recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
         DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {DURATIONS}")
         return 0
