@@ -141,7 +141,7 @@ def test_beam_branching_reuses_one_prefill_without_mixing_prompts():
     from dew.sampling import Beam
 
     found = generate(model, params, prompts, 4, key=jax.random.key(0),
-                     sampling=Sampling(pad_id=0), strategy=Beam(width=1), n=1)
+                     sampling=Sampling(pad_token_id=0), strategy=Beam(width=1), n=1)
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, :3], np.asarray(prompts))
     # Width one is the greedy walk, so a mixed prefix shows up immediately.
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, 3:], walk(model, params, prompts, 4)[:, 3:])

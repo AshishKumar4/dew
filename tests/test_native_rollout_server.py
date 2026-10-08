@@ -24,7 +24,7 @@ from dew.sampling import Sampling
 VOCAB = 13
 EOS = 12
 BUDGET = 4
-SAMPLING = Sampling(temperature=1.0, eos_id=EOS)
+SAMPLING = Sampling(temperature=1.0, eos_token_ids=EOS)
 
 
 def objective():

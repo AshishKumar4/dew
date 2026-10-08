@@ -1369,7 +1369,7 @@ def mode_rollout(args) -> dict:
     greedy = generate(model, params, inputs_for(batch), 4, key=jax.random.key(1),
                       sampling=Sampling(temperature=0))
     eos = int(np.asarray(greedy.tokens)[0, 4])
-    sampling = Sampling(temperature=0, eos_id=eos, pad_id=12)
+    sampling = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
     objective = GRPOObjective(model, seq_len=7, variables=params)
     rollout = SampledRollout(objective, lambda source, text, truth, info: float(len(text)),
                              groups=2, max_new_tokens=4, sampling=sampling)
@@ -1386,7 +1386,7 @@ def mode_rollout(args) -> dict:
     # Stochastic draws over the placed parameters: keys fold in the global
     # row index, so the pool draws what one process draws for the same rows.
     drawn = generate(model, state.variables, inputs_for(local), 4, key=jax.random.key(21),
-                     sampling=Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)).host()
+                     sampling=Sampling(temperature=0.8, top_k=5, eos_token_ids=eos, pad_token_id=12)).host()
     # A resident global array reaches the task as it is: a process cannot
     # fetch the rows the other process's devices hold, so a host round trip
     # would fail here before any model ran.
@@ -1394,7 +1394,7 @@ def mode_rollout(args) -> dict:
     from dew.training.distributed import shard_batch
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
-    controls = Sampling(temperature=0.8, top_k=5, eos_id=eos, pad_id=12)
+    controls = Sampling(temperature=0.8, top_k=5, eos_token_ids=eos, pad_token_id=12)
     through_task = TextGeneration(model, state.variables)(
         resident, 4, key=jax.random.key(27), sampling=controls
     ).host()
@@ -1458,7 +1458,7 @@ def mode_inference_pipeline(args) -> dict:
         prompts = prompts[rank * rows:(rank + 1) * rows]
         requests = requests[rank * rows:(rank + 1) * rows]
     drawn = images(prompts, steps=3, key=5)
-    generated = text(requests, key=5, sampling=Sampling(temperature=0, eos_id=255))
+    generated = text(requests, key=5, sampling=Sampling(temperature=0, eos_token_ids=255))
     default_images = dew.pipeline(args.run_dir)(prompts, steps=3, key=5).host().images
     np.testing.assert_allclose(default_images, drawn.host().images, atol=2e-5, rtol=2e-5)
     rejected = []
@@ -1551,7 +1551,7 @@ def mode_continuations(args) -> dict:
         return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(mask)})
 
     task = TextGeneration(model, placed, sampling=Sampling(temperature=0.9, top_k=5,
-                                                           eos_id=11, pad_id=12), n=3)
+                                                           eos_token_ids=11, pad_token_id=12), n=3)
     request = inputs_for(prompts[local], lengths[local])
     result = task(request, 4, key=7)
     host = result.host()
@@ -1779,13 +1779,13 @@ def mode_decoding_components(args) -> dict:
 
     chain = (decoding.RepetitionPenalty(1.3), jax.tree_util.Partial(raise_last),
              decoding.Temperature(0.8), decoding.TopK(5))
-    task = TextGeneration(model, placed, sampling=Sampling(temperature=0.8, top_k=5, pad_id=12),
+    task = TextGeneration(model, placed, sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12),
                           logits=chain, stopping=(decoding.MaxNewTokens(3),))
     result = task(request, 4, key=7).host()
     # An explicit chain replaces these sampling filters. Their rank-local
     # values are not part of the executed policy or its agreement identity.
     equivalent = task(request, 4, key=7, logits=chain,
-                      sampling=Sampling(temperature=0.3 + rank, top_k=2 + rank, pad_id=12)).host()
+                      sampling=Sampling(temperature=0.3 + rank, top_k=2 + rank, pad_token_id=12)).host()
     for name in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
         if not np.array_equal(getattr(result, name), getattr(equivalent, name)):
             raise AssertionError(f"unused sampling filters changed {name}")
@@ -1863,13 +1863,13 @@ def _ragged_decoding_checks(model, params, prompts, placed, request):
         step = jnp.argmax(model.apply(params, walked)[:, -1], axis=-1)[:, None].astype(jnp.int32)
         walked = jnp.concatenate([walked, step], axis=1)
     early = (decoding.EndOfSequence(jnp.asarray([int(walked[0, -1])], jnp.int32)),)
-    searched = TextGeneration(model, placed, sampling=Sampling(pad_id=12), stopping=early,
+    searched = TextGeneration(model, placed, sampling=Sampling(pad_token_id=12), stopping=early,
                               strategy=Beam(width=3, length_penalty=0.7), n=2)(
                                   request, 4, key=7).host()
-    drafted = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
+    drafted = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_token_id=12),
                              stopping=early, strategy=Speculative(block=3))(
                                  request, 5, key=7).host()
-    plain = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_id=12),
+    plain = TextGeneration(model, placed, sampling=Sampling(temperature=0, pad_token_id=12),
                            stopping=early)(request, 5, key=7).host()
     if not np.array_equal(drafted.tokens, plain.tokens):
         raise AssertionError("speculation and sampling disagreed on a greedy pool run")

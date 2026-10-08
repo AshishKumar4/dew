@@ -327,7 +327,7 @@ class EpisodeRollout:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.groups) is not int or self.groups < 2:
             raise ValueError("an episode group needs at least two samples")
-        if self.sampling.eos_id is None:
+        if self.sampling.eos_token_ids is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
 
     def _persist(self, slot: _Session, run: JournalRun | None, policy_step: int, binding: str) -> None:

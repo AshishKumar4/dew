@@ -90,7 +90,7 @@ def _pair(max_length: int, bos_directory=None):
     loaded = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference",
                              max_seq_len=max_length)
     ours = DewLM(TextGeneration(loaded.model, loaded.variables, RunProcessor(run_tokenizer),
-                                sampling=Sampling(eos_id=255)), batch_size=2)
+                                sampling=Sampling(eos_token_ids=255)), batch_size=2)
     model = LlamaForCausalLM.from_pretrained(LLAMA, dtype=torch.float32).eval()
     theirs = HFLM(pretrained=model, tokenizer=reference, max_length=max_length, batch_size=2)
     return ours, theirs

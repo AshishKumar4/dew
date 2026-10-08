@@ -312,7 +312,7 @@ def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch
     from dew.sampling import Sampling
 
     tool = load("benchmark_lm_serving")
-    bound = task(Sampling(temperature=0, eos_id=None))
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
     prompts = np.asarray([[1, 2], [3, 4]], np.int32)
     monkeypatch.setattr(dew, "pipeline", lambda *args, **kwargs: bound)
     monkeypatch.setattr(tool, "prompts_for", lambda *args, **kwargs: prompts)

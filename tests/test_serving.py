@@ -43,7 +43,7 @@ class Digits:
         return "".join(str(int(token)) for token in ids)
 
 
-_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_id=EOS)
+_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_token_ids=EOS)
 
 
 def task(sampling=_DEFAULT_TASK_SAMPLING, capacity=128):
@@ -115,7 +115,7 @@ def test_prepacked_serving_keeps_the_source_and_reloads_its_original_tree():
 
     from dew.inference.projections import inference_projections
 
-    bound = task(Sampling(temperature=0, eos_id=None))
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
     source = jax.tree.map(np.asarray, bound.variables)
     packed_task = TextGeneration(bound.model, jax.device_put(inference_projections(bound.model, source)),
                                  bound.processor, sampling=bound.sampling)
@@ -219,7 +219,7 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
 def test_host_task_and_server_preserve_nonzero_lora_branches():
     from dew.lora import LoRA
 
-    bound = task(Sampling(temperature=0, eos_id=None))
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
     adapter = LoRA(rank=2, modules=("q_proj", "gate_proj")).apply(bound.model, bound.variables, key=17)
     trained = jax.tree_util.tree_map_with_path(
         lambda path, leaf: leaf + jax.random.normal(jax.random.key(29), leaf.shape) * .25
@@ -239,7 +239,7 @@ def test_reload_normalizes_source_precision_before_concatenating_projections():
     """A float64 value just above an FP16 midpoint must not double-round through FP32."""
     from dew.inference.projections import inference_projections
 
-    bound = task(Sampling(temperature=0, eos_id=None))
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
     source = jax.tree.map(lambda leaf: np.asarray(leaf, dtype=np.float16), bound.variables)
     host = TextGeneration(bound.model, jax.device_put(inference_projections(bound.model, source)),
                           bound.processor, sampling=bound.sampling)
@@ -276,7 +276,7 @@ def test_a_sampled_request_keeps_its_own_draws():
     what a one-row task call folds, so a sampled request draws the same
     tokens alone and served, and a batch call folds by row as a batched
     task call does."""
-    bound = task(Sampling(temperature=1.0, top_k=5, eos_id=EOS))
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_token_ids=EOS))
     server = Server.from_task(bound, slots=3, capacity=128)
     tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
@@ -300,7 +300,7 @@ def test_submission_keeps_device_keys_on_device_until_admission():
     The request still draws the same sampled tokens and likelihoods once it
     is admitted; only the host-side preparation's synchronization changes.
     """
-    bound = task(Sampling(temperature=1.0, top_k=5, eos_id=None))
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_token_ids=None))
     key = jax.random.key(7)
     prompt = np.asarray([1, 2, 3], np.int32)
     server = Server.from_task(bound, slots=2, capacity=128, admission=2)
@@ -317,7 +317,7 @@ def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     are an eager `jax.random.key(seed)`'s, wrapped where the seed overflows
     32 bits as eager keys wrap it. The request draws the sampled tokens and
     likelihoods the one-row task draws with that seed."""
-    bound = task(Sampling(temperature=1.0, top_k=5, eos_id=None))
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_token_ids=None))
     prompt = np.asarray([1, 2, 3], np.int32)
     server = Server.from_task(bound, slots=2, capacity=128, admission=2)
     with guarded():
@@ -331,7 +331,7 @@ def test_a_step_donates_the_slot_matrices_and_rewrites_the_vectors():
     as every cursor, step count and active flag is, so a step donates only
     the matrices: the resident half holds the cache, tokens and validity,
     the carried half each row's vectors."""
-    server = Server.from_task(task(Sampling(temperature=0, eos_id=None)), slots=2, capacity=64)
+    server = Server.from_task(task(Sampling(temperature=0, eos_token_ids=None)), slots=2, capacity=64)
     resident, carried = server._resident, server._carried
     assert jax.tree.leaves(resident) and all(leaf.ndim >= 2 for leaf in jax.tree.leaves(resident))
     assert all(leaf.ndim < 2 for leaf in jax.tree.leaves(carried))
@@ -347,7 +347,8 @@ def test_a_step_without_admission_draws_from_its_own_logits_without_merging_ever
     prompt's logits."""
     from dew.inference.serving_kernel import _advanced, joined
 
-    server = Server.from_task(task(Sampling(temperature=0, eos_id=None)), slots=2, capacity=64, admission=1)
+    server = Server.from_task(task(Sampling(temperature=0, eos_token_ids=None)), slots=2, capacity=64,
+                              admission=1)
     server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
     admission = server._admit()
     state = joined(server._resident, server._carried)
@@ -674,7 +675,7 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
                                   mixture=Mixture(experts=4, top_k=2, dispatch=dispatch))
         params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)) if params is None else params
         return TextGeneration(
-            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_id=EOS)
+            model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0, eos_token_ids=EOS)
         )
 
     lone = generation("global", None)
@@ -804,7 +805,7 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
     is served and reloaded from them; one that names none keeps its layout."""
     from dew.inference.projections import inference_projections
 
-    bound = task(Sampling(temperature=0, eos_id=None))
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
     answering = wrapped(AnsweringDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
     plain = wrapped(UserDecoder, bound.model, bound.variables, bound.sampling, bound.processor)
     members = {"q_proj", "k_proj", "v_proj"}
@@ -836,7 +837,7 @@ def test_a_user_decoder_module_rebuilds_its_cache_where_its_decoder_says_it_goes
 
     directory = Path(__file__).parent / "fixtures" / "hf" / "phi3-tiny"
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", max_seq_len=64)
-    greedy = Sampling(temperature=0, eos_id=None)
+    greedy = Sampling(temperature=0, eos_token_ids=None)
     bare = TextGeneration(loaded.model, loaded.variables, sampling=greedy)
     user = wrapped(AnsweringDecoder, loaded.model, loaded.variables, greedy)
     prompts = np.load(directory / "input_ids.npy").astype(np.int32)[:, :4]

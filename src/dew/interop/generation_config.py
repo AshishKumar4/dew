@@ -338,8 +338,8 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
     return Sampling(
         temperature=records.number(temperature, "temperature") if do_sample else 0.0,
         top_k=(records.integer(top_k, "top_k") or None) if do_sample and top_k is not None else None,
-        eos_id=eos,
-        pad_id=pad_id(config, generation_config),
+        eos_token_ids=eos,
+        pad_token_id=pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
         if do_sample else Sampling.top_p,
         min_p=_probability_control(config, generation_config, "min_p", Sampling.min_p)
@@ -421,7 +421,7 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
         extra["encoder_no_repeat_ngram_size"] = decoding.PromptNoRepeatNGram(
             records.integer(value, "encoder_no_repeat_ngram_size"))
     if (value := read("bad_words_ids")) is not None:
-        extra["bad_words_ids"] = decoding.bad_words(_as_words(value), sampling.eos_id)
+        extra["bad_words_ids"] = decoding.bad_words(_as_words(value), sampling.eos_token_ids)
     if (value := read("min_length")) is not None and eos.size:
         extra["min_length"] = decoding.MinLength(records.integer(value, "min_length"), eos)
     if (value := read("forced_bos_token_id")) is not None:
@@ -528,11 +528,11 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
                       min_p=sampling.min_p, typical_p=sampling.typical_p)
     values.update(repetition_penalty=sampling.repetition_penalty,
                   no_repeat_ngram_size=sampling.no_repeat_ngram_size, min_new_tokens=sampling.min_new_tokens)
-    if sampling.eos_id is not None:
-        values["eos_token_id"] = (sampling.eos_id if isinstance(sampling.eos_id, int)
-                                  else list(sampling.eos_id))
-    if sampling.pad_id is not None:
-        values["pad_token_id"] = sampling.pad_id
+    if sampling.eos_token_ids is not None:
+        values["eos_token_id"] = (sampling.eos_token_ids if isinstance(sampling.eos_token_ids, int)
+                                  else list(sampling.eos_token_ids))
+    if sampling.pad_token_id is not None:
+        values["pad_token_id"] = sampling.pad_token_id
     if sampling.stop:
         values["stop_strings"] = list(sampling.stop)
     if max_new_tokens:
@@ -558,8 +558,8 @@ def source_decoding(config: Mapping[str, object], generation_config: Mapping[str
            _generation_value(config, generation_config, "num_beams"), override is not None)
     strategy = _source_strategy(config, generation_config, model, do_sample, rows)
     if override is not None:
-        ids = Sampling(eos_id=eos_ids(config, generation_config) or None,
-                       pad_id=pad_id(config, generation_config))
+        ids = Sampling(eos_token_ids=eos_ids(config, generation_config) or None,
+                       pad_token_id=pad_id(config, generation_config))
         return with_ids_of(override, ids), None, strategy
     policy = _source_sampling(config, generation_config, do_sample)
     return policy, _source_transforms(config, generation_config, policy, isinstance(strategy, Beam)), strategy

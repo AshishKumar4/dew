@@ -591,13 +591,13 @@ def sequence_bias(entries: Sequence[tuple[Sequence[int], float]]) -> SequenceBia
                         jnp.asarray([value for _, value in pairs], jnp.float32))
 
 
-def bad_words(ids: Sequence[Sequence[int]], eos_id: int | Sequence[int] | None = None) -> SequenceBias:
+def bad_words(ids: Sequence[Sequence[int]], eos_token_ids: int | Sequence[int] | None = None) -> SequenceBias:
     """A `-inf` `SequenceBias` over forbidden sequences, as `NoBadWordsLogitsProcessor`.
 
     Single-token sequences that name an EOS id are dropped, as the reference
     drops them, so banning bad words cannot ban termination.
     """
-    stops = () if eos_id is None else _ids("eos_id", eos_id)
+    stops = () if eos_token_ids is None else _ids("eos_token_ids", eos_token_ids)
     kept = [tuple(word) for word in ids if not (len(word) == 1 and word[0] in stops)]
     if not kept:
         raise ValueError("bad_words_ids holds no sequence outside the EOS ids")

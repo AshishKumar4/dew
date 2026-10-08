@@ -444,7 +444,7 @@ class TextGeneration:
         stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
         chain = (self.logits if sampling is None else None) if logits is None else logits
         criteria = decoding.components(self.stopping if stopping is None else stopping) + stops
-        return replace(policy, stop=(), pad_id=policy.pad), chain, criteria
+        return replace(policy, stop=(), pad_token_id=policy.pad), chain, criteria
 
     def bind(self, variables: Variables) -> TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""

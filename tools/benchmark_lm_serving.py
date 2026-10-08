@@ -196,7 +196,7 @@ def dew_points(args):
 
     began = time.perf_counter()
     task = dew.pipeline(args.model, dtype="bfloat16", param_dtype="bfloat16")
-    task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_id=None),
+    task = dataclasses.replace(task, sampling=Sampling(temperature=0, eos_token_ids=None),
                                logits=None, stopping=())
     if args.vocab_limit > task.model.vocab_size:
         raise ValueError("--vocab-limit exceeds the model vocabulary")
