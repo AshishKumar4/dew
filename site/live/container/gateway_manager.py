@@ -106,9 +106,12 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         if self.kernel_name == "dew-train":
             # Dew runs in the context, reading the model and the corpus prepared read-only
             # under /opt/train (warm-managed.py).
+            # XLA targets AVX2 here as in the model process (start-shared.sh): on these hosts' wider
+            # ISA it plans one step of the page's train.py with a 6.2 GB buffer, past the data limit.
             env.update({"DEW_GUEST_PROFILE": "train", "HF_HOME": "/opt/train/hf",
                         "XDG_CACHE_HOME": "/opt/train/cache", "HF_HUB_DISABLE_PROGRESS_BARS": "1",
-                        "TRANSFORMERS_VERBOSITY": "error", "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1"})
+                        "TRANSFORMERS_VERBOSITY": "error", "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1",
+                        "XLA_FLAGS": "--xla_cpu_max_isa=AVX2"})
         # A privileged write sets the OOM score's floor as well as the score, so the guest
         # cannot lower itself back to the gateway's -1000 (start-shared.sh) and make a trusted
         # process the OOM killer's choice; the kernel then picks the largest guest.
