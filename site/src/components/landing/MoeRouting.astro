@@ -1,0 +1,105 @@
+---
+interface Layer { layer: string; sent: number[][]; rounds: number; per_expert: number[]; }
+interface Frame { label: string; step: number | null; loss: number | null; layers: Layer[]; }
+interface Props { data: { devices: string[]; experts_held: number[][]; kernel_slices: string[]; frames: Frame[]; mesh: Record<string, number>; }; }
+const { data } = Astro.props;
+if (data.devices.length !== 8 || data.frames.length === 0) throw new Error('The MoE view needs the recorded eight-device mesh');
+for (const frame of data.frames) for (const layer of frame.layers) {
+	if (layer.sent.length !== data.devices.length || layer.sent.some((row) => row.length !== data.devices.length || row.some((count) => !Number.isSafeInteger(count) || count < 0))) {
+		throw new Error('The MoE recording has an invalid device send matrix');
+	}
+}
+const payload = JSON.stringify(data).replace(/</g, '\\u003c');
+---
+<figure class="moe-routing" data-moe-routing>
+	<div class="moe-controls">
+		<button type="button" data-moe-play>Play</button>
+		<label>Router <select data-moe-layer>{data.frames[0].layers.map((layer, index) => <option value={index}>{layer.layer}</option>)}</select></label>
+		<label class="moe-frame-control">Recorded frame <input data-moe-frame type="range" min="0" max={data.frames.length - 1} value="0" /></label>
+	</div>
+	<p class="moe-frame-label" data-moe-label>{data.frames[0].label}</p>
+	<svg viewBox="0 0 400 440" role="img" data-moe-routes aria-label="Recorded expert routing among eight simulated CPU devices" />
+	<figcaption>
+		Eight simulated CPU devices: data {data.mesh.data} × expert {data.mesh.expert} × FSDP {data.mesh.fsdp}.
+		Arrows show the recorded assignments sent between devices; each circle shows assignments kept locally.
+		<a href="/examples/moe-mesh/moe-mesh.json">Full routing record</a>.
+	</figcaption>
+	<script type="application/json" data-moe-data set:html={payload} />
+</figure>
+<script>
+	const NS = 'http://www.w3.org/2000/svg';
+	for (const figure of document.querySelectorAll<HTMLElement>('[data-moe-routing]')) {
+		const data = JSON.parse(figure.querySelector('[data-moe-data]')!.textContent!);
+		const frame = figure.querySelector<HTMLInputElement>('[data-moe-frame]')!;
+		const layer = figure.querySelector<HTMLSelectElement>('[data-moe-layer]')!;
+		const play = figure.querySelector<HTMLButtonElement>('[data-moe-play]')!;
+		const label = figure.querySelector<HTMLElement>('[data-moe-label]')!;
+		const svg = figure.querySelector<SVGSVGElement>('[data-moe-routes]')!;
+		let timer: ReturnType<typeof setInterval> | undefined;
+		const element = (name: string, attributes: Record<string, string | number>, text?: string) => {
+			const node = document.createElementNS(NS, name);
+			for (const [key, value] of Object.entries(attributes)) node.setAttribute(key, String(value));
+			if (text !== undefined) node.textContent = text;
+			return node;
+		};
+		const draw = () => {
+			const current = data.frames[Number(frame.value)];
+			const routed = current.layers[Number(layer.value)];
+			label.textContent = `${current.label} · ${routed.layer}${current.loss === null ? '' : ` · loss ${current.loss.toFixed(4)}`}`;
+			frame.setAttribute('aria-valuetext', current.label);
+			svg.setAttribute('aria-label', `${current.label}; ${routed.layer}; recorded device assignment counts`);
+			svg.replaceChildren();
+			const defs = element('defs', {});
+			const marker = element('marker', { id: 'moe-arrow', markerWidth: 6, markerHeight: 6, refX: 5, refY: 3, orient: 'auto' });
+			marker.append(element('path', { d: 'M0,0 L6,3 L0,6 Z', fill: 'currentColor' }));
+			defs.append(marker); svg.append(defs);
+			const points = data.devices.map((_: string, index: number) => [100 + index % 2 * 200, 50 + Math.floor(index / 2) * 100]);
+			for (let source = 0; source < points.length; source++) for (let destination = 0; destination < points.length; destination++) {
+				const count = routed.sent[source][destination];
+				if (!count || source === destination) continue;
+				const [sx, sy] = points[source], [tx, ty] = points[destination];
+				const distance = Math.hypot(tx - sx, ty - sy);
+				const ux = (tx - sx) / distance, uy = (ty - sy) / distance;
+				const bend = source < destination ? 20 : -20;
+				const edge = element('path', { class: 'moe-edge', d: `M${sx + ux * 33},${sy + uy * 33} Q${(sx + tx) / 2 + bend},${(sy + ty) / 2 + bend} ${tx - ux * 38},${ty - uy * 38}`,
+					'stroke-width': 1 + Math.sqrt(count) / 5, 'marker-end': 'url(#moe-arrow)' });
+				edge.append(element('title', {}, `${data.devices[source]} → ${data.devices[destination]}: ${count} assignments`));
+				svg.append(edge);
+			}
+			for (let index = 0; index < points.length; index++) {
+				const [x, y] = points[index];
+				const group = element('g', { class: 'moe-device' });
+				group.append(element('title', {}, `${data.devices[index]}: kernel slice ${data.kernel_slices[index]}`));
+				group.append(element('circle', { cx: x, cy: y, r: 32 }));
+				group.append(element('text', { x, y: y - 4, 'text-anchor': 'middle' }, data.devices[index]));
+				group.append(element('text', { x, y: y + 13, class: 'moe-local', 'text-anchor': 'middle' }, `local ${routed.sent[index][index]}`));
+				const [first, end] = data.experts_held[index];
+				group.append(element('text', { x, y: y + 50, class: 'moe-experts', 'text-anchor': 'middle' }, `experts ${first}–${end - 1}`));
+				svg.append(group);
+			}
+		};
+		const pause = () => { clearInterval(timer); timer = undefined; play.textContent = 'Play'; };
+		play.addEventListener('click', () => {
+			if (timer !== undefined) return pause();
+			play.textContent = 'Pause';
+			timer = setInterval(() => { frame.value = String((Number(frame.value) + 1) % data.frames.length); draw(); }, 150);
+		});
+		frame.addEventListener('input', () => { pause(); draw(); });
+		layer.addEventListener('change', draw);
+		window.addEventListener('pagehide', pause);
+		draw();
+	}
+</script>
+<style>
+	.moe-routing { max-width: 42rem; margin-inline: auto; }
+	.moe-controls { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: center; }
+	.moe-controls button, .moe-controls select { color: var(--sl-color-white); background: var(--sl-color-gray-6); border: 1px solid var(--dew-rule); border-radius: 0.4rem; padding: 0.35rem 0.6rem; font: inherit; }
+	.moe-frame-control { display: flex; flex: 1; align-items: center; gap: 0.5rem; }
+	.moe-frame-control input { min-width: 5rem; width: 100%; accent-color: var(--sl-color-accent); }
+	.moe-frame-label { font: 0.8rem var(--dew-font-mono); color: var(--dew-muted); }
+	.moe-routing svg { display: block; width: 100%; max-height: 32rem; color: var(--sl-color-accent); }
+	.moe-routing :global(.moe-edge) { stroke: currentColor; fill: none; opacity: 0.7; }
+	.moe-routing :global(.moe-device circle) { fill: var(--sl-color-gray-6); stroke: var(--dew-rule); }
+	.moe-routing :global(.moe-device text) { fill: var(--sl-color-white); font: 12px var(--dew-font-mono); }
+	.moe-routing :global(.moe-device .moe-local), .moe-routing :global(.moe-device .moe-experts) { fill: var(--dew-muted); font-size: 10px; }
+</style>

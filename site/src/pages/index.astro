@@ -7,6 +7,8 @@ import { example, trainingExample } from '../data/framework-examples.mjs';
 import HeroOutput from '../components/landing/HeroOutput.astro';
 import LiveSampler from '../components/landing/LiveSampler.astro';
 import LiveText from '../components/landing/LiveText.astro';
+import LoraPairs from '../components/landing/LoraPairs.astro';
+import MoeRouting from '../components/landing/MoeRouting.astro';
 import capture from '../data/capture.json';
 import heroCode from '../data/hero.py?raw';
 import framework from '../../snippets/framework.py?raw';
@@ -42,6 +44,8 @@ const replays = ['aurora', 'lighthouse', 'village'].map((name) => {
 const modelSize = Math.round(replays[0].model.parameters / 1e6);
 const resolution = records.sample_public.result.shape.slice(1, 3).join('×');
 const mesh = records.mesh.result;
+const moe = JSON.parse(readPublic('examples', 'moe-mesh', 'moe-mesh.json'));
+const lora = JSON.parse(readPublic('examples', 'sd15-lora', 'manifest.json'));
 const videos = Object.values(JSON.parse(readPublic('gallery', 'wan-2.1', 'manifest.json')).clips) as { video: string; poster: string; prompt: string }[];
 const gallery = JSON.parse(readPublic('gallery', 'dew-176m', 'manifest.json'));
 const tries = [
@@ -144,6 +148,9 @@ const tutorialNames: Record<string, string> = {
 					<canvas aria-hidden="true" />
 				</div><figcaption>“{entry.prompt}”</figcaption>
 			</figure>)}</div>
+			<h3>A style LoRA</h3>
+			<p class="framework-note">Stable Diffusion 1.5 with a rank-{lora.rank} LoRA on its attention projections, trained with Dew for {lora.training_steps} steps on 20 public-domain Hiroshige prints from the Library of Congress, on one A100. Each pair shares its prompt and seed; drag the slider to compare. <a href="/examples/sd15-lora/manifest.json">Prompts, seeds and settings</a>.</p>
+			<LoraPairs pairs={lora.pairs} />
 		</section>
 
 
@@ -156,6 +163,9 @@ const tutorialNames: Record<string, string> = {
 				<figcaption>{mesh.devices.length} simulated CPU devices: {mesh.axes.fsdp} FSDP shards × {mesh.axes.tensor} tensor slices.</figcaption>
 			</figure>
 			<p class="framework-note"><a href="/concepts/distributed/">Placement and sharding</a> · <a href="/guides/multi-node/">Several hosts</a> · <a href="/guides/tpu/">Cloud TPU</a></p>
+			<h3>Expert routing</h3>
+			<p class="framework-note">With the experts split over devices, each MoE layer's router sends tokens to experts on other devices through all-to-all exchanges. This is the routing <a href="https://github.com/AshishKumar4/dew/blob/main/examples/moe_mesh.py">examples/moe_mesh.py</a> recorded over {moe.steps.length} training steps.</p>
+			<MoeRouting data={moe} />
 		</section>
 
 		<section class="band" data-reveal>
