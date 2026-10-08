@@ -7,6 +7,7 @@ import { example, trainingExample } from '../data/framework-examples.mjs';
 import HeroOutput from '../components/landing/HeroOutput.astro';
 import LiveSampler from '../components/landing/LiveSampler.astro';
 import LiveText from '../components/landing/LiveText.astro';
+import LiveTrain from '../components/landing/LiveTrain.astro';
 import LoraPairs from '../components/landing/LoraPairs.astro';
 import MoeRouting from '../components/landing/MoeRouting.astro';
 import capture from '../data/capture.json';
@@ -14,6 +15,7 @@ import heroCode from '../data/hero.py?raw';
 import framework from '../../snippets/framework.py?raw';
 import samplerCell from '../data/sampler.py?raw';
 import textCell from '../data/text.py?raw';
+import finetuneCell from '../data/finetune.py?raw';
 import textRecording from '../data/text-recording.json';
 import tutorials from '../generated/tutorial-cards.json';
 import { live } from '../live.mjs';
@@ -108,7 +110,9 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Fine-tuning</h2>
-			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names.</p>
+			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names. Run the first cell to fine-tune SmolLM2-135M on Tiny Shakespeare and compare its text before and after.</p>
+			<LiveTrain code={finetuneCell} title="finetune.py" cell="finetune" />
+			<p class="framework-note">A larger model, recorded: Qwen3-0.6B, one step, then saved in its original layout.</p>
 			<EditableExample code={example(framework, 'pretrained')} title="Fine-tune Qwen3-0.6B" />
 			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
 				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}

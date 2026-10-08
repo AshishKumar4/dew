@@ -3,6 +3,10 @@
 A session is one page. Each of its cells runs in a context of its own, so the
 cells of a page run at the same time; a message's "cell" names the context, and
 a message without one uses the page's only cell.
+
+A cell sent with "kernel": "train" runs Dew itself in a fresh training context
+(gateway_manager.py, live_training.py), closed when the cell ends. A host runs
+one at a time; the others wait in order and hear their place in line.
 """
 
 import asyncio
@@ -28,7 +32,8 @@ MAX_OUTPUT = 2_000_000
 # Python contexts one page may hold, and one host; start-gateway.sh starts at most MAX_CONTEXTS kernels.
 MAX_CELLS = 6
 MAX_CONTEXTS = 24
-PRELOAD = "import model_client; model_client.install()"
+PRELOAD = {"python3": "import model_client; model_client.install()",
+           "dew-train": "import live_training; live_training.install()"}
 
 
 class Context:
@@ -77,6 +82,10 @@ class Gateway:
         self.contexts: dict[str, dict[str | None, Context]] = {}
         self.connected = set()
         self.allocating = asyncio.Lock()
+        # The training slot: whether a training cell runs, and the tickets of those waiting, in order.
+        self.slot = asyncio.Condition()
+        self.training = False
+        self.waiting = []
         self.started = time.monotonic()
         self.idle = int(os.environ.get("DEW_LIVE_IDLE_SECONDS", "300"))
         self.wall = int(os.environ.get("DEW_LIVE_WALL_SECONDS", "1200"))
@@ -92,24 +101,24 @@ class Gateway:
                 return json.loads(raw) if raw else None
         return await asyncio.to_thread(call)
 
-    async def start(self, session):
-        """A new context for `session`, its inference client loaded."""
+    async def start(self, session, kernel="python3"):
+        """A new context for `session`: a page cell's, its inference client loaded, or a training one."""
         async with self.allocating:
-            if len(self.contexts.get(session, {})) >= MAX_CELLS:
+            if kernel == "python3" and len(self.contexts.get(session, {})) >= MAX_CELLS:
                 raise ValueError("this page has more live cells than one session runs")
             if sum(map(len, self.contexts.values())) >= MAX_CONTEXTS:
                 raise ValueError("the shared container has no free Python contexts")
             started = time.monotonic()
-            kernel = await self.api("/api/kernels", {"name": "python3"})
+            kernel = {**await self.api("/api/kernels", {"name": kernel}), "preload": PRELOAD[kernel]}
             channels = None
             try:
                 url = f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels"
                 channels = await connect(url, max_size=MAX_OUTPUT,
                                          additional_headers={"Authorization": "token " + self.token})
                 context = Context(kernel["id"], channels)
-                result = await context.execute(PRELOAD, lambda _: asyncio.sleep(0))
+                result = await context.execute(kernel["preload"], lambda _: asyncio.sleep(0))
                 if result["status"] != "ok":
-                    raise RuntimeError("the isolated Python context could not load its inference client")
+                    raise RuntimeError("the isolated Python context could not load its client")
                 context.setup = time.monotonic() - started
                 return context
             except Exception:
@@ -135,10 +144,58 @@ class Gateway:
             cells[cell] = cells.pop(None) if None in cells else await self.start(session)
         return cells[cell]
 
+    async def stop(self, context):
+        await context.channels.close()
+        await self.api(f"/api/kernels/{context.identifier}", method="DELETE")
+
     async def close(self, session):
         for context in self.contexts.pop(session, {}).values():
-            await context.channels.close()
-            await self.api(f"/api/kernels/{context.identifier}", method="DELETE")
+            await self.stop(context)
+
+    async def train(self, session, code, send, stopped, started):
+        """Run a training cell in a fresh context once the host's training slot is free.
+
+        While it waits, `send` hears how many runs are ahead of it, and `stopped()`,
+        which the page's Stop sets, ends the wait. `started` hears the context once
+        it exists, so Stop can interrupt it. Returns the cell's reply.
+        """
+        ticket, told = object(), None
+        async with self.slot:
+            self.waiting.append(ticket)
+        try:
+            while True:
+                async with self.slot:
+                    while True:
+                        if stopped():
+                            return {"status": "aborted", "count": None}
+                        ahead = self.waiting.index(ticket) + self.training
+                        if not ahead:
+                            self.waiting.remove(ticket)
+                            self.training = True
+                            break
+                        if ahead != told:
+                            break
+                        await self.slot.wait()
+                if not ahead:
+                    break
+                await send({"type": "display", "text": json.dumps({"dew-wait": {"ahead": ahead}})})
+                told = ahead
+        finally:
+            async with self.slot:
+                if ticket in self.waiting:
+                    self.waiting.remove(ticket)
+                    self.slot.notify_all()
+        try:
+            context = await self.start(session, "dew-train")
+            started(context)
+            try:
+                return await context.execute(code, send)
+            finally:
+                await self.stop(context)
+        finally:
+            async with self.slot:
+                self.training = False
+                self.slot.notify_all()
 
     async def http(self, connection, request):
         if request.path == "/health":
@@ -174,14 +231,22 @@ class Gateway:
         await socket.send(json.dumps({"type": "ready", "uptime": time.monotonic() - self.started,
                                       "setup": next(iter(cells.values())).setup if cells else 0,
                                       "dew": self.commit}))
-        running = {}
+        # A running cell's task, a running training cell's context, and the training cells Stop ended.
+        running, training, stops = {}, {}, set()
 
         async def run(message, cell):
             context = None
+
+            def send(output):
+                return socket.send(json.dumps({"id": message["id"], **output}))
             try:
-                context = await self.context(session, cell)
-                result = await context.execute(message["code"],
-                    lambda output: socket.send(json.dumps({"id": message["id"], **output})))
+                if message.get("kernel") == "train":
+                    stops.discard(cell)
+                    result = await self.train(session, message["code"], send, lambda: cell in stops,
+                                              lambda started: training.__setitem__(cell, started))
+                else:
+                    context = await self.context(session, cell)
+                    result = await context.execute(message["code"], send)
                 await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
             except Exception as error:
                 if context:
@@ -192,6 +257,8 @@ class Gateway:
                                               "evalue": str(error), "traceback": []}))
                 await socket.send(json.dumps({"id": message["id"], "type": "done",
                                               "status": "error", "count": None}))
+            finally:
+                training.pop(cell, None)
 
         def busy():
             return any(not task.done() for task in running.values())
@@ -213,8 +280,14 @@ class Gateway:
                 for context in cells.values():
                     context.last_used = time.monotonic()
                 if message.get("op") == "interrupt":
-                    if cell in cells:
+                    if cell in training:
+                        await self.api(f"/api/kernels/{training[cell].identifier}/interrupt", {}, "POST")
+                    elif cell in cells:
                         await self.api(f"/api/kernels/{cells[cell].identifier}/interrupt", {}, "POST")
+                    if cell in running and not running[cell].done():
+                        stops.add(cell)
+                        async with self.slot:
+                            self.slot.notify_all()
                 elif message.get("op") == "execute":
                     if cell in running and not running[cell].done():
                         raise ValueError("a cell is already running in this context")
