@@ -61,12 +61,32 @@ def memory():
     return {"total": int(lines["MemTotal"].split()[0]) >> 10, "available": available(), "by_uid": held}
 
 
+def guests():
+    """Each guest process's uid, state and command line."""
+    found = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            fields = dict(line.split(":", 1) for line in (proc / "status").read_text().splitlines() if ":" in line)
+            uid = int(fields["Uid"].split()[1])
+            command = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")[-80:]
+        except (OSError, KeyError, ValueError):
+            continue
+        if 6100 <= uid < 6200:
+            found.append((proc.name, uid, fields["State"].strip(), command))
+    return found
+
+
+def gateway_log():
+    return "\n".join(Path("/run/dew/gateway.log").read_text(errors="replace").splitlines()[-40:])
+
+
 async def page(headers):
     socket = await connect(f"ws://127.0.0.1:8888/contexts/{uuid.uuid4()}/ws", additional_headers=headers)
     try:
         assert json.loads(await socket.recv())["type"] == "ready"
     except ConnectionClosed as closed:
-        raise AssertionError(f"the bridge refused a page: {closed.rcvd}; memory {memory()}") from None
+        raise AssertionError(f"the bridge refused a page: {closed.rcvd}; memory {memory()}; "
+                             f"guests {guests()}; gateway log:\n{gateway_log()}") from None
     return socket
 
 
