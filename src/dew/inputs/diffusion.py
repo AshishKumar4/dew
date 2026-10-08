@@ -171,7 +171,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
                         param_dtype: str = "float32", revision: str | None = None,
                         attention_impl: str = "auto", params: Variables | None = None,
                         mesh: MeshSpec | None = None, layout: Layout | None = None):
-        from dew.interop.pretrained import load_diffusion_conditioner
+        from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl, params=params,
@@ -376,7 +376,7 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
                         attention_impl: str = "auto", tokens: int = 512,
                         params: Variables | None = None, mesh: MeshSpec | None = None,
                         layout: Layout | None = None):
-        from dew.interop.pretrained import load_diffusion_conditioner
+        from dew.interop.pipeline_assembly import load_diffusion_conditioner
 
         return load_diffusion_conditioner(checkpoint, cls, dtype=dtype, param_dtype=param_dtype,
                                           revision=revision, attention_impl=attention_impl,
