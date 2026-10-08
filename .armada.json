@@ -20,6 +20,7 @@
                 "--out={out}"],
     "timeout": 1800,
     "speculative": true,
+    "hedge": 8,
     "secrets": ["DEW_XLA_CACHE_TOKEN"]
   }
 }
