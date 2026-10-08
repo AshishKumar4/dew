@@ -24,7 +24,8 @@ import pytest
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 
-from dew.interop.hf_decoders import _yarn_record, translate_weights
+from dew.interop.decoder_parts import yarn_record
+from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mla import MLAMixer, MultiHeadLatentAttention
@@ -44,7 +45,7 @@ def fixture(name: str) -> dict:
 
 def yarn_of(settings: dict) -> YarnScaling:
     """The fixture's rope spelling as the mixer's yarn record."""
-    record = _yarn_record(
+    record = yarn_record(
         dict(settings["rope_scaling"], rope_theta=settings["rope_theta"]),
         "rope_scaling", float(settings["rope_theta"]),
         int(settings["max_position_embeddings"]))
@@ -283,7 +284,7 @@ def mla_record(settings: dict) -> dict:
         "qk_rope_head_dim": settings["qk_rope_head_dim"],
         "v_head_dim": settings["v_head_dim"],
         "rope_interleave": settings.get("rope_interleave", True),
-        "yarn": _yarn_record(
+        "yarn": yarn_record(
             dict(settings["rope_scaling"], rope_theta=settings["rope_theta"]),
             "rope_scaling", float(settings["rope_theta"]),
             int(settings["max_position_embeddings"])),
