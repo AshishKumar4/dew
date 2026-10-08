@@ -1,8 +1,8 @@
 """MM-DiT, the SD3-style multimodal DiT, and a hierarchical variant.
 
-The block is a dual-stream MM-DiT: text and image tokens keep separate
-qkv/mlp/modulation weights and mix through a single joint attention over the
-concatenated sequence.
+The block is the dual-stream block SD3 and Flux run (`joint.DoubleStreamBlock`):
+text and image tokens keep separate qkv/mlp/modulation weights and mix
+through a single joint attention over the concatenated sequence.
 """
 
 from collections.abc import Sequence
@@ -15,10 +15,9 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.records import JSON
 
-from ..attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from ..attention import LayerNorm
 from ..dit import (
     ROPE_THETA,
-    AdaLNParams,
     RematChoice,
     _AttentionStackOptions,
     _DiTStackOptions,
@@ -28,134 +27,36 @@ from ..dit import (
     stronger_remat,
 )
 from ..precision import at_least_fp32
-from ..rope import rotary_freqs, rotate
-from ..sharding import logical_axes
+from ..rope import rotary_freqs
+from .joint import DoubleStreamBlock
 
 
-@logical_axes({
-    **{(f"{stream}_to_{which}",): ("embed", "heads", "head_dim")
-       for stream in ("img", "txt") for which in ("q", "k", "v")},
-    ("img_out",): ("heads", "head_dim", "embed"),
-    ("txt_out",): ("heads", "head_dim", "embed"),
-    ("img_mlp", "layers_0"): ("embed", "mlp"),
-    ("img_mlp", "layers_2"): ("mlp", "embed"),
-    ("txt_mlp", "layers_0"): ("embed", "mlp"),
-    ("txt_mlp", "layers_2"): ("mlp", "embed"),
-})
-class MMDiTBlock(nn.Module):
-    """Dual-stream MM-DiT block: per-modality weights, joint attention.
+def _block(stack: _AttentionStackOptions, remat: RematChoice, features: int, heads: int,
+           name: str) -> nn.Module:
+    """One dual-stream block: `DoubleStreamBlock`, the block SD3 and Flux run,
+    with the text first, adaLN-Zero modulation, the stack's layer norms and
+    its queries' and keys' at 1e-6, rotate-half pairs, and its dropout."""
+    return remat_block(DoubleStreamBlock, remat)(
+        features, heads, features // heads, context_first=True, qk_norm=stack.qk_norm,
+        epsilon=stack.norm_epsilon, qk_epsilon=1e-6, mlp_hidden=int(features * stack.mlp_ratio),
+        zero_modulation=True, rotary_pairs="half", dropout_rate=stack.dropout_rate, dtype=stack.dtype,
+        precision=stack.precision, attention_impl=stack.attention_impl,
+        force_fp32_for_softmax=stack.force_fp32_for_softmax, name=name)
 
-    Both streams are modulated adaLN-Zero style from the same conditioning
-    vector but with separate parameters, then attend jointly over
-    concat([txt, img]) and go through separate sequential MLPs.
-    """
-    features: int
-    num_heads: int
-    mlp_ratio: int = 4
-    dropout_rate: float = 0.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    force_fp32_for_softmax: bool = True
-    norm_epsilon: float = 1e-5
-    qk_norm: bool = False
-    attention_impl: str = "auto"  # an AttentionImpl
 
-    def setup(self):
-        hidden_features = int(self.features * self.mlp_ratio)
-        dim_head = self.features // self.num_heads
-        def qkv(name):
-            return nn.DenseGeneral(
-                features=[self.num_heads, dim_head], axis=-1,
-                dtype=self.dtype, precision=self.precision, use_bias=True, name=name)
-
-        def out_proj(name):
-            return nn.DenseGeneral(
-                self.features, axis=(-2, -1),
-                dtype=self.dtype, precision=self.precision, name=name)
-
-        def mlp(name):
-            return nn.Sequential([
-                nn.Dense(features=hidden_features, dtype=self.dtype, precision=self.precision),
-                nn.gelu,
-                nn.Dense(features=self.features, dtype=self.dtype, precision=self.precision),
-            ], name=name)
-
-        def norm(name):
-            return LayerNorm(
-                epsilon=self.norm_epsilon, use_scale=False, use_bias=False,
-                dtype=self.dtype, name=name)
-
-        # image stream
-        self.img_ada = AdaLNParams(self.features, dtype=self.dtype, precision=self.precision)
-        self.img_norm1, self.img_norm2 = norm("img_norm1"), norm("img_norm2")
-        self.img_q, self.img_k, self.img_v = qkv("img_to_q"), qkv("img_to_k"), qkv("img_to_v")
-        self.img_out = out_proj("img_out")
-        self.img_mlp = mlp("img_mlp")
-
-        # text stream
-        self.txt_ada = AdaLNParams(self.features, dtype=self.dtype, precision=self.precision)
-        self.txt_norm1, self.txt_norm2 = norm("txt_norm1"), norm("txt_norm2")
-        self.txt_q, self.txt_k, self.txt_v = qkv("txt_to_q"), qkv("txt_to_k"), qkv("txt_to_v")
-        self.txt_out = out_proj("txt_out")
-        self.txt_mlp = mlp("txt_mlp")
-
-        if self.qk_norm:
-            self.img_q_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="img_q_norm")
-            self.img_k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="img_k_norm")
-            self.txt_q_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="txt_q_norm")
-            self.txt_k_norm = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="txt_k_norm")
-
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
-
-    def __call__(self, img, txt, conditioning, freqs_cis, train: bool = False):
-        S_txt = txt.shape[1]
-        i_scale_mlp, i_shift_mlp, i_gate_mlp, i_scale_attn, i_shift_attn, i_gate_attn = jnp.split(
-            self.img_ada(conditioning), 6, axis=-1)
-        t_scale_mlp, t_shift_mlp, t_gate_mlp, t_scale_attn, t_shift_attn, t_gate_attn = jnp.split(
-            self.txt_ada(conditioning), 6, axis=-1)
-
-        # --- Joint attention ---
-        img_h = self.img_norm1(img) * (1 + i_scale_attn) + i_shift_attn
-        txt_h = self.txt_norm1(txt) * (1 + t_scale_attn) + t_shift_attn
-
-        q_i, k_i, v_i = self.img_q(img_h), self.img_k(img_h), self.img_v(img_h)
-        q_t, k_t, v_t = self.txt_q(txt_h), self.txt_k(txt_h), self.txt_v(txt_h)
-        if self.qk_norm:
-            q_i, k_i = self.img_q_norm(q_i), self.img_k_norm(k_i)
-            q_t, k_t = self.txt_q_norm(q_t), self.txt_k_norm(k_t)
-
-        # RoPE rotates the image tokens by their raster index (`rope_for_scan`)
-        if freqs_cis is not None:
-            freqs_cos, freqs_sin = freqs_cis
-            q_i = rotate(q_i, freqs_cos, freqs_sin)
-            k_i = rotate(k_i, freqs_cos, freqs_sin)
-
-        q = jnp.concatenate([q_t, q_i], axis=1)
-        k = jnp.concatenate([k_t, k_i], axis=1)
-        v = jnp.concatenate([v_t, v_i], axis=1)
-
-        attn = scaled_dot_product_attention(
-            q, k, v, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=self.attention_impl)
-        txt_attn, img_attn = attn[:, :S_txt], attn[:, S_txt:]
-
-        img_attn = self.dropout(self.img_out(img_attn), deterministic=not train)
-        txt_attn = self.dropout(self.txt_out(txt_attn), deterministic=not train)
-        img = img + i_gate_attn * img_attn
-        txt = txt + t_gate_attn * txt_attn
-
-        # --- Sequential MLPs ---
-        img_h = self.img_norm2(img) * (1 + i_scale_mlp) + i_shift_mlp
-        img = img + i_gate_mlp * self.dropout(self.img_mlp(img_h), deterministic=not train)
-        txt_h = self.txt_norm2(txt) * (1 + t_scale_mlp) + t_shift_mlp
-        txt = txt + t_gate_mlp * self.dropout(self.txt_mlp(txt_h), deterministic=not train)
-
-        return img, txt
+def _joint_rotation(freqs_cis, text: int):
+    """The rotation over the text-first joint sequence: each image token turns
+    by its own angles, `freqs_cis`, and the text tokens turn by nothing."""
+    if freqs_cis is None:
+        return None
+    cos, sin = freqs_cis
+    return (jnp.concatenate([jnp.ones((text, cos.shape[-1]), cos.dtype), cos]),
+            jnp.concatenate([jnp.zeros((text, sin.shape[-1]), sin.dtype), sin]))
 
 
 class SimpleMMDiT(_DiTStackOptions):
-    """SD3-style MM-DiT: a plain stack of dual-stream blocks."""
+    """SD3-style MM-DiT: a plain stack of dual-stream blocks, the image tokens
+    rotated by their raster index (`rope_for_scan`)."""
     def setup(self):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
         self.conditioning = self._conditioning(self.emb_features)
@@ -163,14 +64,8 @@ class SimpleMMDiT(_DiTStackOptions):
         self.txt_embed = nn.Dense(
             features=self.emb_features, dtype=self.dtype,
             precision=self.precision, name="txt_embed")
-        self.blocks = [
-            remat_block(MMDiTBlock, self.remat)(
-                features=self.emb_features,
-                num_heads=self.num_heads,
-                **self._block_options(),
-                name=f"mmdit_block_{i}"
-            ) for i in range(self.num_layers)
-        ]
+        self.blocks = [_block(self, self.remat, self.emb_features, self.num_heads, f"mmdit_block_{i}")
+                       for i in range(self.num_layers)]
         self.output = self._output(self.patch_size, self.output_channels, modulated=True)
 
     @property
@@ -184,10 +79,11 @@ class SimpleMMDiT(_DiTStackOptions):
         img, inv_idx = self.embed(x)
         txt = self.txt_embed(textcontext.hidden)
         cond_emb = self.conditioning(temb, textcontext)
-        freqs_cis = rope_for_scan(img, self.emb_features // self.num_heads, self.scan_order)
+        rotation = _joint_rotation(
+            rope_for_scan(img, self.emb_features // self.num_heads, self.scan_order), txt.shape[1])
 
         for block in self.blocks:
-            img, txt = block(img, txt, cond_emb, freqs_cis, train)
+            img, txt = block(img, txt, cond_emb, rotation, train)
 
         return self.output(img, inv_idx, H, W, conditioning=cond_emb)
 
@@ -290,15 +186,10 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         return self if restored is None else self.clone(remat=restored)
 
     def stage_blocks(self, stage: int, prefix: str) -> list:
-        """Build one stage's MMDiT blocks, at that stage's width and heads."""
-        return [
-            remat_block(MMDiTBlock, self.remat)(
-                features=self.emb_features[stage],
-                num_heads=self.num_heads[stage],
-                **self._block_options(),
-                name=f"{prefix}_block_stage{stage}_{i}"
-            ) for i in range(self.num_layers[stage])
-        ]
+        """Build one stage's dual-stream blocks, at that stage's width and heads."""
+        return [_block(self, self.remat, self.emb_features[stage], self.num_heads[stage],
+                       f"{prefix}_block_stage{stage}_{i}")
+                for i in range(self.num_layers[stage])]
 
     def encoder_path(self, num_stages: int):
         """Build the encoder, fine to coarse: each stage's blocks and its merger.
@@ -399,12 +290,12 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         H_P, W_P = H // self.base_patch_size, W // self.base_patch_size
         skips = {}
         for stage in range(num_stages):
-            freqs_cis = rotary_freqs(
-                jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             txt = txts[stage]
+            rotation = _joint_rotation(rotary_freqs(
+                jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
+                ROPE_THETA, dtype=at_least_fp32(img.dtype)), txt.shape[1])
             for block in self.encoder_blocks[stage]:
-                img, txt = block(img, txt, conds[stage], freqs_cis, train)
+                img, txt = block(img, txt, conds[stage], rotation, train)
             skips[stage] = img
             if stage < num_stages - 1:
                 img, H_P, W_P = self.patch_mergers[stage](img, H_P, W_P)
@@ -413,11 +304,11 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         for i, stage in enumerate(range(num_stages - 2, -1, -1)):
             img, H_P, W_P = self.patch_expanders[i](img, H_P, W_P)
             img = self.fusion_layers[i](jnp.concatenate([img, skips[stage]], axis=-1))
-            freqs_cis = rotary_freqs(
-                jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             txt = txts[stage]
+            rotation = _joint_rotation(rotary_freqs(
+                jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
+                ROPE_THETA, dtype=at_least_fp32(img.dtype)), txt.shape[1])
             for block in self.decoder_blocks[i]:
-                img, txt = block(img, txt, conds[stage], freqs_cis, train)
+                img, txt = block(img, txt, conds[stage], rotation, train)
 
         return self.output(img, None, H, W, conditioning=conds[0])

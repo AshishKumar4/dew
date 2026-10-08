@@ -1,11 +1,11 @@
 """Stable Diffusion 3's own MM-DiT, as the published transformer computes it.
 
 This module has the arithmetic of Diffusers 0.34.0's `SD3Transformer2DModel`
-where it differs from `SimpleMMDiT`: the modulation channel order, the joint
-attention with the image first, the centred crop of the position buffer, the
-summed timestep and pooled-text embedders, the last block's context-only
-norm, and SD3.5's ninefold modulation with a second self-attention. The
-blocks are `DoubleStreamBlock`s with the image first. The interface is
+where it differs from `SimpleMMDiT`: the joint attention with the image
+first and no rotary, the centred crop of the position buffer, the summed
+timestep and pooled-text embedders, the last block's context-only norm, and
+SD3.5's ninefold modulation with a second self-attention. The blocks are
+`DoubleStreamBlock`s with the image first. The interface is
 Dew's: NHWC latents, a model time and a `DenoisingCondition` with the text
 tokens and pooled vector go in, and NHWC velocity comes out. The source's
 sin/cos position buffer is stored in the `buffers` collection, so no
