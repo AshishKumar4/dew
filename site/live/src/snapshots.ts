@@ -21,7 +21,10 @@ interface SnapshotEnv {
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 const REBUILD_MS = 15 * 60_000;
 
-/** How a trial preparation (`SnapshotRegistry.trial`) ended. */
+// The wall time an alarm handler may run (developers.cloudflare.com/durable-objects/platform/limits).
+const ALARM_MS = 15 * 60_000;
+
+/** How a trial preparation (`SnapshotRegistry.trial`) ended: neither field while it runs. */
 export interface Trial {
 	commit: string;
 	at: number;
@@ -84,9 +87,12 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		});
 	}
 
-	async trialled(): Promise<{ pending: string | null; last: Trial | null }> {
+	async trialled(now = Date.now()): Promise<{ pending: string | null; last: Trial | null }> {
+		const last = (await this.ctx.storage.get<Trial>('trialled')) ?? null;
+		// A trial records its start; one still unfinished after the alarm's 15 minutes was cut off.
+		const cut = last && !last.generation && !last.failure && now - last.at > ALARM_MS;
 		return { pending: (await this.ctx.storage.get<{ commit: string }>('trial'))?.commit ?? null,
-			last: (await this.ctx.storage.get<Trial>('trialled')) ?? null };
+			last: cut ? { ...last, failure: 'the preparation outlived the 15 minutes an alarm may run' } : last };
 	}
 
 	override async alarm(): Promise<void> {
@@ -94,6 +100,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		if (trial) {
 			await this.ctx.storage.delete('trial');
 			const outcome: Trial = { commit: trial.commit, at: Date.now() };
+			await this.ctx.storage.put('trialled', outcome);
 			try {
 				outcome.generation = await this.env.PREPARER.get(this.env.PREPARER.idFromName('trial')).trial(trial.commit);
 			} catch (error) {
