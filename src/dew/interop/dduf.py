@@ -14,11 +14,10 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
-import tempfile
 from pathlib import Path, PurePosixPath
 
 from dew.cache import dew_cache_dir
+from dew.files import staged
 
 _CHUNK = 1 << 24
 
@@ -51,33 +50,23 @@ def unpacked(path: str | os.PathLike[str]) -> Path:
     if (target / "model_index.json").is_file():
         return target
     entries = read_dduf_file(source)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".unpacking-"))
-    try:
-        with open(source, "rb") as archive:
-            for name, entry in entries.items():
-                # huggingface_hub 1.30.0's read_dduf_file checks each name with
-                # its slashes stripped but keys the entry by the name as
-                # written, so an absolute name or a '..' would land outside.
-                parts = PurePosixPath(name)
-                if parts.is_absolute() or ".." in parts.parts:
-                    raise ValueError(f"{source} names an entry {name!r} outside its own directory")
-                destination = staging / name
-                destination.parent.mkdir(parents=True, exist_ok=True)
-                archive.seek(entry.offset)
-                remaining = entry.length
-                with open(destination, "wb") as out:
-                    while remaining:
-                        chunk = archive.read(min(_CHUNK, remaining))
-                        if not chunk:
-                            raise ValueError(f"{source} ends inside its entry {name}")
-                        out.write(chunk)
-                        remaining -= len(chunk)
-        os.replace(staging, target)
-    except OSError:
-        # Another process published the same file first.
-        if not (target / "model_index.json").is_file():
-            raise
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)
+    with staged(target) as staging, open(source, "rb") as archive:
+        for name, entry in entries.items():
+            # huggingface_hub 1.30.0's read_dduf_file checks each name with
+            # its slashes stripped but keys the entry by the name as
+            # written, so an absolute name or a '..' would land outside.
+            parts = PurePosixPath(name)
+            if parts.is_absolute() or ".." in parts.parts:
+                raise ValueError(f"{source} names an entry {name!r} outside its own directory")
+            destination = staging / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            archive.seek(entry.offset)
+            remaining = entry.length
+            with open(destination, "wb") as out:
+                while remaining:
+                    chunk = archive.read(min(_CHUNK, remaining))
+                    if not chunk:
+                        raise ValueError(f"{source} ends inside its entry {name}")
+                    out.write(chunk)
+                    remaining -= len(chunk)
     return target

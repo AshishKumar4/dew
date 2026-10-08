@@ -321,7 +321,7 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
     return restored, valid
 
 
-def _batch_text(batch) -> ModelInputs:
+def batch_text(batch) -> ModelInputs:
     """The batch's `text` rows as `_prepared` gives them, a packed batch's
     `text_segment_ids` and `text_positions` columns folded in."""
     segment_ids = batch.get("text_segment_ids")
@@ -331,7 +331,7 @@ def _batch_text(batch) -> ModelInputs:
                      None if positions is None else jnp.asarray(positions, jnp.int32))
 
 
-def _text_preview[S](phase: str, setup: Callable[[], S | None],
+def text_preview[S](phase: str, setup: Callable[[], S | None],
                      generate: Callable[[S], tuple[jax.Array, jax.Array | None]],
                      decode: Callable[[list[int]], str] | None) -> TextSamples | None:
     """A text preview, on every process: agree on `setup`, generate the rows
@@ -717,7 +717,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         samples = self.samples
         return {
             'seq_len': self.seq_len,
-            'sample_tokens': 0 if samples is None else samples.max_new_tokens,
+            'max_new_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': to_record(Sampling() if samples is None else samples.sampling, Sampling),
             'tokenizer': recorded_tokenizer(self.processor),
         }
@@ -1024,7 +1024,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         The main loss is never scored, since nothing it reaches moves.
         """
         assert self.indexer is not None
-        prepared = _batch_text(batch)
+        prepared = batch_text(batch)
         inputs, _ = self._rows(prepared.tokens)
         collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
         _, gathered = self._hidden_states(
@@ -1080,7 +1080,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = ()
                      ) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
         """Compute the loss's statistics and reports, with the scores they came from."""
-        prepared = _batch_text(batch)
+        prepared = batch_text(batch)
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
         scores = self.token_scores(
@@ -1207,7 +1207,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the
         rows and roles are read outside the compiled scoring."""
-        prepared = {TEXT_KEY: _batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
+        prepared = {TEXT_KEY: batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
         return super().evaluate(params, prepared, step)
 
     def _evaluation_scores(self, params, batch, key) -> TokenScores:
@@ -1233,7 +1233,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             policy, prompt, max_new_tokens = prepared
             return policy(prompt, max_new_tokens, key=step.key).host().tokens, prompt
 
-        return _text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
+        return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 
 
 class Perplexity:

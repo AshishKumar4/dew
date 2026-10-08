@@ -54,7 +54,7 @@ def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
 
 @runtime_checkable
 class ReadsTrain(Protocol):
-    """A token mixer whose call takes `train`, for a dropout of its own."""
+    """A token mixer or feed-forward whose call takes `train`, for a dropout of its own."""
 
     @property
     def reads_train(self) -> bool: ...
@@ -194,7 +194,11 @@ class GatedMLP(nn.Module):
     (`dew.nn.gemma3n.gaussian_topk`). `swiglu_limit` is the clamp that
     GLM-5.3-Flash and DeepSeek V4 apply before the activation: the gate is
     capped from above, and the up projection on both sides. Both need a gated
-    activation.
+    activation. `packed` keeps the gate and up projections in one
+    `gate_up_proj` from init on, as DeepSeek-V4.1's vision tower stores them,
+    and `linear` is the projections' module (Gemma 4's vision tower clips
+    theirs). `dropout_rate` drops the activated hidden units before the down
+    projection while training, as T5's `T5DenseActDense` does.
     """
     hidden_features: int
     out_features: int
@@ -204,32 +208,43 @@ class GatedMLP(nn.Module):
     swiglu_limit: float | None = None
     init_std: float | None = None  # gate/up normal std; None: lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
+    packed: bool = False
+    linear: Callable[..., nn.Dense] = nn.Dense
+    dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     def setup(self):
         dense = functools.partial(
-            nn.Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
+            self.linear, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
         if self.activation not in UNGATED:
-            if self.has_variable('params', 'gate_up_proj'):
+            if self._packed():
                 self.gate_up_proj = dense(2 * self.hidden_features, name='gate_up_proj')
             else:
                 self.gate_proj = dense(self.hidden_features, name='gate_proj')
-        elif self.activation_sparsity or self.swiglu_limit is not None:
-            raise ValueError('activation_sparsity and swiglu_limit require a gated MLP')
-        if not self.has_variable('params', 'gate_up_proj'):
+        elif self.activation_sparsity or self.swiglu_limit is not None or self.packed:
+            raise ValueError('activation_sparsity, swiglu_limit and packed require a gated MLP')
+        if not self._packed():
             self.up_proj = dense(self.hidden_features, name='up_proj')
         self.down_proj = dense(self.out_features, name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
+        self.dropout = nn.Dropout(rate=self.dropout_rate)
 
-    def __call__(self, x):
+    @property
+    def reads_train(self) -> bool:
+        """Whether its call takes `train` (`ReadsTrain`): it drops hidden
+        units while training."""
+        return bool(self.dropout_rate)
+
+    def __call__(self, x, train: bool = False):
         # Column-parallel under a tensor axis: the hidden width splits and
         # down_proj's sum returns to the residual placement in the block.
         if isinstance(self.activation, str) and self.activation in UNGATED:
             up = checkpoint_name(constrain(self.up_proj(x), MLP_HIDDEN), 'up_proj')
-            return checkpoint_name(self.down_proj(ungated_activation(self.activation, up)), 'down_proj')
-        if self.has_variable('params', 'gate_up_proj'):
+            hidden = self.dropout(ungated_activation(self.activation, up), deterministic=not train)
+            return checkpoint_name(self.down_proj(hidden), 'down_proj')
+        if self._packed():
             gate, up = jnp.split(self.gate_up_proj(x), 2, axis=-1)
         else:
             gate, up = self.gate_proj(x), self.up_proj(x)
@@ -241,7 +256,13 @@ class GatedMLP(nn.Module):
             up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
-        return checkpoint_name(self.down_proj(gated_product(self.activation)(gate, up)), 'down_proj')
+        hidden = self.dropout(gated_product(self.activation)(gate, up), deterministic=not train)
+        return checkpoint_name(self.down_proj(hidden), 'down_proj')
+
+    def _packed(self) -> bool:
+        """Whether one `gate_up_proj` holds the gate and up projections: the
+        layer's own layout, or a server's packing of the two."""
+        return self.packed or self.has_variable('params', 'gate_up_proj')
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its gate and up projections packed as `gate_up_proj` (`ProjectionSites`),
@@ -672,7 +693,9 @@ class DecoderBlock(nn.Module):
                          self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
             hidden = self.mlp(mlp_input,
                               **self._feedforward_inputs(attention_metadata),
-                              **({} if self.parallel is not None else routes))
+                              **({} if self.parallel is not None else routes),
+                              **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
+                                 else {}))
             if self.parallel is not None:
                 hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:

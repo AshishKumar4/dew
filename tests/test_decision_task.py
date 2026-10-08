@@ -226,17 +226,83 @@ def test_calibrated_fits_on_labelled_examples_and_gates_answers(decide):
     assert all("abstained" in answer for answer in answered.values())
 
 
-def test_score_reads_the_metrics_of_a_validation_pass(decide):
-    """Accuracy over every answered question is the share of answers whose
-    choice is the labelled option."""
-    examples = [Example.of({"state": request["state"], "questions": request["questions"],
-                            "answers": dict.fromkeys(request["questions"], 0)})
-                for request in CASES.values()]
+def answered():
+    """Every case's questions, each answered with its first option."""
+    return [Example.of({"state": request["state"], "questions": request["questions"],
+                        "answers": dict.fromkeys(request["questions"], 0)})
+            for request in CASES.values()]
+
+
+def passed(objective, variables, examples):
+    """Each held-out row's laid-out batch fields, raw logits and evaluated
+    probabilities, over its real option slots, in the pass's order."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.data.dataset import DataPartition
+    from dew.decision.task import laid_out
+    from dew.objectives.base import VALID_ROWS, Step
+
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
+    rows = []
+    for batch in objective.held_out(examples, batch=8)(DataPartition()):
+        probabilities = np.asarray(objective.evaluate(variables, batch, step).probabilities)
+        logits = np.asarray(objective._logits(variables, laid_out(batch)))
+        # A batch the pass filled with repeats marks its real rows.
+        for row in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
+            count = int(batch["options"][row, 0].sum())
+            rows.append((int(batch["kinds"][row, 0]), logits[row, 0, :count], probabilities[row, 0, :count]))
+    return rows
+
+
+def float32_softmax(logits, temperature):
+    """The tempered softmax computed in float32 throughout."""
+    scaled = logits.astype(np.float32) / np.float32(temperature)
+    shifted = np.exp(scaled - scaled.max())
+    return shifted / shifted.sum()
+
+
+def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
+    """The pass divides each question's logits by the temperature its answer
+    uses, which the released checkpoint sets away from 1: every row chooses
+    what the task answers, its probabilities are as exact as float32's own
+    tempered softmax of the same logits, and score reports that pass."""
+    from dew.decision import KINDS, DecisionObjective
+
+    temperatures = decide.calibration.temperatures
+    assert temperatures.of("choice", 3) != 1
+    examples = answered()
+    answers = [answer for example in examples for answer in decide(example.state, example.questions).values()]
+    rows = passed(DecisionObjective(decide, temperatures=temperatures), decide.variables, examples)
+    assert [int(np.argmax(found)) for _, _, found in rows] == [
+        int(np.argmax(answer.probabilities)) for answer in answers]
+    divided = [(logits, temperatures.of(KINDS[kind].kind, len(logits))) for kind, logits, _ in rows]
+    assert_as_exact_as_the_reference(
+        np.concatenate([found for _, _, found in rows]),
+        np.concatenate([float32_softmax(logits, scale) for logits, scale in divided]),
+        np.concatenate([softmax(logits.astype(np.float64), scale) for logits, scale in divided]),
+        "tempered probabilities")
     scores = decide.score(examples)
     assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
-    right = [int(np.argmax(answer.probabilities)) == 0 for example in examples
-             for answer in decide(example.state, example.questions).values()]
-    assert scores["accuracy"] == pytest.approx(np.mean(right))
+    assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0
+                                                        for answer in answers]))
+
+
+def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(decide):
+    """The temperatures fit the released logits, which training moves, so a
+    run's validation divides by none: exactly what identity temperatures
+    give, and not what the task's own give."""
+    from dew.decision import DecisionObjective
+
+    examples = answered()
+    untempered = DecisionObjective(decide)
+    assert untempered.temperatures is None
+    plain = [found for _, _, found in passed(untempered, decide.variables, examples)]
+    identity = passed(DecisionObjective(decide, temperatures=Temperatures()), decide.variables, examples)
+    tempered = passed(DecisionObjective(decide, temperatures=decide.calibration.temperatures),
+                      decide.variables, examples)
+    np.testing.assert_array_equal(np.concatenate(plain), np.concatenate([found for _, _, found in identity]))
+    assert not np.array_equal(np.concatenate(plain), np.concatenate([found for _, _, found in tempered]))
 
 
 def test_a_gate_abstains_below_its_threshold(decide):

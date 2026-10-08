@@ -5,6 +5,7 @@ import os
 import lane_environment  # configures the backend before JAX reads the environment
 import jax
 import pytest
+import remote_cache
 
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 
@@ -16,6 +17,8 @@ if not os.environ.get("DEW_TEST_NO_CACHE"):
     _cache = default_compilation_cache_dir()
     if _cache:
         enable_compilation_cache(_cache)
+        # On armada, where each task's container starts cold, a cache the tasks share.
+        remote_cache.install_from_environment()
 
 # XLA parses XLA_FLAGS once, at the first compile, not when the backend
 # opens. A test that edits the variable, such as `without_deterministic_ops`

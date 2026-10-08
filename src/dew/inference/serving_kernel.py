@@ -2,7 +2,7 @@
 
 `Slots` is the state a server keeps on its devices, `Admission` and `Draws`
 what one step takes in and gives back, and `Dense` and `Paged` how a cache
-lays out its rows. `_program` compiles the step (`_stepped`) and the
+lays out its rows. `decode_programs` compiles the step (`_stepped`) and the
 admitting step (`_mixed_step`) once per resident format, so the host-side
 scheduler in `serving` only feeds and reads them.
 """
@@ -19,7 +19,7 @@ from jax.experimental import checkify
 from jax.experimental.layout import Format, Layout
 from jax.sharding import Mesh, NamedSharding
 
-from dew.inference.tasks import _sized
+from dew.inference.tasks import cache_sized
 from dew.nn.inputs import Admitted, ModelInputs
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.protocols import Serving
@@ -30,7 +30,7 @@ from dew.sampling import decoding
 from dew.sampling.decoding import LogitsTransform, StepState, Stopping
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, draw
-from dew.sampling.text import _operations, _prefill, prediction_depths
+from dew.sampling.text import decode_ops, prediction_depths, prefill_state
 
 
 @struct.dataclass
@@ -93,13 +93,13 @@ class Draws:
     raw: jax.Array
 
 
-def _opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int) -> Slots:
+def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int) -> Slots:
     """Every slot free: zeros in the shapes of a prefill over an all-invalid
     prompt, which leave the cursors at zero and the validity false."""
-    ops = _operations(model, params, pad_id, prediction_depths(model))
+    ops = decode_ops(model, params, pad_id, prediction_depths(model))
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {"attention_mask": jnp.zeros((slots, 1), bool)})
-    _, decoder = jax.eval_shape(checkify.checkify(lambda: _prefill(model, params, blank, ops)[0],
+    _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
                                                   errors=checkify.user_checks))
     keys = jax.random.key_data(jax.random.key(0))
     return Slots(jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, leaf.dtype), decoder),
@@ -157,7 +157,7 @@ class Dense:
 
     `mixed` runs the admitting step as one forward over the decoding rows'
     tokens and the prompts (`_mixed_step`) where the model allows it
-    (`_mixed_refusal`); otherwise the prompts prefill in a forward of their own.
+    (`mixed_refusal`); otherwise the prompts prefill in a forward of their own.
     With `continuing` a prompt can prefill in pieces, which the mixed step
     alone serves, each reading its row's earlier keys.
     """
@@ -175,9 +175,9 @@ class Dense:
         capacity's f32 scores. A row's slots past the prompt keep a former
         occupant's keys, past the cursor the prefill sets.
         """
-        narrow = _sized(model, admission.prompts.tokens.shape[1])
-        fresh, real = _prefill(narrow, params, admission.prompts,
-                               _operations(narrow, params, pad_id, prediction_depths(narrow)))
+        narrow = cache_sized(model, admission.prompts.tokens.shape[1])
+        fresh, real = prefill_state(narrow, params, admission.prompts,
+                               decode_ops(narrow, params, pad_id, prediction_depths(narrow)))
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
@@ -214,7 +214,7 @@ class Paged:
                 return admission.cursors
             return leaf
 
-        fresh, real = _prefill(model, params, admission.prompts, _operations(model, params, pad_id, 0),
+        fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, 0),
                                cache=jax.tree_util.tree_map_with_path(view, state.decoder.cache))
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
@@ -260,7 +260,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         assert admission is not None
         decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission)
     else:
-        ops = _operations(model, params, pad_id, prediction_depths(model))
+        ops = decode_ops(model, params, pad_id, prediction_depths(model))
         decoder = ops.advance(state.decoder, last, fed)
     if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
@@ -310,7 +310,7 @@ def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Pla
                                logits=held.at[seated].set(logits[0, rows:], mode="drop"))
 
 
-def _mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement: Placement,
+def mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement: Placement,
                    width: int) -> str | None:
     """Why a server's admitting step keeps the prompts' prefill in a forward
     of its own, or None when one mixed forward (`_mixed_step`) runs the model
@@ -339,7 +339,7 @@ def _mixed_refusal(model: nn.Module, params: Variables, shapes: Slots, placement
 
 
 def _probe_admission(width: int) -> Admission:
-    """One admitted row of 64 tokens for `_mixed_refusal`'s trace, which
+    """One admitted row of 64 tokens for `mixed_refusal`'s trace, which
     reads its prompt, slot, cursor, page table and finality."""
     one = jnp.zeros(1, jnp.int32)
     return Admission(ModelInputs(jnp.zeros((1, 64), jnp.int32), {"attention_mask": jnp.zeros((1, 64), bool)}),
@@ -347,13 +347,13 @@ def _probe_admission(width: int) -> Admission:
                      final=jnp.zeros(1, bool), history=one, history_valid=one)
 
 
-def _split(state: Slots) -> tuple[Slots, Slots]:
+def split_donated(state: Slots) -> tuple[Slots, Slots]:
     """Split the state into the matrices a step donates and the vectors it rewrites.
 
     XLA copies a donated buffer whose old value is still read after the output
     is written, which is true of every cursor, step count and active flag. So
     only the matrices are donated; the vectors get fresh buffers. Each half
-    holds None where the other holds the leaf, and `_joined` recombines them.
+    holds None where the other holds the leaf, and `joined` recombines them.
     A `Formats` tree splits the same way, by the rank each layout describes.
     """
     def matrix(leaf: jax.Array | Format) -> bool:
@@ -365,7 +365,7 @@ def _split(state: Slots) -> tuple[Slots, Slots]:
             jax.tree.map(lambda leaf: None if matrix(leaf) else leaf, state))
 
 
-def _joined(resident: Slots, carried: Slots) -> Slots:
+def joined(resident: Slots, carried: Slots) -> Slots:
     return jax.tree.map(lambda held, other: other if held is None else held, resident, carried,
                         is_leaf=lambda leaf: leaf is None)
 
@@ -383,7 +383,7 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
     """
 
     def run(params, resident, carried, admission, transforms, stopping, grammar):
-        state, draws = _advanced(model, params, pad_id, placement, _joined(resident, carried), admission,
+        state, draws = _advanced(model, params, pad_id, placement, joined(resident, carried), admission,
                                  transforms, stopping, grammar)
         draws = jax.tree.map(lambda leaf: leaf[None], draws)
         if steps > 1:
@@ -392,7 +392,7 @@ def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placem
 
             state, more = jax.lax.scan(following, state, length=steps - 1)
             draws = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest]), draws, more)
-        return *_split(state), draws
+        return *split_donated(state), draws
 
     return checkify.checkify(run, errors=checkify.user_checks)(
         params, resident, carried, admission, transforms, stopping, grammar)
@@ -402,7 +402,7 @@ Formats = Slots
 """A `Slots` whose leaves are `Format`s: the resident layout of each leaf."""
 
 
-def _state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
+def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
     """Where each leaf of the resident state lives: `state` with a sharding at every leaf.
 
     Every leaf holds one row per slot on axis zero (`activation_batch`),
@@ -444,7 +444,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
     The matrix half is donated so XLA updates the cache in place instead of
     copying it. `rows` places every leaf of an admission, whose rows come
     group by group, the way the slots are placed; None leaves them where they
-    are. `options` are the program's own XLA options (`_program`); pass
+    are. `options` are the program's own XLA options (`decode_programs`); pass
     XLA_FLAGS to change the backend's defaults. See docs/performance.md for
     the measurements.
     """
@@ -453,7 +453,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
                    out_shardings=(None, (resident, carried, None)), compiler_options=options)
 
 
-def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
+def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
                       state: Slots, shardings: Slots, rows: NamedSharding | None,
                       transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
                       grammar: Grammar | None) -> Formats:
@@ -465,9 +465,9 @@ def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placemen
     decode-only step is compiled once with layouts left to XLA, and the
     output formats it chose become the format every step takes and returns.
     `state` is abstract: choosing the layout allocates nothing. `shardings`
-    places each leaf (`_state_shardings`).
+    places each leaf (`state_shardings`).
     """
-    resident, carried = _split(state)
+    resident, carried = split_donated(state)
 
     def automatic(half: Slots) -> Formats:
         return jax.tree.map(lambda leaf, sharding: None if leaf is None else Format(Layout.AUTO, sharding),
@@ -476,17 +476,17 @@ def _resident_formats(model: nn.Module, params: Variables, pad_id: int, placemen
     program = _compiled(automatic(resident), automatic(carried), rows)
     compiled = program.lower(model, params, pad_id, placement, steps, resident, carried, None, transforms,
                              stopping, grammar).compile()
-    return _joined(*compiled.output_formats[1][:2])
+    return joined(*compiled.output_formats[1][:2])
 
 
-def _opened_in(formats: Formats) -> jax.stages.Wrapped:
-    """`_opened`, allocating its state in `formats`."""
-    return jax.jit(_opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
+def opened_in(formats: Formats) -> jax.stages.Wrapped:
+    """`opened`, allocating its state in `formats`."""
+    return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
 
 _PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None],
                 tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
-"""One pair of step programs per resident layout; see `_program`."""
+"""One pair of step programs per resident layout; see `decode_programs`."""
 
 ADMISSION_OPTIONS = {"xla_gpu_enable_command_buffer": ""}
 """The admitting step's XLA options: no CUDA command buffers. Its inputs are
@@ -496,7 +496,8 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
 
 
-def _program(formats: Formats, rows: NamedSharding | None) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+def decode_programs(formats: Formats, rows: NamedSharding | None
+                    ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
     """`_compiled` over `formats`, once per layout, for the decoding step and
     the admitting one (`ADMISSION_OPTIONS`): one compile per (model,
     admission shape) serves every server that keeps its state in the same
@@ -506,7 +507,7 @@ def _program(formats: Formats, rows: NamedSharding | None) -> tuple[jax.stages.W
     key = (tuple(leaves), str(structure), rows)
     programs = _PROGRAMS.get(key)
     if programs is None:
-        halves = _split(formats)
+        halves = split_donated(formats)
         options = ADMISSION_OPTIONS if jax.default_backend() == "gpu" else None
         programs = _PROGRAMS[key] = (_compiled(*halves, rows), _compiled(*halves, rows, options))
     return programs

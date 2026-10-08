@@ -3,7 +3,6 @@
 """
 
 import dataclasses
-import functools
 from collections.abc import Mapping
 
 import jax
@@ -16,13 +15,13 @@ from dew import records
 from dew._model_types import _QWEN35_VISION_TYPES
 from dew.interop.weights import checkpoint_array, translate_parameters
 from dew.nn.activations import gelu_exact
-from dew.nn.attention import LayerNorm, scaled_dot_product_attention
-from dew.nn.precision import at_least_fp32
-from dew.nn.text_encoders import MLP
+from dew.nn.attention import LayerNorm
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.text_encoders import clip_layer
 from dew.objectives.base import Variables
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _grid_rope, _grid_rope_tables, _vision_section
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
 
 
 def _qwen35_interp_taps(index: jax.Array, size: int | jax.Array, side: int) -> tuple[jax.Array, jax.Array]:
@@ -56,63 +55,6 @@ def _qwen35_pos_embeds(table: jax.Array, rows: jax.Array, cols: jax.Array,
     return (table[indices] * weights[..., None]).sum(axis=-2)
 
 
-class Qwen35VisionAttention(nn.Module):
-    """Full attention over one image's patches with the 2D rotary.
-
-    One fused map carries queries, keys and values together
-    (modeling_qwen3_5.py, Qwen3_5VisionAttention); the scores scale with the
-    head width and the softmax runs in fp32 through the shared kernel.
-    """
-
-    hidden_size: int
-    num_heads: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        self.qkv = nn.Dense(3 * self.hidden_size, use_bias=True, dtype=self.dtype,
-                            precision=self.precision, name="qkv")
-        self.proj = nn.Dense(self.hidden_size, use_bias=True, dtype=self.dtype,
-                             precision=self.precision, name="proj")
-
-    def __call__(self, hidden_states, cos, sin, mask=None) -> jax.Array:
-        batch, length, _ = hidden_states.shape
-        head_dim = self.hidden_size // self.num_heads
-        fused = self.qkv(hidden_states).reshape(batch, length, 3, self.num_heads, head_dim)
-        query, key, value = (fused[:, :, 0], fused[:, :, 1], fused[:, :, 2])
-        query = _grid_rope(query, cos[:, :, None, :], sin[:, :, None, :])
-        key = _grid_rope(key, cos[:, :, None, :], sin[:, :, None, :])
-        attended = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision, mask=mask)
-        return self.proj(attended.reshape(batch, length, self.hidden_size))
-
-
-class Qwen35VisionBlock(nn.Module):
-    """Pre-norm attention over pre-norm shared MLP, both residual."""
-
-    hidden_size: int
-    intermediate_size: int
-    num_heads: int
-    hidden_act: str = "gelu_pytorch_tanh"
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        norm = functools.partial(LayerNorm, epsilon=1e-6, dtype=self.dtype)
-        self.norm1 = norm(name="norm1")
-        self.attn = Qwen35VisionAttention(
-            self.hidden_size, self.num_heads, dtype=self.dtype,
-            precision=self.precision, name="attn")
-        self.norm2 = norm(name="norm2")
-        self.mlp = MLP(self.hidden_size, self.intermediate_size,
-                       activation=self.hidden_act, dtype=self.dtype,
-                       precision=self.precision, name="mlp")
-
-    def __call__(self, hidden_states, cos, sin, mask=None):
-        hidden_states = hidden_states + self.attn(self.norm1(hidden_states), cos, sin, mask)
-        return hidden_states + self.mlp(self.norm2(hidden_states))
-
-
 class Qwen35VisionTransformer(nn.Module):
     """The Qwen 3.5 vision trunk, param layout of `Qwen3_5VisionConfig`.
 
@@ -121,6 +63,12 @@ class Qwen35VisionTransformer(nn.Module):
     inside each frame and excludes padded keys. Fixed NCHW images use the
     processor's channel-then-time patch order. The return value is the
     pre-merge sequence; the projector owns the merger.
+
+    Each block is CLIP's layer (`clip_layer`) at a 1e-6 epsilon, its queries,
+    keys and values in one map, rotated by the patch grid: heights then
+    widths share one frequency table over half the head, and the two turn
+    together as the text rope's halves do (modeling_qwen3_5.py,
+    Qwen3_5VisionRotaryEmbedding and apply_rotary_pos_emb_vision).
     """
 
     config: "Qwen35Vision"
@@ -138,11 +86,11 @@ class Qwen35VisionTransformer(nn.Module):
             precision=self.precision, name="patch_embed")
         self.position_table = nn.Embed(cfg.num_position_embeddings, cfg.hidden_size,
                                        dtype=self.dtype, name="position_table")
+        side = cfg.hidden_size // cfg.num_heads // 2
         self.blocks = [
-            Qwen35VisionBlock(
-                cfg.hidden_size, cfg.intermediate_size, cfg.num_heads,
-                cfg.hidden_act, dtype=self.dtype, precision=self.precision,
-                name=f"blocks_{index}")
+            clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, cfg.num_position_embeddings,
+                       activation=cfg.hidden_act, eps=1e-6, rotary_axes=(side, side), packed=True,
+                       dtype=self.dtype, precision=self.precision, name=f"blocks_{index}")
             for index in range(cfg.depth)]
 
     def __call__(self, pixel_values, grid_thw=None) -> jax.Array:
@@ -185,13 +133,14 @@ class Qwen35VisionTransformer(nn.Module):
         hidden_states = self.patch_embed(pixels)
         table = jnp.asarray(self.position_table.embedding, hidden_states.dtype)
         hidden_states = hidden_states + _qwen35_pos_embeds(table, rows, columns, heights, widths)
-        cos, sin = _grid_rope_tables(jnp.stack([rows, columns], axis=-1), cfg.hidden_size // cfg.num_heads,
-                                     dtype=at_least_fp32(hidden_states.dtype))
+        metadata = AttentionMetadata(rotary_positions=jnp.stack([rows, columns], axis=-1))
+        # Attention stays inside each frame, and padding, segment 0, sees nothing.
         valid = jnp.arange(length)[None, :] < jnp.prod(grid, axis=1, keepdims=True)
-        frames = jnp.arange(length)[None, :] // area
-        keep = (frames[:, :, None] == frames[:, None, :]) & valid[:, None, :]
+        frames = jnp.where(valid, jnp.arange(length)[None, :] // area + 1, 0)
         for block in self.blocks:
-            hidden_states = block(hidden_states, cos, sin, keep[:, None])
+            hidden_states = block(hidden_states, segment_ids=frames, attention_metadata=metadata)
+        # A block without hyper-connections hands on the plain residual.
+        assert isinstance(hidden_states, jax.Array)
         return hidden_states
 
 
@@ -274,6 +223,12 @@ _QWEN35_VISION_TENSORS = {
 }
 
 
+# A block's norms and maps as `clip_layer`'s decoder block names them.
+_BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
+_BLOCK_MAPS = {("attn", "qkv"): ("self_attn", "qkv_proj"), ("attn", "proj"): ("self_attn", "o_proj"),
+               ("mlp", "linear_fc1"): ("mlp", "up_proj"), ("mlp", "linear_fc2"): ("mlp", "down_proj")}
+
+
 def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
     """`blocks.N...` into the block's path."""
     if (
@@ -284,11 +239,10 @@ def _qwen35_vision_block_path(parts) -> tuple[str, ...] | None:
     ):
         return None
     block, leaf = f"blocks_{parts[1]}", parts[-1]
-    if len(parts) == 4 and parts[2] in ("norm1", "norm2"):
-        return (block, parts[2], "scale" if leaf == "weight" else "bias")
-    if len(parts) == 5 and (parts[2], parts[3]) in (("attn", "qkv"), ("attn", "proj"),
-                                                     ("mlp", "linear_fc1"), ("mlp", "linear_fc2")):
-        return (block, parts[2], parts[3].removeprefix("linear_"), "kernel" if leaf == "weight" else "bias")
+    if len(parts) == 4 and parts[2] in _BLOCK_NORMS:
+        return (block, _BLOCK_NORMS[parts[2]], "scale" if leaf == "weight" else "bias")
+    if len(parts) == 5 and (parts[2], parts[3]) in _BLOCK_MAPS:
+        return (block, *_BLOCK_MAPS[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
     return None
 
 

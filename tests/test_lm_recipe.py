@@ -63,8 +63,8 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for(tmp_path
     """Generation decodes into a cache sized when the model is built, so the
     prompt and the budget past it reach beyond the training context."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
-    for flags, context in ((["--sample-tokens", "0"], SEQ), (["--sample-tokens", "8"], SEQ),
-                           (["--sample-tokens", "100", "--sample-prompt", "abc"], 103)):
+    for flags, context in ((["--max-new-tokens", "0"], SEQ), (["--max-new-tokens", "8"], SEQ),
+                           (["--max-new-tokens", "100", "--prompt", "abc"], 103)):
         assert run_config(tokens, *flags).prepare().run.model.fields["max_seq_len"] == context
 
 
@@ -93,7 +93,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     the trainer, perplexity scored on val.bin, the run spec and a checkpoint
     at the final step."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    args = ["--trainer.epochs", "1", "--sample-prompt", "the ", "--sample-tokens", "4",
+    args = ["--trainer.epochs", "1", "--prompt", "the ", "--max-new-tokens", "4",
             "--trainer.name", "run"]
     if packed:
         args = ["--data.pack", "--data.packing-bins", "2", *args]
@@ -138,7 +138,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
         "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data.loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--trainer.steps", "2", "--trainer.name", "mixed", "--sample-tokens", "0",
+        "--trainer.steps", "2", "--trainer.name", "mixed", "--max-new-tokens", "0",
         "--model.dtype", "float32",
         "--model.emb_features", "16", "--model.num_layers", "1", "--model.num_heads", "2"])
     assert config.data.path == {str(first): 0.7, str(second): 0.3}
@@ -252,7 +252,7 @@ def test_the_recipe_continues_a_pretrained_decoder(tmp_path):
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1",
-                               "--sample-tokens", "0", "--trainer.name", "continued")
+                               "--max-new-tokens", "0", "--trainer.name", "continued")
 
     state = config.run()
 
@@ -273,7 +273,7 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     config = pretrained_config(tokens, checkpoint, "--trainer.steps", "0",
-                               "--sample-tokens", "0", "--trainer.name", "zero")
+                               "--max-new-tokens", "0", "--trainer.name", "zero")
 
     state = config.run()
 
@@ -299,7 +299,7 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
     lora = ("--lora.rank", "4", "--lora.modules", "q_proj")
-    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "2", "--sample-tokens", "0",
+    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "2", "--max-new-tokens", "0",
                                "--trainer.name", "lora", *lora)
     assert config.lora == LoRA(rank=4, modules=("q_proj",))
 
@@ -334,7 +334,7 @@ def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     from dew.objectives.base import FROZEN
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
-    config = run_config(tokens, "--trainer.steps", "2", "--sample-tokens", "0", "--trainer.name",
+    config = run_config(tokens, "--trainer.steps", "2", "--max-new-tokens", "0", "--trainer.name",
                         "scratch", "--lora.rank", "2", "--lora.modules", "q_proj", "v_proj")
 
     state = config.run()
@@ -384,7 +384,7 @@ def test_a_hub_reference_at_a_revision_is_recorded_at_its_commit(tmp_path, monke
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", download)
     config = pretrained_config(tokens, "acme/tiny@v1", "--trainer.steps", "0",
-                               "--sample-tokens", "0", "--trainer.name", "pinned")
+                               "--max-new-tokens", "0", "--trainer.name", "pinned")
 
     config.run()
 
@@ -441,7 +441,7 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
                                      vocab_size=tokenizer.vocab_size)
 
     state = pretrained_config(
-        tokens, checkpoint, "--trainer.steps", "1", "--sample-tokens", "0",
+        tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
         "--tokenizer", str(TOKENIZER), "--trainer.name", "exported").run()
 
     trained = tmp_path / "trained"
@@ -474,7 +474,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
     def run(name, *extra):
         config = LMRunConfig.cli(
                           recipe_args(tokens, "--trainer.steps", "2",
-                                           "--sample-tokens", "0",
+                                           "--max-new-tokens", "0",
                                            "--trainer.name", name, *extra,
                                            model_config=sparse))
         state = config.run()
@@ -500,7 +500,7 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
     def run(name, *extra, model_config=deep):
         config = LMRunConfig.cli(
                           recipe_args(tokens, "--trainer.steps", "2",
-                                           "--sample-tokens", "0",
+                                           "--max-new-tokens", "0",
                                            "--trainer.name", name, *extra,
                                            model_config=model_config))
         state = config.run()
@@ -546,7 +546,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--sample-tokens", "0"])
+        "--objective.ema-decay", "None", "--max-new-tokens", "0"])
 
     state = config.run()
 
@@ -617,7 +617,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
+        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.learning-rate", "0.001"])
 
     state = config.run()
 
@@ -654,7 +654,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--sample-tokens", "0", "--optim.learning-rate", "0.001"])
+        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"])
     state = config.run()
     assert int(state.updates) == 1
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=12)
@@ -722,13 +722,13 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     from dew.data import ChatMessages
 
     chat = ChatMessages(tokenizer="byte", path="chat.parquet", seq_len=16)
-    config = LMRunConfig(data=chat, tokenizer="gpt2", sample_tokens=8,
+    config = LMRunConfig(data=chat, tokenizer="gpt2", max_new_tokens=8,
                          objective=ObjectiveConfig("lm", {"ema_decay": 0.99}),
                          sampling=Sampling(temperature=0.5, top_k=7))
 
     record = config.to_dict()
 
-    assert record["tokenizer"] == "gpt2" and record["sample_tokens"] == 8
+    assert record["tokenizer"] == "gpt2" and record["max_new_tokens"] == 8
     assert record["objective"]["name"] == "dew.objectives.lm.objective:LMObjective"
     assert record["objective"]["fields"] == {"ema_decay": 0.99}
     assert "ema_decay" not in record["objective"]["defaults"]

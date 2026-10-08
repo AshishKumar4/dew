@@ -22,6 +22,7 @@ A model trained on a loss over its outputs needs no objective of its own. `Super
 
 ```python
 import optax
+from flax import linen as nn
 
 from dew import Supervised
 from dew.inputs import Field, InputSpec
@@ -32,7 +33,7 @@ def cross_entropy(outputs, batch):
     return optax.softmax_cross_entropy_with_integer_labels(outputs, batch["label"])
 
 
-objective = Supervised(MLP(), cross_entropy, (Accuracy(),), inputs=InputSpec(Field("x", (2,))))
+objective = Supervised(nn.Dense(2), cross_entropy, (Accuracy(),), inputs=InputSpec(Field("x", (2,))))
 ```
 
 The loss is the mean over the batch's rows, `Objective.row_mean`, so a validation batch's repeated rows count for nothing. Each metric is called the same way and reported as its own mean, under its function's name or its class's (`accuracy`). A loss or metric is a module-level function or a configured callable object, such as `CrossEntropy(labels="label")`: a run's record names it by import path, and saving a run whose loss is a lambda raises. Reading the record back builds a callable object only of a class from Dew, Flax or a package the reader trusts (`RunConfig.load(directory, trust=("mypackage",))`). [Recipes](../recipes.md#python-experiments) trains this objective from a Python experiment file.

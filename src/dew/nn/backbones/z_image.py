@@ -27,7 +27,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
-from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.blocks import sinusoidal_time
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
@@ -58,15 +58,13 @@ def rotary_table(dim: int, length: int, theta: float) -> tuple[np.ndarray, np.nd
 
 def _rotation(positions, axes: Sequence[int], lengths: Sequence[int], theta: float, dtype):
     """The rotary cosines and sines for integer `positions` `[B, S, 3]` in
-    `dtype`, each channel pair's value repeated for both channels,
-    `[B, S, 1, sum(axes)]`."""
+    `dtype`, one per channel pair, `[B, S, sum(axes) // 2]`."""
     cosines, sines = [], []
     for index, (dim, length) in enumerate(zip(axes, lengths, strict=True)):
         cos_table, sin_table = rotary_table(dim, length, theta)
         cosines.append(jnp.asarray(cos_table, dtype)[positions[..., index]])
         sines.append(jnp.asarray(sin_table, dtype)[positions[..., index]])
-    return (jnp.repeat(jnp.concatenate(cosines, axis=-1), 2, axis=-1)[:, :, None],
-            jnp.repeat(jnp.concatenate(sines, axis=-1), 2, axis=-1)[:, :, None])
+    return jnp.concatenate(cosines, axis=-1), jnp.concatenate(sines, axis=-1)
 
 
 @logical_axes({("w1",): ("embed", "mlp"), ("w3",): ("embed", "mlp"), ("w2",): ("mlp", "embed")})
@@ -224,8 +222,8 @@ class ZImageTransformer(nn.Module):
         leading = jnp.where(slots[None] < spans[:, None], slots[None] + 1, 0)
         caption_positions = jnp.stack([leading, jnp.zeros_like(leading), jnp.zeros_like(leading)], axis=-1)
         table = (self.axes_dims, self.axes_lens, self.rope_theta)
-        image_rotation = _rotation(image_positions, *table, image.dtype)
-        caption_rotation = _rotation(caption_positions, *table, image.dtype)
+        image_rotation = _rotation(image_positions, *table, at_least_fp32(image.dtype))
+        caption_rotation = _rotation(caption_positions, *table, at_least_fp32(image.dtype))
         whole_image = jnp.full((batch,), image_span, jnp.int32)
         block = {"epsilon": self.norm_eps, "dtype": self.dtype, "precision": self.precision,
                  "attention_impl": self.attention_impl}

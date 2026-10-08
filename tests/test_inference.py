@@ -451,7 +451,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     checkpoints.wait()
     (directory / "run.json").write_text(json.dumps({
         "objective": "lm", "model": dataclasses.asdict(model_config), "tokenizer": "byte",
-        "sample_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
+        "max_new_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
         "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
 
@@ -852,7 +852,7 @@ def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
     policy = Sampling(temperature=0.37, top_k=3, eos_id=255)
     checkpoints = Checkpoints(str(tmp_path / "unbudgeted"))
     checkpoints.save(int(state.step), state, None, artifact={
-        **objective.inference_record(), "sample_tokens": 0, "sampling": dataclasses.asdict(policy)})
+        **objective.inference_record(), "max_new_tokens": 0, "sampling": dataclasses.asdict(policy)})
     checkpoints.wait()
     task = dew.pipeline(str(tmp_path / "unbudgeted"))
     assert task.max_new_tokens is None

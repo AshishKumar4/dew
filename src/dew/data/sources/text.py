@@ -23,12 +23,12 @@ the same windows and the same packing plan.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import json
 import os
 import tempfile
-import uuid
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -36,6 +36,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dew.cache import dew_cache_dir
+from dew.files import replacing
 
 from .hf import HFOptions, HubOptions
 
@@ -159,8 +160,9 @@ class TokenCorpus:
         # point needs the total count, and slicing a memmap of it costs a linear
         # copy, not a second tokenization. The scratch file is created for this
         # run alone (O_EXCL under a unique name), so no file already in `out`,
-        # an input included, is opened, truncated or removed; each output is
-        # written beside its name and renamed over it only once complete.
+        # an input included, is opened, truncated or removed; the three outputs
+        # are all written beside their names first and only then renamed over
+        # them (`replacing`).
         descriptor, name = tempfile.mkstemp(prefix=".tokenize-", suffix=".bin", dir=root)
         scratch = Path(name)
         opening, closing = _added(encoder)
@@ -168,7 +170,6 @@ class TokenCorpus:
         # source reads a record as the span up to an eos.
         closing = closing if eos is None else [*closing, eos]
         total = 0
-        staged: list[tuple[Path, str]] = []
         try:
             with os.fdopen(descriptor, "wb") as handle:
                 for document in _documents(documents):
@@ -192,19 +193,15 @@ class TokenCorpus:
             meta = (json.dumps(dataclasses.asdict(corpus), indent=2) + "\n").encode()
             pieces = (("val.bin", stream[:held_out].tofile), ("train.bin", stream[held_out:].tofile),
                       ("meta.json", lambda handle: handle.write(meta)))
-            for target, write in pieces:
-                path = root / f".{target}.{uuid.uuid4().hex}"
-                with open(path, "xb") as handle:
-                    staged.append((path, target))
-                    write(handle)
+            # Entered last to first, so the renames run first to last and
+            # meta.json, which says the corpus is whole, lands after the splits.
+            with contextlib.ExitStack() as published:
+                for target, write in reversed(pieces):
+                    with open(published.enter_context(replacing(root / target)), "wb") as handle:
+                        write(handle)
             del stream
-            while staged:
-                path, target = staged.pop(0)
-                os.replace(path, root / target)
         finally:
             scratch.unlink(missing_ok=True)
-            for path, _ in staged:
-                path.unlink(missing_ok=True)
         return corpus
 
 

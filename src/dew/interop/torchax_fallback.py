@@ -40,7 +40,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.interop import sources
 from dew.interop.pickles import host_view
-from dew.interop.pretrained import AUTO, PretrainedFallback, _source_processor
+from dew.interop.pretrained import AUTO, PretrainedFallback, source_processor
 from dew.nn.protocols import OutputTable
 from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
 from dew.registry import resolve_dtype
@@ -336,7 +336,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, head_name, persistent)
     module = TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype))
-    processor = _source_processor(directory, config, config, module)
+    processor = source_processor(directory, config, config, module)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}

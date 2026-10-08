@@ -34,7 +34,7 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
-from dew.nn.rope import LongRopeScaling, RopeScaling, apply_rotary_interleave, rotary_freqs
+from dew.nn.rope import LongRopeScaling, RopeScaling, deinterleaved, rotary_freqs, rotate
 from dew.nn.sharding import logical_axes
 
 
@@ -130,8 +130,8 @@ class Llama4Attention(nn.Module):
             freqs_cos, freqs_sin = rotary_freqs(rotary_positions, self.head_dim, self.rope_theta,
                                                 rope_scaling=self.rope_scaling,
                                                 dtype=at_least_fp32(query.dtype))
-            query = apply_rotary_interleave(query, freqs_cos, freqs_sin)
-            key = apply_rotary_interleave(key, freqs_cos, freqs_sin)
+            query = rotate(deinterleaved(query), freqs_cos, freqs_sin)
+            key = rotate(deinterleaved(key), freqs_cos, freqs_sin)
             if self.use_qk_norm:
                 # The reference norms after rotating; the norm has no scale
                 # and a rotation keeps every pair's length, so the two

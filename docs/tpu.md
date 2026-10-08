@@ -115,7 +115,7 @@ dew tpu train dew-16 --zone us-central2-b --job byte-demo --dry-run -- \
     --trainer.batch-size 32 --trainer.steps 2 --trainer.log-every 1 \
     --trainer.eval-every 2 --trainer.checkpoint-every 2 \
     --trainer.checkpoint-dir /home/you/dew-checkpoints \
-    --trainer.name byte-demo --sample-tokens 0
+    --trainer.name byte-demo --max-new-tokens 0
 ```
 
 The model is tiny so that you can inspect the launch; its settings say nothing about TPU performance. `train` syncs the checkout, adds `--trainer.multi-host True` and starts the recipe in the background on every worker, then follows worker 0's log.

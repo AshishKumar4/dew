@@ -116,6 +116,7 @@ Saves are asynchronous, and `wait()` returns once they are durable. Constructing
 
 A state that is not a training run's, such as a simulation's, has no optimizer, average or loss scale. `save(step, state)` takes it as a mapping of arrays in place of a `TrainState` and writes it as it is, with `metrics`, `ranking` and `control` as a train state's are. `restore(template)` reads it back through a mapping template of `jax.ShapeDtypeStruct` leaves, placed on their shardings, or as host arrays with no template. `kept()` reports its kind as `tree`, and a train-state template is refused for it.
 
+<!-- not run: a fragment; the step, state, key, rate and shapes are the simulation's own -->
 ```python
 checkpoints.save(step, {"state": state, "key": key}, metrics={"rate": rate})
 state_tree, _ = checkpoints.restore({"state": state_shapes, "key": key_shape})
@@ -131,6 +132,7 @@ The digest covers the bytes as stored. A restore checks each entry against the s
 
 Evaluation produces the scores that decide which step is best, and the checkpointer keeps those steps on disk. To choose the score, pass `best` the object that produces it, usually one of the metric objects `fit` evaluates. The metric's `Shown(better="lower" | "higher")` gives the direction. A metric without a direction is refused unless `Best(..., mode="min" | "max")` gives one.
 
+<!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->
 ```python
 from dew import Best, Checkpoints, Plateau, Trainer
 from dew.eval import FID, CLIPScore
@@ -154,6 +156,7 @@ Each save records every metric from that evaluation and the training loss under 
 
 With several selectors, each has its own tracker, and the run keeps the union of their winners. A callable selector looks up metrics by object, works with metric objects that are not hashable, and is minimized unless you pass `mode="max"`. `threshold` admits only scores strictly better than that value in the selected direction.
 
+<!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->
 ```python
 # Three best FID steps and two best CLIP-score steps, plus the latest two states.
 trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
@@ -171,6 +174,7 @@ The metrics you pass are evaluated together, on the same weights. If a callable 
 
 The readers that take a step, such as `restore` and `from_run`, also accept best selectors. `"best"` chooses the first tracker's best step, and `"best:val/clip_score"` chooses the best step of the tracker for that metric. An aggregate is named by its position, such as `"best:aggregate:0"`.
 
+<!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->
 ```python
 restored, position = trainer.checkpoints.restore(template, step="best")
 image_model = TextToImage.from_run(run_directory, step="best:val/clip_score")
@@ -184,6 +188,7 @@ for checkpoint in trainer.checkpoints.kept():
 
 With several validation splits, each split has an explicit reader name, given as its key in `validation`, and a metric selector has to name its split. A callable uses `(split, metric)` keys.
 
+<!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->
 ```python
 trainer.fit(data, steps=100_000, metrics=[fid, clip], eval_every=1_000,
             validation={"flowers": flowers.val, "faces": faces.val},
@@ -197,6 +202,7 @@ A recorded run sets `TrainerConfig.best` to a metric name or to a policy such as
 
 `checkpoint_every` takes either a step count or a `timedelta`. With a duration, the save happens at the next safe training step after the duration elapses, and all processes agree on that step. Recorded configurations write the duration as a string such as `checkpoint_every="30m"`, with `s`, `m` or `h` as the unit.
 
+<!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->
 ```python
 from datetime import timedelta
 from dew import Keep
@@ -246,6 +252,7 @@ You usually pick an EMA's length before training and judge it afterwards. Post-h
 
 A snapshot is the ordinary checkpoint itself, which Orbax's public preservation policy keeps even after `keep` would prune it. The state and the averages go into one atomic save, so an interrupted save cannot publish a state without its profiles.
 
+<!-- not run: a fragment of a long diffusion run; its trainer, data, metrics and directory are the run's -->
 ```python
 from dew import Checkpoints
 
