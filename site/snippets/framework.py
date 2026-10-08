@@ -1,13 +1,13 @@
-"""Small runnable examples behind the landing page, using the public API.
+"""The landing page's cells, each a whole program, and the checks of each.
 
-python site/snippets/framework.py --section lm --out /tmp/dew-landing
-Each cell on the page is the code between one "Begin snippet" and "End snippet"
-marker, a whole program that runs in the --out directory. For CI, --smoke
-serves the Hub datasets and models the cells name from small offline fixtures;
-the recordings on the page do not use it.
+Each cell is the code between one "Begin snippet" and "End snippet" marker,
+dedented (cells.py). The page shows it, site/scripts/capture_snippets.py --cell
+records it by running that code alone, and Run on the page runs it on the live
+pool or opens it in Colab (cells.json). `--section NAME --out DIR` runs the cell
+inside its function, followed by checks of what it did; CI runs every section
+with --smoke, which serves the Hub datasets and models the cells name from
+small offline fixtures.
 """
-
-# Each section prints its result for capture_snippets.py.
 
 import argparse
 import json
@@ -20,7 +20,6 @@ import jax
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
-PROFILE = True
 
 
 def lm():
@@ -59,20 +58,6 @@ def diffusion():
     # End snippet: diffusion
     assert int(state.step) == 3 and int(state.updates) == 3
     return {"steps": int(state.step)}
-
-
-def sample_public():
-    # Begin snippet: sample-public
-    from dew.sampling import CFG, DPMSolverMultistep, TextToImage
-
-    pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m",
-                                       revision="f9f06d778860501a257a900ca58faabf853f03cc")
-    result = pipe(["green and purple northern lights over a frozen lake"],
-                  key=5, steps=20, solver=DPMSolverMultistep(), guidance=CFG(5))
-    result.pil()[0].save("sample.png")
-    # End snippet: sample-public
-    assert Path("sample.png").is_file()
-    return {"shape": list(result.host().images.shape), "image": "sample.png"}
 
 
 def jepa():
@@ -133,6 +118,31 @@ def grpo():
     assert len(curve) == 150 and all(0 <= value <= 1 for value in curve)
     return {"steps": 150, "reward": "Adjacent response tokens counting up modulo 13",
             "reports": "tracking/scalars.jsonl"}
+
+
+def finetune():
+    # Begin snippet: finetune
+    from dataclasses import replace
+
+    from dew import Trainer
+    from dew.config import OptimConfig
+    from dew.data import load
+    from dew.interop import PretrainedDecoder
+    from dew.objectives.lm import LMObjective
+    from dew.sampling import Sampling
+
+    name = "HuggingFaceTB/SmolLM2-135M-Instruct"
+    model = PretrainedDecoder.load(name, dtype="float32", max_seq_len=256)
+    data = load("hf/winglian/tiny-shakespeare", batch=1, tokenizer=name, seq_len=64)
+    state = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-4), key=0).fit(
+        data, steps=20, log_every=5)
+    before = model.text_generation(sampling=Sampling(temperature=0))
+    after = replace(model, variables=state.variables).text_generation(sampling=Sampling(temperature=0))
+    print("Before:", before("ROMEO:", 32, key=0).text[0])
+    print("After: ", after("ROMEO:", 32, key=0).text[0])
+    # End snippet: finetune
+    assert int(state.updates) == 20
+    return {"steps": int(state.step)}
 
 
 def pretrained():
@@ -200,6 +210,11 @@ def serving():
     results = server(["The capital of France is", "The capital of Japan is"], 24, key=0)
     print([result.text[0] for result in results])
     # End snippet: serving
+    assert len(results) == 2
+    return {"text": [result.text[0] for result in results]}
+
+
+def formats():
     # Begin snippet: formats
     import jax.numpy as jnp
 
@@ -210,13 +225,11 @@ def serving():
     bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
                                     max_seq_len=128)
     task = bundle.text_generation(sampling=Sampling(temperature=0))
-    int8 = task.quantized(Quantization(dtype="int8", weight_only=True))
-    fp8 = task.quantized(Quantization(dtype="fp8", weight_only=True))
+    for dtype in ("int8", "fp8"):
+        quantized = task.quantized(Quantization(dtype=dtype, weight_only=True))
+        print(dtype, quantized("The capital of France is", 12, key=0).text[0])
     # End snippet: formats
-    for variant in (int8, fp8):
-        quantized = Server.from_task(variant, slots=4, capacity=128)
-        assert len(quantized(["dew"], 2, key=0)) == 1
-    return {"text": [result.text[0] for result in results], "weight_formats": ["int8", "fp8"]}
+    return {"weight_formats": ["int8", "fp8"]}
 
 
 def mesh():
@@ -279,26 +292,31 @@ def reliability():
     Path("resume-comparison.json").write_text(json.dumps(differences, indent=2) + "\n")
     exact = not differences
     assert exact, "resuming the checkpoint changed the parameters"
-    if PROFILE:
-        # Begin snippet: profile
-        from dew import ProfileWindow, Trainer
-        from dew.config import OptimConfig
-        from dew.data import load
-        from dew.nn.backbones import CausalTransformer
-        from dew.objectives.lm import LMObjective
-
-        data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
-        model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
-                                  mlp_features=64, max_seq_len=128)
-        trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
-                          profile=ProfileWindow("profile", steps=2))
-        trainer.fit(data, steps=5)
-        # End snippet: profile
     return {"saved_step": int(state.step), "resumed_step": int(resumed.step), "bit_exact": exact}
 
 
+def profile():
+    # Begin snippet: profile
+    from dew import ProfileWindow, Trainer
+    from dew.config import OptimConfig
+    from dew.data import load
+    from dew.nn.backbones import CausalTransformer
+    from dew.objectives.lm import LMObjective
+
+    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
+                              mlp_features=64, max_seq_len=128)
+    trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
+                      profile=ProfileWindow("profile", steps=2))
+    trainer.fit(data, steps=5)
+    # End snippet: profile
+    assert any(Path("profile").rglob("*.xplane.pb"))
+    return {"profile": "profile"}
+
+
 SECTIONS = {function.__name__: function for function in
-            (lm, diffusion, sample_public, jepa, grpo, pretrained, decide, serving, mesh, reliability)}
+            (lm, jepa, finetune, pretrained, serving, formats, decide, diffusion, mesh, grpo, reliability,
+             profile)}
 
 
 def offline(out):
@@ -321,13 +339,15 @@ def offline(out):
     tables = {"winglian/tiny-shakespeare": {"text": ["dew trains jax models. " * 100] * 4},
               "uoft-cs/cifar10": {"img": images, "label": [0] * len(images)}}
     HFOptions.load = lambda self, path, split, *, streaming: datasets.Dataset.from_dict(tables[path])
+    # One tiny decoder, which reads bytes, stands in for each the cells load.
+    decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
     tokenizer_for = dew.data.text.tokenizer_for
-    dew.data.text.tokenizer_for = lambda name: tokenizer_for("byte" if name == "Qwen/Qwen3-0.6B" else name)
+    dew.data.text.tokenizer_for = lambda name: tokenizer_for("byte" if name in decoders else name)
     load, generation = PretrainedDecoder.load.__func__, PretrainedDecoder.text_generation
 
     def tiny(cls, name, **options):
         fixture = ROOT / "tests/fixtures/hf/qwen3-tiny"
-        return load(cls, fixture if name == "Qwen/Qwen3-0.6B" else name, **options)
+        return load(cls, fixture if name in decoders else name, **options)
 
     # The fixture has no tokenizer of its own.
     def byte_text(self, **options):
@@ -351,24 +371,13 @@ def main():
     parser.add_argument("--section", choices=SECTIONS, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--topology-only", action="store_true")
-    parser.add_argument("--no-profile", action="store_true")
     options = parser.parse_args()
-    global PROFILE
-    PROFILE = not options.no_profile
     out = options.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     if options.smoke:
         offline(out)
     os.chdir(out)
-    if options.topology_only:
-        from dew import MeshSpec
-        jax.config.update("jax_num_cpu_devices", 4)
-        mesh = MeshSpec(fsdp=2, tensor=2).build()
-        result = {"axes": dict(mesh.shape), "devices": [device.id for device in mesh.devices.flat],
-                  "backend": jax.default_backend(), "training": False}
-    else:
-        result = SECTIONS[options.section]()
+    result = SECTIONS[options.section]()
     assert all(np.isfinite(x).all() for x in jax.tree.leaves(result) if isinstance(x, np.ndarray))
     Path("result.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
