@@ -50,7 +50,7 @@ def gelu_exact_torch(x: jax.Array) -> jax.Array:
 
 def gelu_tanh(x: jax.Array) -> jax.Array:
     """`0.5 * x * (1 + tanh(sqrt(2 / pi) (x + 0.044715 x^3)))` in at least fp32, in `x`'s dtype."""
-    return jax.nn.gelu(x.astype(at_least_fp32(x.dtype)), approximate=True).astype(x.dtype)
+    return jax.nn.gelu(x, approximate=True)
 
 
 def quick_gelu(x: jax.Array) -> jax.Array:
