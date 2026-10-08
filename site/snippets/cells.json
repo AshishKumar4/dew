@@ -1,6 +1,24 @@
 {
 	"about": "Where Run on the landing page runs each cell of framework.py: on the live pool's training contexts, or in a Colab notebook (site/notebooks/landing/) where it does not fit a pool host. keep names the files a cell writes that the page shows beside its recording.",
-	"pool": ["lm", "jepa", "finetune", "serving", "formats", "decide", "diffusion", "mesh", "grpo", "reliability", "profile"],
-	"colab": ["pretrained"],
-	"keep": {"grpo": ["tracking/scalars.jsonl"]}
+	"pool": [
+		"lm",
+		"jepa",
+		"finetune",
+		"decide",
+		"diffusion",
+		"mesh",
+		"grpo",
+		"reliability",
+		"profile"
+	],
+	"colab": [
+		"pretrained",
+		"serving",
+		"formats"
+	],
+	"keep": {
+		"grpo": [
+			"tracking/scalars.jsonl"
+		]
+	}
 }

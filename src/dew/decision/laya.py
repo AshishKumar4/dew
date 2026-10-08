@@ -122,14 +122,12 @@ class LayaCheckpoint:
         """Return whether `name_or_dir` (in `subfolder`) holds a Laya checkpoint.
 
         A Laya checkpoint has an `rl_agent_config.json` next to the weights. For a
-        Hub repo id, it asks the Hub without downloading anything.
+        Hub repo id, it asks the Hub without downloading anything (`sources.has_file`).
         """
         config = f"{subfolder}/{CONFIG_FILE}" if subfolder else CONFIG_FILE
         if Path(name_or_dir).is_dir():
             return (Path(name_or_dir) / config).is_file()
-        from huggingface_hub import file_exists
-
-        return file_exists(str(name_or_dir), config, revision=revision)
+        return sources.has_file(str(name_or_dir), config, revision=revision)
 
     @classmethod
     def load(cls, name_or_dir: str | Path = "convaiinnovations/laya", *, subfolder: str | None = None,
