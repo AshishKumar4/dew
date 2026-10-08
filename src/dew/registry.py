@@ -334,10 +334,12 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     """
     with _reading(value):
         built = _rebuilt(annotation, value, dtypes=dtypes)
-    witness: type[ValueT] = typing.get_origin(annotation) or annotation
+    # A union is its own witness: the value is any one of its members.
+    union = typing.get_origin(annotation) in (Union, types.UnionType)
+    witness = annotation if union else typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
-        raise ValueError(f"{value!r} builds {type(built).__name__}, "
-                         f"not the {witness.__name__} the field declares")
+        declared = annotation if union else witness.__name__
+        raise ValueError(f"{value!r} builds {type(built).__name__}, not the {declared} the field declares")
     return built
 
 
