@@ -24,6 +24,20 @@ from .distributed import MeshSpec, shard_batch
 
 
 @dataclass(frozen=True)
+class EvalSuite:
+    """A validation split `fit` scores with its own metrics on its own cadence.
+
+    Empty `metrics` scores fit's, and `every` None scores it on fit's
+    `eval_every`. Every suite is also scored at a checkpoint that ranks the
+    run's steps and at the end, so no ranking reads an earlier score.
+    """
+
+    data: Reader
+    metrics: Sequence[Metric] = ()
+    every: int | None = None
+
+
+@dataclass(frozen=True)
 class Evaluation:
     """The result of one evaluation, with its previews kept on process 0.
 
@@ -132,6 +146,29 @@ def _artifacts(value: Artifacts | None) -> tuple[Artifact, ...]:
     return () if value is None else value if isinstance(value, tuple) else (value,)
 
 
+class _LossSums:
+    """The validation loss's statistics, summed on the devices in batch order,
+    and read once after the split, every rank agreeing on the value."""
+
+    def __init__(self) -> None:
+        self._total = None
+
+    def add(self, statistics) -> None:
+        if statistics is None:
+            return
+        self._total = (statistics if self._total is None
+                       else jax.tree.map(lambda total, value: total + value, self._total, statistics))
+
+    def value(self, objective: Objective[Loss, Effects]) -> float | None:
+        if self._total is None:
+            return None
+        hosted = collective_host(self._total, phase="validation loss")
+        value, valid = jax.device_get(objective._validation_reduction(jax.device_put(hosted)))
+        if not bool(valid) or not np.isfinite(float(value)):
+            raise ValueError("validation loss has no finite statistical support")
+        return float(value)
+
+
 class _Accumulators:
     """Each metric's running accumulator over the batches scored so far.
 
@@ -225,7 +262,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
     its peers at every collective.
     """
     summaries = _Accumulators()
-    loss_stats = None
+    loss_sums = _LossSums()
     scores: dict[str, float] = {}
     previews: tuple[Artifact, ...] = ()
     source = iterator = None
@@ -263,11 +300,7 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                         lambda batch=batch, scored=scored: _dispatched(
                             objective, variables, loss_variables, batch, context, scored,
                             loss=loss, evaluate=bool(metrics), score_key=score_key))
-                    if statistics is not None:
-                        # The statistics stay on the devices, summed there in
-                        # batch order, and come home once after the split.
-                        loss_stats = statistics if loss_stats is None else jax.tree.map(
-                            lambda total, value: total + value, loss_stats, statistics)
+                    loss_sums.add(statistics)
                     if metrics:
                         produced = _merged(produced, batch, held, scored, metrics=metrics,
                                            summaries=summaries, root=root)
@@ -285,13 +318,9 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
         records = sum({int(index): int(count) for index, count in shares}.values())
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
-            if loss_stats is not None:
-                loss_stats = collective_host(loss_stats, phase="validation loss")
-            if loss_stats is not None and f'{split}/loss' not in scores:
-                value, valid = jax.device_get(objective._validation_reduction(jax.device_put(loss_stats)))
-                if not bool(valid) or not np.isfinite(float(value)):
-                    raise ValueError("validation loss has no finite statistical support")
-                scores[f'{split}/loss'] = float(value)
+            loss_value = loss_sums.value(objective)
+            if loss_value is not None and f'{split}/loss' not in scores:
+                scores[f'{split}/loss'] = loss_value
     finally:
         _close_source(iterator if iterator is not None else source)
     return scores, previews, scored, records

@@ -7,7 +7,7 @@ import dataclasses
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
-from .dataset import Batch, DataPartition, Dataset, DatasetSpec, Loading, Tokenize, tokenized
+from .dataset import Batch, DataPartition, Dataset, DatasetSpec, Tokenize, tokenized
 
 if TYPE_CHECKING:
     from .online_loader import Fetch
@@ -35,15 +35,12 @@ class OnlineImages(DatasetSpec):
     sources: tuple[str, ...] = ()
     image_size: int = 256
     min_image_size: int = 128
-    loading: Loading = dataclasses.field(
-        default=Loading(workers=16, threads=512, worker_buffer=20), kw_only=True)
-    """The settings of this spec's own fetch pool, which is not a grain reader.
-
-    `workers` and `threads` size the pool, `worker_buffer` is how many
-    batches the fetchers run ahead, and `read_buffer` is not used. The
-    default differs from grain's, which is sized for file reads and not for
-    a pool waiting on urls.
-    """
+    workers: int = dataclasses.field(default=16, kw_only=True)
+    """Fetcher processes; a pool waiting on urls, not a grain reader."""
+    threads: int = dataclasses.field(default=512, kw_only=True)
+    """Fetches one worker keeps in flight."""
+    prefetch: int = dataclasses.field(default=20, kw_only=True)
+    """Batches the fetchers run ahead of the step."""
     timeout: int = 15
     retries: int = 3
 
@@ -72,8 +69,7 @@ class OnlineImages(DatasetSpec):
             return UrlStream(
                 rows.shard(num_shards=partition.count, index=partition.index),
                 batch=partition.rows(batch), fetch=self.fetch(),
-                workers=self.loading.workers, threads=self.loading.threads,
-                prefetch=self.loading.worker_buffer)
+                workers=self.workers, threads=self.threads, prefetch=self.prefetch)
 
         return Dataset(train=tokenized(stream, tokenize), val=None,
                        records=len(rows), batch=batch)

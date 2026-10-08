@@ -44,6 +44,7 @@ from dew.nn.protocols import RequiresText
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
+    TEACHER,
     Aux,
     Batch,
     EMASpec,
@@ -78,9 +79,6 @@ UNCERTAINTY = "loss_uncertainty"
 
 FAKE_SCORE = "fake_score"
 """Where rCM's fake score network lives in `params` and `constants`."""
-
-TEACHER = "teacher"
-"""The collection of a distilling objective's frozen teacher variables."""
 
 DISCRIMINATOR = "discriminator"
 """Where an adversarial objective's discriminator heads live in `params`."""

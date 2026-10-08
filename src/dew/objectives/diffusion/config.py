@@ -24,7 +24,7 @@ from dew.inputs import Condition, Field, InputSpec, rebuild
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import FROZEN, Variables, merge
+from dew.objectives.base import Variables, merge
 from dew.registry import (
     Configured,
     DtypeName,
@@ -313,25 +313,6 @@ class DiffusionRunConfig(RunConfig):
     def context(self) -> TextCondition | AudioCondition | None:
         """Return the condition the model reads, text or audio, if any."""
         return self.text if self.text is not None else self.audio
-
-    @property
-    def parameter_roots(self) -> tuple[tuple[str, ...], ...]:
-        """Return which parts of the variables tree this config builds own which parameters."""
-        roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
-        if self.pretrained is not None:
-            # Every published pipeline's conditioner owns a bare tree.
-            from dew.inputs.diffusion import DiffusionConditioner
-
-            return (*roots, ("encoders", DiffusionConditioner.keyword), ("autoencoder",))
-        if self.context is not None:
-            encoder = encoders[self.context.encoder]
-            prefix = ("encoders", encoder.keyword)
-            collections = encoder.parameter_collections
-            roots.extend((prefix,) if collections is None else
-                         ((*prefix, collection) for collection in collections))
-        if self.autoencoder is not None:
-            roots.append(("autoencoder",))
-        return tuple(roots)
 
     def build(self, *, variables: Variables | None = None) -> DiffusionObjective:
         """Build the objective, with each component built around its parameters.
