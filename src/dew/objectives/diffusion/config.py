@@ -26,6 +26,7 @@ from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import Variables, merge
 from dew.registry import (
+    Configured,
     DtypeName,
     datasets,
     dtype_name,
@@ -284,21 +285,22 @@ class DiffusionRunConfig(RunConfig):
             return Field("image", (spec.image_size, spec.image_size, 3))
         raise ValueError(f"a diffusion run trains on image or video datasets, not {type(spec).__name__}")
 
-    def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
-        """Return the fields the registry builds the model from.
+    def model_fields(self, autoencoder: AutoEncoder | None) -> dict[str, Configured]:
+        """Return the fields the run derives for the model, which `ModelConfig.build`
+        takes over the model's `arguments`.
 
-        These are the model's `arguments`, plus the channels the model denoises when
-        the architecture takes them as `output_channels`. The published families name
-        theirs as their sources do, in `model.fields`. On the model those build, an
-        `IntervalModel` embeds the duration under an interval process, and MeanFlow,
-        whose loss differentiates in time, turns a `TimeScaled` model's time features
-        at `SMOOTH_TIME_SCALE` unless `model.fields` names a scale.
+        These are the channels the model denoises when the architecture takes them
+        as `output_channels`. The published families name theirs as their sources
+        do, in `model.fields`. On the model those build, an `IntervalModel` embeds
+        the duration under an interval process, and MeanFlow, whose loss
+        differentiates in time, turns a `TimeScaled` model's time features at
+        `SMOOTH_TIME_SCALE` unless `model.fields` names a scale.
         """
-        fields = dict(self.model.arguments)
+        fields: dict[str, Configured] = {}
         if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.name])}:
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
-        model = models.build(self.model.name, fields)
+        model = self.model.build(**fields)
         if isinstance(model, IntervalModel) and self.preset is not None:
             built = self.preset()
             fields["interval"] = isinstance(built, Process) and built.interval
@@ -424,7 +426,7 @@ class DiffusionRunConfig(RunConfig):
                 # __post_init__ holds audio to a VideoDataset.
                 assert self.audio is not None and isinstance(self.data, VideoDataset)
                 conditions[keyword] = self.audio.build(self.data, params=params, dtype=self._compute)
-        model = models.build(self.model.name, self.model_fields(autoencoder))
+        model = self.model.build(**self.model_fields(autoencoder))
         return model, conditions, autoencoder
 
     def _autoencoder_params(self, variables: Variables) -> Variables:
