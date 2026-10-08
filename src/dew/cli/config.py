@@ -10,12 +10,12 @@ from __future__ import annotations
 import dataclasses
 import json
 import os
-import tempfile
 import tomllib
 from pathlib import Path
 
 from filelock import FileLock
 
+from dew.files import write_atomically
 from dew.records import JSON
 
 DEFAULT_ZONES = ("us-central2-b", "europe-west4-a", "us-east1-d")
@@ -137,20 +137,7 @@ def _update_zone_cache(name: str, zone: str | None) -> None:
             if cache.get(name) == zone:
                 return
             cache[name] = zone
-        temporary = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=path.parent,
-                prefix=".zones-", suffix=".json", delete=False,
-            ) as stream:
-                temporary = Path(stream.name)
-                stream.write(json.dumps(cache, indent=2, sort_keys=True) + "\n")
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            if temporary is not None:
-                temporary.unlink(missing_ok=True)
+        write_atomically(path, json.dumps(cache, indent=2, sort_keys=True) + "\n")
 
 
 def cache_zone(name: str, zone: str) -> None:

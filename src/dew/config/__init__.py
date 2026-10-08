@@ -50,6 +50,7 @@ from dew.config.sweep import RandomSearch, Search, Space, _read, _write
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import Reader, ramped, record_argument
+from dew.files import write_atomically
 from dew.lora import LoRA, _Adapted, adapted
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
@@ -921,7 +922,8 @@ class RunConfig:
         path = epath.Path(directory)
         path.mkdir(parents=True, exist_ok=True)
         target = path / RUN_FILE
-        target.write_text(json.dumps(self.record(), indent=2, sort_keys=True))
+        # Whole or not at all: `load` reads it while a run is resumed.
+        write_atomically(target, json.dumps(self.record(), indent=2, sort_keys=True))
         return str(target)
 
     def record(self) -> dict[str, JSON]:
