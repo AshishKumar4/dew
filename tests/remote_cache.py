@@ -6,9 +6,16 @@ the suite spends most of its time in XLA: a parallelism-matrix cell ran 367
 s cold and 99 s with its compilations cached. With DEW_XLA_CACHE_URL and
 DEW_XLA_CACHE_TOKEN set (.armada.json), `install` puts `RemoteCache` over
 JAX's own cache: a local miss is fetched from the URL, the dew-xla-cache
-Worker (tools/armada/xla_cache), and a new entry is written to both. Entries
-are keyed under jax's and jaxlib's versions, the backend and the Python
-minor, beside JAX's own key of the program and its flags.
+Worker (tools/armada/xla_cache), and an entry that took at least `REMOTE_MS`
+to compile is written to both. Entries are keyed under jax's and jaxlib's
+versions, the backend and the Python minor, beside JAX's own key of the
+program and its flags.
+
+A test that runs a model eagerly compiles thousands of small programs, each
+quicker than `REMOTE_MS`, so never in the remote: asking the Worker about each
+one took a DeepSeek drafting test from 103 s to 962 s. So the remote also
+keeps the name of each program it holds (`names/<module>`), a process lists
+those names once, and `get` asks only about a program of one of them.
 
 The remote can only make a task slower: a fetch or an upload that fails
 counts against it, and after `FAILURES` in a row it is left alone for the
@@ -19,14 +26,17 @@ exit.
 
 import atexit
 import concurrent.futures
+import json
 import logging
 import os
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 FAILURES = 3
+REMOTE_MS = 1000
 TIMEOUT_SECONDS = 10.0
 DRAIN_SECONDS = 60.0
 MAX_BYTES = 256 * 1024 * 1024
@@ -46,6 +56,7 @@ class RemoteCache:
         self.uploads = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="xla-cache")
         self.pending: set[concurrent.futures.Future] = set()
         self.fetched = self.uploaded = 0
+        self.names: set[str] = set()
 
     @property
     def available(self) -> bool:
@@ -64,7 +75,7 @@ class RemoteCache:
 
     def get(self, key: str):
         value = self.base.get(key)
-        if value is not None or not self.available:
+        if value is not None or not self.available or module(key) not in self.names:
             return value
         try:
             with self._request(key, "GET") as response:
@@ -82,9 +93,31 @@ class RemoteCache:
         self.base.put(key, value)
         return value
 
+    def load_names(self) -> None:
+        """The names of the programs the remote holds, a page of a thousand at a time."""
+        cursor = None
+        try:
+            while True:
+                fields = {"list": f"{self.prefix}/names/"} | ({"cursor": cursor} if cursor else {})
+                request = urllib.request.Request(f"{self.url}/?{urllib.parse.urlencode(fields)}",
+                                                 headers=self.headers)
+                with urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS) as response:
+                    page = json.load(response)
+                self.names.update(page["keys"])
+                cursor = page["cursor"]
+                if not cursor:
+                    return
+        except Exception as error:  # names that cannot be read leave the remote alone
+            with self.lock:
+                self.failures = FAILURES
+            logger.warning("the shared XLA cache's names are unreadable (%s); compiling without it", error)
+
     def _upload(self, key: str, value: bytes) -> None:
         try:
             self._request(key, "PUT", value).close()
+            if module(key) not in self.names:
+                self._request(f"names/{module(key)}", "PUT", b"1").close()
+                self.names.add(module(key))
         except Exception as error:  # an entry that does not reach the remote is compiled again elsewhere
             self._failed(error)
         else:
@@ -94,7 +127,7 @@ class RemoteCache:
 
     def put(self, key: str, value: bytes) -> None:
         self.base.put(key, value)
-        if self.available and len(value) <= MAX_BYTES:
+        if self.available and len(value) <= MAX_BYTES and compile_ms(value) >= REMOTE_MS:
             future = self.uploads.submit(self._upload, key, bytes(value))
             with self.lock:
                 self.pending.add(future)
@@ -110,6 +143,23 @@ class RemoteCache:
             pending = set(self.pending)
         concurrent.futures.wait(pending, timeout=seconds)
         self.uploads.shutdown(wait=False, cancel_futures=True)
+
+
+def module(key: str) -> str:
+    """The program's name in JAX's cache key, `<module>-<hash>`."""
+    return key.rsplit("-", 1)[0]
+
+
+def compile_ms(value: bytes) -> int:
+    """How long the entry `value` took to compile, as JAX records it in the entry's first bytes."""
+    from jax._src import compilation_cache
+
+    try:
+        entry = compilation_cache.decompress_executable(value)
+        return compilation_cache.extract_executable_and_time(entry)[1]
+    except Exception as error:  # an entry this cannot read stays local
+        logger.debug("a cache entry's compile time is unreadable: %s", error)
+        return 0
 
 
 def prefix() -> str:
@@ -133,6 +183,7 @@ def install(url: str, token: str) -> RemoteCache | None:
         if compilation_cache._cache is None or isinstance(compilation_cache._cache, RemoteCache):
             return None
         remote = RemoteCache(compilation_cache._cache, url, token, prefix())
+        remote.load_names()
         compilation_cache._cache = remote
     except Exception as error:  # a jax whose cache has moved runs on its local cache alone
         logger.warning("the shared XLA cache is not installed: %s", error)
@@ -141,15 +192,9 @@ def install(url: str, token: str) -> RemoteCache | None:
     return remote
 
 
-LOCAL_MAX_BYTES = 4 * 1024 ** 3
-"""The local cache's own LRU bound under the remote; the remote's is the bucket's 14-day expiry."""
-
-
 def install_from_environment() -> RemoteCache | None:
+    """`install` where DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN are set. The local cache keeps no
+    LRU bound: a task's container is short-lived, and the bound makes JAX lock and stamp its index on
+    every compilation. The remote's bound is the bucket's 14-day expiry."""
     url, token = os.environ.get("DEW_XLA_CACHE_URL"), os.environ.get("DEW_XLA_CACHE_TOKEN")
-    if not (url and token):
-        return None
-    import jax
-
-    jax.config.update("jax_compilation_cache_max_size", LOCAL_MAX_BYTES)
-    return install(url, token)
+    return install(url, token) if url and token else None
