@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data import TokenWindows
 from dew.data.text import HFTokenizer, tokenizer_for
-from dew.registry import objectives, resolve_dtype
+from dew.registry import DtypeName, objectives, resolve_dtype
 from dew.sampling.text import Sampling
 
 from .objective import Perplexity, Samples
@@ -65,8 +65,13 @@ class LMRunConfig(RunConfig):
     layout. A run records a hub repo as `repo@commit`, with the commit it
     resolved to. The checkpoint sets the architecture, so of its fields
     --model.max-seq-len alone may be set."""
+    pretrained_param_dtype: DtypeName = "float32"
+    """The dtype `pretrained`'s parameters are stored and trained in."""
 
     def __post_init__(self) -> None:
+        if self.pretrained is None and self.pretrained_param_dtype != "float32":
+            raise ValueError("--pretrained-param-dtype stores a --pretrained checkpoint's parameters; "
+                             "this run loads none")
         if self.objective.name not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
                                                                              "block_diffusion")):
             raise ValueError(
@@ -189,6 +194,7 @@ class LMRunConfig(RunConfig):
         name, revision = split_revision(self.pretrained)
         dtype = resolve_dtype(self.model.fields.get("dtype"))
         loaded = Pretrained.load(name, dtype=jnp.bfloat16 if dtype is None else dtype,
+                                 param_dtype=self.pretrained_param_dtype,
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
                                  max_seq_len=reach, revision=revision)
         if not same_vocabulary(written, loaded, name):
