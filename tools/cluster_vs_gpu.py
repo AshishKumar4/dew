@@ -99,12 +99,76 @@ def collectives(hlo: str) -> dict:
     return found
 
 
+def compiled_step(executable) -> dict:
+    """A compiled step's collectives (`collectives`) and the memory it holds."""
+    memory = executable.memory_analysis()
+    return {"collectives": collectives(executable.as_text()), "temp_GB": memory.temp_size_in_bytes / 1e9,
+            "arguments_GB": memory.argument_size_in_bytes / 1e9}
+
+
 def mesh_of(layout: dict, devices: int) -> dict:
     """The shape's layout over `devices`: an axis given as -1 takes every device."""
     return {axis: devices if size == -1 else size for axis, size in layout.items()}
 
 
-def main() -> None:
+class Outer:
+    """DiLoCo's outer loop: the hosts' parameters averaged in one all-reduce of one flat buffer, and
+    one Nesterov SGD step on the mean change (the pseudo-gradient) that every host restarts from.
+    Each host keeps its own inner optimizer state."""
+
+    def __init__(self, params):
+        import jax
+        import numpy as np
+        import optax
+        from jax.flatten_util import ravel_pytree
+        from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+        hosts = Mesh(np.array(jax.devices()), ("hosts",))
+        self.rows = NamedSharding(hosts, PartitionSpec("hosts"))
+        self.mean = jax.jit(lambda rows: rows.mean(0), out_shardings=NamedSharding(hosts, PartitionSpec()))
+        self.optimizer = optax.sgd(0.7, momentum=0.9, nesterov=True)
+        self.params = ravel_pytree(params)[0]
+        self.state = self.optimizer.init(self.params)
+        self.synced: list[dict] = []
+
+    def sync(self, state, step: int, loss: float, stepped: float):
+        """`state` restarted from the outer step, the hosts' mean of `loss`, and the hosts' mean
+        seconds so far: `stepped` of steps and every sync's."""
+        import jax
+        import numpy as np
+        import optax
+        from jax.flatten_util import ravel_pytree
+
+        start = time.monotonic()
+        local, unravel = ravel_pytree(state.variables["params"])
+        spent = stepped + sum(row["sync_s"] for row in self.synced)
+        rows = jax.make_array_from_process_local_data(
+            self.rows, np.concatenate([np.asarray(local), [loss, spent]]).astype(np.float32)[None])
+        mean = np.asarray(self.mean(rows).addressable_data(0))
+        updates, self.state = self.optimizer.update(self.params - mean[:-2], self.state, self.params)
+        self.params = optax.apply_updates(self.params, updates)
+        params = jax.tree.map(lambda new, old: jax.device_put(new, old.sharding), unravel(self.params),
+                              state.variables["params"])
+        self.synced.append({"step": step, "loss": float(mean[-2]), "sync_s": time.monotonic() - start})
+        return (state.replace(variables={**state.variables, "params": params}), float(mean[-2]),
+                float(mean[-1]) + self.synced[-1]["sync_s"])
+
+
+def joined_pool(world: int, rank: int) -> float:
+    """The seconds this process took to join a pool of `world`, one process a host at rank0, as
+    `dew launch` leaves one; none on one host."""
+    began = time.monotonic()
+    if world > 1:
+        os.environ.update({"DEW_PROCESS_COUNT": str(world), "DEW_PROCESS_ID": str(rank),
+                           "JAX_COORDINATOR_ADDRESS": "rank0:8476",
+                           "JAX_CPU_COLLECTIVES_IMPLEMENTATION": "gloo"})
+    from dew.training.runtime import prepare_process
+
+    prepare_process(multi_host=world > 1)
+    return time.monotonic() - began
+
+
+def arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
     parser.add_argument("--steps", type=int, default=2000)
@@ -115,21 +179,20 @@ def main() -> None:
                         help="print the step's collectives and memory, and train nothing")
     parser.add_argument("--target", type=float, help="the loss to stop at; the shape's own by default")
     parser.add_argument("--dtype", default=None, help="compute dtype; float32 on CPU, bfloat16 on a GPU")
+    parser.add_argument("--diloco", type=int, metavar="H",
+                        help="DiLoCo (Douillard et al. 2023): each host trains its own copy on its own "
+                             "share of every global batch, and every H steps the hosts sync (`Outer`)")
     parser.add_argument("--cache", type=Path,
                         default=Path(os.environ.get("TMPDIR", "/tmp")) / "cluster-bench")
     parser.add_argument("--out", type=Path, required=True)
-    args = parser.parse_args()
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = arguments()
     world = int(os.environ.get("ARMADA_WORLD", "1"))
     rank = int(os.environ.get("ARMADA_RANK", "0"))
-    began = time.monotonic()
-    if world > 1:
-        os.environ.update({"DEW_PROCESS_COUNT": str(world), "DEW_PROCESS_ID": str(rank),
-                           "JAX_COORDINATOR_ADDRESS": "rank0:8476",
-                           "JAX_CPU_COLLECTIVES_IMPLEMENTATION": "gloo"})
-    from dew.training.runtime import prepare_process
-
-    prepare_process(multi_host=world > 1)
-    joined = time.monotonic() - began
+    joined = joined_pool(world, rank)
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -156,22 +219,26 @@ def main() -> None:
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),
                       optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0), mesh=mesh,
                       layout=Layout(), checkpoints=None, tracker=None)
+    if args.diloco:
+        # Each host's own devices: its steps sum nothing over the hosts.
+        trainer.device_mesh = MeshSpec().build(jax.local_devices())
+        partition = DataPartition(index=rank, count=world)
+    else:
+        # Each process reads its own rows of every global batch, which shard_batch assembles.
+        partition = DataPartition.of(trainer.device_mesh)
     state, _, _ = trainer.place()
     parameters = sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"]))
-    # Each process reads its own rows of every global batch, which shard_batch assembles.
-    batches = iter(data.train(DataPartition.of(trainer.device_mesh)))
+    batches = iter(data.train(partition))
     compiled, losses, seconds, reached, compile_seconds = None, [], [], None, 0.0
+    outer = Outer(state.variables["params"]) if args.diloco else None
     for step in range(1, args.steps + 1):
         batch = shard_batch(trainer.device_mesh, next(batches))
         start = time.monotonic()
         if compiled is None:
             compiled = trainer.compile(state, batch)
             compile_seconds = time.monotonic() - start
-            memory = trainer.executable.memory_analysis()
             if rank == 0:
-                print(json.dumps({"collectives": collectives(trainer.executable.as_text()),
-                                  "temp_GB": memory.temp_size_in_bytes / 1e9,
-                                  "arguments_GB": memory.argument_size_in_bytes / 1e9}), flush=True)
+                print(json.dumps(compiled_step(trainer.executable)), flush=True)
             if args.compile_only:
                 args.out.with_suffix(".hlo.txt").write_text(trainer.executable.as_text())
                 return
@@ -182,6 +249,18 @@ def main() -> None:
         losses.append(loss)
         if rank == 0 and (step % 10 == 0 or step < 5):
             print(f"step {step} loss {loss:.4f} {seconds[-1]:.3f} s", flush=True)
+        if outer is not None:
+            if step % args.diloco:
+                continue
+            state, loss, elapsed = outer.sync(state, step, np.mean(losses[-args.diloco:]), sum(seconds))
+            if rank == 0:
+                print(f"sync at step {step}: hosts' loss {loss:.4f} at {elapsed:.0f} s", flush=True)
+            if loss <= target:
+                reached = {"step": step, "seconds": elapsed}
+                break
+            if elapsed > args.seconds:
+                break
+            continue
         if reached is None and len(losses) >= 10 and sum(losses[-10:]) / 10 <= target:
             reached = {"step": step, "seconds": sum(seconds)}
             break
@@ -198,7 +277,8 @@ def main() -> None:
             "processes": jax.process_count(), "devices": jax.device_count(), "dtype": dtype,
             "parameters": int(parameters), "batch": batch_size, "seq_len": SEQ_LEN, "target": target,
             "join_seconds": joined, "compile_seconds": compile_seconds, "steps": len(losses),
-            "reached": reached, "losses": losses, "step_seconds": seconds}))
+            "reached": reached, "losses": losses, "step_seconds": seconds,
+            "synced": None if outer is None else outer.synced}))
         print(json.dumps({"shape": args.shape, "devices": jax.device_count(), "reached": reached,
                           "median_step_s": sorted(seconds)[len(seconds) // 2]}), flush=True)
 
