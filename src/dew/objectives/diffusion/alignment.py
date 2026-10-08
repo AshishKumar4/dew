@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from dew.nn.attention import l2_normalized
 from dew.nn.blocks import torch_bicubic_resize
 from dew.objectives.base import Batch, Objective, Variables
 
@@ -180,11 +181,8 @@ class Alignment:
         projected = self.module(targets.shape[-1]).apply(projector, hidden)
         assert isinstance(projected, jax.Array)
         projected = projected.astype(jnp.promote_types(projected.dtype, jnp.float32))
-
-        def unit(value):
-            return value / jnp.maximum(jnp.linalg.norm(value, axis=-1, keepdims=True), 1e-12)
-
-        return -Objective.row_mean(jnp.sum(unit(projected) * unit(targets), axis=-1), batch).mean()[0]
+        return -Objective.row_mean(jnp.sum(l2_normalized(projected) * l2_normalized(targets), axis=-1),
+                                   batch).mean()[0]
 
     def captures(self, module: nn.Module, method: str) -> bool:
         """Return whether `capture_intermediates` should keep this call: True for `layer`'s output."""

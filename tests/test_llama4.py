@@ -17,7 +17,9 @@ import pytest
 
 from dew.nn.attention import chunk_mask
 from dew.nn.backbones.decoder_block import GatedMLP
-from dew.nn.llama4 import Llama4Attention, temperature_scale
+from dew.nn.llama4 import Llama4Mixer
+from dew.nn.mixer_base import MixerContext
+from dew.nn.mixers.attention import temperature_scale
 from dew.nn.moe import SparseMLP
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "llama4"
@@ -29,13 +31,13 @@ def fixture(name: str) -> dict:
         return {key: np.asarray(value) for key, value in data.items()}
 
 
-def attention(**overrides) -> Llama4Attention:
-    settings: dict[str, Any] = {
-        "emb_features": HIDDEN, "num_heads": HEADS, "num_kv_heads": KV_HEADS,
-        "head_dim": HEAD_DIM, "max_seq_len": 32, "rope_theta": 500000.0,
-        "floor_scale": 4.0, "attn_scale": 0.1}
-    settings.update(overrides)
-    return Llama4Attention(**settings)
+def attention(*, attention_chunk_size: int | None = None, **overrides):
+    """The layer the `llama4` kind builds, with the fixture's geometry."""
+    settings: dict[str, Any] = {"floor_scale": 4.0, "attn_scale": 0.1, **overrides}
+    context = MixerContext(emb_features=HIDDEN, num_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=HEAD_DIM,
+                           max_seq_len=32, rope_theta=500000.0, attention_chunk=attention_chunk_size,
+                           qk_norm=False)
+    return Llama4Mixer(**settings).build(context)()
 
 
 def attention_variables(tensors: dict) -> dict:

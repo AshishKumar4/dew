@@ -286,6 +286,24 @@ def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
         np.testing.assert_array_equal(np.asarray(held), np.asarray(leaf))
 
 
+def test_a_pretrained_run_stores_its_parameters_in_the_dtype_it_names(tmp_path):
+    """`--pretrained-param-dtype bfloat16` loads the checkpoint's parameters
+    as bf16 and trains them so, and the run records it; with no
+    `--pretrained` the field is refused rather than ignored."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    config = pretrained_config(tokens, checkpoint, "--trainer.steps", "1", "--max-new-tokens", "0",
+                               "--trainer.name", "bf16", "--pretrained-param-dtype", "bfloat16")
+    state = config.run()
+    params = jax.tree.leaves(state.variables["params"])
+    floating = [leaf for leaf in params if jnp.issubdtype(leaf.dtype, jnp.floating)]
+    assert floating and all(leaf.dtype == jnp.bfloat16 for leaf in floating)
+    record = json.loads((tmp_path / "runs" / "bf16" / "run.json").read_text())["fields"]
+    assert record["pretrained_param_dtype"] == "bfloat16"
+    with pytest.raises(ValueError, match="this run loads none"):
+        LMRunConfig.cli(recipe_args(tokens, "--pretrained-param-dtype", "bfloat16"))
+
+
 def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     """`--pretrained <decoder> --lora.rank 4 --lora.modules q_proj`: the recipe
     binds the adapter to the loaded weights, two steps move every factor and

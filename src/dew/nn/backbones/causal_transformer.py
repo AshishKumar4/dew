@@ -832,6 +832,17 @@ class CausalTransformer(nn.Module):
             dtype=self.dtype,
             precision=self.precision)
         if self.mlp == 'swigluoai':
+            # GPT OSS's experts and router are its own (`GptOssMLP`): a knob they do not read is refused.
+            plain = Mixture(experts=mixture.experts)
+            ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
+                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
+                                         'expert_features', 'hash_layers', 'latent_features', 'latent_norm',
+                                         'media_bias')
+                       if getattr(mixture, name) != getattr(plain, name)]
+            ignored += ['swiglu_limit'] if self.swiglu_limit is not None else []
+            if ignored:
+                raise ValueError(f"swigluoai's experts take no {', '.join(ignored)}: GPT OSS routes with its "
+                                 f"own biased softmax and clamps at 7.0")
             routed = functools.partial(
                 GptOssMLP, hidden_size=self.emb_features,
                 intermediate_size=self.hidden_features,

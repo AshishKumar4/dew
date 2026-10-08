@@ -174,7 +174,7 @@ def test_only_supported_bfloat16_pools_take_the_paged_kernel(monkeypatch, backen
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
 
     def kernel(layout, dtype):
-        return KVStore(nn.Module(), layout, 2, 32, 2, 64, jnp.dtype(dtype)).kernel()
+        return KVStore(nn.Module(), layout, 2, 2, 64, jnp.dtype(dtype)).kernel()
 
     assert kernel(KVCache(page_size=16), jnp.bfloat16)
     assert kernel(KVCache(page_size=64), jnp.bfloat16) == (backend == "tpu")

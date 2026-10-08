@@ -17,6 +17,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.typing import DTypeLike
 
 from dew.nn.attention import (
     RMSNorm,
@@ -52,6 +53,14 @@ from dew.nn.rope import (
     yarn_rope_freqs,
 )
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
+
+
+def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
+    """Llama 4's query multiplier at each absolute position (arXiv 2501.19399),
+    `log1p(floor((p + 1) / floor_scale)) * attn_scale + 1` in `dtype`, so the
+    first `floor_scale` positions scale by 1."""
+    positions = jnp.asarray(positions, dtype)
+    return jnp.log1p(jnp.floor((positions + 1.0) / floor_scale)) * attn_scale + 1.0
 
 
 def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Array:
@@ -126,6 +135,7 @@ class CausalSelfAttention(nn.Module):
     rope_scaling: RopeScaling | LongRopeScaling | None = None
     qk_norm: bool = True
     qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
+    qk_norm_weight: bool = True  # False: Llama 4's weightless L2 norm (Llama4TextL2Norm)
     v_norm: bool = False
     norm_eps: float = 1e-5
     scale_offset: bool = False
@@ -138,6 +148,9 @@ class CausalSelfAttention(nn.Module):
     attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
     o_proj_bias: bool | None = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: float | None = None  # None: the kernel's own 1/sqrt(head_dim)
+    temperature_tuning: tuple[float, float] | None = None
+    """Llama 4's (floor_scale, attn_scale): an unrotated layer scales each
+    query by its position (`temperature_scale`)."""
     attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
     yarn: YarnScaling | None = None
@@ -222,8 +235,8 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError(
                     f"qk_norm_scope is 'head' or 'projection', got {self.qk_norm_scope!r}")
             norm = functools.partial(
-                RMSNorm, epsilon=self.norm_eps, scale_offset=self.scale_offset,
-                scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+                RMSNorm, epsilon=self.norm_eps, with_scale=self.qk_norm_weight,
+                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast, dtype=self.dtype)
             self.q_norm = norm(name='q_norm')
             if not self.kv_shared:
                 self.k_norm = norm(name='k_norm')
@@ -469,6 +482,11 @@ class CausalSelfAttention(nn.Module):
             # the checkpoint asks for, which rotate folds in otherwise.
             if self.attention_scale is not None:
                 query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
+            if self.temperature_tuning is not None:
+                scale = temperature_scale(positions, *self.temperature_tuning,
+                                          dtype=at_least_fp32(query.dtype))
+                query = query * (scale[..., None, None] if scale.ndim == 2
+                                 else scale[None, :, None, None]).astype(query.dtype)
         else:
             freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query)
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the

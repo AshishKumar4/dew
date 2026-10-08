@@ -40,7 +40,8 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew.interop import sources
 from dew.interop.pickles import host_view
-from dew.interop.pretrained import AUTO, PretrainedFallback, source_processor
+from dew.interop.pretrained import PretrainedFallback, source_processor
+from dew.interop.weights import AUTO
 from dew.nn.protocols import OutputTable
 from dew.nn.sharding import LogicalAxes, logical_spec, parameter_path
 from dew.registry import resolve_dtype

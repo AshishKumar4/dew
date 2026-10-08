@@ -97,14 +97,7 @@ def parameter_gaps(arrays, gradients, layout, prefix: str) -> dict[str, float]:
     for key in arrays.files:
         if not key.startswith(prefix):
             continue
-        entry = layout["transformer/" + key[len(prefix):]]
-        node = gradients[0]
-        for step in entry.paths[0][1:]:
-            node = node[step]
-        value = np.asarray(node)
-        if entry.transpose is not None:
-            value = value.transpose(entry.transpose)
-        assert value.shape == tuple(entry.shape), key
+        value = np.asarray(layout["transformer/" + key[len(prefix):]].export({"params": gradients[0]}))
         gaps[key[len(prefix):]] = relative_gap(value, arrays[key])
     assert gaps, prefix
     return gaps
