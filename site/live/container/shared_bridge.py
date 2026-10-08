@@ -273,7 +273,12 @@ class Gateway:
 
     async def websocket(self, socket):
         session = socket.request.path.split("/")[2]
-        cells = await self.create(session)
+        try:
+            cells = await self.create(session)
+        except Exception as error:
+            # 1013 is "try again later"; the reason says why, within the frame's 123 bytes.
+            await socket.close(1013, str(error).encode()[:123].decode(errors="ignore"))
+            return
         if session in self.connected:
             await socket.close(1008, "this context is already connected")
             return

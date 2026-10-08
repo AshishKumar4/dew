@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 
 from websockets.asyncio.client import connect
+from websockets.exceptions import ConnectionClosed
 
 TEXT = ("from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sampling\n"
         "model = PretrainedDecoder.load('HuggingFaceTB/SmolLM2-135M-Instruct', dtype='float32', "
@@ -46,9 +47,26 @@ def model_process():
     raise AssertionError("the model process is not running")
 
 
+def memory():
+    """The host's memory and what each process group holds, in MiB, for a failure's message."""
+    lines = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
+    held = {}
+    for status in Path("/proc").glob("[0-9]*/status"):
+        try:
+            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
+            uid, rss = int(fields["Uid"].split()[1]), int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, KeyError, ValueError):
+            continue
+        held[uid] = held.get(uid, 0) + (rss >> 10)
+    return {"total": int(lines["MemTotal"].split()[0]) >> 10, "available": available(), "by_uid": held}
+
+
 async def page(headers):
     socket = await connect(f"ws://127.0.0.1:8888/contexts/{uuid.uuid4()}/ws", additional_headers=headers)
-    assert json.loads(await socket.recv())["type"] == "ready"
+    try:
+        assert json.loads(await socket.recv())["type"] == "ready"
+    except ConnectionClosed as closed:
+        raise AssertionError(f"the bridge refused a page: {closed.rcvd}; memory {memory()}") from None
     return socket
 
 
@@ -91,7 +109,7 @@ async def pressure(headers):
                "ValueError: the shared host is short of memory",
                "TimeoutError: this cell's Python context sent")
     unfinished = {name: errors for name, (status, errors) in seen.items() if status != "ok"}
-    report = f"{seen}; MiB available before {before}, now {available()}"
+    report = f"{seen}; MiB available before {before}, now {memory()}"
     assert unfinished, f"nothing was refused or stopped: {report}"
     assert all(errors and all(error.startswith(reasons) for error in errors)
                for errors in unfinished.values()), report
@@ -111,7 +129,8 @@ async def pressure(headers):
         await asyncio.sleep(0.5)
     assert not left, f"contexts left open after their pages closed: {left}"
     print(f"Memory pressure: {len(seen) - len(unfinished)} of 25 cells ran, the others were told why; "
-          f"the model process kept serving ({before} MiB available before).", flush=True)
+          f"the model process kept serving. Memory before: {before} MiB available; after: {memory()}",
+          flush=True)
 
 
 async def main():
