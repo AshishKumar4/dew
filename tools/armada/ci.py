@@ -25,8 +25,8 @@ running at its deadline, short of armada's own timeout, is interrupted and
 every row it holds is red, so a hang is graded with its stack dump rather
 than leaving the task without a verdict. Each row also carries its tests' own
 times, from which `durations` rewrites tests/test_durations.json: given green
-runs' verdicts (`armada verdict <sha> --json`), it records each test's least
-time as the floor's Python ran it.
+runs' verdicts (`armada verdict <sha> --json`), the newest first, it records
+each test of the newest at its least time as the floor's Python ran it.
 """
 
 import argparse
@@ -312,9 +312,10 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
 
 
 def durations(verdicts: list[dict]) -> dict[str, float]:
-    """Each test's least time over green runs' `verdicts`, as their floor's Python ran it: what it
-    takes where nothing slows it. A container can run three times as slowly as the rest of its run,
-    and a run's compilations can miss the shared cache, and neither moves a test's time."""
+    """Each test of the first of green runs' `verdicts`, the newest, at its least time over them all,
+    as their floor's Python ran it: what it takes where nothing slows it. A container can run three
+    times as slowly as the rest of its run, and a run's compilations can miss the shared cache, and
+    neither moves a test's time. A test the newest run did not have is gone."""
     times: dict[str, list[float]] = {}
     for verdict in verdicts:
         rows = verdict["rows"]
@@ -327,7 +328,9 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
         for row in floor:
             for node, seconds in row["tests"].items():
                 times.setdefault(node, []).append(seconds)
-    return {node: round(min(seconds), 3) for node, seconds in sorted(times.items())}
+    newest = {node for row in verdicts[0]["rows"] if row["name"].startswith(f"{PYTHONS[0]}:")
+              for node in row["tests"]}
+    return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
 
 
 def main() -> int:
@@ -345,7 +348,7 @@ def main() -> int:
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     recording = operations.add_parser("durations")
     recording.add_argument("verdicts", type=Path, nargs="+",
-                           help="green runs' verdicts: armada verdict <sha> --json")
+                           help="green runs' verdicts, the newest first: armada verdict <sha> --json")
     args = parser.parse_args()
     if args.operation == "durations":
         recorded = durations([json.loads(path.read_text()) for path in args.verdicts])

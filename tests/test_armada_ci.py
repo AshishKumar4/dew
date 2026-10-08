@@ -180,9 +180,10 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
 
 
 def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
-    """`durations` records each test's least time over green verdicts' floor
-    rows, so a slow container or run moves nothing, and refuses a red run or
-    rows that carry no times."""
+    """`durations` records each test of the newest verdict at its least time
+    over green verdicts' floor rows, so a slow container or run moves nothing
+    and a test since removed is dropped, and refuses a red run or rows that
+    carry no times."""
     def verdict(x, y):
         return {"rows": [
             {"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": x}},
@@ -193,6 +194,10 @@ def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
         "tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
     assert ci.durations([verdict(1.5, 2.0), verdict(30.0, 60.0), verdict(1.0, 2.5)]) == {
         "tests/test_a.py::test_x": 1.0, "tests/test_a.py::test_y": 2.0}
+    removed = {"rows": [{"name": "3.12:tests/test_a.py", "exitCode": 0,
+                         "tests": {"tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_gone": 3.0}}]}
+    assert ci.durations([verdict(1.0, 2.0), removed]) == {
+        "tests/test_a.py::test_x": 0.5, "tests/test_a.py::test_y": 2.0}
     red = {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}
     with pytest.raises(SystemExit, match="red"):
         ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}])
