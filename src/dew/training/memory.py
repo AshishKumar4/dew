@@ -19,12 +19,12 @@ from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding
 
 from dew.data.dataset import rows_of
-from dew.nn.kernels.generation import device_generation
+from dew.nn.kernels.generation import KERNELS, device_generation
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.nn.sharding import mesh_axes
 from dew.objectives.base import Batch, Objective, Variables
 from dew.records import JSON, integers, json_value
-from dew.telemetry.devices import TRITON_GEMM_OFF_GENERATIONS, gpu_free_bytes, xla_flag
+from dew.telemetry.devices import gpu_free_bytes, xla_flag
 from dew.training.distributed import PARAMETER_AXES
 from dew.training.state import TrainState
 
@@ -62,7 +62,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
 
     Only an LM objective gives the tokens per row, its `seq_len`, so any other
     objective's frozen step runs apart. Triton GEMM fusions are turned off where
-    `TRITON_GEMM_OFF_GENERATIONS` measured a win and no module the step runs
+    `KERNELS['xla_triton_gemm']` measured a win and no module the step runs
     keeps them (`TritonGemm`).
     """
     generation = device_generation()
@@ -72,7 +72,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool) -> jax.stages.
             and not (frozen and small)):
         options['xla_gpu_dot_merger_threshold_mb'] = 0
     modules = [entry.module for entry in objective.program_key()]
-    if (generation in TRITON_GEMM_OFF_GENERATIONS and xla_flag('xla_gpu_enable_triton_gemm') is None
+    if (KERNELS['xla_triton_gemm'].get(generation) == 'off' and xla_flag('xla_gpu_enable_triton_gemm') is None
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
