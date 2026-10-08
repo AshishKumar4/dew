@@ -84,7 +84,10 @@ except OSError:
     pass
 else:
     raise AssertionError("a training context reached the network")
-for path in ("/opt/train/escape", "/opt/live/escape", "/work/../escape"):
+# The prepared cache is an overlay of the context's own (gateway_manager.py); training() checks
+# from outside that this write stayed in it.
+Path("/opt/train/escape").write_text("x")
+for path in ("/opt/live/escape", "/work/../escape"):
     try:
         Path(path).write_text("x")
     except OSError:
@@ -116,8 +119,9 @@ assert model.text_generation(sampling=Sampling(temperature=0))("ROMEO:", 4, key=
 
 
 def training():
-    """A training context reaches neither the network nor any path outside its scratch, reads the
-    prepared corpus offline, and says first what its caps changed."""
+    """A training context reaches neither the network nor any path outside its scratch and its
+    private overlay of the prepared cache, reads that cache offline, and says first what its
+    caps changed."""
     kernel = request("/api/kernels", {"name": "dew-train"})
     client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
     client.load_connection_file()
@@ -131,6 +135,7 @@ def training():
     finally:
         client.stop_channels()
         request("/api/kernels/" + kernel["id"], method="DELETE")
+    assert not pathlib.Path("/opt/train/escape").exists(), "a training context wrote the prepared cache"
 
 
 def cells():
