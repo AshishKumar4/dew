@@ -9,9 +9,10 @@ key is not pinned.
 from __future__ import annotations
 
 import os
-import tempfile
 from collections.abc import Sequence
 from pathlib import Path
+
+from dew.files import replacing
 
 
 def path() -> Path:
@@ -56,10 +57,9 @@ def write(name: str, entry: str) -> None:
     kept = _without(current, name)
     if kept and not kept.endswith("\n"):
         kept += "\n"
-    with tempfile.NamedTemporaryFile("w", dir=target.parent, delete=False) as stream:
-        stream.write(kept + entry)
-    os.chmod(stream.name, 0o600)
-    os.replace(stream.name, target)
+    with replacing(target) as written:
+        written.write_text(kept + entry)
+        os.chmod(written, 0o600)
 
 
 def forget(name: str) -> None:

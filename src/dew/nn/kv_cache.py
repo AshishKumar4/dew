@@ -49,7 +49,7 @@ KVDtype = Literal["int8", "float8_e4m3fn"]
 TABLE = "page_table"
 """A paged cache's per-row page table, `[rows, capacity // page_size]`."""
 CURSOR = "cache_index"
-"""The per-row count of tokens a cache holds (`attention._cache_positions`)."""
+"""The per-row count of tokens a cache holds (`attention.cache_positions`)."""
 POOLED = frozenset({"cached_key", "cached_value", "key_scale", "value_scale"})
 """The leaves a paged cache keeps in its shared pool rather than per row."""
 
@@ -442,12 +442,12 @@ class KVStore:
             return True
         if jax.default_backend() != "gpu":
             return False
-        from dew.nn.attention import _FORWARD_MODE
+        from dew.nn.attention import FORWARD_MODE
         from dew.nn.kernels import decode_attention
 
         query = jax.ShapeDtypeStruct((self.rows, self.kv_heads, self.head_dim), self.dtype)
         pages = jax.ShapeDtypeStruct((self.kv_heads, 1, page_size, self.head_dim), self.dtype)
-        return decode_attention.fits_paged(query, pages) and not _FORWARD_MODE.get()
+        return decode_attention.fits_paged(query, pages) and not FORWARD_MODE.get()
 
     def decode(self, query: jax.Array, lengths: jax.Array, softcap: float | None) -> jax.Array:
         """Attend one query per row `[rows, heads, head_dim]` to the first `lengths` slots of that row.

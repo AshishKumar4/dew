@@ -52,9 +52,9 @@ class LMRunConfig(RunConfig):
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""
-    sample_prompt: str = ""
+    prompt: str = ""
     """The prompt that validation samples continue; an empty prompt continues a newline."""
-    sample_tokens: int = 128
+    max_new_tokens: int = 128
     """The number of tokens generated per validation sample; 0 logs no text."""
     sampling: Sampling = dataclasses.field(
         default_factory=lambda: Sampling(temperature=0.8, top_k=40))
@@ -159,10 +159,10 @@ class LMRunConfig(RunConfig):
         """What the objective generates and decodes at every validation. The
         policy is kept with no preview budget too: the run records it, and its
         export and `dew.pipeline` decode with it."""
-        if self.sample_tokens <= 0:
+        if self.max_new_tokens <= 0:
             return Samples(prompt=[], max_new_tokens=0, sampling=self.sampling)
         tokenizer = tokenizer_for(self.tokenizer)
-        return Samples(prompt=tokenizer.encode(self.sample_prompt or "\n"), max_new_tokens=self.sample_tokens,
+        return Samples(prompt=tokenizer.encode(self.prompt or "\n"), max_new_tokens=self.max_new_tokens,
                        sampling=self.sampling, decode=tokenizer.decode)
 
     def pretrained_source(self, written: str, vocab_size: int, context: int):
@@ -218,7 +218,7 @@ class LMRunConfig(RunConfig):
             raise ValueError("masked_diffusion trains a model with a mask token id: continue a --pretrained "
                              "diffusion checkpoint, which carries one, or name --model.mask-token-id beside "
                              "--model.no-causal")
-        decode = None if self.sample_tokens <= 0 else tokenizer_for(self.tokenizer).decode
+        decode = None if self.max_new_tokens <= 0 else tokenizer_for(self.tokenizer).decode
         return self.objective.build(model=model, process=MDLM(mask_id=int(mask))(),
                                     seq_len=self.tokens().seq_len + 1, decode=decode, variables=variables,
                                     processor=self.processor())
