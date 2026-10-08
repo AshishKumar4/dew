@@ -1,8 +1,11 @@
 {
-  "source": "Qwen/Qwen3-0.6B",
-  "text": [
-    " Paris. The capital of Italy is Rome. The capital of"
-  ],
   "steps": 1,
-  "export": "export"
+  "export": [
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "model.safetensors",
+    "tokenizer.json",
+    "tokenizer_config.json"
+  ]
 }
