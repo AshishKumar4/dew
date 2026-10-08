@@ -22,13 +22,7 @@ import jax
 from jax.experimental import multihost_utils
 
 from dew.cache import enable_compilation_cache
-from dew.coordination import (
-    broadcast_from_process_zero,
-    end_pool_on_failure,
-    pool_formed,
-    pool_size,
-    preemption_service,
-)
+from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.pool import (
     PREEMPTED_EXIT,
     PROCESS_COUNT,
@@ -277,7 +271,7 @@ class PreemptionNotice:
     """
 
     def __init__(self):
-        self._pool = pool_formed()
+        self._pool = jax.distributed.is_initialized()
         self._signalled = False
         self._previous: Callable[[int, types.FrameType | None], object] | int | None = None
         self._installed = False

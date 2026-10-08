@@ -1,6 +1,6 @@
 # Inference
 
-An inference task holds a Dew model, its variables, and any tokenizer or condition encoders that come with the source. You call it with inputs and a key or seed, and it generates. `dew.pipeline(source)` loads a task from a run directory, a checkpoint directory or a Hub repository. It returns `TextGeneration` for decoders, `BlockGeneration` for DiffusionGemma, `MaskedGeneration` for masked-diffusion language models such as LLaDA and Dream, and `TextToImage` for diffusion models. `dew.inference.serving.Server` serves a `TextGeneration` with continuous batching over one resident KV cache.
+An inference task holds a Dew model, its variables, and any tokenizer or condition encoders that come with the source. You call it with inputs and a key or seed, and it generates. `dew.pipeline(source)` loads a task from a run directory, a checkpoint directory or a Hub repository holding either. It returns `TextGeneration` for decoders, `BlockGeneration` for DiffusionGemma, `MaskedGeneration` for masked-diffusion language models such as LLaDA and Dream, and `TextToImage` for diffusion models. `dew.inference.serving.Server` serves a `TextGeneration` with continuous batching over one resident KV cache.
 
 ## Example
 
@@ -63,7 +63,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 
 | Argument | Meaning |
 |---|---|
-| `source` | A run directory (it holds `run.json`), a checkpoint directory in a published layout, or a Hub repository. |
+| `source` | A run directory (it holds `run.json`), a checkpoint directory in a published layout, or a Hub repository holding either. |
 | `mesh`, `layout` | Where the weights are placed. Without `mesh`, `MeshSpec()` puts the current process pool's devices on data parallelism. |
 | `dtype` | Compute dtype. |
 | `param_dtype` | Parameter storage. `None` keeps a run's stored dtypes and uses float32 master weights for a published source; `"auto"` keeps the stored dtypes for both, which for a published source means its `config.json` `dtype`, or else its first floating tensor's. |

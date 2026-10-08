@@ -1,0 +1,3 @@
+# The sdist is the package's source: the tests run from a checkout, where
+# their fixtures and support modules live, so none ship in it.
+prune tests
