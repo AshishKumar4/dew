@@ -536,10 +536,14 @@ def test_a_processor_prompt_is_bucketed_like_bare_ids(roomy):
     ids of its width draw at the exact width: the same tokens, and the same
     likelihoods to the bound the bare-id test above justifies.
     """
+    # The references draw bare ids at their exact widths, an executable each, and
+    # whether an earlier test in this process already compiled them is no concern
+    # of this test's: the count starts after them.
+    references = {width: generate(roomy.model, roomy.variables, ramp(width), 8, key=0,
+                                  sampling=roomy.sampling) for width in (100, 120)}
     compiled = text._compiled(None)
     traced = compiled._cache_size()
-    for width in (100, 120):
-        reference = generate(roomy.model, roomy.variables, ramp(width), 8, key=0, sampling=roomy.sampling)
+    for width, reference in references.items():
         drawn = roomy(processor_rows(width), 8, key=0)
         assert drawn.tokens.shape == (1, width + 8)
         np.testing.assert_array_equal(drawn.tokens, reference.tokens)
