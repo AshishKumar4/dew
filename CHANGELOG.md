@@ -11,9 +11,10 @@ newer.
 
 - Training: one `Trainer` for every objective, on one device or a mesh
   (data, FSDP, tensor, sequence, expert and pipeline axes), with data and
-  FSDP across hosts, gradient accumulation, EMA, checkpoints that resume the data position,
-  time- or step-based checkpointing, validation over named splits each with
-  its own metrics and cadence, LoRA, and quantized training.
+  FSDP across hosts, gradient accumulation, EMA, checkpoints that resume the
+  data position, time- or step-based checkpointing, validation over named
+  splits each with its own metrics and cadence, LoRA, and quantized
+  training.
 - Diffusion: DiT, MMDiT, UNet and video backbones; flow matching, EDM and
   other processes; classifier-free guidance, CFG++, APG and autoguidance;
   few-step distillation (rCM, LADD, MeanFlow, shortcut models, guidance
