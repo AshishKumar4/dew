@@ -15,9 +15,40 @@ export interface PreparationPlan {
 	smoke(container: Container, phase: Phase): Promise<void>;
 }
 
-/** Prepare `plan` in `container`; `made` hears its snapshot before the smoke of it begins. */
-export async function prepareSnapshot(container: Container, plan: PreparationPlan,
-	phase: Phase = async () => {}, made: (snapshot: ContainerSnapshot) => Promise<void> = async () => {}): Promise<SnapshotGeneration> {
+/** Where a preparer reports how a preparation ended (`SnapshotRegistry.prepared`). */
+export interface Reply { registry: string; token: string }
+
+/** How a preparation ended: its generation, or why it failed. */
+export interface Prepared {
+	commit: string;
+	trial: boolean;
+	token: string;
+	generation?: SnapshotGeneration;
+	failure?: string;
+}
+
+/**
+ * A preparation `ManagedPreparer.alarm` runs in two stages, the snapshot and then its smoke, each
+ * in an alarm of its own: an alarm may run 15 minutes, and one alarm cannot hold both.
+ */
+interface Job {
+	commit: string;
+	trial: boolean;
+	reply: Reply;
+	// The relay credential the snapshot's smoke starts it with.
+	secret: string;
+	stage: 'build' | 'smoke';
+	// When this stage's alarm began: an alarm that finds it set runs after one that was cut off.
+	began?: number;
+	record?: SnapshotRecord;
+	built?: { snapshot: ContainerSnapshot; prepareSeconds: number; snapshotSeconds: number };
+	// Kept until the registry has it, so a failed report is sent again.
+	outcome?: Prepared;
+}
+
+/** Install and warm `plan` in `container` and snapshot it; `made` hears the snapshot. */
+export async function buildSnapshot(container: Container, plan: PreparationPlan, phase: Phase,
+	made: (snapshot: ContainerSnapshot) => Promise<void>): Promise<{ snapshot: ContainerSnapshot; prepareSeconds: number; snapshotSeconds: number }> {
 	if (!/^[0-9a-f]{40}$/.test(plan.sourceCommit) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(plan.commit)) {
 		throw new Error('preparation must be pinned');
 	}
@@ -39,18 +70,22 @@ export async function prepareSnapshot(container: Container, plan: PreparationPla
 	await made(snapshot);
 	const snapshotSeconds = (Date.now() - snapshotStart) / 1000;
 	await container.destroy();
-	const smokeStart = Date.now();
+	return { snapshot, prepareSeconds, snapshotSeconds };
+}
+
+/** Restore `snapshot` without internet and run `plan`'s smoke on it: its seconds. */
+export async function smokeSnapshot(container: Container, plan: PreparationPlan, snapshot: ContainerSnapshot,
+	phase: Phase): Promise<number> {
+	const started = Date.now();
 	await phase('offline restore');
 	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false,
 		entrypoint: plan.entrypoint, env: plan.env });
 	await container.setInactivityTimeout(15 * 60_000);
 	await plan.smoke(container, phase);
-	return { commit: plan.commit, snapshot, created: Date.now(), prepareSeconds, snapshotSeconds,
-		smokeSeconds: (Date.now() - smokeStart) / 1000 };
+	return (Date.now() - started) / 1000;
 }
 
-export function livePreparation(commit: string, sourceCommit: string): PreparationPlan {
-	const relaySecret = crypto.randomUUID();
+export function livePreparation(commit: string, sourceCommit: string, relaySecret: string): PreparationPlan {
 	return { commit: sourceCommit, sourceCommit, script: 'setup-managed.sh', args: [commit, sourceCommit],
 		name: 'dew-warm-pinned', entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: relaySecret },
 		async smoke(container, phase) {
@@ -80,8 +115,6 @@ export function livePreparation(commit: string, sourceCommit: string): Preparati
 }
 
 export class ManagedPreparer extends DurableObject<Env> {
-	private busy = false;
-
 	async status(): Promise<{ phase: string; at: number } | null> {
 		return (await this.ctx.storage.get<{ phase: string; at: number }>('phase')) ?? null;
 	}
@@ -103,46 +136,74 @@ export class ManagedPreparer extends DurableObject<Env> {
 		await this.ctx.storage.put('snapshots', { ...records, [record.id]: record });
 	}
 
-	protected async runPreparation(plan: () => Promise<PreparationPlan>, trial = false): Promise<SnapshotGeneration> {
-		const container = this.ctx.container;
-		if (!container || this.busy || container.running) throw new Error('snapshot preparation is already running');
-		this.busy = true;
-		let made: SnapshotRecord | undefined;
-		try {
-			await this.ctx.storage.setAlarm(Date.now() + 15 * 60_000);
-			const prepared = await plan();
-			const result = await prepareSnapshot(container, prepared,
-				async (phase) => { await this.ctx.storage.put('phase', { phase, at: Date.now() }); },
-				async (snapshot) => {
-					made = { id: snapshot.id, commit: prepared.commit, created: Date.now(), trial, state: 'preparing' };
-					await this.record(made);
-				});
-			await this.ctx.storage.put('phase', { phase: 'complete', at: Date.now() });
-			if (made) await this.record({ ...made, state: 'ready' });
-			return result;
-		} catch (error) {
-			if (made) await this.record({ ...made, state: 'failed' });
-			throw error;
-		} finally {
-			this.busy = false;
-			if (container.running) await container.destroy();
-			await this.ctx.storage.deleteAlarm();
-		}
+	private phase = async (phase: string) => { await this.ctx.storage.put('phase', { phase, at: Date.now() }); };
+
+	protected plan(job: Job): PreparationPlan {
+		return livePreparation(job.commit, job.commit, job.secret);
+	}
+
+	/** Start preparing `commit`; this preparer's alarms run it and report its end to `reply`. */
+	protected async queue(commit: string, trial: boolean, reply: Reply): Promise<void> {
+		if (await this.ctx.storage.get('job')) throw new Error('snapshot preparation is already running');
+		await this.ctx.storage.put('job', { commit, trial, reply, secret: crypto.randomUUID(), stage: 'build' } satisfies Job);
+		await this.ctx.storage.setAlarm(Date.now() + 1000);
 	}
 
 	override async alarm(): Promise<void> {
-		if (this.ctx.container?.running) await this.ctx.container.destroy();
+		const container = this.ctx.container!;
+		const job = await this.ctx.storage.get<Job>('job');
+		if (!job) {
+			if (container.running) await container.destroy();
+			return;
+		}
+		if (!job.outcome) {
+			const failed = (failure: string): Prepared => ({ commit: job.commit, trial: job.trial, token: job.reply.token, failure });
+			if (job.began) job.outcome = failed(`the ${job.stage} was cut off: it outlived its alarm's 15 minutes, or a deploy restarted it`);
+			else {
+				job.began = Date.now();
+				await this.ctx.storage.put('job', job);
+				// Should this alarm be cut off, the next one fails the preparation.
+				await this.ctx.storage.setAlarm(job.began + 16 * 60_000);
+				try {
+					const plan = this.plan(job);
+					if (job.stage === 'build') {
+						if (container.running) await container.destroy();
+						job.built = await buildSnapshot(container, plan, this.phase, async (snapshot) => {
+							job.record = { id: snapshot.id, commit: job.commit, created: Date.now(), trial: job.trial, state: 'preparing' };
+							await this.record(job.record);
+							await this.ctx.storage.put('job', job);
+						});
+						await this.ctx.storage.put('job', { ...job, stage: 'smoke', began: undefined } satisfies Job);
+						await this.ctx.storage.setAlarm(Date.now() + 1000);
+						return;
+					}
+					const smokeSeconds = await smokeSnapshot(container, plan, job.built!.snapshot, this.phase);
+					job.outcome = { commit: job.commit, trial: job.trial, token: job.reply.token, generation: {
+						commit: job.commit, snapshot: job.built!.snapshot, created: Date.now(),
+						prepareSeconds: job.built!.prepareSeconds, snapshotSeconds: job.built!.snapshotSeconds, smokeSeconds } };
+				} catch (error) {
+					job.outcome = failed(String(error).slice(-6000));
+				}
+			}
+			if (container.running) await container.destroy();
+			if (job.record) await this.record({ ...job.record, state: job.outcome.generation ? 'ready' : 'failed' });
+			if (job.outcome.generation) await this.phase('complete');
+			await this.ctx.storage.put('job', job);
+		}
+		await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
+		await this.ctx.storage.delete('job');
+		await this.ctx.storage.deleteAlarm();
 	}
 }
 
 export class SnapshotPreparer extends ManagedPreparer {
-	async prepare(commit: string): Promise<SnapshotGeneration> {
+	async prepare(commit: string, reply: Reply): Promise<void> {
 		if (commit !== this.env.SNAPSHOT_COMMIT) throw new Error('requested preparation is not the pinned deploy');
-		return this.runPreparation(async () => livePreparation(commit, commit));
+		return this.queue(commit, false, reply);
 	}
 
 	/** Any pushed commit, prepared and smoked as a deploy would be; the registry never promotes it. */
-	async trial(commit: string): Promise<SnapshotGeneration> {
-		return this.runPreparation(async () => livePreparation(commit, commit), true);
+	async trial(commit: string, reply: Reply): Promise<void> {
+		return this.queue(commit, true, reply);
 	}
 }
