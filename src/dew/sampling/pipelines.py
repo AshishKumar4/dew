@@ -255,7 +255,7 @@ class TextToImage:
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
-        from dew.records import integer, record as fields, text
+        from dew.records import integer, json_value, record as fields, text
         from dew.registry import from_record, objectives, solvers
 
         record, step = run_record(directory, step, trust)
@@ -290,7 +290,8 @@ class TextToImage:
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['class'], 'solver class'),
                                 fields(solver_record['fields'], 'solver fields'))
-        guidance = from_record(Guidance | None, record['guidance'], dtypes=False)
+        guidance = from_record(Guidance | None, json_value(record['guidance'], 'guidance'), dtypes=False)
+        assert isinstance(guidance, Guidance | None)  # what from_record witnessed, for the type checker
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
