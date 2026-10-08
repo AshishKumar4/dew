@@ -23,15 +23,16 @@ def capped_load(load):
 def capped_fit(fit):
     """`fit`, with more than STEPS steps lowered to STEPS, logging at least four times."""
     def capped(self, dataset, *, steps, log_every=100, **options):
-        changed = []
-        if steps > STEPS:
+        changed, cut = [], steps > STEPS
+        if cut:
             changed.append(f"steps {steps} -> {STEPS}")
             steps = STEPS
         if log_every > max(1, steps // 4):
             changed.append(f"log_every {log_every} -> {max(1, steps // 4)}")
             log_every = max(1, steps // 4)
         if changed:
-            print(f"Live run: {', '.join(changed)}, so it finishes in about two minutes.")
+            why = "so it finishes in about two minutes" if cut else "to log the run as it goes"
+            print(f"Live run: {', '.join(changed)}, {why}.")
         return fit(self, dataset, steps=steps, log_every=log_every, **options)
     return capped
 

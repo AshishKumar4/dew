@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 from huggingface_hub import snapshot_download
 
-from dew.data import HubText
 from dew.inference import Server
 from dew.interop import PretrainedDecoder
 from dew.sampling import CFG, DPMSolverMultistep, Sampling, TextToImage
@@ -24,21 +23,6 @@ for line in (root / 'text-models').read_text().split():
     name, version = line.split('@')
     snapshot_download(repo_id=name, revision=version, local_dir=f'/opt/models/{name}',
                       allow_patterns=['*.json', '*.safetensors', '*.txt'])
-# A training context's offline inputs (gateway_manager.py): the pinned text models in a Hugging
-# Face cache it may read, and Tiny Shakespeare tokenized for the page's two training cells.
-train = Path('/opt/train')
-for line in (root / 'text-models').read_text().split():
-    name, version = line.split('@')
-    snapshot_download(repo_id=name, revision=version, cache_dir=train / 'hf' / 'hub',
-                      allow_patterns=['*.json', '*.safetensors', '*.txt'])
-    # A load by name reads refs/main offline; it names the pinned revision.
-    refs = train / 'hf' / 'hub' / f'models--{name.replace("/", "--")}' / 'refs'
-    refs.mkdir(exist_ok=True)
-    (refs / 'main').write_text(version)
-os.environ['XDG_CACHE_HOME'] = str(train / 'cache')
-for tokenizer in ('byte', 'HuggingFaceTB/SmolLM2-135M-Instruct'):
-    HubText('winglian/tiny-shakespeare', tokenizer=tokenizer).tokenized()
-del os.environ['XDG_CACHE_HOME']
 pipe = TextToImage.from_pretrained(repo, revision=revision)
 negative = ('letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, '
             'low quality, dull colors, washed out, low contrast, grainy')

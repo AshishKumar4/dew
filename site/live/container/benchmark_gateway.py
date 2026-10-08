@@ -5,8 +5,8 @@ import concurrent.futures
 import json
 import pathlib
 import queue
-import re
 import statistics
+import sys
 import time
 import urllib.request
 
@@ -47,8 +47,7 @@ class Silent(TimeoutError):
         self.output = output
 
 
-def collect(client, message, timeout=30, displays=False):
-    """The stdout a cell printed, and with `displays` the text of its displays too."""
+def collect(client, message, timeout=30):
     stdout = ""
     while True:
         try:
@@ -59,8 +58,6 @@ def collect(client, message, timeout=30, displays=False):
             continue
         if result["msg_type"] == "stream":
             stdout += result["content"]["text"]
-        if displays and result["msg_type"] in ("display_data", "update_display_data"):
-            stdout += result["content"]["data"].get("text/plain", "") + "\n"
         if result["msg_type"] == "error":
             raise RuntimeError(str(result["content"]))
         if result["msg_type"] == "status" and result["content"]["execution_state"] == "idle":
@@ -137,39 +134,37 @@ def training():
 
 
 def cells():
-    """The page's training cells, each run in a fresh training context as a visitor's Run does,
-    while the model process holds its models. A failure names the host's memory."""
-    # Each cell's last line of output, which only a complete run prints; the training summary
-    # itself is a display, not a stream.
-    for name, ending in (("finetune.py", "After: "), ("hero.py", "JULIET:")):
-        code = (pathlib.Path("/opt/live/cells") / name).read_text()
-        # The page shows train.py without its command line (trainingExample, framework-examples.mjs).
-        code = re.sub(r"parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps",
-                      "steps = 1000", code.replace("import argparse\n\n", ""))
-        # The bridge installs the caps in every training context first (PRELOAD, shared_bridge.py).
-        code = "import live_training\nlive_training.install()\n" + code
-        code += "\nimport resource\nprint('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n"
+    """The page's pool cells and its train.py, each run in a fresh training context as a
+    visitor's Run does, while the model process holds its models. A failure names the host's
+    memory."""
+    sys.path.insert(0, "/opt/live/cells")
+    import cells as page
+    programs = {name: page.cell(name) for name in page.CELLS["pool"]}
+    programs["hero"] = page.training_example(pathlib.Path("/opt/live/cells/hero.py").read_text())
+    for name, code in programs.items():
+        # The bridge installs the caps in every training context first (PRELOAD, shared_bridge.py);
+        # the last line, printed only when the cell finished, is what the run kept resident.
+        code = ("import live_training\nlive_training.install()\n" + code + "\nimport resource\n"
+                "print('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n")
         kernel = request("/api/kernels", {"name": "dew-train"})
         client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
         client.load_connection_file()
         client.start_channels()
         started = time.perf_counter()
-        print(f"{name} starts; memory {memory()}", flush=True)
         try:
             client.wait_for_ready(timeout=30)
-            output = collect(client, client.execute(code, allow_stdin=False), timeout=240, displays=True)
+            output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
         except Exception as error:
             raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
                                  f"memory {memory()}") from None
         finally:
             client.stop_channels()
             request("/api/kernels/" + kernel["id"], method="DELETE")
-        assert ending in output, output[-2000:]
         # What a run keeps resident, which the host's memory must hold beside the model process.
         peak = int(output.rsplit("peak ", 1)[1].split()[0])
         assert peak < 4608, f"{name} held {peak} MiB; memory {memory()}"
-        print(f"{name} ran in {time.perf_counter() - started:.0f} s, {peak} MiB resident; memory {memory()}",
-              flush=True)
+        seconds = time.perf_counter() - started
+        print(f"{name} ran in {seconds:.0f} s, {peak} MiB resident; memory {memory()}", flush=True)
 
 
 def memory():

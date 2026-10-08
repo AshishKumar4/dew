@@ -18,16 +18,17 @@ id -u model >/dev/null 2>&1 || useradd --uid 5000 --create-home --shell /usr/sbi
 mkdir -p /opt/live /opt/models /opt/hf /opt/xla /opt/train /run/dew /sessions
 chown model:model /opt/models /opt/hf /opt/xla /opt/train
 chmod 0755 /opt/models /opt/hf /opt/xla
-# The page's training cells, which the context smoke runs as a visitor would (benchmark_gateway.py).
+# The page's cells, which prepare-cells.py fetches the inputs of and the context smoke runs as a
+# visitor would (benchmark_gateway.py).
 mkdir -p /opt/live/cells
-for file in finetune.py hero.py; do
-    curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/src/data/$file" -o "/opt/live/cells/$file"
+for file in snippets/framework.py snippets/cells.py snippets/cells.json src/data/hero.py; do
+    curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/$file" -o "/opt/live/cells/${file##*/}"
 done
 for file in text-to-image text-models; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/site/live/container/$file" -o "/opt/live/$file"
 done
 for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh benchmark_gateway.py warm-managed.py progress.py model_client.py model_service.py live_training.py \
-            shared_bridge.py kernel_outputs.py start-shared.sh smoke-shared.py; do
+            shared_bridge.py kernel_outputs.py start-shared.sh smoke-shared.py prepare-cells.py; do
     curl -fsSL "https://raw.githubusercontent.com/AshishKumar4/dew/$source/site/live/container/$file" -o "/opt/live/$file"
 done
 printf '%s\n' "$commit" > /opt/live/dew-commit
@@ -36,6 +37,7 @@ runuser -u model -- env HF_HOME=/opt/hf JAX_PLATFORMS=cpu \
     JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 \
     JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 XLA_FLAGS=--xla_cpu_max_isa=AVX2 \
     /opt/venv/bin/python /opt/live/warm-managed.py
+runuser -u model -- /opt/venv/bin/python /opt/live/prepare-cells.py
 chmod 0750 /opt/models /opt/hf /opt/xla
 # Training contexts read /opt/train (gateway_manager.py); nothing may write it after preparation.
 chown -R root:root /opt/train
