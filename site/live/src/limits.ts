@@ -13,7 +13,7 @@ export interface Limits {
 	idleSeconds: number;
 	/** CPU time the kernel process may use. */
 	cpuSeconds: number;
-	/** At most `ipStarts` sessions per visitor IP in any `ipWindowSeconds`, one at a time. */
+	/** At most `ipStarts` sessions per visitor IP in any `ipWindowSeconds`, and `TABS` at once (coordinator.ts). */
 	ipWindowSeconds: number;
 	ipStarts: number;
 }

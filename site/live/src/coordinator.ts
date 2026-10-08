@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { type Limits, limitsOf } from './limits';
 
-export type Refusal = 'busy' | 'one-at-a-time' | 'too-many-starts' | 'budget';
+export type Refusal = 'busy' | 'too-many-tabs' | 'too-many-starts' | 'budget';
 export type Opened =
 	| { ok: true; id: string }
 	| { ok: false; reason: Refusal; retryAfter: number };
@@ -10,6 +10,8 @@ export type Opened =
 const UNUSED_MS = 120_000;
 // How late a Kernel may report its container stopped before the Coordinator stops waiting for it.
 const REPORT_GRACE_MS = 120_000;
+// Sessions one visitor may have open at once: a session is a tab, whose cells share it.
+export const TABS = 3;
 
 const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
@@ -43,6 +45,18 @@ export class Coordinator extends DurableObject<Env> {
 
 	private count(query: string, ...bindings: (string | number)[]): number {
 		return Number(this.ctx.storage.sql.exec(query, ...bindings).one().n);
+	}
+
+	/**
+	 * End the started sessions the model pool no longer holds. The pool is shared by the
+	 * production and preview Workers, so each Coordinator asks it rather than being told.
+	 */
+	private async reconcile(now: number): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		const open = sql.exec<{ id: string }>('SELECT id FROM sessions WHERE ended IS NULL AND started IS NOT NULL').toArray();
+		if (!open.length) return;
+		const held = new Set(await this.env.POOL.get(this.env.POOL.idFromName('global')).held());
+		for (const { id } of open) if (!held.has(id)) sql.exec('UPDATE sessions SET ended = ? WHERE id = ? AND ended IS NULL', now, id);
 	}
 
 	/** Close sessions whose Kernel will not report back: never connected, or past the wall clock. */
@@ -82,11 +96,12 @@ export class Coordinator extends DurableObject<Env> {
 
 	/** A session for visitor `ip`; `image` is the kernel image the current deploy starts. */
 	async open(ip: string, now: number, image: string): Promise<Opened> {
+		await this.reconcile(now);
 		this.sweep(now);
 		const { maxSessions, ipStarts, ipWindowSeconds, wallSeconds, budgetSeconds } = this.limits;
 		const sql = this.ctx.storage.sql;
-		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ip = ? AND ended IS NULL', ip) >= 1) {
-			return { ok: false, reason: 'one-at-a-time', retryAfter: 30 };
+		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ip = ? AND ended IS NULL', ip) >= TABS) {
+			return { ok: false, reason: 'too-many-tabs', retryAfter: 30 };
 		}
 		const windowStart = now - ipWindowSeconds * 1000;
 		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ip = ? AND created > ?', ip, windowStart) >= ipStarts) {
@@ -122,16 +137,13 @@ export class Coordinator extends DurableObject<Env> {
 		return cursor.rowsWritten === 1;
 	}
 
-	async ended(id: string, now: number): Promise<void> {
-		this.ctx.storage.sql.exec('UPDATE sessions SET ended = ? WHERE id = ? AND ended IS NULL', now, id);
-	}
-
 	/** Whether a session may still connect: created, and not yet over. */
 	async isOpen(id: string): Promise<boolean> {
 		return this.count('SELECT COUNT(*) AS n FROM sessions WHERE id = ? AND ended IS NULL', id) === 1;
 	}
 
 	async status(now: number): Promise<{ active: number; maxSessions: number; budgetUsedSeconds: number; budgetSeconds: number }> {
+		await this.reconcile(now);
 		this.sweep(now);
 		return {
 			active: this.count('SELECT COUNT(*) AS n FROM sessions WHERE ended IS NULL'),

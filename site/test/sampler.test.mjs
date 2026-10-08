@@ -91,7 +91,7 @@ test('Run sends the editor cell and shows the returned image', async () => {
 	assert.deepEqual(errors, []);
 });
 
-test('homepage text and diffusion cells share one kernel without overlapping', { timeout: 10_000 }, async () => {
+test('homepage text and diffusion cells run at once in their own contexts of one session', { timeout: 10_000 }, async () => {
 	const page = await browser.newPage({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' });
 	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
 		contentType: 'text/javascript',
@@ -103,6 +103,7 @@ test('homepage text and diffusion cells share one kernel without overlapping', {
 		return route.fulfill({ json: { socket: SOCKET, warm: true } });
 	});
 	const sent = [];
+	const text = Promise.withResolvers();
 	const closed = Promise.withResolvers();
 	await page.routeWebSocket(SOCKET, (socket) => {
 		socket.onClose(() => closed.resolve());
@@ -110,15 +111,15 @@ test('homepage text and diffusion cells share one kernel without overlapping', {
 		socket.onMessage((raw) => {
 			const message = JSON.parse(String(raw));
 			if (message.op !== 'execute') return;
-			sent.push(message.code);
+			sent.push(message);
 			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
-			if (message.code.includes('text_model')) {
-				reply({ type: 'display', text: JSON.stringify({ 'dew-progress': { stage: 'load', model: 'SmolLM2' } }) });
+			if (message.cell === 'text') {
 				reply({ type: 'display', text: JSON.stringify({ 'dew-progress': { stage: 'generate', first: false } }) });
-				setTimeout(() => {
+				// The text cell finishes only after the image cell has run.
+				text.promise.then(() => {
 					reply({ type: 'stream', name: 'stdout', text: 'Paris.\n' });
 					reply({ type: 'done', status: 'ok', count: 1 });
-				}, 800);
+				});
 			} else {
 				reply({ type: 'display', png: PNG });
 				reply({ type: 'done', status: 'ok', count: 2 });
@@ -126,21 +127,21 @@ test('homepage text and diffusion cells share one kernel without overlapping', {
 		});
 	});
 	await page.goto(`http://127.0.0.1:${server.address().port}/`);
-	const text = page.locator('[data-text-cell]');
-	const edited = `${await text.inputValue()}\n# edited`;
-	await text.fill(edited);
+	const editor = page.locator('[data-text-cell]');
+	const edited = `${await editor.inputValue()}\n# edited`;
+	await editor.fill(edited);
 	await page.locator('[data-text-run]').click();
 	await page.waitForFunction(() => document.querySelector('[data-text-status]').textContent.startsWith('Generating'));
 	// Use the event directly so scrolling to a second button cannot outlast the mock run.
 	await page.locator('[data-run]').dispatchEvent('click');
-	assert.match(await page.locator('[data-status]').textContent(), /Another cell is running/);
+	await page.locator('[data-final]').waitFor({ state: 'visible' });
+	assert.match(await page.locator('[data-text-status]').textContent(), /^Generating/);
+	text.resolve();
 	await page.waitForFunction(() => document.querySelector('[data-text-status]').textContent.startsWith('Generated in'));
 	assert.equal((await page.locator('[data-text-output]').textContent()).trim(), 'Paris.');
-	await page.locator('[data-run]').click();
-	await page.locator('[data-final]').waitFor({ state: 'visible' });
 	assert.equal(requests, 1);
-	assert.equal(sent.length, 2);
-	assert.equal(sent[0], edited);
+	assert.deepEqual(sent.map((message) => message.cell), ['text', 'image']);
+	assert.equal(sent[0].code, edited);
 	await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
 	await closed.promise;
 	await page.close();
