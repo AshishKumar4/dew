@@ -15,13 +15,13 @@ these tests reshape between that and NHWC with numpy's own reshape.
 """
 
 import json
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, fixture_arrays
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, qwen_image_fields, translate_qwen_image_weights
@@ -34,10 +34,8 @@ CASES = ("square", "rect", "odd", "padded", "acausal", "eps")
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("qwen-image-source")
-    with tarfile.open(ROOT / "tests/fixtures/qwen_image_source.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/qwen_image_source.tar.xz",
+                           tmp_path_factory.mktemp("qwen-image-source"))
 
 
 @pytest.fixture(scope="module")
@@ -47,8 +45,7 @@ def record(source):
 
 @pytest.fixture(scope="module")
 def arrays(source):
-    with np.load(source / "qwen_image.npz") as loaded:
-        return dict(loaded)
+    return fixture_arrays(source / "qwen_image.npz")
 
 
 def relative_gap(actual, expected) -> float:
@@ -357,7 +354,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        from test_trainer import raw_leaf
+        from affine_run import raw_leaf
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"

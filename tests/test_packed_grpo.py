@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import widened
-from test_tools import load
+from tool_support import load
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step

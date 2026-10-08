@@ -16,13 +16,13 @@ gradients are written back into the source layout through the same
 
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, fixture_arrays
 from safetensors.numpy import load_file, save_file
 
 from dew.nn.autoencoders.dc_ae import dc_ae_fields, dc_ae_path, load_dc_ae
@@ -35,16 +35,13 @@ VARIANTS = ("conv", "shuffle")
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("dc-ae")
-    with tarfile.open(ROOT / "tests/fixtures/dc_ae.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/dc_ae.tar.xz", tmp_path_factory.mktemp("dc-ae"))
 
 
 @pytest.fixture(scope="module", params=VARIANTS)
 def variant(request, source):
     directory = source / request.param
-    return directory, load_dc_ae(directory), dict(np.load(directory / "reference.npz"))
+    return directory, load_dc_ae(directory), fixture_arrays(directory / "reference.npz")
 
 
 def channels_last(array):

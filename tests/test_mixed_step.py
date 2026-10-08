@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import TINY_DECODER
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import Admitted
@@ -16,8 +17,7 @@ VOCAB, ROWS, WIDTH = 50, 4, 6
 
 
 def tiny(**overrides):
-    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4, "num_kv_heads": 2,
-              "mlp_features": 64, "max_seq_len": 16}
+    config = {"vocab_size": VOCAB, **TINY_DECODER, "num_kv_heads": 2}
     return CausalTransformer(**{**config, **overrides})
 
 

@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from test_text_rollout_contract import decoder
+from model_support import decoder
 from transformers.generation.logits_process import (
     MinPLogitsWarper,
     TemperatureLogitsWarper,

@@ -9,9 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from flax import linen as nn
-from rl_support import clipped_surrogate, token_mean
-from test_tool_episodes import (
+from episode_support import (
     EOS,
     GROUPS,
     PROMPT,
@@ -24,6 +22,8 @@ from test_tool_episodes import (
     per_call,
     verify,
 )
+from flax import linen as nn
+from rl_support import clipped_surrogate, token_mean
 
 from dew.data import Dataset
 from dew.objectives.base import Step

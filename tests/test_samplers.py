@@ -18,6 +18,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from diffusion_support import walk
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
 
@@ -209,17 +210,8 @@ def integrate(process, solver, x_T, steps):
     """`sample`'s walk over the grid without the final denoise, so what comes
     back is the solver's x at the grid's last sigma."""
     _, model = karras_process()
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
     times = process.times(steps)
-    x, state = x_T, solver.init(x_T, times, process, key=jax.random.PRNGKey(0))
-    for i in range(steps - 1):
-        t = jnp.full((x.shape[0],), times[i])
-        t_next = jnp.full((x.shape[0],), times[i + 1])
-        denoised, eps = denoise(x, t)
-        x, state = solver.step(x, t, t_next, denoised, eps, state,
-                               jax.random.fold_in(jax.random.PRNGKey(0), i), process, denoise)
-    return x, process.schedule.sigmas(times[-1])
+    return walk(solver, process, model, x_T, times)[-1], process.schedule.sigmas(times[-1])
 
 
 FLAXDIFF = dict(np.load(Path(__file__).resolve().parent / "fixtures" / "flaxdiff_solvers" / "solvers.npz"))
@@ -540,31 +532,7 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
     return process, KarrasOracle(sigma_data=edm["sigma_data"])
 
 
-_DEFAULT_WALK_KEY = jax.random.PRNGKey(0)
 
-
-def walk(solver, process, model, x_T, times, key=_DEFAULT_WALK_KEY):
-    """Every latent after each interval of `times`, the walk `sample` takes
-    (its state, its per-step keys) without the final denoise; the reference
-    tool records the same latents and draws the same per-step noise."""
-    params = model.init(jax.random.PRNGKey(1), jnp.ones((1, *x_T.shape[1:])), jnp.ones((1,)))
-    denoise = process.denoiser(model, params, {})
-    with jax.ensure_compile_time_eval():
-        times = jnp.asarray(times, jnp.float32)
-
-    def body(carry, inputs):
-        x, state = carry
-        t, t_next, index = inputs
-        t = jnp.full((x.shape[0],), t)
-        t_next = jnp.full((x.shape[0],), t_next)
-        denoised, eps = denoise(x, t)
-        x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
-                               process, denoise)
-        return (x, state), x
-
-    _, latents = jax.lax.scan(body, (x_T, solver.init(x_T, times, process, key=key)),
-                              (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
-    return latents
 
 
 def relative_gap(actual, expected) -> float:

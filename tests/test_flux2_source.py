@@ -17,13 +17,13 @@ tests reshape between that and NHWC with numpy's own reshape.
 
 import json
 import sys
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, fixture_arrays
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, translate_flux2_weights
@@ -39,10 +39,8 @@ GRADIENT = 1e-4
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("flux2-source")
-    with tarfile.open(ROOT / "tests/fixtures/flux2_source.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/flux2_source.tar.xz",
+                           tmp_path_factory.mktemp("flux2-source"))
 
 
 @pytest.fixture(scope="module")
@@ -52,8 +50,7 @@ def record(source):
 
 @pytest.fixture(scope="module")
 def arrays(source):
-    with np.load(source / "flux2_transformer.npz") as loaded:
-        return dict(loaded)
+    return fixture_arrays(source / "flux2_transformer.npz")
 
 
 def relative_gap(actual, expected) -> float:

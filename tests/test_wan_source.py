@@ -25,7 +25,6 @@ the largest difference over the largest value, 1e-5. Observed: prompt states
 """
 
 import json
-import tarfile
 from pathlib import Path
 
 import jax
@@ -33,6 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from interop_support import extract_fixture, fixture_arrays
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
@@ -47,16 +47,13 @@ CASES = ("published", "variant")
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("wan-transformer")
-    with tarfile.open(ROOT / "tests/fixtures/wan_transformer.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/wan_transformer.tar.xz",
+                           tmp_path_factory.mktemp("wan-transformer"))
 
 
 @pytest.fixture(scope="module")
 def arrays(source):
-    with np.load(source / "wan_transformer.npz") as loaded:
-        return dict(loaded)
+    return fixture_arrays(source / "wan_transformer.npz")
 
 
 def channels_last(value):
@@ -161,10 +158,8 @@ def test_every_tensor_of_the_published_checkpoint_has_a_native_place():
 @pytest.fixture(scope="module")
 def walk(tmp_path_factory):
     directory = tmp_path_factory.mktemp("wan-pipeline")
-    with tarfile.open(ROOT / "tests/fixtures/wan_pipeline.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    with np.load(directory / "wan_pipeline.npz") as loaded:
-        arrays = dict(loaded)
+    extract_fixture(ROOT / "tests/fixtures/wan_pipeline.tar.xz", directory)
+    arrays = fixture_arrays(directory / "wan_pipeline.npz")
     return directory, json.loads((directory / "wan_pipeline.json").read_text()), arrays
 
 
@@ -283,7 +278,7 @@ def test_the_scheduler_steps_as_the_source_on_the_same_model_outputs(pipeline, w
     10 steps, 1.86 at 50; the sigma and alpha tables are bit-identical to the
     source's float32 ones. UniPC of order 1, or bh1, lands 1e4 to 1e5 times
     further."""
-    from test_samplers import walk as step_by_step
+    from diffusion_support import walk as step_by_step
 
     _, _, arrays = walk
     process, times = pipeline.task.grid(steps)

@@ -22,11 +22,6 @@ one; the byte accounting of an offload is a GPU measurement, taken with
 tools/benchmark_host_offload.py.
 """
 
-import json
-import os
-import socket
-import subprocess
-import sys
 from pathlib import Path
 
 import jax
@@ -35,6 +30,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import BATCH, Counting, Features, Regression, Spread, val_batches
+from process_support import run_pool
 
 from dew.data import Dataset
 from dew.inference.banks import CheckpointBanks, HeldBanks
@@ -455,43 +451,7 @@ def test_a_pipeline_over_stages_refuses_a_banked_store():
 # --------------------------------------------------------------------------
 
 WORKER = Path(__file__).with_name("host_banks_worker.py")
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
-
-def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
-
-
-def run_pool(directory: Path, processes: int, devices: int, **flags) -> list[dict]:
-    """`processes` workers in one pool, and their reports in process order."""
-    directory.mkdir(parents=True, exist_ok=True)
-    coordinator = f"127.0.0.1:{free_port()}"
-    environment = {**os.environ, "JAX_PLATFORMS": "cpu",
-                   "PYTHONPATH": str(REPO_ROOT / "src"),
-                   "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
-    outs = [directory / f"process{index}.json" for index in range(processes)]
-    running = []
-    for index, out in enumerate(outs):
-        command = [sys.executable, str(WORKER), "banked", "--out", str(out),
-                   "--processes", str(processes), "--process-id", str(index),
-                   "--coordinator", coordinator]
-        for name, value in flags.items():
-            command += ["--" + name.replace("_", "-"), str(value)]
-        running.append(subprocess.Popen(
-            command, cwd=REPO_ROOT, env=environment, stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT, text=True, start_new_session=True))
-    logs = []
-    try:
-        logs.extend(process.communicate(timeout=600)[0] for process in running)
-    finally:
-        for process in running:
-            if process.poll() is None:
-                process.kill()
-    for index, process in enumerate(running):
-        assert process.returncode == 0, f"process {index} exited {process.returncode}\n{logs[index]}"
-    return [json.loads(out.read_text()) for out in outs]
 
 
 @pytest.mark.distributed
@@ -506,7 +466,7 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
     resident placement's, bitwise, shard for shard. Then the pool writes a
     checkpoint and reads it back bank by bank onto the same placement.
     """
-    reports = run_pool(tmp_path / "pool", processes=2, devices=2, fsdp_size=2,
+    reports = run_pool("banked", tmp_path / "pool", processes=2, script=WORKER, devices=2, fsdp_size=2,
                        tensor_size=2, bank_layers=2, run_dir=str(tmp_path / "run"))
     for report in reports:
         assert report["processes"] == 2 and report["devices"] == 4
@@ -529,7 +489,7 @@ def test_a_pool_reads_its_own_shards_of_a_host_resident_bank(tmp_path):
 
 @pytest.mark.parametrize("kind", ["root", "multimodal"])
 def test_synthetic_banks_keep_namespace_values_across_bank_sizes(kind):
-    from test_layer_banks import SelectedReads, fixture, host_layout, identical, scores, unpack
+    from bank_support import SelectedReads, fixture, host_layout, identical, scores, unpack
 
     from dew.nn.multimodal import MultimodalTransformer
     from tools.benchmark_host_offload import SyntheticBanks

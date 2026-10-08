@@ -10,18 +10,23 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from test_tool_episodes import CALL_THREE, EOS, GROUPS, NINE, PROMPT, SAMPLING, START, build, collect, verify
+from episode_support import (
+    CALL_THREE,
+    EOS,
+    GROUPS,
+    IDENTITY,
+    NINE,
+    PROMPT,
+    START,
+    action,
+    build,
+    collect,
+    environment,
+    verify,
+)
 
 from dew.objectives.rl import EpisodeStatus
-from dew.objectives.rl.episodes import Action, EpisodeId
 from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment, _ProcessEnvironment
-
-WORKER = Path(__file__).with_name("sandbox_square_worker.py")
-IDENTITY = EpisodeId(task=3, attempt=0, sample=0, seed=(1, 2))
-
-
-def environment(mode="ok", **limits):
-    return SubprocessEnvironment((sys.executable, str(WORKER), mode), SandboxLimits(**limits))
 
 
 def alive(pid):
@@ -37,11 +42,6 @@ def wait_gone(pids, seconds=5.):
     while any(alive(pid) for pid in pids) and time.monotonic() < deadline:
         time.sleep(.02)
     return [pid for pid in pids if alive(pid)]
-
-
-def action(context, *tokens):
-    return Action(tuple(context), tokens, (-.1,) * len(tokens), (0.,) * len(tokens),
-                  terminated=True, policy_step=0, sampling=SAMPLING)
 
 
 def test_worker_round_trip_and_process_group_cleanup():
@@ -95,7 +95,7 @@ def test_parent_death_kills_the_worker(tmp_path):
     script.write_text(
         "import json, os, sys, time\n"
         f"sys.path.insert(0, {str(Path(__file__).parent)!r})\n"
-        "from test_sandbox import environment, IDENTITY\n"
+        "from episode_support import environment, IDENTITY\n"
         "with environment()(IDENTITY) as session:\n"
         "    print(json.loads(session.reset().detail)[0], flush=True)\n"
         "    time.sleep(3600)\n")

@@ -1,33 +1,22 @@
 """Real pool agreement, variable episode lengths and global-update parity."""
 
-import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
-from test_multiprocess import free_port, report_of, terminate, worker_env
+from process_support import run_pool, start_process
 
 WORKER = Path(__file__).with_name("tool_episode_worker.py")
 pytestmark = pytest.mark.mesh
 
 
 def run(directory, processes, mode="ok"):
-    directory.mkdir()
-    coordinator = f"127.0.0.1:{free_port()}"
-    outputs = [directory / f"rank{rank}.json" for rank in range(processes)]
-    running = [subprocess.Popen(
-        [sys.executable, str(WORKER), str(rank), str(processes), coordinator, str(output), mode],
-        cwd=WORKER.parents[1], env=worker_env(2 // processes), stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT, text=True, start_new_session=True)
-        for rank, output in enumerate(outputs)]
-    try:
-        return [report_of(process, output, timeout=120)
-                for process, output in zip(running, outputs, strict=True)]
-    finally:
-        for process in running:
-            if process.poll() is None:
-                terminate(process)
+    def start(mode, out, processes, process_id, coordinator):
+        return start_process(
+            [sys.executable, str(WORKER), str(process_id), str(processes), coordinator, str(out), mode],
+            devices=2 // processes)
+    return run_pool(mode, directory, processes, start=start, timeout=120)
 
 
 def test_two_process_variable_turns_match_single_process_actions_and_update(tmp_path):
@@ -39,9 +28,9 @@ def test_two_process_variable_turns_match_single_process_actions_and_update(tmp_
     assert all(report["opened"] == report["closed"] == 4 for report in pool)
     assert all(report["updates"] == 1 and report["error"] is None for report in pool)
     for suffix in (".npz", ".batch.npz"):
-        with np.load(tmp_path / "single" / f"rank0{suffix}") as reference:
+        with np.load(tmp_path / "single" / f"process0{suffix}") as reference:
             for rank in range(2):
-                with np.load(tmp_path / "pool" / f"rank{rank}{suffix}") as actual:
+                with np.load(tmp_path / "pool" / f"process{rank}{suffix}") as actual:
                     assert set(actual.files) == set(reference.files)
                     for name in reference.files:
                         # Both layouts use two global devices and the same row

@@ -20,8 +20,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import decoder
 from reference_error import assert_as_exact_as_the_reference
-from test_text_rollout_contract import decoder
 
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
