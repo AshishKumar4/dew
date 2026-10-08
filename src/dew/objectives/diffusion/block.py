@@ -26,7 +26,7 @@ from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import BlockDenoiser, LayerScalars
+from dew.nn.protocols import BlockDenoiser, CacheCapacity, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     FROZEN,
@@ -256,7 +256,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return (ProgramModule(self.training_model, None, trained=True),)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
-        (self.training_model,) = modules
+        (trained,) = modules
+        if not (isinstance(trained, BlockDenoiser) and isinstance(trained, CacheCapacity)):
+            raise TypeError(f"the block objective trains a block denoiser with a cache capacity, not a "
+                            f"{type(trained).__name__}")
+        self.training_model = trained
+        # The record and the task read the substitute (a run's quantization, a
+        # remat rung) at the serving capacity.
+        self.model = trained.with_cache_capacity(self.model.max_seq_len)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
