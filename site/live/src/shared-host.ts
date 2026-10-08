@@ -23,6 +23,11 @@ export class SharedHost extends DurableObject<Env> {
 	}
 
 	async retire(): Promise<void> {
+		// A context that ended without a close through this host stays a member; only the
+		// contexts the container still holds keep it from retiring.
+		for (const session of (await this.ctx.storage.get<string[]>('sessions')) ?? []) {
+			if (!(await this.has(session))) await this.membership(session, false);
+		}
 		if ((await this.ctx.storage.get<string[]>('sessions'))?.length) throw new Error('a model host still has active contexts');
 		if (this.ctx.container?.running) await this.ctx.container.destroy();
 		await this.ctx.storage.deleteAlarm();

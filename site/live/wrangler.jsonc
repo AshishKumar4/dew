@@ -246,7 +246,7 @@
 				"ALLOWED_ORIGINS": "https://preview.dewml.dev",
 				"TURNSTILE_HOSTNAMES": "preview.dewml.dev",
 				"TURNSTILE_TEST_KEYS": "accept",
-				"BUDGET_SECONDS": "14400",
+				"BUDGET_SECONDS": "144000",
 				"MAX_SESSIONS": "2",
 				"WALL_SECONDS": "1200",
 				"WARM_SECONDS": "600",
