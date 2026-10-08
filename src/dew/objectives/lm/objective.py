@@ -717,7 +717,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         samples = self.samples
         return {
             'seq_len': self.seq_len,
-            'sample_tokens': 0 if samples is None else samples.max_new_tokens,
+            'max_new_tokens': 0 if samples is None else samples.max_new_tokens,
             'sampling': to_record(Sampling() if samples is None else samples.sampling, Sampling),
             'tokenizer': recorded_tokenizer(self.processor),
         }

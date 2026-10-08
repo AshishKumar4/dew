@@ -399,8 +399,8 @@ def test_saved_masked_run_refuses_invalid_sample_budget(masked_source, tmp_path)
     state = Trainer(objective, optax.sgd(0.05), key=jax.random.key(19)).initial_state()
     for index, budget in enumerate((-1, True, "8")):
         checkpoints = Checkpoints(str(tmp_path / str(index)))
-        checkpoints.save(0, state, None, artifact={**objective.inference_record(), "sample_tokens": budget})
+        checkpoints.save(0, state, None, artifact={**objective.inference_record(), "max_new_tokens": budget})
         checkpoints.wait()
-        with pytest.raises(ValueError, match="sample_tokens"):
+        with pytest.raises(ValueError, match="max_new_tokens"):
             pipeline(str(tmp_path / str(index)), ema=False)
 

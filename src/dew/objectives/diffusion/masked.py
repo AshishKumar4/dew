@@ -127,7 +127,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """The row length, tokenizer, process, solver and sampling steps."""
         from dew.inference.tasks import recorded_tokenizer
         from dew.registry import to_record
-        return {'seq_len': self.seq_len, 'sample_tokens': self.seq_len,
+        return {'seq_len': self.seq_len, 'max_new_tokens': self.seq_len,
                 'tokenizer': recorded_tokenizer(self.processor),
                 'process': self.process.to_json(), 'solver': to_record(self.solver, Solver),
                 'sampling_steps': self.steps}
