@@ -28,11 +28,11 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.typing import DTypeLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.blocks import sinusoidal_time
 from dew.nn.precision import at_least_fp32
+from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
 
 from .decoder_block import GatedMLP
@@ -50,31 +50,23 @@ def _image_grid(rows: int, columns: int) -> tuple[np.ndarray, np.ndarray]:
     return np.repeat(heights, columns), np.tile(widths, rows)
 
 
-def _rotary_angles(lengths: jax.Array, text: int, rows: int, columns: int,
-                   axes: Sequence[int], *, dtype: DTypeLike) -> jax.Array:
-    """The angle of every channel pair of every token, image first,
-    `[B, rows * columns + text, sum(axes) / 2]`, in `dtype` (`at_least_fp32`
-    of the model's).
+def _rotary_positions(lengths: jax.Array, text: int, rows: int, columns: int) -> jax.Array:
+    """The rotary ids of every token, image first, `[B, rows * columns + text, 3]`.
 
     A text token sits at its index on all three axes. The image's frame axis
     is the row's own text length, and its other two are the centred grid.
-    Each axis turns at `QwenImage21Rope.rope_params`' inverse frequencies,
-    theta 10000 in its float32 arithmetic below float64.
+    The angles are `QwenImage21Rope.rope_params`', theta 10000 in float32
+    (`dew.nn.rope.axis_tables`), whose inverse frequencies at these widths
+    are the source's float32 `pow` bit for bit.
     """
-    real = np.dtype(dtype).type
     heights, widths = _image_grid(rows, columns)
-    index = jnp.arange(text, dtype=real)
+    index = jnp.arange(text)
     batch = lengths.shape[0]
-    frame = jnp.concatenate([jnp.broadcast_to(lengths.astype(real)[:, None],
-                                              (batch, rows * columns)),
+    frame = jnp.concatenate([jnp.broadcast_to(lengths[:, None], (batch, rows * columns)),
                              jnp.broadcast_to(index, (batch, text))], axis=1)
-    height = jnp.concatenate([jnp.asarray(heights, real), index])
-    width = jnp.concatenate([jnp.asarray(widths, real), index])
-    positions = (frame, jnp.broadcast_to(height, frame.shape), jnp.broadcast_to(width, frame.shape))
-    return jnp.concatenate([
-        position[..., None] * jnp.asarray(real(1.0) / np.power(
-            real(10000), np.arange(0, dim, 2).astype(real) / real(dim)))
-        for position, dim in zip(positions, axes, strict=True)], axis=-1)
+    grid = jnp.concatenate([jnp.asarray(np.stack([heights, widths], axis=-1)),
+                            jnp.stack([index, index], axis=-1)])
+    return jnp.concatenate([frame[..., None], jnp.broadcast_to(grid, (batch, *grid.shape))], axis=-1)
 
 
 def _dense(features: int, name: str, dtype, precision) -> nn.Dense:
@@ -231,9 +223,8 @@ class QwenImageTransformer(nn.Module):
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
         modulation = tuple(zip(still, sampled, strict=True))
 
-        angles = _rotary_angles(lengths, text, rows, columns, self.axes_dims_rope, dtype=wide)
-        rotation = tuple(jnp.repeat(turn(angles), 2, axis=-1)[:, :, None].astype(joint.dtype)
-                         for turn in (jnp.cos, jnp.sin))
+        rotation = axis_tables(_rotary_positions(lengths, text, rows, columns), self.axes_dims_rope, 10000.0,
+                               dtype=wide)
         for index in range(self.num_layers):
             joint = _Block(
                 self.features, self.heads, self.head_dim, self.mlp_ratio, self.eps,

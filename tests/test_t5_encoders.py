@@ -85,15 +85,35 @@ def test_each_umt5_layer_reads_its_own_bias():
     expected = reference(TINY_UMT5)
     encoder = T5Text.from_pretrained(str(TINY_UMT5))
     tokens = {"input_ids": expected["input_ids"], "attention_mask": expected["attention_mask"]}
-    layers = encoder.params["params"]
-    first = layers["layers_0"]["self_attn"]["rel_bias"]
-    shared = dict(layers)
-    for name in ("layers_1", "layers_2"):
-        shared[name] = {**layers[name], "self_attn": {**layers[name]["self_attn"], "rel_bias": first}}
+    tables = encoder.params["params"]
+    shared = dict(tables)
+    for name in ("relative_attention_bias_1", "relative_attention_bias_2"):
+        shared[name] = tables["relative_attention_bias_0"]
 
     difference = largest_difference(encoder.encode({"params": shared}, tokens).hidden,
                                     expected["last_hidden_state"])
     assert difference > TOLERANCE, f"layer 0's table in every layer still matches: {difference:.3e}"
+
+
+def test_training_drops_units_and_one_key_drops_the_same_ones():
+    """The config's dropout_rate reaches the tower, and with `train` the
+    encoder drops units: two dropout keys give different states, one key the
+    same states twice, and evaluation stays the reference's."""
+    from dew.nn.text_encoders import T5EncoderModel, translate_t5_config
+
+    config = json.loads((TINY / "config.json").read_text())
+    tower = translate_t5_config({**config, "dropout_rate": 0.25}).value
+    assert tower.dropout_rate == 0.25
+    variables = T5EncoderModel.from_pretrained(str(TINY)).variables
+    expected = reference(TINY)
+
+    def encoded(**kwargs):
+        return np.asarray(tower.apply(variables, expected["input_ids"], expected["attention_mask"], **kwargs))
+
+    dropped = encoded(train=True, rngs={"dropout": jax.random.key(1)})
+    np.testing.assert_array_equal(dropped, encoded(train=True, rngs={"dropout": jax.random.key(1)}))
+    assert not np.array_equal(dropped, encoded(train=True, rngs={"dropout": jax.random.key(2)}))
+    assert largest_difference(encoded(), expected["last_hidden_state"]) < TOLERANCE
 
 
 def test_the_encoder_tokenizes_and_captions():
@@ -124,14 +144,14 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
 
 @pytest.mark.parametrize("path", [
     ("embed_tokens", "embedding"),
-    ("layers_0", "self_attn", "rel_bias", "embedding"),
+    ("relative_attention_bias_0", "embedding"),
     ("layers_0", "self_attn", "q_proj", "kernel"),
-    ("layers_0", "self_attn", "out_proj", "kernel"),
-    ("layers_0", "attn_norm", "scale"),
-    ("layers_0", "mlp", "wi_0", "kernel"),
-    ("layers_0", "mlp", "wi_1", "kernel"),
-    ("layers_0", "mlp", "wo", "kernel"),
-    ("layers_1", "mlp_norm", "scale"),
+    ("layers_0", "self_attn", "o_proj", "kernel"),
+    ("layers_0", "input_layernorm", "scale"),
+    ("layers_0", "mlp", "gate_proj", "kernel"),
+    ("layers_0", "mlp", "up_proj", "kernel"),
+    ("layers_0", "mlp", "down_proj", "kernel"),
+    ("layers_1", "post_attention_layernorm", "scale"),
     ("final_layer_norm", "scale"),
 ], ids=lambda path: ".".join(path))
 def test_every_translated_leaf_is_load_bearing(path):

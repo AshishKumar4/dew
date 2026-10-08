@@ -17,8 +17,8 @@ Two tables name them. `activation` reads Hugging Face's `hidden_act` names
 (transformers 5.16.1 `activations.ACT2CLS`): 'gelu' is the erfc form there.
 Every tower checks its own subset of names before asking, and refuses the
 rest in its own words. `UNGATED` holds Dew's names for an ungated decoder
-feed-forward, which saved run records store: 'gelu' is the tanh form there and
-'gelu_exact' torch's erf form. The gated names map onto these in
+or encoder feed-forward, which saved run records store: 'gelu' is the tanh
+form there and 'gelu_exact' torch's erf form. The gated names map onto these in
 `dew.nn.moe.gated_product`, which owns the product's rounding.
 """
 
@@ -79,7 +79,8 @@ def activation(name: str) -> Activation:
 
 
 UNGATED: dict[str, Activation] = {
-    'gelu': gelu_tanh, 'gelu_exact': gelu_exact_torch, 'relu': jax.nn.relu, 'relu2': relu2}
+    'gelu': gelu_tanh, 'gelu_exact': gelu_exact_torch, 'relu': jax.nn.relu, 'relu2': relu2,
+    'quick_gelu': quick_gelu}
 """The activations an ungated feed-forward takes, by Dew's names."""
 
 
