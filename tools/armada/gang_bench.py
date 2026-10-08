@@ -18,6 +18,7 @@ import statistics
 import sys
 import threading
 import time
+from pathlib import Path
 
 RANK, WORLD = int(os.environ["ARMADA_RANK"]), int(os.environ["ARMADA_WORLD"])
 PAYLOADS = (4, 1 << 16, 1 << 20, 16 << 20, 64 << 20)
@@ -57,7 +58,10 @@ def relay() -> dict:
         echo.sendall(b"x" * 64)
         got = b""
         while len(got) < 64:
-            got += echo.recv(64 - len(got))
+            chunk = echo.recv(64 - len(got))
+            if not chunk:
+                raise ConnectionError(f"rank {RANK}: {peer} closed the echo")
+            got += chunk
         trips.append(time.perf_counter() - start)
     echo.close()
     sink = socket.create_connection((peer, RELAY_PORT), timeout=60)
@@ -71,7 +75,12 @@ def relay() -> dict:
 
 
 def main() -> None:
-    measured = relay()
+    try:
+        measured = relay()
+    except Exception:
+        # The relay's own account of what it could not reach.
+        print(Path("/armada/relay.log").read_text()[-4000:], file=sys.stderr, flush=True)
+        raise
     began = time.monotonic()
     import jax
 
