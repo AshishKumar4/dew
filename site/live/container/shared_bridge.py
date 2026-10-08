@@ -99,17 +99,19 @@ def available(meminfo=Path("/proc/meminfo")):
 
 
 def largest_guest(proc=Path("/proc")):
-    """The pid of the guest process holding the most memory, or None."""
-    largest, held = None, 0
+    """The pids of the guest context holding the most memory, summed over its processes: each
+    context runs as a uid of its own (gateway_manager.py). Empty when no guest runs."""
+    held, pids = {}, {}
     for status in proc.glob("[0-9]*/status"):
         try:
             fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
             uid, rss = int(fields["Uid"].split()[1]), int(fields.get("VmRSS", "0 kB").split()[0])
         except (OSError, KeyError, ValueError):
             continue
-        if uid in GUEST_UIDS and rss > held:
-            largest, held = int(status.parent.name), rss
-    return largest
+        if uid in GUEST_UIDS:
+            held[uid] = held.get(uid, 0) + rss
+            pids.setdefault(uid, []).append(int(status.parent.name))
+    return pids[max(held, key=held.__getitem__)] if held else []
 
 
 class Gateway:
@@ -355,9 +357,10 @@ class Gateway:
         then tells its cell the context stopped (`Stopped`)."""
         while True:
             await asyncio.sleep(0.5)
-            if available() < RESERVE and (pid := largest_guest()):
-                with suppress(ProcessLookupError):
-                    os.kill(pid, signal.SIGKILL)
+            if available() < RESERVE:
+                for pid in largest_guest():
+                    with suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
 
     async def sweep(self):
         while True:

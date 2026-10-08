@@ -205,12 +205,15 @@ def test_a_cell_whose_context_died_is_told_and_its_next_run_starts_a_new_one(gat
     asyncio.run(asyncio.wait_for(scenario(), 10))
 
 
-def test_the_memory_guard_picks_the_guest_holding_the_most(bridge, tmp_path):
+def test_the_memory_guard_picks_the_context_holding_the_most(bridge, tmp_path):
     (tmp_path / "meminfo").write_text("MemTotal: 12000000 kB\nMemAvailable:  1000000 kB\n")
     assert bridge.available(tmp_path / "meminfo") == 1000000 << 10
-    for pid, uid, rss in ((10, 5000, 9000000), (11, 6101, 200000), (12, 6102, 3000000), (13, 6103, None)):
+    processes = ((10, 5000, 9000000), (11, 6101, 2000000), (12, 6102, 3000000), (13, 6103, None),
+                 (14, 6101, 2000000))
+    for pid, uid, rss in processes:
         (tmp_path / str(pid)).mkdir()
         rows = [f"Uid:\t{uid}\t{uid}\t{uid}\t{uid}"] + ([f"VmRSS:\t{rss} kB"] if rss else [])
         (tmp_path / str(pid) / "status").write_text("\n".join(rows) + "\n")
-    # The model process (uid 5000) holds more, but only guests are candidates.
-    assert bridge.largest_guest(tmp_path) == 12
+    # The model process (uid 5000) holds the most, but only guests are candidates; a context is
+    # all of its uid's processes, so two of 2 GB outweigh one of 3 GB.
+    assert sorted(bridge.largest_guest(tmp_path)) == [11, 14]
