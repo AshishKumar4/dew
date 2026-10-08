@@ -32,7 +32,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
+import re
 import time
 import urllib.request
 from pathlib import Path
@@ -73,6 +75,27 @@ def corpus(cache: Path) -> Path:
     return tokens
 
 
+COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
+BYTES = {"f64": 8, "f32": 4, "s32": 4, "u32": 4, "bf16": 2, "f16": 2, "s8": 1, "u8": 1, "pred": 1}
+
+
+def collectives(hlo: str) -> dict:
+    """Each kind of collective in compiled HLO text: how many there are, their result bytes,
+    and the sizes of the five largest. A combined collective is one op with a tuple result."""
+    found: dict = {}
+    pattern = re.compile(r"= (\(?[^=]*?\)?) (" + "|".join(COLLECTIVES) + r")(?:-start)?\(")
+    for result, kind in pattern.findall(hlo):
+        size = sum(BYTES.get(dtype, 4) * math.prod(int(dim) for dim in dims.split(",") if dim)
+                   for dtype, dims in re.findall(r"(\w+)\[([\d,]*)\]", result))
+        entry = found.setdefault(kind, {"ops": 0, "bytes": 0, "sizes": []})
+        entry["ops"] += 1
+        entry["bytes"] += size
+        entry["sizes"].append(size)
+    for entry in found.values():
+        entry["sizes"] = sorted(entry["sizes"], reverse=True)[:5]
+    return found
+
+
 def mesh_of(layout: dict, devices: int) -> dict:
     """The shape's layout over `devices`: an axis given as -1 takes every device."""
     return {axis: devices if size == -1 else size for axis, size in layout.items()}
@@ -85,6 +108,8 @@ def main() -> None:
     parser.add_argument("--seconds", type=float, default=float("inf"),
                         help="stop after this many seconds of steps, to time a step the run cannot finish")
     parser.add_argument("--batch", type=int, help="the global batch; the shape's own by default")
+    parser.add_argument("--compile-only", action="store_true",
+                        help="print the step's collectives and memory, and train nothing")
     parser.add_argument("--target", type=float, help="the loss to stop at; the shape's own by default")
     parser.add_argument("--dtype", default=None, help="compute dtype; float32 on CPU, bfloat16 on a GPU")
     parser.add_argument("--cache", type=Path,
@@ -139,6 +164,13 @@ def main() -> None:
         if compiled is None:
             compiled = trainer.compile(state, batch)
             compile_seconds = time.monotonic() - start
+            memory = trainer.executable.memory_analysis()
+            if rank == 0:
+                print(json.dumps({"collectives": collectives(trainer.executable.as_text()),
+                                  "temp_GB": memory.temp_size_in_bytes / 1e9,
+                                  "arguments_GB": memory.argument_size_in_bytes / 1e9}), flush=True)
+            if args.compile_only:
+                return
             start = time.monotonic()
         state, loss, _, _, _ = compiled(state, batch)
         loss = float(loss)
