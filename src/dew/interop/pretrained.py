@@ -66,6 +66,7 @@ from dew.interop.streaming import SourceLeaf, WeightLayout
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
@@ -885,7 +886,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
         text_fields["mixer"] = {"class": "attention", "fields": {"bidirectional_images": True}}
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
         kinds = decoder_parts.kinds_of(text_fields).copy()
-        sliding = NativeFields(decoders.LayerKind, {
+        sliding = NativeFields(LayerKind, {
             **kinds.get("sliding_attention", {}),
             "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
         kinds["sliding_attention"] = sliding
@@ -897,7 +898,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
         kinds = decoder_parts.kinds_of(text_fields).copy()
-        full = NativeFields(decoders.LayerKind, {
+        full = NativeFields(LayerKind, {
             **kinds.get("full_attention", {}),
             "mixer": {"class": "attention", "fields": {
                       "mrope_section": [sections[0], sections[1], sections[2]]}}})
