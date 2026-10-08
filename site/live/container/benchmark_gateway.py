@@ -123,13 +123,16 @@ def training():
 def cells():
     """The page's training cells, each run in a fresh training context as a visitor's Run does,
     while the model process holds its models. A failure names the host's memory."""
-    for name in ("finetune.py", "hero.py"):
+    # Each cell's last line of output, which only a complete run prints; the training summary
+    # itself is a display, not a stream.
+    for name, ending in (("finetune.py", "After: "), ("hero.py", "JULIET:")):
         code = (pathlib.Path("/opt/live/cells") / name).read_text()
         kernel = request("/api/kernels", {"name": "dew-train"})
         client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
         client.load_connection_file()
         client.start_channels()
         started = time.perf_counter()
+        print(f"{name} starts; memory {memory()}", flush=True)
         try:
             client.wait_for_ready(timeout=30)
             output = collect(client, client.execute(code, allow_stdin=False), timeout=400)
@@ -139,7 +142,7 @@ def cells():
         finally:
             client.stop_channels()
             request("/api/kernels/" + kernel["id"], method="DELETE")
-        assert "Trained 20 steps" in output, output[-2000:]
+        assert ending in output, output[-2000:]
         print(f"{name} ran in {time.perf_counter() - started:.0f} s; memory {memory()}", flush=True)
 
 
