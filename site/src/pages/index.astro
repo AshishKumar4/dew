@@ -108,6 +108,7 @@ const tutorialNames: Record<string, string> = {
 			<h2 class="band-title">Fine-tuning</h2>
 			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names. Run the first cell to fine-tune SmolLM2-135M on Tiny Shakespeare and compare its text before and after.</p>
 			<LiveTrain code={finetuneCell} title="finetune.py" cell="finetune" />
+			<p class="framework-note">A larger model, recorded: Qwen3-0.6B, one step, then saved in its original layout.</p>
 			<EditableExample code={example(framework, 'pretrained')} title="Fine-tune Qwen3-0.6B" />
 			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
 				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}
