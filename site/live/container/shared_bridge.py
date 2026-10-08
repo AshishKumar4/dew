@@ -14,6 +14,7 @@ import hmac
 import json
 import os
 import re
+import signal
 import time
 import urllib.request
 import uuid
@@ -33,6 +34,10 @@ MAX_OUTPUT = 2_000_000
 # start-gateway.sh starts at most MAX_CONTEXTS + 1 kernels.
 MAX_CELLS = 6
 MAX_CONTEXTS = 24
+# Memory the model process and the bridge keep free. Below it a new context is refused and the
+# largest guest is killed at once: waiting for the kernel's OOM killer lets the host thrash first.
+RESERVE = 1536 << 20
+GUEST_UIDS = range(6100, 6200)
 PRELOAD = {"python3": "import model_client; model_client.install()",
            "dew-train": "import live_training; live_training.install()"}
 
@@ -87,6 +92,28 @@ class Context:
             return reply
 
 
+def available(meminfo=Path("/proc/meminfo")):
+    """The host's available memory, in bytes."""
+    line = next(line for line in meminfo.read_text().splitlines() if line.startswith("MemAvailable:"))
+    return int(line.split()[1]) << 10
+
+
+def largest_guest(proc=Path("/proc")):
+    """The pids of the guest context holding the most memory, summed over its processes: each
+    context runs as a uid of its own (gateway_manager.py). Empty when no guest runs."""
+    held, pids = {}, {}
+    for status in proc.glob("[0-9]*/status"):
+        try:
+            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
+            uid, rss = int(fields["Uid"].split()[1]), int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, KeyError, ValueError):
+            continue
+        if uid in GUEST_UIDS:
+            held[uid] = held.get(uid, 0) + rss
+            pids.setdefault(uid, []).append(int(status.parent.name))
+    return pids[max(held, key=held.__getitem__)] if held else []
+
+
 class Gateway:
     def __init__(self, token, secret, commit):
         self.token, self.secret, self.commit = token, secret, commit
@@ -120,6 +147,8 @@ class Gateway:
                 raise ValueError("this page has more live cells than one session runs")
             if kernel == "python3" and sum(map(len, self.contexts.values())) >= MAX_CONTEXTS:
                 raise ValueError("the shared container has no free Python contexts")
+            if available() < RESERVE + (512 << 20):
+                raise ValueError("the shared host is short of memory right now; try again in a minute")
             started = time.monotonic()
             kernel = {**await self.api("/api/kernels", {"name": kernel}), "preload": PRELOAD[kernel]}
             channels = None
@@ -323,6 +352,16 @@ class Gateway:
             self.connected.discard(session)
             await self.close(session)
 
+    async def guard(self):
+        """Kill the largest guest while the host's available memory is under RESERVE; the bridge
+        then tells its cell the context stopped (`Stopped`)."""
+        while True:
+            await asyncio.sleep(0.5)
+            if available() < RESERVE:
+                for pid in largest_guest():
+                    with suppress(ProcessLookupError):
+                        os.kill(pid, signal.SIGKILL)
+
     async def sweep(self):
         while True:
             await asyncio.sleep(15)
@@ -337,7 +376,7 @@ async def main():
                       Path("/opt/live/dew-commit").read_text().strip())
     async with serve(gateway.websocket, "0.0.0.0", 8888, process_request=gateway.http,
                      max_size=MAX_CODE * 4, ping_interval=20, ping_timeout=20):
-        await gateway.sweep()
+        await asyncio.gather(gateway.sweep(), gateway.guard())
 
 
 if __name__ == "__main__":
