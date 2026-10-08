@@ -1444,7 +1444,7 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
 
 
 def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
-    """`dew.nn.rope.apply_rotary` as it was through 2026-10-06, and as the HF
+    """`dew.nn.rope`'s rotate-half as it was through 2026-10-06, and as the HF
     decoders write it, `x cos + rotate_half(x) sin`, at least fp32."""
     cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
     sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
@@ -1454,6 +1454,17 @@ def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
     x1, x2 = jnp.split(wide, 2, axis=-1)
     out = jnp.concatenate([wide * cos + jnp.concatenate([-x2, x1], axis=-1) * sin, passed], axis=-1)
     return (out if scale is None else out * scale).astype(x.dtype)
+
+
+def test_a_per_axis_rotary_without_its_axes_is_refused():
+    """Turning each axis in its own halves needs the axes; without them the
+    layer would rotate by its positions and drop the per-axis layout."""
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    layer = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=2, head_dim=4, max_seq_len=4,
+                                causal=False, rotary_per_axis=True)
+    with pytest.raises(ValueError, match="needs rotary_axes"):
+        layer.init(jax.random.key(0), jnp.zeros((1, 4, 8)))
 
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
@@ -1467,7 +1478,7 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
     and partial rotary, a folded scale, and a packed batch's own angles."""
     from reference_error import assert_as_exact_as_the_reference
 
-    from dew.nn.rope import apply_rotary
+    from dew.nn.rope import rotate
 
     rng = np.random.default_rng(0)
     x = jnp.asarray(rng.normal(size=(2, 96, 4, 128)), dtype)
@@ -1476,13 +1487,13 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
     cotangent = jnp.asarray(rng.normal(size=x.shape), dtype)
 
     def forward_and_gradient(rotary, x, cos, sin):
-        out, pullback = jax.vjp(lambda x: rotary(x, cos, sin, scale), x)
+        out, pullback = jax.vjp(lambda x: rotary(x, cos, sin, scale=scale), x)
         return out, pullback(cotangent.astype(x.dtype))[0]
 
     with jax.enable_x64():
         wide = (np.asarray(part, np.float64) for part in (x, cos, sin))
         truth = forward_and_gradient(_rotate_half_reference, *wide)
-    new = forward_and_gradient(apply_rotary, x, cos, sin)
+    new = forward_and_gradient(rotate, x, cos, sin)
     old = forward_and_gradient(_rotate_half_reference, x, cos, sin)
     for label, mine, theirs, want in zip(("forward", "gradient"), new, old, truth, strict=True):
         assert mine.dtype == theirs.dtype == dtype

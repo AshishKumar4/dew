@@ -49,7 +49,7 @@ def pipeline(
     """Load the inference task for `source`, with its weights placed once.
 
     `source` is a run directory, a source checkpoint directory or a Hub
-    repository. A run loads as the task its recorded objective declares
+    repository holding either. A run loads as the task its recorded objective declares
     (`Objective.saved_task`), including a plugin objective's own task.
     `mesh` places the weights on that mesh under `layout`, or under the
     trainer's default layout when `layout` is None. Without `mesh`, data
@@ -75,6 +75,16 @@ def pipeline(
     dtype = dtype_name(dtype)
     param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
     root = epath.Path(source)
+    if not root.is_dir():
+        # A Hub source is read at the commit its metadata resolved; one holding
+        # a run (`HfApi().upload_folder`) is pulled whole and loads as the run.
+        from dew.interop import sources
+        from dew.interop.hub import pull_from_hub
+        metadata = sources.snapshot(source, revision, weights=False)
+        if (metadata / RUN_FILE).is_file():
+            root, revision = epath.Path(pull_from_hub(source, metadata.name)), None
+        else:
+            revision = metadata.name
     if root.is_dir() and (
             (root / RUN_FILE).is_file() or any(path.name.isdecimal() for path in root.iterdir())):
         if revision is not None:

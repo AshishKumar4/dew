@@ -155,10 +155,10 @@ def _gemma3_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     """Read a Gemma 3 wrapper: SigLIP tower, avg-pool projector, decoder."""
     text = _wrapper_text(hf_config, used)
     tower = translate_siglip_vision_config(hf_config)
-    mm = records.integer(hf_config.get("mm_tokens_per_image"), "mm_tokens_per_image")
     used.add("mm_tokens_per_image")
     projector = translate_gemma_projector_config(
-        tower["fields"], records.integer(text.get("emb_features"), "emb_features"), mm)
+        tower["fields"], records.integer(text.get("emb_features"), "emb_features"),
+        hf_config.get("mm_tokens_per_image"))
     image = _wrapper_token_id(hf_config, used, "image_token_index", "image_token_id")
     return _wrapper_fields("gemma3", used, text, tower, projector, image,
                            record_int(projector["fields"], "tokens_per_side") ** 2)

@@ -178,11 +178,11 @@ def test_the_guidance_input_follows_the_checkpoints_own_embedder(source):
                             condition)
 
 
-def test_the_rotary_table_is_the_sources_own_interleaved_pairs(source):
-    """The table Flux rotates with: one angle per adjacent channel pair, laid
-    out per axis, over the ids its pipeline writes."""
+def test_the_rotary_turns_the_sources_own_adjacent_pairs(source):
+    """The angles Flux rotates by: one per adjacent channel pair, laid out per
+    axis, over the ids its pipeline writes, each pair turned in place."""
     from dew.nn.backbones.flux import flux_positions
-    from dew.nn.backbones.joint import apply_rotary, rotary_table
+    from dew.nn.rope import axis_tables, rotate
 
     positions = flux_positions(3, 2, 4)
     # The text sits at the origin and each patch carries its row and column.
@@ -190,17 +190,18 @@ def test_the_rotary_table_is_the_sources_own_interleaved_pairs(source):
     np.testing.assert_array_equal(positions[:4], np.zeros((4, 3), np.float32))
     np.testing.assert_array_equal(positions[4:, 1], np.repeat(np.arange(3), 2))
     np.testing.assert_array_equal(positions[4:, 2], np.tile(np.arange(2), 3))
-    cos, sin = rotary_table(positions, (4, 4, 4))
-    assert cos.shape == sin.shape == (10, 12)
-    # Adjacent channels share an angle, and the text row rotates by nothing.
-    np.testing.assert_allclose(cos[:, 0::2], cos[:, 1::2], atol=0)
-    np.testing.assert_array_equal(cos[0], np.ones(12, np.float32))
-    np.testing.assert_array_equal(sin[0], np.zeros(12, np.float32))
-    # A quarter turn on one pair takes (x0, x1) to (-x1, x0).
-    quarter = np.zeros((1, 1, 1, 2), np.float32)
-    rotated = apply_rotary(jnp.asarray([[[[1.0, 2.0]]]]), jnp.zeros((1, 1, 1, 2)) + 0.0,
-                           jnp.ones((1, 1, 1, 2)) + quarter)
-    np.testing.assert_allclose(np.asarray(rotated).ravel(), [-2.0, 1.0], atol=0)
+    cos, sin = axis_tables(positions, (4, 4, 4), 10000.0, dtype=np.float64)
+    assert cos.shape == sin.shape == (10, 6)
+    # The text row rotates by nothing; a patch's row turns the row axis's
+    # first pair, at frequency one.
+    np.testing.assert_array_equal(cos[0], np.ones(6))
+    np.testing.assert_array_equal(sin[0], np.zeros(6))
+    np.testing.assert_array_equal(sin[4:, 2], np.sin(np.repeat(np.arange(3.0), 2)))
+    # A quarter turn takes the pair (x0, x1) to (-x1, x0) and a zero turn
+    # leaves the next pair where it was.
+    rotated = rotate(jnp.asarray([[[1.0, 2.0, 3.0, 4.0]]]), jnp.asarray([[[0.0, 1.0]]]),
+                     jnp.asarray([[[1.0, 0.0]]]), pairs="adjacent")
+    np.testing.assert_array_equal(np.asarray(rotated).ravel(), [-2.0, 1.0, 3.0, 4.0])
 
 
 @pytest.fixture(scope="module")

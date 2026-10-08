@@ -1,0 +1,43 @@
+{
+  "class": "dew.nn.backbones.unet_condition.UNet2DCondition",
+  "resolved_revision": "9cfd069101959ca3828bf9c04a4419870832b74f",
+  "converted_source_directory": "/root/.cache/dew/single_file/4f6538c4177e9d8306071965",
+  "inputs": {
+    "sample": {
+      "key": "image",
+      "shape": [
+        512,
+        512,
+        3
+      ]
+    },
+    "conditions": {
+      "conditioning": {
+        "encoder": {
+          "name": "diffusion_text",
+          "fields": {
+            "checkpoint": "/root/.cache/dew/single_file/.converting-mp8fjfm4",
+            "dtype": "bfloat16",
+            "param_dtype": "bfloat16"
+          }
+        },
+        "field": "text",
+        "unconditional": {
+          "text": "",
+          "negative": true,
+          "zero": false
+        }
+      }
+    }
+  },
+  "parameters_by_collection": {
+    "params": 859520964,
+    "encoders": 123060480,
+    "autoencoder": 83653863
+  },
+  "bytes_by_collection": {
+    "params": 1719041928,
+    "encoders": 246120960,
+    "autoencoder": 167307726
+  }
+}

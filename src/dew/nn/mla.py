@@ -43,7 +43,7 @@ from dew.nn.kv_cache import KVCache, write_cache
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
-from dew.nn.rope import YarnScaling, apply_rotary, apply_rotary_interleave, yarn_query_scale, yarn_rope_freqs
+from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top_k_selection
 
@@ -133,9 +133,9 @@ def indexer_kl(scores, query, key, keep, scale: float):
 
 def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     """Rotate a rope slice in interleaved pairs (DeepSeek's main head, GLM's
-    indexer) or half-split ones (V3.2's indexer)."""
-    rotate = apply_rotary_interleave if interleave else apply_rotary
-    return rotate(part, freqs_cos, freqs_sin)
+    indexer), left in the reference's half layout, or half-split ones (V3.2's
+    indexer)."""
+    return rotate(deinterleaved(part) if interleave else part, freqs_cos, freqs_sin)
 
 
 @logical_axes({

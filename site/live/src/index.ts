@@ -20,7 +20,7 @@ export { SnapshotPreparer } from './preparer';
 
 const REFUSALS: Record<Refusal, string> = {
 	busy: 'Every live kernel is in use right now. Try again in a minute, or open the notebook in Colab.',
-	'one-at-a-time': 'You already have a live kernel open. Close that tab, or wait for it to stop, and try again.',
+	'too-many-tabs': 'Live cells are open in three of your tabs. Close one of them, or wait for it to stop, and try again.',
 	'too-many-starts': 'You have started several live kernels in the last few minutes. Wait a little, or open the notebook in Colab.',
 	budget: "Today's time for live kernels is used up. It resets at midnight UTC; Colab runs the notebook now.",
 };

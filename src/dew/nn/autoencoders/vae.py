@@ -6,7 +6,6 @@ configuration and checkpoint files; no external model implementation runs.
 """
 
 import json
-import math
 import os
 from collections.abc import Sequence
 from functools import partial
@@ -19,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop.weights import ParamTree, translate_parameters
+from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.conv import Conv
 
 
@@ -87,9 +87,11 @@ class FlaxAttentionBlock(nn.Module):
     """Attend over an image's pixels as a sequence, with a residual.
 
     One head as wide as the channels, which is what every AutoencoderKL
-    mid-block runs. The scale is split over the query and the key, as
-    diffusers writes it, which is the arithmetic the published weights were
-    trained under.
+    mid-block runs, through the shared attention core
+    (`dew.nn.attention.scaled_dot_product_attention`), which picks the kernel
+    and runs the softmax in fp32. Its logits are scaled by 1/sqrt(channels),
+    the scale diffusers splits over the query and the key: the same function,
+    rounded in another order.
     """
 
     channels: int
@@ -102,13 +104,9 @@ class FlaxAttentionBlock(nn.Module):
         batch, height, width, channels = hidden_states.shape
         hidden_states = _group_norm(self.num_groups, self.dtype, "group_norm")(hidden_states)
         hidden_states = hidden_states.reshape((batch, height * width, channels))
-        query, key, value = (nn.Dense(self.channels, dtype=self.dtype, name=name)(hidden_states)
+        query, key, value = (nn.Dense(self.channels, dtype=self.dtype, name=name)(hidden_states)[:, :, None]
                              for name in ("query", "key", "value"))
-
-        scale = 1 / math.sqrt(math.sqrt(self.channels))
-        attn_weights = jnp.einsum("...qc,...kc->...qk", query * scale, key * scale)
-        attn_weights = nn.softmax(attn_weights, axis=-1)
-        hidden_states = jnp.einsum("...kc,...qk->...qc", value, attn_weights)
+        hidden_states = scaled_dot_product_attention(query, key, value)[:, :, 0]
 
         hidden_states = nn.Dense(self.channels, dtype=self.dtype, name="proj_attn")(hidden_states)
         return hidden_states.reshape((batch, height, width, channels)) + residual
