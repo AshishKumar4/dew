@@ -1,4 +1,10 @@
 {
+  "devices": [
+    0,
+    1,
+    2,
+    3
+  ],
   "axes": {
     "data": 1,
     "expert": 1,
@@ -7,12 +13,5 @@
     "sequence": 1,
     "stage": 1
   },
-  "devices": [
-    0,
-    1,
-    2,
-    3
-  ],
-  "backend": "cpu",
-  "training": false
+  "steps": 3
 }

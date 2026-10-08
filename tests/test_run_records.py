@@ -10,12 +10,22 @@ import json
 from pathlib import Path
 
 import pytest
+from flax import linen as nn
+from releases import released, released_sampling
 
-from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
+from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
 from dew.decision.config import DecisionRunConfig
-from dew.objectives.diffusion import DiffusionRunConfig
+from dew.diffusion import presets
+from dew.diffusion.discrete import MDLM
+from dew.inputs import CharTable, Condition, Field, InputSpec
+from dew.nn.backbones import SimpleDiT
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.diffusion import DiffusionRunConfig, MaskedDiffusionObjective
 from dew.objectives.jepa import JepaRunConfig
 from dew.objectives.lm.config import LMRunConfig
+from dew.objectives.supervised import Supervised
+from dew.registry import from_record, models, objectives, parameters, read_arguments, to_record
+from dew.sampling import CFG
 from dew.training.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -62,20 +72,121 @@ def test_an_unknown_field_is_refused():
         DiffusionRunConfig.from_dict({**record, "preset": {"class": "edm", "fields": {"warp": 1.0}}})
     with pytest.raises(ValueError, match=r"unknown fields \['seed'\]"):
         RunConfig.from_dict({"trainer": {"seed": 23}})
+    with pytest.raises(ValueError, match=r"takes no \['warp'\], which the record defaults"):
+        LMRunConfig.from_dict({"objective": {"name": "lm", "defaults": {"warp": 1.0}}})
+
+
+@pytest.mark.parametrize("kind, name", [*((ModelConfig, name) for name in models),
+                                        *((ObjectiveConfig, name) for name in objectives)],
+                         ids=lambda value: value if isinstance(value, str) else value.__name__)
+def test_a_config_records_its_class_defaults_and_builds_with_them_as_the_class_does(kind, name):
+    """Every model and objective class records its defaults as JSON that reads
+    back as written, and as the values the class defaults to, so a default
+    that changes later rebuilds as it was; until then a config builds with
+    nothing beyond what it states, and the class supplies its own."""
+    config = kind(name)
+    read = from_record(kind, json.loads(json.dumps(to_record(config, kind))), dtypes=False)
+    assert read == config
+    assert read.arguments == read.fields == {}
+    member = (models if kind is ModelConfig else objectives)[name]
+    declared = ({field.name: field.default_factory() if callable(field.default_factory) else field.default
+                 for field in dataclasses.fields(member)} if dataclasses.is_dataclass(member) else
+                {held: parameter.default for held, (parameter, _) in parameters(member)[0].items()})
+    assert read_arguments(member, config.defaults) == {field: declared[field] for field in config.defaults}
+
+
+def test_a_record_builds_the_defaults_it_was_written_with(monkeypatch):
+    """A run records every argument its objective and its model default, so a
+    later release that defaults them otherwise leaves `dew train run.json`
+    and a resume building what the run trained: MDLM's sampling steps and
+    the model's depth change here, the record still builds the old ones, and
+    a new run takes the new ones."""
+    def run():
+        return LMRunConfig(objective=ObjectiveConfig("masked_diffusion"), model=ModelConfig(
+            "causal_transformer", {"emb_features": 16, "num_heads": 2, "mlp_features": 32, "causal": False,
+                                   "mask_token_id": 0, "qk_norm": False, "dtype": "float32"}))
+
+    def built(config):
+        model = config.model.build(vocab_size=16)
+        objective = config.objective.build(model=model, process=MDLM(mask_id=0)(), seq_len=8)
+        return model.num_layers, objective.steps
+
+    record, (depth, steps) = json.loads(json.dumps(run().record())), built(run())
+    released(monkeypatch, MaskedDiffusionObjective, "steps", steps + 1)
+    released(monkeypatch, CausalTransformer, "num_layers", depth + 1)
+    assert built(RunConfig.read(record)) == (depth, steps)
+    assert built(run()) == (depth + 1, steps + 1)
+
+
+@pytest.mark.parametrize("name", ["diffusion", "mean_flow"])
+def test_a_record_holds_the_sampling_its_objective_resolved_and_builds_it_after_a_release(monkeypatch, name):
+    """A diffusion objective resolves its sampling from what it is built
+    around: a denoiser of its own samples at its default guidance for its
+    fallback step count, and MeanFlow unguided in its own steps. The run
+    records what it sampled with, so a release that samples otherwise by
+    default builds the recorded run as it sampled."""
+    interval = name == "mean_flow"
+    derived = {"model": SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1,
+                                  interval=interval),
+               "process": (presets.MeanFlow() if interval else presets.Flow())(),
+               "inputs": InputSpec(Field("image", (4, 4, 3)),
+                                   {"textcontext": Condition(CharTable.from_pretrained("char_table"))})}
+
+    def run():
+        return RunConfig(objective=ObjectiveConfig(name, {"ema_decay": None}))
+
+    def sampling(config):
+        objective = config.objective.build(**derived)
+        return objective.guidance, objective.steps
+
+    objective = run().objective.build(**derived)
+    record, sampled = json.loads(json.dumps(run().recorded(objective).record())), sampling(run())
+    released_sampling(monkeypatch, CFG(scale=4.5), steps=7)
+    assert sampling(RunConfig.read(record)) == sampled
+    assert sampling(run()) == ((None, sampled[1]) if interval else (CFG(scale=4.5), 7))
+
+
+class Misnamed(Supervised):
+    """A `Supervised` that says it resolves its criteria, which it holds under no such name."""
+
+    resolved = ("criteria",)
+
+
+def test_a_resolved_argument_the_objective_holds_no_attribute_for_is_refused():
+    objective = Misnamed(nn.Dense(2), lambda output, batch: output, inputs=InputSpec(Field("x", (3,))))
+    with pytest.raises(ValueError, match=r"resolves \['criteria'\] and holds no attribute"):
+        RunConfig().recorded(objective)
 
 
 PUBLISHED = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "run.json"
 LIVE_PIN = ROOT / "site" / "live" / "container" / "text-to-image"
 
 
+def changed(written, held, at: str = "") -> list[str]:
+    """Where `written` does not keep what `held` states: a key it lacks, a
+    list of another length, or another value. What `held` does not state is
+    no change."""
+    if isinstance(held, dict) and isinstance(written, dict):
+        return [place for key, value in held.items() for place in
+                (changed(written[key], value, f"{at}/{key}") if key in written else [f"{at}/{key}"])]
+    if isinstance(held, list) and isinstance(written, list) and len(written) == len(held):
+        return [place for index, pair in enumerate(zip(written, held, strict=True))
+                for place in changed(*pair, f"{at}/{index}")]
+    return [] if written == held else [at]
+
+
 def test_the_published_run_reads_back_as_it_was_written():
     """dewml/hybrid-dit-176m's run.json, as the revision the live image pins
-    publishes it, is a current record: it loads and writes back unchanged.
-    A record change that refuses it or rewrites it fails here, and the fix
-    is to re-export the published run in the same change, since the site,
-    the quick start and the live sampler all load it."""
+    publishes it, is a current record: every field it states loads and writes
+    back as it states it. A field added since is written beside them; a
+    rename, a removal or a rewrite fails here, and the fix is to re-export the
+    published run in the same change, since the site, the quick start and the
+    live sampler all load it."""
     held = json.loads(PUBLISHED.read_text())
-    assert json.loads(json.dumps(RunConfig.read(held).record())) == held
+    assert changed(json.loads(json.dumps(RunConfig.read(held).record())), held) == []
+    stated = held["fields"]["objective"]["fields"]
+    built = RunConfig.read(held).objective.arguments
+    assert (built["guidance"], built["steps"]) == (stated["guidance"], stated["steps"])
 
 
 @pytest.mark.network

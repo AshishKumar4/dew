@@ -789,9 +789,11 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
 
 
 def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
-    """Every Python file under the named roots of `checkout`, skipping stub-only trees."""
+    """Every Python file under the named roots of `checkout`, or the root
+    itself when it names a file, skipping stub-only trees."""
     for root in roots:
-        for path in sorted((checkout / root).rglob("*.py")):
+        named = checkout / root
+        for path in [named] if named.is_file() else sorted(named.rglob("*.py")):
             relative = path.relative_to(checkout).as_posix()
             if "/stubs/" in f"/{relative}":
                 continue
@@ -800,8 +802,8 @@ def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
-    parser.add_argument("roots", nargs="*", help="directories under the checkout; by default the package's "
-                        "source, tests, tools, recipes and examples")
+    parser.add_argument("roots", nargs="*", help="directories or files under the checkout; by default the "
+                        "package's source, tests, tools, recipes and examples")
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout (default: Dew's)")
     parser.add_argument("--package", default="dew", help="the package under src/ (default: dew)")
     args = parser.parse_args(argv)

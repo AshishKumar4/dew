@@ -331,42 +331,35 @@ include each timing interval, the image-byte SHA-256 and the example outputs.
 
 ## Real image and masked-text examples
 
-[`sft_diffusion_gemma_images.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma_images.py)
-trains a small, fresh DiffusionGemma with a Gemma4 vision tower on Oxford
-Flowers images and class-name captions. It keeps image placeholders in the
-clean prompt and text targets in the response canvas. The script records the
-SFT loss, vision-parameter movement and generated captions. It does not
-qualify the released 26B DiffusionGemma; that requires a separate 80 GB GPU run.
-[`sft_diffusion_gemma.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma.py)
-remains the text-chat LoRA example.
-
 [`train_masked_lm.py`](https://github.com/AshishKumar4/dew/blob/main/examples/train_masked_lm.py)
-reads real text prepared by `dew tokenize --tokenizer byte`, trains
-the MDLM negative ELBO and unmasks a text sample. The mask is an extra id, 256,
-outside the corpus's byte vocabulary. Use WikiText or TinyStories as input.
-Both scripts accept `--smoke`, which shrinks the model and the run but still
-reads the real corpus you supply. A few steps show that the workflow runs and
-say nothing about caption or language quality.
+trains MDLM on TinyStories, or any Hugging Face text dataset with a `text`
+column. `HubText` tokenizes the train split once (GPT-2 ids by default) into
+Dew's cache, and the head 1% of that stream is held out. A bidirectional
+`CausalTransformer` learns MDLM's negative ELBO, with the mask one id past
+the tokenizer's vocabulary. Every `--eval-every` steps the trainer reports
+`val/perplexity`, the exponential of the NELBO per token, which is the bound
+MDLM reports. At the end the script loads the run back with `dew.pipeline`,
+scores the whole held-out split and unmasks a continuation of each
+`--prompts`, into `result.json` and `samples.txt`.
 
-I ran both for eight updates on the RTX 4080 in float32/HIGHEST. The Flowers
-image-SFT run used 1,020 real training images and a 977,362-parameter model.
-On the same fixed batch and noise key, its SFT loss went from 11.58235 to
-7.64003, and the largest change in a vision parameter was 0.0076374. Negating
-the conditioning pixels changed the trained loss to 8.16366. The masked-LM run
-used 1,984,069 training bytes from a two-million-character WikiText-103 subset
-and a 147,904-parameter model, and its fixed-batch NELBO went from 5.50278 to
-4.17817. Both runs saved checkpoints and generated samples. After eight
-updates the samples look like untrained byte text, and I make no claim about
-their quality.
+[`sft_diffusion_gemma_images.py`](https://github.com/AshishKumar4/dew/blob/main/examples/sft_diffusion_gemma_images.py)
+trains a fresh DiffusionGemma with a Gemma 4 vision tower to caption Oxford
+Flowers 102 with the flower's name. It stages the three splits as small
+parquet files once, trains on train and validation with random crops, and
+scores canvas cross entropy on test. Then it reloads the run as a
+`BlockGeneration` task, captions every test image, and records in
+`result.json` how many captions name the right flower. It trains a small
+model from scratch and does not fine-tune the released 26B DiffusionGemma.
 
-<!-- not run: needs the real corpora and a GPU -->
+Both scripts accept `--smoke`, which writes a few local records, shrinks the
+model and runs four CPU steps without the network. It shows that the
+workflow runs end to end and says nothing about quality.
+
+<!-- not run: downloads the datasets and trains for hours on a GPU -->
 ```bash
-python examples/sft_diffusion_gemma_images.py \
-    --flowers data/oxford_flowers102/2.1.1 --smoke --out runs/flowers-caption-smoke
-dew tokenize --input data/wikitext103-2m.txt \
-    --out data/wikitext-bytes --tokenizer byte
-python examples/train_masked_lm.py \
-    --tokens data/wikitext-bytes --smoke --out runs/masked-lm-smoke
+python examples/train_masked_lm.py --out runs/mdlm-tinystories
+python examples/sft_diffusion_gemma_images.py --out runs/flowers-caption
+JAX_PLATFORMS=cpu python examples/train_masked_lm.py --smoke --out /tmp/mdlm-smoke
 ```
 
 ## TFDS and Hugging Face datasets

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -57,6 +57,25 @@ dependencies = [
     "huggingface_hub",
 ]
 license = "MIT"
+license-files = ["LICENSE"]
+keywords = ["jax", "flax", "diffusion", "language-models", "jepa", "training"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://dewml.dev"
+Documentation = "https://dewml.dev"
+Repository = "https://github.com/AshishKumar4/dew"
+Issues = "https://github.com/AshishKumar4/dew/issues"
+Changelog = "https://github.com/AshishKumar4/dew/blob/main/CHANGELOG.md"
 
 [project.scripts]
 dew = "dew.cli.main:main"

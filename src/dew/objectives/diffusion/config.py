@@ -287,14 +287,14 @@ class DiffusionRunConfig(RunConfig):
     def model_fields(self, autoencoder: AutoEncoder | None) -> dict:
         """Return the fields the registry builds the model from.
 
-        These are the run's precision settings over `model.config`, plus the channels
-        the model denoises when the architecture takes them as `output_channels`. The
-        published families name theirs as their sources do, in `model.config`. On the
-        model those build, an `IntervalModel` embeds the duration under an interval
-        process, and MeanFlow, whose loss differentiates in time, turns a `TimeScaled`
-        model's time features at `SMOOTH_TIME_SCALE` unless `model.config` names a scale.
+        These are the model's `arguments`, plus the channels the model denoises when
+        the architecture takes them as `output_channels`. The published families name
+        theirs as their sources do, in `model.fields`. On the model those build, an
+        `IntervalModel` embeds the duration under an interval process, and MeanFlow,
+        whose loss differentiates in time, turns a `TimeScaled` model's time features
+        at `SMOOTH_TIME_SCALE` unless `model.fields` names a scale.
         """
-        fields = dict(self.model.fields)
+        fields = dict(self.model.arguments)
         if "output_channels" in {field.name for field in dataclasses.fields(models[self.model.name])}:
             fields["output_channels"] = (self.sample_field().shape[-1] if autoencoder is None
                                          else autoencoder.latent_channels)
