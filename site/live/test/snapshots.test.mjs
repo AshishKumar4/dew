@@ -40,6 +40,8 @@ test('a failed preparation alarm preserves the old snapshot and schedules its re
 	assert.equal(result.status.generation.commit, 'a'.repeat(40));
 	assert.equal(result.status.failure.commit, 'b'.repeat(40));
 	assert.ok(result.status.alarm >= result.now + 4 * 60_000);
+	// Each further failure waits twice as long: the third, 20 minutes.
+	assert.ok(result.third.alarm >= result.now + 19 * 60_000 && result.third.alarm <= result.now + 21 * 60_000);
 });
 test('a failed offline smoke does not replace the previous generation', async () => {
 	const result = await scenario('failure');

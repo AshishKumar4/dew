@@ -11,6 +11,7 @@ import { limitsOf } from './limits';
 import { digestIp, sign, verify } from './token';
 import { visitorKey } from './visitor';
 import { operatorAuthorized } from './operator';
+import { prunable } from './snapshot-ledger';
 
 export { Coordinator } from './coordinator';
 export { SharedHost } from './shared-host';
@@ -109,6 +110,17 @@ export default {
 			const host = url.searchParams.get('host') ?? '';
 			await env.SHARED.get(env.SHARED.idFromName(host)).retire();
 			return Response.json({ retired: host });
+		}
+		if (url.pathname === '/v1/operator/snapshots') {
+			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });
+			// GET says which recorded snapshots may go; POST forgets them, so nothing restores one
+			// again, and live/snapshots.mjs then deletes their tags with the operator's login.
+			const preparers = ['trusted', 'trial'].map((name) => env.PREPARER.get(env.PREPARER.idFromName(name)));
+			const active = (await env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global')).previous())?.snapshot.id;
+			const live = new Set([...await env.POOL.get(env.POOL.idFromName('global')).snapshots(), ...(active ? [active] : [])]);
+			const plan = prunable((await Promise.all(preparers.map((preparer) => preparer.snapshots()))).flat(), live, Date.now());
+			if (request.method === 'POST') await Promise.all(preparers.map((preparer) => preparer.forget(plan.delete)));
+			return Response.json({ ...plan, live: [...live] });
 		}
 		if (url.pathname === '/v1/operator/trial') {
 			if (!operatorAuthorized(request, env)) return new Response('Forbidden', { status: 403 });

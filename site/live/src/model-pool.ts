@@ -25,6 +25,13 @@ export class ModelPool extends DurableObject<Env> {
 		return (await this.ctx.storage.get<Pool>('pool')) ?? { hosts: [], sessions: {} };
 	}
 
+	/** Every snapshot the pool may start a host from, or started one from: none of them may be deleted. */
+	async snapshots(): Promise<string[]> {
+		const pool = await this.state();
+		return [...new Set([pool.desired?.snapshot.id, pool.serving, ...pool.hosts.map((host) => host.generation.snapshot.id)]
+			.filter((id): id is string => Boolean(id)))];
+	}
+
 	async configure(generation: SnapshotGeneration): Promise<void> {
 		await this.ctx.storage.transaction(async (storage) => {
 			const pool = (await storage.get<Pool>('pool')) ?? { hosts: [], sessions: {} };
