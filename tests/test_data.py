@@ -4,6 +4,8 @@ video specs and the determinism of what a record becomes.
 `import dew.data` and the grain paths must not need the optional extras,
 which is the point of several of these tests. Anything that genuinely
 requires an optional dependency skips.
+
+Record factories, holdout hashes and batch shares are Dew policies; Grain oracles iteration/resume.
 """
 
 import atexit
