@@ -4,6 +4,7 @@ import { execFileSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { operator, prune } from './snapshots.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const separator = process.argv.indexOf('--');
@@ -34,5 +35,20 @@ if (secretsAt >= 0) {
 			throw new Error(`model pool warmup refused: ${response.status} ${body}`);
 		}
 		await new Promise((resolve) => setTimeout(resolve, 1000));
+	}
+	// The account's registry limits snapshots for every team on it (snapshots.mjs). The new
+	// version can take a few seconds to answer every request, so a refusal is tried again.
+	for (let attempt = 1; ; attempt++) {
+		try {
+			await prune(operator(endpoint, secrets.OPERATOR_SECRET));
+			break;
+		} catch (error) {
+			if (attempt < 6) await new Promise((resolve) => setTimeout(resolve, 10_000));
+			else {
+				console.error('live: pruning snapshots failed', error);
+				process.exitCode = 1;
+				break;
+			}
+		}
 	}
 }
