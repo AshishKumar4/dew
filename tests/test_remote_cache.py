@@ -25,7 +25,8 @@ class Local:
 
 @pytest.fixture
 def worker():
-    """The Worker's protocol over a dict: GET, PUT, a 404 on a miss, a 401 without the token."""
+    """The Worker's protocol over a dict: GET, PUT, a 404 on a miss, a 401 without the token,
+    and Cloudflare's 403 for urllib's own User-Agent, which never reaches the Worker."""
     stored = {}
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -33,6 +34,10 @@ def worker():
             pass
 
         def _authorized(self):
+            if self.headers.get("User-Agent", "").startswith("Python-urllib"):
+                self.send_response(403)
+                self.end_headers()
+                return False
             if self.headers.get("Authorization") == "Bearer token":
                 return True
             self.send_response(401)
