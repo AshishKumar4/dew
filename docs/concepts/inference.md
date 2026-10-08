@@ -1,6 +1,6 @@
 # Inference
 
-An inference task holds a Dew model, its variables, and any tokenizer or condition encoders that come with the source. You call it with inputs and a key or seed, and it generates. `dew.pipeline(source)` loads a task from a run directory, a checkpoint directory or a Hub repository. It returns `TextGeneration` for decoders, `BlockGeneration` for DiffusionGemma, `MaskedGeneration` for masked-diffusion language models such as LLaDA and Dream, and `TextToImage` for diffusion models. `dew.inference.serving.Server` serves a `TextGeneration` with continuous batching over one resident KV cache.
+An inference task holds a Dew model, its variables, and any tokenizer or condition encoders that come with the source. You call it with inputs and a key or seed, and it generates. `dew.pipeline(source)` loads a task from a run directory, a checkpoint directory or a Hub repository holding either. It returns `TextGeneration` for decoders, `BlockGeneration` for DiffusionGemma, `MaskedGeneration` for masked-diffusion language models such as LLaDA and Dream, and `TextToImage` for diffusion models. `dew.inference.serving.Server` serves a `TextGeneration` with continuous batching over one resident KV cache.
 
 ## Example
 
@@ -63,7 +63,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 
 | Argument | Meaning |
 |---|---|
-| `source` | A run directory (it holds `run.json`), a checkpoint directory in a published layout, or a Hub repository. |
+| `source` | A run directory (it holds `run.json`), a checkpoint directory in a published layout, or a Hub repository holding either. |
 | `mesh`, `layout` | Where the weights are placed. Without `mesh`, `MeshSpec()` puts the current process pool's devices on data parallelism. |
 | `dtype` | Compute dtype. |
 | `param_dtype` | Parameter storage. `None` keeps a run's stored dtypes and uses float32 master weights for a published source; `"auto"` keeps the stored dtypes for both, which for a published source means its `config.json` `dtype`, or else its first floating tensor's. |
@@ -101,7 +101,7 @@ print(loaded("One day", 20, key=0).text)
 
 The byte vocabulary has no Hugging Face tokenizer files, so the loaded task has no processor and the example attaches one. A checkpoint that includes a tokenizer loads with its processor, and its `generation_config.json` sets the sampling policy and the token budget. A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way, as long as you have enough host and device memory for its weights and cache. If you already loaded a bundle with `Pretrained.load`, `PretrainedDecoder.text_generation`, `PretrainedBlockDecoder.block_generation` and `PretrainedPipeline.text_to_image` build the same task types from it.
 
-`dew.pipeline(directory)` rebuilds the task from the configuration saved next to the checkpoints, because the checkpoint arrays alone do not describe the model. A recipe's `RunConfig.train` writes that configuration as `run.json`. For a run you assembled by hand, save the matching configuration yourself with `config.save(directory)`. The LM recipe records the resolved model, tokenizer, sampling value and `sample_tokens` budget, and reloading the run restores them.
+`dew.pipeline(directory)` rebuilds the task from the configuration saved next to the checkpoints, because the checkpoint arrays alone do not describe the model. A recipe's `RunConfig.train` writes that configuration as `run.json`. For a run you assembled by hand, save the matching configuration yourself with `config.save(directory)`. The LM recipe records the resolved model, tokenizer, sampling value and `max_new_tokens` budget, and reloading the run restores them.
 
 ## Weights
 
@@ -137,7 +137,7 @@ from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="3664c0556e366d14520e086c752362a8ddbc81ad")
+                                   revision="403c4215556ac77826d69b3c3c7c30f9bb81ab9c")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
@@ -154,6 +154,7 @@ Results hold global arrays sharded by row, including any filler rows that were a
 
 `SafetensorsBanks` and its `stream` run a decoder whose layer weights do not fit in device memory or in host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The banked inference loop then fetches each layer when it runs, with one host read-ahead slot for the next layer, so the full decoder stack is never loaded or captured as a compiled constant.
 
+<!-- not run: needs a local gpt-oss-20b BF16 checkpoint -->
 ```python
 import jax
 import jax.numpy as jnp
@@ -222,7 +223,7 @@ result = task("The capital of France is", 64, sampling=policy, key=0)
 
 A fresh `Sampling(...)` in a call replaces the whole policy, except that any EOS or padding ID it leaves as `None` comes from the task, because those IDs belong to the model and its tokenizer. `stop` strings are compiled once against the task's processor, so a task needs a processor to use them. The controls run in Transformers' order, whatever order you name them in. `logits=` still overrides everything; to add a transform of your own to the chain the policy compiles to, pass `logits=policy.transforms() + (my_transform,)`.
 
-Building a task from a source's defaults raises if an unsupported control is active, such as DoLa or wall-clock stopping. An LM run records its `sampling` value and `sample_tokens` budget, and reloading the run keeps that preview policy. `TextToImage` has a default solver, guidance and step count. A call can override any of them, and `guidance=None` turns off classifier-free guidance.
+Building a task from a source's defaults raises if an unsupported control is active, such as DoLa or wall-clock stopping. An LM run records its `sampling` value and `max_new_tokens` budget, and reloading the run keeps that preview policy. `TextToImage` has a default solver, guidance and step count. A call can override any of them, and `guidance=None` turns off classifier-free guidance.
 
 Every result array has `n` rows per prompt, in prompt order, so `result.rows` is the number of this process's real prompts times `n`. `Generation.text` returns one string per row in the same order, and each row has its own length, termination flag and likelihoods (`behavior_log_probs`, and `raw_log_probs` for the raw policy). `Generation.text` and `CanvasGeneration.text` decode the first time they are read and cache the strings; a result with no processor raises when asked for text. A tokenizer without a pad token works as it is, because Dew tokenizes without padding and then pads the numeric rows and masks at the boundary that `RunProcessor` uses.
 

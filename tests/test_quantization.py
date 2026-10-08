@@ -1034,7 +1034,7 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.distillation import DistillationObjective
     from dew.objectives.lm import LMObjective
-    from dew.training.quantization import _quantize
+    from dew.training.quantization import quantize_trunk
 
     def decoder():
         return CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
@@ -1042,7 +1042,7 @@ def test_the_trainer_knob_quantizes_what_a_distillation_trains_and_not_its_teach
 
     student, teacher = decoder(), decoder()
     objective = DistillationObjective(LMObjective(student, seq_len=4), LMObjective(teacher, seq_len=4))
-    _quantize(objective, Quantization())
+    quantize_trunk(objective, Quantization())
     tokens = jnp.arange(8, dtype=jnp.int32)[None]
     variables = student.init(jax.random.key(0), tokens)
     trained, frozen = (entry.module for entry in objective.program_key())

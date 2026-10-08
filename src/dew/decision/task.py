@@ -18,11 +18,10 @@ from jax.typing import DTypeLike
 from PIL import Image
 
 from dew import records
-from dew.artifacts import Decisions
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
-from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, softmax
+from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures
 from dew.decision.clef import ClefCheckpoint
 from dew.decision.data import Example
 from dew.decision.head import Head
@@ -50,9 +49,9 @@ from dew.decision.questions import (
     Noul,
     NoulAnswer,
     Question,
-    Score,
     ScoreAnswer,
 )
+from dew.files import write_atomically
 from dew.inference.tasks import SHAPE_BUCKETS
 from dew.interop.processors import Processor
 from dew.nn.inputs import RowPlan, mesh_of
@@ -177,11 +176,11 @@ class Decide:
         overrides the compute dtype and `param_dtype` the storage dtype.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import _saved_model, run_record
+        from dew.inference.tasks import run_record, saved_model
         from dew.registry import from_record, objectives
 
-        record = run_record(directory, step)
-        backbone = _saved_model(record, dtype).build()
+        record, step = run_record(directory, step)
+        backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         model = DecisionModel(backbone, Head.from_record(records.json_value(record["head"], "head"),
                                                          width, dtype=head_dtype))
@@ -193,15 +192,10 @@ class Decide:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        checkpoints = Checkpoints(directory)
-        chosen = checkpoints.resolve(step)
-        chosen = checkpoints.latest if chosen is None else chosen
-        if chosen is None:
-            raise FileNotFoundError(f"{directory} holds no checkpoint")
-        averaged = checkpoints.stored(chosen).get("ema") is not None if ema is None else ema
+        averaged = Checkpoints(directory).stored(step).get("ema") is not None if ema is None else ema
         task = cls(model, variables, rows, tokenizer_for(records.text(tokenizer, "tokenizer")),
                    from_record(Specials, records.json_value(record["specials"], "specials")),
-                   name=str(epath.Path(directory).name), weights=Weights(chosen, averaged))
+                   name=str(epath.Path(directory).name), weights=Weights(step, averaged))
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
@@ -210,7 +204,7 @@ class Decide:
         if fitted != task.weights:
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
-                f"weights, and this loads step {chosen}'s {'averaged' if averaged else 'live'} ones; "
+                f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
         return replace(task, calibration=from_record(Calibration, records.json_value(settings["calibration"],
                                                                                     "calibration")),
@@ -251,13 +245,10 @@ class Decide:
         if self.weights is None:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
-        target = epath.Path(directory) / TASK_FILE
-        written = target.parent / f"{TASK_FILE}.tmp"
-        written.write_text(json.dumps({
+        write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
-        written.replace(target)
 
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = ()) -> dict[str, Answer]:
@@ -417,32 +408,28 @@ class Decide:
 
     def score(self, examples: Iterable[Example | Mapping[str, object]],
               metrics: Sequence[Metric] = ()) -> dict[str, float]:
-        """Return `metrics` over the questions answered for `examples`, through this task's calibration.
+        """Return `metrics` over the questions answered for `examples`, through this task's temperatures.
 
-        The default metrics are Accuracy, ECE, AURC and the log loss, computed the
-        way a validation pass computes them for a run.
+        This is a run's validation pass (`Evaluation.run`) over those questions,
+        each probability divided by its temperature; a binning map or abstention
+        thresholds are not applied. The default metrics are Accuracy, ECE, AURC
+        and the log loss. The pass agrees its result across a process pool, so
+        there every process calls it.
         """
         from dew.decision.metrics import AURC, ECE, Accuracy
+        from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
+        from dew.training.distributed import MeshSpec
+        from dew.training.evaluation import Evaluation
 
-        defaults: list[Metric] = [Accuracy(), ECE(), AURC(), LogLoss()]
-        chosen = list(metrics) or defaults
-        scored = self._scored(examples)
-        if not scored:
-            raise ValueError("scoring needs examples with answers")
-        width = max(len(held.logits) for held in scored)
-        probabilities = np.zeros((len(scored), width))
-        options = np.zeros((len(scored), width), bool)
-        for row, held in enumerate(scored):
-            probabilities[row, :len(held.logits)] = softmax(
-                held.logits, self.calibration.temperatures.of(held.kind, len(held.logits)))
-            options[row, :len(held.logits)] = True
-        decisions = Decisions(probabilities=jnp.asarray(probabilities)[:, None],
-                              options=jnp.asarray(options)[:, None],
-                              labels=jnp.asarray([[held.label] for held in scored]),
-                              ordinal=jnp.asarray([[held.kind == Score.kind] for held in scored]),
-                              scored=jnp.ones((len(scored), 1), bool))
-        return {metric.name: metric.finalize(metric(decisions, {})) for metric in chosen}
+        chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
+        objective = DecisionObjective(self, temperatures=self.calibration.temperatures)
+        # A batch is one pass within the budget, as `batch` packs its rows, on
+        # one device, as an answer is: a short last batch need not divide.
+        rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
+        evaluation = Evaluation.run(objective, self.variables, objective.held_out(examples, batch=rows),
+                                    key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
+        return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
         scored = []

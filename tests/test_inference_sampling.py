@@ -592,7 +592,7 @@ def test_a_budget_inside_a_bucket_returns_the_budget_and_what_the_budget_draws(r
     shaped, trips, capacity = tasks._bucketed(ModelInputs.from_value(prompt), budget,
                                               roomy.model.max_seq_len)
     assert (shaped.tokens.shape[1], trips, capacity) == (64, 128, 256)
-    exact = generate(tasks._sized(roomy.model, capacity), roomy.variables, shaped, budget,
+    exact = generate(tasks.cache_sized(roomy.model, capacity), roomy.variables, shaped, budget,
                      key=3, sampling=roomy.sampling)
     compiled = text._compiled(None)
     traced = compiled._cache_size()

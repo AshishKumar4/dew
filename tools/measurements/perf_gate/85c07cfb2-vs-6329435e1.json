@@ -1,0 +1,134 @@
+{
+  "base": "base",
+  "head": "head",
+  "rows": [
+    {
+      "name": "step lm-dense 4x1024",
+      "unit": "ms",
+      "tool": "benchmark_step.py"
+    },
+    {
+      "name": "step lm-moe 4x1024",
+      "unit": "ms",
+      "tool": "benchmark_step.py"
+    },
+    {
+      "name": "step simple-dit-b 32x64px",
+      "unit": "ms",
+      "tool": "benchmark_step.py"
+    },
+    {
+      "name": "serve qwen3-0.6b 32 slots",
+      "unit": "items/s",
+      "tool": "benchmark_lm_serving.py"
+    },
+    {
+      "name": "serve qwen3-0.6b 128 slots",
+      "unit": "items/s",
+      "tool": "benchmark_lm_serving.py"
+    },
+    {
+      "name": "attention cudnn S=2048 D=128 causal fwd+bwd",
+      "unit": "ms",
+      "tool": "benchmark_attention.py"
+    },
+    {
+      "name": "attention xla S=2048 D=128 causal fwd+bwd",
+      "unit": "ms",
+      "tool": "benchmark_attention.py"
+    },
+    {
+      "name": "image pipeline flowers 128px, device crop+flip+jitter",
+      "unit": "items/s",
+      "tool": "benchmark_image_pipeline.py"
+    },
+    {
+      "name": "checkpoint lm-dense save",
+      "unit": "ms",
+      "tool": ""
+    },
+    {
+      "name": "checkpoint lm-dense restore",
+      "unit": "ms",
+      "tool": ""
+    }
+  ],
+  "samples": {
+    "base": [
+      {
+        "step lm-dense 4x1024": 72.016,
+        "step lm-moe 4x1024": 51.756,
+        "step simple-dit-b 32x64px": 39.052,
+        "serve qwen3-0.6b 32 slots": 4551.753687235697,
+        "serve qwen3-0.6b 128 slots": 12858.01715140874,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 11.052789799987295,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.8504798999993,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6399.467121999805,
+        "checkpoint lm-dense restore": 2581.5164900000127
+      },
+      {
+        "step lm-dense 4x1024": 71.837,
+        "step lm-moe 4x1024": 51.76,
+        "step simple-dit-b 32x64px": 39.026,
+        "serve qwen3-0.6b 32 slots": 5740.901584822797,
+        "serve qwen3-0.6b 128 slots": 14327.02421156178,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 11.578380650007603,
+        "attention xla S=2048 D=128 causal fwd+bwd": 37.201481550005155,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6402.3370019999675,
+        "checkpoint lm-dense restore": 2603.1840860000557
+      },
+      {
+        "step lm-dense 4x1024": 71.827,
+        "step lm-moe 4x1024": 51.82,
+        "step simple-dit-b 32x64px": 39.076,
+        "serve qwen3-0.6b 32 slots": 5856.1551244253815,
+        "serve qwen3-0.6b 128 slots": 14248.636968813978,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 11.386289450001641,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.88701819999096,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 5812.264249999771,
+        "checkpoint lm-dense restore": 2617.918230000214
+      }
+    ],
+    "head": [
+      {
+        "step lm-dense 4x1024": 71.759,
+        "step lm-moe 4x1024": 51.693,
+        "step simple-dit-b 32x64px": 39.015,
+        "serve qwen3-0.6b 32 slots": 7318.642685240151,
+        "serve qwen3-0.6b 128 slots": 14422.52434993856,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 11.588106049998714,
+        "attention xla S=2048 D=128 causal fwd+bwd": 37.41922624999461,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6394.25490900021,
+        "checkpoint lm-dense restore": 2612.852508999822
+      },
+      {
+        "step lm-dense 4x1024": 71.806,
+        "step lm-moe 4x1024": 51.675,
+        "step simple-dit-b 32x64px": 39.118,
+        "serve qwen3-0.6b 32 slots": 5462.452768346133,
+        "serve qwen3-0.6b 128 slots": 14368.950202162778,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 10.3853799000035,
+        "attention xla S=2048 D=128 causal fwd+bwd": 37.23175089999131,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6213.516349999736,
+        "checkpoint lm-dense restore": 2720.3634110001076
+      },
+      {
+        "step lm-dense 4x1024": 71.936,
+        "step lm-moe 4x1024": 51.747,
+        "step simple-dit-b 32x64px": 38.945,
+        "serve qwen3-0.6b 32 slots": 5543.112224191158,
+        "serve qwen3-0.6b 128 slots": 14194.429061902149,
+        "attention cudnn S=2048 D=128 causal fwd+bwd": 11.52193890000035,
+        "attention xla S=2048 D=128 causal fwd+bwd": 36.830973800010725,
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6023.894907000795,
+        "checkpoint lm-dense restore": 2683.775360999789
+      }
+    ]
+  }
+}

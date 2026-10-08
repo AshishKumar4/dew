@@ -1,0 +1,39 @@
+---
+interface Pair { prompt: string; seed: number; before: { image: string }; after: { image: string }; }
+interface Props { pairs: Pair[]; }
+const { pairs } = Astro.props;
+---
+<div class="lora-pairs">
+	{pairs.map((pair) => <figure class="lora-pair" data-lora-pair>
+		<div class="lora-comparison" style="--split: 50%">
+			<img src={`/examples/sd15-lora/${pair.before.image}`} width="512" height="512" alt={`Before LoRA: ${pair.prompt}`} loading="lazy" decoding="async" />
+			<img class="lora-after" src={`/examples/sd15-lora/${pair.after.image}`} width="512" height="512" alt={`After LoRA: ${pair.prompt}`} loading="lazy" decoding="async" />
+			<span class="lora-divider" aria-hidden="true" />
+		</div>
+		<div class="lora-labels"><span>Before</span><span>After</span></div>
+		<label class="lora-range">Compare <input type="range" min="0" max="100" value="50" aria-label={`Before and after for seed ${pair.seed}`} /></label>
+		<figcaption>{pair.prompt}<br /><span class="lora-seed">Seed {pair.seed}</span></figcaption>
+	</figure>)}
+</div>
+<script>
+	for (const pair of document.querySelectorAll<HTMLElement>('[data-lora-pair]')) {
+		const range = pair.querySelector<HTMLInputElement>('input')!;
+		const comparison = pair.querySelector<HTMLElement>('.lora-comparison')!;
+		range.addEventListener('input', () => comparison.style.setProperty('--split', `${range.value}%`));
+	}
+</script>
+<style>
+	.lora-pairs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.5rem; }
+	.lora-pair { min-width: 0; margin: 0; }
+	.lora-comparison { position: relative; aspect-ratio: 1; overflow: hidden; border-radius: 0.6rem; }
+	.lora-comparison img { display: block; width: 100%; height: 100%; object-fit: cover; }
+	.lora-comparison .lora-after { position: absolute; inset: 0; clip-path: inset(0 0 0 var(--split)); }
+	.lora-divider { position: absolute; inset-block: 0; left: var(--split); width: 2px; background: #fff; box-shadow: 0 0 2px #000; pointer-events: none; }
+	.lora-labels { display: flex; justify-content: space-between; margin-top: 0.4rem; font: 0.75rem var(--dew-font-mono); color: var(--dew-muted); }
+	.lora-range { display: flex; align-items: center; gap: 0.75rem; margin-block: 0.4rem 0.6rem; font-size: 0.8rem; }
+	.lora-range input { width: 100%; accent-color: var(--sl-color-accent); }
+	.lora-pair figcaption { font-size: 0.85rem; }
+	.lora-seed { color: var(--dew-muted); font: 0.75rem var(--dew-font-mono); }
+	@media (max-width: 60rem) { .lora-pairs { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+	@media (max-width: 35rem) { .lora-pairs { grid-template-columns: 1fr; } }
+</style>

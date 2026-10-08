@@ -12,21 +12,24 @@ from collections.abc import Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
-    _MOE_SHARED,
+from dew.interop.decoder_parts import (
+    MOE_SHARED,
+    DecoderFamily,
     DecoderFields,
     KindFields,
     MixtureFields,
     Packed,
-    _base_config,
-    _dew_path,
-    _refuse,
-    _rope,
+    base_config,
+    dew_path,
+    kind_mixers,
+    read_rope,
+    refuse,
 )
 from dew.nn import llama4 as llama4_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.llama4 import Llama4Mixer
 
 
 def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -43,22 +46,22 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
             layers, records.integer(hf_config.get('no_rope_layer_interval', 4), 'no_rope_layer_interval'))
     no_rope = records.integers(no_rope, 'no_rope_layers')
     if len(no_rope) != layers or set(no_rope) - {0, 1}:
-        _refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
+        refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
     layer_types = llama4_nn.rope_layer_types(no_rope)
     stated = hf_config.get('layer_types')
     if stated is not None and records.strings(stated, 'layer_types') != layer_types:
-        _refuse(f"layer_types {list(records.strings(stated, 'layer_types'))!r}",
+        refuse(f"layer_types {list(records.strings(stated, 'layer_types'))!r}",
                 "it disagrees with no_rope_layers, which is what the reference reads")
     # The released Scout spells its llama3 ramp flat (rope_theta beside
     # rope_scaling); a config transformers wrote nests both. Either way the
     # ramp is the model's, and every rotated layer applies it.
     used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types'))
-    config = _base_config(hf_config, used, layer_types=layer_types,
-                          rope=dataclasses.replace(_rope(hf_config, used), local_theta=None))
+    config = base_config(hf_config, used, layer_types=layer_types,
+                          rope=dataclasses.replace(read_rope(hf_config, used), local_theta=None))
     if hf_config.get('router_jitter_noise', 0.0):
-        _refuse("router_jitter_noise", "the router selects on the logits alone")
+        refuse("router_jitter_noise", "the router selects on the logits alone")
     if hf_config.get('output_router_logits', False):
-        _refuse("output_router_logits", "the decoder returns token logits")
+        refuse("output_router_logits", "the decoder returns token logits")
     used.update(('router_jitter_noise', 'output_router_logits', 'router_aux_loss_coef',
                  'intermediate_size_mlp', 'num_local_experts', 'num_experts_per_tok',
                  'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
@@ -90,7 +93,7 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     )
     if moe_layers is None:
         if step < 1:
-            _refuse(f"interleave_moe_layer_step {step}", "the routed layers are every step-th one")
+            refuse(f"interleave_moe_layer_step {step}", "the routed layers are every step-th one")
         # Llama4TextConfig's default (configuration_llama4.py:186-194).
         moe_layers = list(range(step - 1, layers, step))
     mixture['layers'] = records.integers(moe_layers, 'moe_layers')
@@ -139,16 +142,29 @@ def _llama4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | N
         layer = ('params', f'layers_{parts[2]}', 'mlp')
         if parts[4:] == ['router', 'weight']:
             return (*layer, 'gate', 'kernel')
-        if len(parts) == 6 and parts[4] == 'experts' and parts[5] in _MOE_SHARED:
+        if len(parts) == 6 and parts[4] == 'experts' and parts[5] in MOE_SHARED:
             return (*layer, 'experts', parts[5], 'kernel')
         if (
             len(parts) == 7
             and parts[4] == "shared_expert"
-            and parts[5] in _MOE_SHARED
+            and parts[5] in MOE_SHARED
             and parts[6] == "weight"
         ):
             return (*layer, 'shared_experts', parts[5], 'kernel')
-        if len(parts) == 6 and parts[4] in _MOE_SHARED and parts[5] == 'weight':
+        if len(parts) == 6 and parts[4] in MOE_SHARED and parts[5] == 'weight':
             return (*layer, parts[4], 'kernel')
         raise ValueError(f"unknown tensor name {name!r}")
-    return _dew_path(name, config)
+    return dew_path(name, config)
+
+
+LLAMA4_TEXT = DecoderFamily(
+    ('llama4_text',),
+    _llama4_config,
+    lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in kind_mixers(fields)),
+    'llama4_text',
+    'Llama4ForCausalLM',
+    _llama4_export,
+    weight_path=_llama4_path,
+    packed=_LLAMA4_PACKED,
+    preserve_source_layout=True,
+)

@@ -18,7 +18,7 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew.diffusion.block import BlockProcess
 from dew.interop.config_records import NativeFields
-from dew.interop.hf_decoders import _export_config, translate_config, translate_denoiser_weights
+from dew.interop.hf_decoders import export_config, translate_config, translate_denoiser_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
@@ -200,7 +200,7 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
     names none and transformers' defaults stand. A model the written fields
     would rebuild differently is refused, naming the fields that differ.
     """
-    text = {name: value for name, value in _export_config(model.text).items() if name not in _GEMMA4_ONLY}
+    text = {name: value for name, value in export_config(model.text).items() if name not in _GEMMA4_ONLY}
     text.update(model_type="diffusion_gemma_text",
                 use_bidirectional_attention=None if model.conditioner is None else "vision")
     rebuilt = from_record(CausalTransformer, {
@@ -254,7 +254,7 @@ def export_weights(
     the published implementation cannot build is refused (`_refuse_unreadable`).
     """
     from dew.interop.hf_decoders import export_decoder_weights
-    from dew.nn.vision.gemma4 import _GEMMA4_VISION_TENSORS
+    from dew.nn.vision.gemma4 import _GEMMA4_VISION_NORMS, _GEMMA4_VISION_TENSORS
 
     _refuse_unreadable(config)
     params = variables["params"]
@@ -273,15 +273,16 @@ def export_weights(
             np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
     if "conditioner" in params:
         inverse = {value: key for key, value in _GEMMA4_VISION_TENSORS.items()}
+        norms = {value: key for key, value in _GEMMA4_VISION_NORMS.items()}
         for collection in ("params", "constants"):
             tower = variables.get(collection, {}).get("conditioner", {}).get("tower", {})
             for name, raw in flatten_dict(tower, sep=".").items():
-                parts = name.split(".")
+                parts: list[str] = name.split(".")
                 if tuple(parts) in inverse:
                     target = inverse[tuple(parts)]
                 elif parts[0].startswith("layers_"):
                     index = parts[0].removeprefix("layers_")
-                    tail = parts[1:-1]
+                    tail = [norms.get(part, part) for part in parts[1:-1]]
                     if parts[-1] == "kernel":
                         tail = [*tail, "linear"]
                     ending = parts[-1] if collection == "constants" else "weight"

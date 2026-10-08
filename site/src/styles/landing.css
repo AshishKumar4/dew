@@ -649,23 +649,6 @@ html[data-has-hero][data-past-hero] header.header {
 	margin-block: 1.5rem;
 }
 
-.live-text-model {
-	display: flex;
-	align-items: center;
-	gap: 0.75rem;
-	font-size: 0.85rem;
-}
-
-.live-text-model select {
-	max-width: 100%;
-	padding: 0.4rem 0.6rem;
-	border: 1px solid var(--dew-rule);
-	border-radius: 0.35rem;
-	background: var(--dew-surface);
-	color: var(--sl-color-white);
-	font: inherit;
-}
-
 .live-text-grid {
 	display: grid;
 	gap: 1rem;
@@ -701,14 +684,12 @@ html[data-has-hero][data-past-hero] header.header {
 	overflow-wrap: anywhere;
 }
 
-.sampler-setup summary,
 .sampler-log summary {
 	cursor: pointer;
 	font: 500 0.75rem var(--__sl-font-mono);
 	color: var(--dew-muted);
 }
 
-.sampler-setup .expressive-code,
 .sampler-log > div {
 	margin-top: 0.5rem;
 }

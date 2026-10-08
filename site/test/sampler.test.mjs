@@ -91,7 +91,7 @@ test('Run sends the editor cell and shows the returned image', async () => {
 	assert.deepEqual(errors, []);
 });
 
-test('homepage text and diffusion cells share one kernel without overlapping', { timeout: 10_000 }, async () => {
+test('homepage text and diffusion cells run at once in their own contexts of one session', { timeout: 10_000 }, async () => {
 	const page = await browser.newPage({ viewport: { width: 390, height: 844 }, reducedMotion: 'reduce' });
 	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
 		contentType: 'text/javascript',
@@ -103,6 +103,7 @@ test('homepage text and diffusion cells share one kernel without overlapping', {
 		return route.fulfill({ json: { socket: SOCKET, warm: true } });
 	});
 	const sent = [];
+	const text = Promise.withResolvers();
 	const closed = Promise.withResolvers();
 	await page.routeWebSocket(SOCKET, (socket) => {
 		socket.onClose(() => closed.resolve());
@@ -110,15 +111,16 @@ test('homepage text and diffusion cells share one kernel without overlapping', {
 		socket.onMessage((raw) => {
 			const message = JSON.parse(String(raw));
 			if (message.op !== 'execute') return;
-			sent.push(message.code);
+			sent.push(message);
 			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
-			if (message.code.includes('text_model')) {
-				reply({ type: 'display', text: JSON.stringify({ 'dew-progress': { stage: 'load', model: 'SmolLM2' } }) });
-				reply({ type: 'display', text: JSON.stringify({ 'dew-progress': { stage: 'generate', first: false } }) });
-				setTimeout(() => {
-					reply({ type: 'stream', name: 'stdout', text: 'Paris.\n' });
+			if (message.cell === 'text') {
+				reply({ type: 'display', text: JSON.stringify({ 'dew-text': ' Par', first_token_seconds: 0.25 }) });
+				// The text cell finishes only after the image cell has run.
+				text.promise.then(() => {
+					reply({ type: 'display', text: JSON.stringify({ 'dew-text': ' Paris.', first_token_seconds: 0.25 }) });
+					reply({ type: 'stream', name: 'stdout', text: ' Paris.\n' });
 					reply({ type: 'done', status: 'ok', count: 1 });
-				}, 800);
+				});
 			} else {
 				reply({ type: 'display', png: PNG });
 				reply({ type: 'done', status: 'ok', count: 2 });
@@ -126,23 +128,60 @@ test('homepage text and diffusion cells share one kernel without overlapping', {
 		});
 	});
 	await page.goto(`http://127.0.0.1:${server.address().port}/`);
-	const text = page.locator('[data-text-cell]');
-	const edited = `${await text.inputValue()}\n# edited`;
-	await text.fill(edited);
+	const editor = page.locator('[data-text-cell]');
+	const edited = `${await editor.inputValue()}\n# edited`;
+	await editor.fill(edited);
 	await page.locator('[data-text-run]').click();
 	await page.waitForFunction(() => document.querySelector('[data-text-status]').textContent.startsWith('Generating'));
 	// Use the event directly so scrolling to a second button cannot outlast the mock run.
 	await page.locator('[data-run]').dispatchEvent('click');
-	assert.match(await page.locator('[data-status]').textContent(), /Another cell is running/);
+	await page.locator('[data-final]').waitFor({ state: 'visible' });
+	assert.match(await page.locator('[data-text-status]').textContent(), /^Generating/);
+	assert.equal((await page.locator('[data-text-output]').textContent()).trim(), 'Par');
+	text.resolve();
 	await page.waitForFunction(() => document.querySelector('[data-text-status]').textContent.startsWith('Generated in'));
 	assert.equal((await page.locator('[data-text-output]').textContent()).trim(), 'Paris.');
-	await page.locator('[data-run]').click();
-	await page.locator('[data-final]').waitFor({ state: 'visible' });
+	assert.match(await page.locator('[data-text-status]').textContent(), /first token came 0\.25 s after/);
 	assert.equal(requests, 1);
-	assert.equal(sent.length, 2);
-	assert.equal(sent[0], edited);
+	assert.deepEqual(sent.map((message) => message.cell), ['text', 'image']);
+	assert.equal(sent[0].code, edited);
 	await page.evaluate(() => window.dispatchEvent(new PageTransitionEvent('pagehide')));
 	await closed.promise;
+	await page.close();
+});
+
+test('a training cell waits its turn on the host, then shows the run', { timeout: 10_000 }, async () => {
+	const page = await browser.newPage();
+	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
+		contentType: 'text/javascript',
+		body: 'window.turnstile = { render: (el, o) => { o.callback("token"); return "w"; }, remove() {} };',
+	}));
+	await page.route(`${live.endpoint}/v1/sessions`, (route) => route.fulfill({ json: { socket: SOCKET } }));
+	const sent = [];
+	const turn = Promise.withResolvers();
+	await page.routeWebSocket(SOCKET, (socket) => {
+		socket.send(JSON.stringify({ type: 'ready', uptime: 1, setup: 1 }));
+		socket.onMessage((raw) => {
+			const message = JSON.parse(String(raw));
+			if (message.op !== 'execute') return;
+			sent.push(message);
+			const reply = (body) => socket.send(JSON.stringify({ id: message.id, ...body }));
+			reply({ type: 'display', text: JSON.stringify({ 'dew-wait': { ahead: 1 } }) });
+			turn.promise.then(() => {
+				reply({ type: 'stream', name: 'stdout', text: 'Live run: steps 1000 -> 20.\nTrained 20 steps\n' });
+				reply({ type: 'done', status: 'ok', count: 1 });
+			});
+		});
+	});
+	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	const panel = page.locator('[data-live-train="finetune"]');
+	await panel.locator('[data-train-run]').click();
+	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent
+		.startsWith('This host trains one run at a time; 1 run is ahead of yours'));
+	turn.resolve();
+	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent.startsWith('Ran in'));
+	assert.match(await panel.locator('[data-train-output]').textContent(), /^Live run: steps 1000 -> 20\./);
+	assert.deepEqual(sent.map(({ cell, kernel }) => [cell, kernel]), [['finetune', 'train']]);
 	await page.close();
 });
 
@@ -186,12 +225,13 @@ test('editable Python highlighting follows edits, scrolling and theme', async ()
 	await page.close();
 });
 
-test('standalone examples copy and save the edited cell and reset its original text', async () => {
+test('standalone examples copy the edited cell and reset its original text', async () => {
 	const page = await browser.newPage({ permissions: ['clipboard-read', 'clipboard-write'] });
 	await page.goto(`http://127.0.0.1:${server.address().port}/`);
 	const examples = page.locator('[data-example-editor]');
 	assert.ok(await examples.count() >= 11);
 	const editor = examples.first();
+	assert.deepEqual(await editor.locator('button').allTextContents(), ['Copy', 'Reset']);
 	const text = editor.locator('textarea');
 	const original = await text.inputValue();
 	const edited = `${original}\n# edited`;
@@ -199,13 +239,6 @@ test('standalone examples copy and save the edited cell and reset its original t
 	await editor.locator('[data-example-copy]').click();
 	await editor.getByRole('button', { name: 'Copied', exact: true }).waitFor();
 	assert.equal(await page.evaluate(() => navigator.clipboard.readText()), edited);
-	const saved = page.waitForEvent('download');
-	await editor.locator('[data-example-download]').click();
-	const download = await saved;
-	assert.equal(download.suggestedFilename(), 'train.py');
-	const chunks = [];
-	for await (const chunk of await download.createReadStream()) chunks.push(chunk);
-	assert.equal(Buffer.concat(chunks).toString(), edited);
 	await editor.locator('[data-example-reset]').click();
 	assert.equal(await text.inputValue(), original);
 	await page.close();

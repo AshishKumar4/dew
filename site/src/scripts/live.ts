@@ -137,8 +137,12 @@ export class LiveSession {
 		return new LiveSession(socket, body.warm === true);
 	}
 
-	/** Run one cell; `onOutput` hears each output as it arrives. */
-	run(code: string, onOutput: (output: Output) => void): Promise<Done> {
+	/**
+	 * Run one cell; `onOutput` hears each output as it arrives. Each `cell` name runs in a
+	 * Python context of its own, so differently named cells run at the same time. A `train`
+	 * cell runs Dew itself, one at a time on its host (site/live/container/shared_bridge.py).
+	 */
+	run(code: string, onOutput: (output: Output) => void, cell?: string, kernel?: 'train'): Promise<Done> {
 		const { promise, resolve } = Promise.withResolvers<Done>();
 		if (this.socket.readyState !== WebSocket.OPEN) {
 			resolve({ status: 'aborted', count: null });
@@ -146,12 +150,12 @@ export class LiveSession {
 		}
 		const id = String(this.next++);
 		this.pending.set(id, { onOutput, resolve });
-		this.socket.send(JSON.stringify({ op: 'execute', id, code }));
+		this.socket.send(JSON.stringify({ op: 'execute', id, code, cell, kernel }));
 		return promise;
 	}
 
-	interrupt(): void {
-		this.socket.send(JSON.stringify({ op: 'interrupt' }));
+	interrupt(cell?: string): void {
+		this.socket.send(JSON.stringify({ op: 'interrupt', cell }));
 	}
 
 	restart(): void {

@@ -17,12 +17,14 @@ from dew.data.dataset import (
     Corpus,
     Dataset,
     Loading,
+    Reader,
     mixed_records,
     mixed_stream,
     train_stream,
     validation_pass,
 )
 from dew.data.text import HFTokenizer, Tokenizer
+from dew.decision.calibration import Temperatures
 from dew.decision.data import DecisionTable, Example, Weighted
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
@@ -212,6 +214,14 @@ def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return None
 
 
+def _held_pass(held: Sequence[tuple[Example, tuple[str, ...]]], encoding: Encoding, *, batch: int, seed: int,
+               loading: Loading) -> Reader:
+    """The validation pass over held-out rows: each once, laid out unaugmented."""
+    rows = _Rows(held, f"{len(held)} held-out rows")
+    return validation_pass(rows, [_Encode(encoding, [rows], augment=False)], batch=batch, seed=seed,
+                           loading=loading)
+
+
 def _laid_rows(examples: Iterable[Example | Mapping[str, object]], *,
                joint: bool) -> list[tuple[Example, tuple[str, ...]]]:
     """Each row an example lays out: one per answered question, or, for a joint
@@ -241,8 +251,10 @@ class DecisionObjective(Objective[Ratio]):
     `Encoding` describes, and `dataset` builds them.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
-    `Accuracy`, `ECE`, `AURC` and the scoring rules read. The saved run loads as
-    a `Decide` task.
+    `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
+    divided by `temperatures` (none by default: a `Decide`'s calibration fits
+    its logits before training moves them, so it is not inherited). The saved
+    run loads as a `Decide` task.
     """
 
     artifact = Decisions
@@ -254,7 +266,7 @@ class DecisionObjective(Objective[Ratio]):
                  specials: Specials | None = None, layout: Layout | None = None,
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
-                 none_of_the_above: float = 0.0):
+                 none_of_the_above: float = 0.0, temperatures: Temperatures | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -297,6 +309,7 @@ class DecisionObjective(Objective[Ratio]):
         self.label_smoothing = label_smoothing
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
+        self.temperatures = temperatures
         self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
@@ -354,6 +367,13 @@ class DecisionObjective(Objective[Ratio]):
         inputs = laid_out(batch)
         weights = self.evaluation_variables(params, step)
         logits = self._logits(weights, inputs)
+        if self.temperatures is not None:
+            # Each question's temperature by its type and its count of real
+            # options, as `Temperatures.of` gives it; a padding question has none.
+            width = logits.shape[-1]
+            table = np.asarray([[1.0 if count == 0 else self.temperatures.of(kind.kind, count)
+                                 for count in range(width + 1)] for kind in KINDS], np.float32)
+            logits = logits / jnp.asarray(table)[inputs.kinds, jnp.sum(inputs.options, axis=-1)][..., None]
         empty = ~jnp.any(inputs.options, axis=-1, keepdims=True)
         probabilities = jax.nn.softmax(jnp.where(empty, 0.0, logits), axis=-1)
         return Decisions(probabilities=probabilities, options=inputs.options, labels=batch["labels"],
@@ -399,20 +419,13 @@ class DecisionObjective(Objective[Ratio]):
             laid = _laid_rows(weighted[name].examples, joint=joint)
             corpora.append(_Rows(laid, f"{name}: {len(laid)} rows", corpus))
         held = None if validation is None else _laid_rows(validation, joint=joint)
-        every = [row for rows in corpora for row in rows.rows] + (held or [])
-        width = max(len(example.questions[name].options) + (self.none_of_the_above > 0)
-                    for example, names in every for name in names)
-        questions = max(len(names) for _, names in every)
-        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
-                            self.shuffle_options, self.none_of_the_above)
+        # One shape for the training and the held-out rows, so both compile once.
+        encoding = self._encoding([row for rows in corpora for row in rows.rows] + (held or []))
         records = sum(len(rows) for rows in corpora)
         if records < batch:
             raise ValueError(f"{records} rows of answered questions, fewer than one batch of {batch}")
-        scoring = None
-        if held is not None:
-            held_rows = _Rows(held, f"{len(held)} held-out rows")
-            scoring = validation_pass(held_rows, [_Encode(encoding, [held_rows], augment=False)], batch=batch,
-                                      seed=seed, loading=loading)
+        scoring = (None if held is None
+                   else _held_pass(held, encoding, batch=batch, seed=seed, loading=loading))
         encode = [_Encode(encoding, corpora, augment=True)]
         if len(corpora) == 1:
             return Dataset(train=train_stream(corpora[0], encode, batch=batch, seed=seed, loading=loading),
@@ -420,6 +433,23 @@ class DecisionObjective(Objective[Ratio]):
         mixed = [Corpus(name, rows, weighted[name].weight) for name, rows in zip(names, corpora, strict=True)]
         return Dataset(train=mixed_stream(mixed, encode, batch=batch, seed=seed, loading=loading),
                        val=scoring, records=mixed_records(mixed), batch=batch)
+
+    def held_out(self, examples: Labelled, *, batch: int, loading: Loading | None = None) -> Reader:
+        """Return the validation pass over the answered questions of `examples`,
+        each row once, as `dataset` holds out its `validation`, however few."""
+        held = _laid_rows(examples, joint=self.layout.joint)
+        if not held:
+            raise ValueError("scoring needs examples with answers")
+        return _held_pass(held, self._encoding(held), batch=batch, seed=0,
+                          loading=Loading() if loading is None else loading)
+
+    def _encoding(self, rows: Sequence[tuple[Example, tuple[str, ...]]]) -> Encoding:
+        """The layout of `rows`, with as many option and question slots as the widest row needs."""
+        width = max(len(example.questions[name].options) + (self.none_of_the_above > 0)
+                    for example, names in rows for name in names)
+        questions = max(len(names) for _, names in rows)
+        return Encoding(self.layout, self.tokenizer, self.specials, width, questions,
+                        self.shuffle_options, self.none_of_the_above)
 
     def inference_record(self):
         """Return what a saved run rebuilds its task from.

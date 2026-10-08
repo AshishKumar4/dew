@@ -1143,7 +1143,7 @@ class _WorkerBatches[Record](pygrain.MapDataset[Record]):
         return None if which >= self._whole or record >= len(self._parent) else self._parent[record]
 
 
-class _Filled(pygrain.MapTransform):
+class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
     own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
     `real` every row is a repeat."""
@@ -1168,7 +1168,7 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
 
     A training stream is endless and takes whole batches. An evaluation pass
     (`remainder`) takes every record: its last batch is filled out to `rows`
-    (`_Filled`).
+    (`FilledBatch`).
 
     The slice is `offset + index :: count`. Global batch k is then the same
     records at every count, and an offset is a slice bound rather than a
@@ -1194,7 +1194,7 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
     stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
     stream = stream.batch(rows, drop_remainder=not remainder)
     if remainder:
-        stream = stream.map(_Filled(rows, real=not empty))
+        stream = stream.map(FilledBatch(rows, real=not empty))
     if loading.workers:
         stream = stream.mp_prefetch(pygrain.MultiprocessingOptions(
             num_workers=loading.workers,
@@ -1216,7 +1216,7 @@ def _shared(source: GrainPipeline, *, rows: int, partition: DataPartition, loadi
         return _batches(source, rows=rows, partition=partition, loading=loading, offset=offset,
                         remainder=remainder)
     batches = source(partition).batch(rows, drop_remainder=not remainder)
-    return iter(batches.map(_Filled(rows)) if remainder else batches)
+    return iter(batches.map(FilledBatch(rows)) if remainder else batches)
 
 
 def rows_of(batch: Mapping[str, object]) -> int:

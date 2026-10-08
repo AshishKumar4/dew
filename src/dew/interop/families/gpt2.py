@@ -1,12 +1,22 @@
 """GPT-2's learned positions, biased LayerNorm and Conv1D checkpoint layout."""
 
 from collections.abc import Mapping
+from functools import partial
 
 import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import DecoderFields, Packed, Renames, _decoder_tensors, _refuse, _renamed_path
+from dew.interop.decoder_parts import (
+    DecoderFamily,
+    DecoderFields,
+    Packed,
+    Renames,
+    decoder_tensors,
+    refuse,
+    renamed_name,
+    renamed_path,
+)
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
@@ -24,20 +34,20 @@ def _gpt_neo_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                            'attn_pdrop': hf.get('attention_dropout', 0.)}, used)
     stated = hf.get('attention_types', [[['global', 'local'], 12]])
     if not isinstance(stated, (list, tuple)):
-        _refuse('attention_types', 'GPT-Neo repeats lists of global/local attention kinds')
+        refuse('attention_types', 'GPT-Neo repeats lists of global/local attention kinds')
     pattern: list[str] = []
     for entry in stated:
         if not isinstance(entry, (list, tuple)) or len(entry) != 2:
-            _refuse('attention_types', 'each item holds a kind pattern and its repetition count')
+            refuse('attention_types', 'each item holds a kind pattern and its repetition count')
         repeats = records.integer(entry[1], 'attention_types repetitions')
         if repeats < 1:
-            _refuse('attention_types', 'repetition counts must be positive')
+            refuse('attention_types', 'repetition counts must be positive')
         pattern.extend(records.strings(entry[0], 'attention_types') * repeats)
     if len(pattern) != layers or set(pattern) - {'global', 'local'}:
-        _refuse('attention_types', 'one global or local attention kind is required per layer')
+        refuse('attention_types', 'one global or local attention kind is required per layer')
     if (hf.get('attention_layers') is not None
             and records.strings(hf['attention_layers'], 'attention_layers') != tuple(pattern)):
-        _refuse('attention_layers', 'the expanded pattern must agree with attention_types')
+        refuse('attention_layers', 'the expanded pattern must agree with attention_types')
     used.update(('num_layers', 'num_heads', 'hidden_size', 'intermediate_size', 'max_position_embeddings',
                  'attention_types', 'attention_layers', 'window_size', 'resid_dropout', 'embed_dropout',
                  'attention_dropout', 'classifier_dropout'))
@@ -85,10 +95,10 @@ def _gptj_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     head_dim = records.integer(config['head_dim'], 'head_dim')
     rotated = records.integer(hf.get('rotary_dim', 64), 'rotary_dim')
     if rotated < 2 or rotated > head_dim or rotated % 2:
-        _refuse('rotary_dim', 'GPT-J rotates an even positive prefix of each attention head')
+        refuse('rotary_dim', 'GPT-J rotates an even positive prefix of each attention head')
     used.update(('rotary_dim', 'rotary', 'gradient_checkpointing', 'tokenizer_class'))
     if hf.get('rotary', True) is not True or hf.get('scale_attn_weights', True) is not True:
-        _refuse('rotary/scale_attn_weights', 'GPT-J rotates its heads and scales by their dimension')
+        refuse('rotary/scale_attn_weights', 'GPT-J rotates its heads and scales by their dimension')
     config.update({
         'position_embedding': 'rotary', 'position_embedding_size': None,
         'partial_rotary_factor': rotated / head_dim, 'partial_rotary_type': 'default',
@@ -144,7 +154,7 @@ def _gptj_prepare(tensors: Mapping[str, np.ndarray],
 def _gptj_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if name.endswith(('.attn.bias', '.attn.masked_bias')):
         return None
-    return _renamed_path(_GPTJ_NAMES, name, config)
+    return renamed_path(_GPTJ_NAMES, name, config)
 
 
 def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -156,9 +166,9 @@ def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def _gptj_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+def _gptj_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
                          config: Mapping[str, object]) -> LazyTensors:
-    tensors = _decoder_tensors(model, variables, config)
+    tensors = decoder_tensors(family, model, variables, config)
     rotated = int(model.features_per_head * (model.partial_rotary_factor or 1.))
     order = np.argsort(_gptj_order(model.features_per_head, rotated))
 
@@ -185,18 +195,18 @@ def _gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                  'summary_use_proj', 'summary_activation', 'summary_proj_to_labels',
                  'summary_first_dropout', 'use_cache', 'task_specific_params'))
     if hf.get('add_cross_attention'):
-        _refuse('add_cross_attention', 'GPT-2 cross attention has no decoder counterpart')
+        refuse('add_cross_attention', 'GPT-2 cross attention has no decoder counterpart')
     if hf.get('scale_attn_by_inverse_layer_idx'):
-        _refuse('scale_attn_by_inverse_layer_idx', 'the attention scale does not vary by layer')
+        refuse('scale_attn_by_inverse_layer_idx', 'the attention scale does not vary by layer')
     if hf.get('reorder_and_upcast_attn'):
-        _refuse('reorder_and_upcast_attn', 'the reordered GPT-2 attention arithmetic is not represented')
+        refuse('reorder_and_upcast_attn', 'the reordered GPT-2 attention arithmetic is not represented')
     activation = records.text(hf.get('activation_function', 'gelu_new'), 'activation_function')
     activations = {'gelu_new': 'gelu', 'gelu_fast': 'gelu', 'gelu_pytorch_tanh': 'gelu',
                    'gelu': 'gelu_exact', 'relu': 'relu'}
     if activation not in activations:
-        _refuse(f'activation_function={activation!r}', 'the ungated MLP uses GELU or ReLU')
+        refuse(f'activation_function={activation!r}', 'the ungated MLP uses GELU or ReLU')
     if hidden % heads:
-        _refuse('n_embd/n_head', 'the hidden width must divide into whole attention heads')
+        refuse('n_embd/n_head', 'the hidden width must divide into whole attention heads')
     return native_fields(CausalTransformer)(
         vocab_size=records.integer(hf.get('vocab_size', 50257), 'vocab_size'),
         emb_features=hidden, num_layers=layers, num_heads=heads,
@@ -263,13 +273,13 @@ def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | Non
     # has three leaves, and the fixed buffers are validated by preparation.
     if '.attn.c_attn.' in name or name.endswith(('.attn.bias', '.attn.masked_bias')):
         return None
-    return _renamed_path(_GPT2_NAMES, name, config)
+    return renamed_path(_GPT2_NAMES, name, config)
 
 
 def _gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
     activation = model.mlp
     if not isinstance(activation, str) or activation not in ('gelu', 'gelu_exact', 'relu'):
-        _refuse('mlp', 'GPT-2 requires an ungated GELU or ReLU feed-forward')
+        refuse('mlp', 'GPT-2 requires an ungated GELU or ReLU feed-forward')
     config: dict[str, object] = {
         'n_embd': model.emb_features, 'n_layer': model.num_layers, 'n_head': model.num_heads,
         'n_inner': model.hidden_features, 'n_positions': model.position_embedding_size or model.max_seq_len,
@@ -284,3 +294,38 @@ def _gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
         'num_key_value_heads', 'head_dim', 'intermediate_size',
         'max_position_embeddings', 'rms_norm_eps', 'attention_bias', 'hidden_act', 'rope_theta')))
     return config
+
+
+GPT_NEO = DecoderFamily(
+    ('gpt_neo',), _gpt_neo_config,
+    lambda fields: fields.position_embedding == 'learned' and fields.attention_scale == 1.0
+                   and fields.attention_bias is False and fields.o_proj_bias is True,
+    'gpt_neo', 'GPTNeoForCausalLM', _gpt_neo_export,
+    weight_path=partial(renamed_path, _GPT_NEO_NAMES),
+    export_path=partial(renamed_name, _GPT_NEO_NAMES), preserve_source_layout=False,
+    tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+)
+
+GPTJ = DecoderFamily(
+    ('gptj',), _gptj_config,
+    lambda fields: fields.shared_parallel_norm and fields.head_bias and not fields.attention_bias,
+    'gptj', 'GPTJForCausalLM', _gptj_export,
+    weight_path=_gptj_path, export_path=partial(renamed_name, _GPTJ_NAMES),
+    prepare=_gptj_prepare, export_weights=_gptj_export_weights, preserve_source_layout=False,
+    tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+)
+
+GPT2 = DecoderFamily(
+    ('gpt2',),
+    _gpt2_config,
+    lambda fields: fields.position_embedding == 'learned',
+    'gpt2',
+    'GPT2LMHeadModel',
+    _gpt2_export,
+    weight_path=_gpt2_path,
+    export_path=partial(renamed_name, _GPT2_NAMES),
+    prepare=_gpt2_prepare,
+    packed=_GPT2_PACKED,
+    preserve_source_layout=False,
+    tied_head_names=('lm_head.weight', 'transformer.wte.weight'),
+)

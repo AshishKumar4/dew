@@ -1,9 +1,19 @@
 """Phi's one-norm parallel biased block, sliced rotary and affine output head."""
 
 from collections.abc import Mapping
+from functools import partial
 
 from dew import records
-from dew.interop.hf_decoders import DecoderFields, Renames, _base_config, _refuse
+from dew.interop.decoder_parts import (
+    DecoderFamily,
+    DecoderFields,
+    Renames,
+    base_config,
+    decoder_tensors,
+    refuse,
+    renamed_name,
+    renamed_path,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -16,10 +26,10 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     activation = records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
     activations = {'gelu_new': 'gelu', 'gelu_pytorch_tanh': 'gelu', 'gelu': 'gelu_exact', 'relu': 'relu'}
     if activation not in activations:
-        _refuse('hidden_act', 'Phi uses an ungated GELU or ReLU feed-forward')
+        refuse('hidden_act', 'Phi uses an ungated GELU or ReLU feed-forward')
     if hf.get('qk_layernorm', False):
-        _refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
-    config = _base_config({**hf, 'hidden_act': 'silu', 'rope_theta': theta,
+        refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
+    config = base_config({**hf, 'hidden_act': 'silu', 'rope_theta': theta,
                            'rope_parameters': rope or None}, used, reads=frozenset())
     used.update(('partial_rotary_factor', 'qk_layernorm', 'layer_norm_eps', 'resid_pdrop',
                  'embd_pdrop', 'attention_dropout'))
@@ -51,3 +61,12 @@ def _phi_export(model: CausalTransformer) -> Mapping[str, object]:
                             'partial_rotary_factor': model.partial_rotary_factor or 1.},
         'attention_bias': None, 'rms_norm_eps': None, 'head_dim': None,
     }
+
+
+PHI = DecoderFamily(
+    ('phi',), _phi_config,
+    lambda fields: fields.shared_parallel_norm and fields.head_bias and fields.attention_bias,
+    'phi', 'PhiForCausalLM', _phi_export,
+    weight_path=partial(renamed_path, _PHI_NAMES), export_path=partial(renamed_name, _PHI_NAMES),
+    export_weights=decoder_tensors, preserve_source_layout=False,
+)

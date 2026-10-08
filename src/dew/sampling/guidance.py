@@ -30,7 +30,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -368,8 +368,12 @@ class Autoguidance:
         return Walk.stateless(lambda index: guided(scales(index)))
 
 
-Guidance = CFG | CFGPlusPlus | APG | Autoguidance
-"""The guidance types `sample` accepts, as a union that `isinstance` can check."""
+@runtime_checkable
+class Guidance(Protocol):
+    """What `sample` guides with: a walk over the steps for one denoiser.
+    CFG, CFG++, APG and autoguidance are four; a run records any by class."""
+
+    def walk(self, denoise: Denoiser, steps: int | jax.Array) -> Walk: ...
 
 
 __all__ = ["APG", "CFG", "Autoguidance", "CFGPlusPlus", "Guidance", "Walk"]

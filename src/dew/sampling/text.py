@@ -371,7 +371,7 @@ class Generation(Generic[ArrayT]):
         return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
 
 
-def _prefill(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
+def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
              cache: Variables | None = None) -> tuple[DecoderState, jax.Array]:
     """The state after the prompt, and which rows hold a real token.
 
@@ -520,7 +520,7 @@ def _refuse_exchange(model: nn.Module) -> None:
             "the same layer")
 
 
-def _operations(model: nn.Module, params: Variables, pad_id: int, depths: int) -> DecodeOps:
+def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
 
     Parameters stay unmapped: every operation reads the same tree, and only
@@ -670,8 +670,8 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
-    ops = _operations(model, params, pad_id, prediction_depths(model))
-    state, real = _prefill(model, params, inputs, ops)
+    ops = decode_ops(model, params, pad_id, prediction_depths(model))
+    state, real = prefill_state(model, params, inputs, ops)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, max_new_tokens), jnp.int32)], axis=1),
         valid=jnp.concatenate([jnp.ones((batch, width), bool) if valid is None else valid.astype(bool),
@@ -685,7 +685,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         drawn.behavior_log_probs, drawn.raw_log_probs)
 
 
-def _check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
+def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
                   max_new_tokens: int, sampling: Sampling, n: int) -> np.ndarray:
     """Shared host validation; return validity without placing unused device inputs."""
     if isinstance(model, BlockDenoiser):
@@ -725,7 +725,7 @@ def _validated(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray],
                n: int) -> ModelInputs:
     """Host checks shared by every caller; returns device inputs whose validity
     field is present only where a prompt is actually padded."""
-    valid = _check_inputs(model, ids, fields, max_new_tokens, sampling, n)
+    valid = check_inputs(model, ids, fields, max_new_tokens, sampling, n)
     token_fields = {name: jnp.asarray(value) for name, value in fields.items()
                     if name != "attention_mask"}
     if not valid.all():

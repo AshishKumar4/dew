@@ -105,20 +105,33 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     assert rows["3.12:tests/test_pass.py"]["timings"].keys() == {"tests/test_pass.py"}
 
 
-def test_the_plan_weighs_a_split_file_by_its_groups_and_the_rest_by_armadas_pace(ci):
-    """A file armada last ran in a complete set of groups weighs their sum;
-    a file only GitHub's durations record weighs them scaled by how much
-    slower armada ran the files measured both ways."""
+def test_the_plan_weighs_a_file_by_armadas_median_and_the_rest_by_armadas_pace(ci):
+    """A file armada timed weighs its median; a file only GitHub's durations
+    record weighs them scaled by how much slower armada ran the files
+    measured both ways."""
     Path("tests/test_durations.json").write_text(json.dumps(
-        {"tests/test_split.py::test_a": 10.0, "tests/test_paced.py::test_b": 20.0,
-         "tests/test_measured.py::test_c": 10.0, "tests/test_other.py::test_d": 5.0}))
-    timings = {"files": {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0},
-               "rows": {"3.12:tests/test_split.py#1/2": 200.0, "3.12:tests/test_split.py#2/2": 150.0,
-                        "3.12:tests/test_split.py#1/3": 90.0}}
-    files = ["tests/test_measured.py", "tests/test_other.py", "tests/test_paced.py", "tests/test_split.py"]
-    assert ci.weights(files, timings, "3.12") == {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0,
-                                                  "tests/test_paced.py": 60.0, "tests/test_split.py": 350.0}
-    assert ci.weights(files, timings, "3.14")["tests/test_split.py"] == 30.0
+        {"tests/test_paced.py::test_b": 20.0, "tests/test_measured.py::test_c": 10.0,
+         "tests/test_other.py::test_d": 5.0}))
+    timings = {"files": {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0}}
+    files = ["tests/test_measured.py", "tests/test_other.py", "tests/test_paced.py"]
+    assert ci.weights(files, timings) == {"tests/test_measured.py": 30.0, "tests/test_other.py": 15.0,
+                                          "tests/test_paced.py": 60.0}
+
+
+def test_a_split_group_scales_to_its_whole_file_by_the_recorded_durations(ci):
+    """A group of a split file reports the file's time: its own, times the
+    file's recorded durations over its tests' share of them, so the file's
+    median holds however the file is split."""
+    import xml.etree.ElementTree as ET
+
+    Path("tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_split.py::test_a": 1.0, "tests/test_split.py::TestB::test_b": 3.0,
+         "tests/test_other.py::test_c": 9.0}))
+    group = [ET.Element("testcase", classname="tests.test_split", name="test_a")]
+    assert ci.node_of(ET.Element("testcase", classname="tests.test_split.TestB", name="test_b")) == \
+        "tests/test_split.py::TestB::test_b"
+    assert ci.file_share("tests/test_split.py", group) == 4.0
+    assert ci.file_share("tests/test_split.py", []) is None
 
 
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):

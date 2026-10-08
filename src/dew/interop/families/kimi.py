@@ -60,22 +60,23 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
-    _ACTIVATIONS,
-    _CODEC_FIELDS,
-    _IGNORED_FIELDS,
-    _SERIALIZED_ENCODER_FIELDS,
-    _SERIALIZED_TEXT_FIELDS,
+from dew.interop.decoder_parts import (
+    ACTIVATIONS,
+    CODEC_FIELDS,
     DEFAULT_MAX_SEQ_LEN,
+    IGNORED_FIELDS,
+    SERIALIZED_ENCODER_FIELDS,
+    SERIALIZED_TEXT_FIELDS,
+    DecoderFamily,
     DecoderFields,
     KindFields,
     MixtureFields,
     SituFields,
-    _dew_path,
-    _record_float,
-    _record_int,
-    _refuse,
-    _refuse_encoder_fields,
+    dew_path,
+    record_float,
+    record_int,
+    refuse,
+    refuse_encoder_fields,
 )
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -120,7 +121,7 @@ def _layer_schedule(linear: Mapping[str, object], layers: int) -> tuple[str, ...
     kda = records.integers(linear.get('kda_layers'), 'linear_attn_config.kda_layers')
     full = records.integers(linear.get('full_attn_layers'), 'linear_attn_config.full_attn_layers')
     if sorted((*kda, *full)) != list(range(1, layers + 1)):
-        _refuse('linear_attn_config.kda_layers/full_attn_layers',
+        refuse('linear_attn_config.kda_layers/full_attn_layers',
                 f'the two 1-based lists must name each of the {layers} layers once')
     return tuple('linear_attention' if index + 1 in kda else 'full_attention' for index in range(layers))
 
@@ -150,23 +151,23 @@ def _mixture(text: Mapping[str, object], layers: int) -> MixtureFields | None:
     """
     if text.get('num_experts') is None:
         return None
-    experts = _record_int(text, 'num_experts')
-    top_k = _record_int(text, 'num_experts_per_token')
-    first = _record_int(text, 'first_k_dense_replace', 0)
-    every = _record_int(text, 'moe_layer_freq', 1)
+    experts = record_int(text, 'num_experts')
+    top_k = record_int(text, 'num_experts_per_token')
+    first = record_int(text, 'first_k_dense_replace', 0)
+    every = record_int(text, 'moe_layer_freq', 1)
     score = records.text(text.get('moe_router_activation_func', 'sigmoid'), 'moe_router_activation_func')
     if score not in ('sigmoid', 'softmax'):
-        _refuse('moe_router_activation_func', 'the reference scores by sigmoid or softmax')
-    groups, per_token = _record_int(text, 'num_expert_group', 1), _record_int(text, 'topk_group', 1)
-    width = _record_int(text, 'moe_intermediate_size')
-    shared = _record_int(text, 'num_shared_experts', 0)
+        refuse('moe_router_activation_func', 'the reference scores by sigmoid or softmax')
+    groups, per_token = record_int(text, 'num_expert_group', 1), record_int(text, 'topk_group', 1)
+    width = record_int(text, 'moe_intermediate_size')
+    shared = record_int(text, 'num_shared_experts', 0)
     latent = text.get('routed_expert_hidden_size')
     mixture: MixtureFields = native_fields(Mixture)(
         experts=experts, top_k=top_k,
         layers=tuple(index for index in range(layers) if index >= first and index % every == 0),
         score_function=score, bias=True,
         norm_topk_prob=bool(text.get('moe_renormalize', True)) and top_k > 1,
-        scaling=_record_float(text, 'routed_scaling_factor', 1.0),
+        scaling=record_float(text, 'routed_scaling_factor', 1.0),
         groups=groups if groups > per_token else 1,
         groups_per_token=per_token if groups > per_token else 1,
         expert_features=width, shared_features=width * shared,
@@ -184,58 +185,58 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
     fields its own release does not compute.
     """
     if text.get('model_type', 'kimi_linear') != 'kimi_linear':
-        _refuse(f"model_type {text.get('model_type')!r}", "the Kimi decoder is kimi_linear")
+        refuse(f"model_type {text.get('model_type')!r}", "the Kimi decoder is kimi_linear")
     if not text.get('mla_use_nope'):
-        _refuse('mla_use_nope', 'KimiMLAAttention asserts NoPE (modeling_kimi.py:378)')
-    if _record_int(text, 'num_nextn_predict_layers', 0):
-        _refuse('num_nextn_predict_layers', 'KimiLinearForCausalLM builds no prediction depth')
-    heads = _record_int(text, 'num_attention_heads')
+        refuse('mla_use_nope', 'KimiMLAAttention asserts NoPE (modeling_kimi.py:378)')
+    if record_int(text, 'num_nextn_predict_layers', 0):
+        refuse('num_nextn_predict_layers', 'KimiLinearForCausalLM builds no prediction depth')
+    heads = record_int(text, 'num_attention_heads')
     if text.get('num_key_value_heads') not in (None, heads):
-        _refuse('num_key_value_heads', 'the MLA expands one key and value per query head')
+        refuse('num_key_value_heads', 'the MLA expands one key and value per query head')
     activation = records.text(text.get('hidden_act', 'silu'), 'hidden_act')
-    if activation != 'situ' and activation not in _ACTIVATIONS:
-        _refuse(f"hidden_act {activation!r}", f"the gated MLP supports situ and {sorted(_ACTIVATIONS)}")
-    layers = _record_int(text, 'num_hidden_layers')
+    if activation != 'situ' and activation not in ACTIVATIONS:
+        refuse(f"hidden_act {activation!r}", f"the gated MLP supports situ and {sorted(ACTIVATIONS)}")
+    layers = record_int(text, 'num_hidden_layers')
     linear = records.record(text.get('linear_attn_config'), 'linear_attn_config')
     types = _layer_schedule(linear, layers)
-    hidden = _record_int(text, 'hidden_size')
+    hidden = record_int(text, 'hidden_size')
     kinds: dict[str, KindFields] = {}
     if 'linear_attention' in types:
         bound = linear.get('gate_lower_bound')
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
         kinds['linear_attention'].update(mixer={
             'class': 'kimi_delta_attention', 'fields': {
-            'linear_num_heads': _record_int(linear, 'num_heads'),
-            'linear_head_dim': _record_int(linear, 'head_dim'),
-            'linear_conv_kernel_dim': _record_int(linear, 'short_conv_kernel_size'),
+            'linear_num_heads': record_int(linear, 'num_heads'),
+            'linear_head_dim': record_int(linear, 'head_dim'),
+            'linear_conv_kernel_dim': record_int(linear, 'short_conv_kernel_size'),
             'linear_lower_bound': None if bound is None else float(records.number(bound, 'gate_lower_bound')),
             'use_full_rank_gate': bool(linear.get('use_full_rank_gate', False))}})
     if 'full_attention' in types:
         kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
         kinds['full_attention'].update(mixer={
             'class': 'mla', 'fields': {
-            'q_lora_rank': None if text.get('q_lora_rank') is None else _record_int(text, 'q_lora_rank'),
-            'kv_lora_rank': _record_int(text, 'kv_lora_rank'),
-            'qk_nope_head_dim': _record_int(text, 'qk_nope_head_dim'),
-            'qk_rope_head_dim': _record_int(text, 'qk_rope_head_dim'),
-            'v_head_dim': _record_int(text, 'v_head_dim'),
+            'q_lora_rank': None if text.get('q_lora_rank') is None else record_int(text, 'q_lora_rank'),
+            'kv_lora_rank': record_int(text, 'kv_lora_rank'),
+            'qk_nope_head_dim': record_int(text, 'qk_nope_head_dim'),
+            'qk_rope_head_dim': record_int(text, 'qk_rope_head_dim'),
+            'v_head_dim': record_int(text, 'v_head_dim'),
             'mla_use_nope': True,
             'mla_use_output_gate': bool(text.get('mla_use_output_gate', False))}})
     block = text.get('attn_res_block_size')
     config: DecoderFields = native_fields(CausalTransformer)(
-        vocab_size=_record_int(text, "vocab_size"),
+        vocab_size=record_int(text, "vocab_size"),
         emb_features=hidden,
         num_layers=layers,
         num_heads=heads,
         num_kv_heads=heads,
         head_dim=hidden // heads,
         mlp="swiglu",
-        mlp_features=_record_int(text, "intermediate_size"),
+        mlp_features=record_int(text, "intermediate_size"),
         max_seq_len=max_seq_len,
         layer_types=types,
         kinds={},
         # KimiRMSNorm scales after the cast (modeling_kimi.py:224-239).
-        norm_eps=_record_float(text, "rms_norm_eps", 1e-6),
+        norm_eps=record_float(text, "rms_norm_eps", 1e-6),
         scale_after_cast=True,
         qk_norm=False,
         tie_embeddings=tied,
@@ -243,7 +244,7 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
         attention_residuals=None,
     )
     config.update(
-        mlp=_situ(text) if activation == "situ" else _ACTIVATIONS[activation],
+        mlp=_situ(text) if activation == "situ" else ACTIVATIONS[activation],
         kinds=kinds, mixture=_mixture(text, layers),
         attention_residuals=None if block is None else native_fields(AttentionResiduals)(
             block_size=records.integer(block, "attn_res_block_size")))
@@ -258,23 +259,23 @@ def _kimi_linear_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     still compete, :684-685) and the SiTU activation it does not register."""
     extended = sorted(set(hf_config) & _K3_FIELDS)
     if extended:
-        _refuse(
+        refuse(
             f"config fields {extended}",
             "they are K3's additions, which Kimi Linear's modeling_kimi.py does not compute",
         )
     linear = records.record(hf_config.get('linear_attn_config'), 'linear_attn_config')
     extra = sorted(set(linear) - _LINEAR_ATTN_FIELDS)
     if extra:
-        _refuse(f'linear_attn_config fields {extra}', "Kimi Linear's KimiDeltaAttention reads no such field")
+        refuse(f'linear_attn_config fields {extra}', "Kimi Linear's KimiDeltaAttention reads no such field")
     if hf_config.get('q_lora_rank') is not None:
-        _refuse('q_lora_rank', 'KimiMLAAttention asserts a plain q_proj (modeling_kimi.py:356)')
-    groups, per_token = _record_int(hf_config, 'num_expert_group', 1), _record_int(hf_config, 'topk_group', 1)
+        refuse('q_lora_rank', 'KimiMLAAttention asserts a plain q_proj (modeling_kimi.py:356)')
+    groups, per_token = record_int(hf_config, 'num_expert_group', 1), record_int(hf_config, 'topk_group', 1)
     if groups > per_token:
-        _refuse(f'num_expert_group {groups} over topk_group {per_token}',
+        refuse(f'num_expert_group {groups} over topk_group {per_token}',
                 'the gate fills the unselected groups with 0.0, not -inf, so they still compete '
                 '(modeling_kimi.py:684-685)')
     if hf_config.get('hidden_act') == 'situ':
-        _refuse('hidden_act situ', "Kimi Linear's modeling_kimi.py registers no SiTU")
+        refuse('hidden_act situ', "Kimi Linear's modeling_kimi.py registers no SiTU")
     tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     # model_max_length is a keyword the release's config.json carries and
     # KimiLinearConfig stores without reading; NoPE MLA and KDA have no
@@ -291,22 +292,22 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     """
     text = hf_config.get('text_config')
     if not isinstance(text, Mapping):
-        _refuse('text_config', f"the wrapper carries its decoder under text_config, got {text!r}")
-    unknown = sorted(key for key in set(text) - _LINEAR_FIELDS - _K3_FIELDS - _SERIALIZED_TEXT_FIELDS
-                     - set(_SERIALIZED_ENCODER_FIELDS) - _IGNORED_FIELDS - _CODEC_FIELDS
+        refuse('text_config', f"the wrapper carries its decoder under text_config, got {text!r}")
+    unknown = sorted(key for key in set(text) - _LINEAR_FIELDS - _K3_FIELDS - SERIALIZED_TEXT_FIELDS
+                     - set(SERIALIZED_ENCODER_FIELDS) - IGNORED_FIELDS - CODEC_FIELDS
                      if not str(key).startswith('_'))
     if unknown:
-        _refuse(f"text_config fields {unknown}", "KimiLinearConfig has no such field to compute")
-    _refuse_encoder_fields(text)
+        refuse(f"text_config fields {unknown}", "KimiLinearConfig has no such field to compute")
+    refuse_encoder_fields(text)
     linear = records.record(text.get('linear_attn_config'), 'linear_attn_config')
     extra = sorted(set(linear) - _LINEAR_ATTN_FIELDS - _K3_LINEAR_ATTN_FIELDS)
     if extra:
-        _refuse(f'linear_attn_config fields {extra}', 'KimiDeltaAttention reads no such field')
+        refuse(f'linear_attn_config fields {extra}', 'KimiDeltaAttention reads no such field')
     tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     used.update(_K3_WRAPPER_FIELDS)
     # KimiLinearConfig's own default (configuration_kimi_k3.py:55), capped
     # at the context every family builds by default.
-    context = min(_record_int(text, 'max_position_embeddings', 4096), DEFAULT_MAX_SEQ_LEN)
+    context = min(record_int(text, 'max_position_embeddings', 4096), DEFAULT_MAX_SEQ_LEN)
     return _decoder(text, tied, context)
 
 
@@ -333,7 +334,7 @@ def _decoder_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     if parts in (['output_attn_res_norm', 'weight'], ['output_attn_res_proj', 'weight']):
         return ('params', 'output_res', 'scale' if parts[0].endswith('norm') else 'kernel')
     if len(parts) < 3 or parts[0] != 'layers' or not parts[1].isdigit():
-        return _dew_path('model.' + name, config)
+        return dew_path('model.' + name, config)
     layer, module, tail = f'layers_{parts[1]}', parts[2], parts[3:]
     if tail == ['weight'] and module in _LAYER_SITES:
         return ('params', layer, *_LAYER_SITES[module])
@@ -364,7 +365,7 @@ def _decoder_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
         if tail == ['routed_expert_norm', 'weight']:
             return ('params', layer, 'mlp', 'routed_expert_norm', 'scale')
         raise ValueError(f"unknown tensor name {name!r}")
-    return _dew_path('model.' + name, config)
+    return dew_path('model.' + name, config)
 
 
 def _kimi_linear_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -372,7 +373,7 @@ def _kimi_linear_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
     under `model.*`, the head at `lm_head.weight` (model.safetensors.index.json
     at e1df551)."""
     if name == 'lm_head.weight':
-        return _dew_path(name, config)
+        return dew_path(name, config)
     if not name.startswith('model.'):
         raise ValueError(f"unknown tensor name {name!r}")
     return _decoder_path(name.removeprefix('model.'), config)
@@ -386,7 +387,7 @@ def _kimi_k3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | 
     if name.startswith(('vision_tower.', 'mm_projector.')):
         return None
     if name == 'language_model.lm_head.weight':
-        return _dew_path('lm_head.weight', config)
+        return dew_path('lm_head.weight', config)
     if not name.startswith('language_model.model.'):
         raise ValueError(f"unknown tensor name {name!r}")
     return _decoder_path(name.removeprefix('language_model.model.'), config)
@@ -440,3 +441,33 @@ def _kimi_k3_prepare(tensors: Mapping[str, np.ndarray],
             raise ValueError(f"{name} pads its {heads} heads with nonzero values")
         prepared[name] = log[:heads]
     return prepared
+
+
+# Kimi Linear's released remote code; provenance-only, like K2.5.
+KIMI_LINEAR = DecoderFamily(
+    ('kimi_linear',),
+    _kimi_linear_config,
+    lambda fields: False,
+    'kimi_linear',
+    'KimiLinearForCausalLM',
+    lambda model: {},
+    weight_path=_kimi_linear_path,
+    prepare=_kimi_linear_prepare,
+    preserve_source_layout=True,
+)
+
+
+# Kimi K3's text decoder under its vision wrapper; provenance-only, like K2.5.
+KIMI_K3 = DecoderFamily(
+    ('kimi_k3',),
+    _kimi_k3_config,
+    lambda fields: False,
+    'kimi_k3',
+    'KimiK3ForConditionalGeneration',
+    lambda model: {},
+    weight_path=_kimi_k3_path,
+    prepare=_kimi_k3_prepare,
+    zero_padded=_KDA_ZERO_PADDED,
+    preserve_source_layout=True,
+    tied_head_names=('language_model.lm_head.weight', 'language_model.model.embed_tokens.weight'),
+)

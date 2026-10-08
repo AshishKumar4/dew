@@ -1,0 +1,61 @@
+{
+  "rank": 16,
+  "alpha": 16.0,
+  "dropout": 0.0,
+  "modules": [
+    "to_q",
+    "to_k",
+    "to_v",
+    "to_out.0"
+  ],
+  "learning_rate": 0.00015,
+  "optimizer": "AdamW",
+  "weight_decay": 0.01,
+  "adam_betas": [
+    0.9,
+    0.999
+  ],
+  "adam_epsilon": 1e-08,
+  "batch_size": 1,
+  "accumulation": 1,
+  "target_steps": 160,
+  "training_seed": 1729,
+  "adapter_seed": 42,
+  "data_seed": 23,
+  "compute_dtype": "bfloat16",
+  "frozen_parameter_dtype": "bfloat16",
+  "adapter_parameter_dtype": "float32",
+  "resolution": [
+    512,
+    512
+  ],
+  "ema": null,
+  "unconditional_probability": 0.1,
+  "sampling_steps": 30,
+  "guidance": 7.0,
+  "negative_prompt": "",
+  "prompts": [
+    "a picture in dewprint style of a mountain lake with a small sailboat, snowy peaks, dawn",
+    "a picture in dewprint style of a winding river through a village in autumn, red maple trees",
+    "a picture in dewprint style of a wooden bridge in the rain, people crossing with umbrellas",
+    "a picture in dewprint style of a coastal fishing village, a red sunset over the sea",
+    "a picture in dewprint style of a snow-covered pine tree beside a quiet temple",
+    "a picture in dewprint style of cherry blossom trees beside a river, Mount Fuji in the distance"
+  ],
+  "seeds": [
+    1042,
+    2073,
+    3104,
+    4135,
+    5166,
+    6197
+  ],
+  "gradient_clip_norm": 1.0,
+  "model": "Comfy-Org/stable-diffusion-v1-5-archive",
+  "model_revision": "9cfd069101959ca3828bf9c04a4419870832b74f",
+  "single_file": "v1-5-pruned-emaonly-fp16.safetensors",
+  "dew_commit": "fcdfa0070f49e0a4f8f344be02839d0573f40a98",
+  "worktree": "/content/lora-pairs-160/job-1/dew",
+  "assets": "/content/lora-assets",
+  "checkpoints": "/content/lora-output/checkpoints"
+}

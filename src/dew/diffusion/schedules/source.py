@@ -18,7 +18,7 @@ from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import FlowMatchingScheduler
 from dew.diffusion.schedules.karras import EDMNoiseScheduler
 from dew.diffusion.schedules.source_grids import empirical_mu as empirical_mu, published_betas, sampling_grid
-from dew.diffusion.schedules.source_policy import Origin as Origin, _Policy, resolve_config
+from dew.diffusion.schedules.source_policy import Origin as Origin, SourcePolicy, resolve_config
 from dew.diffusion.transforms import PredictionTransform
 from dew.sampling.solvers import Solver
 
@@ -36,7 +36,7 @@ class SourceSchedule:
     config: Mapping[str, object]
     betas: np.ndarray
     prediction: PredictionTransform
-    policy: _Policy
+    policy: SourcePolicy
     # The native solver this file's class and controls name, resolved once
     # when the file was read.
     solver: Solver

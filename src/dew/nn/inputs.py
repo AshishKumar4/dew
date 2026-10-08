@@ -250,7 +250,9 @@ class AttentionMetadata:
     the ids. `media` `[B, S]` marks the positions a media encoder fills;
     DeepSeek-V4.1 routes those by its image bias and keeps them out of every
     n-gram. `admitted` turns a cached call into a serving step's mixed call
-    (`Admitted`).
+    (`Admitted`). `position_bias` is added to every attention logit,
+    `[B or 1, heads, S, keys]`: T5's relative position table, which its
+    encoder computes once for its layers.
     """
 
     valid: jax.Array | None = None
@@ -262,6 +264,7 @@ class AttentionMetadata:
     engram_ids: jax.Array | None = None
     media: jax.Array | None = None
     admitted: Admitted | None = None
+    position_bias: jax.Array | None = None
 
 
 @struct.dataclass

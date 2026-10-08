@@ -36,6 +36,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: The release's tag is the version the package carries
+        run: |
+          version=$(sed -n 's/^__version__ = "\(.*\)"$/\1/p' src/dew/__init__.py)
+          test "$GITHUB_REF_NAME" = "v$version" || {
+            echo "the release is tagged $GITHUB_REF_NAME and dew.__version__ is $version"; exit 1; }
       - name: Build and check the sdist and wheel
         run: |
           python -m pip install --upgrade pip build twine
