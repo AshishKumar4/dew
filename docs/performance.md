@@ -21,9 +21,12 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
 CI checks correctness, and `tools/perf_gate.py` checks speed. It runs one fixed
 battery on two Dew trees on one machine, in alternating rounds (base then head,
 then head then base). The battery is the training step of a 359.8M dense
-decoder and a 321.8M MoE decoder at 4 x 1024 tokens and SimpleDiT-B at batch
-32, Qwen3-0.6B served at 32 and 128 slots, causal attention forward and backward
-(cudnn and xla, 2048 tokens, 128-wide heads), the Oxford Flowers input pipeline,
+decoder and a 321.8M MoE decoder at 4 x 1024 tokens, SimpleDiT-B and an MM-DiT
+of its size at batch 32, and FLUX.2 and Wan 2.1 at their head width over a few
+blocks; the forward pass of the SigLIP-400M, Qwen3.5 and Gemma 4 vision towers
+and the SD VAE's decoder at their released sizes, with random weights;
+Qwen3-0.6B served at 32 and 128 slots; causal attention forward and backward
+(cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
 and the save and restore of lm-dense's training state. Each row runs in a
 process of its own, with the tree's own copy of the tool where it has one. A row
 regresses when the head's median is worse than the base's by more than either
