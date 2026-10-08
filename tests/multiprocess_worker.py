@@ -2016,16 +2016,20 @@ def mode_step_fits(args) -> dict:
 
 
 def mode_whole_validation(args) -> dict:
-    """Every evaluated objective's validation pass and `Perplexity`'s, on this
-    pool, as `tests/test_whole_validation.py` runs them on one process."""
+    """The validation passes of the evaluated objectives in `--part` i/n (the
+    ith, i + nth, ... of them), and in part 0 `Perplexity`'s, on this pool, as
+    `tests/test_whole_validation.py` runs them on one process."""
     import jax
     from test_objective_inputs import corpus_windows
     from test_whole_validation import EVALUATED, evaluated, perplexity
 
+    index, parts = (int(value) for value in args.part.split("/"))
     root = Path(args.run_dir) / f"process{jax.process_index()}"
     windows = corpus_windows(root / "corpus")
-    return {"passes": {name: evaluated(name, windows, root / name) for name in EVALUATED},
-            "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
+    passes = {name: evaluated(name, windows, root / name) for name in EVALUATED[index::parts]}
+    if index:
+        return {"passes": passes}
+    return {"passes": passes, "perplexity": perplexity(windows), "one": perplexity(windows, 1)}
 
 
 MODES = {"host_training": mode_host_training, "step_fits": mode_step_fits,
@@ -2077,6 +2081,7 @@ def parse_args(argv=None):
                              "orbax's tmp directory creation once did (FileExistsError)")
     parser.add_argument("--tokens", help="directory holding train.bin and val.bin")
     parser.add_argument("--seq-len", type=int, default=8)
+    parser.add_argument("--part", default="0/1", help="i/n: whole_validation's share of the objectives")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through train_stream, whose "

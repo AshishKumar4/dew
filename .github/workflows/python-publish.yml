@@ -23,6 +23,8 @@ jobs:
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
+      # CI's proven job may read the runs of a push; a release's call runs it all.
+      actions: read
     # The test job reaches armada with ARMADA_URL and ARMADA_TOKEN.
     secrets: inherit
 
