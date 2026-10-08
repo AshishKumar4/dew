@@ -214,6 +214,14 @@ def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return None
 
 
+def _held_pass(held: Sequence[tuple[Example, tuple[str, ...]]], encoding: Encoding, *, batch: int, seed: int,
+               loading: Loading) -> Reader:
+    """The validation pass over held-out rows: each once, laid out unaugmented."""
+    rows = _Rows(held, f"{len(held)} held-out rows")
+    return validation_pass(rows, [_Encode(encoding, [rows], augment=False)], batch=batch, seed=seed,
+                           loading=loading)
+
+
 def _laid_rows(examples: Iterable[Example | Mapping[str, object]], *,
                joint: bool) -> list[tuple[Example, tuple[str, ...]]]:
     """Each row an example lays out: one per answered question, or, for a joint
@@ -411,20 +419,13 @@ class DecisionObjective(Objective[Ratio]):
             laid = _laid_rows(weighted[name].examples, joint=joint)
             corpora.append(_Rows(laid, f"{name}: {len(laid)} rows", corpus))
         held = None if validation is None else _laid_rows(validation, joint=joint)
-        every = [row for rows in corpora for row in rows.rows] + (held or [])
-        width = max(len(example.questions[name].options) + (self.none_of_the_above > 0)
-                    for example, names in every for name in names)
-        questions = max(len(names) for _, names in every)
-        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
-                            self.shuffle_options, self.none_of_the_above)
+        # One shape for the training and the held-out rows, so both compile once.
+        encoding = self._encoding([row for rows in corpora for row in rows.rows] + (held or []))
         records = sum(len(rows) for rows in corpora)
         if records < batch:
             raise ValueError(f"{records} rows of answered questions, fewer than one batch of {batch}")
-        scoring = None
-        if held is not None:
-            held_rows = _Rows(held, f"{len(held)} held-out rows")
-            scoring = validation_pass(held_rows, [_Encode(encoding, [held_rows], augment=False)], batch=batch,
-                                      seed=seed, loading=loading)
+        scoring = (None if held is None
+                   else _held_pass(held, encoding, batch=batch, seed=seed, loading=loading))
         encode = [_Encode(encoding, corpora, augment=True)]
         if len(corpora) == 1:
             return Dataset(train=train_stream(corpora[0], encode, batch=batch, seed=seed, loading=loading),
@@ -439,14 +440,16 @@ class DecisionObjective(Objective[Ratio]):
         held = _laid_rows(examples, joint=self.layout.joint)
         if not held:
             raise ValueError("scoring needs examples with answers")
+        return _held_pass(held, self._encoding(held), batch=batch, seed=0,
+                          loading=Loading() if loading is None else loading)
+
+    def _encoding(self, rows: Sequence[tuple[Example, tuple[str, ...]]]) -> Encoding:
+        """The layout of `rows`, with as many option and question slots as the widest row needs."""
         width = max(len(example.questions[name].options) + (self.none_of_the_above > 0)
-                    for example, names in held for name in names)
-        questions = max(len(names) for _, names in held)
-        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
-                            self.shuffle_options, self.none_of_the_above)
-        rows = _Rows(held, f"{len(held)} held-out rows")
-        return validation_pass(rows, [_Encode(encoding, [rows], augment=False)], batch=batch, seed=0,
-                               loading=Loading() if loading is None else loading)
+                    for example, names in rows for name in names)
+        questions = max(len(names) for _, names in rows)
+        return Encoding(self.layout, self.tokenizer, self.specials, width, questions,
+                        self.shuffle_options, self.none_of_the_above)
 
     def inference_record(self):
         """Return what a saved run rebuilds its task from.

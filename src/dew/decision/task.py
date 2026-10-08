@@ -418,7 +418,8 @@ class Decide:
         This is a run's validation pass (`Evaluation.run`) over those questions,
         each probability divided by its temperature; a binning map or abstention
         thresholds are not applied. The default metrics are Accuracy, ECE, AURC
-        and the log loss.
+        and the log loss. The pass agrees its result across a process pool, so
+        there every process calls it.
         """
         from dew.decision.metrics import AURC, ECE, Accuracy
         from dew.decision.objective import DecisionObjective
