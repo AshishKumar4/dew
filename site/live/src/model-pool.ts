@@ -1,6 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { SnapshotGeneration } from './snapshots';
-import { coordinatorOf } from './coordinator';
 
 const MIN_HOSTS = 2;
 const HOST_CAPACITY = 8;
@@ -72,6 +71,11 @@ export class ModelPool extends DurableObject<Env> {
 		}
 	}
 
+	/** The sessions the pool's hosts hold, which each Worker's Coordinator counts as running. */
+	async held(): Promise<string[]> {
+		return Object.keys((await this.state()).sessions);
+	}
+
 	async release(session: string): Promise<void> {
 		await this.ctx.storage.transaction(async (storage) => {
 			const pool = await storage.get<Pool>('pool');
@@ -95,10 +99,7 @@ export class ModelPool extends DurableObject<Env> {
 			let pool = await this.state();
 			if (!pool.desired) return;
 			for (const [session, host] of Object.entries(pool.sessions)) {
-				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) {
-					await this.release(session);
-					await coordinatorOf(this.env).ended(session, Date.now());
-				}
+				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) await this.release(session);
 			}
 			pool = await this.state();
 			const target = Math.max(MIN_HOSTS, Math.ceil(Object.keys(pool.sessions).length / TARGET_LOAD));
