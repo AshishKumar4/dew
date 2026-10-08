@@ -163,6 +163,9 @@ class JointAttention(nn.Module):
             added = (self._norm("norm_added_q", self._heads("add_q_proj", context)),
                      self._norm("norm_added_k", self._heads("add_k_proj", context)),
                      self._heads("add_v_proj", context))
+            if rotation is not None and rotation[0].shape[-2] == image.shape[1]:
+                query, key = (rotate(part, *rotation, pairs=self.rotary_pairs) for part in (query, key))
+                rotation = None
             streams = (added, (query, key, value)) if self.context_first else ((query, key, value), added)
             query, key, value = (jnp.concatenate(pair, axis=1) for pair in zip(*streams, strict=True))
         if rotation is not None:
