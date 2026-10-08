@@ -1,9 +1,9 @@
 """Generate the supported-models page from Dew's runtime registries.
 
 The families come from the code, not from a list kept by hand: the decoder
-table returned by `family_entries()` and the wrapper table `_WRAPPERS` in
-`dew/interop/hf_decoders.py`, the diffusers pipelines in
-`dew/interop/pretrained.py`, and the model registry.
+table `ENTRIES` in `dew/interop/decoder_families.py`, the wrapper table
+`_WRAPPERS` in `dew/interop/hf_decoders.py`, the diffusers pipelines in
+`dew/interop/pipeline_assembly.py`, and the model registry.
 DECODERS, WRAPPERS and PIPELINES below only give each one a readable name and
 a group. The build fails when the code registers a family those tables do not
 name, or when they name one the code no longer has.
@@ -117,10 +117,10 @@ FULL_SIZE = {
 
 def decoder_families() -> list[tuple[str, str, bool]]:
     """(model_type, transformers architecture, has a multimodal wrapper) for every decoder-family entry."""
-    from dew.interop.hf_decoders import family_entries
+    from dew.interop.decoder_families import ENTRIES
 
     return [(model_type, family.architecture, family.wrapper is not None)
-            for family in family_entries() for model_type in family.model_types]
+            for family in ENTRIES for model_type in family.model_types]
 
 
 def wrappers() -> list[str]:
@@ -134,7 +134,7 @@ def wrappers() -> list[str]:
 
 
 def pipelines() -> list[str]:
-    from dew.interop.pretrained import _PIPELINE_POLICY
+    from dew.interop.pipeline_assembly import _PIPELINE_POLICY
 
     return list(_PIPELINE_POLICY)
 
