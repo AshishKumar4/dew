@@ -4,6 +4,8 @@ import argparse
 import concurrent.futures
 import json
 import pathlib
+import queue
+import re
 import statistics
 import time
 import urllib.request
@@ -37,14 +39,28 @@ def execute(client, code):
     return collect(client, client.execute(code, allow_stdin=False))
 
 
-def collect(client, message, timeout=30):
+class Silent(TimeoutError):
+    """The kernel sent nothing for the timeout; `output` is what it had sent."""
+
+    def __init__(self, output):
+        super().__init__(f"the kernel went silent after: {output[-1500:]!r}")
+        self.output = output
+
+
+def collect(client, message, timeout=30, displays=False):
+    """The stdout a cell printed, and with `displays` the text of its displays too."""
     stdout = ""
     while True:
-        result = client.get_iopub_msg(timeout=timeout)
+        try:
+            result = client.get_iopub_msg(timeout=timeout)
+        except queue.Empty:
+            raise Silent(stdout) from None
         if result["parent_header"].get("msg_id") != message:
             continue
         if result["msg_type"] == "stream":
             stdout += result["content"]["text"]
+        if displays and result["msg_type"] in ("display_data", "update_display_data"):
+            stdout += result["content"]["data"].get("text/plain", "") + "\n"
         if result["msg_type"] == "error":
             raise RuntimeError(str(result["content"]))
         if result["msg_type"] == "status" and result["content"]["execution_state"] == "idle":
@@ -123,24 +139,37 @@ def training():
 def cells():
     """The page's training cells, each run in a fresh training context as a visitor's Run does,
     while the model process holds its models. A failure names the host's memory."""
-    for name in ("finetune.py", "hero.py"):
+    # Each cell's last line of output, which only a complete run prints; the training summary
+    # itself is a display, not a stream.
+    for name, ending in (("finetune.py", "After: "), ("hero.py", "JULIET:")):
         code = (pathlib.Path("/opt/live/cells") / name).read_text()
+        # The page shows train.py without its command line (trainingExample, framework-examples.mjs).
+        code = re.sub(r"parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps",
+                      "steps = 1000", code.replace("import argparse\n\n", ""))
+        # The bridge installs the caps in every training context first (PRELOAD, shared_bridge.py).
+        code = "import live_training\nlive_training.install()\n" + code
+        code += "\nimport resource\nprint('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n"
         kernel = request("/api/kernels", {"name": "dew-train"})
         client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
         client.load_connection_file()
         client.start_channels()
         started = time.perf_counter()
+        print(f"{name} starts; memory {memory()}", flush=True)
         try:
             client.wait_for_ready(timeout=30)
-            output = collect(client, client.execute(code, allow_stdin=False), timeout=400)
+            output = collect(client, client.execute(code, allow_stdin=False), timeout=240, displays=True)
         except Exception as error:
             raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
                                  f"memory {memory()}") from None
         finally:
             client.stop_channels()
             request("/api/kernels/" + kernel["id"], method="DELETE")
-        assert "Trained 20 steps" in output, output[-2000:]
-        print(f"{name} ran in {time.perf_counter() - started:.0f} s; memory {memory()}", flush=True)
+        assert ending in output, output[-2000:]
+        # What a run keeps resident, which the host's memory must hold beside the model process.
+        peak = int(output.rsplit("peak ", 1)[1].split()[0])
+        assert peak < 4608, f"{name} held {peak} MiB; memory {memory()}"
+        print(f"{name} ran in {time.perf_counter() - started:.0f} s, {peak} MiB resident; memory {memory()}",
+              flush=True)
 
 
 def memory():

@@ -35,10 +35,14 @@ export class ModelPool extends DurableObject<Env> {
 		});
 	}
 
-	async status(): Promise<{ generation: string | null; ready: number; starting: number; active: number; minimum: number }> {
+	async status(): Promise<{ generation: string | null; ready: number; starting: number; active: number; minimum: number;
+		hosts: Record<string, Record<string, unknown> | null> }> {
 		const pool = await this.state();
-		return { generation: pool.serving ?? null, ready: pool.hosts.filter((host) => host.ready).length,
-			starting: pool.hosts.filter((host) => !host.ready).length, active: Object.keys(pool.sessions).length, minimum: MIN_HOSTS };
+		const ready = pool.hosts.filter((host) => host.ready);
+		const health = await Promise.all(ready.map((host) => this.env.SHARED.get(this.env.SHARED.idFromName(host.id)).health()));
+		return { generation: pool.serving ?? null, ready: ready.length,
+			starting: pool.hosts.filter((host) => !host.ready).length, active: Object.keys(pool.sessions).length, minimum: MIN_HOSTS,
+			hosts: Object.fromEntries(ready.map((host, index) => [host.id, health[index]])) };
 	}
 
 	async image(): Promise<string | null> {
