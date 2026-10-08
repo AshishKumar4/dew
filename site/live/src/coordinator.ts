@@ -47,6 +47,18 @@ export class Coordinator extends DurableObject<Env> {
 		return Number(this.ctx.storage.sql.exec(query, ...bindings).one().n);
 	}
 
+	/**
+	 * End the started sessions the model pool no longer holds. The pool is shared by the
+	 * production and preview Workers, so each Coordinator asks it rather than being told.
+	 */
+	private async reconcile(now: number): Promise<void> {
+		const sql = this.ctx.storage.sql;
+		const open = sql.exec<{ id: string }>('SELECT id FROM sessions WHERE ended IS NULL AND started IS NOT NULL').toArray();
+		if (!open.length) return;
+		const held = new Set(await this.env.POOL.get(this.env.POOL.idFromName('global')).held());
+		for (const { id } of open) if (!held.has(id)) sql.exec('UPDATE sessions SET ended = ? WHERE id = ? AND ended IS NULL', now, id);
+	}
+
 	/** Close sessions whose Kernel will not report back: never connected, or past the wall clock. */
 	private sweep(now: number): void {
 		const sql = this.ctx.storage.sql;
@@ -84,6 +96,7 @@ export class Coordinator extends DurableObject<Env> {
 
 	/** A session for visitor `ip`; `image` is the kernel image the current deploy starts. */
 	async open(ip: string, now: number, image: string): Promise<Opened> {
+		await this.reconcile(now);
 		this.sweep(now);
 		const { maxSessions, ipStarts, ipWindowSeconds, wallSeconds, budgetSeconds } = this.limits;
 		const sql = this.ctx.storage.sql;
@@ -124,16 +137,13 @@ export class Coordinator extends DurableObject<Env> {
 		return cursor.rowsWritten === 1;
 	}
 
-	async ended(id: string, now: number): Promise<void> {
-		this.ctx.storage.sql.exec('UPDATE sessions SET ended = ? WHERE id = ? AND ended IS NULL', now, id);
-	}
-
 	/** Whether a session may still connect: created, and not yet over. */
 	async isOpen(id: string): Promise<boolean> {
 		return this.count('SELECT COUNT(*) AS n FROM sessions WHERE id = ? AND ended IS NULL', id) === 1;
 	}
 
 	async status(now: number): Promise<{ active: number; maxSessions: number; budgetUsedSeconds: number; budgetSeconds: number }> {
+		await this.reconcile(now);
 		this.sweep(now);
 		return {
 			active: this.count('SELECT COUNT(*) AS n FROM sessions WHERE ended IS NULL'),
