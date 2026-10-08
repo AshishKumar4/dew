@@ -118,8 +118,7 @@ def main() -> None:
     data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=shape["batch"])
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto")
-    several = world > 1 or jax.device_count() > 1
-    mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count())) if several else None
+    mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),
                       optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0), mesh=mesh,
                       layout=Layout(), checkpoints=None, tracker=None)
