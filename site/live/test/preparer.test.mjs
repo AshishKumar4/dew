@@ -94,14 +94,19 @@ test('the shared preparation lifecycle tears down and reports an offline smoke f
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['snapshot', 'failed']]);
 });
 test('a stage cut off fails the preparation, and a report the registry missed is sent again', async () => {
-	const prepared = preparer({ failReport: 1 });
+	const prepared = preparer({ failReport: 2 });
 	await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
 	// An alarm began the build and was cut off: the next alarm finds its start.
 	prepared.storage.set('job', { ...prepared.storage.get('job'), began: Date.now() - 15 * 60_000 });
-	await assert.rejects(prepared.runner.alarm(), /registry unreachable/);
-	assert.match(prepared.storage.get('job').outcome.failure, /build was cut off/);
+	for (const _ of [1, 2]) {
+		await prepared.runner.alarm();
+		// The registry did not take it: the outcome is kept, and another alarm will send it.
+		assert.match(prepared.storage.get('job').outcome.failure, /build was cut off/);
+		assert.ok(prepared.state.alarm > Date.now());
+	}
 	await prepared.runner.alarm();
 	assert.equal(prepared.starts.length, 0);
-	assert.match(prepared.reports[0][1].failure, /build was cut off/);
+	assert.deepEqual(prepared.reports.map(([, outcome]) => outcome.failure.match(/build was cut off/) !== null), [true]);
 	assert.equal(prepared.storage.get('job'), undefined);
+	assert.equal(prepared.state.alarm, null);
 });

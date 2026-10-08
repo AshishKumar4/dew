@@ -11,6 +11,7 @@ async function scenario(name) {
 		modules: [{ type: 'ESModule', path: 'snapshots.mjs', contents: bundle.outputFiles[0].text }],
 		compatibilityDate: '2026-09-29', durableObjects: {
 			REGISTRY: { className: 'Registry', useSQLite: true }, PREPARER: { className: 'Preparer', useSQLite: true },
+			POOL: { className: 'Pool', useSQLite: true },
 		},
 	}));
 	try { return await (await worker.dispatchFetch(`https://test/${name}`)).json(); }
@@ -59,6 +60,18 @@ test('a lease that hears nothing fails at its end, and a report after it changes
 	assert.ok(result.status.alarm >= result.now + 4 * 60_000);
 	assert.equal(result.late.generation, null);
 	assert.deepEqual(result.late.failure, result.status.failure);
+});
+test('a trial whose preparer fails late does not overwrite a trial begun meanwhile', async () => {
+	const result = await scenario('overlap');
+	assert.equal(result.trialled.pending, 'b'.repeat(40));
+	assert.equal(result.trialled.last.failure, undefined);
+});
+test('a generation the pool missed is handed over again when its report is sent again', async () => {
+	const result = await scenario('handoff');
+	assert.match(result.first, /pool unreachable/);
+	assert.equal(result.missed, null);
+	assert.equal(result.configured, result.active);
+	assert.equal(result.status.failure, null);
 });
 test('an expired or different-commit generation is not eligible for restoration', async () => {
 	const result = await scenario('expiry');
