@@ -114,6 +114,7 @@ def gradient_sync(mesh) -> dict:
                    out_shardings=replicated)
     timed = {}
     for name, summed in (("tuple", tupled), ("flat", flat)):
+        timed[f"{name}_all_reduces"] = summed.lower(rows).compile().as_text().count(" all-reduce(")
         jax.block_until_ready(summed(rows))
         times = []
         for _ in range(3):
