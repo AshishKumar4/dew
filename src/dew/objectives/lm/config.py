@@ -27,7 +27,7 @@ import jax.numpy as jnp
 from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
 from dew.data import TokenWindows
 from dew.data.text import HFTokenizer, tokenizer_for
-from dew.registry import models, objectives, resolve_dtype
+from dew.registry import objectives, resolve_dtype
 from dew.sampling.text import Sampling
 
 from .objective import Perplexity, Samples
@@ -115,7 +115,7 @@ class LMRunConfig(RunConfig):
             mask = self.model.arguments.get("mask_token_id")
             table = max(vocab_size, mask + 1) if isinstance(mask, int) else vocab_size
             fields = {**self.model.fields, "max_seq_len": context, "vocab_size": table}
-            model = models.build(self.model.name, {**self.model.arguments, **fields})
+            model = self.model.build(max_seq_len=context, vocab_size=table)
         else:
             source, run = self.pretrained_source(written, vocab_size, context)
             model, fields = source.model, dict(source.model_config)

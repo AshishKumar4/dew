@@ -51,7 +51,7 @@ import math
 import re
 from collections.abc import Callable, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -60,6 +60,8 @@ from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 if TYPE_CHECKING:
+    from qwix import QuantizationProvider
+
     from dew.diffusion.process import Conditioning
     from dew.objectives.base import Objective, Variables
 
@@ -165,12 +167,31 @@ class Quantization:
         when the spec was constructed. Without Qwix installed, the call raises
         an error that names the extra.
         """
-        rules = _rules(self, training=True)
-        methods = tuple(method for method in METHODS if hasattr(model, method))
-        wrapped = _qwix().quantize_model(model, _providers()[0](rules), methods=methods)
-        # Qwix makes a class per call; it carries the spec, which a model record writes.
-        type(wrapped)._dew_quantization = self
-        return wrapped
+        return _qwix_wrapped(model, _providers()[0](_rules(self, training=True)), self)
+
+
+def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider,
+                  wrapper: Quantization | InputQuantization) -> nn.Module:
+    """`model` with the matmuls of its `METHODS` under Qwix's `provider`, in
+    the class Qwix makes for the call, which names `wrapper` and the class it
+    wraps (`dew.registry.WrapperClass`) for the model's record.
+
+    Qwix holds one provider per model: it makes its class over the class the
+    model's last Qwix call wrapped (qwix/_src/model.py:116-119), so a second
+    call would drop the first quantization and every wrapper made over it,
+    an adapter included. A model that already computes under Qwix is refused.
+    """
+    held = next((layer for layer in type(model).__mro__ if "_unquantized_type" in vars(layer)), None)
+    if held is not None:
+        raise ValueError(f"{type(model).__name__} already computes under a Qwix quantization, which a "
+                         f"second one would replace; quantize the model once, a run's training "
+                         f"quantization or its checkpoint's input quantization")
+    methods = tuple(method for method in METHODS if hasattr(model, method))
+    wrapped = _qwix().quantize_model(model, provider, methods=methods)
+    layer = type(wrapped)
+    layer._dew_wrapped = type(model)
+    layer._dew_wrapper = staticmethod(lambda: wrapper)
+    return wrapped
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -371,36 +392,48 @@ def _modelopt_input_qdq(x: jax.Array, spec: NVFP4Input, qarray: ModuleType) -> j
     return straight_through(x, jnp.where(rounded == 0, jnp.zeros_like(rounded), rounded))
 
 
-def checkpoint_input_quantization(model: nn.Module, inputs: Mapping[str, NVFP4Input | FP8Input]) -> nn.Module:
-    """Return `model` with its checkpoint's input quantization on the Linear layers.
+@dataclasses.dataclass(frozen=True)
+class InputQuantization:
+    """A checkpoint's input quantization on its Linear layers, which a model
+    loaded from a ModelOpt or compressed-tensors FP8 or NVFP4 checkpoint
+    computes under (`dew.interop.Pretrained`), and a run of it records.
 
-    `inputs` maps each Linear's module path to its NVFP4 or FP8 input scales. The
-    wrapper goes through Qwix, as the rest of this module does: before each
-    matched layer's dot, its input is quantized to its declared format and back with those
-    scales. The weights already hold the values the source reader decoded, and
-    the dot itself is unchanged, so its dtype, accumulation precision and the
-    bias placement stay as the model defines them.
+    `inputs` maps each Linear's module path to its NVFP4 or FP8 input
+    scales. It is not a `Quantization`: nothing trains quantized, and the
+    weights already hold the values the source reader decoded.
     """
-    qwix = _qwix()
-    by_pattern = {re.escape(path): spec for path, spec in inputs.items()}
 
-    class CheckpointInputs(qwix.QtProvider):
-        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
-                        preferred_element_type=None, *, out_sharding=None):
-            # Qwix 0.1.8's private lookup preserves the native scope these checkpoint scales bind.
-            rule, _ = self._get_current_rule_and_op_id('dot_general', only_rule=True)
-            if rule is not None:
-                if dimension_numbers[0][0] != (lhs.ndim - 1,):
-                    raise ValueError("checkpoint NVFP4 input QDQ requires the Linear's trailing input axis")
-                spec = by_pattern[rule.module_path]
-                lhs = fp8_input_qdq(lhs, spec) if isinstance(spec, FP8Input) else nvfp4_input_qdq(lhs, spec)
-            return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
-                                       preferred_element_type=preferred_element_type,
-                                       out_sharding=out_sharding)
+    inputs: Mapping[str, NVFP4Input | FP8Input]
 
-    rules = [qwix.QtRule(module_path=pattern, op_names=('dot_general',)) for pattern in by_pattern]
-    return qwix.quantize_model(model, CheckpointInputs(rules),
-                               methods=tuple(method for method in METHODS if hasattr(model, method)))
+    def apply(self, model: nn.Module) -> nn.Module:
+        """Return `model` quantizing each matched Linear's input to its declared
+        format and back with its scales, before the layer's dot.
+
+        The wrapper goes through Qwix, as the rest of this module does. The dot
+        itself is unchanged, so its dtype, accumulation precision and the bias
+        placement stay as the model defines them.
+        """
+        qwix = _qwix()
+        by_pattern = {re.escape(path): spec for path, spec in self.inputs.items()}
+
+        class CheckpointInputs(qwix.QtProvider):
+            def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
+                            preferred_element_type=None, *, out_sharding=None):
+                # Qwix 0.1.8's private lookup preserves the native scope these checkpoint scales bind.
+                rule, _ = self._get_current_rule_and_op_id('dot_general', only_rule=True)
+                if rule is not None:
+                    if dimension_numbers[0][0] != (lhs.ndim - 1,):
+                        raise ValueError(
+                            "checkpoint NVFP4 input QDQ requires the Linear's trailing input axis")
+                    spec = by_pattern[rule.module_path]
+                    lhs = (fp8_input_qdq(lhs, spec) if isinstance(spec, FP8Input)
+                           else nvfp4_input_qdq(lhs, spec))
+                return jax.lax.dot_general(lhs, rhs, dimension_numbers, precision=precision,
+                                           preferred_element_type=preferred_element_type,
+                                           out_sharding=out_sharding)
+
+        rules = [qwix.QtRule(module_path=pattern, op_names=('dot_general',)) for pattern in by_pattern]
+        return _qwix_wrapped(model, CheckpointInputs(rules), self)
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
@@ -809,15 +842,6 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-@runtime_checkable
-class QuantizedClass(Protocol):
-    """Marks a module class `Quantization.apply` wrapped: Qwix's subclass of
-    the model's own class, and the spec that wrapped it."""
-
-    _unquantized_type: ClassVar[type[nn.Module]]
-    _dew_quantization: ClassVar[Quantization]
-
-
 def quantize_trunk[LossT, EffectsT](objective: Objective[LossT, EffectsT], spec: Quantization) -> None:
     """Quantize the trunk matmuls of the modules `objective` trains, in place.
 
@@ -842,4 +866,4 @@ def quantize_trunk[LossT, EffectsT](objective: Objective[LossT, EffectsT], spec:
     objective.substitute([spec.apply(entry.module) if entry.trained else entry.module for entry in entries])
 
 
-__all__ = ["Quantization"]
+__all__ = ["InputQuantization", "Quantization"]
