@@ -99,7 +99,7 @@ export class ModelPool extends DurableObject<Env> {
 			let pool = await this.state();
 			if (!pool.desired) return;
 			for (const [session, host] of Object.entries(pool.sessions)) {
-				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) await this.release(session);
+				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) await this.close(session);
 			}
 			pool = await this.state();
 			const target = Math.max(MIN_HOSTS, Math.ceil(Object.keys(pool.sessions).length / TARGET_LOAD));
