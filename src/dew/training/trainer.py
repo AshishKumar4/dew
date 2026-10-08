@@ -52,6 +52,7 @@ from dew.nn.sharding import (
     boxed_axes,
     measured_links,
     pipeline_microbatches,
+    ruled_boxes,
 )
 from dew.objectives.base import (
     FROZEN,
@@ -641,7 +642,7 @@ class Trainer(Generic[Loss, Effects]):
     def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
         """The optimizer's state of `params`, Muon's grouping reading the axes
         modules boxed on them in `initialized`."""
-        with boxed(boxed_axes(initialized)):
+        with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)):
             return self.optimizer.init(params)
 
     def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
@@ -651,7 +652,7 @@ class Trainer(Generic[Loss, Effects]):
         a state the trainer did not build."""
         if self._boxed is None:
             self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
-        return self._boxed
+        return ruled_boxes(self._boxed, self.layout.axis_rules)
 
     def shardings(self, state: TrainState) -> Placement[TrainState]:
         """Return where each field of `state` is placed, on the axes that suit its kind.

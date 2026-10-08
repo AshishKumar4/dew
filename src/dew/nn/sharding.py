@@ -582,10 +582,24 @@ def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
     return table
 
 
+def ruled_boxes(table: Mapping[Suffix, LogicalAxes], rules: LogicalAxisRules) -> dict[Suffix, LogicalAxes]:
+    """`table`'s boxes that name an axis `rules` places. A box whose names
+    the rules never mention keeps the shape heuristic, as an undeclared
+    parameter does, where its names alone would leave it whole: a Flax model
+    boxing with its own names (MaxText's 'activation_*', 'kv')."""
+    named = {name for name, _ in rules}
+    return {path: names for path, names in table.items() if named.intersection(names)}
+
+
+def current_boxes() -> Mapping[Suffix, LogicalAxes]:
+    """The boxed axes `declared_axes` reads now."""
+    return _BOXED.get()
+
+
 @contextlib.contextmanager
 def boxed(table: Mapping[Suffix, LogicalAxes]) -> Iterator[None]:
     """Read `table`'s boxed axes ahead of the suffix table while the block runs."""
-    token = _BOXED.set({**_BOXED.get(), **table})
+    token = _BOXED.set(dict(table))
     try:
         yield
     finally:

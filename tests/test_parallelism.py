@@ -344,14 +344,18 @@ class Decoder(nn.Module):
 
 
 class Readouts(nn.Module):
-    """A top-level `readout` whose module boxes its kernel's axes, and a
-    plain `readout` of the same shape under `decoder`."""
+    """A top-level `readout` whose module boxes its kernel's axes, a plain
+    `readout` of the same shape under `decoder`, and a kernel boxed with names
+    no rule mentions."""
 
     @nn.compact
     def __call__(self, x):
-        boxed = nn.Dense(8, use_bias=False, name="readout", kernel_init=nn.with_logical_partitioning(
-            nn.initializers.lecun_normal(), (None, "vocab")))(x)
-        return boxed + Decoder(name="decoder")(x)
+        def boxed(name, names):
+            return nn.Dense(8, use_bias=False, name=name, kernel_init=nn.with_logical_partitioning(
+                nn.initializers.lecun_normal(), names))(x)
+
+        return boxed("readout", (None, "vocab")) + Decoder(name="decoder")(x) + boxed(
+            "foreign", ("foreign_a", "foreign_b"))
 
 
 class BoxedReadout(Objective):
@@ -371,7 +375,9 @@ def test_a_boxed_parameter_places_by_its_own_names_and_its_namesake_elsewhere_do
     `decoder` keeps the shape heuristic's 16-wide split. Muon reads the same
     names: the boxed kernel maps into the vocabulary, so AdamW steps it with
     two moments, and Muon steps its namesake with one, every moment on its
-    parameter's spec."""
+    parameter's spec. A kernel boxed with names no rule mentions keeps the
+    heuristic, as an undeclared one does, rather than the whole-array
+    placement its names alone would give."""
     trainer = Trainer(BoxedReadout(), OPTIMIZER_MAP["muon"](1e-3), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, rules=(("vocab", "fsdp"),)))
     abstract = jax.eval_shape(trainer.initial_state)
@@ -379,6 +385,7 @@ def test_a_boxed_parameter_places_by_its_own_names_and_its_namesake_elsewhere_do
     params = placement.variables["params"]
     assert params["readout"]["kernel"] == P(None, "fsdp")
     assert params["decoder"]["readout"]["kernel"] == P("fsdp")
+    assert params["foreign"]["kernel"] == P("fsdp")
     # The trainer's optimizer state mirrors the params collection itself.
     moments = muon_moment_specs(placement.opt_state, params)
     boxed, plain = moments[("readout", "kernel")], moments[("decoder", "readout", "kernel")]
