@@ -395,7 +395,7 @@ def to_record(value, annotation) -> JSON:
                 for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
-    if not isinstance(value, type) and _owned(type(value), called=False):
+    if not isinstance(value, (type, Enum)) and _owned(type(value), called=False):
         # A plain class of Dew's or a trusted package's, rebuilt from its
         # constructor's parameters as `_built` builds one.
         fields = _constructed(value)
