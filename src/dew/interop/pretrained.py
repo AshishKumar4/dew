@@ -1113,7 +1113,7 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
     member, which this per-Linear binding cannot compute, so they are refused
     before returning a model with the wrong activation forward.
     """
-    from dew.training.quantization import FP8Input, NVFP4Input, checkpoint_input_quantization
+    from dew.training.quantization import FP8Input, InputQuantization, NVFP4Input
 
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
@@ -1140,7 +1140,7 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
     if len(inputs) != sum(name.endswith(codec.input_suffix) for name in grid):
         raise ValueError("NVFP4 input scales must each bind one Linear scope; "
                          "an unbound scale would drop QDQ")
-    return checkpoint_input_quantization(model, inputs)
+    return InputQuantization(inputs).apply(model)
 
 
 def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.DecoderFields, family: str,
