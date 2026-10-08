@@ -117,7 +117,8 @@ from model_support import flat_tree
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop import Pretrained, PretrainedDecoder
-from dew.interop.hf_decoders import DrafterRefused, translate_config, translate_weights
+from dew.interop.decoder_parts import DrafterRefused
+from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -842,10 +843,9 @@ def test_nemotron_h_weight_names_invert():
 
 
 def test_nemotron_h_does_not_claim_another_mamba2_hybrid():
-    from dew.interop.hf_decoders import family_entries
+    from dew.interop.families.nemotron_h import NEMOTRON_H as family
 
     config = translate_config(fixture_config("nemotron-h-tiny"))
-    family = next(entry for entry in family_entries() if entry.model_types == ("nemotron_h",))
     assert family.matches(config.value)
     assert not family.matches(CausalTransformer(vocab_size=64, emb_features=16, num_heads=2,
                                                mlp_features=0, qk_norm=False,
@@ -1235,7 +1235,7 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
     This is the check that a config translation and a key map fit a
     checkpoint nobody wants to download in CI.
     """
-    from dew.interop.hf_decoders import dew_path
+    from dew.interop.decoder_parts import dew_path
 
     table = json.loads((REAL / "tensors.json").read_text())
     config = translate_config(json.loads((REAL / "config.json").read_text()))

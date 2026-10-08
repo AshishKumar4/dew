@@ -1,6 +1,7 @@
 """Decoder families, ordered from the most specific layout to the plain decoder."""
 
 from dew.interop import mamba2
+from dew.interop.decoder_parts import DecoderFamily
 from dew.interop.families.bloom import BLOOM
 from dew.interop.families.deepseek import (
     DEEPSEEK_V2,
@@ -37,7 +38,6 @@ from dew.interop.families.qwen import (
     QWEN3_MOE,
     QWEN3_NEXT,
 )
-from dew.interop.hf_decoders import DecoderFamily
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (

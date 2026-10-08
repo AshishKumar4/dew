@@ -45,7 +45,15 @@ from dew.inputs.diffusion import (
     T5Segment,
     WanConditioner,
 )
-from dew.interop import gguf, hf_decoders as decoders, mamba2, sources, verify, weights as checkpoint_weights
+from dew.interop import (
+    decoder_parts,
+    gguf,
+    hf_decoders as decoders,
+    mamba2,
+    sources,
+    verify,
+    weights as checkpoint_weights,
+)
 from dew.interop.codecs import SourceQuantization, source_quantization
 from dew.interop.components import bind_component
 from dew.interop.config_records import NativeFields
@@ -134,7 +142,7 @@ def _language_layout(name: str, text_name: str, tensor: np.ndarray,
     return packing.layout(name, [part for part in parts if part is not None])
 
 
-def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoders.DecoderFamily,
+def _leaf_layout(name: str, text_name: str, tensor: np.ndarray, family: decoder_parts.DecoderFamily,
                  config, variables: Mapping[str, object], component: str | None) -> WeightLayout | None:
     def nested(path: tuple[str, ...]) -> tuple[str, ...]:
         return path if component is None else (path[0], component, *path[1:])
@@ -559,7 +567,7 @@ class Pretrained:
             scalar_mode = _scalar_mode(self.weight_layouts, values)
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
-                return decoders.layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
+                return decoder_parts.layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
             tensors = {**self.retained_tensors,
                        **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
@@ -1612,7 +1620,7 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
                                                    "tie_word_embeddings")}
 
 
-def _qwen_text_path(record: decoders.DecoderFields):
+def _qwen_text_path(record: decoder_parts.DecoderFields):
     """Map a Qwen3-VL checkpoint's tensors: its language model as the Qwen3
     decoder's, its head too, and its vision tower held as stored, which the
     text-to-image prompt never reads and an export writes back."""
@@ -1667,7 +1675,7 @@ _FLUX2_TEXT: Mapping[str, tuple[Literal["qwen3", "mistral3"], tuple[int, ...]]] 
 formats a prompt with, and the `hidden_states` it stacks."""
 
 
-def _hidden_states_path(record: decoders.DecoderFields, family: str, multimodal: bool):
+def _hidden_states_path(record: decoder_parts.DecoderFields, family: str, multimodal: bool):
     """Map a hidden-states text encoder's tensors: a Qwen3 language model's
     own names, or a Mistral-3's language model as the Mistral decoder's with
     its vision tower and projector held as stored, which a text prompt never
@@ -1791,8 +1799,8 @@ def _safety_path(name: str):
     return _clip_path(name.removeprefix("vision_model."))
 
 
-def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperFields,
-                         max_seq_len: int | None) -> decoders.DecoderFields:
+def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
+                         max_seq_len: int | None) -> decoder_parts.DecoderFields:
     """Read the decoder fields a wrapper's text_config states, with the corrections
     its own family makes to them.
 
@@ -1810,7 +1818,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         text_fields["final_logit_softcap"] = None
         text_fields["mixer"] = {"class": "attention", "fields": {"bidirectional_images": True}}
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        kinds = decoders.kinds_of(text_fields).copy()
+        kinds = decoder_parts.kinds_of(text_fields).copy()
         sliding = NativeFields(decoders.LayerKind, {
             **kinds.get("sliding_attention", {}),
             "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
@@ -1822,7 +1830,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
-        kinds = decoders.kinds_of(text_fields).copy()
+        kinds = decoder_parts.kinds_of(text_fields).copy()
         full = NativeFields(decoders.LayerKind, {
             **kinds.get("full_attention", {}),
             "mixer": {"class": "attention", "fields": {
@@ -1832,7 +1840,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
     return text_fields
 
 
-def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
+def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                    language_model: CausalTransformer, *, dtype: str) -> MultimodalTransformer:
     """Build the wrapper its record describes: the decoder above, the towers and
     projectors it names, and the placeholder ids its prompts carry."""
@@ -2067,7 +2075,7 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
     return checkpoint_input_quantization(model, inputs)
 
 
-def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoders.DecoderFields, family: str,
+def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.DecoderFields, family: str,
                      variables: Variables) -> tuple[tuple[WeightLayout, ...], dict[str, np.ndarray]]:
     """Each source tensor's binding into the tree, and the tensors none binds."""
     bindings, retained = [], {}
@@ -2125,7 +2133,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         text_fields['num_nextn_predict_layers'] = 0
         record['text']['num_nextn_predict_layers'] = 0
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
-    wrapper: decoders.WrapperFields = {**record, "text": text}
+    wrapper: decoder_parts.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     parts = decoders.translate_wrapper_weights(tensors, record, param_dtype=param_dtype, lazy=lazy)
@@ -2171,7 +2179,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
-    decoders.check_decoder_tree(variables, model)
+    decoder_parts.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
     # derived-export family binds too; `save` picks its writer by
@@ -2180,7 +2188,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # (GPT-2's and GPT-NeoX's prepare) has no raw-name bindings.
     entry = decoders.families()[family]
     layouts, retained = ((), {})
-    if entry.preserve_source_layout or entry.prepare is decoders.DecoderFamily.prepare:
+    if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
         layouts, retained = _decoder_layouts(tensors, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 

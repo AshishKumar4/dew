@@ -12,15 +12,7 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import records
-from dew.interop.families.gemma import (
-    gemma4_config,
-    gemma4_export_path,
-    gemma4_export_weights,
-    gemma4_path,
-    parallel_experts,
-)
-from dew.interop.families.qwen import qwen2_config
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     DecoderFamily,
@@ -32,6 +24,14 @@ from dew.interop.hf_decoders import (
     renamed_name,
     renamed_path,
 )
+from dew.interop.families.gemma import (
+    gemma4_config,
+    gemma4_export_path,
+    gemma4_export_weights,
+    gemma4_path,
+    parallel_experts,
+)
+from dew.interop.families.qwen import qwen2_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 

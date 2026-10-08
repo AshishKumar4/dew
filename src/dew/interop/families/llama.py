@@ -14,8 +14,7 @@ from functools import partial
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.families.qwen import qwen35_moe_path
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
     DecoderFamily,
     DecoderFields,
@@ -28,6 +27,7 @@ from dew.interop.hf_decoders import (
     renamed_name,
     softmax_top_k,
 )
+from dew.interop.families.qwen import qwen35_moe_path
 from dew.nn.backbones.decoder_block import Mixture
 
 

@@ -6,7 +6,7 @@ loads here as the first registered family whose convention it follows: its
 config reads as that family reads one and every tensor name maps as that
 family maps it. The candidates (`CONVENTIONS`) are the Llama convention,
 which reads every field the families share (`hf_decoders.base_config`), and
-then every registered causal family in `hf_decoders.family_entries()` order.
+then every registered causal family in `decoder_families.ENTRIES` order.
 The fields a candidate does not read are not trusted by name. Before any
 weight downloads, the installed transformers builds its own class for the
 type from the same config with the sizes shrunk, gives it random weights and
@@ -38,7 +38,8 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import records
-from dew.interop import hf_decoders as decoders, sources
+from dew.interop import decoder_parts, hf_decoders as decoders, sources
+from dew.interop.decoder_families import ENTRIES
 from dew.registry import models
 
 if TYPE_CHECKING:
@@ -49,18 +50,18 @@ if TYPE_CHECKING:
 _MASKED = frozenset({'llada', 'dream', 'Dream', 'diffusion_gemma_text'})
 """The masked-diffusion families: bidirectional, never a causal LM's convention."""
 
-CONVENTIONS: tuple[tuple[str, decoders.DecoderFamily], ...] = (
+CONVENTIONS: tuple[tuple[str, decoder_parts.DecoderFamily], ...] = (
     # Llama's convention reads every field `base_config` shares, windows
     # included, where the registered Llama family reads only what
     # LlamaConfig declares; the probe, not the reference's declarations, is
     # what admits a type's reading.
-    ('llama', replace(decoders.families()['llama'], translate_config=decoders.base_config)),
+    ('llama', replace(decoders.families()['llama'], translate_config=decoder_parts.base_config)),
     # A family whose tensors are rewritten or split before its path map
     # reads them (`prepare`, `packed`: GPT-2's buffers, fused experts) is
     # left out: its names cannot be checked before the weights are read.
-    *((family.model_types[0], family) for family in decoders.family_entries()
+    *((family.model_types[0], family) for family in ENTRIES
       if family.model_types[0] != 'llama' and not set(family.model_types) & _MASKED
-      and family.prepare is decoders.DecoderFamily.prepare and not family.packed),
+      and family.prepare is decoder_parts.DecoderFamily.prepare and not family.packed),
 )
 """The registered families an unregistered type is tried as, in order, each
 by its name and the entry it translates and maps through."""
@@ -78,7 +79,7 @@ _WINDOW = 4
 # checkpoint's own code, and the probe runs in fp32 whatever the checkpoint
 # stores. The quantization record is the codec's, and the probe's weights are
 # plain floats.
-_PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoders.CODEC_FIELDS
+_PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoder_parts.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # fp32 rounding between Dew and transformers on a registered family, in eps
@@ -183,8 +184,8 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     return fields
 
 
-def _unmapped(names: Collection[str], record: decoders.DecoderFields,
-              family: decoders.DecoderFamily) -> list[str]:
+def _unmapped(names: Collection[str], record: decoder_parts.DecoderFields,
+              family: decoder_parts.DecoderFamily) -> list[str]:
     """Return the tensor names `family` has no path for."""
     missing = []
     for name in sorted(names):
@@ -207,11 +208,11 @@ class _Mismatch(ValueError):
 
 
 def _translate(hf_config: Mapping[str, object], convention: str,
-               family: decoders.DecoderFamily) -> tuple[decoders.DecoderFields, set[str]]:
+               family: decoder_parts.DecoderFamily) -> tuple[decoder_parts.DecoderFields, set[str]]:
     # Another family's reader on a foreign config may trip on a field's
     # type or length as well as refuse it; all mean it does not read it.
     try:
-        return decoders.translate_family_config(hf_config, family)
+        return decoder_parts.translate_family_config(hf_config, family)
     except (KeyError, ValueError, TypeError, IndexError) as error:
         raise _Mismatch(f"its config does not read as {convention}'s ({error!r})") from error
 
@@ -249,7 +250,7 @@ class VerifiedMapping:
     """The config fields the convention does not read, which the probe showed inert."""
 
     def translate(self, hf_config: Mapping[str, object],
-                  tensor_names: Collection[str]) -> decoders.DecoderFields:
+                  tensor_names: Collection[str]) -> decoder_parts.DecoderFields:
         """Translate the real config and check the real tensor names, then warn once.
 
         The probe held the shrunk config; the real one differs only in sizes,
@@ -296,8 +297,8 @@ def _reference_config(model_type: str, fields: Mapping[str, object]) -> tuple[Pr
     return config, size, f"transformers {__version__}'s {type(skeleton).__name__}"
 
 
-def _built(model_type: str, convention: str, family: decoders.DecoderFamily,
-           fields: Mapping[str, object]) -> tuple[nn.Module, decoders.DecoderFields, set[str], int]:
+def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily,
+           fields: Mapping[str, object]) -> tuple[nn.Module, decoder_parts.DecoderFields, set[str], int]:
     """A candidate's model at the probe's sizes, its record, the fields it
     left unread and its parameter count."""
     record, inert = _translate({**fields, 'model_type': model_type}, convention, family)
@@ -309,8 +310,8 @@ def _built(model_type: str, convention: str, family: decoders.DecoderFamily,
     return model, record, inert, sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(template['params']))
 
 
-def _agreement(convention: str, family: decoders.DecoderFamily, model: nn.Module,
-               record: decoders.DecoderFields, inert: set[str], name: str, expected: np.ndarray,
+def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.Module,
+               record: decoder_parts.DecoderFields, inert: set[str], name: str, expected: np.ndarray,
                checkpoint: Path, layers: int) -> tuple[float, float]:
     """One candidate against the reference's saved checkpoint: its error and
     the bound, or `_Mismatch` naming how it differs."""
@@ -320,7 +321,7 @@ def _agreement(convention: str, family: decoders.DecoderFamily, model: nn.Module
         raise _Mismatch(f"the tensors {unmapped[:8]} have no {convention} path")
     variables = decoders.translate_weights(tensors, record, convention)
     try:
-        decoders.check_decoder_tree(variables, model)
+        decoder_parts.check_decoder_tree(variables, model)
     except ValueError as error:
         raise _Mismatch(f"its tensors do not fill {convention}'s model ({error})") from error
     # `_ROUNDING` was measured at fp32 matmul precision; a GPU's default runs

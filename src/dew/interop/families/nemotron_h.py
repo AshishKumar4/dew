@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from dew import records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import DecoderFamily, Packed
+from dew.interop.decoder_parts import DecoderFamily, Packed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -24,7 +24,7 @@ from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.mixers.mlp import MLPMixer
 
 if TYPE_CHECKING:
-    from dew.interop.hf_decoders import DecoderFields
+    from dew.interop.decoder_parts import DecoderFields
 
 _PATTERN = {"M": "linear_attention", "*": "full_attention", "-": "mlp", "E": "moe"}
 _LEGACY = {"mamba": "linear_attention", "attention": "full_attention"}

@@ -5,7 +5,7 @@ from collections.abc import Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Packed,

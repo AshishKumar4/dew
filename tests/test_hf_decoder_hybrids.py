@@ -361,7 +361,7 @@ def test_the_router_bias_lands_in_the_moe_collection():
     and the loaded model selects on it: zeroing the bias moves the logits by
     2.1 on deepseek-v3-tiny.
     """
-    from dew.interop.hf_decoders import dew_path
+    from dew.interop.decoder_parts import dew_path
     from dew.interop.sources import load_shards
 
     directory = FIXTURES / "deepseek-v3-tiny"

@@ -10,7 +10,7 @@ import dataclasses
 from collections.abc import Mapping
 
 from dew import records
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
