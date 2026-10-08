@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+# build.sh names the CUDA major: dew-flash-attn-cu12 or dew-flash-attn-cu13.
+name = "dew-flash-attn-cuXX"
+version = "0.1.0"
+description = "FlashAttention-2 for JAX: Dao-AILab's CUDA kernels as XLA FFI targets"
+license = "BSD-3-Clause"
+license-files = ["LICENSE*"]
+requires-python = ">=3.11"
+dependencies = ["jax>=0.11.2"]
+
+[project.urls]
+Source = "https://github.com/AshishKumar4/dew/tree/main/kernels/flash_attn"
+
+[tool.setuptools]
+packages = ["dew_flash_attn"]
+
+[tool.setuptools.package-data]
+dew_flash_attn = ["libdew_flash_attn.so"]
