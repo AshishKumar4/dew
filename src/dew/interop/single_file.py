@@ -37,7 +37,6 @@ import importlib.util
 import json
 import os
 import shutil
-import tempfile
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
@@ -47,6 +46,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from dew.cache import dew_cache_dir
+from dew.files import staged
 from dew.interop import sources
 from dew.interop.pickles import host_view
 from dew.interop.safetensors_io import WEIGHT_STEMS, folder_weights, read_file, write_file
@@ -272,9 +272,7 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
         stored, _ = read_file(source, copy_on_write=True)
         checkpoint = {name: _torch_view(np.asarray(tensor)) for name, tensor in stored.items()}
     index = pipeline_index(configs)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=target.parent, prefix=".converting-"))
-    try:
+    with staged(target) as staging:
         for file in metadata:
             copied = staging / file.relative_to(configs)
             copied.parent.mkdir(parents=True, exist_ok=True)
@@ -311,11 +309,3 @@ def unpacked(path: str | os.PathLike[str], configs: Path | None = None,
                     f"put their diffusers-format weights under {configs}/<component>/ or load the file from "
                     "a repo that ships them")
         yield staging, target
-        try:
-            os.replace(staging, target)
-        except OSError:
-            # Another process published the same conversion first.
-            if not (target / "model_index.json").is_file():
-                raise
-    finally:
-        shutil.rmtree(staging, ignore_errors=True)

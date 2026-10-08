@@ -5,15 +5,17 @@ are all read by other processes or a later run, some while the writer is
 still running. `replacing` hands out a temporary path beside the target,
 unique to this write, and renames it over the target once the block ends with
 its bytes flushed to disk, so a crash at any point leaves either file whole.
-`write_atomically` is that for data in memory. A location with a scheme
-(`gs://`, `s3://`) is written in place: its store makes an object visible
-whole or not at all, and has no rename to stage one with.
+`write_atomically` is that for data in memory, and `staged` is it for a
+directory, which a cache publishes once. A location with a scheme (`gs://`,
+`s3://`) is written in place: its store makes an object visible whole or not
+at all, and has no rename to stage one with.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import shutil
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -51,3 +53,24 @@ def write_atomically(path: str | os.PathLike, contents: str | bytes) -> None:
     """Write `contents`, text as UTF-8, as the whole of `path` (`replacing`)."""
     with replacing(path) as temporary:
         temporary.write_bytes(contents.encode() if isinstance(contents, str) else contents)
+
+
+@contextlib.contextmanager
+def staged(directory: Path) -> Iterator[Path]:
+    """A directory to write the contents of `directory` into, renamed to it
+    when the block ends and removed if the block raises.
+
+    A `directory` another writer published first is kept, whole, and this
+    write dropped: every writer publishes by the one rename.
+    """
+    directory.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(dir=directory.parent, prefix=f".{directory.name}."))
+    try:
+        yield staging
+        try:
+            os.replace(staging, directory)
+        except OSError:
+            if not directory.is_dir():
+                raise
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
