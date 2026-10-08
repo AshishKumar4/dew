@@ -213,6 +213,8 @@ class DiffusionRunConfig(RunConfig):
     `--model` holds only the precision settings and `text` and `autoencoder` stay
     unset.
     """
+    pretrained_param_dtype: DtypeName = "float32"
+    """The dtype `pretrained`'s parameters are stored and trained in."""
     val_metrics: tuple[str, ...] = ("clip",)
     """Metric aliases or import paths, scored on every validation pass.
 
@@ -225,6 +227,9 @@ class DiffusionRunConfig(RunConfig):
         object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
         if not issubclass(objectives[self.objective.name], DiffusionObjective):
             raise ValueError(f"--objective {self.objective.name} trains no diffusion model")
+        if self.pretrained is None and self.pretrained_param_dtype != "float32":
+            raise ValueError("--pretrained-param-dtype stores a --pretrained pipeline's parameters; "
+                             "this run loads none")
 
         if self.pretrained is not None:
             # The pipeline's own denoiser trains; the model flags it reads are
@@ -451,7 +456,8 @@ class DiffusionRunConfig(RunConfig):
         assert self.pretrained is not None
         name, revision = split_revision(self.pretrained)
         return load_diffusion_source(
-            name, revision=revision, dtype=self._compute or "bfloat16", param_dtype="float32",
+            name, revision=revision, dtype=self._compute or "bfloat16",
+            param_dtype=self.pretrained_param_dtype,
             attention_impl=str(self.model.fields.get("attention_impl", "auto")),
             size=self.sample_field().shape[:-1],
             variables=variables)

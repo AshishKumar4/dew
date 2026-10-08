@@ -32,6 +32,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
 
+from .decoder_block import GatedMLP
 from .joint import JointAttention, layer_norm
 
 if TYPE_CHECKING:
@@ -67,24 +68,6 @@ def _rotation(positions, axes: Sequence[int], lengths: Sequence[int], theta: flo
     return jnp.concatenate(cosines, axis=-1), jnp.concatenate(sines, axis=-1)
 
 
-@logical_axes({("w1",): ("embed", "mlp"), ("w3",): ("embed", "mlp"), ("w2",): ("mlp", "embed")})
-class _FeedForward(nn.Module):
-    """`FeedForward`: SiLU of `w1` gating `w3`, then `w2`, no biases."""
-
-    features: int
-    hidden: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.compact
-    def __call__(self, x):
-        dense = {"use_bias": False, "dtype": self.dtype, "precision": self.precision}
-        gated = nn.silu(nn.Dense(self.hidden, name="w1", **dense)(x)) * nn.Dense(
-            self.hidden, name="w3", **dense
-        )(x)
-        return nn.Dense(self.features, name="w2", **dense)(gated)
-
-
 class ZImageBlock(nn.Module):
     """Runs one `ZImageTransformerBlock`.
 
@@ -116,8 +99,8 @@ class ZImageBlock(nn.Module):
         def attention(x):
             return joint(x, rotation=rotation, lengths=lengths)[0]
 
-        feed_forward = _FeedForward(self.features, int(self.features / 3 * 8), dtype=self.dtype,
-                                    precision=self.precision, name="feed_forward")
+        feed_forward = GatedMLP(int(self.features / 3 * 8), self.features, dtype=self.dtype,
+                                precision=self.precision, name="feed_forward")
         if not self.modulation:
             x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x)))
             return x + norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x)))

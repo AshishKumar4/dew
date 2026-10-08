@@ -278,6 +278,22 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
                                          SHIFTS[f"{constants}/sigmas_f64"][index], f"{constants} at {tokens}")
 
 
+def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pipelines):
+    """`pretrained_param_dtype` is the storage the pipeline's denoiser loads
+    and trains in; with no pipeline it is refused rather than ignored."""
+    objective = ObjectiveConfig("diffusion", {"guidance": None, "ema_decay": None})
+    configured = DiffusionRunConfig(pretrained=str(pipelines / "flux" / "pipeline"), preset=None,
+                                    model=precision(), pretrained_param_dtype="bfloat16",
+                                    data=TFDSImages(image_size=16), val_metrics=(),
+                                    objective=objective).build()
+    state = Trainer(configured, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
+    floating = [leaf for leaf in jax.tree.leaves(state.variables["params"])
+                if jnp.issubdtype(leaf.dtype, jnp.floating)]
+    assert floating and all(leaf.dtype == jnp.bfloat16 for leaf in floating)
+    with pytest.raises(ValueError, match="this run loads none"):
+        DiffusionRunConfig(pretrained_param_dtype="bfloat16")
+
+
 def test_a_pretrained_run_refuses_a_model_of_its_own():
     with pytest.raises(ValueError, match=r"leave model, text unset"):
         DiffusionRunConfig(pretrained="some/pipeline", model=ModelConfig("simple_dit"),
@@ -287,7 +303,9 @@ def test_a_pretrained_run_refuses_a_model_of_its_own():
 def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pipelines):
     """Flux from scratch in pixel space, conditioned by the Flux pipeline's
     CLIP and T5 towers: the conditioner's record goes in under `conditioning`,
-    where the published family reads it."""
+    where the published family reads it, and ten steps on one batch lower
+    its loss (one step draws its own noise, which a single step's loss on
+    the evaluation's draw need not follow)."""
     directory = pipelines / "flux" / "pipeline"
     config = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {
@@ -305,8 +323,10 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
     before = value(objective, initial.variables, batch)
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
-    assert bool(accepted)
+    step, state = trainer.compile(initial, batch), initial
+    for _ in range(10):
+        state, _, _, _, accepted = step(state, batch)
+        assert bool(accepted)
     assert value(objective, state.variables, batch) < before
 
 

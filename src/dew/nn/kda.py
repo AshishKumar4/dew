@@ -38,9 +38,8 @@ from .linear import (
     CHUNK_SIZE,
     DepthwiseConv1d,
     RMSNormGated,
-    _masked_conv1d,
-    causal_conv1d,
     chunk_decay,
+    held_conv1d,
     l2norm,
     recurrent_delta_rule,
     strictly_lower_inverse,
@@ -229,17 +228,9 @@ class KimiDeltaAttention(nn.Module):
                 # Allocation only, as GatedDeltaNet: init_cache's dummy token
                 # must not consume a position or leave state behind.
                 return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
-            if valid is not None:
-                mixed, history = _masked_conv1d(conv_input, taps, valid, conv_state.value)
-                conv_state.value = history
-            else:
-                history = jnp.concatenate([conv_state.value, conv_input], axis=2)
-                conv_state.value = history[:, :, -(self.conv_kernel - 1):]
-                mixed = causal_conv1d(history, taps)[..., -S:]
-        elif valid is not None:
-            mixed, _ = _masked_conv1d(conv_input, taps, valid)
+            mixed, conv_state.value = held_conv1d(conv_input, taps, valid, conv_state.value)
         else:
-            mixed = causal_conv1d(conv_input, taps)
+            mixed, _ = held_conv1d(conv_input, taps, valid)
         mixed = jnp.moveaxis(mixed, 2, 1)
         query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim)
                              for part in jnp.split(mixed, 3, axis=-1))

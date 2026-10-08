@@ -310,6 +310,12 @@ def layer_normalized(x, scale, bias, epsilon: float, dtype):
     return y.astype(dtype)
 
 
+def l2_normalized(x, eps: float = 1e-12):
+    """torch's `F.normalize`: `x` over its L2 norm on the last axis, the norm
+    held at `eps` at least."""
+    return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+
+
 def unweighted_rmsnorm(x, eps: float):
     """Normalize the last axis by its root mean square, with no learned weight.
 

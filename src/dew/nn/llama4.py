@@ -1,190 +1,24 @@
 """Llama 4's text attention: iRoPE, chunked local layers, temperature tuning.
 
-`Llama4TextAttention` (modeling_llama4.py) differs from the standard mixer
-in four places, each a field of the reference's config. Local layers rotate
-interleaved pairs, L2-normalise queries and keys with no scale
-(`use_qk_norm`) and attend inside chunks of `attention_chunk_size`; global
-layers carry no positions at all (`no_rope_layers`) and instead scale each
-query by a logarithm of its position (`attn_temperature_tuning`, arXiv
-2501.19399). The routed experts scale each token's input by its routing
-weight, which `dew.nn.moe.ExpertMLP` does under `scale_inputs`.
+`Llama4TextAttention` (modeling_llama4.py) is the shared attention under
+four of the reference's config fields. Local layers rotate adjacent pairs,
+L2-normalise queries and keys with no scale (`use_qk_norm`) and attend
+inside chunks of `attention_chunk_size`; global layers carry no positions at
+all (`no_rope_layers`) and instead scale each query by a logarithm of its
+position (`attn_temperature_tuning`, arXiv 2501.19399). The routed experts
+scale each token's input by its routing weight, which `dew.nn.moe.ExpertMLP`
+does under `scale_inputs`.
 """
 
 import dataclasses
 import functools
 from collections.abc import Callable
 
-import jax.numpy as jnp
 from flax import linen as nn
-from flax.typing import Dtype, PrecisionLike
-from jax.typing import DTypeLike
 
-from dew.nn.attention import (
-    RMSNorm,
-    cached_validity,
-    causal_attention_mask,
-    chunk_mask,
-    document_mask,
-    kernel_for_materialized_mask,
-    local_attention,
-    open_kv_cache,
-    scaled_dot_product_attention,
-)
-from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
-from dew.nn.rope import LongRopeScaling, RopeScaling, deinterleaved, rotary_freqs, rotate
-from dew.nn.sharding import logical_axes
-
-
-def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
-    """The query multiplier of a global layer at each absolute position.
-
-    `log1p(floor((p + 1) / floor_scale)) * attn_scale + 1`, computed in
-    `dtype`, fp32 as the reference does (the queries' own dtype where it is
-    wider, `at_least_fp32`), so the first `floor_scale` positions scale by 1.
-    """
-    positions = jnp.asarray(positions, dtype)
-    return jnp.log1p(jnp.floor((positions + 1.0) / floor_scale)) * attn_scale + 1.0
-
-
-@logical_axes({
-    ("q_proj",): ("embed", "heads"),
-    ("k_proj",): ("embed", "kv"),
-    ("v_proj",): ("embed", "kv"),
-    ("o_proj",): ("attention", "embed"),
-})
-class Llama4Attention(nn.Module):
-    """Grouped-query attention under Llama 4's local or global rule.
-
-    `use_rope` is the layer's `no_rope_layers` entry: a local layer rotates
-    interleaved pairs at `rope_theta` and attends inside its chunk, a global
-    layer skips the rotation and scales its queries by their position.
-    decode=True runs against the fixed-size KV cache the way
-    `CausalSelfAttention` does; the chunk mask reads the cache slots, which
-    are the absolute positions.
-    """
-    emb_features: int
-    num_heads: int
-    num_kv_heads: int
-    head_dim: int
-    max_seq_len: int
-    causal: bool = True
-    rope_theta: float = 500000.0
-    rope_scaling: RopeScaling | LongRopeScaling | None = None
-    use_rope: bool = True
-    use_qk_norm: bool = True
-    attention_chunk_size: int | None = None
-    attn_temperature_tuning: bool = True
-    floor_scale: float = 8192.0
-    attn_scale: float = 0.1
-    norm_eps: float = 1e-5
-    attention_bias: bool = False
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
-    force_fp32_for_softmax: bool = True
-
-    def setup(self):
-        if self.attention_chunk_size is not None and self.attention_chunk_size < 1:
-            raise ValueError(
-                f"attention_chunk_size is a positive chunk length, got "
-                f"{self.attention_chunk_size}; None attends the whole sequence")
-        if self.attention_chunk_size is not None and not self.use_rope:
-            raise ValueError(
-                "Llama 4 chunks its rotated local layers only; a global layer "
-                "without rope attends the whole sequence")
-        dense = functools.partial(
-            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.num_heads * self.head_dim, name='q_proj')
-        self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
-        self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
-        self.o_proj = dense(self.emb_features, name='o_proj')
-        # `Llama4TextL2Norm`: the weightless RMS norm in fp32, cast back.
-        self.qk_l2_norm = RMSNorm(epsilon=self.norm_eps, with_scale=False)
-
-    @nn.compact
-    def __call__(self, x, decode: bool = False,
-                 positions=None, segment_ids=None, kv_store=None,
-                 attention_metadata: AttentionMetadata | None = None):
-        batch, length, _ = x.shape
-        valid = None if attention_metadata is None else attention_metadata.valid
-        logical_positions = positions
-        query = self.q_proj(x).reshape(batch, length, self.num_heads, self.head_dim)
-        key = self.k_proj(x).reshape(batch, length, self.num_kv_heads, self.head_dim)
-        value = self.v_proj(x).reshape(batch, length, self.num_kv_heads, self.head_dim)
-
-        append = None
-        if decode:
-            if not self.causal:
-                raise ValueError("full attention has no KV cache to decode against")
-            positions, append = open_kv_cache(self, key, self.max_seq_len, valid=valid)
-        elif positions is None:
-            positions = jnp.arange(length)
-        else:
-            positions = jnp.asarray(positions)
-
-        rotary_positions = positions if logical_positions is None else logical_positions
-        if self.use_rope:
-            freqs_cos, freqs_sin = rotary_freqs(rotary_positions, self.head_dim, self.rope_theta,
-                                                rope_scaling=self.rope_scaling,
-                                                dtype=at_least_fp32(query.dtype))
-            query = rotate(deinterleaved(query), freqs_cos, freqs_sin)
-            key = rotate(deinterleaved(key), freqs_cos, freqs_sin)
-            if self.use_qk_norm:
-                # The reference norms after rotating; the norm has no scale
-                # and a rotation keeps every pair's length, so the two
-                # orders agree to rounding.
-                query, key = self.qk_l2_norm(query), self.qk_l2_norm(key)
-        elif self.attn_temperature_tuning:
-            scale = temperature_scale(positions, self.floor_scale, self.attn_scale,
-                                      dtype=at_least_fp32(query.dtype))
-            query = (query * scale[..., :, None, None].astype(query.dtype)
-                     if scale.ndim == 2 else query * scale[None, :, None, None].astype(query.dtype))
-
-        if self.attention_chunk_size is not None and self.causal and not decode:
-            # A local layer's queries read their own chunk alone, which
-            # `local_attention` runs without the [S, S] mask below.
-            attention = local_attention(
-                query, key, value, chunk=self.attention_chunk_size,
-                positions=None if logical_positions is None else positions,
-                segment_ids=segment_ids, valid=valid, dtype=self.dtype,
-                precision=self.precision, force_fp32_for_softmax=self.force_fp32_for_softmax,
-                implementation=self.attention_impl)
-            return self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim))
-        causal, mask = self.causal, None
-        key_positions = positions
-        if append is not None:
-            key, value = append(key, value)
-            key_positions = jnp.arange(key.shape[-3])
-            mask = causal_attention_mask(
-                positions, key.shape[-3], key_valid=cached_validity(self, key.shape[-3]))
-            causal = False
-        elif segment_ids is not None:
-            inside = document_mask(segment_ids)[:, None]
-            mask = inside
-            if causal:
-                mask = jnp.logical_and(inside, causal_attention_mask(jnp.arange(length), length))
-            causal = False
-        if self.attention_chunk_size is not None:
-            chunks = chunk_mask(positions, key_positions, self.attention_chunk_size)
-            mask = chunks if mask is None else jnp.logical_and(mask, chunks)
-        if valid is not None:
-            live = jnp.asarray(valid, bool)[:, None, :, None]
-            mask = live if mask is None else mask & live
-            if not decode:
-                mask = mask & jnp.asarray(valid, bool)[:, None, None, :]
-        implementation = self.attention_impl
-        if mask is not None:
-            implementation = kernel_for_materialized_mask(
-                implementation, query, dtype=self.dtype, precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax)
-        attention = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=implementation, causal=causal, mask=mask)
-        return self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim))
+from dew.nn.mixers.attention import CausalSelfAttention
 
 
 @dataclasses.dataclass(frozen=True)
@@ -227,8 +61,14 @@ class Llama4Mixer(MixerBase):
                 "and keys with its own scale-free L2 norm under use_qk_norm, "
                 "scales by 1/sqrt(head_dim), rotates whole interleaved pairs "
                 "and attends by chunk rather than by window")
+        if ctx.attention_chunk is not None and ctx.attention_chunk < 1:
+            raise ValueError(f"attention_chunk_size is a positive chunk length, got {ctx.attention_chunk}; "
+                             "None attends the whole sequence")
+        if ctx.attention_chunk is not None and not self.use_rope:
+            raise ValueError("Llama 4 chunks its rotated local layers only; a global layer without rope "
+                             "attends the whole sequence")
         return functools.partial(
-            Llama4Attention,
+            CausalSelfAttention,
             emb_features=ctx.emb_features,
             num_heads=ctx.num_heads,
             num_kv_heads=ctx.num_kv_heads,
@@ -237,12 +77,13 @@ class Llama4Mixer(MixerBase):
             causal=ctx.causal,
             rope_theta=ctx.rope_theta,
             rope_scaling=ctx.rope_scaling,
-            use_rope=self.use_rope,
-            use_qk_norm=self.use_qk_norm,
-            attention_chunk_size=ctx.attention_chunk,
-            attn_temperature_tuning=self.attn_temperature_tuning,
-            floor_scale=self.floor_scale,
-            attn_scale=self.attn_scale,
+            nope=not self.use_rope,
+            rotary_pairs='adjacent',
+            qk_norm=self.use_rope and self.use_qk_norm,
+            qk_norm_weight=False,
+            attention_chunk=ctx.attention_chunk,
+            temperature_tuning=(None if self.use_rope or not self.attn_temperature_tuning
+                                else (self.floor_scale, self.attn_scale)),
             norm_eps=ctx.norm_eps,
             attention_bias=ctx.attention_bias,
             dtype=ctx.dtype,

@@ -285,7 +285,6 @@ class KVStore:
     module: nn.Module
     layout: KVCache
     rows: int
-    capacity: int
     kv_heads: int
     head_dim: int
     dtype: jnp.dtype
@@ -298,7 +297,7 @@ class KVStore:
         A paged layout raises `ValueError` when `capacity` is not a multiple
         of `page_size`, or when `rows` does not split into the pool's groups.
         """
-        store = cls(module, layout, rows, capacity, kv_heads, head_dim, jnp.dtype(dtype))
+        store = cls(module, layout, rows, kv_heads, head_dim, jnp.dtype(dtype))
         layout.key_rotation(head_dim)
         storage = layout.storage(dtype)
         if layout.page_size is None:
