@@ -1,10 +1,20 @@
 """BLOOM's ALiBi attention, embedding LayerNorm and head-interleaved qkv."""
 
 from collections.abc import Mapping
+from functools import partial
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import DEFAULT_MAX_SEQ_LEN, DecoderFields, Renames, _refuse, _renamed_path
+from dew.interop.decoder_parts import (
+    DEFAULT_MAX_SEQ_LEN,
+    DecoderFamily,
+    DecoderFields,
+    Renames,
+    refuse,
+    renamed_name,
+    renamed_path,
+)
+from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
@@ -20,11 +30,11 @@ def _bloom_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     used.update(('attention_softmax_in_fp32', 'bias_dropout_fusion', 'masked_softmax_fusion',
                  'skip_bias_add', 'skip_bias_add_qkv', 'offset_alibi', 'n_inner', 'seq_length'))
     if hf.get('apply_residual_connection_post_layernorm', False):
-        _refuse('apply_residual_connection_post_layernorm', 'BLOOM residuals read the unnormalized input')
+        refuse('apply_residual_connection_post_layernorm', 'BLOOM residuals read the unnormalized input')
     if hf.get('slow_but_exact', False) and records.integer(hf.get('pretraining_tp', 1), 'pretraining_tp') > 1:
-        _refuse('slow_but_exact', 'the tensor-parallel reference drops projection biases')
+        refuse('slow_but_exact', 'the tensor-parallel reference drops projection biases')
     if hidden % heads:
-        _refuse('hidden_size/n_head', 'the hidden width must divide into whole attention heads')
+        refuse('hidden_size/n_head', 'the hidden width must divide into whole attention heads')
     return native_fields(CausalTransformer)(
         vocab_size=records.integer(hf.get('vocab_size', 250880), 'vocab_size'),
         emb_features=hidden,
@@ -50,7 +60,7 @@ _BLOOM_NAMES: Renames = (
 def _bloom_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if '.self_attention.query_key_value.' in name:
         return None
-    return _renamed_path(_BLOOM_NAMES, name, config)
+    return renamed_path(_BLOOM_NAMES, name, config)
 
 
 def _bloom_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -64,3 +74,15 @@ def _bloom_export(model: CausalTransformer) -> Mapping[str, object]:
                                  'head_dim', 'intermediate_size', 'max_position_embeddings',
                                  'rms_norm_eps', 'attention_bias', 'hidden_act', 'rope_theta')))
     return fields
+
+
+BLOOM = DecoderFamily(
+    ('bloom',), _bloom_config,
+    lambda fields: fields.position_embedding == 'alibi' and fields.embedding_norm,
+    'bloom', 'BloomForCausalLM', _bloom_export,
+    weight_path=_bloom_path, export_path=partial(renamed_name, _BLOOM_NAMES),
+    prepare=partial(gpt_neox_prepare, attention_name='self_attention'),
+    export_weights=partial(gpt_neox_export_weights, attention_name='self_attention'),
+    preserve_source_layout=False,
+    tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+)

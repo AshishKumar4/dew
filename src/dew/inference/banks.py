@@ -302,13 +302,8 @@ class SafetensorsBanks(LayerBanks):
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
-        from dew.interop.hf_decoders import (
-            DecoderFamily,
-            _check_tree,
-            families,
-            translate_config,
-            translate_weights,
-        )
+        from dew.interop.decoder_parts import DecoderFamily, check_decoder_tree
+        from dew.interop.hf_decoders import families, translate_config, translate_weights
         from dew.interop.safetensors_io import read_weights
         from dew.registry import dtype_name, models
 
@@ -335,7 +330,7 @@ class SafetensorsBanks(LayerBanks):
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
-        _check_tree(self._shapes, models.build(
+        check_decoder_tree(self._shapes, models.build(
             "causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"}))
         self.cache_limit = cache_bytes
         self.read_ahead = read_ahead
