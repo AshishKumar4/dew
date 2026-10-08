@@ -5,6 +5,8 @@ Nothing here knows a modality. The objective is a two-output affine map, the
 data is synthetic, and what is asserted is what the trainer owns: the step
 count, what lands on disk and when, what a resume restores, what reaches the
 tracker, and what a failure does to the run.
+
+Local resume combines Dew's run and data-position policies; Orbax oracles the stored state.
 """
 
 import contextlib

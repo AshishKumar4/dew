@@ -98,6 +98,18 @@ def test_router_reproduces_the_mixtral_choice_and_gate_values():
     assert np.max(np.abs(ours_weights - theirs_weights)) < 1e-6
 
 
+def test_a_router_with_all_zero_sigmoid_scores_keeps_finite_zero_weights():
+    router = Router(num_experts=4, in_features=2, top_k=2, score_function="sigmoid")
+    variables = {"params": {"kernel": jnp.full((2, 4), -1000., jnp.float32)}}
+    hidden = jnp.ones((3, 2), jnp.float32)
+
+    weights, indices = jax.jit(router.apply)(variables, hidden)
+
+    np.testing.assert_array_equal(weights, np.zeros((3, 2), np.float32))
+    assert np.isfinite(weights).all()
+    assert np.all((np.asarray(indices) >= 0) & (np.asarray(indices) < 4))
+
+
 def test_mixtral_parity_needs_the_renormalisation():
     """The mutation the router's weights would survive: keep the top-k
     softmax mass without dividing by it."""

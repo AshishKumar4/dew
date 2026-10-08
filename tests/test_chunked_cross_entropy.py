@@ -739,6 +739,41 @@ LAMBDA = 6.0
 U32 = 2.0 ** -24
 
 
+@pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
+def test_a_262144_vocabulary_matches_optax_in_float64_on_cpu(softcap):
+    """Seven targets spanning chunk boundaries, losses, log Z and both gradients
+    against Optax's full-vocabulary CE; 1e-12 allows float64 reduction order.
+    """
+    rng = np.random.default_rng(713)
+    with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
+        hidden = jnp.asarray(rng.normal(size=(7, 5)), jnp.float64)
+        head = jnp.asarray(rng.normal(size=(5, GEMMA_VOCAB)), jnp.float64)
+        targets = jnp.asarray([0, 65535, 65536, 131071, 131072, 196608, 262143], jnp.int32)
+        weights = jnp.asarray(rng.uniform(.5, 1.5, 7), jnp.float64)
+
+        def upstream(states, matrix):
+            logits = states @ matrix
+            if softcap is not None:
+                logits = softcap * jnp.tanh(logits / softcap)
+            losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+            return jnp.sum(weights * losses), (
+                losses, jax.nn.logsumexp(logits, -1), logits.argmax(-1).astype(jnp.int32))
+
+        def tiled(states, matrix):
+            losses, predictions, log_z = chunked_cross_entropy(
+                states, matrix, targets, 16, softcap=softcap, tile=(3, 8192))
+            return jnp.sum(weights * losses), (losses, log_z, predictions)
+
+        expected = jax.jit(jax.value_and_grad(upstream, (0, 1), has_aux=True))(hidden, head)
+        actual = jax.jit(jax.value_and_grad(tiled, (0, 1), has_aux=True))(hidden, head)
+        for have, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
+            assert have.dtype == want.dtype
+            if jnp.issubdtype(want.dtype, jnp.integer):
+                np.testing.assert_array_equal(have, want)
+            else:
+                np.testing.assert_allclose(have, want, rtol=1e-12, atol=1e-12)
+
+
 def float64_cross_entropy(hidden, head, targets, weights, softcap):
     """Losses, log partitions and both gradients of `sum(weights * losses)`,
     in NumPy float64, with the sums of absolute terms the bounds scale."""

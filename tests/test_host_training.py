@@ -1,4 +1,7 @@
-"""Host-owned full-tree transactions: coupling, replay, restart and placement."""
+"""Host-owned full-tree transactions: coupling, replay, restart and placement.
+
+Streamed-bank ownership and placement are Dew execution policies; Optax oracles the updates.
+"""
 import dataclasses
 
 import jax

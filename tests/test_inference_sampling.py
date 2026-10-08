@@ -1,4 +1,7 @@
-"""Request identities, bound policy snapshots and filtered draw likelihoods."""
+"""Request identities, bound policy snapshots and filtered draw likelihoods.
+
+Bindings, shape buckets and cache pause/gather are Dew policies; Transformers oracles their tokens.
+"""
 
 from dataclasses import replace
 

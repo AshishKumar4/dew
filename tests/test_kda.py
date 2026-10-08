@@ -5,9 +5,9 @@ transcribed into NumPy at float64, the sequential row correction loop
 included, and `oracle_recurrent` is `recurrent_kimi_delta_attention`
 (modeling_glm5_next.py:428-478); `oracle_layer` composes
 `Glm5NextTextLinearAttention.forward` (modeling_glm5_next.py:628-733) over
-them with the forget gate (319-335) and the gated norm (346-358). Nothing
-here imports torch, so the module is held to the reference's math and not
-to another implementation's rounding.
+them with the forget gate (319-335) and the gated norm (346-358).
+tools/kda_reference.py also executes the pinned upstream torch functions on CPU
+to hold both rules and their gradients to those outputs.
 
 Observed on CPU, fp32 against the oracle: the chunked rule to 8.1e-08
 scaled with two chunks of four and a carried state, the recurrent rule to
@@ -16,13 +16,16 @@ central differences of the oracle; the bound is 1e-4 on each. A per-head
 scalar decay in place of the per-dimension one moves the layer by 1.06.
 """
 
+import json
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
 from dew.nn.kda import KimiDeltaAttention, KimiDeltaAttentionMixer, chunk_kimi_delta_rule
-from dew.nn.linear import recurrent_delta_rule
+from dew.nn.linear import l2norm as jax_l2norm, recurrent_delta_rule
 from dew.registry import mixers
 
 BOUND = 1e-4
@@ -133,6 +136,30 @@ def operands():
 
 def as_f32(*arrays):
     return tuple(jnp.asarray(array, jnp.float32) for array in arrays)
+
+
+@pytest.mark.parametrize("rule", ["chunk", "recurrent"])
+def test_the_rule_and_all_operand_gradients_match_the_executed_torch_reference(rule):
+    fixture = json.loads((Path(__file__).parent / "fixtures" / "kda" / "torch.json").read_text())
+    names = ("query", "key", "value", "g", "beta", "state")
+    operands = tuple(jnp.asarray(fixture[name], jnp.float32) for name in names)
+
+    def loss(q, k, v, g, beta, state):
+        q, k = jax_l2norm(q), jax_l2norm(k)
+        if rule == "chunk":
+            out, final = chunk_kimi_delta_rule(q, k, v, g, beta, state, chunk_size=4)
+        else:
+            out, final = recurrent_delta_rule(q, k, v, g, beta, state)
+        value = jnp.sum(out * jnp.asarray(fixture["output_cotangent"], jnp.float32))
+        value += jnp.sum(final * jnp.asarray(fixture["state_cotangent"], jnp.float32))
+        return value, (out, final)
+
+    (_, (out, state)), gradients = jax.jit(jax.value_and_grad(
+        loss, tuple(range(len(operands))), has_aux=True))(*operands)
+    actual = {"output": out, "state": state} | {
+        f"grad/{name}": grad for name, grad in zip(names, gradients, strict=True)}
+    for name, value in actual.items():
+        assert scaled(value, np.asarray(fixture[f"{rule}/{name}"])) < BOUND, (rule, name)
 
 
 def test_the_chunked_rule_matches_the_oracle_across_chunks_with_a_carried_state(operands):
