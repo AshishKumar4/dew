@@ -5,7 +5,7 @@ against a pinned transformers release. A `model_type` Dew does not register
 loads here as the first registered family whose convention it follows: its
 config reads as that family reads one and every tensor name maps as that
 family maps it. The candidates (`CONVENTIONS`) are the Llama convention,
-which reads every field the families share (`hf_decoders._base_config`), and
+which reads every field the families share (`hf_decoders.base_config`), and
 then every registered causal family in `hf_decoders.family_entries()` order.
 The fields a candidate does not read are not trusted by name. Before any
 weight downloads, the installed transformers builds its own class for the
@@ -50,11 +50,11 @@ _MASKED = frozenset({'llada', 'dream', 'Dream', 'diffusion_gemma_text'})
 """The masked-diffusion families: bidirectional, never a causal LM's convention."""
 
 CONVENTIONS: tuple[tuple[str, decoders.DecoderFamily], ...] = (
-    # Llama's convention reads every field `_base_config` shares, windows
+    # Llama's convention reads every field `base_config` shares, windows
     # included, where the registered Llama family reads only what
     # LlamaConfig declares; the probe, not the reference's declarations, is
     # what admits a type's reading.
-    ('llama', replace(decoders.families()['llama'], translate_config=decoders._base_config)),
+    ('llama', replace(decoders.families()['llama'], translate_config=decoders.base_config)),
     # A family whose tensors are rewritten or split before its path map
     # reads them (`prepare`, `packed`: GPT-2's buffers, fused experts) is
     # left out: its names cannot be checked before the weights are read.
@@ -78,7 +78,7 @@ _WINDOW = 4
 # checkpoint's own code, and the probe runs in fp32 whatever the checkpoint
 # stores. The quantization record is the codec's, and the probe's weights are
 # plain floats.
-_PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoders._CODEC_FIELDS
+_PROBE_DROPPED = frozenset({'auto_map', 'dtype', 'torch_dtype'}) | decoders.CODEC_FIELDS
 _INSTALL = "pip install 'dewml[torch]'"
 _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 # fp32 rounding between Dew and transformers on a registered family, in eps
@@ -211,7 +211,7 @@ def _translate(hf_config: Mapping[str, object], convention: str,
     # Another family's reader on a foreign config may trip on a field's
     # type or length as well as refuse it; all mean it does not read it.
     try:
-        return decoders._translated(hf_config, family)
+        return decoders.translate_family_config(hf_config, family)
     except (KeyError, ValueError, TypeError, IndexError) as error:
         raise _Mismatch(f"its config does not read as {convention}'s ({error!r})") from error
 
@@ -320,7 +320,7 @@ def _agreement(convention: str, family: decoders.DecoderFamily, model: nn.Module
         raise _Mismatch(f"the tensors {unmapped[:8]} have no {convention} path")
     variables = decoders.translate_weights(tensors, record, convention)
     try:
-        decoders._check_tree(variables, model)
+        decoders.check_decoder_tree(variables, model)
     except ValueError as error:
         raise _Mismatch(f"its tensors do not fill {convention}'s model ({error})") from error
     # `_ROUNDING` was measured at fp32 matmul precision; a GPU's default runs

@@ -12,10 +12,11 @@ from collections.abc import Mapping
 from dew import records
 from dew.interop.hf_decoders import (
     DEFAULT_MAX_SEQ_LEN,
+    DecoderFamily,
     DecoderFields,
-    _base_config,
-    _rope,
-    _specified_layer_types,
+    base_config,
+    read_rope,
+    specified_layer_types,
 )
 
 _SLIDING_THETA = 500000.0
@@ -42,15 +43,27 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     rope_theta says (500000 in both on the released 7B).
     """
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    layer_types = _specified_layer_types(hf_config, used, tuple(
+    layer_types = specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if (index + 1) % 4 else 'full_attention'
         for index in range(layers)))
-    ropes = _rope(hf_config, used, records.integer(hf_config.get(
+    ropes = read_rope(hf_config, used, records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
         local=False, local_default=_SLIDING_THETA)
     if ropes.scaling is not None and not isinstance(hf_config.get('rope_parameters'), Mapping):
         ropes = dataclasses.replace(ropes, full_only=True)
-    config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
+    config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
                           scale_after_cast=False, rope=ropes)
     config.update(sandwich_norms=True, pre_norms=False, qk_norm_scope='projection')
     return config
+
+
+OLMO3 = DecoderFamily(
+    ('olmo3',),
+    _olmo3_config,
+    lambda fields: not fields.pre_norms,
+    'olmo3',
+    'Olmo3ForCausalLM',
+    lambda model: {},
+    sandwich_norms=True,
+    preserve_source_layout=True,
+)

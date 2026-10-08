@@ -14,30 +14,35 @@ from collections.abc import Callable, Mapping
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import (
-    _LINEAR_FIELDS,
-    _MOE_SHARED,
     DEFAULT_MAX_SEQ_LEN,
+    FUSED_EXPERTS,
+    LINEAR_FIELDS,
+    MOE_SHARED,
+    QWEN35,
+    DecoderFamily,
     DecoderFields,
     MixtureFields,
-    _base_config,
-    _dew_path,
-    _kinds_of,
-    _record_int,
-    _refuse,
-    _rope,
-    _Ropes,
-    _softmax_top_k,
-    _specified_layer_types,
+    Ropes,
+    base_config,
+    dew_path,
+    kind_mixers,
+    kinds_of,
+    read_rope,
+    record_int,
+    refuse,
+    softmax_top_k,
+    specified_layer_types,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
+from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 
 
 def _qwen_layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     if hf_config.get('layer_types') is not None:
-        return _specified_layer_types(hf_config, used)
+        return specified_layer_types(hf_config, used)
     used.update(('use_sliding_window', 'sliding_window'))
     enabled = hf_config.get('use_sliding_window', False) and hf_config.get('sliding_window') is not None
     first = records.integer(hf_config.get('max_window_layers', layers), 'max_window_layers')
@@ -67,12 +72,12 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
     if rope_type not in ('default', 'none'):
-        _refuse(f"rope_parameters (rope_type {rope_type!r})",
+        refuse(f"rope_parameters (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
     scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor',
                                    'mrope_section', 'mrope_interleaved'})
     if scaling:
-        _refuse(f"rope_parameters scaling fields {scaling}",
+        refuse(f"rope_parameters scaling fields {scaling}",
                 "the backbone applies plain rotary positions at rope_theta")
     theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
                    'rope_parameters rope_theta')
@@ -86,10 +91,10 @@ _QWEN_READS = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
 """The shared fields Qwen2Config and Qwen3Config declare; neither reads Gemma 3's rope_local_base_freq."""
 
 
-def _qwen2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+def qwen2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     # Qwen2Attention biases q, k and v and builds o_proj without one
     # (modeling_qwen2.py:189-192), whatever the config says.
-    config = _base_config(hf_config, used, layer_types=_qwen_layer_types(hf_config, used),
+    config = base_config(hf_config, used, layer_types=_qwen_layer_types(hf_config, used),
                           reads=_QWEN_READS)
     config.update(attention_bias=True, o_proj_bias=False)
     return config
@@ -103,9 +108,9 @@ def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     ramp: Qwen3's model cards extend to 131072 tokens with it, and
     DeepSeek-R1-0528-Qwen3-8B ships it.
     """
-    rope = _rope(hf_config, used, records.integer(hf_config.get(
+    rope = read_rope(hf_config, used, records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'), local=False)
-    return _base_config(hf_config, used, qk_norm=True, rope=rope,
+    return base_config(hf_config, used, qk_norm=True, rope=rope,
                         layer_types=_qwen_layer_types(hf_config, used), reads=_QWEN_READS)
 
 
@@ -119,7 +124,7 @@ def _sparse_step_layers(hf_config: Mapping[str, object], layers: int, used: set[
     used.update(('decoder_sparse_step', 'mlp_only_layers'))
     step = records.integer(hf_config.get('decoder_sparse_step', 1), 'decoder_sparse_step')
     if step < 1:
-        _refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
+        refuse(f"decoder_sparse_step {step}", "the reference counts layers from one")
     dense = set(records.integers(hf_config.get('mlp_only_layers') or (), 'mlp_only_layers'))
     return tuple(index for index in range(layers)
                  if (index + 1) % step == 0 and index not in dense)
@@ -142,16 +147,16 @@ def _qwen3_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
     windowed = (hf_config.get('use_sliding_window', False)
                 and hf_config.get('sliding_window') is not None)
-    layer_types = _specified_layer_types(hf_config, used, (
+    layer_types = specified_layer_types(hf_config, used, (
         'sliding_attention' if windowed else 'full_attention',) * layers)
-    config = _base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
+    config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types)
     used.update(('num_experts', 'num_local_experts'))
     experts = hf_config.get('num_experts', hf_config.get('num_local_experts'))
     if experts is None:
-        _refuse("num_experts", "a qwen3_moe layer needs its expert count")
+        refuse("num_experts", "a qwen3_moe layer needs its expert count")
     sparse = _sparse_step_layers(hf_config, layers, used)
     if not sparse:
-        _refuse("mlp_only_layers with decoder_sparse_step",
+        refuse("mlp_only_layers with decoder_sparse_step",
                 "together they leave no routed layer, which is a dense qwen3 model")
     expert_count = records.integer(experts, 'num_experts/num_local_experts')
     config['mixture'] = _qwen_moe_mixture(hf_config, used, sparse, expert_count)
@@ -165,7 +170,7 @@ def _qwen_moe_mixture(hf_config: Mapping[str, object], used: set[str],
     norm_topk = bool(hf_config.get('norm_topk_prob', False))
     expert_width = records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size')
     return native_fields(Mixture)(
-        top_k=_softmax_top_k(hf_config, used), experts=experts, layers=sparse,
+        top_k=softmax_top_k(hf_config, used), experts=experts, layers=sparse,
         norm_topk_prob=norm_topk,
         expert_features=expert_width)
 
@@ -181,12 +186,12 @@ def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     enabled = bool(hf_config.get('use_sliding_window', False))
     first = records.integer(hf_config.get('max_window_layers', 28), 'max_window_layers')
-    types = _specified_layer_types(hf_config, used, tuple(
+    types = specified_layer_types(hf_config, used, tuple(
         'sliding_attention' if enabled and index % 2 == 0 and index < first else 'full_attention'
         for index in range(layers)))
     if not enabled and 'sliding_attention' in types:
-        _refuse('layer_types', 'use_sliding_window=False disables the reference window')
-    config = _base_config({**hf_config, 'sliding_window': hf_config.get('sliding_window', 4096)},
+        refuse('layer_types', 'use_sliding_window=False disables the reference window')
+    config = base_config({**hf_config, 'sliding_window': hf_config.get('sliding_window', 4096)},
                           used, layer_types=types, reads=_QWEN_READS)
     config.update(attention_bias=bool(hf_config.get('qkv_bias', True)), o_proj_bias=False)
     used.update(('qkv_bias', 'use_sliding_window', 'max_window_layers', 'num_experts',
@@ -195,7 +200,7 @@ def _qwen2_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     sparse = _sparse_step_layers(hf_config, layers, used)
     if experts > 0 and sparse:
         mixture = _qwen_moe_mixture(hf_config, used, sparse, experts)
-        mixture.update(shared_features=_record_int(hf_config, 'shared_expert_intermediate_size'),
+        mixture.update(shared_features=record_int(hf_config, 'shared_expert_intermediate_size'),
                        shared_gate=True)
         config['mixture'] = mixture
     return config
@@ -211,26 +216,26 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     geometry read from the config.
     """
     interval = records.integer(hf_config.get('full_attention_interval', 4), 'full_attention_interval')
-    layer_types = _specified_layer_types(hf_config, used, tuple(
+    layer_types = specified_layer_types(hf_config, used, tuple(
         'full_attention' if (index + 1) % interval == 0 else 'linear_attention'
         for index in range(records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers'))))
-    config = _base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
-                          layer_types=layer_types, rope=_Ropes(10000.0))
+    config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
+                          layer_types=layer_types, rope=Ropes(10000.0))
     used.add('full_attention_interval')
     rope_theta, partial = _qwen35_rope(hf_config)
     used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
-    kinds = dict(_kinds_of(config))
+    kinds = dict(kinds_of(config))
     if 'linear_attention' in layer_types:
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
         kinds['linear_attention']['mixer'] = {
             'class': 'gated_delta_net', 'fields': {
-            **{field: records.integer(hf_config[field], field) for field in _LINEAR_FIELDS},
+            **{field: records.integer(hf_config[field], field) for field in LINEAR_FIELDS},
             **mixer}}
     unknown_kinds = sorted(set(layer_types) - {'linear_attention', 'full_attention'})
     if unknown_kinds:
-        _refuse(f"layer_types {unknown_kinds}",
+        refuse(f"layer_types {unknown_kinds}",
                 "a hybrid Qwen layer is linear_attention or full_attention")
-    used.update(_LINEAR_FIELDS)
+    used.update(LINEAR_FIELDS)
     config.update(
         # Qwen3_5RMSNorm scales by (1 + w) from a zero init
         # (modeling_qwen3_5.py:727, 736; modeling_qwen3_next.py:137, 146),
@@ -245,11 +250,11 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     return config
 
 
-def _single_prediction_depth(hf_config: Mapping[str, object], used: set[str], field: str) -> int:
+def single_prediction_depth(hf_config: Mapping[str, object], used: set[str], field: str) -> int:
     """Read an optional single shared-embedding prediction depth."""
     depth = hf_config.get(field, 0)
     if type(depth) is not int or depth not in (0, 1):
-        _refuse(field, 'only a single shared prediction layer is supported')
+        refuse(field, 'only a single shared prediction layer is supported')
     used.add(field)
     return depth
 
@@ -262,17 +267,17 @@ def _qwen35_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # field is read nowhere in transformers 5.16.1, so a config turning
     # it off describes a model the reference cannot build.
     if not hf_config.get('attn_output_gate', True):
-        _refuse("attn_output_gate=False",
+        refuse("attn_output_gate=False",
                 "Qwen3_5Attention always gates its output")
     used.add('attn_output_gate')
     # Published checkpoints call the DeltaNet SiLU gate "swish". Full
     # attention always uses sigmoid; this field never changes that branch.
     if hf_config.get('output_gate_type', 'swish') != 'swish':
-        _refuse('output_gate_type', 'Qwen3.5 DeltaNet uses the swish gate')
+        refuse('output_gate_type', 'Qwen3.5 DeltaNet uses the swish gate')
     used.add('output_gate_type')
-    config['num_nextn_predict_layers'] = _single_prediction_depth(hf_config, used, 'mtp_num_hidden_layers')
+    config['num_nextn_predict_layers'] = single_prediction_depth(hf_config, used, 'mtp_num_hidden_layers')
     if hf_config.get('mtp_use_dedicated_embeddings', False):
-        _refuse('mtp_use_dedicated_embeddings', 'the released prediction layer shares embeddings and head')
+        refuse('mtp_use_dedicated_embeddings', 'the released prediction layer shares embeddings and head')
     used.update(('mlp_only_layers', 'mamba_ssm_dtype', 'mtp_use_dedicated_embeddings'))
     return config
 
@@ -295,25 +300,25 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     # plain rotary of this block does not apply.
     used.add('rope_scaling')
     if hf_config.get('rope_scaling') is not None:
-        _refuse('rope_scaling', 'the Qwen3-Next rotary is plain at rope_theta')
+        refuse('rope_scaling', 'the Qwen3-Next rotary is plain at rope_theta')
     used.update(('num_experts', 'norm_topk_prob', 'moe_intermediate_size',
                  'shared_expert_intermediate_size', 'num_experts_per_tok',
                  'output_router_logits', 'router_aux_loss_coef'))
-    experts = _record_int(hf_config, 'num_experts')
+    experts = record_int(hf_config, 'num_experts')
     sparse = _sparse_step_layers(
         hf_config, records.integer(hf_config["num_hidden_layers"], "num_hidden_layers"), used
     )
     # `num_experts > 0` gates the routed block too (modeling_qwen3_next.py:814).
     if sparse and experts > 0:
         norm_topk = bool(hf_config.get('norm_topk_prob', True))
-        expert_width = _record_int(hf_config, 'moe_intermediate_size')
-        shared_width = _record_int(hf_config, 'shared_expert_intermediate_size')
+        expert_width = record_int(hf_config, 'moe_intermediate_size')
+        shared_width = record_int(hf_config, 'shared_expert_intermediate_size')
         config['mixture'] = native_fields(Mixture)(
-            top_k=_softmax_top_k(hf_config, used), experts=experts, layers=sparse,
+            top_k=softmax_top_k(hf_config, used), experts=experts, layers=sparse,
             norm_topk_prob=norm_topk,
             expert_features=expert_width, shared_features=shared_width,
             shared_gate=True)
-    config['num_nextn_predict_layers'] = _single_prediction_depth(hf_config, used, 'num_nextn_predict_layers')
+    config['num_nextn_predict_layers'] = single_prediction_depth(hf_config, used, 'num_nextn_predict_layers')
     return config
 
 
@@ -325,13 +330,13 @@ def _qwen35_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     SparseMoeBlock gates the shared expert independently (Transformers
     modeling_qwen3_5_moe.py:763-801). The checkpoint has no dense MLP width.
     """
-    width = _record_int(hf_config, "moe_intermediate_size")
+    width = record_int(hf_config, "moe_intermediate_size")
     config = _qwen35_config({**hf_config, "intermediate_size": width}, used)
     config["mixture"] = native_fields(Mixture)(
-        experts=_record_int(hf_config, "num_experts"),
-        top_k=_record_int(hf_config, "num_experts_per_tok"),
+        experts=record_int(hf_config, "num_experts"),
+        top_k=record_int(hf_config, "num_experts_per_tok"),
         expert_features=width,
-        shared_features=_record_int(hf_config, "shared_expert_intermediate_size"),
+        shared_features=record_int(hf_config, "shared_expert_intermediate_size"),
         shared_gate=True)
     used.update(("moe_intermediate_size", "num_experts", "num_experts_per_tok",
                  "shared_expert_intermediate_size", "output_router_logits", "router_aux_loss_coef"))
@@ -380,27 +385,110 @@ def _qwen_mtp_path(
 
 def _qwen35_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if name.startswith("mtp."):
-        return _qwen_mtp_path(name, config, _dew_path)
-    return _dew_path(name, config)
+        return _qwen_mtp_path(name, config, dew_path)
+    return dew_path(name, config)
 
 
 
-def _qwen35_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+def qwen35_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if name.startswith("mtp."):
-        return _qwen_mtp_path(name, config, _qwen35_moe_path)
+        return _qwen_mtp_path(name, config, qwen35_moe_path)
     parts = name.split(".")
     if len(parts) >= 5 and parts[:2] == ["model", "layers"] and parts[2].isdigit():
         tail = parts[3:]
         layer = ("params", f"layers_{parts[2]}", "mlp")
-        if len(tail) == 3 and tail[:2] == ["mlp", "experts"] and tail[2] in _MOE_SHARED:
+        if len(tail) == 3 and tail[:2] == ["mlp", "experts"] and tail[2] in MOE_SHARED:
             return (*layer, "experts", tail[2], "kernel")
         if tail == ["mlp", "shared_expert_gate", "weight"]:
             return (*layer, "shared_expert_gate", "kernel")
         if (
             len(tail) == 4
             and tail[:2] == ["mlp", "shared_expert"]
-            and tail[2] in _MOE_SHARED
+            and tail[2] in MOE_SHARED
             and tail[3] == "weight"
         ):
             return (*layer, "shared_experts", tail[2], "kernel")
-    return _dew_path(name, config)
+    return dew_path(name, config)
+
+
+QWEN3_NEXT = DecoderFamily(
+    ('qwen3_next',),
+    _qwen3_next_config,
+    lambda fields: any(
+        isinstance(mixer, GatedDeltaNetMixer) and mixer.fused_in_proj for mixer in kind_mixers(fields)
+    ),
+    'qwen3_next',
+    'Qwen3NextForCausalLM',
+    lambda model: {},
+    weight_path=qwen35_moe_path,
+    packed=FUSED_EXPERTS,
+    preserve_source_layout=True,
+)
+
+QWEN3_5_MOE_TEXT = DecoderFamily(
+    ('qwen3_5_moe_text',),
+    _qwen35_moe_config,
+    lambda fields: bool(fields.output_gate and fields.mixture is not None),
+    'qwen3_5_moe_text',
+    'Qwen3_5MoeForCausalLM',
+    lambda model: {},
+    weight_path=qwen35_moe_path,
+    packed=FUSED_EXPERTS,
+    preserve_source_layout=True,
+)
+
+QWEN3_5_TEXT = DecoderFamily(
+    (QWEN35,),
+    _qwen35_config,
+    lambda fields: bool(
+        fields.output_gate or 'linear_attention' in (fields.layer_types or ())
+    ),
+    QWEN35,
+    'Qwen3_5ForCausalLM',
+    lambda model: {},
+    weight_path=_qwen35_path,
+    preserve_source_layout=True,
+)
+
+QWEN3_MOE = DecoderFamily(
+    ('qwen3_moe',),
+    _qwen3_moe_config,
+    lambda fields: bool(fields.qk_norm and fields.mixture is not None),
+    'qwen3_moe',
+    'Qwen3MoeForCausalLM',
+    _qwen3_export,
+    preserve_source_layout=True,
+)
+
+QWEN3 = DecoderFamily(
+    ('qwen3',),
+    _qwen3_config,
+    lambda fields: bool(fields.qk_norm),
+    'qwen3',
+    'Qwen3ForCausalLM',
+    _qwen3_export,
+    preserve_source_layout=False,
+)
+
+QWEN2_MOE = DecoderFamily(
+    ('qwen2_moe',),
+    _qwen2_moe_config,
+    lambda fields: bool(not fields.qk_norm and fields.mixture is not None
+                        and fields.mixture.shared_gate),
+    'qwen2_moe',
+    'Qwen2MoeForCausalLM',
+    lambda model: {},
+    weight_path=qwen35_moe_path,
+    packed=FUSED_EXPERTS,
+    preserve_source_layout=True,
+)
+
+QWEN2 = DecoderFamily(
+    ('qwen2',),
+    qwen2_config,
+    lambda fields: bool(fields.attention_bias and fields.o_proj_bias is False),
+    'qwen2',
+    'Qwen2ForCausalLM',
+    _qwen3_export,
+    preserve_source_layout=False,
+)

@@ -5,7 +5,15 @@ from collections.abc import Mapping
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import DecoderFields, Packed, _base_config, _dew_path, _refuse
+from dew.interop.hf_decoders import (
+    DecoderFamily,
+    DecoderFields,
+    Packed,
+    base_config,
+    decoder_tensors,
+    dew_path,
+    refuse,
+)
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.rope import LongRopeScaling
 
@@ -19,15 +27,15 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                                    // records.integer(hf['num_attention_heads'], 'num_attention_heads'),
                                    'head_dim') * partial)
     if not 0 < partial <= 1 or rotated < 2 or rotated % 2:
-        _refuse('partial_rotary_factor', 'the rotated head width must be positive and even')
+        refuse('partial_rotary_factor', 'the rotated head width must be positive and even')
     used.update(('original_max_position_embeddings', 'resid_pdrop', 'embd_pdrop', 'attention_dropout',
                  'partial_rotary_factor'))
     used.update(('full_attn_mod', 'interpolate_factor', 'lm_head_bias'))
     if (hf.get('full_attn_mod', 1) != 1 or hf.get('interpolate_factor', 1) != 1
             or hf.get('lm_head_bias', False)):
-        _refuse('full_attn_mod/interpolate_factor/lm_head_bias', 'Phi-3 uses one window and no head bias')
+        refuse('full_attn_mod/interpolate_factor/lm_head_bias', 'Phi-3 uses one window and no head bias')
     layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
-    config = _base_config({**hf, 'rope_scaling': None,
+    config = base_config({**hf, 'rope_scaling': None,
                            'rope_parameters': {'rope_type': 'default', 'rope_theta': theta}}, used,
                           layer_types=('sliding_attention' if hf.get('sliding_window') is not None
                                        else 'full_attention',) * layers,
@@ -50,19 +58,19 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                               records.number(parameters['attention_factor'], 'attention_factor')),
         )
         if len(rope.value.short_factor) != rotated // 2:
-            _refuse('short_factor/long_factor', 'LongRoPE has one factor per rotated head-dimension pair')
+            refuse('short_factor/long_factor', 'LongRoPE has one factor per rotated head-dimension pair')
         config['rope_scaling'] = rope
         extra = set(parameters) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor',
                                    'short_factor', 'long_factor', 'original_max_position_embeddings',
                                    'factor', 'attention_factor'}
         if extra:
-            _refuse(f'rope_parameters fields {sorted(extra)}',
+            refuse(f'rope_parameters fields {sorted(extra)}',
                     'Phi-3 reads the LongRoPE factors and amplitude')
     elif (rope_type != 'default'
           or set(parameters) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor'}):
-        _refuse('rope_parameters', 'Phi-3 uses default or longrope (the older su/yarn spelling)')
+        refuse('rope_parameters', 'Phi-3 uses default or longrope (the older su/yarn spelling)')
     elif partial != 1 and hf.get('sliding_window') is not None:
-        _refuse('partial_rotary_factor', 'partial rotary on sliding layers requires its LongRoPE factors')
+        refuse('partial_rotary_factor', 'partial rotary on sliding layers requires its LongRoPE factors')
     config.update({
         'dropout_rate': records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
         'embedding_dropout_rate': records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
@@ -89,7 +97,7 @@ _PHI3_PACKED = (
 def _phi3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if name.endswith(tuple(packing.name for packing in _PHI3_PACKED)):
         return None
-    return _dew_path(name, config)
+    return dew_path(name, config)
 
 
 def _phi3_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -109,3 +117,12 @@ def _phi3_export(model: CausalTransformer) -> Mapping[str, object]:
         'pad_token_id': None,
         'eos_token_id': None,
     }
+
+
+PHI3 = DecoderFamily(
+    ('phi3',), _phi3_config,
+    lambda fields: isinstance(fields.rope_scaling, LongRopeScaling),
+    'phi3', 'Phi3ForCausalLM', _phi3_export,
+    weight_path=_phi3_path, packed=_PHI3_PACKED,
+    export_weights=decoder_tensors, preserve_source_layout=True,
+)

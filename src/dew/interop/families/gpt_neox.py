@@ -1,18 +1,21 @@
 """GPT-NeoX's parallel biased LayerNorm block and head-interleaved qkv storage."""
 
 from collections.abc import Mapping
+from functools import partial
 
 import jax
 import numpy as np
 
 from dew import records
 from dew.interop.hf_decoders import (
+    DecoderFamily,
     DecoderFields,
     Renames,
-    _base_config,
-    _decoder_tensors,
-    _refuse,
-    _renamed_path,
+    base_config,
+    decoder_tensors,
+    refuse,
+    renamed_name,
+    renamed_path,
 )
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -26,9 +29,9 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     activation = records.text(hf.get('hidden_act', 'gelu'), 'hidden_act')
     activations = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'gelu_pytorch_tanh': 'gelu', 'relu': 'relu'}
     if activation not in activations:
-        _refuse(f'hidden_act={activation!r}', 'GPT-NeoX requires an ungated GELU or ReLU MLP')
+        refuse(f'hidden_act={activation!r}', 'GPT-NeoX requires an ungated GELU or ReLU MLP')
     rope = {key: value for key, value in parameters.items() if key != 'partial_rotary_factor'}
-    config = _base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
+    config = base_config({**hf, 'hidden_act': 'gelu', 'rope_theta': theta,
                            'rope_parameters': rope or None}, used, reads=frozenset({'attention_bias'}))
     used.update(('rotary_pct', 'rotary_emb_base', 'use_parallel_residual', 'layer_norm_eps',
                  'hidden_dropout', 'classifier_dropout', 'is_decoder'))
@@ -46,7 +49,7 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     return config
 
 
-def _gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
+def gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
                        config: Mapping[str, object] | None = None, *,
                        attention_name: str = 'attention', interleaved: bool = True
                        ) -> Mapping[str, np.ndarray]:
@@ -105,13 +108,13 @@ def _gpt_neox_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
     if '.attention.query_key_value.' in name or name.endswith((
             '.attention.bias', '.attention.masked_bias', '.attention.rotary_emb.inv_freq')):
         return None
-    return _renamed_path(_GPT_NEOX_NAMES, name, config)
+    return renamed_path(_GPT_NEOX_NAMES, name, config)
 
 
 def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
     activation = model.mlp
     if not isinstance(activation, str) or activation not in ('gelu', 'gelu_exact', 'relu'):
-        _refuse('mlp', 'GPT-NeoX requires an ungated MLP')
+        refuse('mlp', 'GPT-NeoX requires an ungated MLP')
     fields: dict[str, object] = {
         'layer_norm_eps': model.norm_eps, 'use_parallel_residual': model.parallel_residual,
         'hidden_act': {'gelu': 'gelu_new', 'gelu_exact': 'gelu', 'relu': 'relu'}[activation],
@@ -123,12 +126,12 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def _gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+def gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, object],
                              config: Mapping[str, object], *,
                              attention_name: str = 'attention', interleaved: bool = True) -> LazyTensors:
     """The shared writer's tensors with each layer's q, k and v interleaved by
-    head into `query_key_value`, the inverse of `_gpt_neox_prepare`."""
-    tensors = _decoder_tensors(model, variables, config)
+    head into `query_key_value`, the inverse of `gpt_neox_prepare`."""
+    tensors = decoder_tensors(model, variables, config)
     fused: dict[str, tuple[str, ...]] = {}
     for name in tensors:
         stem, found, leaf = name.partition('.self_attn.q_proj.')
@@ -153,3 +156,24 @@ def _gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, o
         return grouped.reshape(3 * values[0].shape[0], *values[0].shape[1:])
 
     return LazyTensors(specs, build)
+
+
+GPT_NEOX = DecoderFamily(
+    ('gpt_neox',),
+    _gpt_neox_config,
+    lambda fields: bool(
+        fields.norm_type == 'layer'
+        and fields.norm_bias
+        and fields.mlp_bias
+        and fields.position_embedding == 'rotary'
+    ),
+    'gpt_neox',
+    'GPTNeoXForCausalLM',
+    _gpt_neox_export,
+    weight_path=_gpt_neox_path,
+    export_path=partial(renamed_name, _GPT_NEOX_NAMES),
+    prepare=gpt_neox_prepare,
+    export_weights=gpt_neox_export_weights,
+    preserve_source_layout=False,
+    tied_head_names=('embed_out.weight', 'gpt_neox.embed_in.weight'),
+)

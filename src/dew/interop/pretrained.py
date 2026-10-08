@@ -179,7 +179,7 @@ def _wrapper_layouts(tensors, record, variables):
     bindings = []
     retained = {}
     for name, tensor in tensors.items():
-        group, local = decoders._wrapper_route(name, record)
+        group, local = decoders.wrapper_route(name, record)
         if group == "language_model":
             layout = _language_layout(name, local, tensor, record["text"], record["text_model_type"],
                                       variables, "language_model")
@@ -559,7 +559,7 @@ class Pretrained:
             scalar_mode = _scalar_mode(self.weight_layouts, values)
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
-                return decoders._layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
+                return decoders.layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
             tensors = {**self.retained_tensors,
                        **{name: layout.export(values, scalar_mode) for name, layout in layouts.items()}}
         else:
@@ -649,8 +649,8 @@ class PretrainedDecoder(Pretrained):
             decoder = from_record(CausalTransformer, model)
         except ValueError as error:
             raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
-        config = decoders._export_config(decoder)
-        decoders._refuse_lossy_export(decoder, config)
+        config = decoders.export_config(decoder)
+        decoders.refuse_lossy_export(decoder, config)
         built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
                  if entry.init and entry.name not in ("parent", "name")}
         return cls(decoder, variables, None, config, None, built,
@@ -1810,7 +1810,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         text_fields["final_logit_softcap"] = None
         text_fields["mixer"] = {"class": "attention", "fields": {"bidirectional_images": True}}
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
-        kinds = decoders._kinds_of(text_fields).copy()
+        kinds = decoders.kinds_of(text_fields).copy()
         sliding = NativeFields(decoders.LayerKind, {
             **kinds.get("sliding_attention", {}),
             "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
@@ -1822,7 +1822,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
-        kinds = decoders._kinds_of(text_fields).copy()
+        kinds = decoders.kinds_of(text_fields).copy()
         full = NativeFields(decoders.LayerKind, {
             **kinds.get("full_attention", {}),
             "mixer": {"class": "attention", "fields": {
@@ -2144,14 +2144,14 @@ def _media_wrapper(config: Mapping[str, object]) -> bool:
     """
     family = config.get("model_type")
     return (family != "diffusion_gemma" and "text_config" in config
-            and (family not in decoders.families() or decoders._bundles(config)))
+            and (family not in decoders.families() or decoders.bundles(config)))
 
 
 def _derived_weights(model: CausalTransformer, variables: Mapping[str, object],
                      config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
     """Write a loaded decoder through the decoder export's own encoder, under
     the config its fields derive rather than the `config` it shipped."""
-    return decoders.export_decoder_weights(model, variables, decoders._export_config(model))
+    return decoders.export_decoder_weights(model, variables, decoders.export_config(model))
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
@@ -2171,7 +2171,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
         tensors, record, family, param_dtype=param_dtype, lazy=lazy), record, directory)
-    decoders._check_tree(variables, model)
+    decoders.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
     # derived-export family binds too; `save` picks its writer by
