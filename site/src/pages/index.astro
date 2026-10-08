@@ -104,13 +104,24 @@ const tutorialNames: Record<string, string> = {
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Fine-tuning</h2>
-			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, generate from it, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names.</p>
-			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} />}
+			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names.</p>
 			<EditableExample code={example(framework, 'pretrained')} title="Fine-tune Qwen3-0.6B" />
 			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
 				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}
 				source_rows={records.pretrained.capture.hero.screen.length} playbackSeconds={0} />
 			<p class="framework-note"><a href="/reference/models/">Supported families</a>: Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders.</p>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Inference</h2>
+			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. Run the cell to generate on a shared CPU host.</p>
+			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} />}
+			<p class="framework-note"><code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache:</p>
+			<EditableExample code={example(framework, 'serving')} title="Batched decoding" />
+			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
+			<p class="framework-note">Store weights in int8 or fp8:</p>
+			<EditableExample code={example(framework, 'formats')} title="Weight-only int8 and fp8" />
+			<p class="framework-note">The <a href="/guides/inference/">serving guide</a> covers the paged KV cache, prefix sharing, constrained decoding, and the error each quantized format adds.</p>
 		</section>
 
 		<section class="band replay" data-replays data-reveal>
@@ -127,15 +138,6 @@ const tutorialNames: Record<string, string> = {
 			</figure>)}</div>
 		</section>
 
-		<section class="band" data-reveal>
-			<h2 class="band-title">Serving</h2>
-			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. <code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache.</p>
-			<EditableExample code={example(framework, 'serving')} title="Batched decoding" />
-			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
-			<p class="framework-note">Store weights in int8 or fp8:</p>
-			<EditableExample code={example(framework, 'formats')} title="Weight-only int8 and fp8" />
-			<p class="framework-note">The <a href="/guides/inference/">serving guide</a> covers the paged KV cache, prefix sharing, constrained decoding, and the error each quantized format adds.</p>
-		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Distributed</h2>
