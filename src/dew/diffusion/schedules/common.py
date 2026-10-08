@@ -79,7 +79,20 @@ class NoiseScheduler(ABC):
         return (alpha / sigma) ** 2
 
 
-class GeneralizedNoiseScheduler(NoiseScheduler):
+class ContinuousNoiseScheduler(NoiseScheduler):
+    """A schedule whose time is a fraction of the trajectory, not an index.
+
+    T is 1.0, so t = 1 is fully noised, and training draws t uniformly. A
+    subclass provides the rates and the weight of its parameterization.
+    """
+
+    T = 1.0
+
+    def sample_t(self, key, n):
+        return jax.random.uniform(key, (n,), minval=0.0, maxval=self.T)
+
+
+class GeneralizedNoiseScheduler(ContinuousNoiseScheduler):
     """The variance-exploding schedule family of the EDM paper.
 
     The paper is Karras et al. 2022, "Elucidating the Design Space of
@@ -91,8 +104,6 @@ class GeneralizedNoiseScheduler(NoiseScheduler):
     inverts that placement (`t_of_sigma`) for the solvers that step in
     sigma.
     """
-
-    T = 1.0
 
     def __init__(self, sigma_min: float = 0.002, sigma_max: float = 80.0,
                  sigma_data: float = 0.5):
@@ -111,9 +122,6 @@ class GeneralizedNoiseScheduler(NoiseScheduler):
     def rates(self, t):
         sigma = self.sigmas(times(t))
         return jnp.ones_like(sigma), sigma
-
-    def sample_t(self, key, n):
-        return jax.random.uniform(key, (n,), minval=0.0, maxval=self.T)
 
     def weight(self, t):
         sigma = self.sigmas(times(t))

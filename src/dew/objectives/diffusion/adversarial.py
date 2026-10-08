@@ -33,9 +33,9 @@ from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import TextContext, masked_mean
-from dew.objectives.base import Aux, Batch, Objective, Step, Variables
+from dew.objectives.base import TEACHER, Aux, Batch, Objective, Step, Variables
 
-from .objective import DISCRIMINATOR, SPECTRAL, TEACHER, FlowDistillationObjective
+from .objective import DISCRIMINATOR, SPECTRAL, FlowDistillationObjective
 
 
 class SpectralConv(nn.Module):

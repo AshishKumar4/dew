@@ -260,6 +260,9 @@ def merge(tree: Variables, overlay: Variables) -> Variables:
     return merged
 
 
+TEACHER = "teacher"
+"""The collection of a distilling objective's frozen teacher variables."""
+
 FROZEN = "frozen"
 """The name of the collection where a partially trained run keeps its frozen weights.
 
@@ -736,7 +739,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         The tile is `tile`, or the objective's own when that is None. The
         return value describes the new tile, or is None when there was nothing
         to move, as for an objective with no such head. This is the first rung
-        of the fit ladder (`dew.training.trainer.recompute_more`), which logs
+        of the fit ladder (`dew.training.memory.recompute_more`), which logs
         the description, and a resumed run moves to the same rung again.
         """
         return None
@@ -966,6 +969,19 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     """Divide a metric's summed total by its summed count."""
     return accumulated[0] / accumulated[1]
 
+
+
+def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
+    """`log_softmax(logits)[..., tokens]`, reduced in fp32 whatever `logits` holds.
+
+    `tokens` is `logits.shape[:-1]` of ids and the result has that shape. A
+    bf16 log partition over a vocabulary carries bf16's 8-bit mantissa into
+    every score, which is error in the second decimal of a log probability
+    near -10; fp32 carries the logits exactly and rounds only the reduction.
+    optax's cross entropy reads the target logit without building the
+    normalized row.
+    """
+    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
 
 __all__ = [
     "FROZEN",

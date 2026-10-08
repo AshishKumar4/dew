@@ -24,9 +24,9 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
-from dew.objectives.base import Aux, ProgramModule, Step, Variables
+from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, Variables
 
-from .objective import TEACHER, DiffusionObjective, _own_loss, teacher_weights
+from .objective import DiffusionObjective, _own_loss, teacher_weights
 
 
 def with_guidance(conditions: dict, scale: jax.Array) -> dict:
