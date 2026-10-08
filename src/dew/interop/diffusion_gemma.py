@@ -254,7 +254,7 @@ def export_weights(
     the published implementation cannot build is refused (`_refuse_unreadable`).
     """
     from dew.interop.hf_decoders import export_decoder_weights
-    from dew.nn.vision.gemma4 import _GEMMA4_VISION_TENSORS
+    from dew.nn.vision.gemma4 import _GEMMA4_VISION_NORMS, _GEMMA4_VISION_TENSORS
 
     _refuse_unreadable(config)
     params = variables["params"]
@@ -273,6 +273,7 @@ def export_weights(
             np.asarray(leaf).T if kind == "kernel" else np.asarray(leaf))
     if "conditioner" in params:
         inverse = {value: key for key, value in _GEMMA4_VISION_TENSORS.items()}
+        norms = {value: key for key, value in _GEMMA4_VISION_NORMS.items()}
         for collection in ("params", "constants"):
             tower = variables.get(collection, {}).get("conditioner", {}).get("tower", {})
             for name, raw in flatten_dict(tower, sep=".").items():
@@ -281,7 +282,7 @@ def export_weights(
                     target = inverse[tuple(parts)]
                 elif parts[0].startswith("layers_"):
                     index = parts[0].removeprefix("layers_")
-                    tail = parts[1:-1]
+                    tail = [norms.get(part, part) for part in parts[1:-1]]
                     if parts[-1] == "kernel":
                         tail = [*tail, "linear"]
                     ending = parts[-1] if collection == "constants" else "weight"

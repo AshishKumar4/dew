@@ -13,44 +13,13 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.nn.activations import gelu_exact
-from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.precision import at_least_fp32
+from dew.nn.attention import RMSNorm
+from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.registry import Record
 
-from .common import ProjectorBase, TowerBase, TowerGeometry, _grid_rope, _grid_rope_tables, _vision_section
-
-
-class DeepseekV41VisionBlock(nn.Module):
-    """Pre-norm full attention under the grid rotary, then a pre-norm SwiGLU
-    feed-forward, both residual (DeepSeek-V4.1 vision.py:46-84).
-
-    One biased map carries queries, keys and values; the rotary runs in fp32
-    and casts back, as the reference's does.
-    """
-
-    hidden_size: int
-    num_heads: int
-    intermediate_size: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.compact
-    def __call__(self, hidden_states, cos, sin):
-        dense = functools.partial(nn.Dense, dtype=self.dtype, precision=self.precision)
-        norm = functools.partial(RMSNorm, epsilon=1e-6, dtype=self.dtype)
-        batch, length, _ = hidden_states.shape
-        head_dim = self.hidden_size // self.num_heads
-        fused = dense(3 * self.hidden_size, name="wqkv")(norm(name="norm1")(hidden_states)).reshape(
-            batch, length, 3, self.num_heads, head_dim)
-        query, key, value = (fused[:, :, 0], fused[:, :, 1], fused[:, :, 2])
-        query, key = (_grid_rope(part, cos[:, :, None, :], sin[:, :, None, :]).astype(part.dtype)
-                      for part in (query, key))
-        attended = scaled_dot_product_attention(query, key, value, dtype=self.dtype, precision=self.precision)
-        hidden_states = hidden_states + dense(self.hidden_size, name="wo")(
-            attended.reshape(batch, length, self.hidden_size))
-        gate, up = jnp.split(dense(2 * self.intermediate_size, use_bias=False, name="w1")(
-            norm(name="norm2")(hidden_states)), 2, axis=-1)
-        return hidden_states + dense(self.hidden_size, use_bias=False, name="w2")(jax.nn.silu(gate) * up)
+from .common import ProjectorBase, TowerBase, TowerGeometry, _vision_section
 
 
 class DeepseekV41VisionTransformer(nn.Module):
@@ -60,6 +29,11 @@ class DeepseekV41VisionTransformer(nn.Module):
     projection; the blocks attend over the whole grid with its 2D rotary, and
     a final RMS norm closes. The return value keeps the grid,
     `[images, rows, columns, hidden_size]`, which the aligner groups.
+
+    Each block is the decoder block (vision.py:46-84): pre-norm full attention
+    whose queries, keys and values come from one biased map, rotated by the
+    grid in fp32, as Qwen 3.5's vision rope turns them (vision.py:8-21), then a
+    pre-norm SwiGLU whose gate and up maps are one, both residual.
     """
 
     config: "DeepseekV41Vision"
@@ -79,13 +53,19 @@ class DeepseekV41VisionTransformer(nn.Module):
         hidden_states = nn.Dense(cfg.hidden_size, dtype=self.dtype, precision=self.precision,
                                  name="patch_embed")(patches.reshape(images, rows * columns, -1))
         grid = jnp.stack(jnp.meshgrid(jnp.arange(rows), jnp.arange(columns), indexing="ij"), axis=-1)
-        cos, sin = _grid_rope_tables(grid.reshape(1, rows * columns, 2),
-                                     cfg.hidden_size // cfg.num_attention_heads, cfg.rope_theta,
-                                     dtype=at_least_fp32(hidden_states.dtype))
+        metadata = AttentionMetadata(rotary_positions=grid.reshape(1, rows * columns, 2))
+        head_dim = cfg.hidden_size // cfg.num_attention_heads
+        attention = functools.partial(
+            CausalSelfAttention, emb_features=cfg.hidden_size, num_heads=cfg.num_attention_heads,
+            num_kv_heads=cfg.num_attention_heads, head_dim=head_dim, max_seq_len=rows * columns, causal=False,
+            qk_norm=False, attention_bias=True, rotary_axes=(head_dim // 2, head_dim // 2),
+            rope_theta=cfg.rope_theta, packed=True, dtype=self.dtype, precision=self.precision)
+        mlp = functools.partial(GatedMLP, hidden_features=cfg.intermediate_size, out_features=cfg.hidden_size,
+                                packed=True, dtype=self.dtype, precision=self.precision)
         for index in range(cfg.num_hidden_layers):
-            hidden_states = DeepseekV41VisionBlock(
-                cfg.hidden_size, cfg.num_attention_heads, cfg.intermediate_size,
-                dtype=self.dtype, precision=self.precision, name=f"blocks_{index}")(hidden_states, cos, sin)
+            hidden_states = DecoderBlock(
+                attention, mlp, cfg.hidden_size, BlockWiring(), norm_eps=1e-6, dtype=self.dtype,
+                precision=self.precision, name=f"blocks_{index}")(hidden_states, attention_metadata=metadata)
         hidden_states = RMSNorm(epsilon=1e-6, dtype=self.dtype, name="norm")(hidden_states)
         return hidden_states.reshape(images, rows, columns, cfg.hidden_size)
 
@@ -166,6 +146,10 @@ class DeepseekV41Projector(ProjectorBase):
                                           out_width=self.out_width)
 
 
+# A block's norms and maps as the decoder block names them.
+_BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
+_BLOCK_MAPS = {("attn", "wqkv"): ("self_attn", "qkv_proj"), ("attn", "wo"): ("self_attn", "o_proj"),
+               ("mlp", "w1"): ("mlp", "gate_up_proj"), ("mlp", "w2"): ("mlp", "down_proj")}
 _DEEPSEEK_V41_VISION_TENSORS = {
     "patch_embed.proj.weight": ("patch_embed", "kernel"),
     "patch_embed.proj.bias": ("patch_embed", "bias"),
@@ -180,11 +164,10 @@ def deepseek_v41_vision_path(hf_name: str) -> tuple[str, ...]:
     parts = hf_name.split(".")
     if path is None and len(parts) > 3 and parts[0] == "blocks" and parts[1].isdigit():
         block, leaf = f"blocks_{parts[1]}", parts[-1]
-        if len(parts) == 4 and parts[2] in ("norm1", "norm2") and leaf == "weight":
-            path = (block, parts[2], "scale")
-        elif (len(parts) == 5 and (parts[2], parts[3]) in (("attn", "wqkv"), ("attn", "wo"), ("mlp", "w1"),
-                                                           ("mlp", "w2")) and leaf in ("weight", "bias")):
-            path = (block, parts[3], "kernel" if leaf == "weight" else "bias")
+        if len(parts) == 4 and parts[2] in _BLOCK_NORMS and leaf == "weight":
+            path = (block, _BLOCK_NORMS[parts[2]], "scale")
+        elif len(parts) == 5 and (parts[2], parts[3]) in _BLOCK_MAPS and leaf in ("weight", "bias"):
+            path = (block, *_BLOCK_MAPS[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

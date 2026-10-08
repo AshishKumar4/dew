@@ -361,6 +361,20 @@ def yarn_rope_freqs(positions, head_dim: int, theta: float,
     return jnp.cos(angles) * factor, jnp.sin(angles) * factor
 
 
+def axis_halves(x, axes: Sequence[int]):
+    """`x` with each axis's channels split in halves and gathered: every
+    axis's first half, then every axis's second half. Gemma 4's vision rope
+    turns each axis's channels in halves of their own
+    (`apply_multidimensional_rope`); moved so, a query and key turn with
+    `rotate`'s 'half' pairs over angles laid out by `axis_tables`, and their
+    dot product is the reference's. Channels past the axes stay last."""
+    starts = np.cumsum((0, *axes))
+    spans = list(zip(starts[:-1], axes, strict=True))
+    firsts = [x[..., start:start + width // 2] for start, width in spans]
+    seconds = [x[..., start + width // 2:start + width] for start, width in spans]
+    return jnp.concatenate([*firsts, *seconds, x[..., starts[-1]:]], axis=-1)
+
+
 def deinterleaved(x):
     """`x`'s even channels, then its odd ones: the half layout
     `modeling_deepseek_v3.apply_rotary_pos_emb_interleave` moves adjacent
