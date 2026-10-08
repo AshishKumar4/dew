@@ -135,8 +135,7 @@ def test_a_model_builds_and_records_its_own_fields():
     assert config.fields == fields
     assert config.build().precision == "high"
     record = RunConfig(model=config).to_dict()["model"]
-    assert record == {"name": config.name, "fields": fields, "defaults": record["defaults"], "adapter": None,
-                      "quantization": None}
+    assert record == {"name": config.name, "fields": fields, "defaults": record["defaults"], "wrappers": []}
     assert record["defaults"] and not set(record["defaults"]) & set(fields)
 
 

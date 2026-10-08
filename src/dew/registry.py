@@ -30,7 +30,17 @@ import types
 import typing
 from collections.abc import Callable, Iterator, Mapping, MutableMapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, Any, Literal, TypedDict, Union, overload
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    ClassVar,
+    Literal,
+    Protocol,
+    TypedDict,
+    Union,
+    overload,
+    runtime_checkable,
+)
 
 import jax
 import jax.numpy as jnp
@@ -878,6 +888,41 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
                     and not (callable(held) and held is field.default)):
                 fields[field.name] = to_record(held, declared_type(owner, field.name))
     return fields
+
+
+@runtime_checkable
+class Wrapper(Protocol):
+    """A record that wraps a module in a class of its own and makes that
+    class again over a base: a LoRA adapter (`dew.lora.AdapterRecord`), a
+    run's quantized training or a checkpoint's input quantization
+    (`dew.training.quantization`)."""
+
+    def apply(self, model: nn.Module) -> nn.Module: ...
+
+
+@runtime_checkable
+class WrapperClass(Protocol):
+    """A module class a `Wrapper` made over `_dew_wrapped`; `_dew_wrapper`
+    returns that wrapper, which a model record keeps (`ModelConfig.wrappers`)."""
+
+    _dew_wrapped: ClassVar[type]
+
+    @staticmethod
+    def _dew_wrapper() -> Wrapper: ...
+
+
+def wrapper_layers(model_type: type) -> tuple[type, tuple[WrapperClass, ...]]:
+    """The class `model_type`'s wrappers wrap and its wrapper classes, the
+    outermost first.
+
+    Each layer is a subclass of the one inside it, so it inherits the inner
+    layer's markers too; a layer counts once, where its own class declares
+    `_dew_wrapped`."""
+    layers: list[WrapperClass] = []
+    while isinstance(model_type, WrapperClass) and "_dew_wrapped" in vars(model_type):
+        layers.append(model_type)
+        model_type = model_type._dew_wrapped
+    return model_type, tuple(layers)
 
 
 def _recorded(field: dataclasses.Field) -> bool:
