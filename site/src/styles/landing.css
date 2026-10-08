@@ -455,9 +455,8 @@ html[data-has-hero][data-past-hero] header.header {
 	display: none;
 }
 
-.mesh-overview,
 .reward-figure {
-	margin: 1.5rem 0 0;
+	margin: 0;
 	max-width: 40rem;
 	padding: 1.25rem;
 	border: 1px solid var(--dew-rule);
@@ -465,26 +464,6 @@ html[data-has-hero][data-past-hero] header.header {
 	background: var(--dew-output-bg);
 }
 
-.mesh-devices {
-	display: grid;
-	grid-template-columns: repeat(2, minmax(0, 1fr));
-	gap: 0.8rem;
-}
-
-.mesh-device {
-	display: grid;
-	gap: 0.3rem;
-	padding: 0.8rem;
-	border: 1px solid var(--dew-rule);
-	border-radius: 0.4rem;
-	font: 0.75rem var(--__sl-font-mono);
-}
-
-.mesh-device strong {
-	color: var(--dew-accent-text);
-}
-
-.mesh-overview figcaption,
 .reward-figure figcaption {
 	margin-top: 1rem;
 	font-size: 0.8rem;
@@ -994,19 +973,6 @@ html[data-has-hero][data-past-hero] header.header {
 
 .shown-label a:hover::after {
 	opacity: 1;
-}
-
-.shown-output {
-	margin: 0;
-	padding: 0.9rem 1rem;
-	border: 1px solid var(--dew-rule);
-	border-radius: 0.5rem;
-	background: var(--dew-output-bg);
-	overflow: auto;
-	font: 0.78rem/1.65 var(--__sl-font-mono);
-	color: var(--sl-color-gray-2);
-	white-space: pre-wrap;
-	overflow-wrap: anywhere;
 }
 
 /* Figures the examples wrote. The MoE drawing carries its own light background. */

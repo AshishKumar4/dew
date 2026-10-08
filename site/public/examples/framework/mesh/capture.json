@@ -1,24 +1,19 @@
 {
-	"about": "The screen framework.py left on a terminal, written by site/scripts/capture_snippets.py.",
-	"arguments": [
-		"--section",
-		"mesh",
-		"--out",
-		"/tmp/rec/out"
-	],
-	"script_sha256": "5e01545363a1a30f0e81a59adbf6ed34b3bed980597a1abbba8a38d6c81d4e5f",
+	"about": "The screen mesh.py left on a terminal, written by site/scripts/capture_snippets.py.",
+	"arguments": [],
+	"script_sha256": "033e391a3c6162735da891a95c0a9595063ed5af1e9f8e125cb644234a4ab7df",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "9d81a3dc7e71e141ede6afb1b060f21a450a2f96",
+		"dew": "898a4ec7f2af4f4ee3b51c1842d43070e4a957e4",
 		"date": "2026-10-08"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 15.0,
+		"seconds": 20.0,
 		"columns": 96,
 		"screen": [
 			[
@@ -126,7 +121,7 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  0:00:04 "
+					"text": "  100%  0:00:02 "
 				},
 				{
 					"text": "\u2502",
@@ -184,7 +179,7 @@
 					"dim": true
 				},
 				{
-					"text": "3 steps in 0:00:05             "
+					"text": "3 steps in 0:00:03             "
 				},
 				{
 					"text": "\u2502",
@@ -204,7 +199,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 5.20 s                   "
+					"text": "after 3.12 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -224,7 +219,7 @@
 					"dim": true
 				},
 				{
-					"text": "90.3 step/s                    "
+					"text": "68.9 step/s                    "
 				},
 				{
 					"text": "\u2502",
@@ -244,7 +239,7 @@
 					"dim": true
 				},
 				{
-					"text": "0.4% of the wall time in steps "
+					"text": "0.9% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -279,91 +274,6 @@
 				{
 					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f",
 					"fg": "00afd7"
-				}
-			],
-			[
-				{
-					"text": "{"
-				}
-			],
-			[
-				{
-					"text": "  \"devices\": ["
-				}
-			],
-			[
-				{
-					"text": "    0,"
-				}
-			],
-			[
-				{
-					"text": "    1,"
-				}
-			],
-			[
-				{
-					"text": "    2,"
-				}
-			],
-			[
-				{
-					"text": "    3"
-				}
-			],
-			[
-				{
-					"text": "  ],"
-				}
-			],
-			[
-				{
-					"text": "  \"axes\": {"
-				}
-			],
-			[
-				{
-					"text": "    \"data\": 1,"
-				}
-			],
-			[
-				{
-					"text": "    \"expert\": 1,"
-				}
-			],
-			[
-				{
-					"text": "    \"fsdp\": 2,"
-				}
-			],
-			[
-				{
-					"text": "    \"tensor\": 2,"
-				}
-			],
-			[
-				{
-					"text": "    \"sequence\": 1,"
-				}
-			],
-			[
-				{
-					"text": "    \"stage\": 1"
-				}
-			],
-			[
-				{
-					"text": "  },"
-				}
-			],
-			[
-				{
-					"text": "  \"steps\": 3"
-				}
-			],
-			[
-				{
-					"text": "}"
 				}
 			]
 		]

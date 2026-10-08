@@ -15,8 +15,10 @@ import { live } from '../../live.mjs';
 interface Props {
 	cell: string;
 	colab: string;
+	// The cell's own image, recorded by site/scripts/capture_snippets.py --display.
+	recording: { image: string; meta: { where: string; dew: string; date: string }; seconds: number };
 }
-const { cell, colab } = Astro.props;
+const { cell, colab, recording } = Astro.props;
 const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 ---
 
@@ -26,7 +28,6 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			<div class="sampler-editor-bar">
 				<span>sample.py, editable</span>
 				<span class="sampler-editor-actions">
-					<button type="button" class="sampler-reset" data-reset>Reset</button>
 					{
 						liveEnabled && (
 							<button type="button" class="sampler-run" data-run>
@@ -44,17 +45,15 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 	<figure class="sampler-stage" data-stage="idle">
 		<div class="sampler-frame">
 			<img data-preview alt="" hidden />
-			<img data-final alt="" hidden />
-			<p class="sampler-frame-empty" data-empty>
-				{liveEnabled ? 'The image appears here.' : 'Live kernels are not set up for this build of the site.'}
-			</p>
+			<img data-final src={recording.image} width="256" height="256" alt="The image this cell drew when it was recorded." />
+			<p class="sampler-frame-empty" data-empty hidden></p>
 		</div>
 		<div class="sampler-bar" data-bar aria-hidden="true"><span></span></div>
 		<figcaption>
 			<p class="sampler-status" data-status aria-live="polite">
 				{liveEnabled && 'Run opens an isolated Python context backed by the shared Dew model on a 4-vCPU CPU host.'}
 			</p>
-			<p class="sampler-detail" data-detail></p>
+			<p class="sampler-detail" data-detail>Recorded on {recording.meta.where} with Dew <a href={`https://github.com/AshishKumar4/dew/commit/${recording.meta.dew}`}><code>{recording.meta.dew.slice(0, 7)}</code></a> on {recording.meta.date}, in {Math.round(recording.seconds)} s.</p>
 		</figcaption>
 	</figure>
 
@@ -88,7 +87,6 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 		const log = q<HTMLDetailsElement>('[data-log]');
 		const output = q<HTMLElement>('[data-output]');
 		const holder = q<HTMLElement>('[data-turnstile]');
-		const original = editor.value;
 
 		let session: LiveSession | undefined;
 		let compiled = false;
@@ -213,7 +211,6 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			session?.interrupt('image');
 		};
 
-		q<HTMLButtonElement>('[data-reset]').addEventListener('click', () => (editor.value = original));
 		run.addEventListener('click', () => (running ? stop() : void execute()));
 		editor.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !running) {

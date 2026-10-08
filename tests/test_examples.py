@@ -143,12 +143,12 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
     assert "<svg" in (out / "moe-mesh.svg").read_text()
 
 
-@pytest.mark.parametrize(
-    "section",
-    ["lm", "diffusion", "sample_public", "jepa", "grpo", "pretrained", "decide", "serving", "mesh",
-     "reliability"],
-)
+LANDING = json.loads((REPO_ROOT / "site/snippets/cells.json").read_text())
+
+
+@pytest.mark.parametrize("section", LANDING["pool"] + LANDING["colab"])
 def test_landing_snippet_runs(section, tmp_path):
+    """Each landing cell runs, offline from small fixtures, and does what it shows."""
     smoke("landing", tmp_path, "--section", section,
           script=REPO_ROOT / "site/snippets/framework.py")
     result = json.loads((tmp_path / "result.json").read_text())

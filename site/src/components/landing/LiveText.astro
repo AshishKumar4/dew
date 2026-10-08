@@ -1,24 +1,26 @@
 ---
 import PythonEditor from './PythonEditor.astro';
+import { live } from '../../live.mjs';
 interface Props {
 	cell: string;
-	recorded: string;
+	// What the cell printed when site/scripts/capture_snippets.py ran it.
+	recording: { text: string; meta: { where: string; dew: string; date: string }; seconds: number };
 }
-const { cell, recorded } = Astro.props;
+const { cell, recording } = Astro.props;
+const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 ---
 
 <div class="live-text" data-live-text>
 	<div class="live-text-grid">
 		<div class="sampler-editor">
 			<div class="sampler-editor-bar"><span>generate.py</span><span class="sampler-editor-actions">
-				<button type="button" class="sampler-reset" data-text-reset>Reset</button>
-				<button type="button" class="sampler-run" data-text-run>Run</button>
+				{liveEnabled && <button type="button" class="sampler-run" data-text-run>Run</button>}
 			</span></div>
 			<PythonEditor code={cell} kind="text" rows={cell.trimEnd().split('\n').length + 1} label="Editable text generation cell" />
 		</div>
 		<div class="live-text-result">
-			<div class="live-text-output" data-text-output><pre>{recorded}</pre></div>
-			<p class="sampler-status" data-text-status aria-live="polite">Recorded output · Run the cell on a live CPU kernel.</p>
+			<div class="live-text-output" data-text-output><pre>{recording.text}</pre></div>
+			<p class="sampler-status" data-text-status aria-live="polite">Recorded on {recording.meta.where} with Dew <a href={`https://github.com/AshishKumar4/dew/commit/${recording.meta.dew}`}><code>{recording.meta.dew.slice(0, 7)}</code></a> on {recording.meta.date}, in {Math.round(recording.seconds)} s.{liveEnabled && ' Run the cell on a live CPU kernel.'}</p>
 		</div>
 	</div>
 	<div class="turnstile-holder" data-text-turnstile></div>
@@ -30,13 +32,12 @@ const { cell, recorded } = Astro.props;
 	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-text]');
-	if (panel) {
+	if (panel?.querySelector('[data-text-run]')) {
 		const editor = panel.querySelector<HTMLTextAreaElement>('textarea[data-text-cell]')!;
 		const run = panel.querySelector<HTMLButtonElement>('[data-text-run]')!;
 		const output = panel.querySelector<HTMLElement>('[data-text-output]')!;
 		const status = panel.querySelector<HTMLElement>('[data-text-status]')!;
 		const holder = panel.querySelector<HTMLElement>('[data-text-turnstile]')!;
-		const original = editor.value;
 		let session: LiveSession | undefined;
 		let running = false;
 		let stopping = false;
@@ -44,7 +45,6 @@ const { cell, recorded } = Astro.props;
 			session = undefined;
 			if (!running) status.textContent = `${message} Press Run to start a new one.`;
 		});
-		panel.querySelector('[data-text-reset]')!.addEventListener('click', () => { editor.value = original; });
 		const execute = async () => {
 			running = true;
 			stopping = false;

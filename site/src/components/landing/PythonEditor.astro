@@ -51,9 +51,5 @@ const highlighted = highlighter.codeToHtml(code, { lang: 'python', defaultColor:
 			highlight.scrollTop = text.scrollTop;
 			highlight.scrollLeft = text.scrollLeft;
 		});
-		// Model selection and Reset change the editor programmatically.
-		text.addEventListener('change', update);
-		editor.closest('.live-sampler, .live-text')?.addEventListener('click', () => requestAnimationFrame(update));
-		editor.closest('.live-text')?.addEventListener('change', () => requestAnimationFrame(update));
 	}
 </script>

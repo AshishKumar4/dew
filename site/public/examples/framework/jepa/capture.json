@@ -1,24 +1,19 @@
 {
-	"about": "The screen framework.py left on a terminal, written by site/scripts/capture_snippets.py.",
-	"arguments": [
-		"--section",
-		"jepa",
-		"--out",
-		"/tmp/rec/out"
-	],
-	"script_sha256": "5e01545363a1a30f0e81a59adbf6ed34b3bed980597a1abbba8a38d6c81d4e5f",
+	"about": "The screen jepa.py left on a terminal, written by site/scripts/capture_snippets.py.",
+	"arguments": [],
+	"script_sha256": "54e4a3993c0bc9b5edade0baf7611c63dbc7d9b0ef6cdbe6bb414add36096ec1",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "9d81a3dc7e71e141ede6afb1b060f21a450a2f96",
+		"dew": "898a4ec7f2af4f4ee3b51c1842d43070e4a957e4",
 		"date": "2026-10-08"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 19.4,
+		"seconds": 26.8,
 		"columns": 96,
 		"screen": [
 			[
@@ -138,7 +133,7 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  6.9"
+					"text": "  100%  6.6"
 				},
 				{
 					"text": " step/s",
@@ -223,7 +218,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 7.97 s                   "
+					"text": "after 8.21 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -243,7 +238,7 @@
 					"dim": true
 				},
 				{
-					"text": "19.5 step/s                    "
+					"text": "17.9 step/s                    "
 				},
 				{
 					"text": "\u2502",
@@ -298,36 +293,6 @@
 				{
 					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f",
 					"fg": "00afd7"
-				}
-			],
-			[
-				{
-					"text": "{"
-				}
-			],
-			[
-				{
-					"text": "  \"steps\": 3,"
-				}
-			],
-			[
-				{
-					"text": "  \"averaged\": ["
-				}
-			],
-			[
-				{
-					"text": "    \"params\""
-				}
-			],
-			[
-				{
-					"text": "  ]"
-				}
-			],
-			[
-				{
-					"text": "}"
 				}
 			]
 		]
