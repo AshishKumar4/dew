@@ -106,6 +106,7 @@ def uint8_pixels(images: ArrayLike) -> NDArray[np.uint8]:
 
 
 __all__ = [
+    "Artifact",
     "Decisions",
     "ImageGrid",
     "Representations",
