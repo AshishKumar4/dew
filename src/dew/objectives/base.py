@@ -661,15 +661,25 @@ class Objective(ABC, Generic[Loss, Effects]):
         dtype = jnp.promote_types(values.dtype, jnp.float32)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
-        valid = batch.get(VALID_ROWS)
-        if valid is None:
+        if VALID_ROWS not in batch:
             return Ratio(jnp.sum(values, axes), jnp.asarray(math.prod(values.shape[a] for a in axes), dtype))
         held = (rows,) if isinstance(rows, int) else rows
         shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
-        real = jnp.asarray(valid, bool).reshape(shape)
+        real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
         return Ratio(jnp.sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
+
+    @staticmethod
+    def row_weights(batch: Batch, rows: int) -> jax.Array:
+        """Each of the batch's `rows` rows' weight, float32: 1 for a real row
+        and 0 for a repeat that fills an evaluation batch (`VALID_ROWS`), and 1
+        for every row of a training batch. A rule an objective computes itself
+        weights its rows by this, as `row_mean` does."""
+        valid = batch.get(VALID_ROWS)
+        if valid is None:
+            return jnp.ones((rows,), jnp.float32)
+        return jnp.asarray(valid, jnp.float32).reshape(rows)
 
     @staticmethod
     def accuracy(correct: jax.Array, batch: Batch, weights: jax.Array | None = None, *,
