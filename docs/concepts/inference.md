@@ -111,6 +111,7 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 
 `TextGeneration.quantized(Quantization(...))` returns a task that stores the language-model weights the `Quantization` matches as int8 or fp8 values with their scales. It goes through the same Qwix serving path as image tasks, needs the same `dewml[quantization]` extra, and keeps the processor, sampling policy and token budget. Weight quantization is separate from `KVCache.quantized`, which changes how the cache is stored, and `Server.from_task` can use both.
 
+<!-- not run: serves Qwen3-0.6B, which takes 7 GiB on CPU, past the docs test's 4 GiB budget -->
 ```python
 import jax.numpy as jnp
 
