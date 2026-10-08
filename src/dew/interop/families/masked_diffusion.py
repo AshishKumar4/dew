@@ -9,18 +9,28 @@ OLMo-style tensor names need a map of their own.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from functools import partial
 
 from dew import records
-from dew.interop.families.gemma import _gemma4_config, _parallel_experts
-from dew.interop.families.qwen import _qwen2_config
+from dew.interop.families.gemma import (
+    gemma4_config,
+    gemma4_export_path,
+    gemma4_export_weights,
+    gemma4_path,
+    parallel_experts,
+)
+from dew.interop.families.qwen import qwen2_config
 from dew.interop.hf_decoders import (
     DEFAULT_MAX_SEQ_LEN,
+    FUSED_EXPERTS,
+    DecoderFamily,
     DecoderFields,
     Renames,
-    _base_config,
-    _refuse,
-    _renamed_path,
-    _Ropes,
+    Ropes,
+    base_config,
+    refuse,
+    renamed_name,
+    renamed_path,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -32,7 +42,7 @@ def _mask_token(hf_config: Mapping[str, object], used: set[str]) -> int:
     """
     mask = hf_config.get('mask_token_id', hf_config.get('mask_id'))
     if mask is None:
-        _refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
+        refuse('mask_token_id', 'a masked diffusion checkpoint reserves its mask id')
     used.update(('mask_token_id', 'mask_id'))
     return records.integer(mask, 'mask_token_id/mask_id')
 
@@ -53,8 +63,8 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     """
     std = _llada_geometry(hf_config)
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
-    config = _base_config(std, set(), layer_types=('full_attention',) * layers,
-                          rope=_Ropes(records.number(std['rope_theta'], 'rope_theta')))
+    config = base_config(std, set(), layer_types=('full_attention',) * layers,
+                          rope=Ropes(records.number(std['rope_theta'], 'rope_theta')))
     used.update(key for key in _LLADA_READ if key in hf_config)
     mask = _mask_token(hf_config, used)
     _llada_refusals(hf_config, used, std)
@@ -74,7 +84,7 @@ _LLADA_READ = ('hidden_size', 'd_model', 'num_hidden_layers', 'n_layers', 'num_l
 
 
 def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
-    """Rewrite LLaDA's own config spellings under the standard names `_base_config` reads.
+    """Rewrite LLaDA's own config spellings under the standard names `base_config` reads.
 
     The aliases are d_model, n_layers, n_heads, n_kv_heads, mlp_hidden_size,
     embedding_size and max_sequence_length. Each is read beside the standard
@@ -88,7 +98,7 @@ def _llada_geometry(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     intermediate = hf_config.get('intermediate_size', hf_config.get('mlp_hidden_size'))
     vocab = hf_config.get('vocab_size', hf_config.get('embedding_size'))
     if hidden is None or layers is None or heads is None or intermediate is None or vocab is None:
-        _refuse('llada geometry',
+        refuse('llada geometry',
                 'd_model/hidden_size, n_layers/num_hidden_layers, n_heads/num_attention_heads, '
                 'mlp_hidden_size/intermediate_size and embedding_size/vocab_size are required')
     kv_heads = heads if kv_heads is None else kv_heads
@@ -143,58 +153,58 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
     """
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
     if std['attention_bias']:
-        _refuse('include_bias/include_qkv_bias', 'the released checkpoint carries no biases')
+        refuse('include_bias/include_qkv_bias', 'the released checkpoint carries no biases')
     if std['hidden_act'] != 'silu':
-        _refuse(f"activation_type {std['hidden_act']!r}", 'LLaDA-8B computes SwiGLU')
+        refuse(f"activation_type {std['hidden_act']!r}", 'LLaDA-8B computes SwiGLU')
     if hf_config.get('rope') is False:
-        _refuse('rope=False', 'the released checkpoint rotates every layer')
+        refuse('rope=False', 'the released checkpoint rotates every layer')
     used.add('rope')
     if (hf_config.get('rope_parameters') is not None or hf_config.get('rope_scaling') is not None
             or hf_config.get('rope_local_base_freq') is not None):
-        _refuse('rope_parameters/rope_scaling', 'LLaDA-8B carries plain rope at rope_theta')
+        refuse('rope_parameters/rope_scaling', 'LLaDA-8B carries plain rope at rope_theta')
     used.update(('rope_parameters', 'rope_scaling', 'rope_local_base_freq'))
     stated = hf_config.get('layer_types')
     if (stated is not None and records.strings(stated, 'layer_types')
             != ('full_attention',) * layers):
-        _refuse(f'layer_types {list(records.strings(stated, "layer_types"))!r}',
+        refuse(f'layer_types {list(records.strings(stated, "layer_types"))!r}',
                 'LLaDA-8B attends every layer fully')
     if stated is not None:
         used.add('layer_types')
     if hf_config.get('sliding_window') is not None:
-        _refuse('sliding_window', 'LLaDA-8B windows no layer')
+        refuse('sliding_window', 'LLaDA-8B windows no layer')
     used.add('sliding_window')
     if hf_config.get('attention_layer_norm'):
-        _refuse('attention_layer_norm', 'the dense checkpoint norms no queries or keys')
+        refuse('attention_layer_norm', 'the dense checkpoint norms no queries or keys')
     used.update(('attention_layer_norm', 'attention_layer_norm_with_affine'))
     if hf_config.get('bias_for_layer_norm'):
-        _refuse('bias_for_layer_norm', 'the RMS norms carry no bias')
+        refuse('bias_for_layer_norm', 'the RMS norms carry no bias')
     used.add('bias_for_layer_norm')
     if hf_config.get('layer_norm_type', 'rms') != 'rms':
-        _refuse(f"layer_norm_type {hf_config.get('layer_norm_type')!r}", 'the norms are RMS')
+        refuse(f"layer_norm_type {hf_config.get('layer_norm_type')!r}", 'the norms are RMS')
     used.add('layer_norm_type')
     if not hf_config.get('layer_norm_with_affine', True):
-        _refuse('layer_norm_with_affine=False', 'the released norms scale')
+        refuse('layer_norm_with_affine=False', 'the released norms scale')
     used.add('layer_norm_with_affine')
     if hf_config.get('input_emb_norm'):
-        _refuse('input_emb_norm', 'the embeddings enter the first block unnormed')
+        refuse('input_emb_norm', 'the embeddings enter the first block unnormed')
     used.add('input_emb_norm')
     if hf_config.get('block_type', 'llama') != 'llama':
-        _refuse(f"block_type {hf_config.get('block_type')!r}", 'this entry is the llama block')
+        refuse(f"block_type {hf_config.get('block_type')!r}", 'this entry is the llama block')
     used.add('block_type')
     if records.integer(hf_config.get('block_group_size', 1), 'block_group_size') != 1:
-        _refuse('block_group_size', 'the released stack groups no blocks')
+        refuse('block_group_size', 'the released stack groups no blocks')
     used.add('block_group_size')
     if hf_config.get('alibi'):
-        _refuse('alibi', 'the attention carries no alibi slopes')
+        refuse('alibi', 'the attention carries no alibi slopes')
     used.update(('alibi', 'alibi_bias_max'))
     if hf_config.get('scale_logits'):
-        _refuse('scale_logits', 'the head writes raw logits')
+        refuse('scale_logits', 'the head writes raw logits')
     used.add('scale_logits')
     if not hf_config.get('rope_full_precision', True):
-        _refuse('rope_full_precision=False', 'the parity fixture runs the rope in fp32')
+        refuse('rope_full_precision=False', 'the parity fixture runs the rope in fp32')
     used.add('rope_full_precision')
     if hf_config.get('multi_query_attention') not in (None, False):
-        _refuse('multi_query_attention', 'the head counts come from n_heads/n_kv_heads')
+        refuse('multi_query_attention', 'the head counts come from n_heads/n_kv_heads')
     used.add('multi_query_attention')
     used.update(('embedding_dropout', 'residual_dropout', 'flash_attention', 'precision',
                  'init_device', 'init_fn', 'init_std', 'init_cutoff_factor', 'mlp_ratio',
@@ -204,7 +214,7 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
     if embedding is not None and records.integer(embedding, "embedding_size") != records.integer(
         vocab, "vocab_size"
     ):
-        _refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
+        refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
 
 
 def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -219,9 +229,9 @@ def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     Dream-only flag and changes nothing at that value.
     """
     if hf_config.get('use_mrope'):
-        _refuse('use_mrope=True', 'the backbone rotates plain positions')
+        refuse('use_mrope=True', 'the backbone rotates plain positions')
     used.add('use_mrope')
-    config = _qwen2_config(hf_config, used)
+    config = qwen2_config(hf_config, used)
     mask = _mask_token(hf_config, used)
     config.update(causal=False, mask_token_id=mask)
     return config
@@ -251,14 +261,14 @@ def _diffusion_gemma_text_config(hf_config: Mapping[str, object], used: set[str]
     # rather than setting it afterwards, because the global key count is read
     # under it: gemma4 spells the same regime as an attention_k_eq_v field,
     # and DiffusionGemma carries the behaviour in its modules instead.
-    config = _gemma4_config(hf_config, used, k_eq_v=True)
+    config = gemma4_config(hf_config, used, k_eq_v=True)
     if config.get("mixture") is None and all(
             hf_config.get(field) is not None
             for field in ("num_experts", "top_k_experts", "moe_intermediate_size")):
         # DiffusionGemma names no enable_moe_block flag; a config carrying the
         # three routed widths routes every layer beside its dense MLP, which
         # is what its encoder and decoder layers both build.
-        config["mixture"] = _parallel_experts(hf_config)
+        config["mixture"] = parallel_experts(hf_config)
     # final_logit_softcapping is a class attribute of the reference text
     # config, not an instance field a config.json carries; the head always
     # divides by 30 under tanh.
@@ -284,7 +294,7 @@ def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
     which the release nests under `model.transformer.`."""
     if not name.startswith('model.transformer.'):
         raise ValueError(f'unknown tensor name {name!r}')
-    return _renamed_path(_LLADA_NAMES, name, config)
+    return renamed_path(_LLADA_NAMES, name, config)
 
 
 def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -299,3 +309,63 @@ def _diffusion_gemma_export(model: CausalTransformer) -> Mapping[str, object]:
     raise ValueError(
         "diffusion_gemma_text is a cache-reading view; export the complete native DiffusionGemma wrapper"
     )
+
+
+DIFFUSION_GEMMA_TEXT = DecoderFamily(
+    ('diffusion_gemma_text',),
+    _diffusion_gemma_text_config,
+    lambda fields: bool(
+        fields.causal is False
+        and (
+            fields.v_norm
+            or fields.per_layer_input_dim
+            or fields.kv_shared_layers
+        )
+    ),
+    'diffusion_gemma_text',
+    'DiffusionGemmaForBlockDiffusion',
+    _diffusion_gemma_export,
+    sandwich_norms=True,
+    weight_path=gemma4_path,
+    export_path=gemma4_export_path,
+    packed=FUSED_EXPERTS,
+    export_weights=gemma4_export_weights,
+    preserve_source_layout=False,
+)
+
+DREAM = DecoderFamily(
+    ('dream', 'Dream'),
+    _dream_config,
+    lambda fields: bool(
+        fields.causal is False
+        and fields.attention_bias
+        and fields.o_proj_bias is False
+    ),
+    'dream',
+    'DreamModel',
+    _mask_token_export,
+    preserve_source_layout=True,
+)
+
+LLADA = DecoderFamily(
+    ('llada',),
+    _llada_config,
+    lambda fields: bool(
+        fields.causal is False
+        and not fields.attention_bias
+        and fields.mixture is None
+        and not (
+            fields.v_norm
+            or fields.per_layer_input_dim
+            or fields.kv_shared_layers
+        )
+        and not fields.output_gate
+        and not fields.qk_norm
+    ),
+    'llada',
+    'LLaDAModelLM',
+    _mask_token_export,
+    weight_path=_llada_path,
+    export_path=partial(renamed_name, _LLADA_NAMES),
+    preserve_source_layout=True,
+)

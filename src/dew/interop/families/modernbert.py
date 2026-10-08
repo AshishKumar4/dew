@@ -19,17 +19,18 @@ import numpy as np
 from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.hf_decoders import (
-    _ACTIVATIONS,
+    ACTIVATIONS,
     DEFAULT_MAX_SEQ_LEN,
+    DecoderFamily,
     DecoderFields,
     Packed,
     Renames,
-    _hf_activation,
-    _kinds,
-    _refuse,
-    _renamed_name,
-    _renamed_path,
-    _rope,
+    decoder_kinds,
+    hf_activation,
+    read_rope,
+    refuse,
+    renamed_name,
+    renamed_path,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -68,20 +69,20 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         'causal_mask', 'is_causal'))
     for causal in ('causal_mask', 'is_causal'):
         if hf.get(causal):
-            _refuse(causal, "ModernBERT attends both ways; a causal checkpoint is a different model")
+            refuse(causal, "ModernBERT attends both ways; a causal checkpoint is a different model")
     for dropout in ('attention_dropout', 'mlp_dropout'):
         if records.number(hf.get(dropout, 0.0), dropout):
-            _refuse(dropout, "ModernBERT drops inside its attention and MLP where the blocks here do not")
+            refuse(dropout, "ModernBERT drops inside its attention and MLP where the blocks here do not")
     if hf.get('classifier_bias'):
-        _refuse('classifier_bias', "the prediction head's dense layer is bias-free")
+        refuse('classifier_bias', "the prediction head's dense layer is bias-free")
     hidden = records.integer(hf['hidden_size'], 'hidden_size')
     heads = records.integer(hf['num_attention_heads'], 'num_attention_heads')
     layers = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     if hidden % heads:
-        _refuse('hidden_size/num_attention_heads', 'the hidden width must divide into whole heads')
+        refuse('hidden_size/num_attention_heads', 'the hidden width must divide into whole heads')
     activation = records.text(hf.get('hidden_activation', 'gelu'), 'hidden_activation')
-    if activation not in _ACTIVATIONS:
-        _refuse(f'hidden_activation={activation!r}', f'the GLU supports {sorted(_ACTIVATIONS)}')
+    if activation not in ACTIVATIONS:
+        refuse(f'hidden_activation={activation!r}', f'the GLU supports {sorted(ACTIVATIONS)}')
 
     if hf.get('layer_types') is not None:
         layer_types = records.strings(hf['layer_types'], 'layer_types')
@@ -90,14 +91,14 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         layer_types = tuple('sliding_attention' if index % every else 'full_attention'
                             for index in range(layers))
     if isinstance(hf.get('rope_parameters'), Mapping):
-        ropes = _rope(hf, used, local=False)
+        ropes = read_rope(hf, used, local=False)
         if ropes.scaling is not None or ropes.local_scaling is not None:
-            _refuse('rope_parameters', 'ModernBERT rotates at its plain frequencies')
+            refuse('rope_parameters', 'ModernBERT rotates at its plain frequencies')
         theta, local_theta = ropes.theta, ropes.local_theta
     else:
         used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
         if hf.get('rope_scaling') is not None:
-            _refuse('rope_scaling', 'ModernBERT rotates at its plain frequencies')
+            refuse('rope_scaling', 'ModernBERT rotates at its plain frequencies')
         theta = records.number(hf.get('global_rope_theta', 160000.0), 'global_rope_theta')
         local = records.number(hf.get('local_rope_theta', 10000.0), 'local_rope_theta')
         local_theta = None if local == theta else local
@@ -106,12 +107,12 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     head = records.strings(hf.get('architectures', [_MASKED_LM]), 'architectures') != (_ENCODER,)
     head_activation = records.text(hf.get('classifier_activation', 'gelu'), 'classifier_activation')
     if head and head_activation not in _HEAD_ACTIVATIONS:
-        _refuse(f'classifier_activation={head_activation!r}',
+        refuse(f'classifier_activation={head_activation!r}',
                 f'the prediction head supports {sorted(_HEAD_ACTIVATIONS)}')
     config: DecoderFields = native_fields(CausalTransformer)(
         vocab_size=records.integer(hf['vocab_size'], 'vocab_size'),
         emb_features=hidden, num_layers=layers, num_heads=heads, num_kv_heads=heads,
-        head_dim=hidden // heads, mlp=_ACTIVATIONS[activation],
+        head_dim=hidden // heads, mlp=ACTIVATIONS[activation],
         mlp_features=records.integer(hf['intermediate_size'], 'intermediate_size'),
         max_seq_len=min(records.integer(hf.get('max_position_embeddings', 8192), 'max_position_embeddings'),
                         DEFAULT_MAX_SEQ_LEN),
@@ -123,7 +124,7 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
         embedding_dropout_rate=records.number(hf.get('embedding_dropout', 0.0), 'embedding_dropout'),
     )
-    kinds = _kinds(layer_types, window, local_theta, None, None)
+    kinds = decoder_kinds(layer_types, window, local_theta, None, None)
     if 'sliding_attention' in kinds:
         kinds['sliding_attention']['bidirectional_window'] = True
     config['kinds'] = kinds
@@ -169,13 +170,13 @@ def _modernbert_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
     # Alias inspection sees the raw names before preparation splits them.
     if name.endswith(('.attn.Wqkv.weight', '.mlp.Wi.weight')):
         return None
-    return _renamed_path(_MODERNBERT_NAMES, name, config)
+    return renamed_path(_MODERNBERT_NAMES, name, config)
 
 
 def _modernbert_export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
     if dew_name in _HEAD_NAMES:
         return _HEAD_NAMES[dew_name]
-    return _renamed_name(_MODERNBERT_NAMES, dew_name, config)
+    return renamed_name(_MODERNBERT_NAMES, dew_name, config)
 
 
 def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -184,7 +185,7 @@ def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
     local_theta = model.rope_theta if sliding is None else sliding.rope_theta or model.rope_theta
     fields: dict[str, object] = {
         'architectures': [_ENCODER if model.head_transform is None else _MASKED_LM],
-        'hidden_activation': _hf_activation(model.mlp), 'norm_eps': model.norm_eps,
+        'hidden_activation': hf_activation(model.mlp), 'norm_eps': model.norm_eps,
         'norm_bias': model.norm_bias, 'mlp_bias': False, 'layer_types': list(types),
         'rope_parameters': {
             'full_attention': {'rope_type': 'default', 'rope_theta': model.rope_theta},
@@ -209,3 +210,13 @@ def _modernbert_export(model: CausalTransformer) -> Mapping[str, object]:
     fields.update(dict.fromkeys(('num_key_value_heads', 'head_dim', 'rms_norm_eps', 'hidden_act',
                                  'rope_theta', 'rope_local_base_freq', 'sliding_window', 'use_cache')))
     return fields
+
+
+MODERNBERT = DecoderFamily(
+    ('modernbert',), _modernbert_config,
+    lambda fields: not fields.causal and fields.embedding_norm and not fields.first_attention_norm,
+    'modernbert', 'ModernBertForMaskedLM', _modernbert_export,
+    weight_path=_modernbert_path, export_path=_modernbert_export_path,
+    prepare=_modernbert_prepare, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
+    tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
+)

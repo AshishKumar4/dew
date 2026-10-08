@@ -17,23 +17,25 @@ from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.families.deepseek import _deepseek_config, _deepseek_layout, _deepseek_mixture
-from dew.interop.families.qwen import _single_prediction_depth
+from dew.interop.families.deepseek import deepseek_config, deepseek_layout, deepseek_mixture
+from dew.interop.families.qwen import single_prediction_depth
 from dew.interop.hf_decoders import (
+    DecoderFamily,
     DecoderFields,
     KindFields,
     MixtureFields,
-    _base_config,
-    _check_tree,
-    _dew_path,
-    _fixed_fields,
-    _fixed_mixture,
-    _hf_name,
-    _record_float,
-    _record_int,
-    _refuse,
-    _Ropes,
-    _specified_layer_types,
+    Ropes,
+    base_config,
+    check_decoder_tree,
+    dew_path,
+    fixed_fields,
+    fixed_mixture,
+    hf_tensor_name,
+    kind_mixers,
+    record_float,
+    record_int,
+    refuse,
+    specified_layer_types,
     translate_config,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -42,6 +44,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kda import KimiDeltaAttentionMixer
+from dew.nn.mla import MLAMixer
 
 
 def _glm5_refusals(hf_config: Mapping[str, object], used: set[str], layers: int) -> None:
@@ -55,17 +58,17 @@ def _glm5_refusals(hf_config: Mapping[str, object], used: set[str], layers: int)
                            ('qk_rope_head_dim', 0), ('head_dim', 0)):
         used.add(name)
         if hf_config.get(name, expected) != expected:
-            _refuse(name, f'GLM-5.3-Flash requires {expected!r}')
+            refuse(name, f'GLM-5.3-Flash requires {expected!r}')
     if hf_config.get('qk_head_dim', hf_config['qk_nope_head_dim']) != hf_config['qk_nope_head_dim']:
-        _refuse('qk_head_dim', 'NoPE uses qk_nope_head_dim alone')
+        refuse('qk_head_dim', 'NoPE uses qk_nope_head_dim alone')
     kv_heads = hf_config.get('num_key_value_heads')
     if kv_heads is not None and kv_heads != hf_config['num_attention_heads']:
-        _refuse('num_key_value_heads', 'the reference requires one KV head per query head')
+        refuse('num_key_value_heads', 'the reference requires one KV head per query head')
     if hf_config.get('attention_dropout', 0.0) != 0.0:
-        _refuse('attention_dropout', 'k-pool attention does not implement training dropout')
+        refuse('attention_dropout', 'k-pool attention does not implement training dropout')
     used.add('attention_dropout')
     if 'shared' in _glm_indexer_types(hf_config, layers, used):
-        _refuse('indexer_types', 'shared k-pool index selections are not implemented')
+        refuse('indexer_types', 'shared k-pool index selections are not implemented')
 
 
 def _glm5_linear_fields(hf_config: Mapping[str, object],
@@ -79,13 +82,13 @@ def _glm5_linear_fields(hf_config: Mapping[str, object],
     nested = hf_config.get('linear_attn_config')
     raw = {} if nested is None else nested
     if not isinstance(raw, Mapping):
-        _refuse('linear_attn_config', 'expected an object')
+        refuse('linear_attn_config', 'expected an object')
     fields = {'num_heads': ('linear_num_heads', 64), 'head_dim': ('linear_head_dim', 128),
               'short_conv_kernel_size': ('linear_conv_kernel_dim', 4),
               'gate_lower_bound': ('linear_lower_bound', -5.0)}
     extra = set(raw) - set(fields) - {'safe_gate', 'kda_layers', 'full_attn_layers'}
     if extra:
-        _refuse('linear_attn_config', f'unknown fields {sorted(extra)}')
+        refuse('linear_attn_config', f'unknown fields {sorted(extra)}')
     linear = {target: raw.get(source, hf_config.get(target, default))
               for source, (target, default) in fields.items()}
     # The nested safe-gate flag only supplies a missing lower bound (:197-199).
@@ -96,7 +99,7 @@ def _glm5_linear_fields(hf_config: Mapping[str, object],
             indices = raw[name]
             if not isinstance(indices, (list, tuple)) or list(indices) != [
                     i for i, value in enumerate(types) if value == kind]:
-                _refuse(f'linear_attn_config.{name}', 'disagrees with layer_types')
+                refuse(f'linear_attn_config.{name}', 'disagrees with layer_types')
     return linear
 
 
@@ -114,24 +117,24 @@ def _glm5_mixture(hf_config: Mapping[str, object], used: set[str],
         schedule = ['dense'] * min(3, layers) + ['sparse'] * max(layers - 3, 0)
     if (not isinstance(schedule, (list, tuple)) or len(schedule) != layers
             or any(kind not in ('dense', 'sparse') for kind in schedule)):
-        _refuse('mlp_layer_types', 'one dense or sparse entry per layer is required')
+        refuse('mlp_layer_types', 'one dense or sparse entry per layer is required')
     for key, expected in (('scoring_func', 'sigmoid'), ('topk_method', 'noaux_tc')):
         if hf_config.get(key, expected) != expected:
-            _refuse(key, f'GLM5 uses {expected}')
+            refuse(key, f'GLM5 uses {expected}')
     norm_topk = hf_config.get('norm_topk_prob', True)
     if not isinstance(norm_topk, bool):
-        _refuse('norm_topk_prob', 'expected a boolean')
+        refuse('norm_topk_prob', 'expected a boolean')
     routed = tuple(index for index, kind in enumerate(schedule) if kind == 'sparse')
     mixture: MixtureFields | None = None
     if routed:
-        geometry = _deepseek_layout(hf_config, layers, used, sparse_layers=routed)
+        geometry = deepseek_layout(hf_config, layers, used, sparse_layers=routed)
         mixture = NativeFields(Mixture, {
             **geometry,
             "score_function": "sigmoid",
             "bias": True,
             "norm_topk_prob": norm_topk,
-            "groups": _record_int({"n_group": hf_config.get("n_group") or 1}, "n_group"),
-            "groups_per_token": _record_int({"topk_group": hf_config.get("topk_group") or 1}, "topk_group"),
+            "groups": record_int({"n_group": hf_config.get("n_group") or 1}, "n_group"),
+            "groups_per_token": record_int({"topk_group": hf_config.get("topk_group") or 1}, "topk_group"),
         })
     else:
         used.update(('n_routed_experts', 'num_local_experts', 'num_experts_per_tok',
@@ -152,22 +155,22 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     geometry. Every field the reference fixes is checked and refused rather
     than dropped.
     """
-    layers = _record_int(hf_config, 'num_hidden_layers')
-    types = _specified_layer_types(hf_config, used, tuple(
+    layers = record_int(hf_config, 'num_hidden_layers')
+    types = specified_layer_types(hf_config, used, tuple(
         'deepseek_sparse_attention' if i % 4 == 3 else 'linear_attention' for i in range(layers)))
     types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
     if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
-        _refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
+        refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
     _glm5_refusals(hf_config, used, layers)
     linear = _glm5_linear_fields(hf_config, types)
     sparse_fields = ('q_lora_rank', 'kv_lora_rank', 'qk_nope_head_dim', 'v_head_dim',
                      'index_n_heads', 'index_head_dim', 'index_topk', 'index_kpool')
-    sparse = {name: _record_int(hf_config, name) for name in sparse_fields}
+    sparse = {name: record_int(hf_config, name) for name in sparse_fields}
     if sparse['index_kpool'] < 1 or sparse['index_topk'] % sparse['index_kpool']:
-        _refuse('index_topk / index_kpool', 'the budget must contain whole positive-sized pools')
-    config = _base_config({**hf_config, 'layer_types': types, 'head_dim': sparse['qk_nope_head_dim'],
+        refuse('index_topk / index_kpool', 'the budget must contain whole positive-sized pools')
+    config = base_config({**hf_config, 'layer_types': types, 'head_dim': sparse['qk_nope_head_dim'],
                           'num_key_value_heads': hf_config['num_attention_heads']},
-                          used, rope=_Ropes(10000.0))
+                          used, rope=Ropes(10000.0))
     kinds: dict[str, KindFields] = {}
     if 'linear_attention' in types:
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
@@ -182,11 +185,11 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
         kinds=kinds,
         mixture=mixture,
         hyper_connections=native_fields(HyperConnections)(
-            hc_mult=_record_int(hf_config, "hc_mult"), hc_eps=_record_float(hf_config, "hc_eps"),
-            hc_sinkhorn_iters=_record_int(hf_config, "hc_sinkhorn_iters"), head="mean"),
-        swiglu_limit=_record_float(hf_config, "swiglu_limit"),
+            hc_mult=record_int(hf_config, "hc_mult"), hc_eps=record_float(hf_config, "hc_eps"),
+            hc_sinkhorn_iters=record_int(hf_config, "hc_sinkhorn_iters"), head="mean"),
+        swiglu_limit=record_float(hf_config, "swiglu_limit"),
         index_share_for_mtp_iteration=bool(hf_config.get("index_share_for_mtp_iteration", False)),
-        num_nextn_predict_layers=_single_prediction_depth(hf_config, used, "num_nextn_predict_layers"),
+        num_nextn_predict_layers=single_prediction_depth(hf_config, used, "num_nextn_predict_layers"),
     )
     # Native NextN uses normalized trunk states and a plain NoPE depth, not
     # trunk mHC (SGLang 97c6978 deepseek_nextn.py:177-187,247-298). The
@@ -194,7 +197,7 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     # deliberately remains its plain default.
     if (config.get('num_nextn_predict_layers')
             and ('full_attention' not in types or layers - 1 not in routed)):
-        _refuse('num_nextn_predict_layers', 'the prediction depth requires a routed sparse-attention block')
+        refuse('num_nextn_predict_layers', 'the prediction depth requires a routed sparse-attention block')
     used.update((*sparse_fields, *hc_fields, *linear, 'linear_attn_config', 'qk_head_dim',
                  'swiglu_limit', 'index_kpool_always_select_tail', 'output_router_logits',
                  'router_aux_loss_coef', 'index_share_for_mtp_iteration', 'indexer_rope_interleave'))
@@ -216,19 +219,19 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         'altup': None, 'laurel_rank': None, 'per_layer_input_dim': None,
         'activation_sparsity_pattern': None, 'final_logit_softcap': None,
     }
-    _fixed_fields(model, fixed, 'GLM5 requires {0!r}')
+    fixed_fields(model, fixed, 'GLM5 requires {0!r}')
     hc = model.hyper_connections
     if hc is None or hc.head != 'mean':
-        _refuse('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
+        refuse('hyper_connections', 'GLM5 contracts mHC streams by their unweighted mean')
     if model.sharing_layers:
-        _refuse('kv_shared_layers', 'the supported GLM5 layout owns an indexer per sparse layer')
+        refuse('kv_shared_layers', 'the supported GLM5 layout owns an indexer per sparse layer')
     if model.num_nextn_predict_layers not in (0, 1):
-        _refuse('num_nextn_predict_layers', 'GLM5 has zero or one plain prediction depth')
+        refuse('num_nextn_predict_layers', 'GLM5 has zero or one plain prediction depth')
     if model.swiglu_limit is None:
-        _refuse('swiglu_limit', 'GLM5 clamps both dense and routed SwiGLU branches')
+        refuse('swiglu_limit', 'GLM5 clamps both dense and routed SwiGLU branches')
     types = model.per_layer_types
     if len(types) != model.num_layers or set(types) - {'linear_attention', 'full_attention'}:
-        _refuse('layer_types', 'GLM5 uses linear and NoPE sparse attention')
+        refuse('layer_types', 'GLM5 uses linear and NoPE sparse attention')
     linear, sparse = KimiDeltaAttentionMixer(), KPoolSparseAttentionMixer()
     for kind_name in set(types):
         mixer = model.kind_of(kind_name).mixer or model.mixer
@@ -237,13 +240,13 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
         elif kind_name == 'full_attention' and isinstance(mixer, KPoolSparseAttentionMixer):
             sparse = mixer
         else:
-            _refuse(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
+            refuse(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
     mixture = model.mixture
     routed = model.sparse_layers
     if model.num_nextn_predict_layers and (
         "full_attention" not in types or model.num_layers - 1 not in routed
     ):
-        _refuse('num_nextn_predict_layers', 'the source NextN depth requires a routed NoPE block')
+        refuse('num_nextn_predict_layers', 'the source NextN depth requires a routed NoPE block')
     fields: dict[str, object] = {
         'layer_types': ['deepseek_sparse_attention' if kind == 'full_attention' else kind for kind in types],
         'mlp_layer_types': ['sparse' if index in routed else 'dense' for index in range(model.num_layers)],
@@ -272,11 +275,11 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
                        'groups_per_token', 'expert_features', 'shared_features', 'norm_topk_prob',
                        'implementation', 'dispatch'}
         defaults = Mixture(experts=mixture.experts, score_function='sigmoid', bias=True)
-        _fixed_mixture(mixture, defaults, represented,
+        fixed_mixture(mixture, defaults, represented,
                        'GLM5 uses biased grouped sigmoid routing with top-two group scores')
         width = mixture.expert_features or model.hidden_features
         if mixture.shared_features < width or mixture.shared_features % width:
-            _refuse(
+            refuse(
                 "mixture.shared_features", "GLM5 needs an integral positive count of shared expert widths"
             )
         fields.update(
@@ -298,7 +301,7 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
 def _glm5_next_export_weights(model: CausalTransformer, variables: Mapping[str, object],
                               config: Mapping[str, object]) -> dict[str, np.ndarray]:
     persistent = {name: tree for name, tree in variables.items() if name != 'cache'}
-    _check_tree(persistent, model)
+    check_decoder_tree(persistent, model)
     fields = translate_config(config)
     tensors: dict[str, np.ndarray] = {}
     for name, raw in flatten_dict(persistent, sep='.').items():
@@ -314,9 +317,9 @@ def _glm5_next_export_weights(model: CausalTransformer, variables: Mapping[str, 
             if tail == ['final_norm', 'scale']:
                 tail = ['shared_head', 'norm', 'scale']
         else:
-            target = _hf_name('.'.join(path), config)
+            target = hf_tensor_name('.'.join(path), config)
             if target is None or _glm4_moe_path(target, fields) != (collection, *original):
-                _refuse(name, 'the source has no matching persistent leaf')
+                refuse(name, 'the source has no matching persistent leaf')
             tensors[target] = np.ascontiguousarray(leaf.T if path[-1] == 'kernel' else leaf)
             continue
         prefix = f'model.layers.{layer}.'
@@ -325,7 +328,7 @@ def _glm5_next_export_weights(model: CausalTransformer, variables: Mapping[str, 
                 target = prefix + f'mlp.experts.{expert}.{tail[2]}.weight'
                 expected = (collection, *original[:-2], str(expert), *original[-2:])
                 if _glm4_moe_path(target, fields) != expected:
-                    _refuse(name, 'the expert tensor has no matching source path')
+                    refuse(name, 'the expert tensor has no matching source path')
                 tensors[target] = np.ascontiguousarray(value.T)
             continue
         if len(tail) == 2 and tail[0] in ('attn_hc', 'ffn_hc'):
@@ -334,9 +337,9 @@ def _glm5_next_export_weights(model: CausalTransformer, variables: Mapping[str, 
             ending = 'weight' if tail[-1] in ('kernel', 'scale') else tail[-1]
             target = prefix + '.'.join([*tail[:-1], ending])
         if _glm4_moe_path(target, fields) != (collection, *original):
-            _refuse(name, 'the source has no matching persistent leaf')
+            refuse(name, 'the source has no matching persistent leaf')
         if target in tensors:
-            _refuse(name, f'duplicate source tensor {target}')
+            refuse(name, f'duplicate source tensor {target}')
         tensors[target] = np.ascontiguousarray(leaf.T if tail[-1] == 'kernel' else leaf)
     if model.tie_embeddings:
         tensors['lm_head.weight'] = tensors['model.embed_tokens.weight']
@@ -356,11 +359,11 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     entry = records.record(hf_config.get('rope_parameters') or {}, 'rope_parameters')
     rope_type = entry.get('rope_type', entry.get('type', 'default'))
     if rope_type not in ('default', 'none') or hf_config.get('rope_scaling') is not None:
-        _refuse(f"rope_parameters (rope_type {rope_type!r})",
+        refuse(f"rope_parameters (rope_type {rope_type!r})",
                 "Glm4MoeRotaryEmbedding is the plain rotary")
     scaling = sorted(set(entry) - {'rope_type', 'type', 'rope_theta', 'partial_rotary_factor'})
     if scaling:
-        _refuse(f"rope_parameters scaling fields {scaling}",
+        refuse(f"rope_parameters scaling fields {scaling}",
                 "Glm4MoeRotaryEmbedding is the plain rotary")
     theta = records.number(entry.get('rope_theta', hf_config.get('rope_theta', 10000.0)),
                    'rope_parameters rope_theta')
@@ -369,14 +372,14 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
                     'rope_parameters partial_rotary_factor')
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'use_qk_norm',
                  'partial_rotary_factor', 'num_nextn_predict_layers'))
-    config = _base_config(hf_config, used, rope=_Ropes(theta),
+    config = base_config(hf_config, used, rope=Ropes(theta),
                           qk_norm=bool(hf_config.get('use_qk_norm', False)))
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     config.update(
         o_proj_bias=False,
         partial_rotary_factor=None if factor == 1.0 else factor,
         partial_rotary_type="default",
-        mixture=_deepseek_mixture(hf_config, layers, used),
+        mixture=deepseek_mixture(hf_config, layers, used),
         num_nextn_predict_layers=records.integer(
             hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
         ),
@@ -400,7 +403,7 @@ def _glm4_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
     parts = name.split('.')
     if not (len(parts) >= 4 and parts[:2] == ['model', 'layers'] and parts[2].isdigit()
             and int(parts[2]) >= records.integer(config['num_layers'], 'num_layers')):
-        return _dew_path(name, config)
+        return dew_path(name, config)
     if int(parts[2]) >= records.integer(config["num_layers"], "num_layers") + records.integer(
         config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
     ):
@@ -421,7 +424,7 @@ def _glm4_moe_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] |
         return ('params', depth, tail[0], 'scale')
     if tail == ['eh_proj', 'weight']:
         return ('params', depth, 'eh_proj', 'kernel')
-    path = _dew_path('.'.join(['model', 'layers', '0', *tail]), config)
+    path = dew_path('.'.join(['model', 'layers', '0', *tail]), config)
     if path is None:
         return None
     return (path[0], depth, 'block', *path[2:])
@@ -455,15 +458,15 @@ def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[s
             types = ['full' if max(index - offset + 1, 0) % freq == 0 else 'shared'
                      for index in range(layers)]
     if len(types) != layers:
-        _refuse(f"indexer_types of {len(types)} entries",
+        refuse(f"indexer_types of {len(types)} entries",
                 f"the model has {layers} layers, one indexer mode each")
     unknown = sorted(set(types) - {'full', 'shared'})
     if unknown:
-        _refuse(f"indexer_types entries {unknown}",
+        refuse(f"indexer_types entries {unknown}",
                 "a GLM layer runs its indexer ('full') or reuses the previous "
                 "full layer's top-k ('shared')")
     if types and types[0] == 'shared':
-        _refuse("indexer_types starting with 'shared'",
+        refuse("indexer_types starting with 'shared'",
                 "the first layer has no earlier indexer to share "
                 "(modeling_glm_moe_dsa.py:444-445)")
     return tuple(types)
@@ -482,13 +485,13 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice
     # whatever the config says (GLM-5.2 ships 192 over a rope width of 64),
     # so the field describes nothing the reference computes.
-    config = _deepseek_config({**hf_config, 'head_dim': None}, used, sparse=True)
+    config = deepseek_config({**hf_config, 'head_dim': None}, used, sparse=True)
     used.add('head_dim')
     # The indexer's rotation is not a dial: GlmMoeDsaIndexer.forward always
     # interleaves, and a flag saying otherwise describes no model the
     # reference builds.
     if hf_config.get('indexer_rope_interleave', True) is not True:
-        _refuse(f"indexer_rope_interleave {hf_config['indexer_rope_interleave']!r}",
+        refuse(f"indexer_rope_interleave {hf_config['indexer_rope_interleave']!r}",
                 "GlmMoeDsaIndexer always rotates interleaved pairs")
     # GlmMoeDsaTopkRouter casts to float32 itself (:514), whatever
     # moe_router_dtype says; index_share_for_mtp_iteration tells a
@@ -508,3 +511,52 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
         hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
     )
     return config
+
+
+GLM5_NEXT_TEXT = DecoderFamily(
+    ('glm5_next_text',),
+    _glm5_next_config,
+    lambda fields: any(
+        isinstance(mixer, (KimiDeltaAttentionMixer, KPoolSparseAttentionMixer))
+        for mixer in kind_mixers(fields)
+    ),
+    'glm5_next_text',
+    'Glm5NextTextForCausalLM',
+    _glm5_next_export,
+    weight_path=_glm4_moe_path,
+    export_weights=_glm5_next_export_weights,
+    preserve_source_layout=True,
+)
+
+GLM4_MOE = DecoderFamily(
+    ('glm4_moe',),
+    _glm4_moe_config,
+    lambda fields: (
+        fields.partial_rotary_type == 'default'
+        and (mixture := fields.mixture) is not None
+        and mixture.bias
+    ),
+    'glm4_moe',
+    'Glm4MoeForCausalLM',
+    lambda model: {},
+    weight_path=_glm4_moe_path,
+    preserve_source_layout=True,
+)
+
+
+# GLM's sparse block is V3.2's with the indexer rotating interleaved
+# pairs, which no DeepSeek release does, so that field names the family.
+GLM_MOE_DSA = DecoderFamily(
+    ('glm_moe_dsa',),
+    _glm_moe_dsa_config,
+    lambda fields: (
+        isinstance(mixer := fields.mixer, MLAMixer)
+        and mixer.index_topk is not None
+        and mixer.index_rope_interleave
+    ),
+    'glm_moe_dsa',
+    'GlmMoeDsaForCausalLM',
+    lambda model: {},
+    weight_path=_glm4_moe_path,
+    preserve_source_layout=True,
+)

@@ -1235,7 +1235,7 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
     This is the check that a config translation and a key map fit a
     checkpoint nobody wants to download in CI.
     """
-    from dew.interop.hf_decoders import _dew_path
+    from dew.interop.hf_decoders import dew_path
 
     table = json.loads((REAL / "tensors.json").read_text())
     config = translate_config(json.loads((REAL / "config.json").read_text()))
@@ -1244,7 +1244,7 @@ def test_the_real_checkpoints_tensor_table_matches_the_built_tree(rng):
 
     expected = {}
     for name, info in table['tensors'].items():
-        path = _dew_path(name, config)
+        path = dew_path(name, config)
         if path is None:
             continue  # the tied lm_head copy
         shape = tuple(info['shape'])

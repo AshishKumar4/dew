@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 from dew import records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import Packed
+from dew.interop.hf_decoders import DecoderFamily, Packed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -187,3 +187,18 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
 def export_path(dew_name: str, config: Mapping[str, object]) -> str | None:
     """Invert the checkpoint's tensor names for source-layout exports."""
     return mamba2.export_path(dew_name, config, layer_names=_LAYER_NAMES, family="Nemotron-H")
+
+
+NEMOTRON_H = DecoderFamily(
+    ("nemotron_h",),
+    config_from_hf,
+    matches,
+    "nemotron_h",
+    "NemotronHForCausalLM",
+    lambda model: {},
+    weight_path=weight_path,
+    export_path=export_path,
+    packed=PACKED,
+    preserve_source_layout=True,
+    tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
+)
