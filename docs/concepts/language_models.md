@@ -492,7 +492,7 @@ python recipes/lm/train.py data:token-windows --data.path data/diffusion-token-w
     --data.seq-len 511 --objective block_diffusion --objective.prompt-length 256 \
     --pretrained google/diffusiongemma-26B-A4B-it \
     --tokenizer google/diffusiongemma-26B-A4B-it \
-    --sample-tokens 0 --optim.learning-rate 0.00015
+    --max-new-tokens 0 --optim.learning-rate 0.00015
 ```
 
 The token files must use the checkpoint's tokenizer and hold the clean prompt prefix followed by the response canvases you intend. Trainer checkpoints keep the optimizer and iterator state, and `Pretrained.save` writes a complete inference checkpoint in the source format.
