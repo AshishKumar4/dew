@@ -4,22 +4,21 @@
 		"--section",
 		"sample_public",
 		"--out",
-		"/mnt/scratch/dew/tmp/landing-framework/review2/sample_public",
-		"--no-profile"
+		"/tmp/rec/out"
 	],
-	"script_sha256": "9691808d8795be615f2e8b56978a30e4360db75a6541eca76b18064ba0c53481",
+	"script_sha256": "5e01545363a1a30f0e81a59adbf6ed34b3bed980597a1abbba8a38d6c81d4e5f",
 	"meta": {
-		"where": "one RTX 4080",
-		"python": "3.12.13",
+		"where": "a 4-vCPU Cloudflare container",
+		"python": "3.12.15",
 		"jax": "0.11.2.post3",
-		"flax": "0.12.9",
+		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "b474bc5f1310a226a829b58e86bcd4184c801349",
-		"date": "2026-10-01"
+		"dew": "9d81a3dc7e71e141ede6afb1b060f21a450a2f96",
+		"date": "2026-10-08"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 35.7,
+		"seconds": 141.3,
 		"columns": 96,
 		"screen": [
 			[
