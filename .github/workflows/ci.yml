@@ -199,7 +199,7 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about three minutes each on Dew's own armada
-    # deployment (armada-dew), on the fewest of up to 150 containers that
+    # deployment (armada-dew), on the fewest of up to 200 containers that
     # finish as soon, sized from the last runs' usage: at 375, the platform
     # killed 164 of 268 containers at their first command. Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
