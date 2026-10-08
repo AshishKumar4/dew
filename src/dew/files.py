@@ -33,7 +33,7 @@ def replacing(path: str | os.PathLike) -> Iterator[epath.Path]:
     one target (threads, processes) never share it. A location with a scheme
     yields `path` itself.
     """
-    if "://" in os.fspath(path):
+    if "://" in str(path):
         yield epath.Path(path)
         return
     target = Path(path)
@@ -50,9 +50,12 @@ def replacing(path: str | os.PathLike) -> Iterator[epath.Path]:
 
 
 def write_atomically(path: str | os.PathLike, contents: str | bytes) -> None:
-    """Write `contents`, text as UTF-8, as the whole of `path` (`replacing`)."""
+    """Write `contents`, text or bytes, as the whole of `path` (`replacing`)."""
     with replacing(path) as temporary:
-        temporary.write_bytes(contents.encode() if isinstance(contents, str) else contents)
+        if isinstance(contents, str):
+            temporary.write_text(contents)
+        else:
+            temporary.write_bytes(contents)
 
 
 @contextlib.contextmanager
