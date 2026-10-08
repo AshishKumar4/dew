@@ -1,6 +1,6 @@
 {
   "model": "dewml/hybrid-dit-176m",
-  "revision": "73b7e9ed118eaa46fb7f199e688334bb37216cdd",
+  "revision": "403c4215556ac77826d69b3c3c7c30f9bb81ab9c",
   "device": "a 4-vCPU Cloudflare container (CPU)",
   "dew": "7256993a85c7b8d16e944dc77185fe26f6c55244",
   "negative": null,
