@@ -66,7 +66,8 @@ def guests():
     found = []
     for proc in Path("/proc").glob("[0-9]*"):
         try:
-            fields = dict(line.split(":", 1) for line in (proc / "status").read_text().splitlines() if ":" in line)
+            rows = (proc / "status").read_text().splitlines()
+            fields = dict(line.split(":", 1) for line in rows if ":" in line)
             uid = int(fields["Uid"].split()[1])
             command = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")[-80:]
         except (OSError, KeyError, ValueError):
