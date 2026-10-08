@@ -1,9 +1,21 @@
-"""Live cells send bounded inference requests; model weights stay in their serving process."""
+"""The Dew calls a live cell makes, sent to the host's shared model process.
+
+A live cell runs in a small sandboxed process that holds no model weights.
+`install` puts stand-ins for `dew.interop.PretrainedDecoder`,
+`dew.sampling.TextToImage` and the sampling settings the page's cells use in
+place of Dew's own modules. Each call goes to the process on the same host that
+loaded the pinned models with those same calls at startup (model_service.py),
+so a cell reads and prints as it would with Dew installed. Any other Dew module
+refuses to import here.
+"""
 
 import base64
+import importlib.abc
 import io
 import json
 import socket
+import sys
+import types
 from contextlib import suppress
 from dataclasses import asdict, dataclass
 from functools import cache
@@ -11,6 +23,9 @@ from pathlib import Path
 
 SOCKET = "/work/model.sock"
 MAX_RESPONSE = 2_000_000
+MODELS = Path("/opt/live/text-models")
+ELSEWHERE = ("This live kernel runs only the page's models, through the host's shared model process. "
+             "Install Dew to run the rest of it: pip install dewml")
 
 
 class StalePage(ValueError):
@@ -61,6 +76,11 @@ class Heun:
 
 class EulerAncestral:
     pass
+
+
+class Sampling:
+    def __init__(self, **settings):
+        self.settings = settings
 
 
 @dataclass(frozen=True)
@@ -121,10 +141,12 @@ class Pipeline:
         return ImageResult(result)
 
 
-@cache
-def from_pretrained(repo, *, revision=None):
-    metadata = request({"op": "describe", "repo": repo, "revision": revision})
-    return Pipeline(metadata["repo"], metadata["revision"])
+class TextToImage:
+    @staticmethod
+    @cache
+    def from_pretrained(repo, *, revision=None):
+        metadata = request({"op": "describe", "repo": repo, "revision": revision})
+        return Pipeline(metadata["repo"], metadata["revision"])
 
 
 @dataclass(frozen=True)
@@ -142,9 +164,47 @@ class TextTask:
         return TextResult(result["text"])
 
 
-@cache
-def text_model(name):
-    models = {line.split("@")[0] for line in Path("/opt/live/text-models").read_text().split()}
-    if name not in models:
-        raise ValueError("the live kernel serves only its pinned text models")
-    return TextTask(name)
+class Decoder:
+    def __init__(self, name):
+        self.name = name
+
+    def text_generation(self, *, sampling=None):
+        if sampling is None or sampling.settings != {"temperature": 0}:
+            raise ValueError("the shared model process decodes greedily: sampling=Sampling(temperature=0)")
+        return TextTask(self.name)
+
+
+class PretrainedDecoder:
+    @staticmethod
+    def load(name, *, dtype="bfloat16", max_seq_len=None):
+        models = {line.split("@")[0] for line in MODELS.read_text().split()}
+        if name not in models:
+            raise ValueError(f"this live kernel serves only {', '.join(sorted(models))}")
+        if (dtype, max_seq_len) != ("float32", 256):
+            raise ValueError('the shared process loaded this model with dtype="float32", max_seq_len=256')
+        return Decoder(name)
+
+
+class Elsewhere(importlib.abc.MetaPathFinder):
+    """Refuses the Dew modules the shared process does not run for a cell."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name.split(".")[0] == "dew":
+            raise ModuleNotFoundError(f"{name}: {ELSEWHERE}", name=name)
+
+
+def install():
+    """Put the stand-ins where a cell imports Dew from."""
+    def absent(name):
+        raise AttributeError(f"dew.{name}: {ELSEWHERE}")
+
+    dew = types.ModuleType("dew", __doc__)
+    dew.__path__, dew.__getattr__ = [], absent
+    interop = types.ModuleType("dew.interop", __doc__)
+    interop.PretrainedDecoder = PretrainedDecoder
+    sampling = types.ModuleType("dew.sampling", __doc__)
+    for value in (CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage):
+        setattr(sampling, value.__name__, value)
+    dew.interop, dew.sampling = interop, sampling
+    sys.modules.update({"dew": dew, "dew.interop": interop, "dew.sampling": sampling})
+    sys.meta_path.insert(0, Elsewhere())

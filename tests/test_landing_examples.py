@@ -2,9 +2,11 @@
 
 import ast
 import builtins
+import inspect
 import json
 import subprocess
 import symtable
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,12 +41,46 @@ def test_each_native_landing_cell_defines_its_imports_and_data():
             scopes.extend(scope.get_children())
 
 
-def test_live_cells_import_their_client_and_the_native_sampler_has_no_client_dependency():
-    sampler = (ROOT / "site/src/data/sampler.py").read_text()
-    text = (ROOT / "site/src/data/text.py").read_text()
-    assert sampler.startswith("from model_client import CFG, DPMSolverMultistep, from_pretrained\n")
-    assert text.startswith("from model_client import text_model\n")
-    native = (ROOT / "site/src/data/sampler_setup.py").read_text() + "\n" + sampler.split("\n\n", 1)[1]
-    assert "model_client" not in native
-    assert 'PretrainedDecoder.load(name,' in native
-    compile(native, "native-sampler.py", "exec")
+def test_live_cells_are_dew_code_whose_calls_reach_the_shared_model_process():
+    """The live cells import Dew's own names; in the live kernel model_client stands in for
+    them and sends each call to the host's model process."""
+    cells = [(ROOT / "site/src/data" / name).read_text() for name in ("text.py", "sampler.py")]
+    for cell in cells:
+        imports = [node for node in ast.parse(cell).body if isinstance(node, (ast.Import, ast.ImportFrom))]
+        assert {node.module for node in imports} <= {"dew.interop", "dew.sampling"}
+        exec(compile(ast.Module(imports, []), "cell.py", "exec"), {})
+    from dew.interop import PretrainedDecoder
+    inspect.signature(PretrainedDecoder.load).bind("model", dtype="float32", max_seq_len=256)
+    script = """
+import json, sys
+sys.path.insert(0, "site/live/container")
+import model_client
+model_client.MODELS = model_client.Path("site/live/container/text-models")
+png = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC"
+sent = []
+def request(payload):
+    sent.append(payload)
+    if payload["op"] == "describe":
+        return {"repo": payload["repo"], "revision": payload["revision"]}
+    return {"text": [" Paris."]} if payload["op"] == "text" else {"pngs": [png]}
+model_client.request = request
+model_client.install()
+for cell in json.loads(sys.argv[1]):
+    exec(cell, {})
+try:
+    import dew.data
+except ModuleNotFoundError as error:
+    sent.append(str(error))
+print(json.dumps(sent))
+"""
+    finished = subprocess.run([sys.executable, "-c", script, json.dumps(cells)], cwd=ROOT,
+                              capture_output=True, text=True, check=True)
+    printed, sent = finished.stdout.splitlines()
+    sent = json.loads(sent)
+    assert printed == " Paris."
+    assert [request["op"] if isinstance(request, dict) else "refused" for request in sent] == [
+        "text", "describe", "sample", "refused"]
+    assert sent[0]["model"] == "HuggingFaceTB/SmolLM2-135M-Instruct" and sent[0]["tokens"] == 24
+    assert sent[2]["steps"] == 15
+    assert sent[2]["guidance"] == {"scale": 6.0, "interval": [0.15, 0.9], "rescale": 0.0}
+    assert "pip install dewml" in sent[3]

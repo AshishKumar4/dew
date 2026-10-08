@@ -11,7 +11,6 @@ import capture from '../data/capture.json';
 import heroCode from '../data/hero.py?raw';
 import framework from '../../snippets/framework.py?raw';
 import samplerCell from '../data/sampler.py?raw';
-import samplerSetup from '../data/sampler_setup.py?raw';
 import textCell from '../data/text.py?raw';
 import textRecording from '../data/text-recording.json';
 import tutorials from '../generated/tutorial-cards.json';
@@ -106,7 +105,7 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Fine-tuning</h2>
 			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, generate from it, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names.</p>
-			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
+			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} />}
 			<EditableExample code={example(framework, 'pretrained')} title="Fine-tune Qwen3-0.6B" filename="dew-finetune.py" />
 			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
 				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}
@@ -118,7 +117,7 @@ const tutorialNames: Record<string, string> = {
 		<section class="band replay" data-replays data-reveal>
 			<h2 class="band-title">Diffusion</h2>
 			<p class="band-lede">The process sets how training adds noise and what the model learns to predict. At generation time a solver runs the process in reverse, and you can switch solvers without retraining.</p>
-			<LiveSampler setup={samplerSetup} cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
+			<LiveSampler cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
 			<EditableExample code={example(framework, 'diffusion')} title="Define and train a DiT" filename="dew-diffusion.py" />
 			<p class="framework-note">A {modelSize}M-parameter text-to-image model at {resolution}, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
 			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>
