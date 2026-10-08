@@ -22,7 +22,7 @@ const recorded = (name: string) => {
 	const root = ['examples', 'framework', name];
 	return { result: JSON.parse(readPublic(...root, 'result.json')), capture: JSON.parse(readPublic(...root, 'capture.json')) };
 };
-const names = ['lm', 'diffusion', 'sample_public', 'jepa', 'grpo', 'pretrained', 'serving', 'mesh', 'reliability'];
+const names = ['lm', 'diffusion', 'sample_public', 'jepa', 'grpo', 'pretrained', 'decide', 'serving', 'mesh', 'reliability'];
 const records = Object.fromEntries(names.map((name) => [name, recorded(name)]));
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const hero = capture.hero;
@@ -122,6 +122,14 @@ const tutorialNames: Record<string, string> = {
 			<p class="framework-note">Store weights in int8 or fp8:</p>
 			<EditableExample code={example(framework, 'formats')} title="Weight-only int8 and fp8" />
 			<p class="framework-note">The <a href="/guides/inference/">serving guide</a> covers the paged KV cache, prefix sharing, constrained decoding, and the error each quantized format adds.</p>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Decision models</h2>
+			<p class="band-lede">A decision model answers typed questions about a state in one forward pass: each question names its options, and the answer is a probability distribution over exactly those options. <a href="https://huggingface.co/convaiinnovations/laya">Laya</a>, a ModernBERT-large decision model, loads as a Dew model, and <code>systemone</code> takes and returns Jev's wire format.</p>
+			<EditableExample code={example(framework, 'decide')} title="Route a support ticket" />
+			<pre class="shown-output">{JSON.stringify(records.decide.result.answers, null, 2)}</pre>
+			<p class="framework-note">The <a href="/guides/decision-models/">decision models guide</a> covers calibration, abstention and fine-tuning a decision head on any backbone.</p>
 		</section>
 
 		<section class="band replay" data-replays data-reveal>
