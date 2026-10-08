@@ -48,6 +48,7 @@ from dew.training import (
     TrainState,
     display,
     ema_update,
+    memory,
     trainer as trainer_module,
 )
 from dew.training.optim import Cosine
@@ -514,7 +515,7 @@ def ladder_lm_trainer(directory, fits):
     trainer = make_trainer(directory, objective=objective, optimizer=optax.adam(1e-2))
 
     def headroom(executable, devices, held=0):
-        rung = (objective.head_tile is not None, trainer_module.recompute_record(objective))
+        rung = (objective.head_tile is not None, memory.recompute_record(objective))
         return 0 if fits(rung) else -1
     return trainer, objective, headroom
 
@@ -540,16 +541,16 @@ def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, mon
         return rung in ((True, 'minimal'), (True, 'full'))
 
     whole, _, headroom = ladder_lm_trainer(tmp_path / "whole", tiled_and_minimal)
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     expected = whole.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
     split, _, headroom = ladder_lm_trainer(tmp_path / "split", tiled_and_minimal)
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
 
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: True)
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     actual = resumed.fit(lm_windows(tmp_path), steps=4, checkpoint_every=2)
-    assert (objective.head_tile is not None, trainer_module.recompute_record(objective)) == (
+    assert (objective.head_tile is not None, memory.recompute_record(objective)) == (
         True, 'minimal')
     for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
         assert np.asarray(raw_leaf(left)).tobytes() == np.asarray(raw_leaf(right)).tobytes()
@@ -559,14 +560,14 @@ def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(t
     """A process that cannot fit the rung its checkpoint trained on moves up
     the ladder, never down, and says the run now computes otherwise."""
     split, _, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung[0])
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     split.fit(lm_windows(tmp_path), steps=2, checkpoint_every=2)
     caplog.clear()
 
     resumed, objective, headroom = ladder_lm_trainer(tmp_path / "split", lambda rung: rung == (True, 'full'))
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     resumed.fit(lm_windows(tmp_path), steps=3, checkpoint_every=2)
-    assert trainer_module.recompute_record(objective) == 'full'
+    assert memory.recompute_record(objective) == 'full'
     assert "the rung its checkpoint trained on" in caplog.text
 
 
@@ -1217,6 +1218,37 @@ def test_eval_every_scores_the_validation_split_and_logs_the_artifacts():
     assert [step for step, value in tracker.artifacts if isinstance(value, Representations)] == [2, 4]
 
 
+def test_each_suite_is_scored_on_its_own_cadence_with_its_own_metrics():
+    """Two named suites: one every 2 steps with fit's metric, one every 3 with
+    its own; each at its multiples and at the end, under its own name."""
+    from dew.training import EvalSuite
+
+    tracker = RecordingTracker()
+    trainer = make_trainer(objective=Features(), tracker=tracker)
+    trainer.fit(Data(val=None), steps=6, log_every=2, eval_every=2, metrics=(Spread([]),),
+                validation={"often": Data(val=val_batches(1)).val,
+                            "rare": EvalSuite(Data(val=val_batches(2)).val, (Spread([]),), 3)})
+    steps = {name: [step for step, scores in tracker.scalars if f"{name}/spread" in scores]
+             for name in ("often", "rare")}
+    assert steps == {"often": [2, 4, 6], "rare": [3, 6]}
+
+
+def test_the_validation_split_is_the_one_suite_val():
+    """`dataset.val` alone and a one-suite mapping of it are the same run."""
+    from dew.training import EvalSuite
+
+    runs = []
+    held = Data(val=val_batches(3)).val
+    for validation in (None, {"val": held}, {"val": EvalSuite(held, (Spread([]),), 3)}):
+        tracker = RecordingTracker()
+        make_trainer(objective=Features(), tracker=tracker).fit(
+            Data(val=val_batches(3)), steps=6, log_every=2, eval_every=3, metrics=(Spread([]),),
+            validation=validation)
+        runs.append([(step, scores["val/spread"]) for step, scores in tracker.scalars
+                     if "val/spread" in scores])
+    assert runs[0] == runs[1] == runs[2] and [step for step, _ in runs[0]] == [3, 6]
+
+
 @pytest.mark.parametrize("width", [30, 120])
 def test_a_fit_on_a_terminal_of_any_width_shows_every_metric(width, monkeypatch):
     """The live panel lays itself out for the terminal it has: one too
@@ -1838,7 +1870,7 @@ def test_a_step_fits_where_one_free_block_holds_its_temporaries(monkeypatch):
     needed 11.68 GiB of temporaries beside 13.3 GiB of state, and the 16.3
     GiB free were 5.9 GiB below the state and 10.4 GiB above it: neither
     block held them, and the run ran out of memory on its first step."""
-    from dew.training.trainer import step_headroom
+    from dew.training.memory import step_headroom
 
     monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_allocator_spatial_partitioning=false")
     limit = 29.6 * GiB
@@ -1855,8 +1887,8 @@ def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):
     block to return to, and the next step needs a second block as large: the
     RTX 4080's 4096-token step, 6.5 GiB of temporaries with 10.45 GiB free in
     one block, failed so in 5 of 16 runs. With the partitioning off it fits."""
-    from dew.training import trainer as module
-    from dew.training.trainer import step_headroom
+    from dew.training import memory as module
+    from dew.training.memory import step_headroom
 
     monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
 
@@ -1875,8 +1907,8 @@ def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):
 def test_a_growing_pool_places_temporaries_in_a_region_it_has_yet_to_take(monkeypatch):
     """A pool that grows (XLA_PYTHON_CLIENT_PREALLOCATE=false) takes a new
     region for an allocation its free blocks cannot hold, up to its limit."""
-    from dew.training import trainer as module
-    from dew.training.trainer import step_headroom
+    from dew.training import memory as module
+    from dew.training.memory import step_headroom
 
     monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
 
@@ -1890,8 +1922,8 @@ def test_a_growing_pool_takes_no_more_of_its_limit_than_the_gpu_has_free(monkeyp
     """A pool that grows takes a new region from the GPU, which another
     process may already hold: past what the driver reports free, its limit
     is a number, not memory."""
-    from dew.training import trainer as module
-    from dew.training.trainer import step_headroom
+    from dew.training import memory as module
+    from dew.training.memory import step_headroom
 
     monkeypatch.setenv("XLA_FLAGS", "")
     growing = device_memory(16 * GiB, 3 * GiB, largest=GiB, pool=4 * GiB)
@@ -1905,7 +1937,7 @@ def test_a_growing_pool_takes_no_more_of_its_limit_than_the_gpu_has_free(monkeyp
 def test_an_allocator_without_a_pool_is_read_by_its_free_bytes(monkeypatch):
     """A TPU's allocator reports no pool, so its free bytes are all the
     check reads."""
-    from dew.training.trainer import step_headroom
+    from dew.training.memory import step_headroom
 
     monkeypatch.setenv("XLA_FLAGS", "")
     tpu = device_memory(16 * GiB, 3 * GiB, platform="tpu")
@@ -1918,7 +1950,7 @@ def test_cuda_async_needs_room_for_the_temporaries_twice(monkeypatch):
     a step's freed temporaries where the next step cannot reuse them: the
     RTX 4080's 8192-token step, 10.3 GiB of them with 10.45 GiB free, failed
     in 1 of 8 runs at a 0.85 pool. So the step needs room for them twice."""
-    from dew.training.trainer import step_headroom
+    from dew.training.memory import step_headroom
 
     monkeypatch.setenv("XLA_FLAGS", "")
     unpooled = device_memory(13.24 * GiB, 2.79 * GiB)
@@ -1929,7 +1961,7 @@ def test_cuda_async_needs_room_for_the_temporaries_twice(monkeypatch):
 def test_a_step_fits_beside_the_bytes_the_loop_holds_outside_it(monkeypatch):
     """The batches the loop prefetches beside the step's own are placed
     while it runs, so the step fits only with room for them too."""
-    from dew.training.trainer import step_headroom
+    from dew.training.memory import step_headroom
 
     monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_allocator_spatial_partitioning=false")
     pool = device_memory(16 * GiB, 3 * GiB, largest=13 * GiB, pool=16 * GiB)
@@ -1951,7 +1983,7 @@ def test_the_fit_check_holds_room_for_the_batches_fit_prefetches(monkeypatch):
         seen.append(held)
         return 0
 
-    monkeypatch.setattr(trainer_module, 'step_headroom', headroom)
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     trainer = Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0))
@@ -2118,14 +2150,12 @@ def test_a_gpu_training_step_compiles_its_dots_apart(monkeypatch, generation, fl
     merger there."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training import trainer as trainer_module
-
-    monkeypatch.setattr(trainer_module, 'device_generation', lambda: generation)
+    monkeypatch.setattr(memory, 'device_generation', lambda: generation)
     monkeypatch.setenv("XLA_FLAGS", flags)
     model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
                               mlp_features=16, max_seq_len=8)
     objective = LMObjective(model, seq_len=4)
-    assert trainer_module.step_compiler_options(objective, tokens, frozen) == expected
+    assert memory.step_compiler_options(objective, tokens, frozen) == expected
 
 
 def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
@@ -2153,9 +2183,7 @@ def test_a_frozen_step_tells_the_options_its_tokens_and_split(monkeypatch):
 def test_a_step_without_tokens_compiles_whatever_its_batch_holds():
     """Only an objective that names its row tokens has rows counted for the
     options; another's batch may hold no rows at all, a scalar per field."""
-    from dew.training import trainer as trainer_module
-
-    assert trainer_module._device_tokens(object(), {"weight": jnp.asarray(.5)}, 1) == math.inf
+    assert memory.device_tokens(object(), {"weight": jnp.asarray(.5)}, 1) == math.inf
 
 
 def test_the_step_runs_the_program_it_compiled(monkeypatch, tmp_path):

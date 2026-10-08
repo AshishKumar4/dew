@@ -74,7 +74,7 @@ def unpartition_gpu_pool() -> None:
     unless the run named it.
 
     There a step's temporaries can lose their block between steps
-    (`dew.training.trainer.strands_temporaries`). The partitioning lets the
+    (`dew.training.memory.strands_temporaries`). The partitioning lets the
     pool's upper end hold XLA's collective memory space
     (xla/pjrt/gpu/se_gpu_pjrt_client.cc, `GetStreamExecutorGpuDeviceAllocator`
     at openxla/xla 91888df, the commit jax 0.11.2 builds), which a buffer

@@ -2001,7 +2001,7 @@ def mode_step_fits(args) -> dict:
     import jax
 
     from dew.training.distributed import MeshSpec
-    from dew.training.trainer import fits_everywhere, step_fits
+    from dew.training.memory import fits_everywhere, step_fits
 
     # A step over a mesh that spans both processes: each may read only its
     # own devices' memory, which a CPU device does not report.

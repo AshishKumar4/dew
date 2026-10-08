@@ -379,7 +379,7 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     import optax
 
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.trainer import refuse_wide_floats
+    from dew.training.memory import refuse_wide_floats
 
     class Drawn(Trainer):
         def initial_state(self, initializer=None, key=None):
