@@ -162,6 +162,29 @@ def pretrained():
     return {"steps": int(state.step), "export": sorted(path.name for path in Path("export").iterdir())}
 
 
+def decide():
+    # Begin snippet: decide
+    import json
+
+    from dew.decision import Decide
+
+    decide = Decide.from_pretrained("convaiinnovations/laya")
+    response = decide.systemone({
+        "state": "Hi, we were billed twice for March and I want it reversed today.",
+        "questions": {
+            "department": {"type": "choice", "instructions": "Which department should handle this?",
+                           "criteria": {"billing": "invoices, refunds", "technical": "bugs, outages"}},
+            "urgency": {"type": "score", "instructions": "How urgent is this?",
+                        "criteria": ["not urgent", "soon", "blocking"]},
+            "churn_risk": {"type": "noul", "instructions": "Does the user threaten to leave?"},
+        },
+    })
+    print(json.dumps(response["answers"], indent=2))
+    # End snippet: decide
+    assert set(response["answers"]) == {"department", "urgency", "churn_risk"}
+    return response
+
+
 def serving():
     # Begin snippet: serving
     import jax.numpy as jnp
@@ -275,7 +298,7 @@ def reliability():
 
 
 SECTIONS = {function.__name__: function for function in
-            (lm, diffusion, sample_public, jepa, grpo, pretrained, serving, mesh, reliability)}
+            (lm, diffusion, sample_public, jepa, grpo, pretrained, decide, serving, mesh, reliability)}
 
 
 def offline(out):
@@ -286,6 +309,7 @@ def offline(out):
     import dew.data.text
     import dew.interop.hub as hub
     from dew.data import ByteTokenizer, HFOptions
+    from dew.decision import Decide
     from dew.diffusion.presets import Flow
     from dew.inference import RunProcessor
     from dew.interop import PretrainedDecoder
@@ -317,6 +341,8 @@ def offline(out):
         return out / "run"
 
     PretrainedDecoder.load, PretrainedDecoder.text_generation = classmethod(tiny), byte_text
+    laya, tiny_laya = Decide.from_pretrained.__func__, ROOT / "tests/fixtures/laya/tiny"
+    Decide.from_pretrained = classmethod(lambda cls, name, **options: laya(cls, tiny_laya, **options))
     hub.pull_from_hub = run
 
 
