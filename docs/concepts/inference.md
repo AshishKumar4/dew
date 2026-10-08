@@ -66,7 +66,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 | `source` | A run directory (it holds `run.json`), a checkpoint directory in a published layout, or a Hub repository holding either. |
 | `mesh`, `layout` | Where the weights are placed. Without `mesh`, `MeshSpec()` puts the current process pool's devices on data parallelism. |
 | `dtype` | Compute dtype. |
-| `param_dtype` | Parameter storage. `None` keeps a run's stored dtypes and uses float32 master weights for a published source; `"auto"` keeps the stored dtypes for both, which for a published source means its `config.json` `dtype`, or else its first floating tensor's. |
+| `param_dtype` | Parameter storage. `None` and `"auto"` keep each tensor in the dtype it is stored in, for a run or a published source; a quantized source's packed weights decode to the dtype its `config.json` declares. `"float32"` gives a published source float32 master weights. |
 | `ema` | `None` (default): the run's moving-average weights when it stored them, else the live ones. `True` requires the average; `False` reads the live weights. |
 | `step` | Which of a run's checkpoints to load; refused for a source checkpoint. |
 | `revision` | Pins a Hub source; refused for a run directory. |
@@ -111,6 +111,7 @@ For the plain LM, image-diffusion and block-diffusion objectives, `ema=True` ask
 
 `TextGeneration.quantized(Quantization(...))` returns a task that stores the language-model weights the `Quantization` matches as int8 or fp8 values with their scales. It goes through the same Qwix serving path as image tasks, needs the same `dewml[quantization]` extra, and keeps the processor, sampling policy and token budget. Weight quantization is separate from `KVCache.quantized`, which changes how the cache is stored, and `Server.from_task` can use both.
 
+<!-- not run: serves Qwen3-0.6B, which takes 7 GiB on CPU, past the docs test's 4 GiB budget -->
 ```python
 import jax.numpy as jnp
 
@@ -130,6 +131,7 @@ Weights that are already JAX arrays on devices keep their placement through Qwix
 
 On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser weights in place of 670 MiB. In bf16 with int8 weights and activations, its denoiser forward takes 21% less time, and its CLIP score stays within 0.002 of fp32 ([measurements](../performance.md#quantized-serving-of-the-176m-text-to-image-model-2026-09-28)). The time saved depends on the device: on an A100 the quantized forward is slower than the unquantized one, and on a TPU v6e int8 halves the fp32 forward's time but not the bf16 forward's. On a GPU, Dew refuses to quantize the activations of a grouped convolution, because XLA:GPU computes it wrongly or cannot compile it. So this example leaves the model's depthwise convolutions out:
 
+<!-- not run: loads the published 176M text-to-image model, 4.3 GiB on CPU, past the docs test's budget -->
 ```python
 import jax.numpy as jnp
 
@@ -137,7 +139,7 @@ from dew.sampling import TextToImage
 from dew.training.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="403c4215556ac77826d69b3c3c7c30f9bb81ab9c")
+                                   revision="f9f06d778860501a257a900ca58faabf853f03cc")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
@@ -188,7 +190,7 @@ I also compared the real GPT-OSS BF16 weights on the RTX 4080, using the first t
 
 `tools/benchmark_disk_banks.py` measures one cache budget per fresh process: peak RSS, live device allocations, allocator pool size, physical storage reads and decode throughput. Its host read time includes I/O and layout conversion and can overlap compute, so do not add it to the elapsed time. An optional trace records the host reads, transfers and GPU kernels, and the serial probe measures a row read and its host-to-device copy on their own.
 
-The initial full-depth measurement used `unsloth/gpt-oss-20b-BF16` at revision `cc89b3e7fd423253264883a80a4fa5abc619649f`, which has 41.83 GB of weights in 24 layers of 1.646 GB each. It ran on an RTX 4080 with 16 GB VRAM, reading from local NVMe under `/mnt/scratch`, with an 8 GiB host-memory cap. With no retained host cache and read-ahead on, two three-token decode intervals took 255.36 and 261.56 seconds, or 0.0116 tokens/s, with 4.98 GB peak RSS, 5.80 GB peak live device allocations and an 8.59 GB peak allocator pool. The two measured prefills took 64.15 and 101.45 seconds. This was a shared workstation, so these are not controlled bandwidth numbers. The process priority was changed during this initial run, and later large disk reads start under `ionice -c3 nice -n 19`.
+The initial full-depth measurement used `unsloth/gpt-oss-20b-BF16` at revision `cc89b3e7fd423253264883a80a4fa5abc619649f`, which has 41.83 GB of weights in 24 layers of 1.646 GB each. It ran on an RTX 4080 with 16 GB VRAM, reading from local NVMe, with an 8 GiB host-memory cap. With no retained host cache and read-ahead on, two three-token decode intervals took 255.36 and 261.56 seconds, or 0.0116 tokens/s, with 4.98 GB peak RSS, 5.80 GB peak live device allocations and an 8.59 GB peak allocator pool. The two measured prefills took 64.15 and 101.45 seconds. This was a shared workstation, so these are not controlled bandwidth numbers. The process priority was changed during this initial run, and later large disk reads start under `ionice -c3 nice -n 19`.
 
 Each point of the cache-size curve below is a fresh process with a four-token prompt, one measured greedy decode, BF16 storage and compute, and the highest matmul precision. `--no-warmup` compiles both programs without an extra sweep over the weights, since cache initialization already reads the model once. Read-ahead is on. Peak live device storage stayed at 5.80 GB, and the allocator pool at 8.59 GB, for every point:
 
@@ -214,6 +216,7 @@ A call takes `key`, either an integer seed or a JAX key; `key=n` means `jax.rand
 
 `task.sampling` holds the policy that a loaded checkpoint's `generation_config.json` declares. To change one control, replace it on that value, and the others, including the source's EOS IDs, still apply:
 
+<!-- not run: continues the Qwen3-0.6B task above, whose tokenizer lists the vocabulary stop strings need -->
 ```python
 from dataclasses import replace
 
@@ -316,7 +319,7 @@ Calling the server with a batch submits every prompt, steps until they all finis
 | `quantized` | `"int8"` stores keys and values in eight bits with one float32 scale per token and head, and rotates the keys by a Hadamard matrix first, which needs a power-of-two `head_dim`. `"float8_e4m3fn"` stores unrotated e4m3 at any `head_dim`. Either works dense or paged. |
 | `groups` | Splits a paged pool into that many parts, one per equal group of rows. |
 
-With the default dense cache, every served request draws the tokens it would draw alone. `prefix_cache` hashes each page together with everything before it, and after `Server.reload(variables)` the server stops sharing the pages that the old weights wrote. To keep every draw inside a grammar, served or not, use `Sample(guided.json_schema(tokenizer, schema, eos_id))` or `Sample(guided.regex(tokenizer, pattern, eos_id))` as the task's strategy. The automaton comes from `outlines-core` (`pip install dewml[guided]`), and a transform that forces a token the grammar forbids fails the request.
+With the default dense cache, every served request draws the tokens it would draw alone. `prefix_cache` hashes each page together with everything before it, and after `Server.reload(variables)` the server stops sharing the pages that the old weights wrote. To keep every draw inside a grammar, served or not, use `Sample(guided.json_schema(tokenizer, schema, eos_token_ids))` or `Sample(guided.regex(tokenizer, pattern, eos_token_ids))` as the task's strategy. The automaton comes from `outlines-core` (`pip install dewml[guided]`), and a transform that forces a token the grammar forbids fails the request.
 
 On TPU, a paged bfloat16 cache decodes through the Pallas kernel `jax.experimental.pallas.ops.tpu.paged_attention`. On supported CUDA devices, an unquantized BF16 pool with 16-token-aligned pages uses cuDNN's own paged forward. The GPU path needs `'auto'` or `'cudnn'` attention, cuDNN-compatible heads, no logit softcap and no request for reference-only precision. Both paths need one query per row, with a mask that is exactly the filled slots and no window, sinks, image groups, pairwise mask or QK-Clip sow. Grouped pools, quantized storage and other masks keep the existing path, which gathers the pages and runs ordinary attention. The GPU VJP also uses that gathered path, and forward-mode attention uses the existing forward-mode context.
 
@@ -332,7 +335,7 @@ These numbers compare the old and new paged paths; the default dense path is not
 
 BF16 dense and paged prefill can round differently, and that can change a greedy continuation where the top logits are nearly tied. Across the same 448 random-token prompts, 143 requests diverged. Replaying each dense prefix gave a maximum logit difference of 0.732 and a maximum dense top-two gap of 0.223. Full-model float64 evaluations of those prefixes put the ratio of paged to dense RMS rounding error at a median of 0.996 and a maximum of 1.896, within the existing bound of two times the reference, and the ratio of maximum errors was at most 1.597. By the triangle inequality, the two executions' logit difference is then at most three times dense's float64 maximum error, and every first-divergence gap and logit difference was below that per-row bound. So the divergence comes from BF16 precision, and no page-table or cache-position error was found. It is also why paging does not replace the dense default.
 
-Verification records are in `/mnt/scratch/dew/runs/serving-attention`: `native-real.json`, `paged-old.json`, the generation archives, `paged-precision-envelope.json`, and the float64 truth chunks `fp64-chunk0.npz`, `fp64-chunk48.npz`, `fp64-chunk96.npz`. The throughput table predates the separate BF16 vocabulary-head output-rounding change; it holds that arithmetic fixed on both sides.
+The throughput table predates the separate BF16 vocabulary-head output-rounding change; it holds that arithmetic fixed on both sides.
 
 ### Cache quality
 

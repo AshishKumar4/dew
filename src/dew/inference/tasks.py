@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -27,13 +27,13 @@ from flax.core import freeze
 from jax.typing import ArrayLike, DTypeLike
 
 from dew.cache import persist_compilations
-from dew.coordination import agree_process_phase
+from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.nn.protocols import CacheCapacity, TokenModel
 from dew.objectives.base import Variables, thaw
-from dew.records import integer, record as named_fields, text as named
+from dew.records import integer, json_value, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
@@ -129,25 +129,16 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
         return inputs, _budget(max_new_tokens, default_tokens, max_length,
                                inputs.tokens.shape[1]), random_key
 
-    held = None
-    error = None
-    try:
-        held = prepared()
-    except Exception as failure:
-        error = failure
-    if collective:
-        agree_process_phase(error, phase="inference task input preparation")
-    elif error is not None:
-        raise error
-    assert held is not None
-    return held
+    return agreed("inference task input preparation", prepared) if collective else prepared()
 
 
 def decoded_rows(
     processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int
 ) -> tuple[str, ...]:
+    """Each row's `lengths` tokens past `width`, as text: what a task's `decode` and a generation's
+    `text` both return. Without a processor there is no text to return, and it raises."""
     if processor is None:
-        return ()
+        raise ValueError("this generation carries no processor to decode with")
     rows, counts = np.asarray(tokens), np.asarray(lengths)
     return tuple(processor.decode(rows[row:row + 1, width:width + int(counts[row])])[0]
                  for row in range(rows.shape[0]))
@@ -268,14 +259,21 @@ def _pulled(repo_id: str, revision: str | None) -> str:
     return os.fspath(pull_from_hub(repo_id, revision=revision))
 
 
-def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()
-               ) -> tuple[Mapping[str, object], int]:
-    """The inference declaration of the selected checkpoint, not training
-    configuration, and the exact step it is, which a loader reads the
-    weights at too, so a step saved meanwhile cannot pair one step's
-    declaration with another's weights. A task loaded from it compiles into
-    the persistent cache (`persist_compilations`). `trust` names the packages
-    outside Dew whose modules the record may import (`dew.registry.imported`)."""
+class SavedRun(NamedTuple):
+    """One checkpoint of a run, pinned: its inference declaration, not the
+    training configuration, and the exact step it is, which a loader reads
+    the weights at too, so a step saved meanwhile cannot pair one step's
+    declaration with another's weights."""
+
+    record: Mapping[str, object]
+    step: int
+
+
+def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+    """The selected checkpoint of the run in `directory`, pinned (`SavedRun`).
+    A task loaded from it compiles into the persistent cache
+    (`persist_compilations`). `trust` names the packages outside Dew whose
+    modules the record may import (`dew.registry.imported`)."""
     from dew.checkpoints import Checkpoints
     from dew.registry import import_trusted
     persist_compilations()
@@ -289,7 +287,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     record = named_fields(record, 'checkpoint artifact')
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    return record, step
+    return SavedRun(record, step)
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -446,7 +444,7 @@ class TextGeneration:
         stops = self._stops if policy.stop == self.sampling.stop else self._stop_criteria(policy.stop)
         chain = (self.logits if sampling is None else None) if logits is None else logits
         criteria = decoding.components(self.stopping if stopping is None else stopping) + stops
-        return replace(policy, stop=(), pad_id=policy.pad), chain, criteria
+        return replace(policy, stop=(), pad_token_id=policy.pad), chain, criteria
 
     def bind(self, variables: Variables) -> TextGeneration:
         """Return the same task over other weights, such as a policy snapshot."""
@@ -538,7 +536,7 @@ class TextGeneration:
             return replace(_requested(generated, budget, padding), decoder=decoder)
 
     def decode(self, generation: Generation) -> tuple[str, ...]:
-        """Return each row's valid continuation as text, empty without a processor."""
+        """Return each row's valid continuation as text; raises ValueError without a processor."""
         with region("inference.text.decode"):
             rows = generation.host()
             return decoded_rows(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
@@ -593,14 +591,14 @@ class BlockGeneration:
         dtypes override computation and storage.
         """
         from dew.diffusion.block import BlockProcess
-        from dew.registry import objectives
+        from dew.registry import from_record, objectives
         record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         model = model_config.build()
         refuse_non_denoiser(model)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return cls(model, variables, BlockProcess.from_json(named_fields(record['process'], 'process')),
-                   processor,
+        process = from_record(BlockProcess, json_value(record['process'], 'process'), dtypes=False)
+        return cls(model, variables, process, processor,
                    max_new_tokens=_saved_budget(record) or None)
 
     @classmethod
@@ -634,7 +632,7 @@ class BlockGeneration:
             return replace(generated, decoder=decoder)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
-        """Return each row's valid continuation as text, empty without a processor."""
+        """Return each row's valid continuation as text; raises ValueError without a processor."""
         return _canvas_text(self.processor, generation, "inference.block.decode")
 
 
@@ -688,7 +686,7 @@ class MaskedGeneration:
         preview budget becomes the response length a call omits.
         """
         from dew.diffusion.discrete import DiscreteProcess
-        from dew.registry import objectives, solvers
+        from dew.registry import from_record, objectives, solvers
 
         record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
@@ -700,7 +698,7 @@ class MaskedGeneration:
                              f"(TokenModel.mask_token_id), and this {type(model).__name__} names none")
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        process = DiscreteProcess.from_json(named_fields(record['process'], 'process'))
+        process = from_record(DiscreteProcess, json_value(record['process'], 'process'), dtypes=False)
         if process.mask_id != mask_id:
             raise ValueError("model and process mask token disagree")
         solver = named_fields(record['solver'], 'solver')
@@ -743,7 +741,7 @@ class MaskedGeneration:
             return replace(generated, decoder=decoder)
 
     def decode(self, generation: CanvasGeneration) -> tuple[str, ...]:
-        """Return each row's valid response as text, empty without a processor."""
+        """Return each row's valid response as text; raises ValueError without a processor."""
         return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 

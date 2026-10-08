@@ -8,11 +8,10 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import FlaxFeedForward, LayerNorm, scaled_dot_product_attention
+from dew.nn.attention import FlaxFeedForward, LayerNorm, NormalAttention
 from dew.nn.blocks import ResidualBlock, sinusoidal_time, torch_nearest_resize
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import HEADS, constrain, logical_axes, split_positions
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -49,47 +48,6 @@ class _TimeMLP(nn.Module):
         )
 
 
-@logical_axes({(sublayer, projection): ("embed", "heads", "head_dim")
-               for sublayer in ("self_attention", "cross_attention") for projection in ("q", "k", "v")}
-              | {(sublayer, "output"): ("heads", "head_dim", "embed")
-                 for sublayer in ("self_attention", "cross_attention")})
-class _Attention(nn.Module):
-    """Attend over `[B, S, features]` tokens, against `context` when given.
-
-    The head width is `features // heads`. The projections carry no bias,
-    which is what the SD checkpoints hold. Under a tensor axis each shard
-    computes its heads, as Megatron splits an attention: the query, key and
-    value projections by their output heads and the output projection by
-    its input heads. Left whole, every tensor shard projected the whole text
-    context into keys and values (4 times one device's FLOPs for those
-    projections at tensor=4). Under a sequence axis each sequence shard
-    projects its share of the context's tokens where the axis's link pays
-    for it (`split_positions`).
-    """
-
-    features: int
-    heads: int
-    dropout: float
-    dtype: Dtype
-    precision: PrecisionLike = None
-    attention_impl: str = "auto"  # an AttentionImpl
-
-    @nn.compact
-    def __call__(self, x, context=None, *, train=False):
-        context = x if context is None else context
-        depth = self.features // self.heads
-        def project(value, name):
-            return constrain(nn.DenseGeneral((self.heads, depth), use_bias=False, dtype=self.dtype,
-                                             precision=self.precision, name=name)(value), HEADS)
-        keys, values = split_positions(context, (self.heads, depth),
-                                       lambda tokens: (project(tokens, "k"), project(tokens, "v")))
-        attended = scaled_dot_product_attention(project(x, "q"), keys, values,
-            dtype=self.dtype, precision=self.precision, implementation=self.attention_impl)
-        output = nn.DenseGeneral(self.features, axis=(-2, -1), dtype=self.dtype,
-                                 precision=self.precision, name="output")(constrain(attended, HEADS))
-        return nn.Dropout(self.dropout)(output, deterministic=not train) if self.dropout else output
-
-
 class _Transformer(nn.Module):
     """Run one transformer block: self-attention, cross-attention, feed-forward.
 
@@ -109,14 +67,15 @@ class _Transformer(nn.Module):
     def __call__(self, x, context, *, train=False):
         def norm(name):
             return LayerNorm(epsilon=1e-5, dtype=self.dtype, name=name)
-        def attention(name):
-            return _Attention(self.stage.features, self.stage.heads, self.dropout, self.dtype,
-                              self.precision, self.attention_impl, name=name)
+        def attention(name, x, context):
+            # The SD checkpoints hold no query, key or value bias.
+            attended = NormalAttention(
+                self.stage.features, self.stage.heads, self.stage.features // self.stage.heads, self.dtype,
+                self.precision, qkv_bias=False, attention_impl=self.attention_impl, name=name)(x, context)
+            return nn.Dropout(self.dropout)(attended, deterministic=not train) if self.dropout else attended
 
-        x = x + attention("self_attention")(
-            norm("self_norm")(x), context if self.stage.cross_only else None, train=train
-        )
-        x = x + attention("cross_attention")(norm("cross_norm")(x), context, train=train)
+        x = x + attention("self_attention", norm("self_norm")(x), context if self.stage.cross_only else None)
+        x = x + attention("cross_attention", norm("cross_norm")(x), context)
         x = x + FlaxFeedForward(self.stage.features, dtype=self.dtype, precision=self.precision,
                                dropout=self.dropout, approximate_gelu=self.approximate_gelu,
                                name="feed_forward")(norm("ff_norm")(x), train=train)

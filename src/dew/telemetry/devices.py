@@ -74,7 +74,7 @@ def unpartition_gpu_pool() -> None:
     unless the run named it.
 
     There a step's temporaries can lose their block between steps
-    (`dew.training.trainer.strands_temporaries`). The partitioning lets the
+    (`dew.training.memory.strands_temporaries`). The partitioning lets the
     pool's upper end hold XLA's collective memory space
     (xla/pjrt/gpu/se_gpu_pjrt_client.cc, `GetStreamExecutorGpuDeviceAllocator`
     at openxla/xla 91888df, the commit jax 0.11.2 builds), which a buffer
@@ -117,15 +117,6 @@ def deterministic_ops_requested() -> bool:
     return (xla_flag('xla_gpu_deterministic_ops') or '').lower() in ('true', '1')
 
 
-# The generations whose training steps compile with XLA's Triton GEMM fusions
-# off, so every dot goes to cuBLAS: on the A100 (sm80) compiles take half as
-# long and decoder, MoE and DiT steps run 0-6% faster, and on the RTX 4080
-# (sm89) decoder steps run 3-10% faster, and 3x faster where the fusions hit
-# a whole-logits head at 4096 tokens (docs/performance.md). A Mamba-2 mixer
-# loses 7.7% without them and keeps them (`MixerBase.keeps_triton_gemm`), and
-# a step that fits only with them keeps them (`fitting_default`). Unmeasured
-# generations, sm86 among them, keep XLA's default.
-TRITON_GEMM_OFF_GENERATIONS = frozenset({'sm80', 'sm89'})
 
 
 

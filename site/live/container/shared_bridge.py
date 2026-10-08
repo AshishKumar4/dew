@@ -71,7 +71,12 @@ class Context:
             }))
             reply, idle, size = None, False, 0
             while reply is None or not idle:
-                message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
+                try:
+                    message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
+                except TimeoutError:
+                    raise TimeoutError("this cell's Python context sent nothing for 95 seconds, so it "
+                                       "was stopped; the shared host may be busy, so try again in a "
+                                       "minute") from None
                 kind, content = message["msg_type"], message["content"]
                 # The gateway announces a kernel that died, and restarts it, outside any request.
                 if kind == "status" and content["execution_state"] in ("restarting", "dead"):
@@ -96,6 +101,19 @@ def available(meminfo=Path("/proc/meminfo")):
     """The host's available memory, in bytes."""
     line = next(line for line in meminfo.read_text().splitlines() if line.startswith("MemAvailable:"))
     return int(line.split()[1]) << 10
+
+
+def resident(proc=Path("/proc")):
+    """Resident memory by user, in MiB: the model process, the gateway and bridge, each guest."""
+    held = {}
+    for status in proc.glob("[0-9]*/status"):
+        try:
+            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
+            uid, rss = fields["Uid"].split()[1], int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, KeyError, ValueError):
+            continue
+        held[uid] = held.get(uid, 0) + (rss >> 10)
+    return held
 
 
 def largest_guest(proc=Path("/proc")):
@@ -154,8 +172,12 @@ class Gateway:
             channels = None
             try:
                 url = f"ws://127.0.0.1:8890/api/kernels/{kernel['id']}/channels"
-                channels = await connect(url, max_size=MAX_OUTPUT,
-                                         additional_headers={"Authorization": "token " + self.token})
+                try:
+                    channels = await connect(url, max_size=MAX_OUTPUT, open_timeout=60,
+                                             additional_headers={"Authorization": "token " + self.token})
+                except TimeoutError:
+                    raise TimeoutError("this cell's Python context did not start within a minute; the "
+                                       "shared host may be busy, so try again in a minute") from None
                 context = Context(kernel["id"], channels)
                 result = await context.execute(kernel["preload"], lambda _: asyncio.sleep(0))
                 if result["status"] != "ok":
@@ -241,7 +263,11 @@ class Gateway:
     async def http(self, connection, request):
         if request.path == "/health":
             ready = Path("/run/dew/model/ready").exists()
-            return Response(200 if ready else 503, "OK" if ready else "Warming up", Headers(), b"")
+            # Reachable only through the host's Durable Object (shared-host.ts), for the operator.
+            report = {"available_mib": available() >> 20, "contexts": sum(map(len, self.contexts.values())),
+                      "training": self.training, "rss_mib": resident()}
+            return Response(200 if ready else 503, "OK" if ready else "Warming up", Headers(),
+                            json.dumps(report).encode())
         if not hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + self.secret):
             return Response(403, "Forbidden", Headers(), b"")
         match = re.fullmatch(r"/contexts/([0-9a-f-]{36})(?:/(ws|status|close))?", request.path)
@@ -264,7 +290,12 @@ class Gateway:
 
     async def websocket(self, socket):
         session = socket.request.path.split("/")[2]
-        cells = await self.create(session)
+        try:
+            cells = await self.create(session)
+        except Exception as error:
+            # 1013 is "try again later"; the reason says why, within the frame's 123 bytes.
+            await socket.close(1013, str(error).encode()[:123].decode(errors="ignore"))
+            return
         if session in self.connected:
             await socket.close(1008, "this context is already connected")
             return

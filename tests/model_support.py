@@ -46,7 +46,7 @@ class Digits:
         return "".join(str(int(token)) for token in ids)
 
 
-_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_id=12)
+_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_token_ids=12)
 
 
 def serving_task(sampling: Sampling = _DEFAULT_TASK_SAMPLING, capacity: int = 128) -> TextGeneration:

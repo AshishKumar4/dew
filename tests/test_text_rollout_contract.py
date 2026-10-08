@@ -112,7 +112,7 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
         return float(len(completion))
 
     rollout = SampledRollout(objective, reward, groups=2, max_new_tokens=4,
-                             sampling=Sampling(temperature=0, eos_id=eos, pad_id=12))
+                             sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12))
     result = rollout(SimpleNamespace(variables=params, updates=0), batch, jax.random.key(1))
     assert seen[:2] == [("a", "", "1", "")] * 2
     for index, (_, text, _, _) in enumerate(seen):
@@ -226,7 +226,8 @@ def test_any_declared_eos_id_stops_the_generation():
                         sampling=Sampling(temperature=0))
     first = int(baseline.tokens[0, 2])
     result = generate(model, params, prompt, 3, key=jax.random.key(1),
-                      sampling=Sampling(temperature=0, eos_id=((first + 1) % 13, first), pad_id=12))
+                      sampling=Sampling(temperature=0, eos_token_ids=((first + 1) % 13, first),
+                                        pad_token_id=12))
     np.testing.assert_array_equal(result.tokens[0, 2:], [first, 12, 12])
     np.testing.assert_array_equal(result.lengths, [1])
     np.testing.assert_array_equal(result.terminated, [True])

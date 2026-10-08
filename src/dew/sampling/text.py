@@ -161,7 +161,7 @@ class Sampling:
 
     Zero temperature is deterministic argmax, and ``top_k=None`` keeps the
     whole vocabulary. EOS counts as a sampled action; the output slots after
-    it contain ``pad_id`` and have no likelihood.
+    it contain ``pad_token_id`` and have no likelihood.
 
     The repetition penalty, ``no_repeat_ngram_size``, ``min_new_tokens`` and
     ``typical_p`` are Transformers' controls of the same names, and
@@ -169,10 +169,12 @@ class Sampling:
     default changes nothing. ``stop`` ends a row whose text ends with one of
     the strings; a task compiles them against its processor.
 
-    ``eos_id`` and ``pad_id`` belong to the model and its tokenizer, so where
-    a policy leaves them None, a task fills in its own, as Transformers
-    does. Plain `generate` has no task, so it stops on EOS only when the
-    policy names one, and pads with 0 unless the policy names a ``pad_id``.
+    ``eos_token_ids`` and ``pad_token_id``, Transformers' names, belong to the
+    model and its tokenizer, so where a policy leaves them None, a task fills
+    in its own, as Transformers does. Plain `generate` has no task, so it
+    stops on EOS only when the policy names one, and pads with 0 unless the
+    policy names a ``pad_token_id``. The block and masked decoders take the
+    same two names.
 
     A ``Sampling`` value compiles to its transforms in Transformers' order
     when a request has no explicit logits chain. An explicit chain replaces
@@ -182,8 +184,8 @@ class Sampling:
 
     temperature: float = 1.0
     top_k: int | None = None
-    eos_id: int | tuple[int, ...] | None = None
-    pad_id: int | None = None
+    eos_token_ids: int | tuple[int, ...] | None = None
+    pad_token_id: int | None = None
     top_p: float = 1.0
     min_p: float = 0.0
     repetition_penalty: float = 1.0
@@ -213,13 +215,14 @@ class Sampling:
                             ("min_new_tokens", self.min_new_tokens)):
             if type(value) is not int or value < 0:
                 raise ValueError(f"{name} must be a non-negative integer")
-        if self.pad_id is not None and (type(self.pad_id) is not int or self.pad_id < 0):
-            raise ValueError("pad_id must be a non-negative token id")
-        if self.eos_id is not None:
-            stops = (self.eos_id,) if isinstance(self.eos_id, int) else tuple(self.eos_id)
+        if self.pad_token_id is not None and (type(self.pad_token_id) is not int or self.pad_token_id < 0):
+            raise ValueError("pad_token_id must be a non-negative token id")
+        if self.eos_token_ids is not None:
+            eos = self.eos_token_ids
+            stops = (eos,) if isinstance(eos, int) else tuple(eos)
             if not stops or any(type(token) is not int or token < 0 for token in stops):
-                raise ValueError("eos_id must contain non-negative token ids")
-            object.__setattr__(self, "eos_id", stops)
+                raise ValueError("eos_token_ids must contain non-negative token ids")
+            object.__setattr__(self, "eos_token_ids", stops)
         if isinstance(self.stop, str):
             raise ValueError(f"stop is a tuple of strings; write stop=({self.stop!r},)")
         if any(not isinstance(string, str) or not string for string in self.stop):
@@ -229,8 +232,8 @@ class Sampling:
 
     @property
     def pad(self) -> int:
-        """The id in the output slots after EOS, which is `pad_id`, or 0 when `pad_id` is None."""
-        return 0 if self.pad_id is None else self.pad_id
+        """The id in the output slots after EOS, which is `pad_token_id`, or 0 when it is None."""
+        return 0 if self.pad_token_id is None else self.pad_token_id
 
     def active(self, names: Sequence[str]) -> list[str]:
         """Return the controls in `names` that this policy sets away from their defaults.
@@ -245,7 +248,7 @@ class Sampling:
     @property
     def stops(self) -> tuple[int, ...]:
         """The EOS ids that end a draw, or an empty tuple when the policy names no EOS."""
-        eos = self.eos_id
+        eos = self.eos_token_ids
         return () if eos is None else (eos,) if isinstance(eos, int) else tuple(eos)
 
     def transforms(self) -> tuple[LogitsTransform, ...]:
@@ -260,9 +263,9 @@ class Sampling:
 
     def criteria(self) -> tuple[Stopping, ...]:
         """Return the EOS criterion this policy adds after a caller's criteria, empty when it names no EOS."""
-        if self.eos_id is None:
+        if self.eos_token_ids is None:
             return ()
-        return (EndOfSequence(jnp.asarray(self.eos_id, jnp.int32)),)
+        return (EndOfSequence(jnp.asarray(self.eos_token_ids, jnp.int32)),)
 
 
 def with_ids_of(policy: Sampling, defaults: Sampling) -> Sampling:
@@ -271,8 +274,9 @@ def with_ids_of(policy: Sampling, defaults: Sampling) -> Sampling:
     A task's policy holds its model's and tokenizer's ids, so a call that
     replaces the policy keeps stopping and padding where the task does.
     """
-    return replace(policy, eos_id=defaults.eos_id if policy.eos_id is None else policy.eos_id,
-                   pad_id=defaults.pad_id if policy.pad_id is None else policy.pad_id)
+    return replace(policy, eos_token_ids=(defaults.eos_token_ids if policy.eos_token_ids is None
+                                          else policy.eos_token_ids),
+                   pad_token_id=defaults.pad_token_id if policy.pad_token_id is None else policy.pad_token_id)
 
 
 def ordered_transforms(policy: Sampling, extra: Mapping[str, LogitsTransform] = types.MappingProxyType({}),
@@ -286,9 +290,9 @@ def ordered_transforms(policy: Sampling, extra: Mapping[str, LogitsTransform] = 
     and runs no warper, and a beam search (`searching`) picks its own
     continuations, so its chain ends after the processors.
     """
-    eos = None if policy.eos_id is None else jnp.asarray(policy.eos_id, jnp.int32)
+    eos = None if policy.eos_token_ids is None else jnp.asarray(policy.eos_token_ids, jnp.int32)
     if policy.min_new_tokens and eos is None:
-        raise ValueError("min_new_tokens holds EOS back, and this policy names no eos_id; "
+        raise ValueError("min_new_tokens holds EOS back, and this policy names no eos_token_ids; "
                          "set it, or let a task fill it")
     own: dict[str, LogitsTransform | None] = {
         "repetition_penalty": (RepetitionPenalty(policy.repetition_penalty)
@@ -714,8 +718,7 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     media = np.asarray(fields.get("image_indices", np.full(ids.shape, -1))) >= 0
     if vocab is not None and np.any((ids >= vocab) & ~media):
         raise ValueError("text token ids must be inside the vocabulary")
-    if vocab is not None and (sampling.pad >= vocab or
-                             (sampling.eos_id is not None and np.any(np.asarray(sampling.eos_id) >= vocab))):
+    if vocab is not None and (sampling.pad >= vocab or any(token >= vocab for token in sampling.stops)):
         raise ValueError("sampling token ids must be inside the vocabulary")
     return valid
 

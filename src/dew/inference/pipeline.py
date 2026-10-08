@@ -56,10 +56,10 @@ def pipeline(
     parallelism uses the current pool's devices.
 
     `dtype` sets the computation dtype, given as a dtype (`jnp.bfloat16`) or
-    its name. `param_dtype` sets parameter storage. None keeps a run's
-    stored dtypes and uses FP32 masters for a source, and `'auto'` keeps the
-    stored dtypes either way; for a source, that is its config dtype or its
-    first floating tensor, as Transformers' `dtype='auto'` reads it. `ema`
+    its name. `param_dtype` sets parameter storage. None and `'auto'` keep
+    each tensor's stored dtype, a run's or a source's (a quantized source's
+    packed weights decode to the dtype it declares); `jnp.float32` gives a
+    source FP32 masters. `ema`
     selects a run's averaged weights: None reads them when the run kept them
     and its live weights otherwise, and True always reads them. `step`
     selects a run's checkpoint and `revision` pins a Hub source; passing
@@ -129,7 +129,7 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
     )
     from dew.training.distributed import MeshSpec as DefaultMesh
 
-    storage = "float32" if param_dtype is None else param_dtype
+    storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
     def prepared(model, variables):
         with jax.set_mesh(placement.build()):

@@ -19,6 +19,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
 
@@ -182,49 +183,6 @@ class JointAttention(nn.Module):
                 projection("to_add_out")(context_out) if self.context_out else None)
 
 
-@logical_axes({("net_0_proj",): ("embed", "mlp"), ("net_2",): ("mlp", "embed")})
-class FeedForward(nn.Module):
-    """Applies the source's `FeedForward(activation_fn="gelu-approximate")`.
-
-    One projection to the `hidden` width feeds the tanh GELU, and a second
-    projects back. `hidden` is four times the width unless a config names its
-    `inner_dim`, as Wan's `ffn_dim` does. The weights are stored as
-    `net.0.proj` and `net.2`.
-    """
-
-    features: int
-    hidden: int | None = None
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.compact
-    def __call__(self, x):
-        hidden = nn.Dense(self.hidden or 4 * self.features, dtype=self.dtype,
-                          precision=self.precision, name="net_0_proj")(x)
-        hidden = nn.gelu(hidden, approximate=True)
-        return nn.Dense(self.features, dtype=self.dtype, precision=self.precision,
-                        name="net_2")(hidden)
-
-
-@logical_axes({("linear_in",): ("embed", "mlp"), ("linear_out",): ("mlp", "embed")})
-class SwiGLU(nn.Module):
-    """Applies `Flux2FeedForward`: `linear_in` to twice the hidden width, SiLU of the
-    first half times the second, then `linear_out` back. Neither projection has a
-    bias."""
-
-    features: int
-    hidden: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.compact
-    def __call__(self, x):
-        gate, value = jnp.split(nn.Dense(2 * self.hidden, use_bias=False, dtype=self.dtype,
-                                         precision=self.precision, name="linear_in")(x), 2, axis=-1)
-        return nn.Dense(self.features, use_bias=False, dtype=self.dtype, precision=self.precision,
-                        name="linear_out")(nn.silu(gate) * value)
-
-
 class DoubleStreamBlock(nn.Module):
     """Runs one double-stream block of SD3, Flux, FLUX.2 or Dew's own MM-DiT.
 
@@ -285,10 +243,11 @@ class DoubleStreamBlock(nn.Module):
                 projected(2 if self.context_pre_only else 6, "norm1_context"))
 
     def _feed_forward(self, name: str):
-        hidden = self.mlp_hidden or 4 * self.features
-        if self.swiglu:
-            return SwiGLU(self.features, hidden, dtype=self.dtype, precision=self.precision, name=name)
-        return FeedForward(self.features, hidden, dtype=self.dtype, precision=self.precision, name=name)
+        # FLUX.2's SwiGLU stores its gate and up maps as one bias-free `linear_in`;
+        # the others' tanh GELU (`FeedForward(activation_fn="gelu-approximate")`) is biased.
+        return GatedMLP(self.mlp_hidden or 4 * self.features, self.features,
+                        activation="swiglu" if self.swiglu else "gelu", use_bias=not self.swiglu,
+                        packed=self.swiglu, dtype=self.dtype, precision=self.precision, name=name)
 
     def _attention(self, name: str, *, context_out: bool = True):
         return JointAttention(self.heads, self.head_dim, bias=self.bias, qk_norm=self.qk_norm,
@@ -329,5 +288,5 @@ class DoubleStreamBlock(nn.Module):
         return image, context
 
 
-__all__ = ["DoubleStreamBlock", "FeedForward", "JointAttention", "Modulation", "SwiGLU", "embedding",
-           "guided_time", "layer_norm", "modulate"]
+__all__ = ["DoubleStreamBlock", "JointAttention", "Modulation", "embedding", "guided_time", "layer_norm",
+           "modulate"]

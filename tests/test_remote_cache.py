@@ -114,6 +114,8 @@ def test_a_slow_compilation_one_task_makes_is_read_by_the_next(worker):
     assert second.get("jit_step-1") == entry(2)
     assert second.get("jit_step-2") is None and second.get("jit_init-3") is None
     assert seen == ["/jax/cpu/jit_step-1", "/jax/cpu/jit_step-2"] and second.available
+    assert first.summary() == "shared XLA cache: 0 fetched, 1 uploaded, 1 names"
+    assert second.summary() == "shared XLA cache: 1 fetched, 0 uploaded, 3 names"
 
 
 def test_a_wrong_token_leaves_the_remote_alone_and_never_raises(worker):
@@ -124,6 +126,7 @@ def test_a_wrong_token_leaves_the_remote_alone_and_never_raises(worker):
     cache.drain()
     assert not cache.available and stored == {} and cache.get("jit_step-2") is None
     assert cache.base.get("jit_step-1") == entry(2)
+    assert cache.summary().endswith(", given up as unreachable")
 
 
 def test_an_unreachable_remote_only_slows_a_task_by_one_failed_listing(monkeypatch):

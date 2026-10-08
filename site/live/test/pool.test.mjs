@@ -9,7 +9,8 @@ async function scenario(name) {
 		bundle: true, format: 'esm', platform: 'neutral', external: ['cloudflare:workers'], write: false });
 	const worker = new Miniflare(convertV4MiniflareOptions({
 		modules: [{ type: 'ESModule', path: 'pool.mjs', contents: bundle.outputFiles[0].text }], compatibilityDate: '2026-09-29',
-		durableObjects: { POOL: { className: 'Pool', useSQLite: true }, SHARED: { className: 'Host', useSQLite: true } },
+		durableObjects: { POOL: { className: 'Pool', useSQLite: true }, ORPHAN: { className: 'Orphan', useSQLite: true },
+			SHARED: { className: 'Host', useSQLite: true } },
 	}));
 	try { return await (await worker.dispatchFetch(`https://test/${name}`)).json(); }
 	finally { await worker.dispose(); }
@@ -34,4 +35,9 @@ test('idle scale-in never removes the two minimum warm hosts', async () => {
 	assert.equal(result.scaled.ready, 3);
 	assert.equal(result.idle.ready, 2);
 	assert.equal(result.idle.active, 0);
+});
+test('a pool the Worker no longer binds retires its hosts and stops', async () => {
+	const result = await scenario('orphan');
+	assert.deepEqual(result.retired, [true, true]);
+	assert.deepEqual(result.left, { pool: null, alarm: null });
 });

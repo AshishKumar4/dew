@@ -21,7 +21,6 @@ from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 from flax import linen as nn
 from jax.typing import DTypeLike
@@ -63,6 +62,7 @@ from dew.interop.processors import (
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import SourceLeaf, WeightLayout
+from dew.interop.weights import AUTO, declared_dtype
 from dew.nn import audio as audio_nn
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -415,10 +415,12 @@ class Pretrained:
 
         `dtype` sets the compute dtype, and `param_dtype` separately sets the storage
         dtype of floating parameters. It defaults to FP32 master weights, and 'auto'
-        keeps the checkpoint's own dtype. Each is a dtype (`jnp.bfloat16`) or its
-        name, and the model's record keeps the name. Frozen components (text encoders
-        and the VAE) follow `param_dtype` too, while router, clipping, positional and
-        safety state keep their own FP32 or integer dtypes.
+        keeps each tensor in the dtype the checkpoint stores it in; a quantized
+        source's packed weights decode to the dtype it declares (`declared_dtype`).
+        Each is a dtype (`jnp.bfloat16`) or its name, and the model's record keeps
+        the name. Frozen components (text encoders and the VAE) follow `param_dtype`
+        too, while router, clipping, positional and safety state keep their own FP32
+        or integer dtypes.
 
         Without `mesh` or `layout`, the variables are host arrays. With either, they
         are placed on that mesh (the default `MeshSpec()` when only `layout` is given)
@@ -976,35 +978,6 @@ def split_revision(source: str) -> tuple[str, str | None]:
     return name, revision
 
 
-AUTO = "auto"
-"""The param_dtype that stores a checkpoint's parameters in its own dtype."""
-
-
-def checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
-    """Return the storage dtype a checkpoint states, for param_dtype 'auto'.
-
-    transformers' dtype='auto' rule (modeling_utils.py `_get_dtype`, 5.16.1):
-    config.json's `dtype` (`torch_dtype` before 5.0), else the dtype of the
-    first floating tensor. Packed FP8 or FP4 payloads are no storage dtype,
-    so the first tensor stored in one is what a quantized checkpoint without
-    a stated dtype resolves to. A diffusers pipeline states none, so its
-    denoiser's tensors decide.
-    """
-    stated = config.get("dtype", config.get("torch_dtype"))
-    if stated is not None:
-        storage = dtype_name(resolve_dtype(records.text(stated, "dtype")))
-        if storage is None:
-            raise ValueError(f"dtype={stated!r} names no floating parameter storage")
-        return storage
-    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
-                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
-    for tensor in tensors.values():
-        if tensor.dtype in storable:
-            return storable[tensor.dtype]
-    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
-                     "float16 tensor in the checkpoint")
-
-
 def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
                      attention_impl: str, param_dtype: str, streaming: bool) -> PretrainedPipeline | None:
@@ -1022,13 +995,8 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     def pipeline(directory: Path) -> PretrainedPipeline:
         with open(directory / "model_index.json") as handle:
             index = json.load(handle)
-        storage = param_dtype
-        if storage == AUTO:
-            from dew.interop import diffusion
-            denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
-            storage = checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
         loaded = PretrainedPipeline(processor=None, **assemble_pipeline(
-            directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=storage,
+            directory, index, dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
             lazy=streaming))
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
 
@@ -1113,7 +1081,7 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
     member, which this per-Linear binding cannot compute, so they are refused
     before returning a model with the wrong activation forward.
     """
-    from dew.training.quantization import FP8Input, NVFP4Input, checkpoint_input_quantization
+    from dew.training.quantization import FP8Input, InputQuantization, NVFP4Input
 
     codec = source_quantization(config)
     if codec is None or codec.input_scale_dtype is None:
@@ -1140,7 +1108,7 @@ def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
     if len(inputs) != sum(name.endswith(codec.input_suffix) for name in grid):
         raise ValueError("NVFP4 input scales must each bind one Linear scope; "
                          "an unbound scale would drop QDQ")
-    return checkpoint_input_quantization(model, inputs)
+    return InputQuantization(inputs).apply(model)
 
 
 def _decoder_layouts(tensors: Mapping[str, np.ndarray], record: decoder_parts.DecoderFields, family: str,
@@ -1289,9 +1257,8 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    if param_dtype == AUTO:
-        param_dtype = checkpoint_dtype(config, tensors)
-    tensors, quantized_tensors, scale_dtype, grid = _decoded(tensors, config, param_dtype)
+    tensors, quantized_tensors, scale_dtype, grid = _decoded(
+        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype)
     export_adapter = None
     media = _media_wrapper(config)
     if family == "diffusion_gemma":

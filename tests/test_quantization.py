@@ -699,7 +699,7 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
     spec = Quantization(weight_only=True, patterns=(".*_proj",))
     canonical = Pretrained.load(directory, dtype="float32").text_generation(
-        sampling=Sampling(temperature=0, eos_id=None))
+        sampling=Sampling(temperature=0, eos_token_ids=None))
     packed = dew.pipeline(str(directory), dtype="float32")
     reference = canonical.quantized(spec)
     served = packed.quantized(spec)

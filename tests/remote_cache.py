@@ -140,6 +140,12 @@ class RemoteCache:
             finally:
                 self.uploads.task_done()
 
+    def summary(self) -> str:
+        """What the remote did for this process, which a task's log ends with: a slow task whose
+        compilations missed it says so."""
+        return (f"shared XLA cache: {self.fetched} fetched, {self.uploaded} uploaded, {len(self.names)} names"
+                + ("" if self.available else ", given up as unreachable"))
+
     def drain(self, seconds: float = DRAIN_SECONDS) -> None:
         """Wait up to `seconds` for the uploads still queued or running, at the end of pytest's
         session; what is left is abandoned with the process."""

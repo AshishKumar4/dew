@@ -20,7 +20,7 @@ from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling, generate
 
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
-SAMPLING = Sampling(temperature=0.8, top_k=5, eos_id=(3, 9))
+SAMPLING = Sampling(temperature=0.8, top_k=5, eos_token_ids=(3, 9))
 
 
 def assert_same_generation(actual, expected):
@@ -52,7 +52,10 @@ def test_a_bound_task_draws_from_the_weights_it_was_bound_to():
     assert_same_generation(task(rows, 5, key=jax.random.key(1)), before)
     greedy = task(ModelInputs(jnp.asarray(rows)), 5, key=jax.random.key(2), sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(greedy.behavior_log_probs, 0)
-    assert task.decode(greedy) == ()
+    # Without a processor there is no text: the task's decode refuses as the generation's text does.
+    for decoded in (lambda: task.decode(greedy), lambda: greedy.text):
+        with pytest.raises(ValueError, match="no processor to decode with"):
+            decoded()
 
 
 def test_prepared_rows_and_text_requests_are_kept_apart():
@@ -74,7 +77,7 @@ def test_a_loaded_source_generates_from_text_with_its_own_policy():
     images = np.load(FIXTURES / "gemma3-native-tiny" / "raw_images.npy")
     prompts = json.loads((FIXTURES / "gemma3-native-tiny" / "prompts.json").read_text())
     task = loaded.text_generation()
-    assert task.sampling.temperature == 0 and task.sampling.eos_id is not None
+    assert task.sampling.temperature == 0 and task.sampling.eos_token_ids is not None
     generated = task(prompts, 3, key=jax.random.key(1), images=[[images[0]], [images[1], images[2]]])
     np.testing.assert_array_equal(generated.tokens[:, -3:],
                                   np.load(FIXTURES / "gemma3-native-tiny" / "continuation.npy"))

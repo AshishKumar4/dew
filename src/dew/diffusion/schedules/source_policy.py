@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Literal, Protocol
+from typing import Literal, NamedTuple, Protocol
 
 import numpy as np
 
@@ -105,17 +105,35 @@ _ALL_PREDICTIONS = ("epsilon", "sample", "v_prediction")
 _NO_SAMPLE = ("epsilon", "v_prediction")
 
 
+class _Controls(NamedTuple):
+    """The resolved controls a class's native solver is built from."""
+
+    kind: str
+    value: Control
+    order: int
+    algorithm: Algorithm
+    terminal: Terminal
+    variance: Variance
+    corrector: tuple[int, ...]
+
+    def flag(self, key: str) -> bool:
+        return records.boolean(self.value(key), key)
+
+
 @dataclass(frozen=True)
 class _Class:
     """Describes one pinned scheduler class.
 
     The fields are its grid family, the constructor controls it declares with
-    that class's own defaults, the `beta_schedule` tables it accepts, and the
-    `prediction_type` values its own `step` converts.
+    that class's own defaults, the native solver its controls resolve into
+    (built once, so nothing downstream re-reads a control), the
+    `beta_schedule` tables it accepts, and the `prediction_type` values its
+    own `step` converts.
     """
 
     family: Family
     fields: Mapping[str, JSON]
+    solver: Callable[[_Controls], Solver]
     schedules: tuple[str, ...] = ("linear", "scaled_linear", "squaredcos_cap_v2")
     predictions: tuple[str, ...] = _ALL_PREDICTIONS
 
@@ -123,58 +141,78 @@ class _Class:
 _SOURCES: Mapping[str, _Class] = MappingProxyType({
     "DDIM": _Class("tabulated", _fields(_VP_BETAS, _THRESHOLD, _LEADING, clip_sample=True,
                                         clip_sample_range=1.0, set_alpha_to_one=True,
-                                        rescale_betas_zero_snr=False)),
+                                        rescale_betas_zero_snr=False), lambda c: DDIM()),
     "PNDM": _Class("tabulated", _fields(_VP_BETAS, _LEADING, skip_prk_steps=False,
-                                        set_alpha_to_one=False), predictions=_NO_SAMPLE),
+                                        set_alpha_to_one=False),
+                   lambda c: PNDM(skip_prk_steps=c.flag("skip_prk_steps")), predictions=_NO_SAMPLE),
     "DDPM": _Class("tabulated", _fields(_VP_BETAS, _THRESHOLD, _LEADING,
                                         variance_type="fixed_small", clip_sample=True,
                                         clip_sample_range=1.0, rescale_betas_zero_snr=False),
-                   ("linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid")),
-    "LMSDiscrete": _Class("sigma", _fields(_VP_BETAS, _SPACED, _TRANSFORMS)),
+                   lambda c: DDPM(c.variance), ("linear", "scaled_linear", "squaredcos_cap_v2", "sigmoid")),
+    "LMSDiscrete": _Class("sigma", _fields(_VP_BETAS, _SPACED, _TRANSFORMS), lambda c: LMS(order=4)),
     "EulerDiscrete": _Class("sigma", _fields(_VP_BETAS, _SPACED, _TRANSFORMS,
                                              interpolation_type="linear", sigma_min=None,
                                              sigma_max=None, timestep_type="discrete",
                                              rescale_betas_zero_snr=False,
-                                             final_sigmas_type="zero")),
+                                             final_sigmas_type="zero"), lambda c: Euler()),
     "EulerAncestralDiscrete": _Class("sigma", _fields(_VP_BETAS, _SPACED,
                                                       rescale_betas_zero_snr=False),
-                                     predictions=_NO_SAMPLE),
+                                     lambda c: EulerAncestral(), predictions=_NO_SAMPLE),
     "HeunDiscrete": _Class("sigma", _fields(_KD_BETAS, _SPACED, _TRANSFORMS, clip_sample=False,
                                             clip_sample_range=1.0),
-                           ("linear", "scaled_linear", "squaredcos_cap_v2", "exp")),
+                           lambda c: Heun(), ("linear", "scaled_linear", "squaredcos_cap_v2", "exp")),
     "KDPM2Discrete": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS),
-                            predictions=_NO_SAMPLE),
+                            lambda c: KDPM2(ancestral=False), predictions=_NO_SAMPLE),
     "KDPM2AncestralDiscrete": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS),
-                                     predictions=_NO_SAMPLE),
+                                     lambda c: KDPM2(ancestral=True), predictions=_NO_SAMPLE),
     "DPMSolverSDE": _Class("stage", _fields(_KD_BETAS, _SPACED, _TRANSFORMS,
-                                            noise_sampler_seed=None), predictions=_NO_SAMPLE),
+                                            noise_sampler_seed=None),
+                           lambda c: DPMSolverSDE(seed=_optional_seed(c.value)), predictions=_NO_SAMPLE),
     "DPMSolverMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS,
                                                    _FLOW, _DPM, lower_order_final=True,
                                                    euler_at_final=False, use_lu_lambdas=False,
-                                                   rescale_betas_zero_snr=False)),
+                                                   rescale_betas_zero_snr=False),
+                                 lambda c: _dpm_multistep(c)),
     "DPMSolverSinglestep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _TRANSFORMS, _FLOW,
-                                                    _DPM, lower_order_final=False)),
+                                                    _DPM, lower_order_final=False),
+                                  # `set_timesteps` rewrites lower_order_final for a zero
+                                  # terminal, and the class's own `step` has no noise term
+                                  # for the SDE algorithm.
+                                  lambda c: DPMSolverSinglestep(
+                                      c.order, named_choice(c.algorithm, "algorithm_type",
+                                                            ("dpmsolver++", "dpmsolver", "sde-dpmsolver++")),
+                                      _solver_type(c.kind, c.value, ("midpoint", "heun")),
+                                      c.flag("lower_order_final") or c.terminal == "zero")),
+    # DEIS rewrites the two DPM solver names to its own and refuses the rest;
+    # its native integrator carries neither control.
     "DEISMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS, _FLOW,
                                               solver_order=2, algorithm_type="deis",
-                                              solver_type="logrho", lower_order_final=True)),
+                                              solver_type="logrho", lower_order_final=True),
+                            lambda c: _deis(c)),
     "UniPCMultistep": _Class("lambda", _fields(_VP_BETAS, _THRESHOLD, _SPACED, _TRANSFORMS, _FLOW,
                                                solver_order=2, predict_x0=True, solver_type="bh2",
                                                lower_order_final=True, disable_corrector=[],
                                                solver_p=None, final_sigmas_type="zero",
-                                               rescale_betas_zero_snr=False)),
+                                               rescale_betas_zero_snr=False),
+                             lambda c: UniPC(c.order, _solver_type(c.kind, c.value, ("bh1", "bh2")),
+                                             c.flag("predict_x0"), c.flag("lower_order_final"), c.corrector)),
     "EDMDPMSolverMultistep": _Class("edm", _fields(
         _THRESHOLD, num_train_timesteps=1000, prediction_type="epsilon", sigma_min=0.002,
         sigma_max=80.0, sigma_data=0.5, sigma_schedule="karras", rho=7.0, solver_order=2,
         algorithm_type="dpmsolver++", solver_type="midpoint", lower_order_final=True,
-        euler_at_final=False, final_sigmas_type="zero"), (), _NO_SAMPLE),
+        euler_at_final=False, final_sigmas_type="zero"),
+        lambda c: _dpm_multistep(c),
+        (), _NO_SAMPLE),
     "FlowMatchEulerDiscrete": _Class("flow", _fields(
         _TRANSFORMS, num_train_timesteps=1000, prediction_type="flow_prediction", shift=1.0,
         use_dynamic_shifting=False,
         base_shift=0.5, max_shift=1.15, base_image_seq_len=256, max_image_seq_len=4096,
         invert_sigmas=False, shift_terminal=None, time_shift_type="exponential",
-        stochastic_sampling=False), (), ("flow_prediction",)),
-    "LCM": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED)),
-    "TCD": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED)),
+        stochastic_sampling=False), lambda c: Euler(), (), ("flow_prediction",)),
+    "LCM": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED), lambda c: Consistency()),
+    # The source takes TCD's eta as a step argument, not a checkpoint field, so
+    # the solver keeps the step signature's own default.
+    "TCD": _Class("tabulated", _fields(_LCM_BETAS, _DISTILLED), lambda c: TCD()),
 })
 
 # Controls a class declares whose active meaning this file does not
@@ -544,67 +582,24 @@ def _resolve(kind: str, source: _Class, value: Control,
         original_steps=original_steps,
         timestep_scaling=records.number(value("timestep_scaling", 10.0), "timestep_scaling"),
         flow=flow, flow_shift=flow_shift)
-    return policy, _build_solver(kind, value, order, algorithm, terminal,
-                                 variance, disabled)
+    controls = _Controls(kind, value, order, algorithm, terminal, variance, disabled)
+    return policy, _SOURCES[kind].solver(controls)
 
 
-def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
-                  terminal: Terminal, variance: Variance,
-                  corrector: tuple[int, ...]) -> Solver:
-    """The native solver this class and its controls name, built once.
+def _dpm_multistep(controls: _Controls) -> Solver:
+    return DPMSolverMultistep(controls.order, controls.algorithm,
+                              _solver_type(controls.kind, controls.value, ("midpoint", "heun")),
+                              controls.flag("lower_order_final"), controls.flag("euler_at_final"))
 
-    A solver is a frozen value, so the file's class and controls resolve into
-    one here and `SourceSchedule.solver` holds that same value. Nothing
-    downstream re-reads a control to rebuild it.
-    """
-    if kind == "DDIM":
-        return DDIM()
-    if kind == "PNDM":
-        return PNDM(skip_prk_steps=records.boolean(value("skip_prk_steps"), "skip_prk_steps"))
-    if kind == "DDPM":
-        return DDPM(variance)
-    if kind == "LMSDiscrete":
-        return LMS(order=4)
-    if kind in ("EulerDiscrete", "FlowMatchEulerDiscrete"):
-        return Euler()
-    if kind == "EulerAncestralDiscrete":
-        return EulerAncestral()
-    if kind == "HeunDiscrete":
-        return Heun()
-    if kind in ("KDPM2Discrete", "KDPM2AncestralDiscrete"):
-        return KDPM2(ancestral=kind == "KDPM2AncestralDiscrete")
-    if kind == "DPMSolverSDE":
-        seed = value("noise_sampler_seed")
-        return DPMSolverSDE(seed=None if seed is None
-                            else records.integer(seed, "noise_sampler_seed"))
-    if kind == "DEISMultistep":
-        # The class rewrites the two DPM names to its own and refuses the
-        # rest; its native integrator carries neither control.
-        _solver_type(kind, value, ("logrho",))
-        return DEIS(order, records.boolean(value("lower_order_final"), "lower_order_final"))
-    if kind == "LCM":
-        return Consistency()
-    if kind == "TCD":
-        # The source takes eta as a step argument, not a checkpoint field, so
-        # this is the step signature's own default.
-        return TCD()
-    lower_order_final = records.boolean(value("lower_order_final"), "lower_order_final")
-    if kind == "UniPCMultistep":
-        return UniPC(order, _solver_type(kind, value, ("bh1", "bh2")),
-                     records.boolean(value("predict_x0"), "predict_x0"), lower_order_final, corrector)
-    if kind == "DPMSolverSinglestep":
-        # `set_timesteps` rewrites this control for a zero terminal, so the
-        # reconstruction reads the value the source would walk with.
-        return DPMSolverSinglestep(
-            # The class's own `step` has no noise term for the SDE algorithm.
-            order, named_choice(algorithm, "algorithm_type",
-                           ("dpmsolver++", "dpmsolver", "sde-dpmsolver++")),
-            _solver_type(kind, value, ("midpoint", "heun")),
-            lower_order_final or terminal == "zero")
-    return DPMSolverMultistep(order, algorithm,
-                              _solver_type(kind, value, ("midpoint", "heun")),
-                              lower_order_final,
-                              records.boolean(value("euler_at_final"), "euler_at_final"))
+
+def _deis(controls: _Controls) -> Solver:
+    _solver_type(controls.kind, controls.value, ("logrho",))
+    return DEIS(controls.order, controls.flag("lower_order_final"))
+
+
+def _optional_seed(value: Control) -> int | None:
+    seed = value("noise_sampler_seed")
+    return None if seed is None else records.integer(seed, "noise_sampler_seed")
 
 
 def _prediction_transform(policy: SourcePolicy, prediction: str) -> PredictionTransform:

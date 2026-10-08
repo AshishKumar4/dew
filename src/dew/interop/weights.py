@@ -5,9 +5,11 @@ from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 
-from dew.registry import resolve_dtype
+from dew import records
+from dew.registry import dtype_name, resolve_dtype
 
 if TYPE_CHECKING:
     from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout
@@ -17,11 +19,39 @@ type ParamTree = Tree[np.ndarray]
 type TensorPath = Callable[[str], tuple[str, ...] | None]
 
 
+AUTO = "auto"
+"""The param_dtype that stores a checkpoint's parameters in its own dtype."""
+
+
+def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
+    """The compute dtype a checkpoint declares, which its packed FP8 or FP4
+    payloads decode to under param_dtype 'auto': config.json's `dtype`
+    (`torch_dtype` before transformers 5.0), else the dtype of the first
+    floating tensor (transformers' `_get_dtype`, modeling_utils.py, 5.16.1).
+    """
+    stated = config.get("dtype", config.get("torch_dtype"))
+    if stated is not None:
+        storage = dtype_name(resolve_dtype(records.text(stated, "dtype")))
+        if storage is None:
+            raise ValueError(f"dtype={stated!r} names no floating parameter storage")
+        return storage
+    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
+                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
+    for tensor in tensors.values():
+        if tensor.dtype in storable:
+            return storable[tensor.dtype]
+    raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
+                     "float16 tensor in the checkpoint")
+
+
 def checkpoint_dtype(stored: np.dtype, param_dtype: str = "float32", *,
                      path: tuple[str, ...] = ()) -> np.dtype:
-    """Floating payloads use parameter storage; integer and boolean state keeps its dtype."""
+    """Floating payloads use parameter storage, or under `AUTO` keep the dtype
+    each was stored in; integer and boolean state keeps its dtype."""
     if path and (path[0] == 'constants' or (path[0] == 'params' and path[-1] == 'head_bias')):
         param_dtype = 'float32'
+    if param_dtype == AUTO:
+        return stored
     dtype = resolve_dtype(param_dtype)
     if dtype is None or not jnp.issubdtype(dtype, jnp.floating):
         raise ValueError(f"param_dtype {param_dtype!r} must name floating parameter storage")

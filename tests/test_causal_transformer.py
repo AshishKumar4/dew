@@ -20,6 +20,7 @@ from model_support import TINY_DECODER
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer
 from dew.registry import models
 
@@ -1337,10 +1338,12 @@ def test_a_multiplier_scales_bf16_states_in_fp32_opmath():
 
 
 @pytest.mark.parametrize("extra", [{"laurel_rank": 8}, {"per_layer_input_dim": 4},
-                                   {"altup": {"num_inputs": 2}}])
+                                   {"altup": {"num_inputs": 2}},
+                                   {"hyper_connections": HyperConnections(hc_mult=2)}])
 def test_mup_fields_refuse_blocks_that_do_not_carry_them(extra):
-    """LAuReL, AltUp and per-layer inputs keep their own inits and add their
-    branches unscaled, so lm-engine's multipliers cannot be asked of them."""
+    """LAuReL, AltUp, per-layer inputs and mHC's stream stack keep their own
+    inits and add their branches unscaled, so lm-engine's multipliers cannot be
+    asked of them."""
     model = tiny(initializer_range=0.02, residual_multiplier=0.22, **extra)
     with pytest.raises(ValueError, match="lm-engine's dense and routed blocks"):
         model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))

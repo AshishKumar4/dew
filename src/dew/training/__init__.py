@@ -9,7 +9,7 @@ from dew.checkpoints import Checkpoints, Keep
 from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step, everything, under
 
 from .distributed import DEFAULT_RULES, Layout, MeshSpec
-from .evaluation import Evaluation
+from .evaluation import EvalSuite, Evaluation
 from .quantization import Quantization
 from .runtime import Preempted, prepare_process, run_timestamp
 from .selection import Best
@@ -18,8 +18,8 @@ from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, T
 from .trainer import Plateau, ProfileWindow, Rollout, Trainer
 from .transaction import ema_update
 
-__all__ = ["DEFAULT_RULES", "Aux", "Best", "Checkpoints", "EMASpec", "Evaluation", "Keep", "Layout",
-           "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Plateau", "Preempted",
-           "ProfileWindow", "Quantization", "Rollout", "Step", "TensorBoardTracker", "Tracker", "Trackers",
-           "TrainState", "Trainer", "WandbTracker", "ema_update", "everything", "prepare_process",
-           "run_timestamp", "under"]
+__all__ = ["DEFAULT_RULES", "Aux", "Best", "Checkpoints", "EMASpec", "EvalSuite", "Evaluation", "Keep",
+           "Layout", "LocalTracker", "MLflowTracker", "MeshSpec", "Metric", "Objective", "Plateau",
+           "Preempted", "ProfileWindow", "Quantization", "Rollout", "Step", "TensorBoardTracker",
+           "Tracker", "Trackers", "TrainState", "Trainer", "WandbTracker", "ema_update", "everything",
+           "prepare_process", "run_timestamp", "under"]

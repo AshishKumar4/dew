@@ -654,6 +654,47 @@ def test_a_config_without_swiglu_limit_clamps_nothing():
     assert translate_config({**config, "text_config": text})["swiglu_limit"] is None
 
 
+def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeypatch):
+    """The wrapper dispatch and the routing of a bundle's tensors read the
+    family's own entry, so a bundled family under another name loads with
+    no branch of its own: its reader takes its config and its projector
+    names route to the projector, the decoder's tensors unprefixed."""
+    import dataclasses
+
+    from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
+    from dew.interop.hf_decoders import wrapper_route
+
+    read = []
+
+    def reader(hf_config, used):
+        read.append(hf_config["model_type"])
+        return {**DEEPSEEK_V41.wrapper(dict(hf_config, model_type="deepseek_v41"), used),
+                "model_type": "bundle_probe"}
+
+    probe = dataclasses.replace(DEEPSEEK_V41, model_types=("bundle_probe",), wrapper=reader,
+                                wrapper_projector_names=("probe_span",))
+    monkeypatch.setitem(families(), "bundle_probe", probe)
+    config = json.loads((RELEASED / "config.json").read_text())
+    record = translate_wrapper_config({**config, "model_type": "bundle_probe"})
+    assert read == ["bundle_probe"] and record["model_type"] == "bundle_probe"
+    assert wrapper_route("probe_span", record) == ("projector", "probe_span")
+    assert wrapper_route("image_newline", record) == ("language_model", "image_newline")
+    assert wrapper_route("embed.weight", record) == ("language_model", "embed.weight")
+
+
+def test_rate_one_compression_keeps_no_window_buffer():
+    """A window of one token closes with the token, so at rate 1 every token
+    is an entry at once: the cache is the entries alone, with no window
+    buffer or gate to scan."""
+    from dew.nn.deepseek_v4 import CompressedEntries
+
+    entries = CompressedEntries(width=4, rate=1, overlap=False, rope_dim=0, rope_theta=10000.0, yarn=None,
+                                norm_eps=1e-6, position_bias=False)
+    variables = entries.init(jax.random.key(0), jnp.ones((1, 2, 4), jnp.float32), jnp.asarray([[0, 1]]), 4,
+                             write=False, method=CompressedEntries.cached_entries)
+    assert set(variables["cache"]) == {"compressed"}
+
+
 def test_the_vision_half_matches_the_reference(tmp_path):
     """The bundle's vision half: the ViT's patches, blocks and 2D rotary, the
     aligner over a patch grid it pads to whole squares, the span's learned

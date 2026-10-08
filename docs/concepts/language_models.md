@@ -244,7 +244,7 @@ print(tokenizer.decode(result.tokens[0]), result.lengths)
 ```
 
 ```text
-Sampling(temperature=0.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0, no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
+Sampling(temperature=0.0, top_k=None, eos_token_ids=None, pad_token_id=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0, no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
 At night, Lily went home. She wa [24]
 ```
 
@@ -258,7 +258,7 @@ A Hub name such as `"Qwen/Qwen3-0.6B"` loads the same way, and the published che
 
 From the Hub, the loader fetches the configs and indexes first, then only the weight files the index's `weight_map` names, or `model.safetensors` when there is no index. It does not download other copies of the weights in the repo, such as Mistral's `consolidated.safetensors`, a pipeline's fp16 variants and root single-file checkpoints. A tensor stored in two shards is refused. `Pretrained.revision` records the commit the Hub resolved, so you know exactly what you loaded even if the branch moves later. It is `None` for a local directory.
 
-`param_dtype` defaults to float32 master weights. `param_dtype="auto"` stores parameters in the checkpoint's own dtype, which is `dtype` in `config.json` or else the dtype of the first floating tensor, the same rule transformers' `dtype="auto"` follows. `Pretrained.load(..., mesh=MeshSpec(...), layout=Layout(...))`, which `dew.pipeline` calls, places each weight on its devices directly from the memory-mapped checkpoint, one device shard at a time, so the host never holds the whole translated model ([Distributed training](distributed.md) has the measurements).
+`Pretrained.load`'s `param_dtype` defaults to float32 master weights, and `dew.pipeline`'s to `"auto"`. `param_dtype="auto"` keeps each tensor in the dtype the checkpoint stores it in, so a bf16 checkpoint's fp32 state (Mamba's `A_log`, a router's correction bias) stays fp32; a quantized checkpoint's packed weights decode to the `dtype` its `config.json` declares, or else the first floating tensor's. `Pretrained.load(..., mesh=MeshSpec(...), layout=Layout(...))`, which `dew.pipeline` calls, places each weight on its devices directly from the memory-mapped checkpoint, one device shard at a time, so the host never holds the whole translated model ([Distributed training](distributed.md) has the measurements).
 
 A config field Dew cannot express is refused by name. The exceptions are the fields in `_INERT_FIELDS` (`dew/interop/hf_decoders.py`), which transformers 5.16.1 neither declares nor reads, such as SmolLM2's `transformers.js_config`, Qwen2.5's `use_mrope: false` and the Mamba2 ports' `rms_norm`. A family reads only the fields its transformers config class declares. A Llama config that names a sliding window is refused, because transformers' Llama attends to every key; the window is read only for a model type that applies it, such as Mistral or Ministral. MLX quantization is refused by name.
 

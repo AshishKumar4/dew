@@ -35,10 +35,14 @@ export class ModelPool extends DurableObject<Env> {
 		});
 	}
 
-	async status(): Promise<{ generation: string | null; ready: number; starting: number; active: number; minimum: number }> {
+	async status(): Promise<{ generation: string | null; ready: number; starting: number; active: number; minimum: number;
+		hosts: Record<string, Record<string, unknown> | null> }> {
 		const pool = await this.state();
-		return { generation: pool.serving ?? null, ready: pool.hosts.filter((host) => host.ready).length,
-			starting: pool.hosts.filter((host) => !host.ready).length, active: Object.keys(pool.sessions).length, minimum: MIN_HOSTS };
+		const ready = pool.hosts.filter((host) => host.ready);
+		const health = await Promise.all(ready.map((host) => this.env.SHARED.get(this.env.SHARED.idFromName(host.id)).health()));
+		return { generation: pool.serving ?? null, ready: ready.length,
+			starting: pool.hosts.filter((host) => !host.ready).length, active: Object.keys(pool.sessions).length, minimum: MIN_HOSTS,
+			hosts: Object.fromEntries(ready.map((host, index) => [host.id, health[index]])) };
 	}
 
 	async image(): Promise<string | null> {
@@ -95,11 +99,26 @@ export class ModelPool extends DurableObject<Env> {
 	}
 
 	override async alarm(): Promise<void> {
+		// A Worker whose POOL binding moved to another script's pool leaves this one running on
+		// its alarm, warming hosts no visitor reaches: it retires them and stops instead.
+		if (!this.env.POOL.idFromName('global').equals(this.ctx.id)) {
+			const pool = await this.state();
+			for (const host of pool.hosts) {
+				try { await this.env.SHARED.get(this.env.SHARED.idFromName(host.id)).retire(); }
+				catch (error) {
+					console.error('orphaned model host did not retire', host.id, error);
+					await this.ctx.storage.setAlarm(Date.now() + CHECK_MS);
+					return;
+				}
+			}
+			await this.ctx.storage.deleteAll();
+			return;
+		}
 		try {
 			let pool = await this.state();
 			if (!pool.desired) return;
 			for (const [session, host] of Object.entries(pool.sessions)) {
-				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) await this.release(session);
+				if (!(await this.env.SHARED.get(this.env.SHARED.idFromName(host)).has(session))) await this.close(session);
 			}
 			pool = await this.state();
 			const target = Math.max(MIN_HOSTS, Math.ceil(Object.keys(pool.sessions).length / TARGET_LOAD));

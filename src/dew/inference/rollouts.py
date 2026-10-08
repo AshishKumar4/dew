@@ -509,7 +509,7 @@ class OpenAIRolloutServer(_RequestServer):
             [list(prompt)],
             budget,
             key=seed,
-            sampling=replace(self._sampling, pad_id=0),
+            sampling=replace(self._sampling, pad_token_id=0),
             logprobs=0,
             extra_body=self._return_ids,
         )
@@ -572,7 +572,7 @@ class VLLMGenerateServer(_RequestServer):
         parameters: dict[str, JSON] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                        "top_k": sampling.top_k, "min_p": sampling.min_p,
                                        "max_tokens": budget, "seed": seed, "logprobs": 0}
-        if sampling.eos_id is not None:
+        if sampling.eos_token_ids is not None:
             parameters["stop_token_ids"] = list(sampling.stops)
         response = _post(self._root, "/inference/v1/generate",
                          {"token_ids": list(prompt), "sampling_params": parameters}, self._timeout)

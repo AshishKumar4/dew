@@ -25,12 +25,14 @@ from releases import released_sampling
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow, ResolutionShift
+from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
+from dew.diffusion.transforms import FlowMatchPredictionTransform, ScheduleWeighting
 from dew.objectives import Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig, TextCondition
 from dew.objectives.rl.flow import FlowGRPOObjective
-from dew.registry import argument_records
+from dew.registry import argument_records, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
 
@@ -111,7 +113,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
-    assert configured.process.to_json() == written.process.to_json()
+    assert to_record(configured.process, Process) == to_record(written.process, Process)
     assert type(configured.autoencoder) is type(written.autoencoder)
     assert configured.inputs.sample == written.inputs.sample
     assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
@@ -183,8 +185,8 @@ def test_a_published_flow_pipeline_trains_on_the_sd3_papers_convention(family, p
     process = flow_run(family, 16, pipelines).build().process
     schedule = process.schedule
     assert (schedule.density, schedule.logit_mean, schedule.logit_std) == ("logit_normal", 0.0, 1.0)
-    assert process.to_json()["weighting"] == {"name": "ScheduleWeighting", "fields": {}}
-    assert process.to_json()["prediction"]["name"] == "FlowMatchPredictionTransform"
+    assert type(process.weighting) is ScheduleWeighting
+    assert type(process.prediction) is FlowMatchPredictionTransform
 
 
 DRAWS = dict(np.load(FIXTURES / "flow" / "draws.npz"))
@@ -278,6 +280,22 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
                                          SHIFTS[f"{constants}/sigmas_f64"][index], f"{constants} at {tokens}")
 
 
+def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pipelines):
+    """`pretrained_param_dtype` is the storage the pipeline's denoiser loads
+    and trains in; with no pipeline it is refused rather than ignored."""
+    objective = ObjectiveConfig("diffusion", {"guidance": None, "ema_decay": None})
+    configured = DiffusionRunConfig(pretrained=str(pipelines / "flux" / "pipeline"), preset=None,
+                                    model=precision(), pretrained_param_dtype="bfloat16",
+                                    data=TFDSImages(image_size=16), val_metrics=(),
+                                    objective=objective).build()
+    state = Trainer(configured, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
+    floating = [leaf for leaf in jax.tree.leaves(state.variables["params"])
+                if jnp.issubdtype(leaf.dtype, jnp.floating)]
+    assert floating and all(leaf.dtype == jnp.bfloat16 for leaf in floating)
+    with pytest.raises(ValueError, match="this run loads none"):
+        DiffusionRunConfig(pretrained_param_dtype="bfloat16")
+
+
 def test_a_pretrained_run_refuses_a_model_of_its_own():
     with pytest.raises(ValueError, match=r"leave model, text unset"):
         DiffusionRunConfig(pretrained="some/pipeline", model=ModelConfig("simple_dit"),
@@ -287,7 +305,9 @@ def test_a_pretrained_run_refuses_a_model_of_its_own():
 def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pipelines):
     """Flux from scratch in pixel space, conditioned by the Flux pipeline's
     CLIP and T5 towers: the conditioner's record goes in under `conditioning`,
-    where the published family reads it."""
+    where the published family reads it, and ten steps on one batch lower
+    its loss (one step draws its own noise, which a single step's loss on
+    the evaluation's draw need not follow)."""
     directory = pipelines / "flux" / "pipeline"
     config = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {
@@ -305,8 +325,10 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
     before = value(objective, initial.variables, batch)
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
-    assert bool(accepted)
+    step, state = trainer.compile(initial, batch), initial
+    for _ in range(10):
+        state, _, _, _, accepted = step(state, batch)
+        assert bool(accepted)
     assert value(objective, state.variables, batch) < before
 
 

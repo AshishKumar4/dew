@@ -31,11 +31,12 @@ from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
+from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import TextContext, masked_mean
-from dew.objectives.base import Aux, Batch, Objective, Step, Variables
+from dew.objectives.base import TEACHER, Aux, Batch, Objective, Step, Variables
 
-from .objective import DISCRIMINATOR, SPECTRAL, TEACHER, FlowDistillationObjective
+from .objective import DISCRIMINATOR, SPECTRAL, FlowDistillationObjective
 
 
 class SpectralConv(nn.Module):
@@ -56,13 +57,13 @@ class SpectralConv(nn.Module):
         kernel = self.param("kernel", lambda key: jax.random.uniform(key, shape, minval=-bound, maxval=bound))
         bias = self.param("bias", lambda key: jax.random.uniform(
             key, (self.features,), minval=-bound, maxval=bound))
-        u = self.variable(SPECTRAL, "u", lambda: _normalized(jax.random.normal(self.make_rng("params"),
+        u = self.variable(SPECTRAL, "u", lambda: l2_normalized(jax.random.normal(self.make_rng("params"),
                                                                                 (self.features,))))
         # torch's [out, in, kh, kw] flattened per output channel.
         matrix = jnp.transpose(kernel, (3, 2, 0, 1)).reshape(self.features, -1)
         held = jax.lax.stop_gradient(matrix)
-        v = _normalized(held.T @ u.value)
-        following = _normalized(held @ v)
+        v = l2_normalized(held.T @ u.value)
+        following = l2_normalized(held @ v)
         sigma = following @ (matrix @ v)
         if update and not self.is_initializing():
             u.value = following
@@ -73,10 +74,6 @@ class SpectralConv(nn.Module):
         y = jax.lax.conv_general_dilated(x, (kernel / sigma).astype(x.dtype), (1, 1), pad,
                                          dimension_numbers=("NHWC", "HWIO", "NHWC"))
         return y + bias
-
-
-def _normalized(x: jax.Array, eps: float = 1e-12) -> jax.Array:
-    return x / jnp.maximum(jnp.linalg.norm(x), eps)
 
 
 class BatchNormLocal(nn.Module):

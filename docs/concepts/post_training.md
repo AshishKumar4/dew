@@ -304,7 +304,7 @@ Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough conte
 | `sequence_mask`, `geometric_mask` | `None` | Chain rejection by summed or mean k1. |
 | `sampling_temperature` | `1.0` | Temperature the sampled IDs are scored at. |
 
-Pass `sampling=Sampling(eos_id=..., temperature=..., top_k=...)`; `eos_id` takes one ID or a tuple. The response mask includes EOS; the text passed to the reward leaves out EOS and padding. The rollout turns `prompt_length` into the standard `ModelInputs` attention mask.
+Pass `sampling=Sampling(eos_token_ids=..., temperature=..., top_k=...)`; `eos_id` takes one ID or a tuple. The response mask includes EOS; the text passed to the reward leaves out EOS and padding. The rollout turns `prompt_length` into the standard `ModelInputs` attention mask.
 
 Generation prefills the padded batch once and packs the real tokens into each row's cache, so prompts of different valid lengths reuse the same compiled shape. After a row hits EOS, later steps leave its cache unchanged. Rescoring reads each chain on its own through its segment IDs and positions. GRPO validation scores prompt perplexity over real next-token transitions; it does not generate answers for a separate reward evaluation.
 

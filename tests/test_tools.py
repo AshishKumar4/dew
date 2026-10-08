@@ -301,7 +301,7 @@ def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch
     from dew.sampling import Sampling
 
     tool = load("benchmark_lm_serving")
-    bound = task(Sampling(temperature=0, eos_id=None))
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
     prompts = np.asarray([[1, 2], [3, 4]], np.int32)
     monkeypatch.setattr(dew, "pipeline", lambda *args, **kwargs: bound)
     monkeypatch.setattr(tool, "prompts_for", lambda *args, **kwargs: prompts)
@@ -1149,3 +1149,102 @@ def test_the_census_counts_a_speculative_drafter_as_refused_by_design(tmp_path):
     assert "['DSparkDraftModel']" in routes["drafter"][1]
     assert coverage["summary"]["all types"]["by design"] == {"models": 1, "download_share": 0.75}
     assert coverage["summary"]["all types"]["refused"]["models"] == 0
+
+
+def test_a_tutorials_outputs_are_stale_after_a_dependency_only_commit(tmp_path, monkeypatch):
+    """The outputs come from the library and its pinned dependencies, so a
+    commit that changes only pyproject.toml makes them stale, as one to a
+    module the notebook imported does."""
+    checker = load("check_tutorial_outputs")
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+
+    (tmp_path / "src" / "dew").mkdir(parents=True)
+    (tmp_path / "src" / "dew" / "probe.py").write_text("VALUE = 1\n")
+    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.2"]\n')
+    git("init", "-q")
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outputs")
+    recorded = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    notebook = tmp_path / "probe.ipynb"
+    notebook.write_text(json.dumps({"metadata": {"dew": {"outputs": {"commit": recorded}}}, "cells": []}))
+    monkeypatch.setattr(checker, "ROOT", tmp_path)
+    imports = {"probe.ipynb": ["dew.probe"]}
+    assert checker.verdict(notebook, imports)[0] == "current"
+    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.3"]\n')
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "dependency")
+    label, lines = checker.verdict(notebook, imports)
+    assert label == "STALE" and "pyproject.toml" in lines[0]
+
+
+def _committed(repository: Path, message: str) -> str:
+    def git(*args):
+        command = ["git", "-C", str(repository), "-c", "user.name=t", "-c", "user.email=t@t", *args]
+        return subprocess.run(command, check=True, capture_output=True, text=True).stdout.strip()
+
+    git("add", "-A")
+    git("commit", "-q", "-m", message)
+    return git("rev-parse", "HEAD")
+
+
+def test_saved_tutorial_outputs_name_the_commit_that_last_changed_a_dependency(tmp_path, monkeypatch):
+    """The outputs come from the library and its pinned dependencies, so the
+    commit a save records is the last one to change either, and an
+    uncommitted dependency change leaves no commit to record."""
+    runner = load("run_tutorials")
+    (tmp_path / "src" / "dew").mkdir(parents=True)
+    (tmp_path / "src" / "dew" / "probe.py").write_text("VALUE = 1\n")
+    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.2"]\n')
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    _committed(tmp_path, "library")
+    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.3"]\n')
+    dependency = _committed(tmp_path, "dependency")
+    (tmp_path / "notes.txt").write_text("unrelated\n")
+    _committed(tmp_path, "notes")
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    assert runner.library_commit() == dependency
+    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.4"]\n')
+    with pytest.raises(SystemExit, match="uncommitted"):
+        runner.library_commit()
+
+
+@pytest.mark.parametrize("stop", ["CellTimeoutError", "DeadKernelError"])
+def test_a_tutorial_run_records_a_stalled_notebook_and_runs_the_rest(tmp_path, monkeypatch, stop):
+    """A cell that times out or a kernel that dies fails its notebook, and the
+    run goes on to the next one; the kernel spec a reused --workdir holds is
+    written again for this interpreter."""
+    import nbformat
+
+    runner = load("run_tutorials")
+    (tmp_path / "tutorials").mkdir()
+    for name in ("01-stalls.ipynb", "02-runs.ipynb"):
+        nbformat.write(nbformat.v4.new_notebook(cells=[nbformat.v4.new_code_cell("x = 1")]),
+                       tmp_path / "tutorials" / name)
+    workdir = tmp_path / "work"
+    stale = workdir / ".jupyter" / "kernels" / "dew-tutorials"
+    stale.mkdir(parents=True)
+    (stale / "kernel.json").write_text(json.dumps({"argv": ["/gone/python", "-m", "ipykernel_launcher"],
+                                                   "display_name": "old", "language": "python"}))
+    ran = []
+
+    class Client:
+        def __init__(self, notebook, **options):
+            self.notebook = notebook
+
+        def execute(self):
+            ran.append(len(ran))
+            if len(ran) == 1:
+                raise getattr(runner, stop)("stalled")
+            probe = {"modules": ["dew"], "device": "cpu", "jax": "0"}
+            self.notebook.cells[-1].outputs = [nbformat.v4.new_output(
+                "stream", name="stdout", text=runner.PROBE_MARK + json.dumps(probe) + "\n")]
+
+    monkeypatch.setattr(runner, "ROOT", tmp_path)
+    monkeypatch.setattr(runner, "NotebookClient", Client)
+    monkeypatch.setenv("JUPYTER_PATH", "")
+    monkeypatch.setattr(sys, "argv", ["run_tutorials.py", "--workdir", str(workdir)])
+    assert runner.main() == 1
+    assert ran == [0, 1]
+    assert json.loads((stale / "kernel.json").read_text())["argv"][0] == sys.executable

@@ -12,6 +12,10 @@ export class Preparer extends DurableObject {
 		return { snapshot: { id: crypto.randomUUID() }, commit, created: Date.now(),
 			prepareSeconds: 1, snapshotSeconds: 1, smokeSeconds: 1 };
 	}
+	async trial(commit: string) {
+		await this.ctx.storage.put('trials', ((await this.ctx.storage.get<number>('trials')) ?? 0) + 1);
+		return this.prepare(commit);
+	}
 	async fail() { await this.ctx.storage.put('fail', true); }
 	async calls() { return (await this.ctx.storage.get<number>('calls')) ?? 0; }
 }
@@ -39,6 +43,16 @@ export default {
 			await registry.ensure(B);
 			await registry.runAlarm();
 			return Response.json({ status: await registry.status(), now: Date.now() });
+		}
+		if (scenario === 'trial') {
+			await registry.refresh(A);
+			const renewal = (await registry.status()).alarm;
+			await registry.trial(B);
+			const pending = await registry.trialled();
+			await registry.runAlarm();
+			const trials = env.PREPARER.get(env.PREPARER.idFromName('trial'));
+			return Response.json({ pending, trialled: await registry.trialled(), active: await registry.previous(),
+				renewal, alarm: (await registry.status()).alarm, trialCalls: await trials.calls(), trustedCalls: await preparer.calls() });
 		}
 		if (scenario === 'concurrent') {
 			const replies = await Promise.all(Array.from({ length: 10 }, () => registry.refresh(A)));

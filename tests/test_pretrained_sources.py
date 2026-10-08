@@ -416,24 +416,21 @@ def leaf_dtypes(variables):
     return {np.dtype(leaf.dtype) for leaf in jax.tree.leaves(variables["params"])}
 
 
-@pytest.mark.parametrize("stated, stored", [
-    ({}, ml_dtypes.bfloat16),                       # the first floating tensor's
-    ({"dtype": "float16"}, np.float16),             # config.json's, which wins
-    ({"torch_dtype": "float32"}, np.float32),       # the pre-5.0 spelling
-])
-def test_param_dtype_auto_stores_the_checkpoints_dtype(tmp_path, stated, stored):
-    """transformers' dtype='auto' rule: config.json's dtype, else the
-    dtype of the first floating tensor."""
+@pytest.mark.parametrize("stated", [{}, {"dtype": "float16"}, {"torch_dtype": "float32"}])
+def test_param_dtype_auto_stores_each_tensor_as_the_checkpoint_stores_it(tmp_path, stated):
+    """A stated dtype decides only what packed weights decode to; every
+    stored tensor keeps its own dtype (tests/test_auto_storage.py)."""
     loaded = pretrained.Pretrained.load(bf16_source(tmp_path, **stated), dtype="float32",
                                         param_dtype="auto", attention_impl="xla")
 
-    assert leaf_dtypes(loaded.variables) == {np.dtype(stored)}
+    assert leaf_dtypes(loaded.variables) == {np.dtype(ml_dtypes.bfloat16)}
 
 
-def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path):
+@pytest.mark.parametrize("param_dtype", [None, "auto"])
+def test_the_pipeline_places_a_source_in_its_own_dtype(tmp_path, param_dtype):
     import dew
 
-    task = dew.pipeline(str(bf16_source(tmp_path)), dtype="float32", param_dtype="auto")
+    task = dew.pipeline(str(bf16_source(tmp_path)), dtype="float32", param_dtype=param_dtype)
 
     assert leaf_dtypes(task.variables) == {np.dtype(ml_dtypes.bfloat16)}
 
@@ -485,7 +482,7 @@ if sys.argv[2] == "typed":
     from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
     task = Pretrained.load(sys.argv[1], dtype="bfloat16", param_dtype="auto").text_generation(
-        sampling=Sampling(temperature=0, eos_id=None))
+        sampling=Sampling(temperature=0, eos_token_ids=None))
     generated = task(np.asarray([[1,2,3]], np.int32), 3, key=0).host()
     assert int(generated.lengths[0]) == 3
 else:

@@ -25,7 +25,7 @@ from dew.training import Trainer
 PAD, START, CALL_THREE, EOS, NINE, ANSWER_NINE, WRONG, CALL_FOUR, SIXTEEN, ANSWER_SIXTEEN = range(10)
 VOCAB = 12
 PROMPT, RESPONSE, TURNS, GROUPS = 8, 3, 3, 4
-SAMPLING = Sampling(temperature=.7, top_k=2, eos_id=EOS, pad_id=PAD)
+SAMPLING = Sampling(temperature=.7, top_k=2, eos_token_ids=EOS, pad_token_id=PAD)
 
 
 IDENTITY = EpisodeId(task=3, attempt=0, sample=0, seed=(1, 2))

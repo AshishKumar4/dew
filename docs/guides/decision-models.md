@@ -10,6 +10,7 @@ A decision model answers typed questions about a state in one forward pass. It g
 
 ## Answer questions
 
+<!-- not run: loads the Laya release, near 4 GiB on CPU, past the docs test's budget -->
 ```python
 from dew.decision import Choice, Decide, Noul, Score
 
@@ -30,6 +31,7 @@ Each question and the state form one row. Laya's layout puts the question first,
 
 `systemone` takes and returns Jev's wire format, so a client written for Jev talks to a `Decide` task unchanged:
 
+<!-- not run: asks the Laya task the block above loads -->
 ```python
 decide.systemone({
     "state": "I was charged twice for March, fix it today.",

@@ -516,7 +516,7 @@ def test_a_trainer_run_trains_through_multi_turn_environments_on_the_native_serv
                               head_dim=8, mlp_features=32, max_seq_len=64, dtype="float32")
     target = GRPOObjective(model, seq_len=width - 1, behavior_importance=2.0)
     params = target.init(jax.random.key(0))
-    sampling = Sampling(temperature=1.0, eos_id=STOP)
+    sampling = Sampling(temperature=1.0, eos_token_ids=STOP)
     server = NativeRolloutServer(Server.from_task(TextGeneration(model, params, None, sampling=sampling),
                                                   slots=16, capacity=64))
 

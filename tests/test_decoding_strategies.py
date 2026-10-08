@@ -209,7 +209,7 @@ def test_a_callers_criterion_ends_the_row_it_names(model):
         return state.step >= 2
 
     drawn = generate(module, params, prompt, 5, key=jax.random.key(0),
-                     sampling=Sampling(temperature=0, pad_id=11), stopping=(after_two,))
+                     sampling=Sampling(temperature=0, pad_token_id=11), stopping=(after_two,))
     assert drawn.lengths.tolist() == [2, 2]
     assert drawn.terminated.tolist() == [True, True]
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[:, 5:], 11)
@@ -265,7 +265,7 @@ def test_min_new_tokens_holds_the_eos_back_and_the_row_still_terminates(model):
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
     eos = int(np.asarray(generate(module, params, prompt, 1, key=jax.random.key(0),
                                   sampling=Sampling(temperature=0)).tokens)[0, -1])
-    policy = Sampling(temperature=0, eos_id=eos, pad_id=12)
+    policy = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
     immediate = generate(module, params, prompt, 5, key=jax.random.key(0), sampling=policy)
     assert immediate.lengths.tolist() == [1] and immediate.terminated.tolist() == [True]
     held = generate(module, params, prompt, 5, key=jax.random.key(0), sampling=policy,
@@ -301,7 +301,7 @@ def test_stop_strings_end_a_row_on_text_it_never_decodes_on_the_host(tmp_path, m
         return jnp.where(jnp.arange(VOCAB)[None, :] == pick[:, None], 0.0, -jnp.inf)
 
     drawn = generate(module, params, prompt, 4, key=jax.random.key(0),
-                     sampling=Sampling(pad_id=0), logits=(scripted,),
+                     sampling=Sampling(pad_token_id=0), logits=(scripted,),
                      stopping=(criterion,))
     assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
     np.testing.assert_array_equal(np.asarray(drawn.tokens)[0, 3:5], order[:2])

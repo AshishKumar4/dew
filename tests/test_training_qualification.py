@@ -4,7 +4,8 @@ The other recovery tests each hold one feature: CUDA bitwise resume
 (test_trainer), partial accumulation (test_training_transactions), a real
 SIGKILL (test_multiprocess), an export transformers reads
 (test_decoder_export). This one runs them together, as a fine-tune does. A
-tiny transformers Llama, loaded through `Pretrained.load`, trains with
+tiny transformers Llama, and a Qwen3 MoE that routes in every layer, each
+loaded through `Pretrained.load`, trains with
 dropout, EMA, two-micro-step accumulation, dynamic loss scaling and a clipped
 AdamW (tests/qualification_worker.py). One run goes uninterrupted. A second
 is SIGKILLed after step 7, holding the step-5 checkpoint, which sits between
@@ -27,7 +28,14 @@ import numpy as np
 import pytest
 import qualification_worker as worker
 import torch
-from transformers import AutoModelForCausalLM, AutoTokenizer, LlamaConfig, LlamaForCausalLM
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    LlamaConfig,
+    LlamaForCausalLM,
+    Qwen3MoeConfig,
+    Qwen3MoeForCausalLM,
+)
 
 from dew.data import TokenCorpus
 
@@ -74,24 +82,57 @@ def source_gradients(directory: Path) -> tuple[torch.Tensor, dict[str, np.ndarra
                                                      local_files_only=True).eval()
     with np.load(directory / "baseline" / "reference.npz") as recorded:
         ids = torch.from_numpy(recorded["ids"]).long()
-    logits = reference(ids).logits[:, :-1]
+    routed = getattr(reference.config, "num_experts", 0) > 0
+    output = reference(ids, output_router_logits=True) if routed else reference(ids)
+    # A top-2 pick that a rounding could flip would show as a gradient mismatch, not as a tie.
+    for router in output.router_logits if routed else ():
+        picks = torch.topk(router.detach(), 3, dim=-1).values
+        assert float((picks[:, 1] - picks[:, 2]).min()) > 1e-4, "a token's router nearly ties at its 2nd pick"
+    logits = output.logits[:, :-1]
     loss = torch.nn.functional.cross_entropy(logits.reshape(-1, logits.shape[-1]), ids[:, 1:].reshape(-1))
     loss.backward()
-    return loss.detach(), {name: parameter.grad.numpy() for name, parameter in reference.named_parameters()}
+    gradients = {}
+    for name, parameter in reference.named_parameters():
+        gradient = parameter.grad.numpy()
+        # transformers 5 holds a MoE layer's experts fused; the checkpoint, and Dew's export, one tensor each.
+        if name.endswith(".experts.gate_up_proj"):
+            gate, up = np.split(gradient, 2, axis=1)
+            for expert in range(gradient.shape[0]):
+                gradients[name.replace("gate_up_proj", f"{expert}.gate_proj.weight")] = gate[expert]
+                gradients[name.replace("gate_up_proj", f"{expert}.up_proj.weight")] = up[expert]
+        elif name.endswith(".experts.down_proj"):
+            for expert in range(gradient.shape[0]):
+                gradients[name.replace("down_proj", f"{expert}.down_proj.weight")] = gradient[expert]
+        else:
+            gradients[name] = gradient
+    return loss.detach(), gradients
 
 
-@pytest.fixture(scope="module")
-def qualified(tmp_path_factory) -> Path:
-    directory = tmp_path_factory.mktemp("qualification")
+def source_model(kind: str, vocab: int):
+    """A tiny transformers decoder: a dense Llama, or a Qwen3 MoE whose every layer routes over four
+    experts, two a token."""
+    if kind == "dense":
+        return LlamaForCausalLM(LlamaConfig(
+            vocab_size=vocab, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
+            num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=worker.SEQUENCE,
+            tie_word_embeddings=False))
+    return Qwen3MoeForCausalLM(Qwen3MoeConfig(
+        vocab_size=vocab, hidden_size=64, intermediate_size=128, moe_intermediate_size=64,
+        num_hidden_layers=2,
+        num_attention_heads=4, num_key_value_heads=2, head_dim=16, num_experts=4, num_experts_per_tok=2,
+        decoder_sparse_step=1, norm_topk_prob=True, max_position_embeddings=worker.SEQUENCE,
+        tie_word_embeddings=False))
+
+
+@pytest.fixture(scope="module", params=["dense", "moe"])
+def qualified(tmp_path_factory, request) -> Path:
+    directory = tmp_path_factory.mktemp(f"qualification-{request.param}")
     (directory / "corpus.txt").write_bytes((ROOT / "CONTRIBUTING.md").read_bytes())
     TokenCorpus.write(directory / "corpus.txt", directory / "tokens", tokenizer=str(TOKENIZER),
                       val_fraction=0.1)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
     torch.manual_seed(13)
-    LlamaForCausalLM(LlamaConfig(
-        vocab_size=len(tokenizer), hidden_size=64, intermediate_size=128, num_hidden_layers=2,
-        num_attention_heads=4, num_key_value_heads=2, max_position_embeddings=worker.SEQUENCE,
-        tie_word_embeddings=False)).save_pretrained(directory / "source")
+    source_model(request.param, len(tokenizer)).save_pretrained(directory / "source")
     tokenizer.save_pretrained(directory / "source")
     finish(spawn(directory, "baseline"), "baseline")
     kill_when_ready(spawn(directory, "interrupted"), directory / "ready-to-kill")

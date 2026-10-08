@@ -12,7 +12,7 @@ from __future__ import annotations
 import base64
 import inspect
 import io
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import TYPE_CHECKING, Literal, Protocol
@@ -102,15 +102,14 @@ class Completion:
 
 
 def _invoke[T](call: Callable[..., T], fields: Mapping[str, object]) -> T:
-    """Call `call` with `fields` as keyword arguments.
+    """Call `call` with `fields` as keyword arguments, an async SDK call too,
+    whose awaitable comes back.
 
-    The SDK owns the request schema, so nothing here validates the names.
+    The SDK owns the request schema, so nothing here validates the names; the
+    call is the type boundary between a request built as a mapping and the
+    SDK's typed signature, which a direct `call(**fields)` would not pass.
     """
     return call(**fields)
-
-
-async def _ainvoke[T](call: Callable[..., Awaitable[T]], fields: Mapping[str, object]) -> T:
-    return await call(**fields)
 
 
 def _object(value: object, name: str) -> Mapping[str, object]:
@@ -181,7 +180,7 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     if sampling is not None:
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.eos_id is not None or sampling.pad != 0:
+        if sampling.eos_token_ids is not None or sampling.pad != 0:
             raise ValueError("Ollama text completion cannot implement native EOS-token or padding IDs")
         unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
                                      "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
@@ -301,12 +300,12 @@ class OllamaCompletion:
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
         requests = self._generations(prompts, max_new_tokens, key, parameters)
         client = self._async()
-        return _ollama_result([await _ainvoke(client.generate, body) for body in requests])
+        return _ollama_result([await _invoke(client.generate, body) for body in requests])
 
     async def astream(self, prompt: str, max_new_tokens: int, *, key: int | jax.Array | None = None,
                       **parameters: RequestField) -> AsyncIterator[OllamaResponse]:
         (body,) = self._generations(prompt, max_new_tokens, key, parameters, stream=True)
-        return await _ainvoke(self._async().generate, body)
+        return await _invoke(self._async().generate, body)
 
     async def achat(
         self,
@@ -318,7 +317,7 @@ class OllamaCompletion:
         **parameters: RequestField,
     ) -> OllamaChat | AsyncIterator[OllamaChat]:
         body = self._chat(messages, max_new_tokens, key, stream, parameters)
-        return await _ainvoke(self._async().chat, body)
+        return await _invoke(self._async().chat, body)
 
 
 def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None, tuple[float, ...] | None]:
@@ -488,7 +487,7 @@ class OpenAICompletion:
             raise ValueError(f"remote text completion cannot implement {unmatched} as Dew does; "
                              "an OpenAI-compatible server strips stop strings from the text")
         if self.provider == "openai" and (
-            sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None
+            sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_token_ids is not None
             or sampling.repetition_penalty != 1.0
         ):
             raise ValueError("top-k, min-p, repetition-penalty and EOS-token controls require "
@@ -500,7 +499,7 @@ class OpenAICompletion:
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
                                       "min_p": sampling.min_p,
                                       "repetition_penalty": sampling.repetition_penalty}
-        if sampling.eos_id is not None:
+        if sampling.eos_token_ids is not None:
             controls["stop_token_ids"] = list(sampling.stops)
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():
@@ -599,7 +598,7 @@ class OpenAICompletion:
         fields, expected = _openai_fields(
             self.model, prompts, max_new_tokens, seed, self._parameters(parameters)
         )
-        raw = await _ainvoke(self._async().completions.with_raw_response.create, fields)
+        raw = await _invoke(self._async().completions.with_raw_response.create, fields)
         return _openai_result(raw.http_response.json(), raw.parse(), expected)
 
     async def astream(
@@ -613,7 +612,7 @@ class OpenAICompletion:
         seed = key_seed(key)
         fields, _ = _openai_fields(self.model, prompts, max_new_tokens, seed,
                                    self._parameters(parameters), stream=True)
-        return await _ainvoke(self._async().completions.create, fields)
+        return await _invoke(self._async().completions.create, fields)
 
     async def achat(
         self,
@@ -626,4 +625,4 @@ class OpenAICompletion:
     ) -> ChatCompletion | AsyncStream[ChatCompletionChunk]:
         seed = key_seed(key)
         fields = self._chat_body(messages, max_new_tokens, seed, stream, parameters)
-        return await _ainvoke(self._async().chat.completions.create, fields)
+        return await _invoke(self._async().chat.completions.create, fields)

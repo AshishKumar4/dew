@@ -58,7 +58,7 @@ def test_an_episode_record_reads_back_every_sampling_control():
 
     trainer, rollout = build()
     episode = collect(rollout, trainer.initial_state())[0]
-    policy = Sampling(temperature=0.7, eos_id=episode.transitions[0].action.sampling.eos_id,
+    policy = Sampling(temperature=0.7, eos_token_ids=episode.transitions[0].action.sampling.eos_token_ids,
                       repetition_penalty=1.1, no_repeat_ngram_size=2, stop=("\n\n",))
     turns = tuple(replace(turn, action=replace(turn.action, sampling=policy)) for turn in episode.transitions)
     episode = replace(episode, transitions=turns)
@@ -66,4 +66,4 @@ def test_an_episode_record_reads_back_every_sampling_control():
     restored = episode_from_record(json.loads(json.dumps(asdict(episode))))
 
     assert restored == episode
-    assert restored.transitions[0].action.sampling.pad_id is None
+    assert restored.transitions[0].action.sampling.pad_token_id is None

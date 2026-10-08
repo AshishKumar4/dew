@@ -31,9 +31,33 @@ env:
   EXTRAS: test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
 
 jobs:
+  # A commit this workflow passed on another push, as one proved on
+  # ci/integration before main takes it, is not proved again: lint, types and
+  # package skip, and the test job finds armada's verdict. A pull request, a
+  # dispatch and the release's call run everything.
+  proven:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.find.outputs.run }}
+    steps:
+    - id: find
+      if: github.event_name == 'push'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # A pull request's run tested a merge, not this commit.
+        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$GITHUB_SHA&status=success" \
+          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
+        echo "run=$run" >> "$GITHUB_OUTPUT"
+        if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
+
   # Lint and the site's checks, and the type check beside them: each installs
   # dewml as tools/armada/install.sh does, with uv, from uv's cache.
   lint:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -85,6 +109,8 @@ jobs:
         python site/scripts/gen_examples.py --check
 
   types:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -111,6 +137,8 @@ jobs:
   # refuses and twine passes; the wheel installs from PyPI alone into an
   # empty environment and runs; and the accelerator extras resolve.
   package:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
@@ -154,6 +182,13 @@ jobs:
         logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
         assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))
         EOF
+    - name: PyPI's jax still keys a pool's processes apart (jax-ml/jax#40940)
+      # The repro is expected to fail here (xfail, strict): once it passes, a
+      # release carries the fix, and the patched jax and its refusal can go.
+      run: |
+        "$RUNNER_TEMP/clean/bin/pip" install --quiet pytest
+        DEW_UPSTREAM_JAX=1 "$RUNNER_TEMP/clean/bin/python" -m pytest -q -p no:cacheprovider -rxX \
+          tests/test_distribution.py::test_a_pools_second_run_loads_what_its_first_compiled
     - name: Resolve the accelerator extras
       run: |
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
@@ -171,11 +206,13 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about three minutes each on Dew's own armada
-    # deployment (armada-dew), on the fewest of up to 150 containers that
+    # deployment (armada-dew), on the fewest of up to 200 containers that
     # finish as soon, sized from the last runs' usage: at 375, the platform
     # killed 164 of 268 containers at their first command. Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
-    # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
+    # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets. The eight
+    # heaviest tasks run twice from the start, and each keeps its first green
+    # answer (task.hedge): a copy that runs slowly holds nothing up.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
@@ -193,7 +230,7 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#2f735864d34fd2b0d4d201f8b5e51779539b7e7f"
+        armada="bunx --bun github:AshishKumar4/armada#75558607b6a00d1eed74aaf3b8e2a8e766a9ea4d"
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
 
   multihost:
