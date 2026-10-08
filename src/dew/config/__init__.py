@@ -15,7 +15,9 @@ The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
 so inference rebuilds a run from what training was built from. A field the
 file lacks takes its declared default, and a field the class does not have
-raises an error.
+raises an error. The model and the objective record their classes' defaults
+too (`ModelConfig.defaults`), so a default changed since leaves the record
+building what it built.
 """
 
 import copy
@@ -118,18 +120,31 @@ class ModelConfig:
     class's own fields, its compute and storage dtypes, attention kernel and
     matmul precision included, which the command line sets one flag each
     (`RunConfig.cli`); a recipe fills the ones it derives from its data in
-    `build`.
+    `build`. `defaults` holds every other field the class defaults, as it
+    defaulted them when the run was first recorded, so the record builds the
+    same model after a default changes (`arguments`).
     """
 
     name: str = "simple_dit"
     fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    """Each field the class defaults and `fields` leaves out, as a record holds it;
+    one a record lacks, as a field the class has since gained, takes the class's
+    default now."""
     adapter: JsonDict | None = None
     """The bound LoRA record; its factors are stored with the checkpoint variables."""
     quantization: Quantization | None = None
     """The quantized training the model was wrapped in, which `build` wraps it in again."""
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "name", registry.import_path(models[self.name]))
+        member = models[self.name]
+        object.__setattr__(self, "name", registry.import_path(member))
+        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+
+    @property
+    def arguments(self) -> JsonDict:
+        """The fields the model is built from, before those a recipe derives (`_arguments`)."""
+        return _arguments(models[self.name], self.fields, self.defaults)
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -156,7 +171,7 @@ class ModelConfig:
 
     def build(self, **derived: Configured):
         """Build the model from its fields and the ones the recipe `derived`."""
-        model = models.build(self.name, {**self.fields, **derived})
+        model = models.build(self.name, {**self.arguments, **derived})
         if self.quantization is not None:
             model = self.quantization.apply(model)
         return model if self.adapter is None else adapted(model, self.adapter)
@@ -171,29 +186,42 @@ class ObjectiveConfig:
     (`registry.argument_records`), which the command line sets one flag each
     (`--objective.ema_decay 0.999`); what the objective is built around, the
     model and what a recipe reads off its data, `build` takes from the caller.
+    `defaults` holds every other argument the class defaults, as `ModelConfig`
+    holds a model's, so an EMA decay, a loss weighting or a sampling step count
+    the class defaults differently later leaves a recorded run as it was.
     """
 
     name: str
     fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    """Each argument the class defaults and `fields` leaves out, as a record holds it;
+    one a record lacks takes the class's default now."""
 
     def __post_init__(self) -> None:
         member = objectives[self.name]
         object.__setattr__(self, "name", registry.import_path(member))
         object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
+        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
+
+    @property
+    def arguments(self) -> JsonDict:
+        """The arguments the objective is built from, before those the caller derives (`_arguments`)."""
+        return _arguments(objectives[self.name], self.fields, self.defaults)
 
     def build(self, **derived) -> Objective:
-        """Build the objective from its fields and the arguments the caller
-        `derived`; an argument both give is refused, since the caller's would
-        silently replace what the run states."""
+        """Build the objective from its arguments and those the caller
+        `derived`, which replace a recorded default; an argument the run
+        states is refused there, since the caller's would silently replace
+        it."""
         stated = sorted(set(self.fields) & set(derived))
         if stated:
             raise ValueError(f"the run derives {stated} for {self.name}; leave them out of its arguments")
-        return objectives.build(self.name, self.fields, **derived)
+        return objectives.build(self.name, self.arguments, **derived)
 
 
 def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapping[str, object]]:
     """A dataclass of `member`'s own fields, one flag each, defaulting to
-    `given` over the member's defaults, and those defaults.
+    `given` over the member's defaults, and the value each flag starts at.
 
     A model's fields are its dataclass fields. An objective's are its
     constructor's arguments, but for those it takes positionally without a
@@ -204,43 +232,40 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
     A field with no default also takes None, for leaving it to the recipe. A
     field whose default no record carries (a callable, say) gets no flag and
     keeps that default."""
-    flags, defaults = [], {}
+    flags, started = [], {}
     # One record: a module two defaults share is written once.
     with registry.recording():
         for name, declared, annotation in _member_fields(member):
+            declared = None if declared is dataclasses.MISSING else declared
             annotation = registry.resolve_alias(annotation)
             if name in ("dtype", "param_dtype"):
                 typed = registry.DtypeName | None
-                declared = registry.dtype_name(registry.resolve_dtype(declared))
+                declared = _record_of(name, declared, annotation)
             elif name == "precision":
                 typed = Literal["default", "high", "highest"] | None
-                declared = None if declared is None else str(declared).lower().removeprefix("precision.")
+                declared = _record_of(name, declared, annotation)
             elif annotation is not None and _scalar(annotation):
                 typed = annotation if declared is not None else annotation | None
             else:
                 typed = Annotated[JSON, _JSON_FLAG]
                 try:
-                    # The record itself, not a copy: a module a later default
-                    # shares turns this one into its defining record.
-                    declared = to_record(declared, annotation)
-                    json.dumps(declared)
+                    declared = _record_of(name, declared, annotation)
                 except (TypeError, ValueError):
                     continue  # a field no record carries keeps its class default
-            defaults[name] = declared
-            value = given.get(name, declared)
-            copied = functools.partial(copy.deepcopy, value)
+            started[name] = given.get(name, declared)
+            copied = functools.partial(copy.deepcopy, started[name])
             flags.append((name, typed, dataclasses.field(default_factory=copied)))
-    return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), defaults
+    return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), started
 
 
 def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
-    """Each field `_member_flags` flags: its name, its default (None for none)
-    and its annotation (None where its module cannot resolve it)."""
+    """Each field `_member_flags` flags: its name, its default
+    (`dataclasses.MISSING` for none) and its annotation (None where its
+    module cannot resolve it)."""
     if isinstance(member, type) and dataclasses.is_dataclass(member):
         for field in dataclasses.fields(member):
             if field.init and field.name not in ("parent", "name"):
-                default = (field.default if field.default is not dataclasses.MISSING else
-                           field.default_factory() if callable(field.default_factory) else None)
+                default = (field.default_factory() if callable(field.default_factory) else field.default)
                 yield field.name, default, _declared_type(member, field.name)
         return
     for name, (parameter, owner) in registry.parameters(member)[0].items():
@@ -250,7 +275,56 @@ def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]
             annotation = _parameter_type(owner, name)
         except ValueError:
             annotation = None
-        yield name, None if parameter.default is parameter.empty else parameter.default, annotation
+        default = dataclasses.MISSING if parameter.default is parameter.empty else parameter.default
+        yield name, default, annotation
+
+
+def _record_of(name: str, declared: Configured, annotation: Annotation) -> JSON:
+    """A member's default `declared` as a record holds it: a dtype by its
+    name, a matmul precision by its level, anything else as `to_record`
+    writes it. TypeError or ValueError for a value no record carries."""
+    if name in ("dtype", "param_dtype"):
+        return registry.dtype_name(registry.resolve_dtype(declared))
+    if name == "precision":
+        return None if declared is None else str(declared).lower().removeprefix("precision.")
+    # The record itself, not a copy: a module a later default shares turns
+    # this one into its defining record.
+    record = to_record(declared, annotation)
+    json.dumps(record)
+    return record
+
+
+def _defaults(member: type, stated: Mapping[str, object], recorded: Mapping[str, object]) -> JsonDict:
+    """The record of each field or argument `member` defaults that `stated`
+    leaves out: as `recorded` holds it, or else as the class defaults it now.
+    A default no record carries (a callable, say) is left to the class, and
+    a recorded one the class no longer takes is refused."""
+    defaults, named = {}, set()
+    # One record: a module two defaults share is written once.
+    with registry.recording():
+        for name, declared, annotation in _member_fields(member):
+            named.add(name)
+            if name in stated or name in recorded or declared is dataclasses.MISSING:
+                continue
+            try:
+                defaults[name] = _record_of(name, declared, annotation)
+            except (TypeError, ValueError):
+                continue
+    unknown = sorted(set(recorded) - named)
+    if unknown:
+        raise ValueError(f"{member.__name__} takes no {unknown}, which the record defaults")
+    return {**defaults, **{name: value for name, value in recorded.items() if name not in stated}}
+
+
+def _arguments(member: type, fields: Mapping[str, object], defaults: Mapping[str, object]) -> JsonDict:
+    """What a config builds `member` from beside what its caller derives:
+    `fields`, over each of `defaults` the class no longer defaults the same.
+    A default the class still has is left to it, so a class that treats an
+    argument left out in its own way, as `DPOObjective` holds its reference
+    at unit decay, still does."""
+    now = _defaults(member, {}, {})
+    return {**{name: value for name, value in defaults.items() if name not in now or now[name] != value},
+            **fields}
 
 
 def _chosen(given: list[str], field: str) -> str | None:
@@ -263,16 +337,17 @@ def _chosen(given: list[str], field: str) -> str | None:
 
 
 def _given[C: (ModelConfig, ObjectiveConfig)](start: C, parsed: "DataclassInstance",
-                                              declared: Mapping[str, object]) -> C:
+                                              started: Mapping[str, object]) -> C:
     """`start` with the fields its flags `parsed`: those it started from, and
-    those the command line set to something other than the class's default.
-    A field it started from that takes no flag is kept as it was. A tuple is
-    held as the list its record reads back as."""
-    def listed(value: JSON | tuple[JSON, ...]) -> JSON:
+    those the command line set to something other than the flag `started`
+    at. A field it started from that takes no flag is kept as it was, and so
+    is a recorded default the command line left alone. A tuple is held as
+    the list its record reads back as."""
+    def listed(value):
         return [listed(entry) for entry in value] if isinstance(value, tuple) else value
 
     chosen = {key: listed(value) for key, value in vars(parsed).items()
-              if key in start.fields or value != declared[key]}
+              if key in start.fields or listed(value) != listed(started[key])}
     return dataclasses.replace(start, fields={**start.fields, **chosen})
 
 
@@ -890,12 +965,13 @@ class RunConfig:
         if name is not None and (objective is None
                                  or registry.import_path(objectives[name]) != objective.name):
             objective = ObjectiveConfig(name)
-        model_flags, model_declared = _member_flags(models[model.name], model.fields)
+        model_flags, model_started = _member_flags(models[model.name], model.arguments)
         if objective is None:
-            objective_flags, objective_declared = tyro.conf.Suppress[None], {}
+            objective_flags, objective_started = tyro.conf.Suppress[None], {}
             objective_default = dataclasses.field(default=None)
         else:
-            objective_flags, objective_declared = _member_flags(objectives[objective.name], objective.fields)
+            objective_flags, objective_started = _member_flags(objectives[objective.name],
+                                                               objective.arguments)
             objective_default = dataclasses.field(default_factory=objective_flags)
         # The run parses with its model and objective as those flags, and
         # validates once it holds the classes they name.
@@ -911,9 +987,9 @@ class RunConfig:
             raise ValueError("the command line built no run config")
         return cls(**{field.name: getattr(parsed, field.name) for field in dataclasses.fields(cls)
                       if field.name not in ("model", "objective")},
-                   model=_given(model, parsed.model, model_declared),
+                   model=_given(model, parsed.model, model_started),
                    objective=None if objective is None else _given(objective, parsed.objective,
-                                                                   objective_declared))
+                                                                   objective_started))
 
     @classmethod
     def _started(cls, default: Self | None, field: str) -> ModelConfig | ObjectiveConfig | None:
@@ -978,13 +1054,17 @@ class RunConfig:
             prepared.after(state, os.path.join(trainer.checkpoint_dir, name))
         return state
 
-    def _naming(self, objective: Objective[Loss, Effects]) -> Self:
-        """Return this config with `objective`'s class as its record names it.
+    def recorded(self, objective: Objective[Loss, Effects]) -> Self:
+        """Return this config as the record of the run that trains `objective`.
 
         The record names the class by its import path, so it says what was
         trained and loads in a process that imported nothing. Arguments the
         run states belong to the class it names, so a run that states them
-        for another class than the one it trains is refused.
+        for another class than the one it trains is refused. Each argument
+        the objective resolved from what it was built around
+        (`Objective.resolved`) and the run leaves unstated is recorded as
+        the objective holds it, so the record builds what the run sampled
+        with.
         """
         trained = registry.import_path(type(objective))
         stated = ObjectiveConfig(trained) if self.objective is None else self.objective
@@ -992,7 +1072,13 @@ class RunConfig:
             if stated.fields:
                 raise ValueError(f"the run states the arguments of {stated.name} and trains {trained}")
             stated = ObjectiveConfig(trained)
-        return dataclasses.replace(self, objective=stated)
+        missing = [name for name in objective.resolved if not hasattr(objective, name)]
+        if missing:
+            raise ValueError(f"{trained} resolves {missing} and holds no attribute of that name to record")
+        resolved = registry.argument_records(type(objective), {
+            name: getattr(objective, name) for name in objective.resolved if name not in stated.fields})
+        return dataclasses.replace(self, objective=dataclasses.replace(
+            stated, defaults={**stated.defaults, **resolved}))
 
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
@@ -1032,7 +1118,7 @@ class RunConfig:
         if self.trainer.quantization is not None:
             _quantize(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
-        self = dataclasses.replace(self._naming(objective),
+        self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
         trainer = self.trainer
         # Before the run length, since a ramp reads fewer records a step early

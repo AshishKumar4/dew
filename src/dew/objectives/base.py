@@ -426,6 +426,12 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     An entry under `loss` covers the loss itself, for an objective where the
     trainer's default (lower is better) does not hold."""
+    resolved: ClassVar[tuple[str, ...]] = ()
+    """The constructor arguments the objective resolves from what it is built
+    around when they are left out, each held as an attribute of that name.
+    A run records the value it resolved, which no default in the signature
+    can say: a diffusion objective samples with a loaded pipeline's own
+    guidance, else its fallback (`RunConfig.recorded`)."""
 
     def optimizer(self, tx: optax.GradientTransformation, *,
                   accumulation: int) -> optax.GradientTransformation:

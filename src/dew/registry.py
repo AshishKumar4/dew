@@ -717,7 +717,7 @@ def _construct(member: type, fields: Mapping[str, object], *, dtypes: bool) -> C
     return configured(member(**_declared(member, fields, dtypes=dtypes)))
 
 
-def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> dict[str, Configured]:
+def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> Mapping[str, object]:
     """The record's fields as `member` declares them, each walked against its
     own annotation. A field the record lacks takes its declared default; a
     field `member` does not declare, or a required one the record lacks,
@@ -731,19 +731,16 @@ def _declared(member: type, fields: Mapping[str, object], *, dtypes: bool) -> di
     if unknown or missing:
         raise ValueError(f"{member.__name__} does not match the record: unknown fields {unknown}, "
                          f"missing fields {missing}; its fields are {names}")
-    return {name: _rebuilt(_declared_type(member, name), configured(value), dtypes=dtypes, name=name)
-            for name, value in fields.items()}
+    return {name: _read(member, name, value, dtypes=dtypes) for name, value in fields.items()}
 
 
 def _arguments(function: Callable[..., Configured], fields: Mapping[str, object], *,
                dtypes: bool) -> Mapping[str, object]:
     """The record's fields as the parameters of the registered `function`, or
     of a class's constructor (`parameters`), each walked against its own
-    annotation, as `_declared` walks a dataclass's. A field the function does
-    not take, or a parameter without a default that the record lacks, raises;
-    a function taking `**kwargs` takes any field. A record or a JSON list is
-    read against its parameter's annotation and a dtype's name is the dtype;
-    any other value, a scalar or a value the caller built, is taken as given."""
+    annotation (`_read`), as `_declared` walks a dataclass's. A field the
+    function does not take, or a parameter without a default that the record
+    lacks, raises; a function taking `**kwargs` takes any field."""
     named, open_ended = parameters(function)
     unknown = [] if open_ended else sorted(set(fields) - set(named))
     missing = [name for name, (parameter, _) in named.items()
@@ -751,10 +748,31 @@ def _arguments(function: Callable[..., Configured], fields: Mapping[str, object]
     if unknown or missing:
         raise ValueError(f"{function.__name__} does not match the record: unknown fields {unknown}, "
                          f"missing fields {missing}; its parameters are {sorted(named)}")
-    return {name: _rebuilt(_parameter_type(named[name][1], name) if name in named else None, value,
-                           dtypes=dtypes, name=name)
-            if isinstance(value, (Mapping, list)) or (dtypes and name == "dtype") else value
-            for name, value in fields.items()}
+    return {name: _read(function, name, value, dtypes=dtypes) for name, value in fields.items()}
+
+
+def read_arguments(member: type | Callable[..., Configured], record: Mapping[str, object]
+                   ) -> Mapping[str, object]:
+    """`record`'s fields of the dataclass `member`, or arguments of the
+    function or constructor `member`, each read as `build` reads it, without
+    asking whether they are all that `member` takes."""
+    with _reading(record):
+        return {name: _read(member, name, value, dtypes=True) for name, value in record.items()}
+
+
+def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes: bool):
+    """One field of the dataclass `member`, walked against its own annotation;
+    or one argument of the function or constructor `member`, a record or a
+    JSON list read against its parameter's annotation and a dtype's name the
+    dtype, any other value, a scalar or a value the caller built, as given."""
+    held = _record_class(member)
+    if held is not None:
+        return _rebuilt(_declared_type(held, name), configured(value), dtypes=dtypes, name=name)
+    if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")):
+        return value
+    named = parameters(member)[0]
+    return _rebuilt(_parameter_type(named[name][1], name) if name in named else None, value,
+                    dtypes=dtypes, name=name)
 
 
 def argument_records(member: type | Callable[..., Configured], fields: Mapping[str, object]

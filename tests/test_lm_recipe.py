@@ -729,8 +729,9 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     record = config.to_dict()
 
     assert record["tokenizer"] == "gpt2" and record["sample_tokens"] == 8
-    assert record["objective"] == {"name": "dew.objectives.lm.objective:LMObjective",
-                                   "fields": {"ema_decay": 0.99}}
+    assert record["objective"]["name"] == "dew.objectives.lm.objective:LMObjective"
+    assert record["objective"]["fields"] == {"ema_decay": 0.99}
+    assert "ema_decay" not in record["objective"]["defaults"]
     assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
     assert LMRunConfig.from_dict(record) == config
     with pytest.raises(ValueError, match="trains on token files"):

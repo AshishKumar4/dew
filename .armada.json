@@ -9,12 +9,15 @@
   },
   "history": "commit",
   "env": { "JAX_PLATFORMS": "cpu", "PYTHONFAULTHANDLER": "1" },
-  "pool": 150,
+  "pool": 375,
   "size": "auto",
-  "plan": { "command": ["python3", "tools/armada/ci.py", "plan", "--target={target}", "--timings={timings}"] },
+  "target": 180,
+  "plan": { "command": ["python3", "tools/armada/ci.py", "plan", "--target={target}", "--timings={timings}"],
+            "local": true },
   "task": {
     "command": ["python3", "tools/armada/ci.py", "task", "--python={python}", "--tests={tests}", "--split={split}",
                 "--out={out}"],
-    "timeout": 1800
+    "timeout": 1800,
+    "speculative": true
   }
 }

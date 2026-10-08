@@ -270,6 +270,65 @@ def test_the_layer_decodes_as_it_prefills(reference, geometry):
     assert largest(jnp.concatenate(steps, axis=1), parallel) < 5e-4
 
 
+def test_a_bf16_layer_decodes_its_state_in_bf16_within_its_prefills_error(reference, geometry):
+    """A bf16 layer at the default matmul precision holds its decode state in
+    bf16, as vLLM does, and runs the rule in fp32. Over 65 single-token steps
+    after a prefill its outputs stay within twice the bf16 parallel forward's
+    error (which keeps its chunk state in fp32), both measured from the fp32
+    forward, whose error is far below bf16's (tests/reference_error.py's
+    rule); the conv state, the projections' own bf16 values, is held as they
+    are. Asked for the highest precision, as this lane runs, it holds fp32."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])
+    truth = np.asarray(module.apply(variables, hidden), np.float64)
+    narrow = module.clone(dtype=jnp.bfloat16)
+    exact = narrow.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+    assert {leaf.dtype for leaf in jax.tree.leaves(exact)} == {jnp.dtype(jnp.float32)}
+
+    with jax.default_matmul_precision("default"):
+        parallel = np.asarray(narrow.apply(variables, hidden), np.float64)
+        cache = narrow.apply(variables, hidden[:, :1], decode=True, mutable=["cache"])[1]["cache"]
+        assert {leaf.dtype for leaf in jax.tree.leaves(cache)} == {jnp.dtype(jnp.bfloat16)}
+        prefill = 5
+        out, mutated = narrow.apply({**variables, "cache": cache}, hidden[:, :prefill],
+                                    decode=True, mutable=["cache"])
+        steps = [out]
+        for position in range(prefill, hidden.shape[1]):
+            out, mutated = narrow.apply({**variables, **mutated}, hidden[:, position:position + 1],
+                                        decode=True, mutable=["cache"])
+            steps.append(out)
+    decoded = np.asarray(jnp.concatenate(steps, axis=1), np.float64)
+
+    def rms(x):
+        return float(np.sqrt(np.mean((x - truth) ** 2)))
+
+    assert rms(decoded) <= 2 * rms(parallel), (rms(decoded), rms(parallel))
+
+
+def test_a_bf16_state_decays_where_rounding_to_nearest_would_hold_it():
+    """A state decayed by 0.999 a token moves by less than half a bf16 step
+    near 1, so rounded to nearest it never decays. Rounded stochastically
+    (`round_to_bf16`, its noise drawn from the token's key and value) it
+    follows the exact decay, 0.999 ** 2000, to within 2%. Rounded to
+    nearest, Qwen3.5-0.8B's bf16 state drifted to ten times the fp32 state's
+    error over 1024 tokens (docs/performance.md)."""
+    from dew.nn.kernels.delta_rule import round_to_bf16
+
+    def decayed(rounding):
+        def step(state, token):
+            key, value = (jax.random.normal(jax.random.fold_in(jax.random.key(token), side), (1, 64))
+                          for side in (0, 1))
+            stepped = state.astype(jnp.float32) * 0.999
+            return rounding(stepped, key, value), None
+        return jax.lax.scan(step, jnp.ones((1, 64, 64), jnp.bfloat16), jnp.arange(2000))[0]
+
+    nearest = decayed(lambda stepped, key, value: stepped.astype(jnp.bfloat16))
+    stochastic = decayed(round_to_bf16)
+    assert np.all(np.asarray(nearest, np.float32) == 1.0)
+    np.testing.assert_allclose(np.asarray(stochastic, np.float32).mean(), 0.999 ** 2000, rtol=0.02)
+
+
 def scan_masked_conv1d(x, kernel, valid, state=None):
     """The token-by-token form the compacted convolution replaced.
 
@@ -487,11 +546,13 @@ def test_the_chunked_rule_holds_with_aligned_keys():
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
+@pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("rows", [3, 32])
-def test_the_decode_kernel_steps_as_the_recurrence_does(rows):
+def test_the_decode_kernel_steps_as_the_recurrence_does(rows, held):
     """One decode token through `dew.nn.kernels.delta_rule` (one read and one
     write of the state) gives the reference recurrence's output and state,
-    at Qwen3.5-0.8B's widths (16 heads, 128 wide)."""
+    at Qwen3.5-0.8B's widths (16 heads, 128 wide). A state held in bf16 is
+    read and stepped in fp32 and written back rounded once, stochastically."""
     from dew.nn.linear import decode_gated_delta_rule
 
     rng = np.random.default_rng(0)
@@ -501,11 +562,14 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows):
     value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
     g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
     beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
-    want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta, state)
+    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, held)
+    want, want_state = recurrent_gated_delta_rule(query, key, value, g, beta, state.astype(jnp.float32))
     got, got_state = jax.jit(decode_gated_delta_rule)(query, key, value, g, beta, state)
+    assert got_state.dtype == held
     np.testing.assert_allclose(got, want, atol=2e-6)
-    np.testing.assert_allclose(got_state, want_state, atol=2e-6)
+    # A bf16 state is rounded stochastically: within one bf16 step of the fp32 one.
+    np.testing.assert_allclose(np.asarray(got_state, np.float32), want_state,
+                               atol=2e-6, rtol=2 ** -7 if held == jnp.bfloat16 else 0)
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
