@@ -177,8 +177,8 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			}
 			return true;
 		});
-		// A report sent again because the pool missed its generation hands the generation over again. No
-		// newer one can overtake it: the trusted preparer takes no preparation until this report is taken.
+		// A report sent again because the pool missed its generation hands the generation over again;
+		// the pool ignores a generation older than its own (model-pool.ts).
 		if (!promoted && (await this.previous())?.snapshot.id !== candidate.snapshot.id) {
 			return this.failed(outcome.token, 'prepared snapshot does not match the requested generation');
 		}

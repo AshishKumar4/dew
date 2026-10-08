@@ -6,7 +6,7 @@ export class Pool extends ModelPool {
 		await this.ctx.storage.put('pool', { hosts: hosts.map((id) => ({ id, ready: true, lastUsed: 0 })), sessions: {} });
 		await this.ctx.storage.setAlarm(Date.now() + 60_000);
 	}
-	async left() { return { pool: (await this.ctx.storage.get('pool')) ?? null, alarm: await this.ctx.storage.getAlarm() }; }
+	async left() { return { pool: (await this.ctx.storage.get<any>('pool')) ?? null, alarm: await this.ctx.storage.getAlarm() }; }
 	async idle() {
 		const state = (await this.ctx.storage.get<any>('pool'))!;
 		for (const host of state.hosts) host.lastUsed = 0;
@@ -38,6 +38,11 @@ export default {
 			return Response.json({ retired, left: await orphan.left() });
 		}
 		const pool = env.POOL.get(env.POOL.idFromName('global'));
+		if (scenario === 'older') {
+			await pool.configure({ ...generation, snapshot: { id: 'newer' }, created: generation.created + 1 });
+			await pool.configure(generation);
+			return Response.json({ desired: (await pool.left()).pool!.desired.snapshot.id });
+		}
 		await pool.configure(generation);
 		const before = await pool.image();
 		await pool.runAlarm();
