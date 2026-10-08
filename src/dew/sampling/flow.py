@@ -26,6 +26,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 
 from .guidance import Guidance, Walk
+from .sample import sample
 
 
 @struct.dataclass
@@ -143,8 +144,10 @@ class FlowSDE:
         if not math.isfinite(schedule.shift) or schedule.shift <= 0:
             raise ValueError("a rectified-flow timestep shift must be finite and positive")
 
-    def init(self, x: jax.Array, times: jax.Array, process: Process, *, key: jax.Array) -> tuple[()]:
-        return ()
+    def init(self, x: jax.Array, times: jax.Array, process: Process, *,
+             key: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """No transition yet: a NaN density and no noise, per row."""
+        return jnp.full((x.shape[0],), jnp.nan, jnp.float32), jnp.zeros((x.shape[0],), bool)
 
     def transition(self, x: jax.Array, t: jax.Array, t_next: jax.Array,
                    denoised: jax.Array, eps: jax.Array, process: Process) -> GaussianTransition:
@@ -154,50 +157,39 @@ class FlowSDE:
         return flow_transition(x, eps - denoised, sigma, following, noise_level=self.noise_level)
 
     def step(self, x: jax.Array, t: jax.Array, t_next: jax.Array,
-             denoised: jax.Array, eps: jax.Array, state: tuple[()], key: jax.Array,
+             denoised: jax.Array, eps: jax.Array, state: tuple[jax.Array, jax.Array], key: jax.Array,
              process: Process,
              denoise: Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]],
-             /) -> tuple[jax.Array, tuple[()]]:
-        return self.transition(x, t, t_next, denoised, eps, process).sample(key), state
+             /) -> tuple[jax.Array, tuple[jax.Array, jax.Array]]:
+        """Draw the next state; the state carried is the transition's log
+        density of that draw and whether the transition is stochastic."""
+        transition = self.transition(x, t, t_next, denoised, eps, process)
+        following = transition.sample(key)
+        return following, (transition.log_prob(following), transition.stochastic)
 
     def trajectory(self, denoise: Denoiser, x_T: jax.Array, steps: int, *,
                    guidance: Guidance | None = None, key: int | jax.Array) -> FlowTrajectory:
-        """Record this solver's transitions over the same time grid and keys as `sample`.
+        """`sample` with this solver, recording each transition's state, log
+        density and whether it is stochastic (`sample(record=...)`).
 
         `steps` counts grid points, including both endpoints, so a
         ten-transition rollout uses steps=11 and fewer than 2 raises
-        `ValueError`. Guidance is applied the same way before each Gaussian
-        is built, and each step is guided or not exactly as in `sample`. The
-        guidance must keep no state between steps, because each transition
-        is later rescored on its own, so APG with momentum raises
-        `ValueError`. Rectified flow's clean prediction at t=0 is its state,
-        so the last transition already produces the final sample.
+        `ValueError`. The guidance must keep no state between steps, because
+        each transition is later rescored on its own, so APG with momentum
+        raises `ValueError`. Rectified flow's clean prediction at t=0 is its
+        state, so the last transition already produces the final sample.
         """
         if steps < 2:
             raise ValueError("a trajectory needs at least two time points")
-        from dew.nn.inputs import request_key
-        key = request_key(key)
-        process = denoise.process
         x_T = jnp.asarray(x_T, jnp.float32)
-        walk = Walk.over(denoise, guidance, steps - 1)
-        if jax.tree.leaves(walk.init(x_T)):
+        if jax.tree.leaves(Walk.over(denoise, guidance, steps - 1).init(x_T)):
             raise ValueError("a flow trajectory's transitions are rescored one at a time, so its "
                              "guidance carries nothing between steps; APG's momentum does")
-        times = process.times(steps)
-        batch = x_T.shape[0]
-
-        def body(x, inputs):
-            t, t_next, index = inputs
-            t, t_next = jnp.full((batch,), t), jnp.full((batch,), t_next)
-            denoised, eps = walk.at((), index)(x, t)
-            transition = self.transition(x, t, t_next, denoised, eps, process)
-            following = transition.sample(jax.random.fold_in(key, index))
-            return following, (following, transition.log_prob(following), transition.stochastic)
-
-        _, (states, log_probs, stochastic) = jax.lax.scan(
-            body, x_T, (times[:-1], times[1:], jnp.arange(steps - 1)))
+        _, (states, log_probs, stochastic) = sample(
+            denoise, x_T, steps, solver=self, guidance=guidance, key=key, final_denoise=False,
+            record=lambda following, state: (following, *state))
         states = jnp.concatenate((x_T[:, None], jnp.swapaxes(states, 0, 1)), axis=1)
-        return FlowTrajectory(states, times, log_probs.T, stochastic.T)
+        return FlowTrajectory(states, denoise.process.times(steps), log_probs.T, stochastic.T)
 
 
 @struct.dataclass

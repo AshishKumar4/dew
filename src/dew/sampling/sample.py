@@ -1,6 +1,6 @@
 """The reverse process as one scan over a time grid."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import overload
 
 import jax
@@ -18,31 +18,19 @@ from dew.sampling.solvers import Solver
 def sample[StateT](
     denoise: Denoiser | DiscreteDenoiser,
     x_T: jax.Array,
-    steps: int,
+    steps: int | None = None,
     *,
     solver: Solver[StateT],
     guidance: Guidance | None = None,
     key: int | jax.Array,
-    times: None = None,
+    times: ArrayLike | Sequence[float] | None = None,
     final_denoise: bool = True,
+    record: None = None,
 ) -> jax.Array: ...
 
 
 @overload
-def sample[StateT](
-    denoise: Denoiser | DiscreteDenoiser,
-    x_T: jax.Array,
-    steps: None = None,
-    *,
-    solver: Solver[StateT],
-    guidance: Guidance | None = None,
-    key: int | jax.Array,
-    times: ArrayLike | Sequence[float],
-    final_denoise: bool = True,
-) -> jax.Array: ...
-
-
-def sample[StateT](
+def sample[StateT, RecordT](
     denoise: Denoiser | DiscreteDenoiser,
     x_T: jax.Array,
     steps: int | None = None,
@@ -52,7 +40,22 @@ def sample[StateT](
     key: int | jax.Array,
     times: ArrayLike | Sequence[float] | None = None,
     final_denoise: bool = True,
-) -> jax.Array:
+    record: Callable[[jax.Array, StateT], RecordT],
+) -> tuple[jax.Array, RecordT]: ...
+
+
+def sample[StateT, RecordT](
+    denoise: Denoiser | DiscreteDenoiser,
+    x_T: jax.Array,
+    steps: int | None = None,
+    *,
+    solver: Solver[StateT],
+    guidance: Guidance | None = None,
+    key: int | jax.Array,
+    times: ArrayLike | Sequence[float] | None = None,
+    final_denoise: bool = True,
+    record: Callable[[jax.Array, StateT], RecordT] | None = None,
+) -> jax.Array | tuple[jax.Array, RecordT]:
     """Run the reverse process from `x_T` with `solver` and return the final sample.
 
     The time grid runs from T to 0. The solver takes one step across each
@@ -67,6 +70,11 @@ def sample[StateT](
     is allowed, and a single point takes no solver step.
     `final_denoise=False` returns the last point's state without the closing
     clean prediction, which is how those solvers end.
+
+    `record` reads each step's new state and the solver's state after it,
+    and the sample comes back with those readings stacked over the steps,
+    `(sample, records)`; Flow-GRPO records each transition and its density
+    this way (`FlowSDE.trajectory`). A record needs at least one step.
 
     `denoise` is `process.denoiser(...)`, which holds the process the solver
     reads, and `guidance` wraps it. Every step's noise comes from `key`
@@ -104,6 +112,8 @@ def sample[StateT](
     batch = x_T.shape[0]
     guided = walk.init(x_T)
     if times.shape[0] == 1:
+        if record is not None:
+            raise ValueError("a record reads the steps, and a grid of one point takes none")
         return walk.at(guided, count)(x_T, jnp.full((batch,), times[0]))[0] if final_denoise else x_T
 
     with jax.ensure_compile_time_eval():
@@ -118,11 +128,11 @@ def sample[StateT](
         (denoised, eps), guided = stepping.step(x, t, index, guided)
         x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
                                process, stepping.at(guided, index))
-        return (x, state, guided), None
+        return (x, state, guided), None if record is None else record(x, state)
 
-    (x, _, guided), _ = lax.scan(
+    (x, _, guided), records = lax.scan(
         body, (x_T, initial, guided),
         (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
-    if not final_denoise:
-        return x
-    return walk.at(guided, count)(x, jnp.full((batch,), times[-1]))[0]
+    if final_denoise:
+        x = walk.at(guided, count)(x, jnp.full((batch,), times[-1]))[0]
+    return x if record is None else (x, records)
