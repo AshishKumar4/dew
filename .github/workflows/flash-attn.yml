@@ -1,12 +1,23 @@
 # Builds kernels/flash_attn's wheels, FlashAttention-2 for JAX, for each CUDA
 # major, on the CUDA toolkit's own glibc-2.28 image; no GPU is needed to build.
 # The wheels are this run's artifacts.
+#
+# A tag flash-attn-v<version> releases them: the build checks that the tag is
+# the version kernels/flash_attn/pyproject.toml carries and that both wheels
+# pass twine's checks, and the publish job uploads those same wheels to PyPI
+# as dew-flash-attn-cu12 and dew-flash-attn-cu13. Trusted publishing: PyPI
+# accepts this workflow's short-lived OIDC token, so the repository holds no
+# PyPI secret. Each of the two PyPI projects names this repository, this
+# workflow file and the `pypi` environment as its publisher. Only the publish
+# job can mint the token, and it runs no code from the repository.
 
 name: FlashAttention wheels
 
 on:
   push:
     branches: [ "main", "ci/**" ]
+    # GitHub does not evaluate the paths below for a tag.
+    tags: [ "flash-attn-v*" ]
     paths: [ "kernels/flash_attn/**", ".github/workflows/flash-attn.yml" ]
   workflow_dispatch:
 
@@ -29,8 +40,14 @@ jobs:
       # The image's GCC 8 is older than nvcc's C++17 needs.
       run: |
         dnf install -y -q git python3.12 python3.12-pip gcc-toolset-12-gcc-c++
-        python3.12 -m pip install --quiet cmake ninja
+        python3.12 -m pip install --quiet cmake ninja twine
     - uses: actions/checkout@v4
+    - name: The tag is the version the wheel carries
+      if: startsWith(github.ref, 'refs/tags/flash-attn-v')
+      run: |
+        version=$(sed -n 's/^version = "\(.*\)"$/\1/p' kernels/flash_attn/pyproject.toml)
+        test "$GITHUB_REF_NAME" = "flash-attn-v$version" || {
+          echo "the tag is $GITHUB_REF_NAME and kernels/flash_attn carries $version"; exit 1; }
     - name: Build
       env:
         PYTHON: python3.12
@@ -38,7 +55,27 @@ jobs:
       run: |
         source /opt/rh/gcc-toolset-12/enable
         sh kernels/flash_attn/build.sh
+    - name: Check the wheel as PyPI will
+      run: python3.12 -m twine check --strict kernels/flash_attn/dist/*.whl
     - uses: actions/upload-artifact@v4
       with:
         name: dew-flash-attn-cuda${{ matrix.cuda }}
         path: kernels/flash_attn/dist/*.whl
+
+  publish:
+    needs: wheel
+    if: startsWith(github.ref, 'refs/tags/flash-attn-v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/dew-flash-attn-cu12
+    permissions:
+      id-token: write
+    steps:
+    - uses: actions/download-artifact@v4
+      with:
+        pattern: dew-flash-attn-cuda*
+        merge-multiple: true
+        path: dist/
+    - name: Publish
+      uses: pypa/gh-action-pypi-publish@release/v1
