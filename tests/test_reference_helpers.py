@@ -5,6 +5,9 @@ import pytest
 
 
 def test_kimi_mxfp4_zero_groups_have_finite_scales_and_decode_to_zero():
+    """An all-zero group's exponent is log2(0), which compressed-tensors
+    clamps to E8M0 code 0, 2**-127, the smallest finite scale, rather than
+    255, E8M0's NaN; its values decode to zero."""
     torch = pytest.importorskip("torch")
     pytest.importorskip("compressed_tensors")
     from tools.kimi_k3_reference import mxfp4
@@ -15,8 +18,8 @@ def test_kimi_mxfp4_zero_groups_have_finite_scales_and_decode_to_zero():
     packed, scales, decoded = mxfp4(weight)
 
     assert torch.isfinite(decoded).all()
-    assert torch.equal(scales[:, 1], torch.full((2,), 127, dtype=torch.uint8))
-    assert scales[1, 0] == 127
+    assert torch.equal(scales[:, 1], torch.zeros((2,), dtype=torch.uint8))
+    assert scales[1, 0] == 0 and scales[0, 0] == 127
     assert torch.count_nonzero(packed[:, 16:]) == torch.count_nonzero(packed[1, :16]) == 0
     torch.testing.assert_close(decoded[:, 32:], weight[:, 32:], rtol=0, atol=0)
     torch.testing.assert_close(decoded[1, :32], weight[1, :32], rtol=0, atol=0)
