@@ -8,7 +8,6 @@ export function example(source, name) {
 }
 
 export function trainingExample(source) {
-	return source.replace('import argparse\n', '')
-		.replace(/parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps/, 'steps = 1000')
-		.replace('tokens = Path(__file__).with_name("tokens")', 'tokens = Path("tokens")');
+	return source.replace('import argparse\n\n', '')
+		.replace(/parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps/, 'steps = 1000');
 }
