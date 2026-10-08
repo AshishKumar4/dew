@@ -92,7 +92,13 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			await this.env.PREPARER.get(this.env.PREPARER.idFromName('trial')).trial(commit,
 				{ registry: this.ctx.id.toString(), token: trial.token });
 		} catch (error) {
-			await this.ctx.storage.put('trialled', { ...trial, failure: String(error).slice(-6000) });
+			// Unless a later trial, or this one's own report, came in while the preparer was asked.
+			await this.ctx.storage.transaction(async (storage) => {
+				const last = await storage.get<Trial>('trialled');
+				if (last?.token === trial.token && !last.generation && !last.failure) {
+					await storage.put('trialled', { ...last, failure: String(error).slice(-6000) });
+				}
+			});
 		}
 	}
 
@@ -171,7 +177,10 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 			}
 			return true;
 		});
-		if (!promoted) return this.failed(outcome.token, 'prepared snapshot does not match the requested generation');
+		// A report sent again because the pool missed its generation hands the generation over again.
+		if (!promoted && (await this.previous())?.snapshot.id !== candidate.snapshot.id) {
+			return this.failed(outcome.token, 'prepared snapshot does not match the requested generation');
+		}
 		if (this.env.POOL) await this.env.POOL.get(this.env.POOL.idFromName('global')).configure(candidate);
 	}
 
