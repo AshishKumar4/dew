@@ -179,8 +179,11 @@ LOGITS: LogicalAxes = ("activation_batch", "activation_length", "activation_voca
 """`[batch, length, vocab]` scores."""
 
 
-DECLARED: dict[Suffix, LogicalAxes] = {}
-"""Every decorated module's declarations, merged."""
+DECLARED: dict[type, dict[Suffix, LogicalAxes]] = {}
+"""Each decorated module class's own declarations."""
+_OWNERS: dict[Suffix, tuple[LogicalAxes, type]] = {}
+"""Every declaration by its suffix, with the class that made it: the table
+`declared_axes` matches, one set of axes per suffix across all classes."""
 
 @dataclasses.dataclass
 class Schedule:
@@ -492,8 +495,19 @@ def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
     return jax.lax.with_sharding_constraint(x, logical_spec(axes, x.shape))
 
 
+def _qualified(cls: type) -> str:
+    return f"{cls.__module__}.{cls.__qualname__}"
+
+
 def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
-    """Declare the parameter axes of the modules `cls` creates."""
+    """Declare the parameter axes of the modules `cls` creates.
+
+    A suffix names a parameter's trailing module names, matched in every
+    model in the process, so two classes that declare one suffix differently
+    are refused here, both named. A class outside Dew qualifies a one-name
+    suffix with the name its own module goes by, (`head`, `readout`) rather
+    than (`readout`,), which would place any model's `readout`.
+    """
     declared = {tuple(suffix): tuple(axes) for suffix, axes in declared.items()}
     for suffix, axes in declared.items():
         names = [name for name in axes if name is not None]
@@ -506,13 +520,22 @@ def logical_axes(declared: Mapping[Suffix, LogicalAxes]):
                 f"width names one of them or leaves the other None")
 
     def decorate(cls):
+        single = sorted('/'.join(suffix) for suffix in declared if len(suffix) == 1)
+        if single and cls.__module__.partition('.')[0] != 'dew':
+            raise ValueError(
+                f"{_qualified(cls)} declares the one-name suffixes {single}, which place a "
+                f"module of that name in any model; qualify each with the name of the "
+                f"module that holds it, e.g. ('head', '{single[0]}')")
         for suffix, axes in declared.items():
-            held = DECLARED.get(suffix)
-            if held is not None and held != axes:
+            held = _OWNERS.get(suffix)
+            if held is not None and held[0] != axes and held[1] is not cls:
                 raise ValueError(
-                    f"{'/'.join(suffix)} is declared {axes} by {cls.__name__} and "
-                    f"{held} elsewhere; one module path has one set of axes")
-            DECLARED[suffix] = axes
+                    f"{'/'.join(suffix)} is declared {axes} by {_qualified(cls)} and "
+                    f"{held[0]} by {_qualified(held[1])}; a suffix has one set of axes")
+        for suffix, axes in declared.items():
+            if suffix not in _OWNERS or _OWNERS[suffix][1] is cls:
+                _OWNERS[suffix] = (axes, cls)
+        DECLARED[cls] = declared
         return cls
 
     return decorate
@@ -547,14 +570,14 @@ def declared_axes(path, ndim: int) -> LogicalAxes | None:
     axes (GPT OSS's fused experts). The parameter's own path is tried first.
     """
     names = parameter_path(path)
-    suffix = _matching(DECLARED, names) or _matching(DECLARED, names[:-1])
+    suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
     if suffix is None:
         return None
-    axes = DECLARED[suffix]
+    axes, owner = _OWNERS[suffix]
     if ndim > len(axes):
         raise ValueError(
-            f"{'/'.join(suffix)} is declared {axes}, which cannot name the "
-            f"{ndim} dimensions of {'/'.join(parameter_path(path))}")
+            f"{'/'.join(suffix)} is declared {axes} by {_qualified(owner)}, which cannot "
+            f"name the {ndim} dimensions of {'/'.join(names)}")
     return axes[len(axes) - ndim:]
 
 
