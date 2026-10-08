@@ -33,6 +33,8 @@ function preparer({ failSmoke = false, failReport = 0 } = {}) {
 		async delete(key) { storage.delete(key); },
 	} };
 	const env = { SNAPSHOTS: { idFromString: (id) => id, get: (registry) => ({ async prepared(outcome) {
+		// A report that outlives its alarm is cut off with it: an alarm past those 15 minutes sends it again.
+		assert.ok(state.alarm > Date.now() + 15 * 60_000);
 		if (failReport-- > 0) throw new Error('registry unreachable');
 		reports.push([registry, outcome]);
 	} }) } };
