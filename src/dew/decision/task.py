@@ -18,11 +18,10 @@ from jax.typing import DTypeLike
 from PIL import Image
 
 from dew import records
-from dew.artifacts import Decisions
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
-from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, softmax
+from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures
 from dew.decision.clef import ClefCheckpoint
 from dew.decision.data import Example
 from dew.decision.head import Head
@@ -50,7 +49,6 @@ from dew.decision.questions import (
     Noul,
     NoulAnswer,
     Question,
-    Score,
     ScoreAnswer,
 )
 from dew.files import write_atomically
@@ -415,32 +413,25 @@ class Decide:
 
     def score(self, examples: Iterable[Example | Mapping[str, object]],
               metrics: Sequence[Metric] = ()) -> dict[str, float]:
-        """Return `metrics` over the questions answered for `examples`, through this task's calibration.
+        """Return `metrics` over the questions answered for `examples`, through this task's temperatures.
 
-        The default metrics are Accuracy, ECE, AURC and the log loss, computed the
-        way a validation pass computes them for a run.
+        This is a run's validation pass (`Evaluation.run`) over those questions,
+        each probability divided by its temperature; a binning map or abstention
+        thresholds are not applied. The default metrics are Accuracy, ECE, AURC
+        and the log loss.
         """
         from dew.decision.metrics import AURC, ECE, Accuracy
+        from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
+        from dew.training.evaluation import Evaluation
 
-        defaults: list[Metric] = [Accuracy(), ECE(), AURC(), LogLoss()]
-        chosen = list(metrics) or defaults
-        scored = self._scored(examples)
-        if not scored:
-            raise ValueError("scoring needs examples with answers")
-        width = max(len(held.logits) for held in scored)
-        probabilities = np.zeros((len(scored), width))
-        options = np.zeros((len(scored), width), bool)
-        for row, held in enumerate(scored):
-            probabilities[row, :len(held.logits)] = softmax(
-                held.logits, self.calibration.temperatures.of(held.kind, len(held.logits)))
-            options[row, :len(held.logits)] = True
-        decisions = Decisions(probabilities=jnp.asarray(probabilities)[:, None],
-                              options=jnp.asarray(options)[:, None],
-                              labels=jnp.asarray([[held.label] for held in scored]),
-                              ordinal=jnp.asarray([[held.kind == Score.kind] for held in scored]),
-                              scored=jnp.ones((len(scored), 1), bool))
-        return {metric.name: metric.finalize(metric(decisions, {})) for metric in chosen}
+        chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
+        objective = DecisionObjective(self, temperatures=self.calibration.temperatures)
+        # A batch is one pass within the budget, as `batch` packs its rows.
+        rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
+        evaluation = Evaluation.run(objective, self.variables, objective.held_out(examples, batch=rows),
+                                    key=0, metrics=chosen)
+        return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
         scored = []
