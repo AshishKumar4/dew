@@ -248,9 +248,8 @@ def test_mfu_is_skipped_on_unknown_hardware():
 
 
 def test_mfu_uses_the_per_device_flop_count(monkeypatch):
-    from dew.telemetry import instrumentation
-    monkeypatch.setitem(instrumentation.PEAK_FLOPS_PER_DEVICE,
-                        jax.devices()[0].device_kind, 100.0)
+    from dew.telemetry import instrumentation, peaks
+    monkeypatch.setitem(peaks.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
     assert instrumentation.model_flops_utilization(50.0, 1.0) == pytest.approx(0.5)
     assert instrumentation.model_flops_utilization(50.0, 2.0) == pytest.approx(0.25)
 
@@ -260,6 +259,8 @@ def test_mfu_uses_the_per_device_flop_count(monkeypatch):
     ("NVIDIA H100 PCIe", 756e12),
     ("NVIDIA A100-SXM4-80GB", 312e12),
     ("NVIDIA GeForce RTX 4080", 97.5e12),
+    ("NVIDIA L4", 121e12),
+    ("NVIDIA RTX PRO 6000 Blackwell Server Edition", 500e12),
     ("TPU v5 lite", 197e12),
     ("TPU v5", 459e12),
     ("TPU7x", None),
