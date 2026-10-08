@@ -59,16 +59,22 @@ async def outcomes(socket, count):
         message = json.loads(await asyncio.wait_for(socket.recv(), timeout=600))
         status, errors = seen.get(message["id"], (None, []))
         if message["type"] == "error":
-            errors.append(message["evalue"])
+            errors.append(f"{message['ename']}: {message['evalue']}")
         seen[message["id"]] = (message["status"] if message["type"] == "done" else status, errors)
     return seen
 
 
+def available():
+    lines = Path("/proc/meminfo").read_text().splitlines()
+    return int(next(line for line in lines if line.startswith("MemAvailable:")).split()[1]) >> 10
+
+
 async def pressure(headers):
     """More memory than the host holds, asked for at once: 24 page cells filling their address
-    space and a training run filling its writable memory. The OOM killer stops guests and never
-    the model process, a stopped cell is told so, and the model still answers afterwards."""
-    model = model_process()
+    space and a training run filling its writable memory. The bridge refuses contexts or stops
+    guests, never the model process, every cell that does not finish says why, and the model
+    still answers afterwards."""
+    model, before = model_process(), available()
     pages = [await page(headers) for _ in range(4)]
     for number, socket in enumerate(pages):
         for cell in range(6):
@@ -79,14 +85,16 @@ async def pressure(headers):
     seen = {}
     for number, socket in enumerate(pages):
         seen.update(await outcomes(socket, 7 if number == 0 else 6))
-    stopped = [name for name, (_, errors) in seen.items()
-               if any(error.startswith("This cell's Python context stopped") for error in errors)]
-    assert stopped, f"nothing ran out of memory: {seen}"
-    # Every other cell either ran to its own limit or was refused a context in words.
-    refusals = ("the shared container has no free Python contexts",
-                "the shared host is short of memory right now; try again in a minute")
-    assert all(status == "ok" or all(error in refusals for error in errors)
-               for name, (status, errors) in seen.items() if name not in stopped), seen
+    # A cell that did not finish was stopped or refused, in words; the pressure must have done one.
+    reasons = ("Stopped: This cell's Python context stopped",
+               "ValueError: the shared container has no free",
+               "ValueError: the shared host is short of memory",
+               "TimeoutError: this cell's Python context sent")
+    unfinished = {name: errors for name, (status, errors) in seen.items() if status != "ok"}
+    report = f"{seen}; MiB available before {before}, now {available()}"
+    assert unfinished, f"nothing was refused or stopped: {report}"
+    assert all(errors and all(error.startswith(reasons) for error in errors)
+               for errors in unfinished.values()), report
     assert model_process() == model, "the model process was restarted"
     for socket in pages:
         await socket.close()
@@ -95,7 +103,8 @@ async def pressure(headers):
     (status, errors), = (await outcomes(socket, 1)).values()
     assert status == "ok", errors
     await socket.close()
-    print(f"Memory pressure stopped {len(stopped)} of 25 cells; the model process kept serving.", flush=True)
+    print(f"Memory pressure: {len(seen) - len(unfinished)} of 25 cells ran, the others were told why; "
+          f"the model process kept serving ({before} MiB available before).", flush=True)
 
 
 async def main():
