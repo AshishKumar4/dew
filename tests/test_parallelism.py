@@ -337,6 +337,55 @@ def test_a_plugins_one_name_suffix_is_refused_and_its_qualified_one_places_only_
     assert elsewhere["params"]["decoder"]["readout"]["kernel"].spec == P("fsdp")
 
 
+class Decoder(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(8, use_bias=False, name="readout")(x)
+
+
+class Readouts(nn.Module):
+    """A top-level `readout` whose module boxes its kernel's axes, and a
+    plain `readout` of the same shape under `decoder`."""
+
+    @nn.compact
+    def __call__(self, x):
+        boxed = nn.Dense(8, use_bias=False, name="readout", kernel_init=nn.with_logical_partitioning(
+            nn.initializers.lecun_normal(), (None, "vocab")))(x)
+        return boxed + Decoder(name="decoder")(x)
+
+
+class BoxedReadout(Objective):
+    ema = None
+
+    def init(self, key, variables=None):
+        return Readouts().init(key, jnp.ones((1, 16)))
+
+    def loss(self, variables, batch, step):
+        return jnp.sum(Readouts().apply(variables, batch["image"][:, 0, 0, :16]) ** 2), Aux({})
+
+
+def test_a_boxed_parameter_places_by_its_own_names_and_its_namesake_elsewhere_does_not():
+    """A module that boxes its parameter (`nn.with_logical_partitioning`)
+    places it by those names, ahead of any suffix, though the state holds it
+    unboxed: its 8-wide vocabulary splits, while the plain `readout` under
+    `decoder` keeps the shape heuristic's 16-wide split. Muon reads the same
+    names: the boxed kernel maps into the vocabulary, so AdamW steps it with
+    two moments, and Muon steps its namesake with one, every moment on its
+    parameter's spec."""
+    trainer = Trainer(BoxedReadout(), OPTIMIZER_MAP["muon"](1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, rules=(("vocab", "fsdp"),)))
+    abstract = jax.eval_shape(trainer.initial_state)
+    placement = jax.tree.map(lambda sharding: sharding.spec, trainer.shardings(abstract))
+    params = placement.variables["params"]
+    assert params["readout"]["kernel"] == P(None, "fsdp")
+    assert params["decoder"]["readout"]["kernel"] == P("fsdp")
+    # The trainer's optimizer state mirrors the params collection itself.
+    moments = muon_moment_specs(placement.opt_state, params)
+    boxed, plain = moments[("readout", "kernel")], moments[("decoder", "readout", "kernel")]
+    assert (len(boxed[1]), set(boxed[1])) == (2, {P(None, "fsdp")})
+    assert (len(plain[1]), set(plain[1])) == (1, {P("fsdp")})
+
+
 def test_rule_override_changes_only_declared_axes():
     specs = declared_specs(dit_variables(), {"mlp": "fsdp"})
 

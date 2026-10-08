@@ -34,6 +34,8 @@ from dew.nn.sharding import (
     LayoutRefused,
     LogicalAxisRules,
     MeshAxes,
+    boxed,
+    boxed_axes,
     declared_axes,
     logical_spec,
     mesh_axes,
@@ -412,7 +414,9 @@ class Layout:
     def shardings[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return a NamedSharding for each leaf of `tree`, from the axes its module declared.
 
-        A leaf whose path no module declares falls back to a shape heuristic,
+        A parameter its module boxed (`nn.with_logical_partitioning`) takes the
+        axes it carries, in `tree` or in the trainer's `boxed` table. A leaf
+        whose path no module declares falls back to a shape heuristic,
         which splits its largest dimension that fsdp divides evenly over fsdp.
         So the axes of one model family can be declared at a time. A leaf below
         `min_shard` elements is replicated either way.
@@ -443,7 +447,8 @@ class Layout:
                     f"split the batch, and the stage axis holds the pipeline")
             return NamedSharding(mesh, spec)
 
-        return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
+        with boxed(boxed_axes(tree)):
+            return jax.tree_util.tree_map_with_path(leaf_sharding, nn.unbox(tree))
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.

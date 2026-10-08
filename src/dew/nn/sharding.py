@@ -561,14 +561,55 @@ def _matching(table, names: Suffix):
     return None
 
 
+_BOXED: contextvars.ContextVar[Mapping[Suffix, LogicalAxes]] = contextvars.ContextVar(
+    "boxed", default=types.MappingProxyType({}))
+"""The axes modules boxed on their own parameters (`boxed_axes`), which
+`declared_axes` reads ahead of the suffix table while `boxed` holds them."""
+
+
+def boxed_axes(tree) -> dict[Suffix, LogicalAxes]:
+    """The axes each parameter a module boxed itself carries
+    (`nn.with_logical_partitioning`), by the parameter's full path,
+    collection first; `nn.unbox` drops them."""
+    table: dict[Suffix, LogicalAxes] = {}
+
+    def visit(path, leaf):
+        if isinstance(leaf, nn.LogicallyPartitioned):
+            table[parameter_path(path)] = tuple(leaf.names)
+
+    jax.tree_util.tree_map_with_path(visit, tree,
+                                     is_leaf=lambda leaf: isinstance(leaf, nn.LogicallyPartitioned))
+    return table
+
+
+@contextlib.contextmanager
+def boxed(table: Mapping[Suffix, LogicalAxes]) -> Iterator[None]:
+    """Read `table`'s boxed axes ahead of the suffix table while the block runs."""
+    token = _BOXED.set({**_BOXED.get(), **table})
+    try:
+        yield
+    finally:
+        _BOXED.reset(token)
+
+
 def declared_axes(path, ndim: int) -> LogicalAxes | None:
     """The declared axes of the parameter at `path`, or None for an unnamed one.
 
-    A declaration names a module, whose parameters share its axes, or one
-    parameter under its module, for a module whose leaves have different
-    axes (GPT OSS's fused experts). The parameter's own path is tried first.
+    A parameter its module boxed with its axes (`boxed`) takes exactly
+    those, matched by its whole path: a variables leaf by its own, a leaf of
+    a tree that mirrors the params collection (an optimizer moment, a
+    gradient) under `params`. Otherwise a declaration names a module, whose
+    parameters share its axes, or one parameter under its module, for a
+    module whose leaves have different axes (GPT OSS's fused experts). The
+    parameter's own path is tried first.
     """
     names = parameter_path(path)
+    held = _BOXED.get()
+    own = held.get(names) or held.get(("params", *names))
+    if own is not None:
+        if ndim > len(own):
+            raise ValueError(f"{'/'.join(names)} is boxed {own}, which cannot name its {ndim} dimensions")
+        return own[len(own) - ndim:]
     suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
     if suffix is None:
         return None
