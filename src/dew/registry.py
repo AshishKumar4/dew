@@ -320,34 +320,27 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-@overload
-def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT: ...
-
-
-@overload
-def from_record(annotation: types.UnionType, value: Configured, *, dtypes: bool = True) -> Configured: ...
-
-
-def from_record(annotation, value: Configured, *, dtypes: bool = True):
+def from_record[ValueT](annotation: type[ValueT] | tuple[type[ValueT], ...], value: Configured, *,
+                        dtypes: bool = True) -> ValueT:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
     `ValueError` naming what the record built instead, so a caller reads a
     value of the type it asked for rather than one it has to narrow again. A
     container annotation, `tuple[ParamGroup, ...]` or `Mapping[str, ...]`,
-    builds every entry and witnesses the container.
+    builds every entry and witnesses the container. A tuple of classes is
+    any one of them, as `isinstance` reads one, and the record names which.
     `dtypes` is the one policy the two readers differ in: a module field
     takes a `dtype` as the dtype its name says (True), and a run record
     keeps the name it wrote (`RunConfig.from_dict`, False).
     """
+    declared = functools.reduce(operator.or_, annotation) if isinstance(annotation, tuple) else annotation
     with _reading(value):
-        built = _rebuilt(annotation, value, dtypes=dtypes)
-    # A union is its own witness: the value is any one of its members.
-    union = typing.get_origin(annotation) in (Union, types.UnionType)
-    witness = annotation if union else typing.get_origin(annotation) or annotation
+        built = _rebuilt(declared, value, dtypes=dtypes)
+    witness = annotation if isinstance(annotation, tuple) else typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
-        declared = annotation if union else witness.__name__
-        raise ValueError(f"{value!r} builds {type(built).__name__}, not the {declared} the field declares")
+        named = witness.__name__ if isinstance(witness, type) else declared
+        raise ValueError(f"{value!r} builds {type(built).__name__}, not the {named} the field declares")
     return built
 
 

@@ -26,7 +26,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import Variables, thaw
 from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.guidance import CFG, Guidance
+from dew.sampling.guidance import APG, CFG, Autoguidance, CFGPlusPlus, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import region
@@ -290,8 +290,9 @@ class TextToImage:
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['class'], 'solver class'),
                                 fields(solver_record['fields'], 'solver fields'))
-        guidance = from_record(Guidance | None, json_value(record['guidance'], 'guidance'), dtypes=False)
-        assert isinstance(guidance, Guidance | None)  # what from_record witnessed, for the type checker
+        recorded = json_value(record['guidance'], 'guidance')
+        guidance = (None if recorded is None
+                    else from_record((CFG, CFGPlusPlus, APG, Autoguidance), recorded, dtypes=False))
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
