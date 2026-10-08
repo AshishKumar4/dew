@@ -11,6 +11,7 @@ gang the module is skipped: CI's multihost job runs it on a gang of four.
 
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -27,10 +28,6 @@ if WORLD < 2:
 import test_multiprocess as single  # noqa: E402
 from process_support import report_of, spawn, terminate, worker_env  # noqa: E402
 from test_multiprocess import (  # noqa: E402, F401
-    LOCAL_KILL_AFTER,
-    STEPS,
-    dumped_params,
-    local_committed,
     local_flags,
     test_a_default_run_name_takes_its_timestamp_from_process_zero,
     test_four_processes_build_the_same_mesh_as_two,
@@ -44,6 +41,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 POOLS = count()
 """The pools this run has started: the n-th is the same pool on every rank, at the same ports."""
 COORDINATOR, EXCHANGE = 20000, 21000
+KILL_AFTER = 60
+"""Seconds into a pool's run that one of its hosts dies: past the join, in compilation or training."""
 
 
 def exchange(sequence: int, mine: object) -> list:
@@ -148,79 +147,67 @@ def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
 
 
 @pytest.mark.distributed
-def test_every_layout_across_hosts_matches_one_device():
-    """Data, FSDP, tensor, expert, sequence and pipeline layouts of the parity tool's dense decoder and its
-    mixture of experts, over four devices on the gang's hosts, each against one device: every split's sums
-    cross the relay between containers, which one host's loopback never does."""
-    if 4 % WORLD:
-        pytest.skip(f"the layouts are four-device layouts, which {WORLD} hosts do not split evenly")
-    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", "dense", "moe"],
-                      devices=4 // WORLD)
+def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device():
+    """The parity tool's dense decoder and mixture of experts over one device on each of four hosts:
+    the data, fsdp and replica layouts, whose sums cross the relay between containers, match one
+    device, and an axis inside a model replica (tensor, stage) is refused across hosts, since each
+    container is its own slice and only fsdp may cross slices."""
+    if WORLD != 4:
+        pytest.skip("one device on each of four hosts")
+    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", "dense", "moe", "--layouts",
+                       "data4", "fsdp4", "replicas4", "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
     if RANK == 0:
-        assert "mismatch" not in output and "works" in output, output[-4000:]
+        summary = next(line for line in output.splitlines() if re.fullmatch(r"\w+ \d+(, \w+ \d+)*", line))
+        counts = {status: int(count) for status, count in re.findall(r"(\w+) (\d+)", summary)}
+        refusals = re.findall(r"^refused (\S+): (.*)$", output, re.M)
+        assert counts == {"works": 8, "refused": 4}, output[-4000:]
+        assert sorted(name for name, _ in refusals) == ["dense/stage4", "dense/tensor4", "moe/stage4",
+                                                        "moe/tensor4"]
+        assert all("granules" in reason for _, reason in refusals), refusals
 
 
 @pytest.mark.distributed
-def test_each_host_resumes_a_lost_pool_from_its_own_local_checkpoint(tmp_path):
-    """Two hosts train with a local checkpoint every two steps on each host's own disk. Both are
-    killed once local step eight landed, as a preemption takes a pool; the restarted pool reads step
-    eight back on each host from its own disk and lands on the parameters of the run nobody killed."""
-    if RANK >= 2:
-        # A pool of two: the other ranks swap nothing but their place.
-        exchange(next(POOLS), None)
-        gang_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
-        gang_pool("fit", tmp_path / "resumed", 2, **local_flags(tmp_path))
-        return
-    sequence = next(POOLS)
-    marker = tmp_path / "blocked"
-    (tmp_path / "killed").mkdir()
-    process = spawn("fit", tmp_path / "killed" / f"process{RANK}.json", processes=2, process_id=RANK,
-                    coordinator=f"rank0:{COORDINATOR + sequence}",
-                    **local_flags(tmp_path, block_after=LOCAL_KILL_AFTER, marker=marker))
-    landed = local_committed(tmp_path, RANK, LOCAL_KILL_AFTER)
-    deadline = time.monotonic() + 900
-    while (not (marker.exists() and landed.exists()) and time.monotonic() < deadline
-           and process.poll() is None):
-        time.sleep(0.1)
-    blocked = marker.exists() and landed.exists()
-    terminate(process)
-    output = "" if blocked else process.stdout.read()[-4000:]
-    parts = exchange(sequence, [blocked, output])[:2]
-    assert [part[0] for part in parts] == [True, True], "\n".join(part[1] for part in parts)
-
-    whole = gang_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
-    resumed = gang_pool("fit", tmp_path / "resumed", 2, **local_flags(tmp_path))
-
-    assert resumed[RANK]["restored_step"] == LOCAL_KILL_AFTER
-    assert resumed[RANK]["restored_from"] == str(tmp_path / "local" / f"process{RANK}")
-    assert [report["step"] for report in resumed] == [STEPS, STEPS] == [report["step"] for report in whole]
-    single.assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{RANK}.json"),
-                                  dumped_params(tmp_path / "whole" / f"process{RANK}.json"))
-
-
-@pytest.mark.distributed
-def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
-    """A host that dies mid-run (its process killed outright) ends the pool's other processes with an error,
-    rather than leaving them waiting for ever on a peer that is gone."""
+def test_a_checkpoint_directory_on_each_hosts_own_disk_is_refused_on_every_host(tmp_path):
+    """A pool whose persistent checkpoint directory is a path on each host's own disk, which no
+    other host sees, is refused on every host before it trains: a step process 0 committed there
+    would lack the other hosts' shards."""
     sequence = next(POOLS)
     if RANK >= 2:
         exchange(sequence, None)
         return
-    marker = tmp_path / "blocked"
     process = spawn("fit", tmp_path / f"process{RANK}.json", processes=2, process_id=RANK,
-                    coordinator=f"rank0:{COORDINATOR + sequence}",
-                    **local_flags(tmp_path, block_after=3, marker=marker))
-    deadline = time.monotonic() + 900
-    while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
-        time.sleep(0.1)
-    if RANK == 1:
-        terminate(process)
-        exchange(sequence, "killed")
-        return
-    exchange(sequence, "waiting")
+                    coordinator=f"rank0:{COORDINATOR + sequence}", **local_flags(tmp_path))
     try:
         output = process.communicate(timeout=600)[0]
     except subprocess.TimeoutExpired:
         terminate(process)
-        pytest.fail("rank 0's process kept waiting ten minutes after rank 1's host died")
-    assert process.returncode != 0, output[-4000:]
+        output = "still running after ten minutes"
+    parts = exchange(sequence, [process.returncode, output[-4000:]])[:2]
+    assert all(code not in (0, None) for code, _ in parts), parts
+    assert all("is not shared: process(es) [1] of 2" in text for _, text in parts), parts
+
+
+@pytest.mark.distributed
+def test_losing_one_host_ends_the_pool_on_the_others(tmp_path):
+    """A host that dies while its pool trains (its process killed outright) ends the pool's process
+    on the other host with an error, rather than leaving it waiting for ever on a peer that is gone."""
+    sequence = next(POOLS)
+    if RANK >= 2:
+        exchange(sequence, None)
+        return
+    process = spawn("tracked", tmp_path / f"process{RANK}.json", processes=2, process_id=RANK,
+                    coordinator=f"rank0:{COORDINATOR + sequence}", fsdp_size=2, steps=1_000_000)
+    time.sleep(KILL_AFTER)
+    alive = process.poll() is None
+    if RANK == 1:
+        terminate(process)
+    outcome = None
+    if RANK == 0:
+        try:
+            process.communicate(timeout=600)
+            outcome = process.returncode
+        except subprocess.TimeoutExpired:
+            terminate(process)
+    parts = exchange(sequence, [alive, outcome])[:2]
+    assert [part[0] for part in parts] == [True, True], "a process ended before rank 1's host died"
+    assert parts[0][1] not in (0, None), "rank 0's process kept waiting ten minutes after rank 1's host died"
