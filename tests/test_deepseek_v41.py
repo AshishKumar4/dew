@@ -674,7 +674,7 @@ def test_a_family_that_reads_its_media_bundle_plugs_in_through_its_entry(monkeyp
     probe = dataclasses.replace(DEEPSEEK_V41, model_types=("bundle_probe",), wrapper=reader,
                                 wrapper_projector_names=("probe_span",))
     monkeypatch.setitem(families(), "bundle_probe", probe)
-    config = json.loads((TINY / "config.json").read_text())
+    config = json.loads((RELEASED / "config.json").read_text())
     record = translate_wrapper_config({**config, "model_type": "bundle_probe"})
     assert read == ["bundle_probe"] and record["model_type"] == "bundle_probe"
     assert wrapper_route("probe_span", record) == ("projector", "probe_span")
