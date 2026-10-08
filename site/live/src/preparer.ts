@@ -190,6 +190,8 @@ export class ManagedPreparer extends DurableObject<Env> {
 			if (job.outcome.generation) await this.phase('complete');
 			await this.ctx.storage.put('job', job);
 		}
+		// Should the report outlive this alarm's 15 minutes, the alarm after it sends it again.
+		await this.ctx.storage.setAlarm(Date.now() + 16 * 60_000);
 		try {
 			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
 		} catch (error) {
