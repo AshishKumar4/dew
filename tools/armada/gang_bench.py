@@ -91,6 +91,39 @@ def relay() -> dict:
     return {"rtt_ms_p50": round(1000 * statistics.median(trips), 2), "MBps": round(STREAM / seconds / 1e6, 2)}
 
 
+def gradient_sync(mesh) -> dict:
+    """The seconds to sum tools/cluster_vs_gpu.py's dense gradients over the hosts: as the
+    data-parallel step does, one all-reduce of a tuple of every parameter's buffer, and as one
+    flat buffer of them all."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.backbones import CausalTransformer
+
+    model = CausalTransformer(emb_features=384, num_layers=6, num_heads=6, mlp_features=1536,
+                              vocab_size=256, max_seq_len=257)
+    shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 256), jnp.int32))["params"]
+    rows = [jax.make_array_from_process_local_data(NamedSharding(mesh, PartitionSpec("hosts")),
+                                                   np.ones((1, *leaf.shape), np.float32))
+            for leaf in jax.tree.leaves(shapes)]
+    replicated = NamedSharding(mesh, PartitionSpec())
+    tupled = jax.jit(lambda leaves: [leaf.sum(0) for leaf in leaves], out_shardings=replicated)
+    flat = jax.jit(lambda leaves: jnp.concatenate([leaf.reshape(1, -1) for leaf in leaves], 1).sum(0),
+                   out_shardings=replicated)
+    timed = {}
+    for name, summed in (("tuple", tupled), ("flat", flat)):
+        jax.block_until_ready(summed(rows))
+        times = []
+        for _ in range(3):
+            start = time.monotonic()
+            jax.block_until_ready(summed(rows))
+            times.append(time.monotonic() - start)
+        timed[f"{name}_s"] = round(statistics.median(times), 3)
+    return {"buffers": len(rows), "bytes": sum(4 * leaf.size for leaf in jax.tree.leaves(shapes)), **timed}
+
+
 def main() -> None:
     print(f"rank {RANK} started at {time.time():.3f}", file=sys.stderr, flush=True)
     try:
@@ -136,6 +169,7 @@ def main() -> None:
         moved = 2 * (WORLD - 1) / WORLD * size
         results.append({"bytes": size, "median_s": round(median, 4),
                         "bus_MBps": round(moved / median / 1e6, 2)})
+    synced = gradient_sync(mesh)
     relays = multihost_utils.process_allgather(np.asarray([measured["rtt_ms_p50"], measured["MBps"]]))
     multihost_utils.sync_global_devices("bench end")
     if RANK == 0:
@@ -144,7 +178,8 @@ def main() -> None:
                           "relay": {"rtt_ms_p50": float(np.median(rtts)), "rtt_ms_max": float(rtts.max()),
                                     "MBps_min": float(rates.min()), "MBps_median": float(np.median(rates)),
                                     "MBps_sum": float(rates.sum())},
-                          "join_s": round(joined, 2), "barrier_s": round(barrier, 3), "sum": results}),
+                          "join_s": round(joined, 2), "barrier_s": round(barrier, 3), "sum": results,
+                          "gradient_sync": synced}),
               flush=True)
     jax.distributed.shutdown()
 

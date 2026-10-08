@@ -80,15 +80,18 @@ BYTES = {"f64": 8, "f32": 4, "s32": 4, "u32": 4, "bf16": 2, "f16": 2, "s8": 1, "
 
 
 def collectives(hlo: str) -> dict:
-    """Each kind of collective in compiled HLO text: how many there are, their result bytes,
-    and the sizes of the five largest. A combined collective is one op with a tuple result."""
+    """Each kind of collective in compiled HLO text: how many ops there are, how many buffers they
+    move (a combined collective is one op with a tuple of them), their bytes, and the sizes of the
+    five largest ops."""
     found: dict = {}
-    pattern = re.compile(r"= (\(?[^=]*?\)?) (" + "|".join(COLLECTIVES) + r")(?:-start)?\(")
+    pattern = re.compile(r"= (\([^()]*\)|\S+) (" + "|".join(COLLECTIVES) + r")(?:-start)?\(")
     for result, kind in pattern.findall(hlo):
+        buffers = re.findall(r"(\w+)\[([\d,]*)\]", result)
         size = sum(BYTES.get(dtype, 4) * math.prod(int(dim) for dim in dims.split(",") if dim)
-                   for dtype, dims in re.findall(r"(\w+)\[([\d,]*)\]", result))
-        entry = found.setdefault(kind, {"ops": 0, "bytes": 0, "sizes": []})
+                   for dtype, dims in buffers)
+        entry = found.setdefault(kind, {"ops": 0, "buffers": 0, "bytes": 0, "sizes": []})
         entry["ops"] += 1
+        entry["buffers"] += len(buffers)
         entry["bytes"] += size
         entry["sizes"].append(size)
     for entry in found.values():
