@@ -190,7 +190,9 @@ def test_each_host_resumes_a_lost_pool_from_its_own_local_checkpoint(tmp_path):
         time.sleep(0.1)
     blocked = marker.exists() and landed.exists()
     terminate(process)
-    assert exchange(sequence, blocked)[:2] == [True, True], "a run ended or stalled before local step eight"
+    output = "" if blocked else process.stdout.read()[-4000:]
+    parts = exchange(sequence, [blocked, output])[:2]
+    assert [part[0] for part in parts] == [True, True], "\n".join(part[1] for part in parts)
 
     whole = gang_pool("fit", tmp_path / "whole", 2, **local_flags(tmp_path / "whole-run"))
     resumed = gang_pool("fit", tmp_path / "resumed", 2, **local_flags(tmp_path))
