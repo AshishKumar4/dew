@@ -87,6 +87,16 @@ def available():
     return int(next(line for line in lines if line.startswith("MemAvailable:")).split()[1]) >> 10
 
 
+async def closed():
+    """Wait for the bridge to close every context, connection file included, after its page closed."""
+    for _ in range(120):
+        left = sorted(path.name for path in Path("/sessions/connections").glob("kernel-*.json"))
+        if not left:
+            return
+        await asyncio.sleep(0.5)
+    raise AssertionError(f"contexts left open after their pages closed: {left}; memory {memory()}")
+
+
 async def pressure(headers):
     """More memory than the host holds, asked for at once: 24 page cells filling their address
     space and a training run filling its writable memory. The bridge refuses contexts or stops
@@ -116,18 +126,13 @@ async def pressure(headers):
     assert model_process() == model, "the model process was restarted"
     for socket in pages:
         await socket.close()
+    await closed()
     socket = await page(headers)
     await socket.send(json.dumps({"op": "execute", "id": "after", "code": TEXT}))
     (status, errors), = (await outcomes(socket, 1)).values()
     assert status == "ok", errors
     await socket.close()
-    # Every context the pressure opened is closed with its page, connection file included.
-    for _ in range(120):
-        left = sorted(path.name for path in Path("/sessions/connections").glob("kernel-*.json"))
-        if not left:
-            break
-        await asyncio.sleep(0.5)
-    assert not left, f"contexts left open after their pages closed: {left}"
+    await closed()
     print(f"Memory pressure: {len(seen) - len(unfinished)} of 25 cells ran, the others were told why; "
           f"the model process kept serving. Memory before: {before} MiB available; after: {memory()}",
           flush=True)
