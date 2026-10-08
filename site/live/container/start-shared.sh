@@ -2,6 +2,9 @@
 # Only trusted serving processes can read model weights; Python contexts use IPC.
 set -eu
 umask 077
+# The gateway, the model process and the bridge inherit this, so the OOM killer never picks them;
+# each guest raises its own score to 1000 (guest_entry.py).
+echo -1000 > /proc/self/oom_score_adj
 mkdir -p /run/dew/model
 chmod 0711 /run/dew
 chown model:model /run/dew/model
