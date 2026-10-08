@@ -103,7 +103,7 @@ class EnvironmentSource:
                             ("max_turns", max_turns), ("workers", workers)):
             if type(value) is not int or value < 1:
                 raise ValueError(f"{name} must be a positive integer")
-        if server.sampling.eos_id is None:
+        if server.sampling.eos_token_ids is None:
             raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
         self.server, self.environment, self.verifier = server, environment, verifier
         self.max_prompt_tokens, self.max_new_tokens, self.max_turns = (

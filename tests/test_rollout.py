@@ -277,7 +277,8 @@ def test_the_mask_stops_after_the_first_stop_token():
     stop = int(chains(first)[0]["input_ids"][PROMPT_WIDTH])
 
     stopped = SampledRollout(objective, Calls(), groups=GROUPS,
-                             max_new_tokens=NEW_TOKENS, sampling=Sampling(temperature=0.0, eos_id=stop))(
+                             max_new_tokens=NEW_TOKENS,
+                             sampling=Sampling(temperature=0.0, eos_token_ids=stop))(
                                  FakeState(params), batch, jax.random.key(1))
 
     chain = chains(stopped)[0]

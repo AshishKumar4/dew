@@ -93,18 +93,18 @@ class Special(Protocol):
     def all_special_ids(self) -> list[int]: ...
 
 
-def regex(tokenizer: Vocabulary | Referencing | Tokenizing, pattern: str, eos_id: int | Sequence[int],
+def regex(tokenizer: Vocabulary | Referencing | Tokenizing, pattern: str, eos_token_ids: int | Sequence[int],
           vocab_size: int | None = None) -> Grammar:
     """The automaton of `pattern` over the tokenizer's vocabulary.
 
-    `eos_id` is the id, or ids, that end a row, as `Sampling.eos_id` names
+    `eos_token_ids` is the id, or ids, that end a row, as `Sampling.eos_token_ids` names
     them; a state that completes the pattern allows them. `vocab_size`
     sizes the class table for the model's head when it pads past the
     tokenizer.
     """
     from outlines_core import Index, Vocabulary as Pieces
 
-    stops = (eos_id,) if isinstance(eos_id, int) else tuple(eos_id)
+    stops = (eos_token_ids,) if isinstance(eos_token_ids, int) else tuple(eos_token_ids)
     if not stops:
         raise ValueError("guided decoding needs an EOS id to end a row on")
     source = vocabulary_of(tokenizer, "guided decoding")
@@ -121,7 +121,7 @@ def regex(tokenizer: Vocabulary | Referencing | Tokenizing, pattern: str, eos_id
 
 
 def json_schema(tokenizer: Vocabulary | Referencing | Tokenizing, schema: str | Mapping[str, JSON],
-                eos_id: int | Sequence[int], vocab_size: int | None = None,
+                eos_token_ids: int | Sequence[int], vocab_size: int | None = None,
                 whitespace: str | None = None) -> Grammar:
     """The automaton of the JSON documents `schema` accepts; see `regex`.
 
@@ -131,7 +131,7 @@ def json_schema(tokenizer: Vocabulary | Referencing | Tokenizing, schema: str | 
     from outlines_core import json_schema as schemas
 
     text = schema if isinstance(schema, str) else json.dumps(schema)
-    return regex(tokenizer, schemas.build_regex_from_schema(text, whitespace), eos_id, vocab_size)
+    return regex(tokenizer, schemas.build_regex_from_schema(text, whitespace), eos_token_ids, vocab_size)
 
 
 def _tables(transitions: Mapping[int, Mapping[int, int]], initial: int, finals: set[int],

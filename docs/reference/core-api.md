@@ -202,7 +202,7 @@ Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 ```text
 generate(model, params, inputs, max_new_tokens, *, key=None,
          sampling=Sampling(), n=1, logits=None, stopping=None, strategy=None) -> Generation
-Sampling(temperature=1.0, top_k=None, eos_id=None, pad_id=None, top_p=1.0, min_p=0.0,
+Sampling(temperature=1.0, top_k=None, eos_token_ids=None, pad_token_id=None, top_p=1.0, min_p=0.0,
          repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0,
          no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
 ```
@@ -215,7 +215,7 @@ The compiled decoder uses one padded input shape, with a cache cursor per row an
 
 A prompt's key is its global row key. Continuation zero draws with that key, so `n=1` and continuation zero of a larger request are the same draw. Continuation `j` folds `j` into the key, so raising `n` leaves the continuations already drawn unchanged. On a mesh, row padding pads the prompts before their continuations exist, so a prompt's `n` rows stay together on the process that asked for them and `host()` drops only the padded prompts' rows.
 
-`Sampling.eos_id` accepts an integer or a tuple of IDs, and any of them terminates a row; the value is normalized to an immutable tuple. `Sampling` holds the common generation controls as one value, and each default changes nothing. The controls are:
+`Sampling.eos_token_ids` accepts an integer or a tuple of IDs, and any of them terminates a row; the value is normalized to an immutable tuple. `Sampling` holds the common generation controls as one value, and each default changes nothing. The controls are:
 
 - the repetition penalty (Transformers' `RepetitionPenalty`), over the prompt and the generated tokens;
 - vLLM's presence and frequency penalties, over the generated tokens;
@@ -230,7 +230,7 @@ A prompt's key is its global row key. Continuation zero draws with that key, so 
 `Generation.tokens` includes the original prompt and has shape `(B * n, P + max_new_tokens)`, where `B` is the number of placed prompt rows. The rows hold prompt zero's `n` continuations first, then the other prompts' in request order. The other fields are aligned with the rows of `tokens`:
 
 - `lengths`, the count of response tokens including EOS;
-- `terminated`, true when EOS ended the row and false when the token budget did (slots after termination hold `Sampling.pad_id`);
+- `terminated`, true when EOS ended the row and false when the token budget did (slots after termination hold `Sampling.pad_token_id`);
 - `behavior_log_probs` and `raw_log_probs`, of shape `(B * n, max_new_tokens)`, the likelihoods of each action under the filtered distribution that drew it and under the unmodified policy.
 
 `rows` counts this process's real prompts times `n`. `host()` returns the record over host arrays of those rows, and `text` decodes them through the task's processor, one string per row.
@@ -276,7 +276,7 @@ def favor_short(state, logits):
 
 # The common controls are one value, compiled in Transformers' order.
 policy = Sampling(temperature=0.8, top_p=0.9, repetition_penalty=1.1, frequency_penalty=0.4,
-                  no_repeat_ngram_size=3, eos_id=2, pad_id=0)
+                  no_repeat_ngram_size=3, eos_token_ids=2, pad_token_id=0)
 drawn = generate(model, variables, prompts, 32, key=0, sampling=policy,
                  stopping=(decoding.MaxNewTokens(24),))
 
@@ -286,7 +286,7 @@ nudged = generate(model, variables, prompts, 32, key=0, sampling=policy,
 
 # The same request as a deterministic search over four beams, returning two.
 searched = generate(model, variables, prompts, 32, key=0,
-                    sampling=Sampling(eos_id=2, pad_id=0),
+                    sampling=Sampling(eos_token_ids=2, pad_token_id=0),
                     logits=(decoding.NoRepeatNGram(3),),
                     strategy=Beam(width=4, length_penalty=1.0), n=2)
 
@@ -294,7 +294,7 @@ searched = generate(model, variables, prompts, 32, key=0,
 # tokens are distributed exactly as ordinary sampling under this call's
 # policy; accepted drafts save target forwards, which untrained depths rarely give.
 drafted = generate(model, variables, prompts, 32, key=0,
-                   sampling=Sampling(temperature=0.8, top_p=0.9, eos_id=2),
+                   sampling=Sampling(temperature=0.8, top_p=0.9, eos_token_ids=2),
                    strategy=Speculative(block=4))
 print(drawn.tokens.shape, nudged.tokens.shape, searched.tokens.shape, drafted.tokens.shape)
 ```
@@ -321,7 +321,7 @@ The transforms port `transformers/generation/logits_process.py` from Transformer
 | `NoRepeatNGram(size)` | `NoRepeatNGramLogitsProcessor` | |
 | `PromptNoRepeatNGram(size)` | `EncoderNoRepeatNGramLogitsProcessor` | n-grams of the prompt |
 | `sequence_bias(entries)` | `SequenceBiasLogitsProcessor` | `(token ids, bias)` pairs compiled into one table |
-| `bad_words(ids, eos_id=None)` | `NoBadWordsLogitsProcessor` | a `-inf` table; single-token EOS sequences are dropped |
+| `bad_words(ids, eos_token_ids=None)` | `NoBadWordsLogitsProcessor` | a `-inf` table; single-token EOS sequences are dropped |
 | `SuppressTokens(tokens)` | `SuppressTokensLogitsProcessor` | |
 | `BeginSuppressTokens(tokens, offset=0)` | `SuppressTokensAtBeginLogitsProcessor` | `offset` is the generated index to suppress at: 0 for the first drawn token, 1 when a forced BOS takes that slot |
 | `ForcedBOS(token)` | `ForcedBOSTokenLogitsProcessor` | |
@@ -332,7 +332,7 @@ The transforms port `transformers/generation/logits_process.py` from Transformer
 
 | Criterion | Reference | Notes |
 | --- | --- | --- |
-| `EndOfSequence(eos)` | `EosTokenCriteria` | what `Sampling.eos_id` compiles to |
+| `EndOfSequence(eos)` | `EosTokenCriteria` | what `Sampling.eos_token_ids` compiles to |
 | `MaxNewTokens(count)` | | a budget below `max_new_tokens` |
 | `MaxLength(length)` | `MaxLengthCriteria` | prompt and generated tokens together |
 | `stop_strings(tokenizer, strings, vocab_size=None)` | `StopStringCriteria` | |

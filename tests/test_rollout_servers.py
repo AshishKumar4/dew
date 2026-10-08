@@ -72,7 +72,7 @@ def pushed(variables, version):
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
 def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
     completion, calls = engine(provider, lambda _: choice(provider, [3, 5, EOS], [-.5, -1., -.25], "stop"))
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, version=4)
+    server = OpenAIRolloutServer(completion, Sampling(eos_token_ids=EOS), pushed, version=4)
     try:
         draw = server.submit([1, 2, 9], 8, key=11).result()
     finally:
@@ -94,7 +94,7 @@ def test_a_draw_is_the_reported_ids_and_behavior_likelihoods(provider):
 @pytest.mark.parametrize("provider", ["vllm", "sglang"])
 def test_a_budget_stop_is_unterminated_and_a_disagreeing_reason_is_refused(provider):
     completion, _ = engine(provider, lambda _: choice(provider, [3, 5], [-.5, -1.], "length"))
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed)
+    server = OpenAIRolloutServer(completion, Sampling(eos_token_ids=EOS), pushed)
     try:
         assert not server.submit([1], 2, key=0).result().terminated
         with pytest.raises(ValueError, match="disagrees"):
@@ -110,7 +110,7 @@ def test_listed_ids_that_disagree_with_the_likelihoods_are_refused():
         return answer
 
     completion, _ = engine("sglang", misaligned)
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed)
+    server = OpenAIRolloutServer(completion, Sampling(eos_token_ids=EOS), pushed)
     try:
         with pytest.raises(ValueError, match="token_ids"):
             server.submit([1], 2, key=0).result()
@@ -133,7 +133,7 @@ def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
                 "routed_experts": base64.b64encode(buffer.getvalue()).decode()}
 
     completion, _ = engine("vllm", answer)
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, routing=True)
+    server = OpenAIRolloutServer(completion, Sampling(eos_token_ids=EOS), pushed, routing=True)
     try:
         draw = server.submit([1, 2], 8, key=0).result()
     finally:
@@ -141,7 +141,7 @@ def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
     assert draw.routed_experts is not None and draw.routed_experts.dtype == np.uint8
     np.testing.assert_array_equal(draw.routed_experts, record)
     bare, _ = engine("vllm", lambda _: choice("vllm", [EOS], [0.], "stop"))
-    server = OpenAIRolloutServer(bare, Sampling(eos_id=EOS), pushed, routing=True)
+    server = OpenAIRolloutServer(bare, Sampling(eos_token_ids=EOS), pushed, routing=True)
     try:
         with pytest.raises(ValueError, match="enable-return-routed-experts"):
             server.submit([1], 8, key=0).result()
@@ -152,9 +152,9 @@ def test_a_routing_server_carries_vllms_routed_experts_into_the_draw():
 def test_raw_engine_likelihoods_are_not_taken_for_a_transformed_policy():
     completion, _ = engine("vllm", lambda _: choice("vllm", [EOS], [0.], "stop"))
     with pytest.raises(ValueError, match="processed_logprobs"):
-        OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed)
+        OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_token_ids=EOS), pushed)
     OpenAIRolloutServer(
-        completion, Sampling(temperature=0.7, eos_id=EOS), pushed, processed_logprobs=True
+        completion, Sampling(temperature=0.7, eos_token_ids=EOS), pushed, processed_logprobs=True
     ).close()
 
 
@@ -162,7 +162,8 @@ def test_vllms_completions_route_refuses_a_filter_for_want_of_its_support():
     """vLLM reports filtered likelihoods on /v1/completions but not the kept
     ids, so a top-k or top-p policy goes to the token route instead."""
     completion, _ = engine("vllm", lambda _: choice("vllm", [EOS], [0.], "stop"))
-    for filtering in (Sampling(top_k=20, eos_id=EOS), Sampling(temperature=.7, top_p=.9, eos_id=EOS)):
+    for filtering in (Sampling(top_k=20, eos_token_ids=EOS),
+                      Sampling(temperature=.7, top_p=.9, eos_token_ids=EOS)):
         with pytest.raises(ValueError, match="VLLMGenerateServer"):
             OpenAIRolloutServer(completion, filtering, pushed, processed_logprobs=True)
 
@@ -192,7 +193,7 @@ def test_vllms_token_route_draws_carry_the_kept_ids_and_the_routing(monkeypatch)
         return httpx.Response(200, json=answer)
 
     monkeypatch.setattr(httpx, "post", post)
-    sampling = Sampling(temperature=.7, top_k=20, top_p=.9, eos_id=EOS)
+    sampling = Sampling(temperature=.7, top_k=20, top_p=.9, eos_token_ids=EOS)
     server = VLLMGenerateServer("http://engine:8000/", sampling, pushed, routing=True)
     try:
         draw = server.submit([1, 2], 4, key=3).result()
@@ -206,19 +207,21 @@ def test_vllms_token_route_draws_carry_the_kept_ids_and_the_routing(monkeypatch)
     assert draw.support == ((5, 6), (EOS,))
     np.testing.assert_array_equal(draw.routed_experts, record)
     with pytest.raises(ValueError, match="finite top-k"):
-        VLLMGenerateServer("http://engine:8000", Sampling(temperature=.7, top_p=.9, eos_id=EOS), pushed)
+        VLLMGenerateServer("http://engine:8000", Sampling(temperature=.7, top_p=.9, eos_token_ids=EOS),
+                           pushed)
 
 
 def test_sglang_serves_a_tempered_policy_but_no_filter():
     # SGLang reports log softmax(logits / T), before its top-k, top-p and min-p.
     completion, _ = engine("sglang", lambda _: choice("sglang", [EOS], [0.], "stop"))
-    OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_id=EOS), pushed).close()
-    for filtering in (Sampling(top_k=20, eos_id=EOS), Sampling(temperature=.7, top_p=.9, eos_id=EOS),
-                      Sampling(min_p=.05, eos_id=EOS)):
+    OpenAIRolloutServer(completion, Sampling(temperature=.7, eos_token_ids=EOS), pushed).close()
+    for filtering in (Sampling(top_k=20, eos_token_ids=EOS),
+                      Sampling(temperature=.7, top_p=.9, eos_token_ids=EOS),
+                      Sampling(min_p=.05, eos_token_ids=EOS)):
         with pytest.raises(ValueError, match="filter"):
             OpenAIRolloutServer(completion, filtering, pushed)
     with pytest.raises(ValueError, match="vLLM mode"):
-        OpenAIRolloutServer(completion, Sampling(eos_id=EOS), pushed, processed_logprobs=True)
+        OpenAIRolloutServer(completion, Sampling(eos_token_ids=EOS), pushed, processed_logprobs=True)
 
 
 def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():
@@ -233,7 +236,7 @@ def test_a_draw_in_flight_across_a_push_keeps_its_submission_version():
     completion, _ = engine("vllm", slow)
     pushes = []
     server = OpenAIRolloutServer(
-        completion, Sampling(eos_id=EOS), lambda *push: pushes.append(push), version=1
+        completion, Sampling(eos_token_ids=EOS), lambda *push: pushes.append(push), version=1
     )
     try:
         early = server.submit([1], 4, key=0)
@@ -260,7 +263,7 @@ def test_a_failed_push_keeps_the_version():
         raise RuntimeError("/update_weights_from_disk answered 400")
 
     completion, _ = engine("sglang", lambda _: choice("sglang", [EOS], [0.], "stop"))
-    server = OpenAIRolloutServer(completion, Sampling(eos_id=EOS), refused, version=3)
+    server = OpenAIRolloutServer(completion, Sampling(eos_token_ids=EOS), refused, version=3)
     try:
         with pytest.raises(RuntimeError, match="400"):
             server.load({"params": {}}, 4)

@@ -25,7 +25,7 @@ from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_ta
 from dew.sampling import Sampling
 
 EOS = 9
-SAMPLING = Sampling(temperature=1.0, eos_id=EOS)
+SAMPLING = Sampling(temperature=1.0, eos_token_ids=EOS)
 
 
 class Server:
@@ -195,7 +195,7 @@ def test_a_cancelled_session_stops_mid_draw_and_releases_its_environment():
 
 
 def test_a_server_without_raw_likelihoods_under_a_transforming_policy_is_refused():
-    server = Server(raw=False, sampling=Sampling(temperature=0.7, eos_id=EOS))
+    server = Server(raw=False, sampling=Sampling(temperature=0.7, eos_token_ids=EOS))
     episodes = source(server, factory([], []))
     with pytest.raises(Exception, match="no raw likelihoods"):
         episodes.submit(Task("1"), 1, version=0)[0].result(timeout=10)

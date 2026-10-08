@@ -419,7 +419,7 @@ class Server:
             raise ValueError("a server takes stop strings compiled into stopping; build it with "
                              "Server.from_task, which compiles the task's")
         self.pad_id = sampling.pad
-        self.sampling = dataclasses.replace(sampling, pad_id=self.pad_id)
+        self.sampling = dataclasses.replace(sampling, pad_token_id=self.pad_id)
         self.transforms = transforms
         self.stopping = stopping
         self.slots = slots

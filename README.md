@@ -698,7 +698,7 @@ result = generate(
     prompt,
     max_new_tokens=128,
     key=jax.random.key(0),
-    sampling=Sampling(temperature=0.8, top_k=40, eos_id=tokenizer.eos_token_id),
+    sampling=Sampling(temperature=0.8, top_k=40, eos_token_ids=tokenizer.eos_token_id),
 )
 print(tokenizer.decode(result.tokens[0], skip_special_tokens=True))
 ```

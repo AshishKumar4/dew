@@ -440,7 +440,7 @@ def test_train_rlvr_turns_feed_a_failed_attempt_back_and_run_each_program_once()
     runs = []
 
     class Server:
-        sampling = Sampling(temperature=1.0, eos_id=eos)
+        sampling = Sampling(temperature=1.0, eos_token_ids=eos)
         version = 0
 
         def submit(self, prompt, max_new_tokens, *, key):
@@ -484,7 +484,7 @@ def test_train_rlvr_scorer_forgets_old_programs_in_a_long_run():
         return 0.0
 
     score = example.attempt_scorer(reward, lambda ids: " ".join(map(str, ids)))
-    sampling = Sampling(temperature=1.0, eos_id=0)
+    sampling = Sampling(temperature=1.0, eos_token_ids=0)
     programs = [
         Action((1,), (token,), (-0.5,), (-0.5,), terminated=False, policy_step=0, sampling=sampling)
         for token in range(1, 65_538)

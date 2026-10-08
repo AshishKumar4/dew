@@ -482,7 +482,7 @@ if sys.argv[2] == "typed":
     from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
     task = Pretrained.load(sys.argv[1], dtype="bfloat16", param_dtype="auto").text_generation(
-        sampling=Sampling(temperature=0, eos_id=None))
+        sampling=Sampling(temperature=0, eos_token_ids=None))
     generated = task(np.asarray([[1,2,3]], np.int32), 3, key=0).host()
     assert int(generated.lengths[0]) == 3
 else:

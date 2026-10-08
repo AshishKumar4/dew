@@ -233,7 +233,7 @@ def test_bad_words_ban_sequences_and_keep_the_eos_reachable():
     words = [[9], [1, 3], [4]]
     prompts = [[3, 3, 9, 1], [7, 2, 5, 2, 7]]
     drawn = [[1], [5]]
-    agrees(decoding.bad_words(words, eos_id=(4,)),
+    agrees(decoding.bad_words(words, eos_token_ids=(4,)),
            NoBadWordsLogitsProcessor(words, eos_token_id=torch.tensor([4])), prompts, drawn)
 
 

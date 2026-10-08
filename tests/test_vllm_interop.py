@@ -168,7 +168,7 @@ def test_top_k_top_p_and_min_p_reach_the_servers_sampler(client, continuation):
 
 
 def test_a_stop_token_ends_the_completion_and_names_itself(client, reference):
-    """`Sampling.eos_id` is the client's only termination control, and it
+    """`Sampling.eos_token_ids` is the client's only termination control, and it
     reaches the server as `stop_token_ids`.
 
     Stopping the model on the token it was about to draw first is a
@@ -180,10 +180,10 @@ def test_a_stop_token_ends_the_completion_and_names_itself(client, reference):
     head = tokenizer.encode(PROMPTS[0], add_special_tokens=False)
     first = greedy(loaded, head, DRAWN)[0]
 
-    answer = client(PROMPTS[0], DRAWN, sampling=Sampling(temperature=0.0, eos_id=first))
+    answer = client(PROMPTS[0], DRAWN, sampling=Sampling(temperature=0.0, eos_token_ids=first))
     ours = generate(loaded.model, loaded.variables,
                     ModelInputs(tokens=jnp.asarray([head], jnp.int32)), DRAWN,
-                    key=jax.random.key(0), sampling=Sampling(temperature=0.0, eos_id=first))
+                    key=jax.random.key(0), sampling=Sampling(temperature=0.0, eos_token_ids=first))
 
     assert answer.finish_reasons == ("stop",)
     assert answer.responses[0].choices[0].stop_reason == first
