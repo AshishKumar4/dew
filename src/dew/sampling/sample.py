@@ -119,20 +119,26 @@ def sample[StateT, RecordT](
     with jax.ensure_compile_time_eval():
         initial = solver.init(x_T, times, process, key=key)
 
-    def body(carry, inputs):
-        x, state, guided = carry
-        t, t_next, index = inputs
-        t = jnp.full((batch,), t)
-        t_next = jnp.full((batch,), t_next)
-        stepping = walk if spanned is None else Walk.over(spanned.spanning(t, t_next), guidance, count)
-        (denoised, eps), guided = stepping.step(x, t, index, guided)
-        x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
-                               process, stepping.at(guided, index))
-        return (x, state, guided), None if record is None else record(x, state)
+    def scanned[ReadT](read: Callable[[jax.Array, StateT], ReadT]) -> tuple[jax.Array, ReadT]:
+        """The sample, and `read` of every step stacked over the steps."""
+        def body(carry, inputs):
+            x, state, guided = carry
+            t, t_next, index = inputs
+            t = jnp.full((batch,), t)
+            t_next = jnp.full((batch,), t_next)
+            stepping = walk if spanned is None else Walk.over(spanned.spanning(t, t_next), guidance, count)
+            (denoised, eps), guided = stepping.step(x, t, index, guided)
+            x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
+                                   process, stepping.at(guided, index))
+            return (x, state, guided), read(x, state)
 
-    (x, _, guided), records = lax.scan(
-        body, (x_T, initial, guided),
-        (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
-    if final_denoise:
-        x = walk.at(guided, count)(x, jnp.full((batch,), times[-1]))[0]
-    return x if record is None else (x, records)
+        (x, _, walked), readings = lax.scan(
+            body, (x_T, initial, guided),
+            (times[:-1], times[1:], jnp.arange(times.shape[0] - 1)))
+        if final_denoise:
+            x = walk.at(walked, count)(x, jnp.full((batch,), times[-1]))[0]
+        return x, readings
+
+    if record is None:
+        return scanned(lambda x, state: None)[0]
+    return scanned(record)
