@@ -126,12 +126,12 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def gpt_neox_export_weights(model: CausalTransformer, variables: Mapping[str, object],
-                             config: Mapping[str, object], *,
+def gpt_neox_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
+                            config: Mapping[str, object], *,
                              attention_name: str = 'attention', interleaved: bool = True) -> LazyTensors:
     """The shared writer's tensors with each layer's q, k and v interleaved by
     head into `query_key_value`, the inverse of `gpt_neox_prepare`."""
-    tensors = decoder_tensors(model, variables, config)
+    tensors = decoder_tensors(family, model, variables, config)
     fused: dict[str, tuple[str, ...]] = {}
     for name in tensors:
         stem, found, leaf = name.partition('.self_attn.q_proj.')

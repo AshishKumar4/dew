@@ -75,9 +75,9 @@ def _falcon_prepare(tensors: Mapping[str, np.ndarray],
                               interleaved=config['num_kv_heads'] != 1)
 
 
-def _falcon_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+def _falcon_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> LazyTensors:
-    return gpt_neox_export_weights(model, variables, config, attention_name='self_attention',
+    return gpt_neox_export_weights(family, model, variables, config, attention_name='self_attention',
                                     interleaved=model.kv_heads != 1)
 
 

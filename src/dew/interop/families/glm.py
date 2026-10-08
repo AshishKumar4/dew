@@ -36,7 +36,7 @@ from dew.interop.hf_decoders import (
     record_int,
     refuse,
     specified_layer_types,
-    translate_config,
+    translated,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -298,11 +298,12 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
     return fields
 
 
-def _glm5_next_export_weights(model: CausalTransformer, variables: Mapping[str, object],
-                              config: Mapping[str, object]) -> dict[str, np.ndarray]:
+def _glm5_next_export_weights(family: DecoderFamily, model: CausalTransformer,
+                              variables: Mapping[str, object], config: Mapping[str, object]
+                              ) -> dict[str, np.ndarray]:
     persistent = {name: tree for name, tree in variables.items() if name != 'cache'}
     check_decoder_tree(persistent, model)
-    fields = translate_config(config)
+    fields = translated(config, family)
     tensors: dict[str, np.ndarray] = {}
     for name, raw in flatten_dict(persistent, sep='.').items():
         collection, *path = name.split('.')
