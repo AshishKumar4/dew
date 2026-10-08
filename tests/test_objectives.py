@@ -259,3 +259,20 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     stepped = trainer.fit(Data(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
     expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 16
     np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
+
+
+def test_a_supplied_rule_is_computed_only_where_something_differentiates():
+    """A pass that reads only the values, as a validation pass does, leaves
+    the rule out of its program; differentiated, the statistic's gradient is
+    the rule, bit for bit."""
+    params = {"w": jnp.asarray([0.5, -1.0, 2.0])}
+    x = np.random.default_rng(0).normal(size=(8, 3)).astype(np.float32)
+
+    def statistic(p, x):
+        rule = {"w": jnp.sin(x).sum(0)}  # an operation of its own, to look for
+        return Objective.with_gradients(jnp.mean(jnp.square(x @ p["w"] - 1.0)), rule, p)
+
+    assert "sine" not in jax.jit(statistic).lower(params, x).compile().as_text()
+    np.testing.assert_allclose(statistic(params, x), np.mean(np.square(x @ np.asarray(params["w"]) - 1.0)),
+                               rtol=1e-6)
+    np.testing.assert_array_equal(jax.grad(statistic)(params, x)["w"], jnp.sin(x).sum(0))
