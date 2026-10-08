@@ -277,7 +277,7 @@ def test_an_eos_inside_a_block_ends_the_row_on_the_token_that_drew_it():
         return jnp.where((state.step == 1)[:, None], forced, logits)
 
     drawn = generate(model, params, prompt, 6, key=jax.random.key(1),
-                     sampling=Sampling(temperature=0, eos_id=eos, pad_id=0),
+                     sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=0),
                      logits=(script, decoding.Greedy()), strategy=Speculative(block=3))
     assert int(drawn.lengths[0]) == 2 and bool(drawn.terminated[0])
     assert int(np.asarray(drawn.tokens)[0, 4]) == eos
@@ -537,7 +537,7 @@ def test_beam_search_refuses_a_chain_that_leaves_a_live_beam_undefined():
     kept = decoding.SuppressTokens(jnp.asarray([token for token in range(VOCAB) if token != 5],
                                                jnp.int32))
     found = generate(model, params, prompt, 4, key=jax.random.key(0), logits=(kept,),
-                     sampling=Sampling(pad_id=0), strategy=Beam(width=2))
+                     sampling=Sampling(pad_token_id=0), strategy=Beam(width=2))
     np.testing.assert_array_equal(np.asarray(found.tokens)[0, 3:], 5)
 
 

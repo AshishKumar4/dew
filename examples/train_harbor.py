@@ -266,7 +266,7 @@ def smoke_setup(config: Config, source) -> tuple[SmokeGateway, Path, tuple[Path,
     for task in tasks:
         task.mkdir(parents=True, exist_ok=True)
     stock = source.text_generation().sampling
-    sampling = Sampling(temperature=1.0, eos_id=stock.eos_id, pad_id=stock.pad_id)
+    sampling = Sampling(temperature=1.0, eos_token_ids=stock.eos_token_ids, pad_token_id=stock.pad_token_id)
     engine = Server.from_task(
         TextGeneration(source.model, source.variables, source.processor, sampling=sampling),
         slots=config.prompts * config.groups,

@@ -221,7 +221,7 @@ def test_one_policy_holds_the_common_controls_in_the_reference_order():
     its penalties together. Every control at its neutral value adds nothing."""
     from dew.sampling import decoding
 
-    policy = Sampling(temperature=0.7, top_k=5, top_p=0.9, min_p=0.05, eos_id=5,
+    policy = Sampling(temperature=0.7, top_k=5, top_p=0.9, min_p=0.05, eos_token_ids=5,
                       repetition_penalty=1.1, presence_penalty=0.5, frequency_penalty=0.25,
                       no_repeat_ngram_size=3, min_new_tokens=2, typical_p=0.8)
     assert [type(transform) for transform in policy.transforms()] == [
@@ -232,7 +232,7 @@ def test_one_policy_holds_the_common_controls_in_the_reference_order():
         decoding.RepetitionPenalty, decoding.PresencePenalty, decoding.FrequencyPenalty,
         decoding.NoRepeatNGram, decoding.MinNewTokens, decoding.Greedy]
     assert Sampling(temperature=0.7).transforms() == (decoding.Temperature(0.7),)
-    with pytest.raises(ValueError, match="eos_id"):
+    with pytest.raises(ValueError, match="eos_token_ids"):
         Sampling(min_new_tokens=2).transforms()
     for bad in ({"repetition_penalty": 0.0}, {"no_repeat_ngram_size": -1}, {"min_new_tokens": -1},
                 {"typical_p": 1.5}, {"stop": ("",)}, {"stop": "\n\n"}, {"presence_penalty": float("nan")}):
@@ -254,8 +254,9 @@ def test_a_sources_generation_config_becomes_its_sampling_value(task):
         "repetition_penalty": 1.3, "no_repeat_ngram_size": 2, "min_new_tokens": 2, "typical_p": 0.9})
     bound = source.text_generation()
     assert bound.logits is None
-    assert bound.sampling == Sampling(temperature=0.7, top_k=5, eos_id=5, pad_id=3, repetition_penalty=1.3,
-                                      no_repeat_ngram_size=2, min_new_tokens=2, typical_p=0.9)
+    assert bound.sampling == Sampling(temperature=0.7, top_k=5, eos_token_ids=5, pad_token_id=3,
+                                      repetition_penalty=1.3, no_repeat_ngram_size=2, min_new_tokens=2,
+                                      typical_p=0.9)
     greedy = bound([[1, 2]], 6, key=1, n=1, sampling=replace(bound.sampling, temperature=0))
     explicit = bound([[1, 2]], 6, key=1, n=1, logits=(
         decoding.RepetitionPenalty(1.3), decoding.NoRepeatNGram(2),
@@ -269,13 +270,13 @@ def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
     policy that names neither stops and pads where the task does."""
     first = task([[1, 2]], 4, key=1, sampling=Sampling(temperature=0))
     eos = int(first.tokens[0, 3])
-    bound = replace(task, sampling=Sampling(temperature=0, eos_id=eos, pad_id=11))
+    bound = replace(task, sampling=Sampling(temperature=0, eos_token_ids=eos, pad_token_id=11))
 
     drawn = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0))
 
     assert drawn.lengths.tolist() == [2] and drawn.terminated.tolist() == [True]
     np.testing.assert_array_equal(drawn.tokens[0, 4:], 11)
-    named = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0, eos_id=12, pad_id=0))
+    named = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0, eos_token_ids=12, pad_token_id=0))
     assert named.lengths.tolist() == [4] and not named.terminated.any()
 
 

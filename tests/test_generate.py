@@ -184,7 +184,7 @@ def test_continuation_zero_is_the_single_draw_and_earlier_continuations_do_not_m
     model = tiny()
     prompt = jax.random.randint(rng, (2, 4), 0, VOCAB)
     params = model.init(rng, prompt)
-    sampling = Sampling(temperature=0.9, top_k=7, eos_id=(3, 9), pad_id=1)
+    sampling = Sampling(temperature=0.9, top_k=7, eos_token_ids=(3, 9), pad_token_id=1)
     draw = functools.partial(generate, model, params, prompt, 5,
                              key=jax.random.PRNGKey(4), sampling=sampling)
 
@@ -212,7 +212,7 @@ def test_each_continuation_stops_at_its_own_eos(rng):
     # A token the greedy policy walks into, so sampled rows reach it as well.
     eos = int(generate(model, params, prompt, 1, key=jax.random.PRNGKey(0),
                        sampling=Sampling(temperature=0)).tokens[0, -1])
-    sampling = Sampling(temperature=1.0, eos_id=eos, pad_id=VOCAB - 1)
+    sampling = Sampling(temperature=1.0, eos_token_ids=eos, pad_token_id=VOCAB - 1)
 
     result = generate(model, params, prompt, 6, key=jax.random.PRNGKey(1), sampling=sampling, n=5)
 
@@ -221,7 +221,7 @@ def test_each_continuation_stops_at_its_own_eos(rng):
     for row, (length, stopped) in enumerate(zip(lengths, terminated, strict=True)):
         assert not np.any(drawn[row, :length - 1] == eos)
         assert bool(drawn[row, length - 1] == eos) == bool(stopped)
-        np.testing.assert_array_equal(drawn[row, length:], sampling.pad_id)
+        np.testing.assert_array_equal(drawn[row, length:], sampling.pad_token_id)
         np.testing.assert_array_equal(np.asarray(result.behavior_log_probs)[row, length:], 0)
         np.testing.assert_array_equal(np.asarray(result.raw_log_probs)[row, length:], 0)
     assert len(set(lengths[:5].tolist())) > 1

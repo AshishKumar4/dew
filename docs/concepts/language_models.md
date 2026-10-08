@@ -244,7 +244,7 @@ print(tokenizer.decode(result.tokens[0]), result.lengths)
 ```
 
 ```text
-Sampling(temperature=0.0, top_k=None, eos_id=None, pad_id=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0, no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
+Sampling(temperature=0.0, top_k=None, eos_token_ids=None, pad_token_id=0, top_p=1.0, min_p=0.0, repetition_penalty=1.0, presence_penalty=0.0, frequency_penalty=0.0, no_repeat_ngram_size=0, min_new_tokens=0, typical_p=1.0, stop=())
 At night, Lily went home. She wa [24]
 ```
 
