@@ -1965,17 +1965,17 @@ def mode_decoding_components(args) -> dict:
 def _meshless_request(model, params, prompts, mask, asking: int) -> dict:
     """What weights on no mesh answer a process that asks for 1 + 2 * `asking`
     rows and 3 + `asking` tokens: its own request, whatever another asks."""
+    import jax
     import jax.numpy as jnp
 
-    from dew.inference import TextGeneration
     from dew.nn.inputs import ModelInputs
-    from dew.sampling import Sampling
+    from dew.sampling import Sampling, generate
 
     rows = 1 + 2 * asking
     own = ModelInputs(jnp.asarray(prompts[:rows]), {"attention_mask": jnp.asarray(mask[:rows])})
-    alone = TextGeneration(model, params, sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12))
-    answer = alone(own, 3 + asking, key=11).host()
-    return {"tokens": answer.tokens.tolist(), "lengths": answer.lengths.tolist()}
+    answer = generate(model, params, own, 3 + asking, key=jax.random.key(11),
+                      sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12)).host()
+    return {"tokens": np.asarray(answer.tokens).tolist(), "lengths": np.asarray(answer.lengths).tolist()}
 
 
 def _undefined_draw(task, request, rank: int, processes: int) -> str:

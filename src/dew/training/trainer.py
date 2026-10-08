@@ -155,7 +155,7 @@ def batch_shapes(batch: Batch) -> Shapes:
 
 def batch_layout(batch: Batch) -> str:
     """A batch's fields, each with its dtype and global shape."""
-    return ", ".join(f"{jax.tree_util.keystr(path)} {np.result_type(leaf)}{list(np.shape(leaf))}"
+    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.asarray(leaf).dtype}{list(np.shape(leaf))}"
                      for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
 
 
