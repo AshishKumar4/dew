@@ -14,6 +14,7 @@ from flax import linen as nn
 from dew.records import JSON
 
 from ..attention import LayerNorm
+from ..blocks import sinusoidal_time
 from ..conv import Conv
 from ..dit import (
     ROPE_THETA,
@@ -28,7 +29,6 @@ from ..dit import (
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..scan_orders import hilbert_patchify, hilbert_unpatchify, unpatchify
-from .unet_condition import sinusoidal_time
 
 
 class UViT(_TransformerOptions):

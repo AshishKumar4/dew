@@ -30,20 +30,12 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.blocks import sinusoidal_time
 from dew.nn.precision import at_least_fp32
+from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
-from .joint import (
-    DoubleStreamBlock,
-    Modulation,
-    apply_rotary,
-    embedding,
-    guided_time,
-    layer_norm,
-    modulate,
-    rotary_table,
-)
+from .joint import DoubleStreamBlock, Modulation, embedding, guided_time, layer_norm, modulate
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -94,7 +86,7 @@ class Flux2SingleBlock(nn.Module):
         query = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_q")(query)
         key = RMSNorm(epsilon=self.epsilon, dtype=self.dtype, name="norm_k")(key)
         attended = scaled_dot_product_attention(
-            apply_rotary(query, *rotation), apply_rotary(key, *rotation), value,
+            rotate(query, *rotation, pairs="adjacent"), rotate(key, *rotation, pairs="adjacent"), value,
             implementation=self.attention_impl, precision=self.precision)
         gated, value_half = jnp.split(projected[..., 3 * inner:], 2, axis=-1)
         joined = jnp.concatenate(
@@ -181,9 +173,9 @@ class Flux2Transformer(nn.Module):
 
         mods = (modulation(6, "double_stream_modulation_img"), modulation(6, "double_stream_modulation_txt"))
         single_mods = modulation(3, "single_stream_modulation")
-        tables = rotary_table(flux2_positions(rows, columns, context.shape[1]), self.axes_dims_rope,
-                              theta=self.rope_theta)
-        rotation = tuple(jnp.asarray(table[None, :, None], image.dtype) for table in tables)
+        tables = axis_tables(flux2_positions(rows, columns, context.shape[1]), self.axes_dims_rope,
+                             self.rope_theta, dtype=np.float64)
+        rotation = tuple(jnp.asarray(table[None], at_least_fp32(image.dtype)) for table in tables)
         hidden = int(self.features * self.mlp_ratio)
         block = {"epsilon": self.eps, "dtype": self.dtype, "precision": self.precision,
                  "attention_impl": self.attention_impl}

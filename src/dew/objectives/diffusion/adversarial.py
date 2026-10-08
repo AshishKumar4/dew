@@ -31,19 +31,11 @@ from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
+from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import TextContext, masked_mean
 from dew.objectives.base import Aux, Batch, Objective, Step, Variables
 
 from .objective import DISCRIMINATOR, SPECTRAL, TEACHER, FlowDistillationObjective
-
-
-def timestep_embedding(time: jax.Array, features: int) -> jax.Array:
-    """DiT's sinusoidal embedding of a model time: cosines then sines at
-    geometric frequencies from 1 to 1/10000."""
-    half = features // 2
-    frequencies = jnp.exp(-math.log(10000.0) * jnp.arange(half, dtype=jnp.float32) / half)
-    angles = jnp.asarray(time, jnp.float32)[:, None] * frequencies[None, :]
-    return jnp.concatenate([jnp.cos(angles), jnp.sin(angles)], axis=-1)
 
 
 class SpectralConv(nn.Module):
@@ -250,7 +242,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
     def _condition(self, time: jax.Array, conditions) -> jax.Array:
         """The heads' condition: the noise level's sinusoidal embedding and,
         where the model reads text, its pooled states."""
-        parts = [timestep_embedding(time, self.time_features)]
+        parts = [sinusoidal_time(time, self.time_features, dtype=jnp.float32)]
         parts += [masked_mean(value.hidden, value.mask).astype(jnp.float32)
                   for value in conditions.values() if isinstance(value, TextContext)]
         return jnp.concatenate(parts, axis=-1)
