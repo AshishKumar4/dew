@@ -1,54 +1,54 @@
 {
 	"about": "Terminal frames from public/hero/train.cast, prepared by scripts/terminal-replay.py.",
 	"meta": {
-		"where": "an RTX 4080",
-		"python": "3.12.13",
+		"where": "one A100",
+		"python": "3.12.3",
 		"jax": "0.11.2.post3",
-		"flax": "0.12.9",
+		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "0128621c2fbe85b591153d944b350499738a564c",
-		"date": "2026-10-04",
-		"wall_seconds": 101.8,
-		"script_sha256": "c97ff9aaa09801fd7f8b8cfa2de13f136370dad3b334d302ecb7a75890203fc6",
+		"dew": "a89d268282cda6a1585e2d2f125d7db9852dfd9a",
+		"date": "2026-10-08",
+		"wall_seconds": 106.0,
+		"script_sha256": "4678e170b38cca442737a1d36086ca0f56746a2a5364c7a3be69641b1706dc8d",
 		"steps": 1000,
-		"device": "NVIDIA GeForce RTX 4080",
-		"description": "Tiny Shakespeare, final 50,000 bytes held out, freshly initialized weights, real recorded training",
-		"validation_perplexity_display": 4.682
+		"device": "NVIDIA A100-SXM4-40GB",
+		"description": "Tiny Shakespeare from winglian/tiny-shakespeare, the first 1% of its tokens held out, freshly initialized weights, real recorded training",
+		"validation_perplexity_display": 3.891
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 101.8,
+		"seconds": 106.0,
 		"columns": 110,
 		"screen": [
 			[
 				{
 					"text": "\u256d\u2500  ",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "dew",
-					"fg": "8b6cd9",
+					"fg": "875fd7",
 					"bold": true
 				},
 				{
 					"text": " \u00b7 ",
-					"fg": "2aa7c9",
+					"fg": "00afd7",
 					"dim": true
 				},
 				{
 					"text": "CausalTransformer",
-					"fg": "2aa7c9",
+					"fg": "00afd7",
 					"bold": true
 				},
 				{
 					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " 10.7M parameters"
@@ -58,7 +58,7 @@
 					"dim": true
 				},
 				{
-					"text": "1 \u00d7 NVIDIA GeForce RTX 4080"
+					"text": "1 \u00d7 NVIDIA A100-SXM4-40GB"
 				},
 				{
 					"text": "  \u00b7  batch ",
@@ -72,301 +72,53 @@
 					"dim": true
 				},
 				{
-					"text": "float32                               "
+					"text": "float32                                 "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "                                                                                                            "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
 				},
 				{
-					"text": "\u2501",
-					"fg": "2aa7c9"
+					"text": "\u2501\u2501\u2501\u2501\u2501",
+					"fg": "00afd7"
 				},
 				{
-					"text": "\u2501",
-					"fg": "2ba6c9"
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2501",
-					"fg": "2ca5c9"
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2501",
-					"fg": "2ea4c9"
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2501",
-					"fg": "2fa3c9"
-				},
-				{
-					"text": "\u2501",
-					"fg": "31a2ca"
-				},
-				{
-					"text": "\u2501",
-					"fg": "32a1ca"
-				},
-				{
-					"text": "\u2501",
-					"fg": "34a0ca"
-				},
-				{
-					"text": "\u2501",
-					"fg": "359fca"
-				},
-				{
-					"text": "\u2501",
-					"fg": "379ecb"
-				},
-				{
-					"text": "\u2501",
-					"fg": "389ecb"
-				},
-				{
-					"text": "\u2501",
-					"fg": "3a9dcb"
-				},
-				{
-					"text": "\u2501",
-					"fg": "3b9ccb"
-				},
-				{
-					"text": "\u2501",
-					"fg": "3d9bcc"
-				},
-				{
-					"text": "\u2501",
-					"fg": "3e9acc"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4099cc"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4198cc"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4297cd"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4496cd"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4596cd"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4795cd"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4894ce"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4a93ce"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4b92ce"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4d91ce"
-				},
-				{
-					"text": "\u2501",
-					"fg": "4e90cf"
-				},
-				{
-					"text": "\u2501",
-					"fg": "508fcf"
-				},
-				{
-					"text": "\u2501",
-					"fg": "518ecf"
-				},
-				{
-					"text": "\u2501",
-					"fg": "538dcf"
-				},
-				{
-					"text": "\u2501",
-					"fg": "548dd0"
-				},
-				{
-					"text": "\u2501",
-					"fg": "568cd0"
-				},
-				{
-					"text": "\u2501",
-					"fg": "578bd0"
-				},
-				{
-					"text": "\u2501",
-					"fg": "598ad0"
-				},
-				{
-					"text": "\u2501",
-					"fg": "5a89d1"
-				},
-				{
-					"text": "\u2501",
-					"fg": "5b88d1"
-				},
-				{
-					"text": "\u2501",
-					"fg": "5d87d1"
-				},
-				{
-					"text": "\u2501",
-					"fg": "5e86d1"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6085d1"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6185d2"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6384d2"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6483d2"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6682d2"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6781d3"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6980d3"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6c7ed3"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6d7dd4"
-				},
-				{
-					"text": "\u2501",
-					"fg": "6f7cd4"
-				},
-				{
-					"text": "\u2501",
-					"fg": "707cd4"
-				},
-				{
-					"text": "\u2501",
-					"fg": "727bd4"
-				},
-				{
-					"text": "\u2501",
-					"fg": "737ad5"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7479d5"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7678d5"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7777d5"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7976d6"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7a75d6"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7c74d6"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7d74d6"
-				},
-				{
-					"text": "\u2501",
-					"fg": "7f73d7"
-				},
-				{
-					"text": "\u2501",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2501",
-					"fg": "8271d7"
-				},
-				{
-					"text": "\u2501",
-					"fg": "8370d7"
-				},
-				{
-					"text": "\u2501",
-					"fg": "856fd8"
-				},
-				{
-					"text": "\u2501",
-					"fg": "866ed8"
-				},
-				{
-					"text": "\u2501",
-					"fg": "886dd8"
-				},
-				{
-					"text": "\u2501",
-					"fg": "896cd8"
-				},
-				{
-					"text": "\u2501",
-					"fg": "8b6cd9"
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
@@ -380,44 +132,44 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  16.6"
+					"text": "  100%  31.0"
 				},
 				{
 					"text": " step/s",
 					"dim": true
 				},
 				{
-					"text": "  0:01:24 "
+					"text": "  0:01:08 "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "                                                                                                            "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
 				},
 				{
 					"text": "train                                                                                                     ",
-					"fg": "8b6cd9",
+					"fg": "875fd7",
 					"bold": true
 				},
 				{
@@ -425,13 +177,13 @@
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -444,7 +196,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     1.195",
+					"text": "     1.120",
 					"bold": true
 				},
 				{
@@ -452,63 +204,43 @@
 				},
 				{
 					"text": "\u2588",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2585",
-					"fg": "34a0ca"
+					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2584",
-					"fg": "3f99cc"
-				},
-				{
-					"text": "\u2583",
-					"fg": "4a93ce"
+					"text": "\u2584\u2583\u2583\u2582\u2582",
+					"fg": "5f87d7"
 				},
 				{
 					"text": "\u2582",
-					"fg": "558cd0"
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2582",
-					"fg": "5f86d1"
-				},
-				{
-					"text": "\u2582",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2581",
-					"fg": "7579d5"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8b6cd9"
+					"text": "\u2581\u2581",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 39%",
-					"fg": "3fae6a"
+					"text": "    \u2193 43%",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                       "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -521,7 +253,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     1.195",
+					"text": "     1.120",
 					"bold": true
 				},
 				{
@@ -529,63 +261,43 @@
 				},
 				{
 					"text": "\u2588",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2585",
-					"fg": "34a0ca"
+					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2584",
-					"fg": "3f99cc"
-				},
-				{
-					"text": "\u2583",
-					"fg": "4a93ce"
+					"text": "\u2584\u2583\u2583\u2582\u2582",
+					"fg": "5f87d7"
 				},
 				{
 					"text": "\u2582",
-					"fg": "558cd0"
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2582",
-					"fg": "5f86d1"
-				},
-				{
-					"text": "\u2582",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2581",
-					"fg": "7579d5"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8b6cd9"
+					"text": "\u2581\u2581",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 39%",
-					"fg": "3fae6a"
+					"text": "    \u2193 43%",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                       "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -598,7 +310,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     3.304",
+					"text": "     3.064",
 					"bold": true
 				},
 				{
@@ -606,63 +318,43 @@
 				},
 				{
 					"text": "\u2588",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2585",
-					"fg": "34a0ca"
+					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2583",
-					"fg": "3f99cc"
-				},
-				{
-					"text": "\u2583",
-					"fg": "4a93ce"
+					"text": "\u2583\u2583\u2582\u2582\u2582",
+					"fg": "5f87d7"
 				},
 				{
 					"text": "\u2582",
-					"fg": "558cd0"
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2582",
-					"fg": "5f86d1"
-				},
-				{
-					"text": "\u2582",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2581",
-					"fg": "7579d5"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8b6cd9"
+					"text": "\u2581\u2581",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 54%",
-					"fg": "3fae6a"
+					"text": "    \u2193 56%",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                       "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -675,7 +367,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     61.4%",
+					"text": "     64.7%",
 					"bold": true
 				},
 				{
@@ -683,70 +375,50 @@
 				},
 				{
 					"text": "\u2581",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
-					"text": "\u2584",
-					"fg": "34a0ca"
+					"text": "\u2585",
+					"fg": "5fafd7"
 				},
 				{
-					"text": "\u2586",
-					"fg": "3f99cc"
-				},
-				{
-					"text": "\u2586",
-					"fg": "4a93ce"
+					"text": "\u2586\u2586\u2587\u2587\u2587",
+					"fg": "5f87d7"
 				},
 				{
 					"text": "\u2587",
-					"fg": "558cd0"
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2587",
-					"fg": "5f86d1"
-				},
-				{
-					"text": "\u2587",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2588",
-					"fg": "7579d5"
-				},
-				{
-					"text": "\u2588",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2588",
-					"fg": "8b6cd9"
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2191 19.0 pt",
-					"fg": "3fae6a"
+					"text": "\u2191 22.5 pt",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                       "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
 				},
 				{
 					"text": "throughput                                                                                                ",
-					"fg": "8b6cd9",
+					"fg": "875fd7",
 					"bold": true
 				},
 				{
@@ -754,13 +426,13 @@
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -773,7 +445,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     60.02",
+					"text": "     33.92",
 					"bold": true
 				},
 				{
@@ -781,63 +453,43 @@
 				},
 				{
 					"text": "\u2581",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2581",
-					"fg": "34a0ca"
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2581\u2581\u2581\u2588\u2581",
+					"fg": "5f87d7"
 				},
 				{
 					"text": "\u2581",
-					"fg": "3f99cc"
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2581",
-					"fg": "4a93ce"
-				},
-				{
-					"text": "\u2581",
-					"fg": "558cd0"
-				},
-				{
-					"text": "\u2588",
-					"fg": "5f86d1"
-				},
-				{
-					"text": "\u2581",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2581",
-					"fg": "7579d5"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2581",
-					"fg": "8b6cd9"
+					"text": "\u2581\u2581",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 0.3%",
-					"fg": "3fae6a"
+					"text": "   \u2193 3.6%",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                       "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -850,7 +502,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     1,066",
+					"text": "     1,887",
 					"bold": true
 				},
 				{
@@ -858,63 +510,43 @@
 				},
 				{
 					"text": "\u2588",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2588",
-					"fg": "34a0ca"
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2588\u2588\u2588\u2581\u2588",
+					"fg": "5f87d7"
 				},
 				{
 					"text": "\u2588",
-					"fg": "3f99cc"
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2588",
-					"fg": "4a93ce"
-				},
-				{
-					"text": "\u2588",
-					"fg": "558cd0"
-				},
-				{
-					"text": "\u2581",
-					"fg": "5f86d1"
-				},
-				{
-					"text": "\u2588",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2588",
-					"fg": "7579d5"
-				},
-				{
-					"text": "\u2588",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2588",
-					"fg": "8b6cd9"
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 0.3%",
-					"fg": "3fae6a"
+					"text": "   \u2191 3.8%",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                       "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -927,7 +559,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     20.0%",
+					"text": "     11.0%",
 					"bold": true
 				},
 				{
@@ -935,70 +567,50 @@
 				},
 				{
 					"text": "\u2588",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2588",
-					"fg": "34a0ca"
+					"fg": "5fafd7"
+				},
+				{
+					"text": "\u2588\u2588\u2588\u2581\u2588",
+					"fg": "5f87d7"
 				},
 				{
 					"text": "\u2588",
-					"fg": "3f99cc"
+					"fg": "8787d7"
 				},
 				{
-					"text": "\u2588",
-					"fg": "4a93ce"
-				},
-				{
-					"text": "\u2588",
-					"fg": "558cd0"
-				},
-				{
-					"text": "\u2581",
-					"fg": "5f86d1"
-				},
-				{
-					"text": "\u2588",
-					"fg": "6a7fd3"
-				},
-				{
-					"text": "\u2588",
-					"fg": "7579d5"
-				},
-				{
-					"text": "\u2588",
-					"fg": "8072d7"
-				},
-				{
-					"text": "\u2588",
-					"fg": "8b6cd9"
+					"text": "\u2588\u2588",
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": " \u2191 0.1 pt",
-					"fg": "3fae6a"
+					"text": " \u2191 0.4 pt",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                       "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
 				},
 				{
 					"text": "optimizer                                                                                                 ",
-					"fg": "8b6cd9",
+					"fg": "875fd7",
 					"bold": true
 				},
 				{
@@ -1006,13 +618,13 @@
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "   "
@@ -1030,33 +642,33 @@
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "                                                                                                            "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
 				},
 				{
 					"text": "val \u00b7 step 1000                                                                                           ",
-					"fg": "8b6cd9",
+					"fg": "875fd7",
 					"bold": true
 				},
 				{
@@ -1064,13 +676,13 @@
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -1083,7 +695,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     4.682",
+					"text": "     3.891",
 					"bold": true
 				},
 				{
@@ -1091,69 +703,69 @@
 				},
 				{
 					"text": "\u2588",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2581",
-					"fg": "8b6cd9"
+					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 2.5%",
-					"fg": "3fae6a"
+					"text": "   \u2193 2.9%",
+					"fg": "5faf5f"
 				},
 				{
 					"text": "                                                                    "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500  ",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2713 ",
-					"fg": "3fae6a"
+					"fg": "5faf5f"
 				},
 				{
 					"text": "finished",
-					"fg": "2aa7c9",
+					"fg": "00afd7",
 					"dim": true
 				},
 				{
 					"text": "  \u2500\u256f",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u256d\u2500  ",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2713 ",
-					"fg": "3fae6a"
+					"fg": "5faf5f"
 				},
 				{
 					"text": "CausalTransformer",
-					"fg": "2aa7c9",
+					"fg": "00afd7",
 					"bold": true
 				},
 				{
 					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -1163,17 +775,17 @@
 					"dim": true
 				},
 				{
-					"text": "1000 steps in 0:01:26           "
+					"text": "1000 steps in 0:01:11           "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -1183,17 +795,17 @@
 					"dim": true
 				},
 				{
-					"text": "after 11.58 s                   "
+					"text": "after 23.34 s                   "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -1203,17 +815,17 @@
 					"dim": true
 				},
 				{
-					"text": "16.7 step/s                     "
+					"text": "29.4 step/s                     "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -1223,17 +835,17 @@
 					"dim": true
 				},
 				{
-					"text": "69.8% of the wall time in steps "
+					"text": "47.8% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -1243,7 +855,7 @@
 					"dim": true
 				},
 				{
-					"text": "1.195                          ",
+					"text": "1.120                          ",
 					"bold": true
 				},
 				{
@@ -1251,13 +863,13 @@
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": " "
@@ -1267,39 +879,39 @@
 					"dim": true
 				},
 				{
-					"text": "4.682",
+					"text": "3.891",
 					"bold": true
 				},
 				{
 					"text": " "
 				},
 				{
-					"text": "\u2193 2.5%",
-					"fg": "3fae6a"
+					"text": "\u2193 2.9%",
+					"fg": "5faf5f"
 				},
 				{
 					"text": " "
 				},
 				{
 					"text": "\u2588",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				},
 				{
 					"text": "\u2581",
-					"fg": "8b6cd9"
+					"fg": "875fd7"
 				},
 				{
 					"text": "      "
 				},
 				{
 					"text": "\u2502",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
 				{
 					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f",
-					"fg": "2aa7c9"
+					"fg": "00afd7"
 				}
 			],
 			[
@@ -1309,12 +921,7 @@
 			],
 			[
 				{
-					"text": "The mercy of the duke of the treason"
-				}
-			],
-			[
-				{
-					"text": "The grace of my heart."
+					"text": "The means the chamber of the treacherous speech."
 				}
 			],
 			[],
@@ -1326,31 +933,11 @@
 			],
 			[
 				{
-					"text": "Then shall I see thee so in the common men"
-				}
-			],
-			[
-				{
-					"text": "Of the world have been that swift to see"
-				}
-			],
-			[
-				{
-					"text": "The death of many things of the confess"
-				}
-			],
-			[
-				{
-					"text": "Of the ground confession of the ground;"
-				}
-			],
-			[
-				{
-					"text": "And then the kind of the sun and lo"
+					"text": "What say you should be so, that I have seen them again."
 				}
 			]
 		],
-		"rows": 39,
+		"rows": 34,
 		"source_rows": 200,
 		"viewer_rows": 200,
 		"replay": "/hero/train.json"
