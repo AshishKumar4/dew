@@ -35,7 +35,7 @@ from jax.sharding import PartitionSpec as P
 
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
-from .kernels.generation import device_generation, triton_runs
+from .kernels.generation import measured_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
 from .protocols import ProjectionGroup, declared_groups
@@ -57,7 +57,7 @@ from .sharding import (
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-# 'auto' resolves per hardware generation through GROUPED_MATMUL_BY_GENERATION.
+# 'auto' resolves per hardware generation through `KERNELS['grouped_matmul']`.
 GROUPED_MATMULS = ('auto', 'xla', 'pallas', 'tokamax')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
@@ -334,28 +334,11 @@ class Router(nn.Module):
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
 
-# The grouped matmul 'auto' runs per hardware generation (`device_generation`):
-# the measured winner, forward plus backward, at lm-moe's shape and at 128
-# experts (docs/performance.md). On sm80, sm86 and sm89 JAX's Pallas kernels
-# run 5x to 61x faster than XLA's ragged_dot, a product over every expert.
-# On TPU v5e/v6e XLA wins except tokamax's mosaic_tpu_v2 (1.11x-1.38x at 8
-# experts), which is not a dependency. Unlisted generations run 'xla'.
-GROUPED_MATMUL_BY_GENERATION = {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas',
-                                'v5e': 'xla', 'v6e': 'xla'}
-
-# The kernel 'tokamax' names, per generation: its own dispatch tries Mosaic
-# first, 4x to 13x slower than XLA on a TPU and over shared memory on sm89.
-# Only the forward runs on tokamax: its Triton backward faults
-# (CUDA_ERROR_ILLEGAL_ADDRESS) on sm80 and sm89.
-TOKAMAX_KERNEL_BY_GENERATION = {'sm80': 'triton', 'sm89': 'triton',
-                                'v5e': 'mosaic_tpu_v2', 'v6e': 'mosaic_tpu_v2'}
-
-
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
                           precision: PrecisionLike) -> str:
     """The one choice of grouped matmul: 'xla', 'pallas' or 'tokamax'.
 
-    'auto' takes the generation's measured one (`GROUPED_MATMUL_BY_GENERATION`).
+    'auto' takes the generation's measured one (`KERNELS['grouped_matmul']`).
     'pallas' needs a GPU the kernels compile for and a product they compute
     exactly (`ragged_dot_runs`), else 'xla'. `operands` are the input and kernel
     dtypes as stored.
@@ -364,8 +347,7 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
         raise ValueError(
             f"implementation must be one of {list(GROUPED_MATMULS)}, got "
             f"{implementation!r}")
-    chosen = (GROUPED_MATMUL_BY_GENERATION.get(device_generation(), 'xla')
-              if implementation == 'auto' else implementation)
+    chosen = measured_kernel('grouped_matmul', 'xla') if implementation == 'auto' else implementation
     if chosen != 'pallas':
         return chosen
     runs = ragged_dot_runs(compute, operands, precision)
@@ -396,7 +378,7 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
         return tokamax.ragged_dot(
             tokens, kernel, group_sizes, precision=precision,
             preferred_element_type=preferred_element_type,
-            implementation=TOKAMAX_KERNEL_BY_GENERATION.get(device_generation(), 'xla'))
+            implementation=measured_kernel('tokamax_grouped_matmul', 'xla'))
     return xla_ragged_dot(tokens, kernel, group_sizes, precision=precision,
                           preferred_element_type=preferred_element_type)
 

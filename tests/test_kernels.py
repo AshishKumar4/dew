@@ -59,6 +59,35 @@ def value_and_grads(implementation, query, key, value, **kwargs):
 
 
 @on_gpu
+@pytest.mark.parametrize("implementation", ["cudnn", "flash"])
+def test_a_fused_kernel_takes_forward_mode_through_the_reference(implementation, without_deterministic_ops):
+    """A fused kernel defines only its reverse-mode derivative, so a JVP
+    traced under `forward_mode_attention` takes its tangent from the
+    reference (`forward_differentiable`): the tangent agrees with the xla
+    kernel's within two bf16 ulps of its scale. Outside the context, jax
+    refuses the JVP of the kernel's custom_vjp, which this also holds."""
+    from dew.nn.attention import forward_mode_attention
+    if implementation == "flash":
+        pytest.importorskip("dew_flash_attn")
+    query, key, value = qkv((2, 256, 8, 64))
+    tangents = qkv((2, 256, 8, 64), seed=1)
+
+    def attend(name):
+        return lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation=name, causal=True)
+
+    def tangent(name):
+        with forward_mode_attention():
+            return np.asarray(jax.jit(lambda *a: jax.jvp(attend(name), a[:3], a[3:])[1])(
+                query, key, value, *tangents), np.float32)
+
+    with pytest.raises(TypeError, match="custom_vjp"):
+        jax.jvp(attend(implementation), (query, key, value), tangents)
+
+    got, want = tangent(implementation), tangent("xla")
+    assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
+@on_gpu
 @pytest.mark.parametrize("q_len, kv_len, causal", [
     (1024, 77, False),   # every cross-attention over CLIP's 77 text tokens
     (9, 7, False),       # short enough that one attended pad key would move an eighth of the mass
@@ -107,10 +136,72 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     found = util.find_spec
+    # dew_flash_attn, which 'auto' prefers on an A100, is out of this test.
     monkeypatch.setattr(util, 'find_spec', lambda name: object() if name == 'tokamax' and installed
-                        else None if name == 'tokamax' else found(name))
+                        else None if name in ('tokamax', 'dew_flash_attn') else found(name))
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 64)), jnp.bfloat16)
     assert attention.resolve_implementation('auto', query, query, **call) == chosen
+
+
+@pytest.mark.parametrize("generation, installed, call, chosen", [
+    ("sm80", True, {}, "flash"),
+    ("sm80", True, {"causal": True}, "flash"),
+    ("sm80", True, {"head_dim": 256}, "flash"),
+    ("sm80", True, {"causal": True, "keys": 256}, "cudnn"),
+    ("sm80", True, {"keys": 256}, "flash"),
+    ("sm80", True, {"sliding_window": 64, "causal": True}, "cudnn"),
+    ("sm80", True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn"),
+    ("sm80", True, {"softcap": 30.0}, "xla"),
+    ("sm80", True, {"dtype": jnp.float32}, "xla"),
+    ("sm80", False, {}, "cudnn"),
+    ("sm89", True, {}, "cudnn"),
+])
+def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, generation, installed, call,
+                                                                chosen, without_deterministic_ops):
+    """With dew_flash_attn installed, 'auto' takes FlashAttention-2 where it
+    was measured faster than cuDNN, for a bf16 call with no window, mask, bias
+    or softcap, heads up to 256 wide and a square causal mask if any."""
+    from importlib import util
+
+    from dew.nn import attention
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
+    monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    found = util.find_spec
+    monkeypatch.setattr(util, 'find_spec', lambda name: (object() if installed else None)
+                        if name == 'dew_flash_attn' else None if name == 'tokamax' else found(name))
+    query = jnp.zeros((1, 128, 4, call.pop("head_dim", 128)), call.pop("dtype", jnp.bfloat16))
+    key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
+    assert attention.resolve_implementation('auto', query, key, **call) == chosen
+
+
+@pytest.mark.parametrize("generation", ["sm90", "sm100", "sm75", "cpu"])
+def test_flash_refuses_a_device_its_wheel_has_no_code_for(monkeypatch, generation, without_deterministic_ops):
+    """The wheel holds sm80 code, which compute capability 8.x runs: an
+    explicit 'flash' on any other device is refused by name, before a CUDA
+    launch could fail without one."""
+    from dew.nn import attention, kernels
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    monkeypatch.setattr(attention, 'device_generation', lambda: generation)
+    query = jnp.zeros((1, 128, 4, 64), jnp.bfloat16)
+    with pytest.raises(ValueError, match=f"built for sm8x and this device is {generation}"):
+        attention.flash_attention(query, query, query, causal=True)
+
+
+@pytest.mark.parametrize("call, refusal", [
+    ({"mask": jnp.ones((1, 1, 128, 128), bool)}, "takes no sinks"),
+    ({"dtype": jnp.float32}, "bf16 or fp16"),
+    ({"causal": True, "keys": 256}, "as many queries as keys"),
+])
+def test_flash_refuses_what_it_cannot_take_by_name(call, refusal, without_deterministic_ops):
+    """An explicit 'flash' names the mask, fp32 input or causal mask over
+    more keys than queries it cannot take, before it imports anything."""
+    query = jnp.zeros((1, 128, 4, 64), call.pop("dtype", jnp.bfloat16))
+    key = jnp.zeros((1, call.pop("keys", 128), 4, 64), query.dtype)
+    arguments = {"bias": None, "mask": None, "causal": False, "sliding_window": None, "softcap": None,
+                 "sinks": None, "segment_ids": None, "key_value_seq_lengths": None}
+    with pytest.raises(ValueError, match=refusal):
+        fused_attention(query, key, key, implementation='flash', **{**arguments, **call})
 
 
 def test_cudnn_refuses_a_bidirectional_window_by_name(without_deterministic_ops):
@@ -144,6 +235,35 @@ def test_triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_
     _, key, value = qkv((2, kv_len, kv_heads, head_dim), seed=1)
 
     fused = value_and_grads('triton', query, key, value, causal=causal)
+    reference = value_and_grads('xla', query, key, value, causal=causal)
+
+    for got, want in zip(fused, reference, strict=True):
+        assert got.shape == want.shape
+        assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
+@on_gpu
+@pytest.mark.parametrize("q_len, kv_len, heads, kv_heads, head_dim, causal", [
+    (1024, 1024, 16, 8, 128, True),  # Qwen3-0.6B's grouped heads
+    (512, 512, 8, 8, 256, True),     # 256-wide heads, which cudnn takes on Hopper alone
+    (256, 256, 12, 12, 64, False),   # SimpleDiT-B's image tokens
+    (333, 333, 4, 4, 64, True),      # an odd length
+    (1024, 77, 4, 4, 64, False),     # cross-attention over CLIP's 77 tokens
+    (256, 256, 8, 8, 80, True),      # a head width that is no power of two
+])
+def test_flash_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_dim, causal,
+                                          without_deterministic_ops):
+    """FlashAttention-2 at the shapes 'auto' sends it: within two bf16 ulps
+    of the output scale of the xla kernel, forward and backward, as cudnn and
+    triton are. Its backward takes heads over 192 wide only on sm80 and sm90
+    ("requires A100/A800 or H100/H800", measured on an L4)."""
+    pytest.importorskip("dew_flash_attn")
+    if head_dim > 192 and kernels.device_generation() in ('sm86', 'sm87', 'sm89'):
+        pytest.skip("FlashAttention-2's backward takes heads over 192 wide only on sm80 and sm90")
+    query, _, _ = qkv((2, q_len, heads, head_dim))
+    _, key, value = qkv((2, kv_len, kv_heads, head_dim), seed=1)
+
+    fused = value_and_grads('flash', query, key, value, causal=causal)
     reference = value_and_grads('xla', query, key, value, causal=causal)
 
     for got, want in zip(fused, reference, strict=True):
