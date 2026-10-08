@@ -248,7 +248,7 @@ def test_beta_tables_are_improved_diffusions(name, steps):
     alphas rounded once."""
     reference = BETAS[f"improved_diffusion_{name}_{steps}"]
     schedule = (LinearNoiseScheduler if name == "linear" else CosineNoiseScheduler)(steps)
-    np.testing.assert_array_equal(np.asarray(schedule._record_fields["betas"]), reference)
+    np.testing.assert_array_equal(np.asarray(schedule.betas), reference)
     alpha, sigma = schedule.rates(jnp.arange(steps))
     cumulative = np.cumprod(1 - reference)
     np.testing.assert_array_equal(alpha, np.sqrt(cumulative).astype(np.float32))

@@ -25,12 +25,14 @@ from releases import released_sampling
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import TFDSImages
 from dew.diffusion.presets import Flow, ResolutionShift
+from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
+from dew.diffusion.transforms import FlowMatchPredictionTransform, ScheduleWeighting
 from dew.objectives import Step
 from dew.objectives.diffusion import DiffusionObjective, DiffusionRunConfig, TextCondition
 from dew.objectives.rl.flow import FlowGRPOObjective
-from dew.registry import argument_records
+from dew.registry import argument_records, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
 
@@ -111,7 +113,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
     written = DiffusionObjective(source, solver=Euler(), steps=2, **settings)
     assert configured.model == written.model
-    assert configured.process.to_json() == written.process.to_json()
+    assert to_record(configured.process, Process) == to_record(written.process, Process)
     assert type(configured.autoencoder) is type(written.autoencoder)
     assert configured.inputs.sample == written.inputs.sample
     assert configured.inputs.conditions.keys() == written.inputs.conditions.keys()
@@ -183,8 +185,8 @@ def test_a_published_flow_pipeline_trains_on_the_sd3_papers_convention(family, p
     process = flow_run(family, 16, pipelines).build().process
     schedule = process.schedule
     assert (schedule.density, schedule.logit_mean, schedule.logit_std) == ("logit_normal", 0.0, 1.0)
-    assert process.to_json()["weighting"] == {"name": "ScheduleWeighting", "fields": {}}
-    assert process.to_json()["prediction"]["name"] == "FlowMatchPredictionTransform"
+    assert type(process.weighting) is ScheduleWeighting
+    assert type(process.prediction) is FlowMatchPredictionTransform
 
 
 DRAWS = dict(np.load(FIXTURES / "flow" / "draws.npz"))

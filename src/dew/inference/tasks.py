@@ -33,7 +33,7 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_c
 from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key
 from dew.nn.protocols import CacheCapacity, TokenModel
 from dew.objectives.base import Variables, thaw
-from dew.records import integer, record as named_fields, text as named
+from dew.records import integer, json_value, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.strategies import Strategy
@@ -589,14 +589,14 @@ class BlockGeneration:
         dtypes override computation and storage.
         """
         from dew.diffusion.block import BlockProcess
-        from dew.registry import objectives
+        from dew.registry import from_record, objectives
         record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         model = model_config.build()
         refuse_non_denoiser(model)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return cls(model, variables, BlockProcess.from_json(named_fields(record['process'], 'process')),
-                   processor,
+        process = from_record(BlockProcess, json_value(record['process'], 'process'), dtypes=False)
+        return cls(model, variables, process, processor,
                    max_new_tokens=_saved_budget(record) or None)
 
     @classmethod
@@ -684,7 +684,7 @@ class MaskedGeneration:
         preview budget becomes the response length a call omits.
         """
         from dew.diffusion.discrete import DiscreteProcess
-        from dew.registry import objectives, solvers
+        from dew.registry import from_record, objectives, solvers
 
         record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
@@ -696,7 +696,7 @@ class MaskedGeneration:
                              f"(TokenModel.mask_token_id), and this {type(model).__name__} names none")
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        process = DiscreteProcess.from_json(named_fields(record['process'], 'process'))
+        process = from_record(DiscreteProcess, json_value(record['process'], 'process'), dtypes=False)
         if process.mask_id != mask_id:
             raise ValueError("model and process mask token disagree")
         solver = named_fields(record['solver'], 'solver')

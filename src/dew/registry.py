@@ -396,10 +396,29 @@ def to_record(value, annotation) -> JSON:
                 for (key, entry_value), entry in zip(value.items(), entries, strict=True)}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    if not isinstance(value, (type, Enum)) and _owned(type(value), called=False):
+        # A plain class of Dew's or a trusted package's, rebuilt from its
+        # constructor's parameters as `_built` builds one; it declares no
+        # fields, so its record always names it.
+        return {"class": import_path(type(value)), "fields": _constructed(value)}
     raise TypeError(
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
         f"functions with an import path")
+
+
+def _constructed(value: Configured) -> dict[str, JSON]:
+    """The record of a plain class's instance: each constructor parameter as
+    the attribute of that name holds it, which `_built` passes back."""
+    cls = type(value)
+    named, _ = parameters(cls)
+    fields = {}
+    for name, (_, owner) in named.items():
+        if not hasattr(value, name):
+            raise TypeError(f"{cls.__name__} keeps no attribute {name!r} for its constructor parameter, "
+                            f"so a record cannot rebuild it")
+        fields[name] = to_record(getattr(value, name), parameter_type(owner, name))
+    return fields
 
 
 def _record_key(key: object, declared: Annotation) -> str:
@@ -667,7 +686,10 @@ def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, d
     held = _record_class(member)
     if held is not None:
         return _construct(held, fields, dtypes=dtypes)
-    return configured(member(**_arguments(member, fields, dtypes=dtypes)))
+    built = member(**_arguments(member, fields, dtypes=dtypes))
+    # A plain class of Dew's or a trusted package's is the value its record
+    # describes (`to_record` writes it from its constructor's parameters).
+    return built if isinstance(member, type) and _owned(member, called=False) else configured(built)
 
 
 def _key(annotation: Annotation, key: str) -> RecordKey:
