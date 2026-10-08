@@ -19,7 +19,7 @@ read. A call the loss passes the weight into unchanged (`pjit`, a
 rematerialized region, a scan over stacked layers) is followed; any other
 use, a custom VJP's included, keeps it.
 
-Where: `NARROW_COPY_GENERATIONS`, the CUDA generations it was measured to
+Where: `KERNELS['narrow_copies']`, the CUDA generations it was measured to
 pay on (docs/performance.md). A TPU fuses the cast into the matmul, so the
 copy there only adds writes. The gradients are the cast's on split meshes
 as partitioned for the CPU (tests/test_narrow.py); a multi-GPU run over
@@ -32,11 +32,6 @@ from jax.core import ShapedArray
 from jax.extend import core
 
 from dew.objectives.base import Variables, merge, select
-
-NARROW_COPY_GENERATIONS = frozenset({'sm80', 'sm89'})
-"""The CUDA generations whose steps read narrow copies: Qwen3-0.6B at 1 x 1024
-tokens runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4
-against 125.9 on an A100 (docs/performance.md)."""
 
 _PASSED_THROUGH = ("jit", "pjit", "closed_call", "core_call", "remat2", "checkpoint")
 

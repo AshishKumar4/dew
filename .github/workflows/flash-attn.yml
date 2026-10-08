@@ -1,0 +1,44 @@
+# Builds kernels/flash_attn's wheels, FlashAttention-2 for JAX, for each CUDA
+# major, on the CUDA toolkit's own glibc-2.28 image; no GPU is needed to build.
+# The wheels are this run's artifacts.
+
+name: FlashAttention wheels
+
+on:
+  push:
+    branches: [ "main", "ci/**" ]
+    paths: [ "kernels/flash_attn/**", ".github/workflows/flash-attn.yml" ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheel:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      matrix:
+        cuda: [ "12.9.1", "13.0.0" ]
+    container: nvidia/cuda:${{ matrix.cuda }}-devel-rockylinux8
+    defaults:
+      run:
+        shell: bash
+    steps:
+    - name: Install the build tools
+      # The image's GCC 8 is older than nvcc's C++17 needs.
+      run: |
+        dnf install -y -q git python3.12 python3.12-pip gcc-toolset-12-gcc-c++
+        python3.12 -m pip install --quiet cmake ninja
+    - uses: actions/checkout@v4
+    - name: Build
+      env:
+        PYTHON: python3.12
+        JOBS: "4"
+      run: |
+        source /opt/rh/gcc-toolset-12/enable
+        sh kernels/flash_attn/build.sh
+    - uses: actions/upload-artifact@v4
+      with:
+        name: dew-flash-attn-cuda${{ matrix.cuda }}
+        path: kernels/flash_attn/dist/*.whl
