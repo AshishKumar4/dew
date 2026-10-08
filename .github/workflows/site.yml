@@ -1,7 +1,9 @@
 # Builds dewml.dev on every change to what it is made of, and fails on a broken
 # link, a notebook without its outputs, a public module without an API page or
 # a registered model family the model list does not name. On main it deploys
-# the site, and rebuilds the live-execution image on the pushed Dew commit.
+# the site, and rebuilds the live-execution image on the pushed Dew commit. A
+# ci/** push builds and checks it beside CI, and main deploys that build of
+# the same commit rather than building it again.
 #
 # Deploying needs the repository secret CLOUDFLARE_API_TOKEN, a token for the
 # account that holds dewml.dev with Workers Scripts, Containers and Workers
@@ -11,7 +13,8 @@ name: Site
 
 on:
   push:
-    branches: [ "main" ]
+    # ci/** is where a branch goes for its own run before it lands.
+    branches: [ "main", "ci/**" ]
     paths: [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
   pull_request:
     branches: [ "main" ]
@@ -23,10 +26,31 @@ permissions:
 
 concurrency:
   group: site-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/ci/') }}
 
 jobs:
+  # The run that built and checked this commit on another push, which leaves
+  # the build as its artifact only once every check passed: main deploys it.
+  proven:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+    outputs:
+      run: ${{ steps.find.outputs.run }}
+    steps:
+    - id: find
+      if: github.event_name == 'push'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=site&per_page=100" \
+          --jq "[.artifacts[] | select(.workflow_run.head_sha == \"$GITHUB_SHA\" and (.expired | not))][0].workflow_run.id // empty")
+        echo "run=$run" >> "$GITHUB_OUTPUT"
+        if [ -n "$run" ]; then echo "built in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
+
   build:
+    needs: proven
+    if: needs.proven.outputs.run == ''
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -51,17 +75,21 @@ jobs:
     - run: pnpm live:test
     - run: pnpm test  # Chrome, which ubuntu-latest has
     - uses: actions/upload-artifact@v4
-      if: github.event_name == 'push'
+      if: github.event_name != 'pull_request'
       with:
         name: site
         path: site/dist
         retention-days: 7
 
   deploy:
-    needs: build
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [proven, build]
+    # After this run's build, or the proven run's in its place.
+    if: ${{ !failure() && !cancelled() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
     defaults:
       run:
         working-directory: site
@@ -89,6 +117,8 @@ jobs:
       with:
         name: site
         path: site/dist
+        run-id: ${{ needs.proven.outputs.run || github.run_id }}
+        github-token: ${{ github.token }}
     - name: Deploy dewml.dev and the www redirect
       if: steps.token.outputs.present == 'true'
       env:
