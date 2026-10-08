@@ -159,14 +159,20 @@ class NativeModels:
                 "shape": list(pixels.shape),
                 "dtype": pixels.dtype.name if pixels.dtype.name == "bfloat16" else pixels.dtype.str}
 
-    def text(self, requests):
+    def text(self, requests, emitters=None):
         tickets = []
-        for request in requests:
+        for index, request in enumerate(requests):
             try:
                 if request["model"] not in self.text_servers:
                     raise ValueError("the live kernel serves only its pinned text models")
                 server = self.text_servers[request["model"]]
-                tickets.append(server.submit(request["prompt"], request["tokens"], key=request["key"]))
+                ticket = server.submit(request["prompt"], request["tokens"], key=request["key"])
+                if emitters is not None:
+                    def streamed(ticket, server=server, emit=emitters[index]):
+                        decoded = server.processor.decode(self.np.asarray([ticket.tokens], dtype="int32"))[0]
+                        emit({"text": decoded, "first_token_seconds": ticket.first - ticket.submitted})
+                    ticket.add_tokens_callback(streamed)
+                tickets.append(ticket)
             except Exception as error:
                 tickets.append(error)
         for server in self.text_servers.values():
@@ -252,7 +258,7 @@ class ModelService(socketserver.ThreadingUnixStreamServer):
                             held = following
                             break
                         group.append(following)
-                    results = self.models.text([request for request, _ in group])
+                    results = self.models.text([request for request, _ in group], [emit for _, emit in group])
                     for result, (_, send) in zip(results, group, strict=True):
                         if isinstance(result, Exception):
                             send({"error": {"name": type(result).__name__, "message": str(result)}})

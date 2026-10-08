@@ -1,0 +1,361 @@
+{
+	"about": "The screen framework.py left on a terminal, written by site/scripts/capture_snippets.py.",
+	"arguments": [
+		"--section",
+		"decide",
+		"--out",
+		"/tmp/rec-decide/out"
+	],
+	"script_sha256": "43a3db065b322ba9a1a08ab8c65a6ff622b4e50ff77bbc0eb7b97caee8010f15",
+	"meta": {
+		"where": "a 4-vCPU Cloudflare container",
+		"python": "3.12.15",
+		"jax": "0.11.2.post3",
+		"flax": "0.12.10",
+		"optax": "0.2.8",
+		"dew": "124b9c320b0bc0ac930787d3fa1b664aa7b0de6f",
+		"date": "2026-10-08"
+	},
+	"hero": {
+		"returncode": 0,
+		"seconds": 45.1,
+		"columns": 96,
+		"screen": [
+			[
+				{
+					"text": "{"
+				}
+			],
+			[
+				{
+					"text": "  \"department\": {"
+				}
+			],
+			[
+				{
+					"text": "    \"type\": \"choice\","
+				}
+			],
+			[
+				{
+					"text": "    \"choice\": \"billing\","
+				}
+			],
+			[
+				{
+					"text": "    \"probabilities\": {"
+				}
+			],
+			[
+				{
+					"text": "      \"billing\": 0.9897,"
+				}
+			],
+			[
+				{
+					"text": "      \"technical\": 0.0103"
+				}
+			],
+			[
+				{
+					"text": "    },"
+				}
+			],
+			[
+				{
+					"text": "    \"confidence\": 0.9794"
+				}
+			],
+			[
+				{
+					"text": "  },"
+				}
+			],
+			[
+				{
+					"text": "  \"urgency\": {"
+				}
+			],
+			[
+				{
+					"text": "    \"type\": \"score\","
+				}
+			],
+			[
+				{
+					"text": "    \"score\": 1.7091,"
+				}
+			],
+			[
+				{
+					"text": "    \"legend\": {"
+				}
+			],
+			[
+				{
+					"text": "      \"0\": \"not urgent\","
+				}
+			],
+			[
+				{
+					"text": "      \"1\": \"soon\","
+				}
+			],
+			[
+				{
+					"text": "      \"2\": \"blocking\""
+				}
+			],
+			[
+				{
+					"text": "    },"
+				}
+			],
+			[
+				{
+					"text": "    \"probabilities\": {"
+				}
+			],
+			[
+				{
+					"text": "      \"0\": 0.0483,"
+				}
+			],
+			[
+				{
+					"text": "      \"1\": 0.1942,"
+				}
+			],
+			[
+				{
+					"text": "      \"2\": 0.7574"
+				}
+			],
+			[
+				{
+					"text": "    },"
+				}
+			],
+			[
+				{
+					"text": "    \"confidence\": 0.5636"
+				}
+			],
+			[
+				{
+					"text": "  },"
+				}
+			],
+			[
+				{
+					"text": "  \"churn_risk\": {"
+				}
+			],
+			[
+				{
+					"text": "    \"type\": \"noul\","
+				}
+			],
+			[
+				{
+					"text": "    \"noul\": 0.0818"
+				}
+			],
+			[
+				{
+					"text": "  }"
+				}
+			],
+			[
+				{
+					"text": "}"
+				}
+			],
+			[
+				{
+					"text": "{"
+				}
+			],
+			[
+				{
+					"text": "  \"model\": \"convaiinnovations/laya\","
+				}
+			],
+			[
+				{
+					"text": "  \"answers\": {"
+				}
+			],
+			[
+				{
+					"text": "    \"department\": {"
+				}
+			],
+			[
+				{
+					"text": "      \"type\": \"choice\","
+				}
+			],
+			[
+				{
+					"text": "      \"choice\": \"billing\","
+				}
+			],
+			[
+				{
+					"text": "      \"probabilities\": {"
+				}
+			],
+			[
+				{
+					"text": "        \"billing\": 0.9897,"
+				}
+			],
+			[
+				{
+					"text": "        \"technical\": 0.0103"
+				}
+			],
+			[
+				{
+					"text": "      },"
+				}
+			],
+			[
+				{
+					"text": "      \"confidence\": 0.9794"
+				}
+			],
+			[
+				{
+					"text": "    },"
+				}
+			],
+			[
+				{
+					"text": "    \"urgency\": {"
+				}
+			],
+			[
+				{
+					"text": "      \"type\": \"score\","
+				}
+			],
+			[
+				{
+					"text": "      \"score\": 1.7091,"
+				}
+			],
+			[
+				{
+					"text": "      \"legend\": {"
+				}
+			],
+			[
+				{
+					"text": "        \"0\": \"not urgent\","
+				}
+			],
+			[
+				{
+					"text": "        \"1\": \"soon\","
+				}
+			],
+			[
+				{
+					"text": "        \"2\": \"blocking\""
+				}
+			],
+			[
+				{
+					"text": "      },"
+				}
+			],
+			[
+				{
+					"text": "      \"probabilities\": {"
+				}
+			],
+			[
+				{
+					"text": "        \"0\": 0.0483,"
+				}
+			],
+			[
+				{
+					"text": "        \"1\": 0.1942,"
+				}
+			],
+			[
+				{
+					"text": "        \"2\": 0.7574"
+				}
+			],
+			[
+				{
+					"text": "      },"
+				}
+			],
+			[
+				{
+					"text": "      \"confidence\": 0.5636"
+				}
+			],
+			[
+				{
+					"text": "    },"
+				}
+			],
+			[
+				{
+					"text": "    \"churn_risk\": {"
+				}
+			],
+			[
+				{
+					"text": "      \"type\": \"noul\","
+				}
+			],
+			[
+				{
+					"text": "      \"noul\": 0.0818"
+				}
+			],
+			[
+				{
+					"text": "    }"
+				}
+			],
+			[
+				{
+					"text": "  },"
+				}
+			],
+			[
+				{
+					"text": "  \"usage\": {"
+				}
+			],
+			[
+				{
+					"text": "    \"input_tokens\": 134,"
+				}
+			],
+			[
+				{
+					"text": "    \"output_tokens\": 0"
+				}
+			],
+			[
+				{
+					"text": "  }"
+				}
+			],
+			[
+				{
+					"text": "}"
+				}
+			]
+		]
+	}
+}

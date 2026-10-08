@@ -8,12 +8,6 @@ cell's step count and whose PNG is that prediction mapped linearly from
 latents to a small RGB image, then {"dew-progress": {"stage": "decode"}} while
 the model's final clean prediction and the VAE decode run. The
 page shows these as the run's progress; any other display is the cell's own.
-
-`ReportingModels` wraps the setup cell's loaders, `from_pretrained` and
-`text_model`: it reports {"dew-progress": {"stage": "load", "model": name}}
-before a model this kernel has not loaded yet loads. A text task then reports
-{"dew-progress": {"stage": "generate", "first": bool}} before each generation,
-`first` for that model's first one in this kernel, which compiles its program.
 """
 
 from __future__ import annotations
@@ -22,14 +16,12 @@ import base64
 import io
 import json
 import queue
-from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 import jax
 import numpy as np
-from huggingface_hub.errors import OfflineModeIsEnabled
 from PIL import Image
 
 # Stable Diffusion's VAE latents (sd-vae-ft-mse, as the model is trained on)
@@ -127,42 +119,3 @@ class StalePage(ValueError):
 
     def _render_traceback_(self) -> list[str]:
         return [str(self)]
-
-
-class ReportingModels:
-    """`load`, one of the setup cell's loaders, reporting each model's load and
-    handing back what it loads wrapped in `wrap`, once per model."""
-
-    def __init__(self, load: Callable[..., Any], wrap: Callable[[Any], Any]) -> None:
-        self.load = load
-        self.wrap = wrap
-        self.loaded: dict[tuple[str, str | None], Any] = {}
-
-    def __call__(self, name: str, *, revision: str | None = None) -> Any:
-        key = (name, revision)
-        if key not in self.loaded:
-            _show({"stage": "load", "model": name})
-            try:
-                loaded = self.load(name) if revision is None else self.load(name, revision=revision)
-            except OfflineModeIsEnabled:
-                if any(model == name and version != revision for model, version in self.loaded):
-                    raise StalePage("This page was updated. Reload it to use the current model.") from None
-                raise
-            self.loaded[key] = self.wrap(loaded)
-        return self.loaded[key]
-
-
-class ReportingText:
-    """A text generation task, reporting each call before it runs."""
-
-    def __init__(self, task: Any) -> None:
-        self.task = task
-        self.called = False
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self.task, name)
-
-    def __call__(self, *args, **kw):
-        _show({"stage": "generate", "first": not self.called})
-        self.called = True
-        return self.task(*args, **kw)

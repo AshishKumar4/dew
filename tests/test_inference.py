@@ -502,6 +502,31 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
+def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
+    """A Hub repository holding a run, as `HfApi().upload_folder` publishes
+    it, loads as that run: pulled whole at the commit its metadata resolved
+    (the name of the snapshot directory), with checkpoints selected by step."""
+    import huggingface_hub
+
+    import dew.interop.hub as hub
+    from dew.sampling import Sampling
+
+    snapshot = tmp_path / "3f2a9c"
+    make_lm_run(snapshot)
+    resolved, pulled = [], []
+    monkeypatch.setattr(huggingface_hub, "snapshot_download",
+                        lambda repo_id, revision, allow_patterns: resolved.append(revision) or snapshot)
+    monkeypatch.setattr(hub, "snapshot_download",
+                        lambda repo_id, revision: pulled.append(revision) or snapshot)
+    task = dew.pipeline("user/byte-lm", revision="main", step=2)
+    assert isinstance(task, TextGeneration)
+    assert (resolved, pulled) == (["main"], ["3f2a9c"])
+    greedy = Sampling(temperature=0, eos_id=255)
+    local = dew.pipeline(str(snapshot), step=2)
+    np.testing.assert_array_equal(task("the ", key=2, sampling=greedy).host().tokens,
+                                  local("the ", key=2, sampling=greedy).host().tokens)
+
+
 def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
     """An LM keeps no EMA unless asked, so each reader's default takes the
     live weights of such a run: the objective's pipeline, `dew.pipeline`

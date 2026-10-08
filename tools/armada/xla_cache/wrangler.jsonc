@@ -1,0 +1,10 @@
+// Deployed by hand with `wrangler deploy -c tools/armada/xla_cache/wrangler.jsonc`
+// on the account armada-dew runs on; its CACHE_TOKEN is `wrangler secret put`.
+{
+  "name": "dew-xla-cache",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-30",
+  "workers_dev": true,
+  "preview_urls": false,
+  "r2_buckets": [{ "binding": "CACHE", "bucket_name": "dew-xla-cache" }]
+}

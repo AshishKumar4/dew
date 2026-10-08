@@ -8,7 +8,7 @@ reference), so the comparison runs in CI without a download.
 Tolerances and the differences actually observed, fp32 on CPU:
 
 - siglip-tiny tower: max |difference| 1.1e-06, tolerance 1e-4. Two layers of
-  width 32 over a 2x2 patch grid, sharing CLIPAttention; the trunk sequence
+  width 32 over a 2x2 patch grid, CLIP's layer (`clip_layer`); the trunk sequence
   alone (the attention pooling head some checkpoints carry maps to nothing).
 - siglip projector : max |difference| 3.3e-07, tolerance 1e-4. Block average,
   (1 + w) RMSNorm and the plain matrix on the reference trunk output.

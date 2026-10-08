@@ -13,8 +13,9 @@ The source keeps its norms, its modulation tables and its time embedder in
 fp32 (`_keep_in_fp32_modules`) and adds the gated residuals in fp32. A
 bfloat16 model here does the same at `at_least_fp32` of its dtype, and
 rounds the stream back after each sum. The source rotates queries and keys
-in float64; Dew rotates them at `at_least_fp32` of their dtype, from
-`rotary_table`'s float32 cosines and sines.
+in float64; Dew rotates them at `at_least_fp32` of their dtype, by
+cosines and sines computed in float64 (`dew.nn.rope.axis_tables`) and
+rounded to float32.
 """
 
 from __future__ import annotations
@@ -29,12 +30,13 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
-from dew.nn.backbones.unet_condition import sinusoidal_time
+from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
+from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
-from .joint import FeedForward, Modulation, apply_rotary, embedding, layer_norm, modulate, rotary_table
+from .joint import FeedForward, Modulation, embedding, layer_norm, modulate
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -45,10 +47,10 @@ def wan_rotation(frames: int, rows: int, columns: int, head_dim: int, *,
     """`WanRotaryPosEmbed` over a patch grid: the head's channel pairs split
     between frame, row and column, `head_dim // 6` pairs each for the rows
     and the columns and the rest for the frames, each axis's angles at its
-    own width, `[frames * rows * columns, head_dim]`."""
+    own width, in float64, `[frames * rows * columns, head_dim // 2]`."""
     side = 2 * (head_dim // 6)
     positions = np.indices((frames, rows, columns)).reshape(3, -1).T
-    return rotary_table(positions, (head_dim - 2 * side, side, side), theta=theta)
+    return axis_tables(positions, (head_dim - 2 * side, side, side), theta, dtype=np.float64)
 
 
 # The source stores one flat [inner, inner] tensor per projection; the
@@ -65,7 +67,7 @@ class WanAttention(nn.Module):
     normalizes each token's whole projection before it is split into heads,
     where the MM-DiTs normalize each head. And its cross-attention reads keys
     and values from the text alone, where theirs join the two streams.
-    `rotation`, `[1, S, 1, D]`, rotates the self-attention's queries and
+    `rotation`, `[1, S, D // 2]`, rotates the self-attention's queries and
     keys.
     """
 
@@ -95,9 +97,7 @@ class WanAttention(nn.Module):
         value = self._projected("to_v", source)
         if rotation is not None:
             # The source rotates in float64 and rounds once to its dtype.
-            wide = at_least_fp32(query.dtype)
-            query, key = (apply_rotary(part.astype(wide), *rotation).astype(part.dtype)
-                          for part in (query, key))
+            query, key = (rotate(part, *rotation, pairs="adjacent") for part in (query, key))
         attended = scaled_dot_product_attention(query, key, value, implementation=self.attention_impl,
                                                 precision=self.precision)
         attended = attended.reshape(x.shape[0], x.shape[1], self.heads * self.head_dim)
@@ -228,7 +228,7 @@ class WanTransformer(nn.Module):
         modulation = jnp.stack(Modulation(self.features, 6, name="time_proj", **dense)(embedded), axis=1)
         context = embedding(conditioning.context, self.features, "text_embedder",
                             activation=lambda hidden: nn.gelu(hidden, approximate=True), **dense)
-        rotation = tuple(jnp.asarray(table[None, :, None], wide)
+        rotation = tuple(jnp.asarray(table[None], wide)
                          for table in wan_rotation(frames, rows, columns, self.attention_head_dim))
         for index in range(self.num_layers):
             tokens = WanBlock(self.features, self.num_attention_heads, self.ffn_dim,

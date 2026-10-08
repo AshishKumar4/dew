@@ -4,16 +4,14 @@ import PythonEditor from './PythonEditor.astro';
 interface Props {
 	code: string;
 	title: string;
-	filename?: string;
 }
-const { code, title, filename = 'dew-example.py' } = Astro.props;
+const { code, title } = Astro.props;
 ---
-<div class="sampler-editor example-editor" data-example-editor data-filename={filename}>
+<div class="sampler-editor example-editor" data-example-editor>
 	<div class="sampler-editor-bar">
 		<span>{title}, editable</span>
 		<span class="sampler-editor-actions">
 			<button type="button" data-example-copy>Copy</button>
-			<button type="button" data-example-download>Save</button>
 			<button type="button" data-example-reset>Reset</button>
 		</span>
 	</div>
@@ -37,14 +35,6 @@ const { code, title, filename = 'dew-example.py' } = Astro.props;
 		editor.querySelector('[data-example-reset]')!.addEventListener('click', () => {
 			text.value = text.defaultValue;
 			text.dispatchEvent(new Event('input'));
-		});
-		editor.querySelector('[data-example-download]')!.addEventListener('click', () => {
-			const url = URL.createObjectURL(new Blob([text.value], { type: 'text/x-python' }));
-			const link = document.createElement('a');
-			link.href = url;
-			link.download = editor.dataset.filename!;
-			link.click();
-			setTimeout(() => URL.revokeObjectURL(url), 1000);
 		});
 	}
 </script>

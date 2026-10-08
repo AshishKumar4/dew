@@ -1,24 +1,20 @@
 ---
 import PythonEditor from './PythonEditor.astro';
 interface Props {
-	models: { id: string; label: string }[];
 	cell: string;
 	recorded: string;
 }
-const { models, cell, recorded } = Astro.props;
+const { cell, recorded } = Astro.props;
 ---
 
 <div class="live-text" data-live-text>
-	{models.length > 1 && <label class="live-text-model">Model
-		<select data-model>{models.map((model) => <option value={model.id}>{model.label}</option>)}</select>
-	</label>}
 	<div class="live-text-grid">
 		<div class="sampler-editor">
 			<div class="sampler-editor-bar"><span>generate.py</span><span class="sampler-editor-actions">
 				<button type="button" class="sampler-reset" data-text-reset>Reset</button>
 				<button type="button" class="sampler-run" data-text-run>Run</button>
 			</span></div>
-			<PythonEditor code={cell} kind="text" rows={5} label="Editable text generation cell" />
+			<PythonEditor code={cell} kind="text" rows={cell.trimEnd().split('\n').length + 1} label="Editable text generation cell" />
 		</div>
 		<div class="live-text-result">
 			<div class="live-text-output" data-text-output><pre>{recorded}</pre></div>
@@ -31,12 +27,11 @@ const { models, cell, recorded } = Astro.props;
 <script>
 	import type { LiveSession } from '../../scripts/live';
 	import { renderOutput } from '../../scripts/live';
-	import { landingKernel, reserveKernel, onKernelClose, closeKernel } from '../../scripts/landing-kernel';
+	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-text]');
 	if (panel) {
 		const editor = panel.querySelector<HTMLTextAreaElement>('textarea[data-text-cell]')!;
-		const picker = panel.querySelector<HTMLSelectElement>('[data-model]');
 		const run = panel.querySelector<HTMLButtonElement>('[data-text-run]')!;
 		const output = panel.querySelector<HTMLElement>('[data-text-output]')!;
 		const status = panel.querySelector<HTMLElement>('[data-text-status]')!;
@@ -49,16 +44,8 @@ const { models, cell, recorded } = Astro.props;
 			session = undefined;
 			if (!running) status.textContent = `${message} Press Run to start a new one.`;
 		});
-		picker?.addEventListener('change', () => {
-			editor.value = editor.value.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(picker.value)}`);
-		});
-		panel.querySelector('[data-text-reset]')!.addEventListener('click', () => {
-			editor.value = picker ? original.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(picker.value)}`) : original;
-		});
+		panel.querySelector('[data-text-reset]')!.addEventListener('click', () => { editor.value = original; });
 		const execute = async () => {
-			let release: () => void;
-			try { release = reserveKernel(); }
-			catch (error) { status.textContent = error instanceof Error ? error.message : String(error); return; }
 			running = true;
 			stopping = false;
 			run.textContent = 'Stop';
@@ -75,29 +62,33 @@ const { models, cell, recorded } = Astro.props;
 			try {
 				timer = window.setInterval(() => { if (!stopping) status.textContent = `${phase} · ${Math.round((performance.now() - since) / 1000)} s`; }, 1000);
 				session = await landingKernel(holder, setPhase);
-				if (stopping) { closeKernel(); throw new Error('Stopped.'); }
+				if (stopping) throw new Error('Stopped.');
 				const started = performance.now();
 				setPhase('Generating');
+				// The server streams the text so far; the cell then prints all of it, which is already shown.
+				const streamed = document.createElement('pre');
+				let first: number | undefined;
 				const result = await session.run(editor.value, (message) => {
-					if (message.type === 'display' && message.text) {
-						try {
-							const progress = JSON.parse(message.text)['dew-progress'];
-							if (progress?.stage === 'load') { setPhase(`Loading ${progress.model}`); return; }
-							if (progress?.stage === 'generate') { setPhase(progress.first ? 'Compiling the first generation' : 'Generating'); return; }
-						} catch { /* Ordinary text output, not a progress report. */ }
+					if (message.type === 'display' && message.text?.startsWith('{"dew-text"')) {
+						const packet = JSON.parse(message.text);
+						first ??= packet.first_token_seconds;
+						streamed.textContent = packet['dew-text'];
+						if (!streamed.isConnected) output.append(streamed);
+						return;
 					}
+					if (message.type === 'stream' && message.text.trimEnd() === streamed.textContent?.trimEnd()) return;
 					renderOutput(output, message);
-				});
+				}, 'text');
 				window.clearInterval(timer);
+				const seconds = ((performance.now() - started) / 1000).toFixed(1);
 				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
-					: result.status === 'ok' ? `Generated in ${((performance.now() - started) / 1000).toFixed(1)} s.`
-					: 'The cell stopped with an error.';
+					: result.status !== 'ok' ? 'The cell stopped with an error.'
+					: first === undefined ? `Generated in ${seconds} s.`
+					: `Generated in ${seconds} s; the first token came ${first.toFixed(2)} s after the request.`;
 			} catch (error) {
-				closeKernel();
 				status.textContent = error instanceof Error ? error.message : String(error);
 			} finally {
 				window.clearInterval(timer);
-				release();
 				running = false;
 				run.textContent = 'Run';
 				run.disabled = false;
@@ -105,7 +96,7 @@ const { models, cell, recorded } = Astro.props;
 		};
 		run.addEventListener('click', () => {
 			if (!running) void execute();
-			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt(); }
+			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt('text'); }
 		});
 		editor.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !running) {

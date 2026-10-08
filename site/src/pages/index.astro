@@ -7,12 +7,15 @@ import { example, trainingExample } from '../data/framework-examples.mjs';
 import HeroOutput from '../components/landing/HeroOutput.astro';
 import LiveSampler from '../components/landing/LiveSampler.astro';
 import LiveText from '../components/landing/LiveText.astro';
+import LiveTrain from '../components/landing/LiveTrain.astro';
+import LoraPairs from '../components/landing/LoraPairs.astro';
+import MoeRouting from '../components/landing/MoeRouting.astro';
 import capture from '../data/capture.json';
 import heroCode from '../data/hero.py?raw';
 import framework from '../../snippets/framework.py?raw';
 import samplerCell from '../data/sampler.py?raw';
-import samplerSetup from '../data/sampler_setup.py?raw';
 import textCell from '../data/text.py?raw';
+import finetuneCell from '../data/finetune.py?raw';
 import textRecording from '../data/text-recording.json';
 import tutorials from '../generated/tutorial-cards.json';
 import { live } from '../live.mjs';
@@ -23,7 +26,7 @@ const recorded = (name: string) => {
 	const root = ['examples', 'framework', name];
 	return { result: JSON.parse(readPublic(...root, 'result.json')), capture: JSON.parse(readPublic(...root, 'capture.json')) };
 };
-const names = ['lm', 'diffusion', 'sample_public', 'jepa', 'grpo', 'pretrained', 'serving', 'mesh', 'reliability'];
+const names = ['lm', 'diffusion', 'sample_public', 'jepa', 'grpo', 'pretrained', 'decide', 'serving', 'mesh', 'reliability'];
 const records = Object.fromEntries(names.map((name) => [name, recorded(name)]));
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const hero = capture.hero;
@@ -43,6 +46,8 @@ const replays = ['aurora', 'lighthouse', 'village'].map((name) => {
 const modelSize = Math.round(replays[0].model.parameters / 1e6);
 const resolution = records.sample_public.result.shape.slice(1, 3).join('×');
 const mesh = records.mesh.result;
+const moe = JSON.parse(readPublic('examples', 'moe-mesh', 'moe-mesh.json'));
+const lora = JSON.parse(readPublic('examples', 'sd15-lora', 'manifest.json'));
 const videos = Object.values(JSON.parse(readPublic('gallery', 'wan-2.1', 'manifest.json')).clips) as { video: string; poster: string; prompt: string }[];
 const gallery = JSON.parse(readPublic('gallery', 'dew-176m', 'manifest.json'));
 const tries = [
@@ -84,7 +89,7 @@ const tutorialNames: Record<string, string> = {
 			<h2 class="band-title">Training</h2>
 			<p class="band-lede">A small decoder trains on Tiny Shakespeare on {capture.meta.where}, then writes one sample from each of the prompts <code>ROMEO:</code> and <code>JULIET:</code>.</p>
 			<div class="run-grid">
-				<EditableExample code={trainingExample(heroCode)} title="train.py" filename="train.py" />
+				<LiveTrain code={trainingExample(heroCode)} title="train.py" cell="hero" />
 				<HeroOutput screen={hero.screen} meta={capture.meta} seconds={hero.seconds} replay={hero.replay} rows={hero.rows} columns={hero.columns} source_rows={hero.source_rows} playbackSeconds={terminalReplay.duration} />
 			</div>
 			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full script</a></p>
@@ -93,33 +98,53 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Language modeling</h2>
 			<p class="band-lede">The objective creates the model's variables, computes the loss and runs evaluation. <code>Trainer.fit</code> steps the optimizer, logs progress and saves checkpoints, and every model on this page trains through that one call.</p>
-			<EditableExample code={example(framework, 'lm')} title="Language modeling" filename="dew-lm.py" />
+			<EditableExample code={example(framework, 'lm')} title="Language modeling" />
 			<p class="framework-note"><a href={fullScript}>Full script</a></p>
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Representation learning</h2>
 			<p class="band-lede">A JEPA encoder sees part of an image and learns to predict the representations of the patches it cannot see.</p>
-			<EditableExample code={example(framework, 'jepa')} title="JEPA" filename="dew-jepa.py" />
+			<EditableExample code={example(framework, 'jepa')} title="JEPA" />
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Fine-tuning</h2>
-			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, generate from it, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names.</p>
-			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} models={[{ id: 'HuggingFaceTB/SmolLM2-135M-Instruct', label: 'SmolLM2 135M Instruct' }]} />}
-			<EditableExample code={example(framework, 'pretrained')} title="Fine-tune Qwen3-0.6B" filename="dew-finetune.py" />
+			<p class="band-lede">Load a Hugging Face checkpoint as a Flax model, fine-tune it with the same trainer, and save it back in the Hugging Face layout with its original tensor names. Run the first cell to fine-tune SmolLM2-135M on Tiny Shakespeare and compare its text before and after.</p>
+			<LiveTrain code={finetuneCell} title="finetune.py" cell="finetune" />
+			<p class="framework-note">A larger model, recorded: Qwen3-0.6B, one step, then saved in its original layout.</p>
+			<EditableExample code={example(framework, 'pretrained')} title="Fine-tune Qwen3-0.6B" />
 			<HeroOutput screen={records.pretrained.capture.hero.screen} meta={records.pretrained.capture.meta}
 				seconds={records.pretrained.capture.hero.seconds} columns={records.pretrained.capture.hero.columns}
 				source_rows={records.pretrained.capture.hero.screen.length} playbackSeconds={0} />
-			<pre class="shown-output">export/config.json{'\n'}export/model.safetensors.index.json</pre>
 			<p class="framework-note"><a href="/reference/models/">Supported families</a>: Qwen, Llama, Gemma, Mistral, DeepSeek, Mamba and multimodal decoders.</p>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Inference</h2>
+			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. Run the cell to generate on a shared CPU host.</p>
+			{live.endpoint && live.turnstileSitekey && <LiveText cell={textCell} recorded={textRecording.text} />}
+			<p class="framework-note"><code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache:</p>
+			<EditableExample code={example(framework, 'serving')} title="Batched decoding" />
+			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
+			<p class="framework-note">Store weights in int8 or fp8:</p>
+			<EditableExample code={example(framework, 'formats')} title="Weight-only int8 and fp8" />
+			<p class="framework-note">The <a href="/guides/inference/">serving guide</a> covers the paged KV cache, prefix sharing, constrained decoding, and the error each quantized format adds.</p>
+		</section>
+
+		<section class="band" data-reveal>
+			<h2 class="band-title">Decision models</h2>
+			<p class="band-lede">A decision model answers typed questions about a state in one forward pass: each question names its options, and the answer is a probability distribution over exactly those options. <a href="https://huggingface.co/convaiinnovations/laya">Laya</a>, a ModernBERT-large decision model, loads as a Dew model, and <code>systemone</code> takes and returns Jev's wire format.</p>
+			<EditableExample code={example(framework, 'decide')} title="Route a support ticket" />
+			<pre class="shown-output">{JSON.stringify(records.decide.result.answers, null, 2)}</pre>
+			<p class="framework-note">The <a href="/guides/decision-models/">decision models guide</a> covers calibration, abstention and fine-tuning a decision head on any backbone.</p>
 		</section>
 
 		<section class="band replay" data-replays data-reveal>
 			<h2 class="band-title">Diffusion</h2>
 			<p class="band-lede">The process sets how training adds noise and what the model learns to predict. At generation time a solver runs the process in reverse, and you can switch solvers without retraining.</p>
-			<LiveSampler setup={samplerSetup} cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
-			<EditableExample code={example(framework, 'diffusion')} title="Define and train a DiT" filename="dew-diffusion.py" />
+			<LiveSampler cell={samplerCell} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
+			<EditableExample code={example(framework, 'diffusion')} title="Define and train a DiT" />
 			<p class="framework-note">A {modelSize}M-parameter text-to-image model at {resolution}, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
 			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>
 				<div class="replay-frame" style={`aspect-ratio: ${entry.width} / ${entry.height}`}>
@@ -127,33 +152,30 @@ const tutorialNames: Record<string, string> = {
 					<canvas aria-hidden="true" />
 				</div><figcaption>“{entry.prompt}”</figcaption>
 			</figure>)}</div>
+			<h3>A style LoRA</h3>
+			<p class="framework-note">Stable Diffusion 1.5 with a rank-{lora.rank} LoRA on its attention projections, trained with Dew for {lora.training_steps} steps on 20 public-domain Hiroshige prints from the Library of Congress, on one A100. Each pair shares its prompt and seed; drag the slider to compare. <a href="/examples/sd15-lora/manifest.json">Prompts, seeds and settings</a>.</p>
+			<LoraPairs pairs={lora.pairs} />
 		</section>
 
-		<section class="band" data-reveal>
-			<h2 class="band-title">Serving</h2>
-			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. <code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache.</p>
-			<EditableExample code={example(framework, 'serving')} title="Batched decoding" filename="dew-serving.py" />
-			<pre class="shown-output">{records.serving.result.text.join('\n')}</pre>
-			<p class="framework-note">Store weights in int8 or fp8:</p>
-			<EditableExample code={example(framework, 'formats')} title="Weight-only int8 and fp8" filename="dew-formats.py" />
-			<p class="framework-note">The <a href="/guides/inference/">serving guide</a> covers the paged KV cache, prefix sharing, constrained decoding, and the error each quantized format adds.</p>
-		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Distributed</h2>
 			<p class="band-lede">To use more devices, give <code>Trainer</code> a mesh; the objective and data stay as they are. FSDP shards parameters and optimizer state, tensor parallelism splits each layer's weight matrices, and an expert axis puts an MoE's experts on different devices. The devices left over form the data-parallel axis.</p>
-			<EditableExample code={example(framework, 'mesh')} title="Four simulated CPU devices" filename="dew-mesh.py" />
+			<EditableExample code={example(framework, 'mesh')} title="Four simulated CPU devices" />
 			<figure class="mesh-overview">
 				<div class="mesh-devices">{mesh.devices.map((id: number, index: number) => <div class="mesh-device"><strong>cpu:{id}</strong><span>fsdp {Math.floor(index / mesh.axes.tensor)} · tensor {index % mesh.axes.tensor}</span></div>)}</div>
 				<figcaption>{mesh.devices.length} simulated CPU devices: {mesh.axes.fsdp} FSDP shards × {mesh.axes.tensor} tensor slices.</figcaption>
 			</figure>
 			<p class="framework-note"><a href="/concepts/distributed/">Placement and sharding</a> · <a href="/guides/multi-node/">Several hosts</a> · <a href="/guides/tpu/">Cloud TPU</a></p>
+			<h3>Expert routing</h3>
+			<p class="framework-note">With the experts split over devices, each MoE layer's router sends tokens to experts on other devices through all-to-all exchanges. This is the routing <a href="https://github.com/AshishKumar4/dew/blob/main/examples/moe_mesh.py">examples/moe_mesh.py</a> recorded over {moe.steps.length} training steps.</p>
+			<MoeRouting data={moe} />
 		</section>
 
 		<section class="band" data-reveal>
 			<h2 class="band-title">Post-training</h2>
 			<p class="band-lede">GRPO samples a group of completions for each prompt and scores them with a reward function. The reward here is the fraction of adjacent tokens that count up by one, modulo 13.</p>
-			<EditableExample code={example(framework, 'grpo')} title="Rollout and reward" filename="dew-grpo.py" />
+			<EditableExample code={example(framework, 'grpo')} title="Rollout and reward" />
 			<figure class="reward-figure">
 				<svg viewBox="0 0 380 180" role="img" aria-label={`Mean completion reward at each of ${reward.length} GRPO updates; fraction of adjacent tokens counting up modulo 13.`}>
 					<line x1="40" y1="40" x2="40" y2="140" /><line x1="40" y1="140" x2="340" y2="140" />
@@ -169,9 +191,9 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Reliability</h2>
 			<p class="band-lede">A checkpoint stores the training state and the position in the data stream. When the job receives SIGTERM, <code>fit</code> stops at the next step every process agrees on, writes a checkpoint and exits with status 143. Run the same command again to resume.</p>
-			<EditableExample code={example(framework, 'reliability')} title="Save and resume" filename="dew-resume.py" />
+			<EditableExample code={example(framework, 'reliability')} title="Save and resume" />
 			<pre class="shown-output">{`Saved step ${records.reliability.result.saved_step}, then resumed and trained to step ${records.reliability.result.resumed_step}.\nEvery TrainState leaf matches an uninterrupted run bit for bit: ${records.reliability.result.bit_exact}.`}</pre>
-			<EditableExample code={example(framework, 'profile')} title="JAX/XProf capture" filename="dew-profile.py" />
+			<EditableExample code={example(framework, 'profile')} title="JAX/XProf capture" />
 			<p class="framework-note"><a href="/guides/checkpoints/">Checkpoint guarantees</a> · <a href="/reference/performance/">Profiling</a></p>
 		</section>
 
