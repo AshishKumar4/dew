@@ -44,6 +44,36 @@ def device_generation() -> str:
     return device.platform
 
 
+# The kernel each choice runs per generation, as measured (docs/performance.md, "Kernel choices per
+# generation"); a generation a row does not name runs the choice's portable path.
+KERNELS: dict[str, dict[str, str]] = {
+    # FlashAttention-2 (dew_flash_attn) beat cuDNN by 4-8% in Qwen3-0.6B's training step, and the
+    # xla path 256-wide heads take by 17%; on the L4 it gained under 3%.
+    'attention': {'sm80': 'flash'},
+    # JAX's Pallas grouped matmul runs 5x-61x faster than XLA's ragged_dot on sm80-sm89; on TPU XLA
+    # wins except tokamax's mosaic_tpu_v2 (1.11x-1.38x at 8 experts), not a dependency.
+    'grouped_matmul': {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas', 'v5e': 'xla', 'v6e': 'xla'},
+    # The kernel 'tokamax' names. Its own dispatch tries Mosaic first, 4x-13x slower than XLA on a TPU
+    # and over shared memory on sm89; its Triton backward faults on sm80 and sm89, so only the forward
+    # runs on it.
+    'tokamax_grouped_matmul': {'sm80': 'triton', 'sm89': 'triton', 'v5e': 'mosaic_tpu_v2',
+                               'v6e': 'mosaic_tpu_v2'},
+    # XLA's Triton GEMM fusions off, every dot on cuBLAS: on sm80 compiles take half as long and
+    # decoder, MoE and DiT steps run 0-6% faster; on sm89 decoder steps run 3-10% faster, 3x where the
+    # fusions hit a whole-logits head at 4096 tokens. A Mamba-2 mixer loses 7.7% and keeps them.
+    'xla_triton_gemm': {'sm80': 'off', 'sm89': 'off'},
+    # The forward reads bf16 copies of the fp32 weights (dew.training.narrow): Qwen3-0.6B at 1 x 1024
+    # runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4 against 125.9 on an A100. A
+    # TPU fuses the cast into the matmul.
+    'narrow_copies': {'sm80': 'on', 'sm89': 'on'},
+}
+
+
+def measured_kernel(choice: str, default: str) -> str:
+    """The kernel `KERNELS` names for `choice` on the default device's generation, else `default`."""
+    return KERNELS[choice].get(device_generation(), default)
+
+
 def bf16_dot_runs() -> bool:
     """Return whether the default device multiplies bf16 operands into an fp32 sum as one dot algorithm.
 
