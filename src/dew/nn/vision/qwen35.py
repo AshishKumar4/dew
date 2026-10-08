@@ -139,6 +139,8 @@ class Qwen35VisionTransformer(nn.Module):
         frames = jnp.where(valid, jnp.arange(length)[None, :] // area + 1, 0)
         for block in self.blocks:
             hidden_states = block(hidden_states, segment_ids=frames, attention_metadata=metadata)
+        # A block without hyper-connections hands on the plain residual.
+        assert isinstance(hidden_states, jax.Array)
         return hidden_states
 
 

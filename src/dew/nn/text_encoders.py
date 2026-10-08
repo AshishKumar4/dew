@@ -229,6 +229,8 @@ class CLIPVisionTransformer(nn.Module):
         hidden_states = self.pre_layernorm(hidden_states)
         for layer in self.layers:
             hidden_states = layer(hidden_states)
+        # A block without hyper-connections hands on the plain residual.
+        assert isinstance(hidden_states, jax.Array)
         return CLIPTowerOutput(hidden_states, self.post_layernorm(hidden_states[:, 0]))
 
 

@@ -277,7 +277,7 @@ def export_weights(
         for collection in ("params", "constants"):
             tower = variables.get(collection, {}).get("conditioner", {}).get("tower", {})
             for name, raw in flatten_dict(tower, sep=".").items():
-                parts = name.split(".")
+                parts: list[str] = name.split(".")
                 if tuple(parts) in inverse:
                     target = inverse[tuple(parts)]
                 elif parts[0].startswith("layers_"):
