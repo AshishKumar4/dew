@@ -1,5 +1,6 @@
 // Dew CI's shared XLA compilation cache (tests/remote_cache.py): GET, HEAD
-// and PUT of /<key> in the dew-xla-cache bucket, for a bearer of the
+// and PUT of /<key> in the dew-xla-cache bucket, and GET /?list=<prefix>
+// for the keys under a prefix, a page at a time, for a bearer of the
 // CACHE_TOKEN secret, which armada-dew holds as DEW_XLA_CACHE_TOKEN. A miss
 // is a 404. The bucket expires an entry 14 days after it is written.
 const MAX_BYTES = 256 * 1024 * 1024;
@@ -14,7 +15,15 @@ async function authorized(request, token) {
 export default {
   async fetch(request, env) {
     if (!env.CACHE_TOKEN || !(await authorized(request, env.CACHE_TOKEN))) return new Response(null, { status: 401 });
-    const key = decodeURIComponent(new URL(request.url).pathname.slice(1));
+    const url = new URL(request.url);
+    const listed = url.searchParams.get('list');
+    if (listed !== null && request.method === 'GET') {
+      if (listed.length > 512 || !KEY.test(listed.replace(/\/$/, ''))) return new Response(null, { status: 400 });
+      const page = await env.CACHE.list({ prefix: listed, limit: 1000, cursor: url.searchParams.get('cursor') ?? undefined });
+      return Response.json({ keys: page.objects.map((object) => object.key.slice(listed.length)),
+        cursor: page.truncated ? page.cursor : null });
+    }
+    const key = decodeURIComponent(url.pathname.slice(1));
     if (key.length > 512 || !KEY.test(key) || key.split('/').includes('..')) return new Response(null, { status: 400 });
     if (request.method === 'GET') {
       const object = await env.CACHE.get(key);
