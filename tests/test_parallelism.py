@@ -282,7 +282,115 @@ def test_a_declaration_that_names_one_axis_twice_is_refused_where_it_is_written(
         @logical_axes({("fused_proj",): ("embed", "embed")})
         class Fused(nn.Module):
             pass
-    assert ("fused_proj",) not in DECLARED
+    assert not any(("fused_proj",) in table for table in DECLARED.values())
+
+
+@pytest.fixture
+def declarations(monkeypatch):
+    """The declaration tables, restored after the test that decorates classes."""
+    from dew.nn import sharding
+
+    monkeypatch.setattr(sharding, "DECLARED", dict(sharding.DECLARED))
+    monkeypatch.setattr(sharding, "_OWNERS", dict(sharding._OWNERS))
+    return sharding
+
+
+def test_two_classes_declaring_one_suffix_differently_are_refused_both_named(declarations):
+    """A suffix is matched in every model in the process, so a second class
+    that declares it otherwise fails where it is decorated, naming both."""
+    @logical_axes({("plugin_head", "readout"): ("embed", "vocab")})
+    class Head(nn.Module):
+        pass
+
+    with pytest.raises(ValueError, match=r"plugin_head/readout.*Other.*Head"):
+        @logical_axes({("plugin_head", "readout"): ("vocab", "embed")})
+        class Other(nn.Module):
+            pass
+    # The same axes from another class place the same parameters, and stand.
+    @logical_axes({("plugin_head", "readout"): ("embed", "vocab")})
+    class Same(nn.Module):
+        pass
+
+    assert declarations.DECLARED[Head] == declarations.DECLARED[Same]
+
+
+def test_a_plugins_one_name_suffix_is_refused_and_its_qualified_one_places_only_that_path(declarations):
+    """A class outside Dew that declares (`readout`,) would place every
+    model's `readout`; qualified by its holder's name it places that one, and
+    a model whose `readout` sits elsewhere keeps the shape heuristic."""
+    with pytest.raises(ValueError, match=r"one-name suffixes \['readout'\].*\('head', 'readout'\)"):
+        @logical_axes({("readout",): ("embed", "vocab")})
+        class Bare(nn.Module):
+            pass
+
+    @logical_axes({("classifier", "readout"): (None, "vocab")})
+    class Classifier(nn.Module):
+        pass
+
+    # The declaration splits the 8-wide vocabulary; the heuristic splits the
+    # largest dimension fsdp divides, the 16-wide one.
+    layout, mesh = Layout(min_shard=1, rules=(("vocab", "fsdp"),)), MeshSpec(fsdp=2).build()
+    kernel = jax.ShapeDtypeStruct((16, 8), jnp.float32)
+    declared = layout.shardings(mesh, {"params": {"classifier": {"readout": {"kernel": kernel}}}})
+    elsewhere = layout.shardings(mesh, {"params": {"decoder": {"readout": {"kernel": kernel}}}})
+    assert declared["params"]["classifier"]["readout"]["kernel"].spec == P(None, "fsdp")
+    assert elsewhere["params"]["decoder"]["readout"]["kernel"].spec == P("fsdp")
+
+
+class Decoder(nn.Module):
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(8, use_bias=False, name="readout")(x)
+
+
+class Readouts(nn.Module):
+    """A top-level `readout` whose module boxes its kernel's axes, a plain
+    `readout` of the same shape under `decoder`, and a kernel boxed with names
+    no rule mentions."""
+
+    @nn.compact
+    def __call__(self, x):
+        def boxed(name, names):
+            return nn.Dense(8, use_bias=False, name=name, kernel_init=nn.with_logical_partitioning(
+                nn.initializers.lecun_normal(), names))(x)
+
+        return boxed("readout", (None, "vocab")) + Decoder(name="decoder")(x) + boxed(
+            "foreign", ("foreign_a", "foreign_b"))
+
+
+class BoxedReadout(Objective):
+    ema = None
+
+    def init(self, key, variables=None):
+        return Readouts().init(key, jnp.ones((1, 16)))
+
+    def loss(self, variables, batch, step):
+        return jnp.sum(Readouts().apply(variables, batch["image"][:, 0, 0, :16]) ** 2), Aux({})
+
+
+def test_a_boxed_parameter_places_by_its_own_names_and_its_namesake_elsewhere_does_not():
+    """A module that boxes its parameter (`nn.with_logical_partitioning`)
+    places it by those names, ahead of any suffix, though the state holds it
+    unboxed: its 8-wide vocabulary splits, while the plain `readout` under
+    `decoder` keeps the shape heuristic's 16-wide split. Muon reads the same
+    names: the boxed kernel maps into the vocabulary, so AdamW steps it with
+    two moments, and Muon steps its namesake with one, every moment on its
+    parameter's spec. A kernel boxed with names no rule mentions keeps the
+    heuristic, as an undeclared one does, rather than the whole-array
+    placement its names alone would give."""
+    trainer = Trainer(BoxedReadout(), OPTIMIZER_MAP["muon"](1e-3), key=jax.random.key(0),
+                      mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, rules=(("vocab", "fsdp"),)))
+    abstract = jax.eval_shape(trainer.initial_state)
+    placement = jax.tree.map(lambda sharding: sharding.spec, trainer.shardings(abstract))
+    params = placement.variables["params"]
+    assert params["readout"]["kernel"] == P(None, "fsdp")
+    assert params["decoder"]["readout"]["kernel"] == P("fsdp")
+    assert params["foreign"]["kernel"] == P("fsdp")
+    # The trainer's optimizer state mirrors the params collection itself.
+    moments = muon_moment_specs(placement.opt_state, params)
+    boxed, plain = moments[("readout", "kernel")], moments[("decoder", "readout", "kernel")]
+    assert (len(boxed[1]), set(boxed[1])) == (2, {P(None, "fsdp")})
+    assert (len(plain[1]), set(plain[1])) == (1, {P("fsdp")})
 
 
 def test_rule_override_changes_only_declared_axes():

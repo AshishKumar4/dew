@@ -46,9 +46,13 @@ from dew.nn.sharding import (
     TENSOR_AXIS,
     LayoutRefused,
     Link,
+    LogicalAxes,
     Schedule,
+    boxed,
+    boxed_axes,
     measured_links,
     pipeline_microbatches,
+    ruled_boxes,
 )
 from dew.objectives.base import (
     FROZEN,
@@ -61,6 +65,7 @@ from dew.objectives.base import (
     Shown,
     Step,
     TrainingScalar,
+    Variables,
     select,
 )
 from dew.records import JSON, boolean, record
@@ -559,6 +564,9 @@ class Trainer(Generic[Loss, Effects]):
         self._xla_defaults = False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
+        # The axes the objective's modules box on their own parameters, as the
+        # last trace of `initial_state` saw them (`_boxed_axes`).
+        self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
 
     @property
@@ -589,7 +597,11 @@ class Trainer(Generic[Loss, Effects]):
         from dew.nn.inputs import request_key
         key = self.key if key is None else request_key(key)
         init_key, run_key = jax.random.split(key)
-        params = nn.unbox(initializer(init_key))
+        initialized = initializer(init_key)
+        # Static metadata, the same on every trace of the state: the
+        # placement reads it from here rather than tracing init again.
+        self._boxed = boxed_axes(initialized)
+        params = nn.unbox(initialized)
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
@@ -603,7 +615,7 @@ class Trainer(Generic[Loss, Effects]):
                    if self.dynamic_scale else None),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
-            opt_state=self.optimizer.init(params["params"]),
+            opt_state=self._boxed_init(initialized, params["params"]),
             # The average starts equal to the parameters but as its own
             # buffers: the step donates the state, and a buffer can be
             # donated once.
@@ -627,6 +639,21 @@ class Trainer(Generic[Loss, Effects]):
         from dew.training.host import companion_mesh
         return companion_mesh(self.device_mesh)
 
+    def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
+        """The optimizer's state of `params`, Muon's grouping reading the axes
+        modules boxed on them in `initialized`."""
+        with boxed(ruled_boxes(boxed_axes(initialized), self.layout.axis_rules)):
+            return self.optimizer.init(params)
+
+    def _boxed_axes(self) -> dict[tuple[str, ...], LogicalAxes]:
+        """The axes the objective's modules box on their own parameters
+        (`nn.with_logical_partitioning`), which its init returns and the state
+        unboxes: what `initial_state` last traced, else one abstract init, for
+        a state the trainer did not build."""
+        if self._boxed is None:
+            self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
+        return ruled_boxes(self._boxed, self.layout.axis_rules)
+
     def shardings(self, state: TrainState) -> Placement[TrainState]:
         """Return where each field of `state` is placed, on the axes that suit its kind.
 
@@ -635,6 +662,10 @@ class Trainer(Generic[Loss, Effects]):
         state, the frozen collection is the exception: it stays where the realization
         reads it (`execution.resident`) for the whole run.
         """
+        with boxed(self._boxed_axes()):
+            return self._shardings(state)
+
+    def _shardings(self, state: TrainState) -> Placement[TrainState]:
         mesh = self.state_mesh
         params = dict(state.variables)
         frozen = params.pop(FROZEN, None) if self.host_master else None
