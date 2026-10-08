@@ -103,6 +103,13 @@ async def pressure(headers):
     (status, errors), = (await outcomes(socket, 1)).values()
     assert status == "ok", errors
     await socket.close()
+    # Every context the pressure opened is closed with its page, connection file included.
+    for _ in range(120):
+        left = sorted(path.name for path in Path("/sessions/connections").glob("kernel-*.json"))
+        if not left:
+            break
+        await asyncio.sleep(0.5)
+    assert not left, f"contexts left open after their pages closed: {left}"
     print(f"Memory pressure: {len(seen) - len(unfinished)} of 25 cells ran, the others were told why; "
           f"the model process kept serving ({before} MiB available before).", flush=True)
 
