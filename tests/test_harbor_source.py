@@ -92,6 +92,14 @@ def test_a_trace_that_cannot_train_is_refused(broken):
         calls([broken], unstamped=0)
 
 
+@pytest.mark.parametrize("raw", [{"choices": [{"prompt_token_ids": [1]}]}, {"sglext": {"input_ids": [1]}}])
+def test_prompt_ids_come_from_the_gateway_alone(raw):
+    """An engine's raw reply may list prompt ids too, but a trace without the
+    gateway's own is refused rather than filled from it."""
+    with pytest.raises(ValueError, match="no prompt ids"):
+        calls([trace([], [3], [-.5], raw_response=raw)], unstamped=0)
+
+
 @pytest.mark.parametrize("malformed", [
     {**trace([1], [3], [-.5]), "raw_response": "upstream said no"},  # a raw response that is not an object
     {**trace([1], [3], [-.5]), "logprobs": ["-0.5"]},  # a likelihood that is not a number

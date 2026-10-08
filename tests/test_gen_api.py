@@ -77,3 +77,24 @@ def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api,
         "`objective.sampler`: dew.objectives.diffusion.objective.DiffusionObjective has no sampler",
         "`objective.variables(...)`: variables is a value "
         "dew.objectives.diffusion.objective.DiffusionObjective holds, not a method"]
+
+
+def test_names_that_differ_only_in_case_link_to_their_own_headings(gen_api, documented):
+    """`dew.sampling` documents the class `Sample` and the function `sample`,
+    whose headings render as `#sample` and `#sample-1`; each links to its own."""
+    _, pages, home = documented
+    urls = gen_api.linked(pages, home).by_path
+    assert urls["dew.sampling.Sample"] != urls["dew.sampling.sample"]
+    assert {urls["dew.sampling.Sample"].rsplit("#", 1)[1], urls["dew.sampling.sample"].rsplit("#", 1)[1]} == {
+        "sample", "sample-1"}
+
+
+def test_a_module_that_declares_all_needs_its_own_page(gen_api, documented):
+    """With `dew.nn.multimodal`'s page dropped, the module itself is
+    reported, not only the names it exports."""
+    package, pages, home = documented
+    assert gen_api.undocumented(package, pages, home) == []
+    page = "dew.nn.multimodal"
+    without = gen_api.undocumented(package, {path: held for path, held in pages.items() if path != page},
+                                   {name: path for name, path in home.items() if path != page})
+    assert f"{page} declares __all__ but has no API page; add it to GROUPS" in without

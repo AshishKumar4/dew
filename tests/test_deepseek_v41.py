@@ -654,6 +654,19 @@ def test_a_config_without_swiglu_limit_clamps_nothing():
     assert translate_config({**config, "text_config": text})["swiglu_limit"] is None
 
 
+def test_rate_one_compression_keeps_no_window_buffer():
+    """A window of one token closes with the token, so at rate 1 every token
+    is an entry at once: the cache is the entries alone, with no window
+    buffer or gate to scan."""
+    from dew.nn.deepseek_v4 import CompressedEntries
+
+    entries = CompressedEntries(width=4, rate=1, overlap=False, rope_dim=0, rope_theta=10000.0, yarn=None,
+                                norm_eps=1e-6, position_bias=False)
+    variables = entries.init(jax.random.key(0), jnp.ones((1, 2, 4), jnp.float32), jnp.asarray([[0, 1]]), 4,
+                             write=False, method=CompressedEntries.cached_entries)
+    assert set(variables["cache"]) == {"compressed"}
+
+
 def test_the_vision_half_matches_the_reference(tmp_path):
     """The bundle's vision half: the ViT's patches, blocks and 2D rotary, the
     aligner over a patch grid it pads to whole squares, the span's learned

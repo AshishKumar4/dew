@@ -376,6 +376,31 @@ def _moments(opt_state) -> optax.ScaleByAdamState:
     raise AssertionError("the optimizer state carries no Adam moments")
 
 
+def test_a_host_step_differentiates_its_moving_leaves_only(monkeypatch):
+    """The banked step takes the loss's gradient in the moving leaves alone:
+    a frozen bank is held as a value, not differentiated and its cotangent
+    thrown away, so freezing a layer takes leaves out of the backward."""
+    import sys
+
+    differentiated = []
+    vjp = jax.vjp
+
+    def counted(function, primals, *rest, **options):
+        if sys._getframe(1).f_code.co_filename.endswith("training/execution.py"):
+            differentiated.append(len(jax.tree.leaves(primals)))
+        return vjp(function, primals, *rest, **options)
+
+    monkeypatch.setattr(jax, "vjp", counted)
+    model = decoder()
+    # Every layer's gate kernel frozen: the bank they share is held whole.
+    for trainable in (lambda path: True, lambda path: path[-2:] != ("gate_proj", "kernel")):
+        start = freeze(LMObjective(model, 8).init(jax.random.key(0)), trainable)
+        objective = LMObjective(model, 8, head_chunks=1, variables=jax.tree.map(np.asarray, start))
+        updated(objective, tokens(), HOST)
+    every, moving = differentiated
+    assert moving == every - 1
+
+
 def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stack(tmp_path):
     """Per-layer and per-leaf freezing through one banked decoder.
 
