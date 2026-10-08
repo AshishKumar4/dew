@@ -140,36 +140,45 @@ def training():
 
 def cells():
     """The page's pool cells and its train.py, each run in a fresh training context as a
-    visitor's Run does, while the model process holds its models. A failure names the host's
-    memory."""
+    visitor's Run does, while the model process holds its models. The three that hold a few
+    GiB run one after another beside the small ones, to end within the registry's 15-minute
+    alarm (site/live/src/snapshots.ts). A failure names the host's memory."""
     sys.path.insert(0, "/opt/live/cells")
     import cells as page
     programs = {name: page.cell(name) for name in page.CELLS["pool"]}
     programs["hero"] = page.training_example(pathlib.Path("/opt/live/cells/hero.py").read_text())
-    for name, code in programs.items():
-        # The bridge installs the caps in every training context first (PRELOAD, shared_bridge.py);
-        # the last line, printed only when the cell finished, is what the run kept resident.
-        code = ("import live_training\nlive_training.install()\n" + code + "\nimport resource\n"
-                "print('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n")
-        kernel = request("/api/kernels", {"name": "dew-train"})
-        client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
-        client.load_connection_file()
-        client.start_channels()
-        started = time.perf_counter()
-        try:
-            client.wait_for_ready(timeout=30)
-            output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
-        except Exception as error:
-            raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
-                                 f"memory {memory()}") from None
-        finally:
-            client.stop_channels()
-            request("/api/kernels/" + kernel["id"], method="DELETE")
-        # What a run keeps resident, which the host's memory must hold beside the model process.
-        peak = int(output.rsplit("peak ", 1)[1].split()[0])
-        assert peak < 4608, f"{name} held {peak} MiB; memory {memory()}"
-        seconds = time.perf_counter() - started
-        print(f"{name} ran in {seconds:.0f} s, {peak} MiB resident; memory {memory()}", flush=True)
+    large = [name for name in ("decide", "finetune", "hero") if name in programs]
+    streams = [large, [name for name in programs if name not in large]]
+    with concurrent.futures.ThreadPoolExecutor(len(streams)) as pool:
+        for future in [pool.submit(lambda names: [cell(name, programs[name]) for name in names], names)
+                       for names in streams]:
+            future.result()
+
+
+def cell(name, code):
+    # The bridge installs the caps in every training context first (PRELOAD, shared_bridge.py);
+    # the last line, printed only when the cell finished, is what the run kept resident.
+    code = ("import live_training\nlive_training.install()\n" + code + "\nimport resource\n"
+            "print('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n")
+    kernel = request("/api/kernels", {"name": "dew-train"})
+    client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
+    client.load_connection_file()
+    client.start_channels()
+    started = time.perf_counter()
+    try:
+        client.wait_for_ready(timeout=30)
+        output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
+    except Exception as error:
+        raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
+                             f"memory {memory()}") from None
+    finally:
+        client.stop_channels()
+        request("/api/kernels/" + kernel["id"], method="DELETE")
+    # What a run keeps resident, which the host's memory must hold beside the model process.
+    peak = int(output.rsplit("peak ", 1)[1].split()[0])
+    assert peak < 4608, f"{name} held {peak} MiB; memory {memory()}"
+    seconds = time.perf_counter() - started
+    print(f"{name} ran in {seconds:.0f} s, {peak} MiB resident; memory {memory()}", flush=True)
 
 
 def memory():

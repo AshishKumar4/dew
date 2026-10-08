@@ -33,13 +33,17 @@ for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh b
 done
 printf '%s\n' "$commit" > /opt/live/dew-commit
 install -m 0644 -o model -g model /dev/null /opt/live/prepared.json
+# The pool cells' inputs download while the model process's models warm: the preparation, smoke
+# included, must end within the registry's 15-minute alarm (site/live/src/snapshots.ts).
+runuser -u model -- /opt/venv/bin/python /opt/live/prepare-cells.py > /root/prepare-cells.log 2>&1 &
+cells=$!
 runuser -u model -- env HF_HOME=/opt/hf JAX_PLATFORMS=cpu \
     JAX_COMPILATION_CACHE_DIR=/opt/xla JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS=0 \
     JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 XLA_FLAGS=--xla_cpu_max_isa=AVX2 \
     /opt/venv/bin/python /opt/live/warm-managed.py
-runuser -u model -- /opt/venv/bin/python /opt/live/prepare-cells.py
+if ! wait "$cells"; then tail -c 4000 /root/prepare-cells.log >&2; exit 1; fi
 chmod 0750 /opt/models /opt/hf /opt/xla
 # Training contexts read /opt/train (gateway_manager.py); nothing may write it after preparation.
 chown -R root:root /opt/train
 chmod -R a+rX,go-w /opt/train
-rm -rf /var/lib/apt/lists/* /root/.cache
+rm -rf /var/lib/apt/lists/* /root/.cache /root/prepare-cells.log
