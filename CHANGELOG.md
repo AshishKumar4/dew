@@ -9,9 +9,9 @@ The first release on PyPI, as `dewml`: `pip install dewml` for the CPU, with
 the `cuda12`, `cuda13` and `tpu` extras for accelerators, on Python 3.12 or
 newer.
 
-- Training: one `Trainer` for every objective, on one device or a
-  multi-host mesh (data, FSDP, tensor, sequence, expert and pipeline axes),
-  with gradient accumulation, EMA, checkpoints that resume the data position,
+- Training: one `Trainer` for every objective, on one device or a mesh
+  (data, FSDP, tensor, sequence, expert and pipeline axes), with data and
+  FSDP across hosts, gradient accumulation, EMA, checkpoints that resume the data position,
   time- or step-based checkpointing, validation over named splits each with
   its own metrics and cadence, LoRA, and quantized training.
 - Diffusion: DiT, MMDiT, UNet and video backbones; flow matching, EDM and
