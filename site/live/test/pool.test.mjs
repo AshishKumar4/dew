@@ -36,6 +36,9 @@ test('idle scale-in never removes the two minimum warm hosts', async () => {
 	assert.equal(result.idle.ready, 2);
 	assert.equal(result.idle.active, 0);
 });
+test('a generation handed over after a newer one does not replace it', async () => {
+	assert.equal((await scenario('older')).desired, 'newer');
+});
 test('a pool the Worker no longer binds retires its hosts and stops', async () => {
 	const result = await scenario('orphan');
 	assert.deepEqual(result.retired, [true, true]);
