@@ -293,8 +293,7 @@ def model_variables(case: Case):
                 TextContext(jnp.ones((1, TEXT_TOKENS, TEXT_FEATURES)), jnp.ones((1, TEXT_TOKENS), bool)))
 
 
-def text_condition() -> Condition:
-    return Condition(StubText.from_pretrained("stub"), field="text", unconditional="")
+
 
 
 def batches(case: Case, encoder: ConditionEncoder | None):

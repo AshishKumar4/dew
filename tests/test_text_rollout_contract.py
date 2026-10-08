@@ -7,31 +7,16 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import decoder
 from rl_support import clipped_surrogate
 
 from dew.data import Dataset
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
-from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-from dew.nn.mla import MLAMixer
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import GRPOObjective, SampledRollout
 from dew.sampling import Sampling, generate
 from dew.training import Trainer
-
-
-def decoder(kind="attention"):
-    mixer = None
-    if kind == "mla":
-        mixer = MLAMixer(q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=4,
-                         qk_rope_head_dim=4, v_head_dim=8)
-    elif kind == "recurrent":
-        mixer = GatedDeltaNetMixer(linear_num_key_heads=2, linear_num_value_heads=2,
-                                  linear_key_head_dim=8, linear_value_head_dim=8)
-    return CausalTransformer(vocab_size=13, emb_features=16, num_layers=1, num_heads=2,
-                             head_dim=8, mlp_features=32, max_seq_len=12,
-                             dtype="float32", mixer=mixer)
 
 
 def prompts():

@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from test_text_rollout_contract import decoder
+from model_support import decoder, greedy_walk as walk
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
@@ -71,13 +71,7 @@ MODELS = {
 }
 
 
-def walk(model, params, prompt, steps):
-    """Greedy continuation without a cache, one full forward per token."""
-    sequence = np.asarray(prompt)
-    for _ in range(steps):
-        logits = np.asarray(model.apply(params, jnp.asarray(sequence))[:, -1])
-        sequence = np.concatenate([sequence, logits.argmax(-1)[:, None].astype(np.int32)], axis=1)
-    return sequence
+
 
 
 @pytest.mark.parametrize("kind", list(MODELS))

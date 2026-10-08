@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import checkify
-from test_text_rollout_contract import decoder
+from model_support import decoder, greedy_walk as walk
 
 from dew.sampling import Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
@@ -110,15 +110,7 @@ def model():
     return module, module.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
 
 
-def walk(module, params, prompt, steps, transform=None):
-    """Greedy continuation without a cache, one full forward per token."""
-    sequence = np.asarray(prompt)
-    for _ in range(steps):
-        logits = np.asarray(module.apply(params, jnp.asarray(sequence))[:, -1])
-        if transform is not None:
-            logits = transform(sequence, logits)
-        sequence = np.concatenate([sequence, logits.argmax(-1)[:, None].astype(np.int32)], axis=1)
-    return sequence
+
 
 
 def test_defaults_reproduce_the_plain_greedy_walk_when_no_component_is_given(model):

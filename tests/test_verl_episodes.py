@@ -10,7 +10,7 @@ from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
-from test_tool_episodes import build, collect
+from episode_support import build, collect
 
 from dew.objectives.rl import session_of
 from dew.objectives.rl.sessions import pack

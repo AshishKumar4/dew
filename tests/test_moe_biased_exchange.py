@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from moe_support import exchange_worker
+from moe_support import exchange_worker, reference_case, training_shardings, training_step
 
 from dew.nn.gpt_oss import GptOssExperts, GptOssMLP
 from dew.training import Layout, MeshSpec
@@ -151,18 +151,7 @@ def test_biased_exchange_padding_never_creates_an_expert_contribution(tokens):
 
 
 
-def reference_case(skewed: bool):
-    name = 'exchange_skewed' if skewed else 'exchange_random'
-    with np.load(Path(__file__).parent / 'fixtures' / 'gpt_oss' / (name + '.npz')) as fixture:
-        arrays = {name: np.asarray(value) for name, value in fixture.items()}
 
-    def parameters(prefix):
-        return {'router': {'kernel': jnp.asarray(arrays[prefix + 'router.weight'].T),
-                           'bias': jnp.asarray(arrays[prefix + 'router.bias'])},
-                'experts': {name.removeprefix(prefix + 'experts.'): jnp.asarray(value)
-                            for name, value in arrays.items() if name.startswith(prefix + 'experts.')}}
-
-    return arrays, parameters(''), parameters('grad.')
 
 
 @pytest.mark.parametrize('skewed', [False, True])
@@ -213,28 +202,7 @@ def test_decoder_mixture_can_select_biased_expert_exchange():
 
 
 
-def training_shardings(mesh):
-    from jax.sharding import NamedSharding, PartitionSpec as P
-    return {
-        'router': {'kernel': NamedSharding(mesh, P('fsdp', 'expert')),
-                   'bias': NamedSharding(mesh, P('expert'))},
-        'experts': {'gate_up_proj': NamedSharding(mesh, P('expert', None, 'fsdp')),
-                    'gate_up_proj_bias': NamedSharding(mesh, P('expert', 'fsdp')),
-                    'down_proj': NamedSharding(mesh, P('expert', 'fsdp')),
-                    'down_proj_bias': NamedSharding(mesh, P('expert'))}}
 
-
-def training_step(model, optimizer):
-    def objective(parameters, x):
-        output = jnp.asarray(model.apply({'params': parameters}, x))
-        return jnp.mean(jnp.sin(output.astype(jnp.float32))), output
-
-    def step(parameters, state, x):
-        result, gradients = jax.value_and_grad(objective, (0, 1), has_aux=True)(parameters, x)
-        updates, state = optimizer.update(gradients[0], state, parameters)
-        return result, gradients, optax.apply_updates(parameters, updates), state
-
-    return step
 
 
 @pytest.mark.mesh
@@ -279,7 +247,7 @@ def test_full_biased_router_and_experts_take_identical_pooled_adam_steps(dtype, 
 
 @pytest.mark.mesh
 def test_biased_router_updates_pool_across_two_real_cpu_processes(tmp_path):
-    from test_multiprocess import run_pool
+    from process_support import run_pool
 
     reports = run_pool(Path(__file__).with_name('moe_biased_exchange_worker.py'), tmp_path, 2,
                        timeout=120, start=exchange_worker)

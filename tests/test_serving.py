@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import Digits, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
@@ -35,22 +36,7 @@ PROMPTS = ["12", "5", "1234567", "98", "321"]
 BUDGETS = [5, 9, 3, 12, 7]
 
 
-class Digits:
-    def encode(self, text):
-        return [int(character) for character in text]
 
-    def decode(self, ids):
-        return "".join(str(int(token)) for token in ids)
-
-
-_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_id=EOS)
-
-
-def task(sampling=_DEFAULT_TASK_SAMPLING, capacity=128):
-    model = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
-                              head_dim=8, mlp_features=32, max_seq_len=capacity, dtype="float32")
-    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    return TextGeneration(model, params, RunProcessor(Digits()), sampling=sampling)
 
 
 def assert_same_generation(served, alone):
