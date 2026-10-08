@@ -4,21 +4,21 @@
 		"--section",
 		"sample_public",
 		"--out",
-		"/tmp/rec/out"
+		"/tmp/recapture/out"
 	],
-	"script_sha256": "5e01545363a1a30f0e81a59adbf6ed34b3bed980597a1abbba8a38d6c81d4e5f",
+	"script_sha256": "9f7a596a52d8421f22b794d22e2d5a326fca3c04275770bcdb51ecafd3877f5c",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "9d81a3dc7e71e141ede6afb1b060f21a450a2f96",
+		"dew": "7256993a85c7b8d16e944dc77185fe26f6c55244",
 		"date": "2026-10-08"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 141.3,
+		"seconds": 72.3,
 		"columns": 96,
 		"screen": [
 			[
