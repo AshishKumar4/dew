@@ -13,6 +13,11 @@ export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const scenario = new URL(request.url).pathname.slice(1);
 		const coordinator = env.COORDINATOR.get(env.COORDINATOR.idFromName(scenario));
+		if (scenario === 'tabs') {
+			const tabs = [];
+			for (let tab = 0; tab <= 3; tab++) tabs.push(await coordinator.open('visitor', at(tab), IMAGE));
+			return Response.json({ tabs, other: await coordinator.open('neighbour', at(4), IMAGE) });
+		}
 		const opened = await coordinator.open('visitor', at(0), IMAGE);
 		if (!opened.ok) return Response.json(opened, { status: 500 });
 		if (scenario === 'late') await coordinator.status(at(121));

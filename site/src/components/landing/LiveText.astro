@@ -31,7 +31,7 @@ const { models, cell, recorded } = Astro.props;
 <script>
 	import type { LiveSession } from '../../scripts/live';
 	import { renderOutput } from '../../scripts/live';
-	import { landingKernel, reserveKernel, onKernelClose, closeKernel } from '../../scripts/landing-kernel';
+	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-text]');
 	if (panel) {
@@ -56,9 +56,6 @@ const { models, cell, recorded } = Astro.props;
 			editor.value = picker ? original.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(picker.value)}`) : original;
 		});
 		const execute = async () => {
-			let release: () => void;
-			try { release = reserveKernel(); }
-			catch (error) { status.textContent = error instanceof Error ? error.message : String(error); return; }
 			running = true;
 			stopping = false;
 			run.textContent = 'Stop';
@@ -75,7 +72,7 @@ const { models, cell, recorded } = Astro.props;
 			try {
 				timer = window.setInterval(() => { if (!stopping) status.textContent = `${phase} · ${Math.round((performance.now() - since) / 1000)} s`; }, 1000);
 				session = await landingKernel(holder, setPhase);
-				if (stopping) { closeKernel(); throw new Error('Stopped.'); }
+				if (stopping) throw new Error('Stopped.');
 				const started = performance.now();
 				setPhase('Generating');
 				const result = await session.run(editor.value, (message) => {
@@ -87,17 +84,15 @@ const { models, cell, recorded } = Astro.props;
 						} catch { /* Ordinary text output, not a progress report. */ }
 					}
 					renderOutput(output, message);
-				});
+				}, 'text');
 				window.clearInterval(timer);
 				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
 					: result.status === 'ok' ? `Generated in ${((performance.now() - started) / 1000).toFixed(1)} s.`
 					: 'The cell stopped with an error.';
 			} catch (error) {
-				closeKernel();
 				status.textContent = error instanceof Error ? error.message : String(error);
 			} finally {
 				window.clearInterval(timer);
-				release();
 				running = false;
 				run.textContent = 'Run';
 				run.disabled = false;
@@ -105,7 +100,7 @@ const { models, cell, recorded } = Astro.props;
 		};
 		run.addEventListener('click', () => {
 			if (!running) void execute();
-			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt(); }
+			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt('text'); }
 		});
 		editor.addEventListener('keydown', (event) => {
 			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !running) {

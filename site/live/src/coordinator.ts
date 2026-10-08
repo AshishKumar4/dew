@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { type Limits, limitsOf } from './limits';
 
-export type Refusal = 'busy' | 'one-at-a-time' | 'too-many-starts' | 'budget';
+export type Refusal = 'busy' | 'too-many-tabs' | 'too-many-starts' | 'budget';
 export type Opened =
 	| { ok: true; id: string }
 	| { ok: false; reason: Refusal; retryAfter: number };
@@ -10,6 +10,8 @@ export type Opened =
 const UNUSED_MS = 120_000;
 // How late a Kernel may report its container stopped before the Coordinator stops waiting for it.
 const REPORT_GRACE_MS = 120_000;
+// Sessions one visitor may have open at once: a session is a tab, whose cells share it.
+export const TABS = 3;
 
 const utcDay = (ms: number): string => new Date(ms).toISOString().slice(0, 10);
 
@@ -85,8 +87,8 @@ export class Coordinator extends DurableObject<Env> {
 		this.sweep(now);
 		const { maxSessions, ipStarts, ipWindowSeconds, wallSeconds, budgetSeconds } = this.limits;
 		const sql = this.ctx.storage.sql;
-		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ip = ? AND ended IS NULL', ip) >= 1) {
-			return { ok: false, reason: 'one-at-a-time', retryAfter: 30 };
+		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ip = ? AND ended IS NULL', ip) >= TABS) {
+			return { ok: false, reason: 'too-many-tabs', retryAfter: 30 };
 		}
 		const windowStart = now - ipWindowSeconds * 1000;
 		if (this.count('SELECT COUNT(*) AS n FROM sessions WHERE ip = ? AND created > ?', ip, windowStart) >= ipStarts) {
