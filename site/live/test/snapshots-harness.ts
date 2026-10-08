@@ -42,7 +42,11 @@ export default {
 			await preparer.fail();
 			await registry.ensure(B);
 			await registry.runAlarm();
-			return Response.json({ status: await registry.status(), now: Date.now() });
+			const first = await registry.status();
+			await registry.runAlarm();
+			await registry.runAlarm();
+			const third = await registry.status();
+			return Response.json({ status: first, third, now: Date.now() });
 		}
 		if (scenario === 'trial') {
 			await registry.refresh(A);

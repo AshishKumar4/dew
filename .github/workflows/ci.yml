@@ -211,8 +211,9 @@ jobs:
     # killed 164 of 268 containers at their first command. Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets. The eight
-    # heaviest tasks run twice from the start, and each keeps its first green
-    # answer (task.hedge): a copy that runs slowly holds nothing up.
+    # heaviest tasks run twice from the start (task.hedge): the first copy to
+    # answer decides, a copy's red is the task's verdict, and a slow copy
+    # holds nothing up.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
     # unreported each fail it. A commit armada already graded green, as one
@@ -230,7 +231,7 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#75558607b6a00d1eed74aaf3b8e2a8e766a9ea4d"
+        armada="bunx --bun github:AshishKumar4/armada#64c844cd5636c5f03d5e83188a43fdfd4f063d16"
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
 
   multihost:
