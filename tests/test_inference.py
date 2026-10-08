@@ -30,7 +30,7 @@ from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
-from dew.sampling import CFG, Euler, Heun, TextToImage
+from dew.sampling import APG, CFG, CFGPlusPlus, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.training import Checkpoints, Trainer
 
@@ -62,13 +62,13 @@ _DEFAULT_MAKE_RUN_PRESET = EDM()
 
 
 def make_run(
-    directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder=STUB_TEXT, checkpoint="stub-clip", steps=2
+    directory, preset=_DEFAULT_MAKE_RUN_PRESET, encoder=STUB_TEXT, checkpoint="stub-clip", steps=2, **stated
 ):
     """`steps` training steps of the tiny conditional DiT, its checkpoint and
     its `run.json` in `directory`, as the recipe leaves them: the objective is
-    the config's own build. A directory that already holds the run resumes
-    it to `steps`."""
-    config = run_config(directory, preset, encoder, checkpoint)
+    the config's own build, stating `stated` beside its own fields. A
+    directory that already holds the run resumes it to `steps`."""
+    config = stating(run_config(directory, preset, encoder, checkpoint), **stated)
     objective = config.build()
     encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
@@ -100,6 +100,17 @@ def make_run(
     checkpoints.wait()
     config.save(str(directory))
     return objective, state
+
+
+@pytest.mark.parametrize("guidance", [CFG(4.0, interval=(0.1, 0.9)), CFGPlusPlus(0.6, interval=(0.2, 1.0)),
+                                      APG(5.0, eta=0.5, norm_threshold=2.0, momentum=-0.5), None],
+                         ids=["cfg", "cfg++", "apg", "none"])
+def test_a_run_reloads_the_guidance_it_evaluated_with(tmp_path, guidance):
+    """The checkpoint records its guidance by class, so the task a run
+    reloads guides as its evaluation did, whichever kind, or not at all."""
+    objective, _ = make_run(tmp_path, guidance=guidance)
+    assert objective.guidance == guidance
+    assert TextToImage.from_run(str(tmp_path)).guidance == guidance
 
 
 def test_pipeline_generates_from_a_run_directory(tmp_path):

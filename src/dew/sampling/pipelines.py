@@ -290,8 +290,7 @@ class TextToImage:
         solver_record = fields(record['solver'], 'solver')
         solver = solvers.build(text(solver_record['class'], 'solver class'),
                                 fields(solver_record['fields'], 'solver fields'))
-        guidance = (None if record['guidance'] is None
-                    else from_record(CFG, fields(record['guidance'], 'guidance'), dtypes=False))
+        guidance = from_record(Guidance | None, record['guidance'], dtypes=False)
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),

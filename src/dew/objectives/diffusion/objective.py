@@ -405,7 +405,7 @@ class DiffusionObjective(Objective[Ratio]):
         return {'process': self.process.to_json(), 'inputs': self.inputs.to_json(),
                 'autoencoder': None if self.autoencoder is None else self.autoencoder.to_json(),
                 'solver': to_record(self.solver, Solver),
-                'guidance': to_record(self.guidance, type(self.guidance)), 'sampling_steps': self.steps,
+                'guidance': to_record(self.guidance, Guidance | None), 'sampling_steps': self.steps,
                 'condition_precision': self._condition_precision,
                 # A tuned autoencoder's weights and statistics sit in the run's own tree.
                 'end_to_end': None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd)}
