@@ -12,12 +12,16 @@ import resource
 from typing import ClassVar
 
 GIB = 1024 * 1024 * 1024
-# A page cell's context only sends requests to the model process. A training
-# context runs Dew itself: JAX's threads and reservations need room beyond
-# the step's own memory, and the bridge runs one at a time per host.
+INFINITY = resource.RLIM_INFINITY
+# A page cell's context only sends requests to the model process, in a small
+# address space. A training context runs Dew itself, and JAX reserves more
+# address space than it ever touches (11 GiB for the 3.8 GiB fine-tune cell),
+# so its bound is on writable memory instead; the bridge runs one per host.
 PROFILES = {
-    "cell": {"memory": GIB * 3 // 4, "cpu_seconds": 10, "processes": 32, "files": 128},
-    "train": {"memory": 10 * GIB, "cpu_seconds": 300, "processes": 256, "files": 1024},
+    "cell": {"address_space": GIB * 3 // 4, "data": INFINITY, "cpu_seconds": 10, "processes": 32,
+             "files": 128},
+    "train": {"address_space": INFINITY, "data": 6 * GIB, "cpu_seconds": 600, "processes": 256,
+              "files": 1024},
 }
 
 
@@ -28,7 +32,8 @@ class Comparison(ctypes.Structure):
 
 def install(profile="cell"):
     limits = PROFILES[profile]
-    resource.setrlimit(resource.RLIMIT_AS, (limits["memory"], limits["memory"]))
+    resource.setrlimit(resource.RLIMIT_AS, (limits["address_space"], limits["address_space"]))
+    resource.setrlimit(resource.RLIMIT_DATA, (limits["data"], limits["data"]))
     resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
     # Stock ipykernel creates more than 64 descriptors while starting its shell channels.
     resource.setrlimit(resource.RLIMIT_NOFILE, (limits["files"], limits["files"]))

@@ -1,4 +1,4 @@
-"""Bounds a live training cell to about a minute on a shared 4-vCPU host.
+"""Bounds a live training cell to a couple of minutes on a shared 4-vCPU host.
 
 A training context runs Dew itself, not the stand-ins of model_client.
 `install` caps the batch of a `dew.data.load` dataset at BATCH and a
@@ -31,7 +31,7 @@ def install():
             changed.append(f"log_every {log_every} -> {max(1, steps // 4)}")
             log_every = max(1, steps // 4)
         if changed:
-            print(f"Live run: {', '.join(changed)}, so it ends in about a minute.")
+            print(f"Live run: {', '.join(changed)}, so it finishes in about two minutes.")
         return fit(self, dataset, steps=steps, log_every=log_every, **options)
 
     dew.data.load, Trainer.fit = capped_load, capped_fit
