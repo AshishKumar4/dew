@@ -146,6 +146,9 @@ def cells():
         # The page shows train.py without its command line (trainingExample, framework-examples.mjs).
         code = re.sub(r"parser = argparse.ArgumentParser\(\)[\s\S]*?steps = parser.parse_args\(\).steps",
                       "steps = 1000", code.replace("import argparse\n\n", ""))
+        # The bridge installs the caps in every training context first (PRELOAD, shared_bridge.py).
+        code = "import live_training\nlive_training.install()\n" + code
+        code += "\nimport resource\nprint('peak', resource.getrusage(resource.RUSAGE_SELF).ru_maxrss >> 10)\n"
         kernel = request("/api/kernels", {"name": "dew-train"})
         client = BlockingKernelClient(connection_file=f"/run/dew/gateway/kernel-{kernel['id']}.json")
         client.load_connection_file()
@@ -162,7 +165,11 @@ def cells():
             client.stop_channels()
             request("/api/kernels/" + kernel["id"], method="DELETE")
         assert ending in output, output[-2000:]
-        print(f"{name} ran in {time.perf_counter() - started:.0f} s; memory {memory()}", flush=True)
+        # What a run keeps resident, which the host's memory must hold beside the model process.
+        peak = int(output.rsplit("peak ", 1)[1].split()[0])
+        assert peak < 4608, f"{name} held {peak} MiB; memory {memory()}"
+        print(f"{name} ran in {time.perf_counter() - started:.0f} s, {peak} MiB resident; memory {memory()}",
+              flush=True)
 
 
 def memory():
