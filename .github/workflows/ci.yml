@@ -154,6 +154,13 @@ jobs:
         logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
         assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))
         EOF
+    - name: PyPI's jax still keys a pool's processes apart (jax-ml/jax#40940)
+      # The repro is expected to fail here (xfail, strict): once it passes, a
+      # release carries the fix, and the patched jax and its refusal can go.
+      run: |
+        "$RUNNER_TEMP/clean/bin/pip" install --quiet pytest
+        DEW_UPSTREAM_JAX=1 "$RUNNER_TEMP/clean/bin/python" -m pytest -q -p no:cacheprovider -rxX \
+          tests/test_distribution.py::test_a_pools_second_run_loads_what_its_first_compiled
     - name: Resolve the accelerator extras
       run: |
         for extras in cuda12,quantization,profile cuda13,quantization,profile tpu,quantization,profile; do
