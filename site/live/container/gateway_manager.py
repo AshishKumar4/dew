@@ -89,6 +89,11 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "--ro-bind", str(connection), "/kernel.json",
             "--bind", str(directory), "/work/ipc",
             "--ro-bind", "/run/dew/model/model.sock", "/work/model.sock",
+            # A training context reads the prepared cells' inputs (prepare-cells.py) through an
+            # overlay of its own: the Hub and datasets libraries write locks and records beside
+            # what they read, and no context may change what the next one reads.
+            *(["--overlay-src", "/opt/train", "--tmp-overlay", "/opt/train"]
+              if self.kernel_name == "dew-train" else []),
             "--chdir", "/work", "--cap-drop", "ALL",
             "/opt/venv/bin/python", "/opt/live/guest_entry.py", *arguments,
         ]
