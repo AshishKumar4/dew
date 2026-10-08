@@ -872,10 +872,7 @@ class Checkpoints:
         """Return the selected step's inference declaration.
 
         It is None when the step's objective declares no inference record."""
-        step = self.resolve(step)
-        step = self.latest if step is None else step
-        if step is None:
-            raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        step = self.pinned(step)
         local = step == self._local_latest()
         custom = self._step_metadata(step, local=local).custom_metadata or {}
         return json_value(custom.get('artifact'), 'artifact')
@@ -902,6 +899,15 @@ class Checkpoints:
         candidates = [(checkpoint.metrics[key], checkpoint.step)
                       for checkpoint in retained if key in checkpoint.metrics]
         return min(candidates)[1] if candidates else None
+
+    def pinned(self, step: int | str | None = None) -> int:
+        """The exact step `step` selects: itself, the best by a ranking, or, for
+        None, the latest committed now, which a later save does not move."""
+        step = self.resolve(step)
+        step = self.latest if step is None else step
+        if step is None:
+            raise FileNotFoundError(f"{self.directory} holds no checkpoint")
+        return step
 
     def resolve(self, step: int | str | None) -> int | None:
         if not isinstance(step, str):

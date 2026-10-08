@@ -218,7 +218,7 @@ class Adapter:
         from dew.records import record, text
         from dew.registry import objectives
 
-        declaration = run_record(str(directory), step, trust)
+        declaration, step = run_record(str(directory), step, trust)
         config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         if config.adapter is None:
             raise ValueError(f"{directory} trained no adapter")

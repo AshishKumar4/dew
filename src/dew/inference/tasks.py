@@ -269,15 +269,19 @@ def _pulled(repo_id: str, revision: str | None) -> str:
 
 
 def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()
-               ) -> Mapping[str, object]:
+               ) -> tuple[Mapping[str, object], int]:
     """The inference declaration of the selected checkpoint, not training
-    configuration. A task loaded from it compiles into the persistent cache
-    (`persist_compilations`). `trust` names the packages outside Dew whose
-    modules the record may import (`dew.registry.imported`)."""
+    configuration, and the exact step it is, which a loader reads the
+    weights at too, so a step saved meanwhile cannot pair one step's
+    declaration with another's weights. A task loaded from it compiles into
+    the persistent cache (`persist_compilations`). `trust` names the packages
+    outside Dew whose modules the record may import (`dew.registry.imported`)."""
     from dew.checkpoints import Checkpoints
     from dew.registry import import_trusted
     persist_compilations()
-    record = Checkpoints(directory).artifact(step)
+    checkpoints = Checkpoints(directory)
+    step = checkpoints.pinned(step)
+    record = checkpoints.artifact(step)
     import_trusted(record, trust)
     if record is None:
         raise ValueError("this checkpoint's objective declares no inference record; declare "
@@ -285,7 +289,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
     record = named_fields(record, 'checkpoint artifact')
     if 'unrecorded' in record:
         raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    return record
+    return record, step
 
 
 def _saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -330,10 +334,10 @@ def _saved_budget(record: Mapping[str, object]) -> int | None:
 
 
 def _saved_run(directory: str, dtype: DTypeLike | None, step: int | str | None, trust: Sequence[str]
-               ) -> tuple[Mapping[str, object], ModelConfig, Processor | None]:
-    """Read a run's record, its model config at `dtype`, and its host processor."""
-    record = run_record(directory, step, trust)
-    return record, _saved_model(record, dtype), _saved_processor(record)
+               ) -> tuple[Mapping[str, object], int, ModelConfig, Processor | None]:
+    """Read a run's record, the exact step it is, its model config at `dtype`, and its host processor."""
+    record, step = run_record(directory, step, trust)
+    return record, step, _saved_model(record, dtype), _saved_processor(record)
 
 
 def _freeze_variables(task: TextGeneration | BlockGeneration | MaskedGeneration,
@@ -490,7 +494,7 @@ class TextGeneration:
         """
         from dew.registry import objectives
 
-        record, model_config, processor = _saved_run(directory, dtype, step, trust)
+        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
@@ -590,7 +594,7 @@ class BlockGeneration:
         """
         from dew.diffusion.block import BlockProcess
         from dew.registry import objectives
-        record, model_config, processor = _saved_run(directory, dtype, step, trust)
+        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         model = model_config.build()
         refuse_non_denoiser(model)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
@@ -686,7 +690,7 @@ class MaskedGeneration:
         from dew.diffusion.discrete import DiscreteProcess
         from dew.registry import objectives, solvers
 
-        record, model_config, processor = _saved_run(directory, dtype, step, trust)
+        record, step, model_config, processor = _saved_run(directory, dtype, step, trust)
         budget = _saved_budget(record)
         model = model_config.build()
         refuse_causal(model)

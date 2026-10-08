@@ -258,7 +258,7 @@ class TextToImage:
         from dew.records import integer, record as fields, text
         from dew.registry import from_record, objectives, solvers
 
-        record = run_record(directory, step, trust)
+        record, step = run_record(directory, step, trust)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
         inputs_record = fields(record['inputs'], 'inputs')
         autoencoder_record = None if record['autoencoder'] is None else fields(record['autoencoder'],

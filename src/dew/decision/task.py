@@ -180,7 +180,7 @@ class Decide:
         from dew.inference.tasks import _saved_model, run_record
         from dew.registry import from_record, objectives
 
-        record = run_record(directory, step)
+        record, step = run_record(directory, step)
         backbone = _saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         model = DecisionModel(backbone, Head.from_record(records.json_value(record["head"], "head"),
@@ -193,15 +193,10 @@ class Decide:
             raise ValueError("the run records no tokenizer to lay its rows out with")
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        checkpoints = Checkpoints(directory)
-        chosen = checkpoints.resolve(step)
-        chosen = checkpoints.latest if chosen is None else chosen
-        if chosen is None:
-            raise FileNotFoundError(f"{directory} holds no checkpoint")
-        averaged = checkpoints.stored(chosen).get("ema") is not None if ema is None else ema
+        averaged = Checkpoints(directory).stored(step).get("ema") is not None if ema is None else ema
         task = cls(model, variables, rows, tokenizer_for(records.text(tokenizer, "tokenizer")),
                    from_record(Specials, records.json_value(record["specials"], "specials")),
-                   name=str(epath.Path(directory).name), weights=Weights(chosen, averaged))
+                   name=str(epath.Path(directory).name), weights=Weights(step, averaged))
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
@@ -210,7 +205,7 @@ class Decide:
         if fitted != task.weights:
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
-                f"weights, and this loads step {chosen}'s {'averaged' if averaged else 'live'} ones; "
+                f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
         return replace(task, calibration=from_record(Calibration, records.json_value(settings["calibration"],
                                                                                     "calibration")),

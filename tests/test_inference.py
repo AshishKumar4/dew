@@ -538,6 +538,35 @@ def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp
                                   local("the ", key=2, sampling=greedy).host().tokens)
 
 
+def test_a_run_loads_one_step_whole_while_a_later_step_is_saved(tmp_path, monkeypatch):
+    """A step committed after the latest declaration is read, before the
+    weights are, does not move the load: the task holds the declared step's
+    weights, not the new step's."""
+    _, state = make_lm_run(tmp_path)
+    moved = jax.tree.map(lambda leaf: leaf + 1 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, state)
+    read = Checkpoints.artifact
+    saved = []
+
+    def read_then_save(self, step=None):
+        record = read(self, step)
+        if not saved:
+            saved.append(step)
+            writer = Checkpoints(str(tmp_path), keep=2)
+            writer.save(4, moved, None, artifact=record)
+            writer.wait()
+        return record
+
+    monkeypatch.setattr(Checkpoints, "artifact", read_then_save)
+    task = dew.pipeline(str(tmp_path))
+    monkeypatch.setattr(Checkpoints, "artifact", read)
+    assert Checkpoints(str(tmp_path)).latest == 4
+    for name, step in (("declared", 2), ("later", 4)):
+        pinned = dew.pipeline(str(tmp_path), step=step)
+        same = all(np.array_equal(loaded, expected) for loaded, expected in zip(
+            jax.tree.leaves(task.variables), jax.tree.leaves(pinned.variables), strict=True))
+        assert same == (name == "declared"), name
+
+
 def test_an_lm_run_without_an_average_publishes_and_exports_its_live_weights(tmp_path):
     """An LM keeps no EMA unless asked, so each reader's default takes the
     live weights of such a run: the objective's pipeline, `dew.pipeline`
