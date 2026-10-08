@@ -423,14 +423,16 @@ class Decide:
         from dew.decision.metrics import AURC, ECE, Accuracy
         from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
+        from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or [Accuracy(), ECE(), AURC(), LogLoss()]
         objective = DecisionObjective(self, temperatures=self.calibration.temperatures)
-        # A batch is one pass within the budget, as `batch` packs its rows.
+        # A batch is one pass within the budget, as `batch` packs its rows, on
+        # one device, as an answer is: a short last batch need not divide.
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
         evaluation = Evaluation.run(objective, self.variables, objective.held_out(examples, batch=rows),
-                                    key=0, metrics=chosen)
+                                    key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
     def _scored(self, examples: Iterable[Example | Mapping[str, object]]) -> list[Scored]:
