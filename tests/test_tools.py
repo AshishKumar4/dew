@@ -1162,6 +1162,34 @@ def test_the_census_counts_a_speculative_drafter_as_refused_by_design(tmp_path):
     assert coverage["summary"]["all types"]["refused"]["models"] == 0
 
 
+def test_a_tutorials_outputs_are_stale_after_a_dependency_only_commit(tmp_path, monkeypatch):
+    """The outputs come from the library and its pinned dependencies, so a
+    commit that changes only pyproject.toml makes them stale, as one to a
+    module the notebook imported does."""
+    checker = load("check_tutorial_outputs")
+
+    def git(*args):
+        subprocess.run(["git", "-C", str(tmp_path), *args], check=True, capture_output=True)
+
+    (tmp_path / "src" / "dew").mkdir(parents=True)
+    (tmp_path / "src" / "dew" / "probe.py").write_text("VALUE = 1\n")
+    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.2"]\n')
+    git("init", "-q")
+    git("add", "-A")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "outputs")
+    recorded = subprocess.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+    notebook = tmp_path / "probe.ipynb"
+    notebook.write_text(json.dumps({"metadata": {"dew": {"outputs": {"commit": recorded}}}, "cells": []}))
+    monkeypatch.setattr(checker, "ROOT", tmp_path)
+    imports = {"probe.ipynb": ["dew.probe"]}
+    assert checker.verdict(notebook, imports)[0] == "current"
+    (tmp_path / "pyproject.toml").write_text('dependencies = ["jax==0.11.3"]\n')
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "dependency")
+    label, lines = checker.verdict(notebook, imports)
+    assert label == "STALE" and "pyproject.toml" in lines[0]
+
+
 def _committed(repository: Path, message: str) -> str:
     def git(*args):
         command = ["git", "-C", str(repository), "-c", "user.name=t", "-c", "user.email=t@t", *args]

@@ -92,8 +92,8 @@ def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: in
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
     # loop's zero initial state came back with other values in most
     # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
-    # The barrier materializes the zero. Remove it when XLA fixes the draft in
-    # verification-evidence/upstream-reports/xla-cpu-scan-uninitialized.
+    # The barrier materializes the zero. Remove it when XLA:CPU no longer
+    # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
 
     def one_chunk(s, step):

@@ -52,3 +52,18 @@ def test_models_check_rejects_unlabelled_wrapper(models_generator, monkeypatch, 
     assert error.value.code == 1
     assert "multimodal model_type 'site_probe' is registered" in capsys.readouterr().err
     assert not list(tmp_path.iterdir())
+
+
+def test_a_replay_is_cropped_to_its_aspect_around_the_picture():
+    """A frame taller than the replay's 3:2 keeps its middle rows, so every
+    replay on the page shares one shape."""
+    import numpy as np
+    from PIL import Image
+
+    path = Path(__file__).resolve().parents[1] / "site/scripts/replay-atlas.py"
+    spec = importlib.util.spec_from_file_location("site_replay_under_test", path)
+    atlas = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(atlas)
+    checkers = (np.indices((12, 12)).sum(0) % 2 * 255).astype(np.uint8)
+    picture = Image.fromarray(np.repeat(checkers[..., None], 3, -1))
+    assert atlas.content_box(picture, 1.5) == (0, 2, 12, 10)
