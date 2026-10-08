@@ -173,7 +173,8 @@ jobs:
     # Pythons as tasks of about three minutes each on Dew's own armada
     # deployment (armada-dew), on the fewest of up to 150 containers that
     # finish as soon, sized from the last runs' usage: at 375, the platform
-    # killed 164 of 268 containers at their first command.
+    # killed 164 of 268 containers at their first command. Tasks share XLA's
+    # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
@@ -192,5 +193,5 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#2ef68c1352f5cd961cdc54d0b1399edf22a09aec"
+        armada="bunx --bun github:AshishKumar4/armada#2f735864d34fd2b0d4d201f8b5e51779539b7e7f"
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
