@@ -18,8 +18,24 @@ export class SharedHost extends DurableObject<Env> {
 	}
 
 	async warm(): Promise<void> {
-		if (this.ctx.container?.running && !this.starting && !(await this.available())) await this.ctx.container.destroy();
+		if (this.ctx.container?.running && !this.starting && !(await this.available())) {
+			// A host busy with a run can miss one check; restarting it would end every cell on it.
+			const missed = ((await this.ctx.storage.get<number>('missed')) ?? 0) + 1;
+			await this.ctx.storage.put('missed', missed);
+			const sessions = (await this.ctx.storage.get<string[]>('sessions'))?.length ?? 0;
+			if (sessions && missed < 3) return;
+			console.error('model host restarted after failing its health check', missed, 'times with', sessions, 'contexts');
+			await this.ctx.container.destroy();
+		}
+		await this.ctx.storage.delete('missed');
 		await this.ready();
+	}
+
+	/** The bridge's report of the host's memory and contexts, or null while it is not running. */
+	async health(): Promise<Record<string, unknown> | null> {
+		if (!this.ctx.container?.running) return null;
+		try { return await (await this.ctx.container.getTcpPort(PORT).fetch('http://container/health')).json(); }
+		catch { return null; }
 	}
 
 	async retire(): Promise<void> {

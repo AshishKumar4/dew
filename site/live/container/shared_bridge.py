@@ -103,6 +103,19 @@ def available(meminfo=Path("/proc/meminfo")):
     return int(line.split()[1]) << 10
 
 
+def resident(proc=Path("/proc")):
+    """Resident memory by user, in MiB: the model process, the gateway and bridge, each guest."""
+    held = {}
+    for status in proc.glob("[0-9]*/status"):
+        try:
+            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
+            uid, rss = fields["Uid"].split()[1], int(fields.get("VmRSS", "0 kB").split()[0])
+        except (OSError, KeyError, ValueError):
+            continue
+        held[uid] = held.get(uid, 0) + (rss >> 10)
+    return held
+
+
 def largest_guest(proc=Path("/proc")):
     """The pids of the guest context holding the most memory, summed over its processes: each
     context runs as a uid of its own (gateway_manager.py). Empty when no guest runs."""
@@ -250,7 +263,11 @@ class Gateway:
     async def http(self, connection, request):
         if request.path == "/health":
             ready = Path("/run/dew/model/ready").exists()
-            return Response(200 if ready else 503, "OK" if ready else "Warming up", Headers(), b"")
+            # Reachable only through the host's Durable Object (shared-host.ts), for the operator.
+            report = {"available_mib": available() >> 20, "contexts": sum(map(len, self.contexts.values())),
+                      "training": self.training, "rss_mib": resident()}
+            return Response(200 if ready else 503, "OK" if ready else "Warming up", Headers(),
+                            json.dumps(report).encode())
         if not hmac.compare_digest(request.headers.get("Authorization", ""), "Bearer " + self.secret):
             return Response(403, "Forbidden", Headers(), b"")
         match = re.fullmatch(r"/contexts/([0-9a-f-]{36})(?:/(ws|status|close))?", request.path)
