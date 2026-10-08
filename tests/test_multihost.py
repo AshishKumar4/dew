@@ -9,6 +9,7 @@ their processes reported over the gang (`exchange`), and each asserts on the who
 gang the module is skipped: CI's multihost job runs it on a gang of four.
 """
 
+import contextlib
 import json
 import os
 import re
@@ -45,38 +46,68 @@ KILL_AFTER = 60
 """Seconds into a pool's run that one of its hosts dies: past the join, in compilation or training."""
 
 
+ANSWER_SECONDS = 60
+"""How long a rank waits on one connection for the whole of an exchange before it asks again: the relay
+between containers holds a connection to a port nobody listens on yet open rather than refusing it."""
+
+
 def exchange(sequence: int, mine: object) -> list:
-    """What every rank gave for the `sequence`-th exchange, in rank order: each rank hands rank 0
-    its part, and rank 0 hands every rank the whole."""
+    """What every rank gave for the `sequence`-th exchange, in rank order: each rank hands rank 0 its part,
+    and rank 0 hands every rank the whole, which the rank acknowledges. A rank that hears nothing asks again
+    on a new connection, so rank 0 answers every connection it holds once it holds every part, and goes on
+    only once every rank acknowledged the whole, or none asked again for twice a rank's wait."""
     if RANK == 0:
-        parts = {0: mine}
-        with socket.create_server(("0.0.0.0", EXCHANGE + sequence)) as server:
-            server.settimeout(900)
-            conns = []
-            while len(parts) < WORLD:
-                conn = server.accept()[0]
-                rank, part = json.loads(_read(conn))
-                parts[rank] = part
-                conns.append(conn)
-            whole = json.dumps([parts[rank] for rank in range(WORLD)]).encode()
-            for conn in conns:
-                conn.sendall(len(whole).to_bytes(8, "big") + whole)
-                conn.close()
-        return [parts[rank] for rank in range(WORLD)]
+        return _gathered(sequence, mine)
     deadline = time.monotonic() + 900
     while True:
         try:
-            conn = socket.create_connection(("rank0", EXCHANGE + sequence), timeout=60)
-            sent = json.dumps([RANK, mine]).encode()
-            conn.sendall(len(sent).to_bytes(8, "big") + sent)
-            whole = json.loads(_read(conn))
-            conn.close()
-            return whole
-        except (ConnectionError, OSError):
-            # Rank 0 has not opened this exchange yet: it may still be in the pool before it.
+            with socket.create_connection(("rank0", EXCHANGE + sequence), timeout=ANSWER_SECONDS) as conn:
+                sent = json.dumps([RANK, mine]).encode()
+                conn.sendall(len(sent).to_bytes(8, "big") + sent)
+                whole = json.loads(_read(conn))
+                conn.sendall(b"k")
+                return whole
+        except OSError:
+            # Rank 0 has not opened this exchange yet (it may still be in the pool before it), or its answer
+            # was lost.
             if time.monotonic() > deadline:
                 raise
             time.sleep(1)
+
+
+def _gathered(sequence: int, mine: object) -> list:
+    """Rank 0's side of `exchange`."""
+    parts, acknowledged, asking = {0: mine}, {0}, []
+    with socket.create_server(("0.0.0.0", EXCHANGE + sequence)) as server:
+        server.settimeout(900)
+        while len(acknowledged) < WORLD:
+            try:
+                conn = server.accept()[0]
+            except TimeoutError:
+                if len(parts) < WORLD:
+                    raise
+                break
+            conn.settimeout(ANSWER_SECONDS)
+            try:
+                rank, part = json.loads(_read(conn))
+            except (OSError, ValueError):
+                conn.close()
+                continue
+            parts[rank] = part
+            asking.append((rank, conn))
+            if len(parts) < WORLD:
+                continue
+            whole = json.dumps([parts[rank] for rank in range(WORLD)]).encode()
+            for _, conn in asking:
+                with contextlib.suppress(OSError):
+                    conn.sendall(len(whole).to_bytes(8, "big") + whole)
+            for rank, conn in asking:
+                with conn, contextlib.suppress(OSError):
+                    if _exact(conn, 1) == b"k":
+                        acknowledged.add(rank)
+            asking = []
+            server.settimeout(2 * ANSWER_SECONDS)
+    return [parts[rank] for rank in range(WORLD)]
 
 
 def _read(conn: socket.socket) -> bytes:
