@@ -79,7 +79,7 @@ const native = `${setup.trimEnd()}\n\n${cell.replace('from model_client import C
 <script>
 	import type { LiveSession, Output } from '../../scripts/live';
 	import { renderOutput } from '../../scripts/live';
-	import { landingKernel, reserveKernel, onKernelClose, closeKernel } from '../../scripts/landing-kernel';
+	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-sampler]');
 	const run = panel?.querySelector<HTMLButtonElement>('[data-run]');
@@ -175,13 +175,6 @@ const native = `${setup.trimEnd()}\n\n${cell.replace('from model_client import C
 		};
 
 		const execute = async () => {
-			let release: () => void;
-			try {
-				release = reserveKernel();
-			} catch (error) {
-				show('error', error instanceof Error ? error.message : String(error));
-				return;
-			}
 			running = true;
 			stopping = false;
 			failure = undefined;
@@ -196,10 +189,7 @@ const native = `${setup.trimEnd()}\n\n${cell.replace('from model_client import C
 					show('starting', 'Checking that you are not a bot');
 					tick('Waiting');
 					const opened = await landingKernel(holder, (text) => show('starting', text.replace(/…$/, '')));
-					if (stopping) {
-						closeKernel();
-						throw new Error('Stopped.');
-					}
+					if (stopping) throw new Error('Stopped.');
 					session = opened;
 					compiled = opened.warm;
 				}
@@ -208,30 +198,27 @@ const native = `${setup.trimEnd()}\n\n${cell.replace('from model_client import C
 				// a warm spare compiled it before it was handed out.
 				show('sampling', compiled ? 'Sampling' : 'Starting the sampler; a new kernel compiles it first');
 				tick('Running');
-				const done = await session.run(editor.value, onOutput);
+				const done = await session.run(editor.value, onOutput, 'image');
 				untick();
 				if (stopping || done.status === 'aborted') show('idle', 'Stopped.');
 				else if (done.status === 'ok') show('done', `The cell ran in ${seconds()} s on the live kernel.`, 1);
 				else show('error', failure ?? 'The cell stopped with an error; the kernel output below says why.');
 			} catch (error) {
 				untick();
-				closeKernel();
-				session = undefined;
 				show(stopping ? 'idle' : 'error', stopping ? 'Stopped.' : error instanceof Error ? error.message : String(error));
 			} finally {
-				release();
 				running = false;
 				run.textContent = 'Run';
 				run.disabled = false;
 			}
 		};
 
-		// Stopping interrupts the cell; before the kernel is ready it lets the start finish and closes it.
+		// Stopping interrupts the cell; before the kernel is ready it lets the start finish and runs nothing.
 		const stop = () => {
 			stopping = true;
 			run.disabled = true;
 			show(stage.dataset.stage ?? 'idle', 'Stopping');
-			session?.interrupt();
+			session?.interrupt('image');
 		};
 
 		q<HTMLButtonElement>('[data-reset]').addEventListener('click', () => (editor.value = original));
