@@ -182,7 +182,7 @@ class Flux2Transformer(nn.Module):
         for index in range(self.num_layers):
             image, context = DoubleStreamBlock(
                 self.features, self.heads, self.head_dim, context_first=True, bias=False, mlp_hidden=hidden,
-                shared_modulation=True, name=f"transformer_blocks_{index}", **block)(
+                swiglu=True, shared_modulation=True, name=f"transformer_blocks_{index}", **block)(
                 image, context, mods, rotation)
         joined = jnp.concatenate([context, image], axis=1)
         for index in range(self.num_single_layers):
