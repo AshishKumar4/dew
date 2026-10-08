@@ -296,12 +296,15 @@ def offline(out):
     HFOptions.load = lambda self, path, split, *, streaming: datasets.Dataset.from_dict(tables[path])
     tokenizer_for = dew.data.text.tokenizer_for
     dew.data.text.tokenizer_for = lambda name: tokenizer_for("byte" if name == "Qwen/Qwen3-0.6B" else name)
-    load = PretrainedDecoder.load.__func__
+    load, generation = PretrainedDecoder.load.__func__, PretrainedDecoder.text_generation
 
     def tiny(cls, name, **options):
-        bundle = load(cls, ROOT / "tests/fixtures/hf/qwen3-tiny" if name == "Qwen/Qwen3-0.6B" else name,
-                      **options)
-        return replace(bundle, processor=RunProcessor(ByteTokenizer()))
+        fixture = ROOT / "tests/fixtures/hf/qwen3-tiny"
+        return load(cls, fixture if name == "Qwen/Qwen3-0.6B" else name, **options)
+
+    # The fixture has no tokenizer of its own.
+    def byte_text(self, **options):
+        return replace(generation(self, **options), processor=RunProcessor(ByteTokenizer()))
 
     def run(repo_id, revision=None):
         sys.path.insert(0, str(ROOT / "tests"))
@@ -310,7 +313,7 @@ def offline(out):
             make_run(out / "run", preset=Flow())
         return out / "run"
 
-    PretrainedDecoder.load = classmethod(tiny)
+    PretrainedDecoder.load, PretrainedDecoder.text_generation = classmethod(tiny), byte_text
     hub.pull_from_hub = run
 
 
