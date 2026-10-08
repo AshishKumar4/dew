@@ -31,23 +31,25 @@ env:
   EXTRAS: test,av,tfds,metrics,plots,inference-clients,serve,vision,quantization,profile,torchax,gguf
 
 jobs:
+  # Lint and the site's checks, and the type check beside them: each installs
+  # dewml as tools/armada/install.sh does, with uv, from uv's cache.
   lint:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
     - uses: actions/setup-python@v5
       with:
-        # The compatibility floor, which pyright checks syntax against.
         python-version: "3.12"
-        cache: pip
-        cache-dependency-path: pyproject.toml
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+          constraints.txt
     - name: Install dependencies
       run: |
-        python -m pip install --upgrade pip
-        pip install flake8 uv
-        pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
-        # pyright resolves every import in src/dew, the optional readers' included.
-        pip install -e ".[$EXTRAS]" -c constraints.txt
+        uv pip install --system torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        uv pip install --system flake8 -e ".[$EXTRAS]" -c constraints.txt
     - name: Lint with flake8
       run: |
         # stop the build if there are Python syntax errors or undefined names; the
@@ -81,6 +83,26 @@ jobs:
         uv run --no-project --with griffe==2.3.0 --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
         JAX_PLATFORMS=cpu python site/scripts/gen_models.py --check
         python site/scripts/gen_examples.py --check
+
+  types:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions/setup-python@v5
+      with:
+        # The compatibility floor, which pyright checks syntax against.
+        python-version: "3.12"
+    - uses: astral-sh/setup-uv@v6
+      with:
+        enable-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+          constraints.txt
+    - name: Install dependencies
+      run: |
+        uv pip install --system torch torchvision --index-url https://download.pytorch.org/whl/cpu
+        # pyright resolves every import in src/dew, the optional readers' included.
+        uv pip install --system -e ".[$EXTRAS]" -c constraints.txt
     - name: Type check
       run: uvx pyright@1.1.406 --pythonpath "$(which python)" src/dew
 
@@ -149,8 +171,10 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about three minutes each on Dew's own armada
-    # deployment (armada-dew), on the fewest of up to 375 containers
-    # (armada's most) that finish as soon, sized from the last runs' usage.
+    # deployment (armada-dew), on the fewest of up to 150 containers that
+    # finish as soon, sized from the last runs' usage: at 375, the platform
+    # killed 164 of 268 containers at their first command. Tasks share XLA's
+    # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
     # This job sends the commit, waits, and prints each red row's output; a
     # failed test, a test skipped on a missing import and a file left
@@ -169,5 +193,5 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#2ef68c1352f5cd961cdc54d0b1399edf22a09aec"
+        armada="bunx --bun github:AshishKumar4/armada#2f735864d34fd2b0d4d201f8b5e51779539b7e7f"
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
