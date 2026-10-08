@@ -1,0 +1,101 @@
+{
+  "model": "SD1.5",
+  "training_framework": "Dew",
+  "dew_commit": "fcdfa0070f49e0a4f8f344be02839d0573f40a98",
+  "rank": 16,
+  "training_steps": 160,
+  "sampling_steps": 30,
+  "guidance": 7.0,
+  "solver": "PNDM (skip_prk_steps=True)",
+  "resolution": [
+    512,
+    512
+  ],
+  "pairs": [
+    {
+      "before": {
+        "image": "before-01.webp",
+        "source": "before-01.png",
+        "source_sha256": "a105e8413f32fed9c41bb711f94b72b7ff484fcbf46c33d8b9610b5e93eaedad"
+      },
+      "prompt": "a picture in dewprint style of a mountain lake with a small sailboat, snowy peaks, dawn",
+      "seed": 1042,
+      "after": {
+        "image": "after-01.webp",
+        "source": "after-01.png",
+        "source_sha256": "a3b71caae32cac2a4a6dfca00d16276401407755ee46e5d3bdc124bc00e36ee9"
+      }
+    },
+    {
+      "before": {
+        "image": "before-02.webp",
+        "source": "before-02.png",
+        "source_sha256": "7689e899c3e6531fc44f86a6a2ec8bcfd5c6d9a99d79fbc2383b28622c36db4e"
+      },
+      "prompt": "a picture in dewprint style of a winding river through a village in autumn, red maple trees",
+      "seed": 2073,
+      "after": {
+        "image": "after-02.webp",
+        "source": "after-02.png",
+        "source_sha256": "bf6537c211d0dc7220b3915b4e867cec1d07e6db6c6769f96310bf1214caf0c1"
+      }
+    },
+    {
+      "before": {
+        "image": "before-03.webp",
+        "source": "before-03.png",
+        "source_sha256": "da6d1871e5338a48bce09e7a70396066d0aede4027624f2fb53b2b5b61f61e21"
+      },
+      "prompt": "a picture in dewprint style of a wooden bridge in the rain, people crossing with umbrellas",
+      "seed": 3104,
+      "after": {
+        "image": "after-03.webp",
+        "source": "after-03.png",
+        "source_sha256": "eaa0fc41b6a5084548f04b24f660457e26412661598135b51bbe958529a59649"
+      }
+    },
+    {
+      "before": {
+        "image": "before-04.webp",
+        "source": "before-04.png",
+        "source_sha256": "735d960407b1467ff3f47b642ab787a803627c69465b8a9693d7de1415b0b60b"
+      },
+      "prompt": "a picture in dewprint style of a coastal fishing village, a red sunset over the sea",
+      "seed": 4135,
+      "after": {
+        "image": "after-04.webp",
+        "source": "after-04.png",
+        "source_sha256": "8b89a1df4e6103cfe07d673b97ba98b6ddeb47653dcb3fe413c617fc8abbcf45"
+      }
+    },
+    {
+      "before": {
+        "image": "before-05.webp",
+        "source": "before-05.png",
+        "source_sha256": "9b52a6620853613ef30c26679634fe2c21386ac4b4e62ae14ab6800c2885ba8f"
+      },
+      "prompt": "a picture in dewprint style of a snow-covered pine tree beside a quiet temple",
+      "seed": 5166,
+      "after": {
+        "image": "after-05.webp",
+        "source": "after-05.png",
+        "source_sha256": "e15ce12b3a3a398c434e673f5f8068303e03a537180dfe955a3a8ea95c65fcf8"
+      }
+    },
+    {
+      "before": {
+        "image": "before-06.webp",
+        "source": "before-06.png",
+        "source_sha256": "ed8f59494a0183346d06cede263aa425634668dbdc195d699fd6c78a5a03344a"
+      },
+      "prompt": "a picture in dewprint style of cherry blossom trees beside a river, Mount Fuji in the distance",
+      "seed": 6197,
+      "after": {
+        "image": "after-06.webp",
+        "source": "after-06.png",
+        "source_sha256": "c47af07747a5b61ba7627d53ccc5e0ee1b6d7a5cc8dca118911e829fc0baced5"
+      }
+    }
+  ],
+  "images": "WebP at quality 88, converted from the run's PNGs, whose sha256 each entry keeps"
+}

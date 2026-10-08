@@ -1,18 +1,14 @@
 """What every vision family shares: the tower and projector bases, the
-geometry a conditioner reads off a tower, the vision-config readers, the
-projector tensor table, and the layer path and grid rotary two families share.
+geometry a conditioner reads off a tower, the vision-config readers and the
+projector tensor table.
 """
 
 import dataclasses
 from collections.abc import Mapping
 
-import jax
-import jax.numpy as jnp
 from flax import linen as nn
-from jax.typing import DTypeLike
 
 from dew import records
-from dew.nn.rope import inverse_frequencies
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -67,30 +63,6 @@ class TowerBase:
         whether it carries each one.
         """
         return TowerGeometry()
-
-
-def _grid_rope_tables(positions: jax.Array, head_dim: int, theta: float = 10000.0, *,
-                      dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
-    """The 2D rotary tables of a patch grid's attention, as cos/sin.
-
-    Heights then widths share one frequency table over half the head
-    (modeling_qwen3_5.py, Qwen3_5VisionRotaryEmbedding.forward; DeepSeek-V4.1
-    vision.py:8-15), doubled the way the text rope doubles its pairs.
-    """
-    dim = head_dim // 2
-    inv_freq = inverse_frequencies(theta, dim, dtype=dtype)
-    flat = (positions.astype(dtype)[..., None] * inv_freq).reshape(
-        *positions.shape[:-1], -1)
-    doubled = jnp.concatenate([flat, flat], axis=-1)
-    return jnp.cos(doubled), jnp.sin(doubled)
-
-
-def _grid_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
-    """The half rotation, broadcast over the heads (modeling_qwen3_5.py,
-    apply_rotary_pos_emb_vision; DeepSeek-V4.1 vision.py:18-21)."""
-    half = values.shape[-1] // 2
-    first, second = values[..., :half], values[..., half:]
-    return values * cos + jnp.concatenate([-second, first], axis=-1) * sin
 
 
 _PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {

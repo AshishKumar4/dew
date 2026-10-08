@@ -10,116 +10,15 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
-from jax.typing import DTypeLike
 
 from dew import records
 from dew.nn.activations import gelu_exact
-from dew.nn.attention import LayerNorm, scaled_dot_product_attention
-from dew.nn.precision import at_least_fp32
-from dew.nn.rope import inverse_frequencies
-from dew.nn.text_encoders import MLP, _encoder_layer_path
+from dew.nn.attention import LayerNorm
+from dew.nn.inputs import AttentionMetadata
+from dew.nn.text_encoders import _encoder_layer_path, clip_layer
 from dew.registry import Record
 
 from .common import ProjectorBase, TowerBase, TowerGeometry, _image_size, _vision_section
-
-
-def _llama4_vision_tables(grid: int, head_dim: int, theta: float, *,
-                          dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
-    """The complex rotary tables of the Llama 4 vision attention, as cos/sin.
-
-    Positions are the patch grid in row-major order with the class token last
-    (modeling_llama4.py, Llama4VisionRotaryEmbedding._compute_freqs_ci): the
-    x angles cover the first half of each head and the y angles the second,
-    each pair sharing one angle, and the class row is the identity. Writing
-    the doubled values out directly reads the same angles the reference's
-    interleave and stride do.
-    """
-    positions = jnp.arange(grid * grid + 1, dtype=jnp.int32)
-    kinds = jnp.where(positions == grid * grid, -2, positions)
-    safe = jnp.where(kinds < 0, 0, kinds)
-    freq_dim = head_dim // 2
-    inv_freq = inverse_frequencies(theta, freq_dim, dtype=dtype)
-    angles = jnp.concatenate([(safe % grid + 1)[:, None] * inv_freq[None, :],
-                              (safe // grid + 1)[:, None] * inv_freq[None, :]], axis=1)
-    angles = jnp.where((kinds < 0)[:, None], 0.0, angles)
-    return jnp.cos(angles), jnp.sin(angles)
-
-
-def _llama4_vision_rope(values: jax.Array, cos: jax.Array, sin: jax.Array) -> jax.Array:
-    """The complex rotation on real pairs, one shared angle per pair."""
-    pairs = values.reshape(*values.shape[:-1], -1, 2)
-    first, second = pairs[..., 0], pairs[..., 1]
-    table, turn = cos[:, None, :], sin[:, None, :]
-    rotated = jnp.stack([first * table - second * turn,
-                         first * turn + second * table], axis=-1)
-    return rotated.reshape(values.shape)
-
-
-class Llama4VisionAttention(nn.Module):
-    """Biased multi-head attention with the grid rotary on queries and keys."""
-
-    hidden_size: int
-    num_heads: int
-    grid: int
-    rope_theta: float = 10000.0
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(nn.Dense, use_bias=True,
-                                  dtype=self.dtype, precision=self.precision)
-        self.q_proj = dense(self.hidden_size, name="q_proj")
-        self.k_proj = dense(self.hidden_size, name="k_proj")
-        self.v_proj = dense(self.hidden_size, name="v_proj")
-        self.o_proj = dense(self.hidden_size, name="o_proj")
-
-    def __call__(self, hidden_states) -> jax.Array:
-        batch, length, _ = hidden_states.shape
-        head_dim = self.hidden_size // self.num_heads
-        heads = (batch, length, self.num_heads, head_dim)
-        query = self.q_proj(hidden_states).reshape(heads)
-        key = self.k_proj(hidden_states).reshape(heads)
-        value = self.v_proj(hidden_states).reshape(heads)
-        cos, sin = _llama4_vision_tables(self.grid, head_dim, self.rope_theta,
-                                         dtype=at_least_fp32(query.dtype))
-        query = _llama4_vision_rope(query, cos, sin)
-        key = _llama4_vision_rope(key, cos, sin)
-        attended = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision)
-        return self.o_proj(attended.reshape(batch, length, self.hidden_size))
-
-
-class Llama4VisionEncoderLayer(nn.Module):
-    """Pre-norm attention over pre-norm MLP, both residual."""
-
-    hidden_size: int
-    num_heads: int
-    intermediate_size: int
-    grid: int
-    rope_theta: float = 10000.0
-    layer_norm_eps: float = 1e-5
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
-                                 dtype=self.dtype)
-        self.input_layernorm = norm(name="input_layernorm")
-        self.self_attn = Llama4VisionAttention(
-            self.hidden_size, self.num_heads, self.grid, self.rope_theta,
-            dtype=self.dtype, precision=self.precision, name="self_attn")
-        self.post_attention_layernorm = norm(name="post_attention_layernorm")
-        self.mlp = MLP(self.hidden_size, self.intermediate_size,
-                       activation="gelu", dtype=self.dtype,
-                       precision=self.precision, name="mlp")
-
-    def __call__(self, hidden_states):
-        residual = hidden_states
-        hidden_states = self.self_attn(self.input_layernorm(hidden_states))
-        hidden_states = residual + hidden_states
-        residual = hidden_states
-        hidden_states = self.mlp(self.post_attention_layernorm(hidden_states))
-        return residual + hidden_states
 
 
 def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
@@ -216,11 +115,15 @@ class Llama4VisionTransformer(nn.Module):
         norm = functools.partial(LayerNorm, epsilon=cfg.layer_norm_eps,
                                  dtype=self.dtype)
         self.layernorm_pre = norm(name="layernorm_pre")
+        # The grid's rotary turns adjacent pairs, the x angles over the first
+        # half of each head and the y angles over the second
+        # (modeling_llama4.py, Llama4VisionRotaryEmbedding).
+        side = cfg.hidden_size // cfg.num_heads // 2
         self.layers = [
-            Llama4VisionEncoderLayer(
-                cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, grid,
-                cfg.rope_theta, layer_norm_eps=cfg.layer_norm_eps,
-                dtype=self.dtype, precision=self.precision, name=f"layers_{index}")
+            clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, grid * grid + 1,
+                       activation="gelu", eps=cfg.layer_norm_eps, rotary_axes=(side, side),
+                       rotary_pairs="adjacent", rope_theta=cfg.rope_theta, dtype=self.dtype,
+                       precision=self.precision, name=f"layers_{index}")
             for index in range(cfg.num_layers)]
         self.layernorm_post = norm(name="layernorm_post")
         self.vision_adapter = Llama4VisionAdapter(
@@ -247,8 +150,15 @@ class Llama4VisionTransformer(nn.Module):
         hidden_states = jnp.concatenate([hidden_states, class_token], axis=1)
         hidden_states = hidden_states + self.positional_embedding.astype(hidden_states.dtype)
         hidden_states = self.layernorm_pre(hidden_states)
+        # Each patch sits at its column and row plus one, row-major, and the
+        # class token last at the origin, which turns by nothing
+        # (Llama4VisionRotaryEmbedding._compute_freqs_ci).
+        index = jnp.arange(grid * grid)
+        positions = jnp.concatenate([jnp.stack([index % grid + 1, index // grid + 1], axis=-1),
+                                     jnp.zeros((1, 2), index.dtype)])
+        metadata = AttentionMetadata(rotary_positions=positions[None])
         for layer in self.layers:
-            hidden_states = layer(hidden_states)
+            hidden_states = layer(hidden_states, attention_metadata=metadata)
         hidden_states = self.layernorm_post(hidden_states)[:, :-1, :]
         return self.vision_adapter(hidden_states)
 
@@ -304,6 +214,9 @@ class Llama4Projector(ProjectorBase):
         return Llama4ProjectorModule(text_width=self.text_width)
 
 
+# Llama 4 names its layers' norms and maps as the decoder block does.
+_LAYER_NORMS = {name: name for name in ("input_layernorm", "post_attention_layernorm")}
+_LAYER_PROJECTIONS = {name: name for name in ("q_proj", "k_proj", "v_proj", "o_proj")}
 _LLAMA4_VISION_TENSORS = {
     "patch_embedding.linear.weight": ("patch_embedding", "kernel"),
     "class_embedding": ("class_embedding",),
@@ -320,8 +233,7 @@ _LLAMA4_VISION_TENSORS = {
 def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Llama 4 vision tensor name into its path in a trunk tree."""
     path = _LLAMA4_VISION_TENSORS.get(hf_name) or _encoder_layer_path(
-        hf_name.split("."), "model", ("input_layernorm", "post_attention_layernorm"),
-        ("q_proj", "k_proj", "v_proj", "o_proj"))
+        hf_name.split("."), "model", _LAYER_NORMS, _LAYER_PROJECTIONS)
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

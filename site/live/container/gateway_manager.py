@@ -103,7 +103,16 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "MALLOC_ARENA_MAX": "2",
             **({"DEW_GUEST_TRACE": "1"} if os.environ.get("DEW_GUEST_TRACE") == "1" else {}),
         }
-        isolated = ["unshare", "--mount", "--pid", "--fork", "--kill-child", "--mount-proc",
+        if self.kernel_name == "dew-train":
+            # Dew runs in the context, reading the model and the corpus prepared read-only
+            # under /opt/train (warm-managed.py).
+            env.update({"DEW_GUEST_PROFILE": "train", "HF_HOME": "/opt/train/hf",
+                        "XDG_CACHE_HOME": "/opt/train/cache"})
+        # A privileged write sets the OOM score's floor as well as the score, so the guest
+        # cannot lower itself back to the gateway's -1000 (start-shared.sh) and make a trusted
+        # process the OOM killer's choice; the kernel then picks the largest guest.
+        isolated = ["sh", "-c", 'echo 1000 > /proc/self/oom_score_adj && exec "$@"', "oom",
+                    "unshare", "--mount", "--pid", "--fork", "--kill-child", "--mount-proc",
                     "--ipc", "--uts", "--net", *limited]
         await super()._async_launch_kernel(isolated, **{**kwargs, "env": env, "cwd": "/"})
 

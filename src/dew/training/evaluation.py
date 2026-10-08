@@ -11,8 +11,8 @@ from dataclasses import dataclass, replace
 from typing import Any
 
 import jax
-import jax.numpy as jnp
 import numpy as np
+from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 
 from dew.artifacts import Artifact, Artifacts
@@ -242,44 +242,35 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
 
         agreed("iterator construction", open_source)
         assert iterator is not None and mesh is not None
+        loss_variables = (context.ema if context.ema is not None and not objective._ema_is_reference
+                          else variables)
         while True:
-            batch, available = _next_batch(iterator, scored)
+            held, available = _next_batch(iterator, scored)
             if not available:
                 break
-            batch, last = _covered(batch, last, scored)
-            batch = _placed_batch(mesh, batch, scored)
-            records += int(jax.device_get(jnp.sum(batch[VALID_ROWS])))
+            held, last, batch = _covered(mesh, held, last, scored)
+            # This rank's own real rows, counted on the host; the pool's count
+            # is summed once after the split.
+            records += int(np.sum(held[VALID_ROWS]))
             produced = None
             if metrics or loss:
                 # The objective scores under the mesh, as the step trains
                 # under it: the model's placements and its sequence and stage
                 # splits read it. A preview decodes, which neither split does.
                 with jax.set_mesh(mesh):
-                    if loss:
-                        assert batch is not None
-                        loss_batch = batch
-                        loss_variables = (
-                            context.ema
-                            if context.ema is not None and not objective._ema_is_reference
-                            else variables
-                        )
-                        statistics = agreed(
-                            f"validation loss batch {scored}",
-                            lambda loss_variables=loss_variables, loss_batch=loss_batch, scored=scored: (
-                                objective._validation_loss(
-                                loss_variables,
-                                loss_batch,
-                                replace(context, key=_folded(score_key, scored)),
-                                )
-                            ),
-                        )
-                        statistics = collective_host(statistics, phase=f"validation loss batch {scored}")
+                    statistics, produced = agreed(
+                        f"scoring batch {scored}",
+                        lambda batch=batch, scored=scored: _dispatched(
+                            objective, variables, loss_variables, batch, context, scored,
+                            loss=loss, evaluate=bool(metrics), score_key=score_key))
+                    if statistics is not None:
+                        # The statistics stay on the devices, summed there in
+                        # batch order, and come home once after the split.
                         loss_stats = statistics if loss_stats is None else jax.tree.map(
                             lambda total, value: total + value, loss_stats, statistics)
                     if metrics:
-                        produced = _scored_batch(objective, variables, batch, context, scored,
-                                                 metrics=metrics, summaries=summaries,
-                                                 score_key=score_key, root=root)
+                        produced = _merged(produced, batch, held, scored, metrics=metrics,
+                                           summaries=summaries, root=root)
             if scored == 0 and preview_enabled:
                 previews = _previewed(objective, variables, batch, context,
                                       preview_key=preview_key, scored=produced, root=root)
@@ -287,8 +278,15 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
             scored += 1
             if not metrics and not loss:
                 break
+        # Processes on one data share (a replicated stage or sequence axis)
+        # read the same rows, so the pool counts each share once.
+        shares = np.asarray(multihost_utils.process_allgather(
+            np.asarray([DataPartition.of(mesh).index, records], np.int64))).reshape(-1, 2)
+        records = sum({int(index): int(count) for index, count in shares}.values())
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
+            if loss_stats is not None:
+                loss_stats = collective_host(loss_stats, phase="validation loss")
             if loss_stats is not None and f'{split}/loss' not in scores:
                 value, valid = jax.device_get(objective._validation_reduction(jax.device_put(loss_stats)))
                 if not bool(valid) or not np.isfinite(float(value)):
@@ -319,30 +317,29 @@ def _next_batch(iterator: Iterator, index: int) -> tuple[Batch | None, int]:
     return batch, available
 
 
-def _covered(batch: Batch | None, last: Batch | None, index: int) -> tuple[Batch, Batch]:
-    """The batch this rank scores at `index`, and the one it keeps to cover the next.
+def _covered(mesh: Mesh, batch: Batch | None, last: Batch | None, index: int
+             ) -> tuple[Batch, Batch, Batch]:
+    """The batch this rank scores at `index`, the one it keeps to cover the
+    next, and the first placed on the mesh, under one agreement.
 
     Its own batch carries `VALID_ROWS`, every row real where the reader
     marked none. A rank whose share has run out while a peer's has not
     scores a copy of its last batch with every row a repeat.
     """
-    def cover() -> tuple[Batch, Batch]:
+    def cover() -> tuple[Batch, Batch, Batch]:
         if batch is not None:
             held = batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
-            return held, held
-        if last is None:
+            kept = held
+        elif last is None:
             raise ValueError(
                 f"process {jax.process_index()}'s reader yields no batch while a peer's yields one; "
                 "Dew's readers give an empty share one batch whose rows are all repeats "
                 "(`VALID_ROWS` False), and a reader of your own has to as well")
-        return {**last, VALID_ROWS: np.zeros(rows_of(last), bool)}, last
+        else:
+            held, kept = {**last, VALID_ROWS: np.zeros(rows_of(last), bool)}, last
+        return held, kept, shard_batch(mesh, held)
 
-    return agreed(f"batch cover {index}", cover)
-
-
-def _placed_batch(mesh: Mesh, batch: Batch, index: int) -> Batch:
-    """Shard one validation batch onto the mesh."""
-    return agreed(f"batch placement {index}", lambda: shard_batch(mesh, batch))
+    return agreed(f"batch cover and placement {index}", cover)
 
 
 def _cut(leaf, keep: np.ndarray):
@@ -366,30 +363,52 @@ def _real_batch(batch: Batch, keep: np.ndarray) -> Batch:
                         {name: leaf for name, leaf in batch.items() if name != VALID_ROWS})
 
 
-def _scored_batch(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,
-                  context: Step, index: int, *, metrics: Sequence[Metric],
-                  summaries: _Accumulators, score_key: jax.Array, root: bool):
-    """Score one batch into `summaries`, returning what the objective produced.
+def _dispatched(objective: Objective[Loss, Effects], variables: Variables, loss_variables: Variables,
+                batch: Batch, context: Step, index: int, *, loss: bool, evaluate: bool,
+                score_key: jax.Array):
+    """One batch's device work, dispatched under one key: the validation-loss
+    statistics where `loss`, and what the objective produces where `evaluate`."""
+    keyed = replace(context, key=_folded(score_key, index))
+    statistics = objective._validation_loss(loss_variables, batch, keyed) if loss else None
+    return statistics, objective.evaluate(variables, batch, keyed) if evaluate else None
 
-    The report and the batch come home together, so each metric on root
-    reads hosted arrays. Every rank reaches every metric's agreement,
-    whether or not it holds an accumulator.
+
+def _as_placed(leaf) -> np.ndarray:
+    """`leaf` as placing it and reading it back gives it: in JAX's canonical
+    dtype, where float64 is float32 unless x64 is on."""
+    host = np.asarray(jax.device_get(leaf))
+    return host.astype(jax.dtypes.canonicalize_dtype(host.dtype), copy=False)
+
+
+def _merged(produced, batch: Batch, held: Batch, index: int, *, metrics: Sequence[Metric],
+            summaries: _Accumulators, root: bool):
+    """Merge one batch into every metric's accumulator on root, returning what
+    the objective produced, hosted.
+
+    The artifacts come home, and so does the batch the metrics read: on one
+    process that is the host batch it was placed from, as the devices hold
+    it, so nothing copies back; a batch spread over processes comes home
+    with the artifacts. One agreement covers every metric, so a failure on
+    root stops its peers there.
     """
-    produced = agreed(f"scoring batch {index}", lambda: objective.evaluate(
-        variables, batch, replace(context, key=_folded(score_key, index))))
-    produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
-    # The metrics read the real rows alone, so a repeat filling out the
-    # split's last batch scores nothing.
-    keep = np.asarray(home[VALID_ROWS], bool)
-    artifacts = tuple(_real_artifact(artifact, keep) for artifact in _artifacts(produced))
-    home = _real_batch(home, keep)
-    for metric in metrics:
-        def merge(metric=metric) -> None:
-            if not root:
-                return
-            summaries.add(metric, metric(_pick(artifacts, metric.reads), home))
+    if all(leaf.is_fully_addressable for leaf in jax.tree.leaves(batch) if isinstance(leaf, jax.Array)):
+        produced = collective_host(produced, phase=f"scoring batch {index}")
+        home = jax.tree.map(_as_placed, held)
+    else:
+        produced, home = collective_host((produced, batch), phase=f"scoring batch {index}")
 
-        agreed(f"metric {metric.name} batch {index}", merge)
+    def merge() -> None:
+        if not root:
+            return
+        # The metrics read the real rows alone, so a repeat filling out the
+        # split's last batch scores nothing.
+        keep = np.asarray(home[VALID_ROWS], bool)
+        artifacts = tuple(_real_artifact(artifact, keep) for artifact in _artifacts(produced))
+        real = _real_batch(home, keep)
+        for metric in metrics:
+            summaries.add(metric, metric(_pick(artifacts, metric.reads), real))
+
+    agreed(f"metrics batch {index}", merge)
     return produced
 
 

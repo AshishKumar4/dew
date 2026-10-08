@@ -11,7 +11,18 @@ import errno
 import resource
 from typing import ClassVar
 
-MEMORY_BYTES = 768 * 1024 * 1024
+GIB = 1024 * 1024 * 1024
+INFINITY = resource.RLIM_INFINITY
+# A page cell's context only sends requests to the model process, in a small
+# address space. A training context runs Dew itself, and JAX reserves more
+# address space than it ever touches (11 GiB for the 3.8 GiB fine-tune cell),
+# so its bound is on writable memory instead; the bridge runs one per host.
+PROFILES = {
+    "cell": {"address_space": GIB * 3 // 4, "data": INFINITY, "cpu_seconds": 10, "processes": 32,
+             "files": 128},
+    "train": {"address_space": INFINITY, "data": 6 * GIB, "cpu_seconds": 600, "processes": 256,
+              "files": 1024},
+}
 
 
 class Comparison(ctypes.Structure):
@@ -19,14 +30,16 @@ class Comparison(ctypes.Structure):
                 ("first", ctypes.c_uint64), ("second", ctypes.c_uint64)]
 
 
-def install(cpu_seconds=10):
-    resource.setrlimit(resource.RLIMIT_AS, (MEMORY_BYTES, MEMORY_BYTES))
+def install(profile="cell"):
+    limits = PROFILES[profile]
+    resource.setrlimit(resource.RLIMIT_AS, (limits["address_space"], limits["address_space"]))
+    resource.setrlimit(resource.RLIMIT_DATA, (limits["data"], limits["data"]))
     resource.setrlimit(resource.RLIMIT_FSIZE, (32 * 1024 * 1024, 32 * 1024 * 1024))
     # Stock ipykernel creates more than 64 descriptors while starting its shell channels.
-    resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
-    resource.setrlimit(resource.RLIMIT_NPROC, (32, 32))
+    resource.setrlimit(resource.RLIMIT_NOFILE, (limits["files"], limits["files"]))
+    resource.setrlimit(resource.RLIMIT_NPROC, (limits["processes"], limits["processes"]))
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-    resource.setrlimit(resource.RLIMIT_CPU, (cpu_seconds, cpu_seconds + 1))
+    resource.setrlimit(resource.RLIMIT_CPU, (limits["cpu_seconds"], limits["cpu_seconds"] + 1))
     lib = ctypes.CDLL("libseccomp.so.2", use_errno=True)
     lib.seccomp_init.argtypes = [ctypes.c_uint32]
     lib.seccomp_init.restype = ctypes.c_void_p

@@ -1437,8 +1437,10 @@ class Trainer(Generic[Loss, Effects]):
         logged as `val/<name>`.
 
         Every `checkpoint_every` steps, and at the end, the state and the data
-        position are written. Every `checkpoints.local_every` steps they are also
-        written to the local directory.
+        position are written; a duration is checked at each `log_every` step, so
+        they are written at the first log step after that much time. Every
+        `checkpoints.local_every` steps they are also written to the local
+        directory.
 
         A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops the run
         at the next step every process agrees on. That step's state and data position
@@ -1691,10 +1693,15 @@ class Trainer(Generic[Loss, Effects]):
             self._log_interval(current, loss, aux, accepted, state, interval)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
-            elapsed = time.perf_counter() - run.last_checkpoint
-            due = np.asarray(elapsed >= plan.checkpoint_every.total_seconds())
-            checkpoint_due = bool(due) if jax.process_count() == 1 else bool(
-                np.asarray(multihost_utils.process_allgather(due)).any())
+            # The clock is read at the log interval, where the step is already
+            # waited on, so a pool's processes agree on it there rather than
+            # gathering behind every step.
+            checkpoint_due = False
+            if current % plan.log_every == 0:
+                elapsed = time.perf_counter() - run.last_checkpoint
+                due = np.asarray(elapsed >= plan.checkpoint_every.total_seconds())
+                checkpoint_due = bool(due) if jax.process_count() == 1 else bool(
+                    np.asarray(multihost_utils.process_allgather(due)).any())
         else:
             checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
         evaluation_due = bool(plan.eval_every and current % plan.eval_every == 0)

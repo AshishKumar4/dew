@@ -11,8 +11,8 @@ from typing import Literal, Protocol
 import numpy as np
 
 from dew import records
-from dew.diffusion.schedules.flow import _token_mu
-from dew.diffusion.schedules.source_grids import _choice, published_betas
+from dew.diffusion.schedules.flow import token_mu
+from dew.diffusion.schedules.source_grids import named_choice, published_betas
 from dew.diffusion.transforms import (
     ConsistencyBoundary,
     DirectPredictionTransform,
@@ -197,7 +197,7 @@ _KARRAS_ROUNDS = ("DPMSolverSinglestep", "DEISMultistep", "UniPCMultistep",
                   "KDPM2Discrete", "KDPM2AncestralDiscrete")
 
 @dataclass(frozen=True)
-class _Flow:
+class FlowShift:
     """Holds a rectified-flow file's shift controls and the shift they name.
 
     `shift` alone is the static form. With `dynamic` the shift follows the
@@ -221,7 +221,7 @@ class _Flow:
         mu is interpolated linearly in the token count and is not
         exponentiated here.
         """
-        return _token_mu(tokens, self.base_tokens, self.max_tokens, self.base_shift, self.max_shift)
+        return token_mu(tokens, self.base_tokens, self.max_tokens, self.base_shift, self.max_shift)
 
     def base(self, tokens: int | None, mu: float | None = None) -> float:
         """The shift this file names at `tokens` latent tokens, or at the
@@ -243,7 +243,7 @@ class _Flow:
         return math.exp(mu) if self.kind == "exponential" else mu
 
 @dataclass(frozen=True)
-class _Policy:
+class SourcePolicy:
     """One source class's controls, resolved into the numbers its grid and its
     solver need."""
 
@@ -270,13 +270,14 @@ class _Policy:
     distilled: bool
     original_steps: int
     timestep_scaling: float
-    flow: _Flow | None
+    flow: FlowShift | None
     flow_shift: float | None
     """A log-SNR class's `flow_shift` under `use_flow_sigmas`: its grid is then
     the shifted rectified-flow path rather than the beta table's."""
 
 
-def resolve_config(config: Mapping[str, object]) -> tuple[np.ndarray, PredictionTransform, _Policy, Solver]:
+def resolve_config(config: Mapping[str, object]
+                   ) -> tuple[np.ndarray, PredictionTransform, SourcePolicy, Solver]:
     """Resolve the published class and its declared controls once, before any grid is built."""
     name = config.get("_class_name")
     if not isinstance(name, str):
@@ -305,7 +306,7 @@ def resolve_config(config: Mapping[str, object]) -> tuple[np.ndarray, Prediction
         raise ValueError(f"Native source scheduling reconstructs use_flow_sigmas for "
                          f"{' and '.join(_FLOW_SIGMA_CLASSES)}, not {kind}")
     prediction = ("flow_prediction" if source.family == "flow"
-                  else _choice(value("prediction_type"), "prediction_type",
+                  else named_choice(value("prediction_type"), "prediction_type",
                                ("flow_prediction",) if flow_sigmas else source.predictions))
     if kind == "PNDM" and prediction == "v_prediction":
         raise ValueError("Published PNDM v-prediction requires velocity-domain history; "
@@ -333,7 +334,7 @@ def _algorithm(kind: str, family: str, declared: Mapping[str, JSON],
         return "dpmsolver++"
     algorithm = str(value("algorithm_type"))
     if kind == "DEISMultistep":
-        _choice("deis" if algorithm in ("deis", "dpmsolver", "dpmsolver++") else algorithm,
+        named_choice("deis" if algorithm in ("deis", "dpmsolver", "dpmsolver++") else algorithm,
                 "algorithm_type", ("deis",))
         return "dpmsolver++"
     if algorithm == "deis":
@@ -342,7 +343,7 @@ def _algorithm(kind: str, family: str, declared: Mapping[str, JSON],
                                       "sde-dpmsolver")
     if family == "edm":
         allowed = ("dpmsolver++", "sde-dpmsolver++")
-    return _choice(algorithm, "algorithm_type", allowed)
+    return named_choice(algorithm, "algorithm_type", allowed)
 
 
 def _solver_type[SolverT: str](kind: str, value: Control,
@@ -351,12 +352,12 @@ def _solver_type[SolverT: str](kind: str, value: Control,
     class this is being built for takes."""
     solver_type = str(value("solver_type"))
     if kind == "UniPCMultistep":
-        return _choice("bh2" if solver_type in ("midpoint", "heun", "logrho") else solver_type,
+        return named_choice("bh2" if solver_type in ("midpoint", "heun", "logrho") else solver_type,
                        "solver_type", allowed)
     if kind == "DEISMultistep":
-        return _choice("logrho" if solver_type in ("midpoint", "heun", "bh1", "bh2")
+        return named_choice("logrho" if solver_type in ("midpoint", "heun", "bh1", "bh2")
                        else solver_type, "solver_type", allowed)
-    return _choice("midpoint" if solver_type in ("logrho", "bh1", "bh2") else solver_type,
+    return named_choice("midpoint" if solver_type in ("logrho", "bh1", "bh2") else solver_type,
                    "solver_type", allowed)
 
 
@@ -385,10 +386,10 @@ def _x0_limit(kind: str, declared: Mapping[str, JSON], value: Control,
     return None, None
 
 
-def _flow_controls(value: Control) -> _Flow:
+def _flow_controls(value: Control) -> FlowShift:
     """A flow file's shift controls, checked and turned into numbers."""
     terminal = value("shift_terminal")
-    return _Flow(
+    return FlowShift(
         shift=records.number(value("shift", 1.0), "shift"),
         dynamic=records.boolean(value("use_dynamic_shifting", absent=False), "use_dynamic_shifting"),
         base_shift=records.number(value("base_shift", 0.5), "base_shift"),
@@ -396,7 +397,7 @@ def _flow_controls(value: Control) -> _Flow:
         base_tokens=records.integer(value("base_image_seq_len", 256), "base_image_seq_len"),
         max_tokens=records.integer(value("max_image_seq_len", 4096), "max_image_seq_len"),
         terminal=None if terminal is None else records.number(terminal, "shift_terminal"),
-        kind=_choice(value("time_shift_type", "exponential"), "time_shift_type",
+        kind=named_choice(value("time_shift_type", "exponential"), "time_shift_type",
                      ("exponential", "linear")))
 
 
@@ -411,7 +412,7 @@ def _sigma_transform(family: str, declared: Mapping[str, JSON], value: Control) 
     if len(active) > 1:
         raise ValueError("Only one of the Karras, exponential and beta sigma grids can be used")
     if family == "edm":
-        return _choice(value("sigma_schedule"), "sigma_schedule", _SIGMA_SCHEDULES)
+        return named_choice(value("sigma_schedule"), "sigma_schedule", _SIGMA_SCHEDULES)
     return active[0] if active else "none"
 
 
@@ -426,7 +427,7 @@ def _final_sigma(family: str, declared: Mapping[str, JSON], value: Control,
     terminal: Terminal = "zero" if family in ("sigma", "stage") else "sigma_min"
     if "final_sigmas_type" not in declared:
         return terminal
-    terminal = _choice(value("final_sigmas_type"), "final_sigmas_type", _TERMINALS)
+    terminal = named_choice(value("final_sigmas_type"), "final_sigmas_type", _TERMINALS)
     if terminal == "zero" and algorithm not in ("dpmsolver++", "sde-dpmsolver++"):
         raise ValueError(f"final_sigmas_type=zero is not supported for algorithm_type "
                          f"{algorithm}, as the source scheduler refuses")
@@ -440,7 +441,7 @@ def _variance_type(kind: str, value: Control) -> Variance:
     and is refused rather than approximated.
     """
     if kind == "DDPM":
-        mode = _choice(value("variance_type"), "variance_type",
+        mode = named_choice(value("variance_type"), "variance_type",
                        ("fixed_small", "fixed_small_log", "fixed_large"))
         return "large" if mode == "fixed_large" else "small"
     if value("variance_type") in ("learned", "learned_range"):
@@ -494,13 +495,13 @@ def _flow_shift(kind: str, value: Control, transform: Transform,
 
 
 def _resolve(kind: str, source: _Class, value: Control,
-             betas: np.ndarray) -> tuple[_Policy, Solver]:
+             betas: np.ndarray) -> tuple[SourcePolicy, Solver]:
     """Every control the class declares, checked and turned into a number."""
     declared, family = source.fields, source.family
     train_steps = records.integer(value("num_train_timesteps"), "num_train_timesteps")
     transform = _sigma_transform(family, declared, value)
     algorithm = _algorithm(kind, family, declared, value)
-    spacing: Spacing = _choice(value("timestep_spacing", "linspace"), "timestep_spacing",
+    spacing: Spacing = named_choice(value("timestep_spacing", "linspace"), "timestep_spacing",
                                _SPACINGS)
     terminal = _final_sigma(family, declared, value, algorithm)
     variance = _variance_type(kind, value)
@@ -518,7 +519,7 @@ def _resolve(kind: str, source: _Class, value: Control,
     order = records.integer(value("solver_order", 2), "solver_order")
     flow = _flow_controls(value) if family == "flow" else None
     flow_shift = _flow_shift(kind, value, transform, algorithm)
-    policy = _Policy(
+    policy = SourcePolicy(
         kind=kind, family=family, train_steps=train_steps,
         spacing=spacing,
         offset=records.integer(value("steps_offset", 0), "steps_offset"),
@@ -596,7 +597,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
         # reconstruction reads the value the source would walk with.
         return DPMSolverSinglestep(
             # The class's own `step` has no noise term for the SDE algorithm.
-            order, _choice(algorithm, "algorithm_type",
+            order, named_choice(algorithm, "algorithm_type",
                            ("dpmsolver++", "dpmsolver", "sde-dpmsolver++")),
             _solver_type(kind, value, ("midpoint", "heun")),
             lower_order_final or terminal == "zero")
@@ -606,7 +607,7 @@ def _build_solver(kind: str, value: Control, order: int, algorithm: Algorithm,
                               records.boolean(value("euler_at_final"), "euler_at_final"))
 
 
-def _prediction_transform(policy: _Policy, prediction: str) -> PredictionTransform:
+def _prediction_transform(policy: SourcePolicy, prediction: str) -> PredictionTransform:
     """What the model predicts on this class's grid, with the class's own input
     scaling and its own limit on x_0."""
     if policy.family == "flow":

@@ -54,6 +54,20 @@ UDIT_MOVED = {"time_embed": ("conditioning", "time_embed"),
               "final_norm": ("output", "final_norm"), "final_proj": ("output", "final_proj")}
 DIT_POOLING = {"text_pooling": "all"}
 PROJECTIONS = {"project_in_conv": "project_in", "project_out_conv": "project_out"}
+MMDITS = ("SimpleMMDiT", "HierarchicalMMDiT")
+# FlaxDiff's MM-DiT block module by module, as Dew's `DoubleStreamBlock`
+# names it: one joint attention holds both streams' projections and norms.
+MMDIT_MODULES = {"img_ada": ("norm1",), "txt_ada": ("norm1_context",),
+                 "img_to_q": ("attn", "to_q"), "img_to_k": ("attn", "to_k"), "img_to_v": ("attn", "to_v"),
+                 "txt_to_q": ("attn", "add_q_proj"), "txt_to_k": ("attn", "add_k_proj"),
+                 "txt_to_v": ("attn", "add_v_proj"), "img_out": ("attn", "to_out_0"),
+                 "txt_out": ("attn", "to_add_out"), "img_q_norm": ("attn", "norm_q"),
+                 "img_k_norm": ("attn", "norm_k"), "txt_q_norm": ("attn", "norm_added_q"),
+                 "txt_k_norm": ("attn", "norm_added_k"), "img_mlp": ("ff",), "txt_mlp": ("ff_context",)}
+MMDIT_LAYERS = {"ada_proj": "linear", "layers_0": "net_0_proj", "layers_2": "net_2"}
+# FlaxDiff's six modulation pieces (scale_mlp, shift_mlp, gate_mlp, scale,
+# shift, gate) in SD3's order (shift, scale, gate, shift_mlp, scale_mlp, gate_mlp).
+MODULATION_ORDER = (4, 3, 5, 1, 0, 2)
 
 
 @pytest.fixture(scope="module")
@@ -80,11 +94,19 @@ def dew_model(cls: str, config: dict):
     return MODELS[cls](**fields, attention_impl="reference")
 
 
+def mmdit_block(cls: str, name: str) -> bool:
+    """Whether a FlaxDiff parameter is one of an MM-DiT block's."""
+    return cls in MMDITS and "_block_" in name.split("/")[0]
+
+
 def dew_path(cls: str, name: str) -> tuple[str, ...]:
     """The Dew parameter a FlaxDiff parameter path lands on."""
     path = tuple(name.split("/"))
     if cls == "SimpleUDiT" and path[0] in UDIT_MOVED:
         return (*UDIT_MOVED[path[0]], *path[1:])
+    if mmdit_block(cls, name):
+        block, module, *rest = path
+        return (block, *MMDIT_MODULES[module], *(MMDIT_LAYERS.get(part, part) for part in rest))
     if cls in UNETS:
         # FlaxDiff's ConvLayer wraps the convolution Dew's Conv is, and its
         # middle stage projects with a 1x1 convolution where Dew's is dense.
@@ -93,15 +115,33 @@ def dew_path(cls: str, name: str) -> tuple[str, ...]:
     return path
 
 
-def to_dew(name: str, value: np.ndarray) -> np.ndarray:
+def to_dew(cls: str, name: str, value: np.ndarray) -> np.ndarray:
     """A FlaxDiff parameter in Dew's layout: a 1x1 convolution's kernel as
-    the dense kernel it is."""
-    return value[0, 0] if PROJECTIONS.keys() & set(name.split("/")) else value
+    the dense kernel it is, an MM-DiT's per-head projections flat, and its
+    modulation pieces in SD3's order."""
+    if PROJECTIONS.keys() & set(name.split("/")):
+        return value[0, 0]
+    if not mmdit_block(cls, name):
+        return value
+    module, leaf = name.split("/")[1], name.split("/")[-1]
+    if module.endswith("_ada"):
+        pieces = np.split(value, 6, axis=-1)
+        return np.concatenate([pieces[index] for index in MODULATION_ORDER], axis=-1)
+    if module[4:] in ("to_q", "to_k", "to_v"):
+        return value.reshape(*value.shape[:-2], -1)
+    if module[4:] == "out" and leaf == "kernel":
+        return value.reshape(-1, value.shape[-1])
+    return value
 
 
-def from_dew(name: str, value: np.ndarray) -> np.ndarray:
-    """The inverse of `to_dew`, for a Dew gradient."""
-    return value[None, None] if PROJECTIONS.keys() & set(name.split("/")) else value
+def from_dew(cls: str, name: str, value: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:
+    """The inverse of `to_dew` onto FlaxDiff's `shape`, for a Dew gradient."""
+    if PROJECTIONS.keys() & set(name.split("/")):
+        return value[None, None]
+    if mmdit_block(cls, name) and name.split("/")[1].endswith("_ada"):
+        pieces = np.split(value, 6, axis=-1)
+        return np.concatenate([pieces[MODULATION_ORDER.index(index)] for index in range(6)], axis=-1)
+    return value.reshape(shape)
 
 
 def fourier_path(cls: str) -> tuple[str, ...]:
@@ -148,8 +188,8 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
 
     prefix = f"{case}/param."
     names = sorted(name.removeprefix(prefix) for name in arrays if name.startswith(prefix))
-    params = nest({dew_path(cls, name): to_dew(name, part(f"param.{name}").view(ml_dtypes.bfloat16)
-                                               .astype(np.float32))
+    params = nest({dew_path(cls, name): to_dew(cls, name, part(f"param.{name}").view(ml_dtypes.bfloat16)
+                                                    .astype(np.float32))
                    for name in names})
     constants = nest({(*fourier_path(cls), "frequencies"): part("fourier_table")})
     model = dew_model(cls, config)
@@ -180,7 +220,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         grad_params, grad_image, grad_text = gradients
         native = [np.asarray(grad_image), np.asarray(grad_text)]
         for name in names:
-            value = from_dew(name, leaf(grad_params, dew_path(cls, name)))
+            value = from_dew(cls, name, leaf(grad_params, dew_path(cls, name)), part(f"param.{name}").shape)
             native.append(value if back is None else unet_channels(name, value, back))
         return np.concatenate([np.ravel(value) for value in native])
 
@@ -195,7 +235,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         output_distances, gradient_distances = [], []
         truth_gradients = source_order("fp64")
         for order in orders:
-            moved = nest({dew_path(cls, name): to_dew(name, unet_channels(
+            moved = nest({dew_path(cls, name): to_dew(cls, name, unet_channels(
                 name, part(f"param.{name}").view(ml_dtypes.bfloat16).astype(np.float32), order))
                           for name in names})
             output, gradients = run(moved)

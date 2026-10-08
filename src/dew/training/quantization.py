@@ -810,7 +810,7 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
 
 
 @runtime_checkable
-class _Quantized(Protocol):
+class QuantizedClass(Protocol):
     """Marks a module class `Quantization.apply` wrapped: Qwix's subclass of
     the model's own class, and the spec that wrapped it."""
 
@@ -818,7 +818,7 @@ class _Quantized(Protocol):
     _dew_quantization: ClassVar[Quantization]
 
 
-def _quantize[LossT, EffectsT](objective: Objective[LossT, EffectsT], spec: Quantization) -> None:
+def quantize_trunk[LossT, EffectsT](objective: Objective[LossT, EffectsT], spec: Quantization) -> None:
     """Quantize the trunk matmuls of the modules `objective` trains, in place.
 
     This is `RunConfig.train`'s step, not a user's. `Quantization.apply`

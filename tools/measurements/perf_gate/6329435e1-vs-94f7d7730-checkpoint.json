@@ -1,0 +1,57 @@
+{
+  "base": "base",
+  "head": "head",
+  "rows": [
+    {
+      "name": "image pipeline flowers 128px, device crop+flip+jitter",
+      "unit": "items/s",
+      "tool": "benchmark_image_pipeline.py"
+    },
+    {
+      "name": "checkpoint lm-dense save",
+      "unit": "ms",
+      "tool": ""
+    },
+    {
+      "name": "checkpoint lm-dense restore",
+      "unit": "ms",
+      "tool": ""
+    }
+  ],
+  "samples": {
+    "base": [
+      {
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: b-2/dew/tools/benchmark_image_pipeline.py --flowers exited 1: Traceback (most recent call last):\n  File \"/content/c30pg-promote-repair-aug/job-2/dew/tools/benchmark_image_pipeline.py\", line 34, in <module>\n    from dew.data import DataPartition, Loading, TFDSImages\nImportError: cannot import name 'TFDSImages' from 'dew.data' (/content/gate-base/src/dew/data/__init__.py). Did you mean: 'HFImages'?\n",
+        "checkpoint lm-dense save": 10518.07965599994,
+        "checkpoint lm-dense restore": 3478.95215199992
+      },
+      {
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: b-2/dew/tools/benchmark_image_pipeline.py --flowers exited 1: Traceback (most recent call last):\n  File \"/content/c30pg-promote-repair-aug/job-2/dew/tools/benchmark_image_pipeline.py\", line 34, in <module>\n    from dew.data import DataPartition, Loading, TFDSImages\nImportError: cannot import name 'TFDSImages' from 'dew.data' (/content/gate-base/src/dew/data/__init__.py). Did you mean: 'HFImages'?\n",
+        "checkpoint lm-dense save": 10519.720829999984,
+        "checkpoint lm-dense restore": 3566.0362170000326
+      },
+      {
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: b-2/dew/tools/benchmark_image_pipeline.py --flowers exited 1: Traceback (most recent call last):\n  File \"/content/c30pg-promote-repair-aug/job-2/dew/tools/benchmark_image_pipeline.py\", line 34, in <module>\n    from dew.data import DataPartition, Loading, TFDSImages\nImportError: cannot import name 'TFDSImages' from 'dew.data' (/content/gate-base/src/dew/data/__init__.py). Did you mean: 'HFImages'?\n",
+        "checkpoint lm-dense save": 10379.36089599998,
+        "checkpoint lm-dense restore": 3504.1290410000556
+      }
+    ],
+    "head": [
+      {
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6005.450440999994,
+        "checkpoint lm-dense restore": 2628.648931999919
+      },
+      {
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6212.51839699994,
+        "checkpoint lm-dense restore": 2654.145533000019
+      },
+      {
+        "image pipeline flowers 128px, device crop+flip+jitter": "not run: aise FileNotFoundError(f\"No prepared TFDS data at {path!r}. \" + PREPARE)\nFileNotFoundError: No prepared TFDS data at '/content/tfds/oxford_flowers102/missing'. Prepare it in a separate environment with download_and_prepare(file_format='array_record'), then pass the builder.data_dir it wrote as path=. Where TensorFlow is installed, leaving path unset has dew prepare it into its own TFDS directory.\n",
+        "checkpoint lm-dense save": 6336.657758999991,
+        "checkpoint lm-dense restore": 2637.66668400001
+      }
+    ]
+  }
+}

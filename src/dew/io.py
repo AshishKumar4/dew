@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import jax
 from etils import epath
 
-from dew.checkpoints import RUN_FILE, _frozen_entries, is_uri
+from dew.checkpoints import RUN_FILE, frozen_entries, is_uri
 from dew.training.tracker import WandbTracker
 
 REGISTRY = "wandb-registry-model"
@@ -47,7 +47,7 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     path = epath.Path(directory)
     run = path.parent
     spec = run / RUN_FILE
-    entries = _frozen_entries(directory)
+    entries = frozen_entries(directory)
     if is_uri(directory):
         artifact.add_reference(str(path), name=path.name)
         if spec.exists():

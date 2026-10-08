@@ -21,7 +21,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import gather_cache_rows
 from dew.sampling import Sampling, generate
-from dew.sampling.text import _operations, _prefill
+from dew.sampling.text import decode_ops, prefill_state
 
 VOCAB = 13
 
@@ -91,8 +91,8 @@ def test_gathered_cache_rows_decode_like_the_prefixes_they_came_from(kind):
     rows = jnp.asarray([2, 0, 2, 1], jnp.int32)
 
     def continue_from(cache_rows):
-        ops = _operations(model, params, 0, 0)
-        state, _ = _prefill(model, params, ModelInputs(prompts), ops)
+        ops = decode_ops(model, params, 0, 0)
+        state, _ = prefill_state(model, params, ModelInputs(prompts), ops)
         state = ops.reindex(state, cache_rows)
         drawn = []
         for _ in range(4):
@@ -117,7 +117,7 @@ def test_every_cache_leaf_moves_with_its_row(kind):
     model = MODELS[kind]()
     prompts = jnp.asarray([[1, 2, 3], [4, 5, 6], [7, 8, 9]], jnp.int32)
     params = model.init(jax.random.key(0), prompts[:1])
-    state, _ = _prefill(model, params, ModelInputs(prompts), _operations(model, params, 0, 0))
+    state, _ = prefill_state(model, params, ModelInputs(prompts), decode_ops(model, params, 0, 0))
     order = jnp.asarray([2, 0, 1], jnp.int32)
     inverse = jnp.asarray([1, 2, 0], jnp.int32)
 
