@@ -1,81 +1,79 @@
 {
   "model": "dewml/hybrid-dit-176m",
-  "revision": "403c4215556ac77826d69b3c3c7c30f9bb81ab9c",
-  "device": "a 4-vCPU Cloudflare container (CPU)",
-  "dew": "7256993a85c7b8d16e944dc77185fe26f6c55244",
+  "device": "NVIDIA A100-SXM4-40GB",
   "negative": null,
   "batches": [
     {
       "sampler": "heun40",
       "seed": 0,
       "images": 6,
-      "seconds": 249.47
+      "seconds": 87.61
     },
     {
       "sampler": "heun40",
       "seed": 1,
       "images": 6,
-      "seconds": 255.16
+      "seconds": 1.05
     },
     {
       "sampler": "heun40",
       "seed": 2,
       "images": 6,
-      "seconds": 216.43
+      "seconds": 1.05
     },
     {
       "sampler": "heun40",
       "seed": 3,
       "images": 6,
-      "seconds": 257.06
+      "seconds": 1.05
     },
     {
       "sampler": "dpm2m20",
       "seed": 0,
       "images": 6,
-      "seconds": 77.17
+      "seconds": 34.61
     },
     {
       "sampler": "dpm2m20",
       "seed": 1,
       "images": 6,
-      "seconds": 95.61
+      "seconds": 0.3
     },
     {
       "sampler": "dpm2m20",
       "seed": 2,
       "images": 6,
-      "seconds": 198.61
+      "seconds": 0.3
     },
     {
       "sampler": "dpm2m20",
       "seed": 3,
       "images": 6,
-      "seconds": 73.94
+      "seconds": 0.3
     },
     {
       "sampler": "ea100",
       "seed": 0,
       "images": 6,
-      "seconds": 250.27
+      "seconds": 36.32
     },
     {
       "sampler": "ea100",
       "seed": 1,
       "images": 6,
-      "seconds": 304.34
+      "seconds": 1.36
     },
     {
       "sampler": "ea100",
       "seed": 2,
       "images": 6,
-      "seconds": 247.83
+      "seconds": 1.35
     },
     {
       "sampler": "ea100",
       "seed": 3,
       "images": 6,
-      "seconds": 252.39
+      "seconds": 1.35
     }
   ],
   "images": [
