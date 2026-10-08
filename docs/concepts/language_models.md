@@ -196,6 +196,7 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 `LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew tokenize --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
+<!-- not run: fine-tunes Qwen3-0.6B on the token files `dew tokenize` writes, which CI does not prepare -->
 ```python
 from dew.interop import PretrainedDecoder
 
@@ -209,6 +210,7 @@ This downloads the Hub weights and needs memory for the model, gradients and opt
 
 `dew.lora.LoRA` describes a low-rank adapter with PEFT's own fields (`rank`, `modules` as PEFT's `target_modules`, `alpha`, `rslora`, `dropout`). `bundle.adapt(lora, key=)` returns the same kind of bundle with the adapter attached: the adapted model, the variables with the factors under `params` and every base weight under `frozen`, and the bound `adapter`. Any objective over that bundle trains the factors and leaves every other weight as loaded. `tuned.adapter.save` writes PEFT's adapter directory, and `tuned.save` writes the source's layout with the factors merged into the kernels. Both take the trainer's `state.variables` as they come back from `fit`:
 
+<!-- not run: adapts the Qwen3-0.6B bundle and trains on the token files of the block above -->
 ```python
 from dew.lora import LoRA
 

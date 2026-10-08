@@ -162,11 +162,23 @@ A JEPA configuration adds predictor fields, target-mask settings and optional re
 
 `dew train` trains a run written in Python, with no recipe. The file builds a `RunConfig`, `run`, or a function `run` returning one, and the objective it names is built around its model:
 
+<!-- not run: the file `dew train experiment.py` imports; its MLP is recorded by that module's import path -->
 ```python
+from flax import linen as nn
+
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import HFOptions, HubDataset
 from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy, CrossEntropy
+
+
+class MLP(nn.Module):
+    hidden: int = 32
+
+    @nn.compact
+    def __call__(self, x):
+        return nn.Dense(2)(nn.relu(nn.Dense(self.hidden)(x)))
+
 
 run = RunConfig(
     model=ModelConfig.from_model(MLP(hidden=32)),

@@ -154,6 +154,7 @@ Results hold global arrays sharded by row, including any filler rows that were a
 
 `SafetensorsBanks` and its `stream` run a decoder whose layer weights do not fit in device memory or in host RAM. The source reads a local Hugging Face safetensors checkpoint through read-only memory maps and the ordinary decoder translator. The banked inference loop then fetches each layer when it runs, with one host read-ahead slot for the next layer, so the full decoder stack is never loaded or captured as a compiled constant.
 
+<!-- not run: needs a local gpt-oss-20b BF16 checkpoint -->
 ```python
 import jax
 import jax.numpy as jnp
