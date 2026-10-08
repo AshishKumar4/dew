@@ -82,6 +82,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--shape", choices=sorted(SHAPES), required=True)
     parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--seconds", type=float, default=float("inf"),
+                        help="stop after this many seconds of steps, to time a step the run cannot finish")
+    parser.add_argument("--batch", type=int, help="the global batch; the shape's own by default")
     parser.add_argument("--target", type=float, help="the loss to stop at; the shape's own by default")
     parser.add_argument("--dtype", default=None, help="compute dtype; float32 on CPU, bfloat16 on a GPU")
     parser.add_argument("--cache", type=Path,
@@ -101,7 +104,9 @@ def main() -> None:
     joined = time.monotonic() - began
     import jax
     import jax.numpy as jnp
+    import numpy as np
     import optax
+    from jax.experimental import multihost_utils
 
     from dew.data import TokenWindows
     from dew.data.dataset import DataPartition
@@ -115,7 +120,8 @@ def main() -> None:
     dtype = args.dtype or ("bfloat16" if platform == "gpu" else "float32")
     target = shape["target"] if args.target is None else args.target
     tokens = corpus(args.cache)
-    data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=shape["batch"])
+    batch_size = shape["batch"] if args.batch is None else args.batch
+    data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=batch_size)
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto")
     mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))
@@ -143,12 +149,18 @@ def main() -> None:
         if reached is None and len(losses) >= 10 and sum(losses[-10:]) / 10 <= target:
             reached = {"step": step, "seconds": sum(seconds)}
             break
+        # Rank 0's clock decides, so every process stops at the same step.
+        over = sum(seconds) > args.seconds
+        if world > 1:
+            over = bool(multihost_utils.broadcast_one_to_all(np.asarray(over)))
+        if over:
+            break
     if rank == 0:
         args.out.parent.mkdir(parents=True, exist_ok=True)
         args.out.write_text(json.dumps({
             "shape": args.shape, "platform": platform, "device_kind": jax.devices()[0].device_kind,
             "processes": jax.process_count(), "devices": jax.device_count(), "dtype": dtype,
-            "parameters": int(parameters), "batch": shape["batch"], "seq_len": SEQ_LEN, "target": target,
+            "parameters": int(parameters), "batch": batch_size, "seq_len": SEQ_LEN, "target": target,
             "join_seconds": joined, "compile_seconds": compile_seconds, "steps": len(losses),
             "reached": reached, "losses": losses, "step_seconds": seconds}))
         print(json.dumps({"shape": args.shape, "devices": jax.device_count(), "reached": reached,
