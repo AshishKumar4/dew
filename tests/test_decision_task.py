@@ -226,17 +226,54 @@ def test_calibrated_fits_on_labelled_examples_and_gates_answers(decide):
     assert all("abstained" in answer for answer in answered.values())
 
 
-def test_score_reads_the_metrics_of_a_validation_pass(decide):
-    """Accuracy over every answered question is the share of answers whose
-    choice is the labelled option."""
-    examples = [Example.of({"state": request["state"], "questions": request["questions"],
-                            "answers": dict.fromkeys(request["questions"], 0)})
-                for request in CASES.values()]
+def answered():
+    """Every case's questions, each answered with its first option."""
+    return [Example.of({"state": request["state"], "questions": request["questions"],
+                        "answers": dict.fromkeys(request["questions"], 0)})
+            for request in CASES.values()]
+
+
+def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
+    """Each metric is the one the task's own calibrated answers give, to
+    float32 rounding: the pass divides by the same temperatures, which the
+    released checkpoint sets away from 1."""
+    from dew.artifacts import Decisions
+    from dew.decision.metrics import AURC, ECE, Accuracy
+    from dew.decision.scoring import LogLoss
+
+    assert decide.calibration.temperatures.of("choice", 3) != 1
+    examples = answered()
+    answers = [answer for example in examples for answer in decide(example.state, example.questions).values()]
+    width = max(len(answer.probabilities) for answer in answers)
+    probabilities, options = np.zeros((len(answers), 1, width)), np.zeros((len(answers), 1, width), bool)
+    for row, answer in enumerate(answers):
+        probabilities[row, 0, :len(answer.probabilities)] = answer.probabilities
+        options[row, 0, :len(answer.probabilities)] = True
+    decisions = Decisions(probabilities=probabilities, options=options,
+                          labels=np.zeros((len(answers), 1), int),
+                          ordinal=np.asarray([[answer.kind == "score"] for answer in answers]),
+                          scored=np.ones((len(answers), 1), bool))
     scores = decide.score(examples)
     assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
-    right = [int(np.argmax(answer.probabilities)) == 0 for example in examples
-             for answer in decide(example.state, example.questions).values()]
-    assert scores["accuracy"] == pytest.approx(np.mean(right))
+    for metric in (Accuracy(), ECE(), AURC(), LogLoss()):
+        assert scores[metric.name] == pytest.approx(float(metric.finalize(metric(decisions, {}))),
+                                                    rel=1e-5, abs=1e-6), metric.name
+
+
+def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(decide):
+    """The temperatures fit the released logits, which training moves, so a
+    run's validation reads the probabilities untempered."""
+    from dew.decision import DecisionObjective
+    from dew.decision.scoring import LogLoss
+    from dew.training.evaluation import Evaluation
+
+    examples = answered()
+    objective = DecisionObjective(decide)
+    validated = Evaluation.run(objective, decide.variables, objective.held_out(examples, batch=8), key=0,
+                               metrics=[LogLoss()]).scores["val/log_loss"]
+    untempered = replace(decide, calibration=Calibration()).score(examples, [LogLoss()])["log_loss"]
+    assert validated == pytest.approx(untempered, rel=1e-6)
+    assert validated != pytest.approx(decide.score(examples, [LogLoss()])["log_loss"], rel=1e-3)
 
 
 def test_a_gate_abstains_below_its_threshold(decide):
