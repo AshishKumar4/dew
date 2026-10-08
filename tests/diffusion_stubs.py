@@ -80,3 +80,15 @@ def label_table(labels, null: float = 0.0) -> CharTable:
     for index, label in enumerate(labels):
         entries[table.tokenize([str(index)])["input_ids"][0, 1]] = label
     return CharTable.from_pretrained(tokens=2, features=1, params={"table": jnp.asarray(entries)})
+
+
+@dataclass(frozen=True)
+class OutsideGuidance:
+    """A guidance from outside Dew, as a plugin would write one: CFG at `scale`."""
+
+    scale: float
+
+    def walk(self, denoise, steps):
+        from dew.sampling import CFG
+
+        return CFG(self.scale).walk(denoise, steps)

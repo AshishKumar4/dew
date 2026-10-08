@@ -26,7 +26,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
 from dew.objectives.base import Variables, thaw
 from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.guidance import APG, CFG, Autoguidance, CFGPlusPlus, Guidance
+from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sample
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import region
@@ -256,7 +256,7 @@ class TextToImage:
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
         from dew.records import integer, json_value, record as fields, text
-        from dew.registry import from_record, from_record_among, objectives, solvers
+        from dew.registry import from_record, objectives, solvers
 
         record, step = run_record(directory, step, trust)
         config = ModelConfig.from_dict(fields(record['model'], 'model'))
@@ -291,8 +291,7 @@ class TextToImage:
         solver = solvers.build(text(solver_record['class'], 'solver class'),
                                 fields(solver_record['fields'], 'solver fields'))
         recorded = json_value(record['guidance'], 'guidance')
-        guidance = (None if recorded is None
-                    else from_record_among((CFG, CFGPlusPlus, APG, Autoguidance), recorded, dtypes=False))
+        guidance = None if recorded is None else from_record(Guidance, recorded, dtypes=False)
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
