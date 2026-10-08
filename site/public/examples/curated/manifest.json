@@ -1,7 +1,7 @@
 {
  "model": {
   "model": "dewml/hybrid-dit-176m",
-  "revision": "73b7e9ed118eaa46fb7f199e688334bb37216cdd",
+  "revision": "403c4215556ac77826d69b3c3c7c30f9bb81ab9c",
   "loaded_with": "dew.sampling.TextToImage.from_run(pull_from_hub('dewml/hybrid-dit-176m', revision=...)), the run from_pretrained loads",
   "checkpoint_step": 1350000,
   "parameters": 175640848,
@@ -16,7 +16,7 @@
   6,
   4
  ],
- "note": "Each image is one call (see call); key is the sampling key (the old seed). The set was chosen from RTX 4080 draws of revision 3664c055 for having no white or black bands, and clip_score and aesthetic were measured on those draws. These are the same calls run again on CPU at 73b7e9ed: they differ from the chosen draws in detail, and p2_k32 now has white side bands.",
+ "note": "Each image is one call (see call); key is the sampling key (the old seed). The set was chosen from RTX 4080 draws of revision 3664c055 for having no white or black bands, and clip_score and aesthetic were measured on those draws. These are the same calls run again on CPU at 403c4215: they differ from the chosen draws in detail, and p2_k32 now has white side bands.",
  "images": [
   {
    "id": "dpm40_cfg7.5i_negB/aurora2.vivid.s05",
