@@ -938,6 +938,23 @@ def test_diffusion_gemma_source_export_resolves_omitted_embedding_tie_default(tm
             export_weights(loaded.model, loaded.variables, disagreeing)
 
 
+def test_a_float64_reference_leaves_meta_device_construction_as_it_was():
+    """Widening replaces torch.arange, so a first meta-device context inside
+    it must not leave torch listing the replacement as the constructor it
+    places: later from_pretrained calls build their models on meta, and an
+    arange left on the CPU fails beside them (Gemma 4's proportional rope)."""
+    import torch
+    from torch.utils._device import _device_constructors
+
+    from tools.diffusers_wan_reference import float64
+
+    _device_constructors.cache_clear()
+    with float64(), torch.device("meta"):
+        assert torch.arange(3).device.type == "meta"
+    with torch.device("meta"):
+        assert torch.arange(3).device.type == "meta"
+
+
 @pytest.mark.parametrize("fixture, mode, dense", [
     ("gemma4-ple", "frozen", True),
     ("gemma4-ple", "frozen", False),
