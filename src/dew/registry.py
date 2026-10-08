@@ -397,10 +397,9 @@ def to_record(value, annotation) -> JSON:
         return value
     if not isinstance(value, (type, Enum)) and _owned(type(value), called=False):
         # A plain class of Dew's or a trusted package's, rebuilt from its
-        # constructor's parameters as `_built` builds one.
-        fields = _constructed(value)
-        return fields if type(value) is _unwrapped(annotation) else {"class": import_path(type(value)),
-                                                                     "fields": fields}
+        # constructor's parameters as `_built` builds one; it declares no
+        # fields, so its record always names it.
+        return {"class": import_path(type(value)), "fields": _constructed(value)}
     raise TypeError(
         f"{type(value).__name__} is not something a run record can carry; a "
         f"config field holds JSON scalars, sequences, mappings, dataclasses and "
