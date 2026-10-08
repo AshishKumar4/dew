@@ -24,24 +24,19 @@ if WORLD < 2:
     pytest.skip("runs across the containers of an armada gang", allow_module_level=True)
 
 import test_multiprocess as single  # noqa: E402
+from process_support import report_of, spawn, terminate, worker_env  # noqa: E402
 from test_multiprocess import (  # noqa: E402, F401
-    DEVICES,
-    LAST_LOCAL_STEP,
     LOCAL_KILL_AFTER,
     STEPS,
     dumped_params,
     local_committed,
     local_flags,
-    report_of,
-    spawn,
-    terminate,
     test_a_default_run_name_takes_its_timestamp_from_process_zero,
     test_four_processes_build_the_same_mesh_as_two,
     test_processes_read_disjoint_shards_that_cover_the_corpus,
     test_the_global_batch_is_the_union_of_the_process_slices,
     test_the_mesh_covers_every_process_in_the_pool,
     two_processes,
-    worker_env,
 )
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
