@@ -18,7 +18,7 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew.diffusion.block import BlockProcess
 from dew.interop.config_records import NativeFields
-from dew.interop.hf_decoders import _export_config, translate_config, translate_denoiser_weights
+from dew.interop.hf_decoders import export_config, translate_config, translate_denoiser_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import VisionConditioner
@@ -200,7 +200,7 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
     names none and transformers' defaults stand. A model the written fields
     would rebuild differently is refused, naming the fields that differ.
     """
-    text = {name: value for name, value in _export_config(model.text).items() if name not in _GEMMA4_ONLY}
+    text = {name: value for name, value in export_config(model.text).items() if name not in _GEMMA4_ONLY}
     text.update(model_type="diffusion_gemma_text",
                 use_bidirectional_attention=None if model.conditioner is None else "vision")
     rebuilt = from_record(CausalTransformer, {

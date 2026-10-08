@@ -1,12 +1,21 @@
 """Falcon-7B's one-norm parallel block and fused multi-query projection."""
 
 from collections.abc import Mapping
+from functools import partial
 
 import numpy as np
 
 from dew import records
-from dew.interop.families.gpt_neox import _gpt_neox_export_weights, _gpt_neox_prepare
-from dew.interop.hf_decoders import DecoderFields, Renames, _base_config, _refuse, _renamed_path
+from dew.interop.decoder_parts import (
+    DecoderFamily,
+    DecoderFields,
+    Renames,
+    base_config,
+    refuse,
+    renamed_name,
+    renamed_path,
+)
+from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -17,20 +26,20 @@ def _falcon_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                  'ffn_hidden_size', 'activation', 'layer_norm_epsilon',
                  'apply_residual_connection_post_layernorm'))
     if hf.get('alibi', False):
-        _refuse('alibi', 'this Falcon port rotates its heads, as Falcon-7B does')
+        refuse('alibi', 'this Falcon port rotates its heads, as Falcon-7B does')
     if hf.get('new_decoder_architecture', False) or hf.get('num_ln_in_parallel_attn') not in (None, 1):
-        _refuse('new_decoder_architecture/num_ln_in_parallel_attn', 'Falcon-7B uses its one-norm decoder')
+        refuse('new_decoder_architecture/num_ln_in_parallel_attn', 'Falcon-7B uses its one-norm decoder')
     if not hf.get('parallel_attn', True):
-        _refuse('parallel_attn', 'Falcon-7B sums attention and MLP before residual dropout')
+        refuse('parallel_attn', 'Falcon-7B sums attention and MLP before residual dropout')
     if hf.get('hidden_dropout', 0.):
-        _refuse('hidden_dropout', 'Falcon drops the summed parallel branch; Falcon-7B uses zero dropout')
+        refuse('hidden_dropout', 'Falcon drops the summed parallel branch; Falcon-7B uses zero dropout')
     hidden = records.integer(hf.get('hidden_size', 4544), 'hidden_size')
     heads = records.integer(hf.get('num_attention_heads', 71), 'num_attention_heads')
     activation = records.text(hf.get('activation', 'gelu') or 'gelu', 'activation')
     activations = {'gelu': 'gelu_exact', 'gelu_new': 'gelu', 'relu': 'relu'}
     if activation not in activations:
-        _refuse('activation', 'the ungated Falcon MLP supports GELU and ReLU')
-    config = _base_config({**hf, 'hidden_size': hidden, 'num_attention_heads': heads,
+        refuse('activation', 'the ungated Falcon MLP supports GELU and ReLU')
+    config = base_config({**hf, 'hidden_size': hidden, 'num_attention_heads': heads,
                            'num_key_value_heads': 1 if hf.get('multi_query', True) else heads,
                            'intermediate_size': hf.get('ffn_hidden_size') or 4 * hidden,
                            'hidden_act': 'silu'}, used, reads=frozenset(), tie_embeddings=True)
@@ -55,20 +64,20 @@ _FALCON_NAMES: Renames = (
 def _falcon_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if '.self_attention.query_key_value.' in name:
         return None
-    return _renamed_path(_FALCON_NAMES, name, config)
+    return renamed_path(_FALCON_NAMES, name, config)
 
 
 def _falcon_prepare(tensors: Mapping[str, np.ndarray],
                     config: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
     if config is None:
         raise ValueError('Falcon fused qkv requires translated head geometry')
-    return _gpt_neox_prepare(tensors, config, attention_name='self_attention',
+    return gpt_neox_prepare(tensors, config, attention_name='self_attention',
                               interleaved=config['num_kv_heads'] != 1)
 
 
-def _falcon_export_weights(model: CausalTransformer, variables: Mapping[str, object],
+def _falcon_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
                            config: Mapping[str, object]) -> LazyTensors:
-    return _gpt_neox_export_weights(model, variables, config, attention_name='self_attention',
+    return gpt_neox_export_weights(family, model, variables, config, attention_name='self_attention',
                                     interleaved=model.kv_heads != 1)
 
 
@@ -83,3 +92,14 @@ def _falcon_export(model: CausalTransformer) -> Mapping[str, object]:
         'num_key_value_heads': None, 'head_dim': None, 'intermediate_size': None,
         'hidden_act': None, 'rms_norm_eps': None, 'attention_bias': None,
     }
+
+
+FALCON = DecoderFamily(
+    ('falcon',), _falcon_config,
+    lambda fields: fields.shared_parallel_norm and fields.mlp == 'gelu_exact'
+                   and fields.partial_rotary_factor is None,
+    'falcon', 'FalconForCausalLM', _falcon_export,
+    weight_path=_falcon_path, export_path=partial(renamed_name, _FALCON_NAMES),
+    prepare=_falcon_prepare, export_weights=_falcon_export_weights, preserve_source_layout=False,
+    tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+)

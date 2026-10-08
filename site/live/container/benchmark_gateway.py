@@ -58,7 +58,7 @@ for score in ("-1000", "-999", "0"):
     try:
         with open("/proc/self/oom_score_adj", "w") as file:
             file.write(score)
-    except PermissionError:
+    except OSError:
         pass
     else:
         raise AssertionError(f"a guest lowered its OOM score to {score}")

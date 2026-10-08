@@ -52,7 +52,7 @@ def census(out: Path, limit: int) -> None:
 def _route(config: dict, *, probe: bool) -> tuple[str, str]:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    from dew.interop import hf_decoders, verify
+    from dew.interop import decoder_parts, hf_decoders, verify
     from dew.interop.codecs import source_quantization
 
     try:
@@ -68,7 +68,7 @@ def _route(config: dict, *, probe: bool) -> tuple[str, str]:
     try:
         hf_decoders.translate_config(config)
         return "tier 1", "registered family"
-    except hf_decoders.DrafterRefused as error:
+    except decoder_parts.DrafterRefused as error:
         return "by design", str(error)[:300]
     except (KeyError, ValueError, TypeError) as error:
         registered_error = f"{type(error).__name__}: {error}"

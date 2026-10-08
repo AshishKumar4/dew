@@ -6,13 +6,13 @@ the suite spends most of its time in XLA: a parallelism-matrix cell ran 367
 s cold and 99 s with its compilations cached. With DEW_XLA_CACHE_URL and
 DEW_XLA_CACHE_TOKEN set (.armada.json), `install` puts `RemoteCache` over
 JAX's own cache: a local miss is fetched from the URL, the dew-xla-cache
-Worker (tools/armada/xla_cache), and an entry that took at least `REMOTE_MS`
+Worker (tools/armada/xla_cache), and an entry that took at least `REMOTE_SECONDS`
 to compile is written to both. Entries are keyed under jax's and jaxlib's
 versions, the backend and the Python minor, beside JAX's own key of the
 program and its flags.
 
 A test that runs a model eagerly compiles thousands of small programs, each
-quicker than `REMOTE_MS`, so never in the remote: asking the Worker about each
+quicker than `REMOTE_SECONDS`, so never in the remote: asking the Worker about each
 one took a DeepSeek drafting test from 103 s to 962 s. So the remote also
 keeps the name of each program it holds (`names/<module>`), a process lists
 those names once, and `get` asks only about a program of one of them.
@@ -24,19 +24,19 @@ background thread, and the process waits up to `DRAIN_SECONDS` for them at
 exit.
 """
 
-import atexit
-import concurrent.futures
 import json
 import logging
 import os
+import queue
 import sys
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
 FAILURES = 3
-REMOTE_MS = 1000
+REMOTE_SECONDS = 1
 TIMEOUT_SECONDS = 10.0
 DRAIN_SECONDS = 60.0
 MAX_BYTES = 256 * 1024 * 1024
@@ -53,8 +53,10 @@ class RemoteCache:
         self.headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-xla-cache"}
         self.failures = 0
         self.lock = threading.Lock()
-        self.uploads = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="xla-cache")
-        self.pending: set[concurrent.futures.Future] = set()
+        # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
+        self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
+        for _ in range(2):
+            threading.Thread(target=self._uploading, daemon=True, name="xla-cache").start()
         self.fetched = self.uploaded = 0
         self.names: set[str] = set()
 
@@ -127,22 +129,23 @@ class RemoteCache:
 
     def put(self, key: str, value: bytes) -> None:
         self.base.put(key, value)
-        if self.available and len(value) <= MAX_BYTES and compile_ms(value) >= REMOTE_MS:
-            future = self.uploads.submit(self._upload, key, bytes(value))
-            with self.lock:
-                self.pending.add(future)
-            future.add_done_callback(self._settled)
+        if self.available and len(value) <= MAX_BYTES and compile_seconds(value) >= REMOTE_SECONDS:
+            self.uploads.put((key, bytes(value)))
 
-    def _settled(self, future) -> None:
-        with self.lock:
-            self.pending.discard(future)
+    def _uploading(self) -> None:
+        while True:
+            key, value = self.uploads.get()
+            try:
+                self._upload(key, value)
+            finally:
+                self.uploads.task_done()
 
     def drain(self, seconds: float = DRAIN_SECONDS) -> None:
-        """Wait up to `seconds` for the uploads still running."""
-        with self.lock:
-            pending = set(self.pending)
-        concurrent.futures.wait(pending, timeout=seconds)
-        self.uploads.shutdown(wait=False, cancel_futures=True)
+        """Wait up to `seconds` for the uploads still queued or running, at the end of pytest's
+        session; what is left is abandoned with the process."""
+        began = time.monotonic()
+        while self.uploads.unfinished_tasks and time.monotonic() - began < seconds:
+            time.sleep(0.1)
 
 
 def module(key: str) -> str:
@@ -150,8 +153,9 @@ def module(key: str) -> str:
     return key.rsplit("-", 1)[0]
 
 
-def compile_ms(value: bytes) -> int:
-    """How long the entry `value` took to compile, as JAX records it in the entry's first bytes."""
+def compile_seconds(value: bytes) -> int:
+    """How long the entry `value` took to compile, in whole seconds, as JAX records it in the entry's
+    first bytes."""
     from jax._src import compilation_cache
 
     try:
@@ -188,7 +192,6 @@ def install(url: str, token: str) -> RemoteCache | None:
     except Exception as error:  # a jax whose cache has moved runs on its local cache alone
         logger.warning("the shared XLA cache is not installed: %s", error)
         return None
-    atexit.register(remote.drain)
     return remote
 
 
