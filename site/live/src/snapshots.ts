@@ -13,12 +13,21 @@ interface SnapshotEnv {
 	SNAPSHOT_COMMIT: string;
 	PREPARER: DurableObjectNamespace<DurableObject & {
 		prepare(commit: string): Promise<SnapshotGeneration>;
+		trial(commit: string): Promise<SnapshotGeneration>;
 	}>;
 	POOL?: DurableObjectNamespace<DurableObject & { configure(generation: SnapshotGeneration): Promise<void> }>;
 }
 
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 const REBUILD_MS = 15 * 60_000;
+
+/** How a trial preparation (`SnapshotRegistry.trial`) ended. */
+export interface Trial {
+	commit: string;
+	at: number;
+	generation?: SnapshotGeneration;
+	failure?: string;
+}
 
 export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 	async current(commit: string, now = Date.now()): Promise<SnapshotGeneration | null> {
@@ -61,7 +70,39 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		return { generation: null, rebuilding: true };
 	}
 
+	/**
+	 * Prepare and smoke `commit`, a pushed branch's container code, on a preparer of its own,
+	 * without promoting it: an operator iterates on the smoke without a deploy from main.
+	 * The registry's own alarm, a renewal or retry, runs after it.
+	 */
+	async trial(commit: string): Promise<void> {
+		if (!/^[0-9a-f]{40}$/.test(commit)) throw new Error('a trial names a full commit');
+		await this.ctx.storage.transaction(async (storage) => {
+			const pending = await storage.getAlarm();
+			await storage.put('trial', { commit, resume: pending });
+			await storage.setAlarm(Date.now() + 1000);
+		});
+	}
+
+	async trialled(): Promise<{ pending: string | null; last: Trial | null }> {
+		return { pending: (await this.ctx.storage.get<{ commit: string }>('trial'))?.commit ?? null,
+			last: (await this.ctx.storage.get<Trial>('trialled')) ?? null };
+	}
+
 	override async alarm(): Promise<void> {
+		const trial = await this.ctx.storage.get<{ commit: string; resume: number | null }>('trial');
+		if (trial) {
+			await this.ctx.storage.delete('trial');
+			const outcome: Trial = { commit: trial.commit, at: Date.now() };
+			try {
+				outcome.generation = await this.env.PREPARER.get(this.env.PREPARER.idFromName('trial')).trial(trial.commit);
+			} catch (error) {
+				outcome.failure = String(error).slice(-6000);
+			}
+			await this.ctx.storage.put('trialled', outcome);
+			if (trial.resume !== null) await this.ctx.storage.setAlarm(Math.max(trial.resume, Date.now() + 1000));
+			return;
+		}
 		const commit = await this.ctx.storage.get<string>('requested') || this.env.SNAPSHOT_COMMIT || (await this.previous())?.commit;
 		try {
 			if (!commit) throw new Error('snapshot renewal has no requested generation');

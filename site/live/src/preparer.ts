@@ -108,4 +108,9 @@ export class SnapshotPreparer extends ManagedPreparer {
 		if (commit !== this.env.SNAPSHOT_COMMIT) throw new Error('requested preparation is not the pinned deploy');
 		return this.runPreparation(async () => livePreparation(commit, commit));
 	}
+
+	/** Any pushed commit, prepared and smoked as a deploy would be; the registry never promotes it. */
+	async trial(commit: string): Promise<SnapshotGeneration> {
+		return this.runPreparation(async () => livePreparation(commit, commit));
+	}
 }

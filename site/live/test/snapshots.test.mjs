@@ -54,3 +54,13 @@ test('an expired or different-commit generation is not eligible for restoration'
 	assert.equal(result.expired, null);
 	assert.equal(result.mismatch, null);
 });
+test('a trial prepares a branch commit on its own preparer, promotes nothing and keeps the renewal', async () => {
+	const result = await scenario('trial');
+	assert.equal(result.pending.pending, 'b'.repeat(40));
+	assert.equal(result.trialled.pending, null);
+	assert.equal(result.trialled.last.commit, 'b'.repeat(40));
+	assert.equal(result.trialled.last.generation.commit, 'b'.repeat(40));
+	assert.equal(result.active.commit, 'a'.repeat(40));
+	assert.equal(result.alarm, result.renewal);
+	assert.deepEqual([result.trialCalls, result.trustedCalls], [1, 1]);
+});
