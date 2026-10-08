@@ -33,8 +33,8 @@ for file in guest_limits.py guest_entry.py gateway_manager.py start-gateway.sh b
 done
 printf '%s\n' "$commit" > /opt/live/dew-commit
 install -m 0644 -o model -g model /dev/null /opt/live/prepared.json
-# The pool cells' inputs download while the model process's models warm: the preparation, smoke
-# included, must end within the registry's 15-minute alarm (site/live/src/snapshots.ts).
+# The pool cells' inputs download while the model process's models warm: the build, snapshot
+# included, must end within its 15-minute alarm (site/live/src/preparer.ts).
 runuser -u model -- /opt/venv/bin/python /opt/live/prepare-cells.py > /root/prepare-cells.log 2>&1 &
 cells=$!
 runuser -u model -- env HF_HOME=/opt/hf JAX_PLATFORMS=cpu \

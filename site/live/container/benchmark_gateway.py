@@ -141,8 +141,8 @@ def training():
 def cells():
     """The page's pool cells and its train.py, each run in a fresh training context as a
     visitor's Run does, while the model process holds its models. The three that hold a few
-    GiB run one after another beside the small ones, to end within the registry's 15-minute
-    alarm (site/live/src/snapshots.ts). A failure names the host's memory."""
+    GiB run one after another beside the small ones, to end within the smoke's 15-minute
+    alarm (site/live/src/preparer.ts). A failure names the host's memory."""
     sys.path.insert(0, "/opt/live/cells")
     import cells as page
     programs = {name: page.cell(name) for name in page.CELLS["pool"]}
