@@ -13,12 +13,12 @@ TEXT = ("from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sam
         "max_seq_len=256)\n"
         "task = model.text_generation(sampling=Sampling(temperature=0))\n"
         "print(task('The capital of France is', 24, key=0).text[0])")
-# A guest cannot lower its OOM score below the 1000 it starts at.
+# A guest cannot lower its OOM score below the 1000 it starts at; its /proc is read-only besides.
 LOWER = """for score in ("-1000", "-999", "0"):
     try:
         with open("/proc/self/oom_score_adj", "w") as file:
             file.write(score)
-    except PermissionError:
+    except OSError:
         pass
     else:
         raise AssertionError(f"a guest lowered its OOM score to {score}")
