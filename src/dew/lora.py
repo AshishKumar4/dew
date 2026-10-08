@@ -232,7 +232,7 @@ class Adapter:
 
         It goes over the adapted `model` and a checkpoint's `variables`.
         """
-        if not isinstance(type(model), _Adapted):
+        if not isinstance(type(model), AdaptedClass):
             raise ValueError(f"{type(model).__name__} is not adapted, so it carries no adapter")
         targets, rslora, dropout, layouts = _read_record(adapter)
         whole = thaw(variables)
@@ -319,7 +319,7 @@ def _refuse_unadaptable(model: nn.Module) -> None:
     """Refuse a model already adapted, and an NNX model behind Flax's bridge,
     whose `nnx.Linear` makes no `nn.Dense` call the branch could join: its
     factors would train while its forward never read them."""
-    if isinstance(type(model), _Adapted):
+    if isinstance(type(model), AdaptedClass):
         raise ValueError("The model is already adapted")
     if isinstance(model, bridge.ToLinen):
         raise TypeError(f"{model.nnx_class.__name__} is an NNX model behind flax.nnx.bridge.ToLinen; an "
@@ -420,7 +420,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     run cannot record (a file's mixed ranks) still loads and computes.
     """
     base = type(model)
-    if isinstance(base, _Adapted):
+    if isinstance(base, AdaptedClass):
         raise ValueError("The model is already adapted")
     factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
 
@@ -886,7 +886,7 @@ def unadapted(model: nn.Module) -> nn.Module:
     """`model` without its adapter: its base class over the same fields. A
     model no adapter wraps is itself."""
     model_type = type(model)
-    if not isinstance(model_type, _Adapted):
+    if not isinstance(model_type, AdaptedClass):
         return model
     return model_type._dew_lora_base(**{field.name: getattr(model, field.name)
                                         for field in dataclasses.fields(model)
@@ -894,7 +894,7 @@ def unadapted(model: nn.Module) -> nn.Module:
 
 
 @runtime_checkable
-class _Adapted(Protocol):
+class AdaptedClass(Protocol):
     """Marks a module class an adapter already wrapped.
 
     The wrapper subclass declares the interceptor its `apply` and `init` run

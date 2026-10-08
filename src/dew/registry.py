@@ -242,7 +242,7 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
 
     def from_record(self, record: Mapping[str, object]) -> Built:
         """Construct the member a class record names, `{"class": ..., "fields": {...}}`."""
-        named = _class_record(record)
+        named = class_record(record)
         if named is None:
             raise ValueError(f"a {self.kind} is the record that names it, "
                              f"{{'class': ..., 'fields': {{...}}}}, not {record!r}")
@@ -260,7 +260,7 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         return functools.reduce(operator.or_, self.values())
 
 
-def _declared_type(member: type, field: str) -> Annotation:
+def declared_type(member: type, field: str) -> Annotation:
     """Resolve one field's annotation, without evaluating unrelated ones."""
     for owner in member.__mro__:
         annotations = get_annotations(owner, format=Format.FORWARDREF)
@@ -467,7 +467,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         if len(inner) == 1:
             return _rebuilt(inner[0], value, dtypes=dtypes)
         classes = tuple(member for member in inner if isinstance(member, type))
-        named = _class_record(value) if isinstance(value, Mapping) else None
+        named = class_record(value) if isinstance(value, Mapping) else None
         if named is not None:
             if not classes:
                 raise ValueError(f"{annotation} declares no class, so nothing builds the record {value!r}")
@@ -477,7 +477,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
         if typing.get_origin(annotation) is Callable or annotation is Callable:
             # A callable field, such as a Sequential's layers or a loss, takes
             # a record of a class whose instances are called, whatever class.
-            named = _class_record(value)
+            named = class_record(value)
             if named is not None:
                 member = _member(named[0], (object,))
                 if not _owned(member, called=True):
@@ -490,7 +490,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
             # A field typed with a class takes a record of the class itself or
             # of any class derived from it or function returning it; `object`
             # declares nothing, and its record stays the record it is.
-            named = _class_record(value)
+            named = class_record(value)
             if named is not None:
                 return _built(_member(named[0], (annotation,)), named[1], dtypes=dtypes)
             if dataclasses.is_dataclass(annotation):
@@ -511,7 +511,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     return configured(value)
 
 
-def _class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
+def class_record(value: Mapping[str, object] | Mapping[RecordKey, object]
                   ) -> tuple[str, Mapping[str, object]] | None:
     """The class a class record, `{"class": ..., "fields": {...}}`, names and
     its fields (a record with no fields may leave them out); None for a
@@ -767,11 +767,11 @@ def _read(member: type | Callable[..., Configured], name: str, value, *, dtypes:
     dtype, any other value, a scalar or a value the caller built, as given."""
     held = _record_class(member)
     if held is not None:
-        return _rebuilt(_declared_type(held, name), configured(value), dtypes=dtypes, name=name)
+        return _rebuilt(declared_type(held, name), configured(value), dtypes=dtypes, name=name)
     if not (isinstance(value, (Mapping, list)) or (dtypes and name == "dtype")):
         return value
     named = parameters(member)[0]
-    return _rebuilt(_parameter_type(named[name][1], name) if name in named else None, value,
+    return _rebuilt(parameter_type(named[name][1], name) if name in named else None, value,
                     dtypes=dtypes, name=name)
 
 
@@ -789,7 +789,7 @@ def argument_records(member: type | Callable[..., Configured], fields: Mapping[s
     records = {}
     with _reading(fields), recording():
         for name, value in fields.items():
-            annotation = _parameter_type(named[name][1], name) if name in named else None
+            annotation = parameter_type(named[name][1], name) if name in named else None
             built = (_rebuilt(annotation, value, dtypes=False, name=name)
                      if isinstance(value, (Mapping, list)) else value)
             records[name] = to_record(built, annotation)
@@ -820,7 +820,7 @@ def parameters(member: type | Callable[..., Configured]) -> tuple[Parameters, bo
     return named, bool(owners)
 
 
-def _parameter_type(function: Callable[..., Configured], name: str) -> Annotation:
+def parameter_type(function: Callable[..., Configured], name: str) -> Annotation:
     """Resolve the annotation of one parameter of `function`, or its return
     for `name="return"`, without evaluating the others. None where it has no
     annotation. An annotation naming what the function's module does not
@@ -845,7 +845,7 @@ def _parameter_type(function: Callable[..., Configured], name: str) -> Annotatio
 def _returns(member: Callable[..., Configured], held: type) -> bool:
     """Whether the function `member` is declared to return `held` or a class
     derived from it."""
-    returned = _parameter_type(member, "return")
+    returned = parameter_type(member, "return")
     return isinstance(returned, type) and _derives(returned, held)
 
 
@@ -872,7 +872,7 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
             held = getattr(value, field.name)
             if (_recorded(field) and not (isinstance(value, nn.Module) and field.name in ('parent', 'name'))
                     and not (callable(held) and held is field.default)):
-                fields[field.name] = to_record(held, _declared_type(owner, field.name))
+                fields[field.name] = to_record(held, declared_type(owner, field.name))
     return fields
 
 
@@ -961,7 +961,7 @@ def with_dtype(name: str, fields: Mapping[str, object], dtype: str | None) -> Ma
             continue
         if isinstance(value, nn.Module):
             parts[key] = value.clone(dtype=resolve_dtype(dtype))
-        elif isinstance(value, Mapping) and (named := _class_record(value)) is not None:
+        elif isinstance(value, Mapping) and (named := class_record(value)) is not None:
             parts[key] = {"class": named[0], "fields": {**named[1], "dtype": dtype}}
         elif isinstance(value, Mapping):
             parts[key] = {**value, "dtype": dtype}
@@ -978,11 +978,11 @@ def _part_type(member: type, field: str, value: Configured) -> type | None:
 
     if isinstance(value, nn.Module):
         return type(value)
-    named = _class_record(value) if isinstance(value, Mapping) else None
+    named = class_record(value) if isinstance(value, Mapping) else None
     if named is not None:
         held = _member(named[0], (nn.Module,))
         return held if isinstance(held, type) else None
-    declared = _unwrapped(_declared_type(member, field))
+    declared = _unwrapped(declared_type(member, field))
     if isinstance(value, Mapping) and isinstance(declared, type) and issubclass(declared, nn.Module):
         return declared
     return None

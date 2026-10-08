@@ -299,14 +299,14 @@ def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
     proposer did."""
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import reseed
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor()
     prompt = jnp.asarray([[1, 2, 3, 4], [5, 6, 7, 8]], jnp.int32)
     emitted = jnp.asarray([[11, 3], [2, 9]], jnp.int32)
     realized = jnp.concatenate([prompt, emitted], axis=1)
     width = realized.shape[1]
-    ops = _operations(model, params_of(model, prompt), 0, 1)
+    ops = decode_ops(model, params_of(model, prompt), 0, 1)
     params = params_of(model, prompt)
 
     ahead = model.apply(params, realized, method=model.hidden_states)
@@ -314,7 +314,7 @@ def test_a_rejected_prefix_leaves_the_prediction_cache_teacher_forced():
                             positions=jnp.broadcast_to(jnp.arange(1, width)[None, :], (2, width - 1)),
                             method=model.mtp_step)[0]
 
-    state, _ = _prefill(model, params, ModelInputs(prompt), ops)
+    state, _ = prefill_state(model, params, ModelInputs(prompt), ops)
     state, _ = reseed(
         ops, state, (state.hidden,), ahead[:, prompt.shape[1]:width],
         model.apply(params, emitted, method=model.token_embeddings),
@@ -382,7 +382,7 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
     proposal does not change the law."""
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import reseed
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor()
     prompt = jnp.asarray([[1, 2, 3, 4, 5], [6, 7, 8, 9, 10]], jnp.int32)
@@ -394,8 +394,8 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
                                                        (2, width - 1)),
                             method=model.mtp_step)[0]
 
-    ops = _operations(model, params, 0, 1)
-    seeded, _ = _prefill(model, params, ModelInputs(prompt[:, :-1]), ops)
+    ops = decode_ops(model, params, 0, 1)
+    seeded, _ = prefill_state(model, params, ModelInputs(prompt[:, :-1]), ops)
     _, cached, _ = ops.propose(
         seeded, states[:, width - 2:width - 1], prompt[:, width - 1:width], None,
         jnp.ones((2, 1), bool), jnp.full((2, 1), width - 1, jnp.int32), 0, "ordinary")
@@ -406,7 +406,7 @@ def test_the_prediction_cache_matches_a_teacher_forced_reference():
     # which is what a block does after it decides its accepted prefix.
     grown = jnp.concatenate([prompt, jnp.asarray([[2], [3]], jnp.int32)], axis=1)
     ahead = model.apply(params, grown, method=model.hidden_states)
-    full, _ = _prefill(model, params, ModelInputs(prompt), ops)
+    full, _ = prefill_state(model, params, ModelInputs(prompt), ops)
     full = reseed(ops, full, (states[:, width - 1],), states[:, width - 1:width],
                   model.apply(params, grown[:, width:width + 1], method=model.token_embeddings),
                   jnp.ones((2, 1), bool), jnp.full((2, 1), width, jnp.int32),
@@ -430,7 +430,7 @@ def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
     would leave the second one drafting from a pairing it never saw."""
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import reseed
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor(num_nextn_predict_layers=2)
     prompt = jnp.asarray([[1, 2, 3, 4, 5, 6], [6, 7, 8, 9, 10, 11]], jnp.int32)
@@ -439,8 +439,8 @@ def test_a_second_prediction_depth_is_seeded_the_way_the_model_trains_it():
     states = model.apply(params, prompt, method=model.hidden_states)
     trained = model.apply(params, states, prompt, method=model.mtp_hidden_states)
 
-    ops = _operations(model, params, 0, 2)
-    empty, _ = _prefill(model, params, ModelInputs(prompt[:, :1]), ops)
+    ops = decode_ops(model, params, 0, 2)
+    empty, _ = prefill_state(model, params, ModelInputs(prompt[:, :1]), ops)
     produced = []
     reseed(
         recording(ops, produced), empty, (states[:, 0], None), states[:, 1:],
@@ -462,18 +462,18 @@ def test_explicit_prompt_coordinates_reach_the_prediction_cache():
     """A caller that supplies its own rotary coordinates gets a prediction
     cache written at those coordinates, not at a count of tokens."""
     from dew.nn.inputs import ModelInputs
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor()
     prompt = jnp.asarray([[1, 2, 3, 4, 5]], jnp.int32)
     coordinates = jnp.asarray([[2, 4, 7, 11, 13]], jnp.int32)
     params = model.init(jax.random.key(0), prompt)
-    ops = _operations(model, params, 0, 1)
+    ops = decode_ops(model, params, 0, 1)
     states = model.apply(params, prompt, positions=coordinates, method=model.hidden_states)
     reference = model.apply(params, states[:, :-1], prompt[:, 1:], depth=0,
                             positions=coordinates[:, 1:], method=model.mtp_step)[0]
 
-    seeded, _ = _prefill(model, params,
+    seeded, _ = prefill_state(model, params,
                          ModelInputs(prompt[:, :-1], {"positions": coordinates[:, :-1]}), ops)
     _, cached, _ = ops.propose(seeded, states[:, -2:-1], prompt[:, -1:], None,
                                jnp.ones((1, 1), bool), coordinates[:, -1:], 0, "ordinary")
@@ -489,19 +489,19 @@ def test_a_draft_after_an_advance_is_proposed_at_the_advanced_coordinate():
     place back and nothing in the emitted tokens would show it."""
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import _coordinates, reseed
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor()
     grown = jnp.asarray([[1, 2, 3, 4, 5]], jnp.int32)
     coordinates = jnp.asarray([[10, 11, 12, 13, 14]], jnp.int32)
     params = model.init(jax.random.key(0), grown)
-    ops = _operations(model, params, 0, 1)
+    ops = decode_ops(model, params, 0, 1)
     states = jnp.asarray(model.apply(params, grown, positions=coordinates,
                                      method=model.hidden_states))
     reference = model.apply(params, states[:, :-1], grown[:, 1:], depth=0,
                             positions=coordinates[:, 1:], method=model.mtp_step)[0]
 
-    prompted, _ = _prefill(model, params,
+    prompted, _ = prefill_state(model, params,
                            ModelInputs(grown[:, :3], {"positions": coordinates[:, :3]}), ops)
     advanced = ops.advance(prompted, grown[:, 3], jnp.ones(1, bool))
     step = StepState(tokens=jnp.pad(grown[:, :3], ((0, 0), (0, 2))),
@@ -550,7 +550,7 @@ def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
     from dew.nn.inputs import ModelInputs
     from dew.nn.multimodal import MultimodalTransformer
     from dew.nn.vision import GemmaProjector, SiglipVision
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     language = predictor()
     model = MultimodalTransformer(
@@ -571,8 +571,8 @@ def test_a_media_prompt_seeds_the_depths_with_its_prepared_embeddings():
                             conditioning={"pixel_values": pixels},
                             method=model.mtp_hidden_states)[0]
 
-    ops = _operations(model, params, 0, 1)
-    seeded, _ = _prefill(model, params,
+    ops = decode_ops(model, params, 0, 1)
+    seeded, _ = prefill_state(model, params,
                          ModelInputs(prompt[:, :-1], {"image_indices": indices[:, :-1]},
                                      {"pixel_values": pixels}), ops)
     _, _, produced = ops.propose(
@@ -598,7 +598,7 @@ def test_multi_axis_rotary_coordinates_reach_the_depths():
     was given and a drawn token continues from the coordinate the model's
     cache reached, which is where the reference puts it."""
     from dew.nn.inputs import ModelInputs
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = mrope_predictor()
     tokens = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
@@ -609,8 +609,8 @@ def test_multi_axis_rotary_coordinates_reach_the_depths():
     reference = model.apply(params, states, tokens, rotary_positions=rotary,
                             method=model.mtp_hidden_states)[0]
 
-    ops = _operations(model, params, 0, 1)
-    seeded, _ = _prefill(model, params,
+    ops = decode_ops(model, params, 0, 1)
+    seeded, _ = prefill_state(model, params,
                          ModelInputs(tokens[:, :-1], {"rotary_positions": rotary[:, :-1]}), ops)
     _, _, produced = ops.propose(
         seeded, states[:, -2:-1], tokens[:, -1:], None,
@@ -628,7 +628,7 @@ def test_the_target_advances_a_drawn_token_at_the_multi_axis_coordinate():
     through the cache have to score what an uncached forward scores at
     those coordinates."""
     from dew.nn.inputs import ModelInputs
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = mrope_predictor()
     tokens = jnp.asarray([[1, 2, 3, 4, 6]], jnp.int32)
@@ -636,8 +636,8 @@ def test_the_target_advances_a_drawn_token_at_the_multi_axis_coordinate():
     params = model.init(jax.random.key(0), tokens, rotary_positions=rotary)
     reference = model.apply(params, tokens, rotary_positions=rotary)
 
-    ops = _operations(model, params, 0, 1)
-    state, _ = _prefill(model, params,
+    ops = decode_ops(model, params, 0, 1)
+    state, _ = prefill_state(model, params,
                         ModelInputs(tokens[:, :3], {"rotary_positions": rotary[:, :3]}), ops)
     for at in (3, 4):
         state = ops.advance(state, tokens[:, at], jnp.ones(1, bool))
@@ -650,7 +650,7 @@ def test_a_padded_prompt_seeds_the_depths_at_its_logical_coordinates():
     the physical slot the padding pushed it to. Seeding from slots would put
     the whole prediction history one place along."""
     from dew.nn.inputs import ModelInputs
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor()
     padded = jnp.asarray([[0, 1, 2, 3]], jnp.int32)
@@ -664,8 +664,8 @@ def test_a_padded_prompt_seeds_the_depths_at_its_logical_coordinates():
                             positions=jnp.asarray([[1, 2, 3]], jnp.int32),
                             method=model.mtp_step)[0]
 
-    ops = _operations(model, params, 0, 1)
-    seeded, _ = _prefill(model, params, ModelInputs(padded, {"attention_mask": mask}), ops)
+    ops = decode_ops(model, params, 0, 1)
+    seeded, _ = prefill_state(model, params, ModelInputs(padded, {"attention_mask": mask}), ops)
     _, cached, _ = ops.propose(seeded, states[:, 2:3], grown[:, 3:4], None,
                                jnp.ones((1, 1), bool), jnp.asarray([[3]], jnp.int32), 0, "ordinary")
     largest = float(np.max(np.abs(np.asarray(cached)[:, 0] - np.asarray(reference)[:, -1])))
@@ -678,7 +678,7 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
     the target's state writes an entry the training pass never has."""
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import reseed
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor(num_nextn_predict_layers=2)
     cold = jnp.asarray([[1]], jnp.int32)
@@ -688,8 +688,8 @@ def test_a_cold_prompt_holds_its_second_depth_back_until_it_has_a_predecessor():
     states = model.apply(params, whole, method=model.hidden_states)
     trained = model.apply(params, states, whole, method=model.mtp_hidden_states)
 
-    ops = _operations(model, params, 0, 2)
-    state, _ = _prefill(model, params, ModelInputs(cold), ops)
+    ops = decode_ops(model, params, 0, 2)
+    state, _ = prefill_state(model, params, ModelInputs(cold), ops)
     produced = []
     reseed(recording(ops, produced), state, (state.hidden, *state.drafts),
            states[:, 1:], model.apply(params, emitted, method=model.token_embeddings),
@@ -710,7 +710,7 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
     """
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import reseed
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     model = predictor(num_nextn_predict_layers=2)
     whole = jnp.arange(1, prefix + 4, dtype=jnp.int32)[None, :]
@@ -720,8 +720,8 @@ def test_prediction_depths_resume_from_real_history_not_rotary_coordinates(prefi
     params = model.init(jax.random.key(13), whole)
     hidden = model.apply(params, whole, positions=positions, method=model.hidden_states)
     reference = model.apply(params, hidden, whole, positions=positions, method=model.mtp_logits)[1]
-    ops = _operations(model, params, 0, 2)
-    state, _ = _prefill(model, params,
+    ops = decode_ops(model, params, 0, 2)
+    state, _ = prefill_state(model, params,
                          ModelInputs(whole[:, :prefix], {"positions": positions[:, :prefix]}), ops)
     emitted = whole[:, prefix:-1]
     state, carried = reseed(
@@ -740,7 +740,7 @@ def test_prediction_index_reuse_reseeds_each_rows_accepted_history():
     from dew.nn.dsa_kpool import KPoolSparseAttentionMixer
     from dew.nn.inputs import ModelInputs
     from dew.sampling.strategies import reseed
-    from dew.sampling.text import _operations, _prefill
+    from dew.sampling.text import decode_ops, prefill_state
 
     mixer = KPoolSparseAttentionMixer(
         q_lora_rank=8, kv_lora_rank=8, qk_nope_head_dim=8, v_head_dim=8,
@@ -752,9 +752,9 @@ def test_prediction_index_reuse_reseeds_each_rows_accepted_history():
     prompt = jnp.asarray([[1, 2, 3, 4], [0, 0, 5, 6]], jnp.int32)
     valid = prompt != 0
     params = params_of(model, prompt)
-    ops = _operations(model, params, 0, 1)
+    ops = decode_ops(model, params, 0, 1)
     assert ops.propose is not None and ops.verify is not None and ops.embed is not None
-    seeded, _ = _prefill(model, params, ModelInputs(prompt, {"attention_mask": valid}), ops)
+    seeded, _ = prefill_state(model, params, ModelInputs(prompt, {"attention_mask": valid}), ops)
     assert seeded.hidden is not None
     saved = seeded.cache
     drafted, _, produced = ops.propose(
@@ -772,7 +772,7 @@ def test_prediction_index_reuse_reseeds_each_rows_accepted_history():
         ops, replayed, (seeded.hidden,), seen, ops.embed(emitted), keep, positions,
         jnp.asarray([1, 0]), prior_tokens=jnp.asarray([4, 2]))
     whole = jnp.concatenate([prompt, emitted], axis=1)
-    canonical, _ = _prefill(model, params, ModelInputs(whole, {"attention_mask": whole != 0}), ops)
+    canonical, _ = prefill_state(model, params, ModelInputs(whole, {"attention_mask": whole != 0}), ops)
     seed = corrected.cache["mtp_0"]["block"]["self_attn"]
     np.testing.assert_array_equal(seed["selection_position"], [4, 1])
     for wanted, actual in zip(jax.tree.leaves(canonical.cache["mtp_0"]),

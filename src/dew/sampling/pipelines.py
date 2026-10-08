@@ -214,11 +214,11 @@ class TextToImage:
         """Build a task over the objective's model and `variables` that samples the way its evaluation does.
 
         A loss-only head the objective trains is dropped."""
-        from dew.objectives.diffusion.objective import _without_loss_heads
+        from dew.objectives.diffusion.objective import without_loss_heads
 
         autoencoder, variables = objective.published_autoencoder(variables)
         return cls(objective.model, objective.process, objective.inputs,
-                   _without_loss_heads(variables), autoencoder,
+                   without_loss_heads(variables), autoencoder,
                    steps=objective.steps, guidance=objective.guidance, solver=objective.solver,
                    blank=objective._fixed_blank.rebind(variables.get("encoders", {})))
 
@@ -254,7 +254,7 @@ class TextToImage:
         from dew.diffusion.process import Process
         from dew.inference.tasks import run_record
         from dew.nn.autoencoders import AutoEncoder
-        from dew.objectives.diffusion.objective import FixedBlank, _without_loss_heads
+        from dew.objectives.diffusion.objective import FixedBlank, without_loss_heads
         from dew.records import integer, record as fields, text
         from dew.registry import from_record, objectives, solvers
 
@@ -295,7 +295,7 @@ class TextToImage:
         precision = record['condition_precision']
         precision = None if precision is None else text(precision, 'condition_precision')
         return cls(config.build(), Process.from_json(fields(record['process'], 'process')),
-                   inputs, _without_loss_heads(params), autoencoder,
+                   inputs, without_loss_heads(params), autoencoder,
                    steps=integer(record['sampling_steps'], 'sampling_steps'),
                    guidance=guidance, solver=solver,
                    blank=FixedBlank(inputs, params.get("encoders", {}), precision))

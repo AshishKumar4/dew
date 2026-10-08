@@ -29,7 +29,7 @@ from flax import linen as nn
 from jax.typing import DTypeLike
 
 from dew import records
-from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
+from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
 from dew.coordination import agreed
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceSchedule
@@ -62,7 +62,7 @@ from dew.interop.processors import (
     HostProcessor as HostProcessor,
     Processor as Processor,
     ProcessorCall as ProcessorCall,
-    _hosts,
+    hosts,
 )
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout
@@ -1816,7 +1816,7 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoders.WrapperF
             "mixer": {"class": "attention", "fields": {"bidirectional_images": True}}})
         kinds["sliding_attention"] = sliding
         text_fields["kinds"] = kinds
-    if family in _QWEN35_TYPES:
+    if family in QWEN35_TYPES:
         rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
@@ -1855,7 +1855,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoders.WrapperFields,
         audio_soft_tokens=record["audio_soft_tokens"])
 
 
-def _source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
+def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
                       model: nn.Module, gguf_path: Path | None = None, *, media: bool = False
                       ) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
@@ -1880,7 +1880,7 @@ def _source_processor(directory: Path, config: Mapping[str, object], record: Map
         tokenizer = (gguf.tokenizer(gguf_path) if gguf_path is not None
                      and not (directory / "tokenizer_config.json").exists()
                      else load_tokenizer(str(directory), local_files_only=True))
-        if not _hosts(tokenizer):
+        if not hosts(tokenizer):
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
         return Processor(tokenizer, config, record, model.vocab_size)
     return None
@@ -1905,7 +1905,7 @@ AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 
 
-def _checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
+def checkpoint_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarray]) -> str:
     """Return the storage dtype a checkpoint states, for param_dtype 'auto'.
 
     transformers' dtype='auto' rule (modeling_utils.py `_get_dtype`, 5.16.1):
@@ -1951,7 +1951,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
         if storage == AUTO:
             from dew.interop import diffusion
             denoiser = "transformer" if (directory / "transformer" / "config.json").is_file() else "unet"
-            storage = _checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
+            storage = checkpoint_dtype({}, diffusion.component_tensors(directory, denoiser))
         loaded = _load_diffusion_source(directory, index, dtype=dtype, attention_impl=attention_impl,
                                         param_dtype=storage, lazy=streaming)
         return replace(loaded, variables=placed(loaded.variables), revision=commit)
@@ -2120,7 +2120,7 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     # The Transformers conditional classes ignore auxiliary prediction
     # layers. A released config advertises a depth even when its checkpoint
     # contains only the trunk; a source with mtp.* retains its actual depth.
-    if (record['text_model_type'] in _QWEN35_TEXT_TYPES
+    if (record['text_model_type'] in QWEN35_TEXT_TYPES
             and not any(name.startswith(('mtp.', 'model.mtp.')) for name in tensors)):
         text_fields['num_nextn_predict_layers'] = 0
         record['text']['num_nextn_predict_layers'] = 0
@@ -2214,7 +2214,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
     if param_dtype == AUTO:
-        param_dtype = _checkpoint_dtype(config, tensors)
+        param_dtype = checkpoint_dtype(config, tensors)
     tensors, quantized_tensors, scale_dtype, grid = _decoded(tensors, config, param_dtype)
     export_adapter = None
     media = _media_wrapper(config)
@@ -2244,7 +2244,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             # by going back over its source names (`weight_layouts`).
             export_adapter = _derived_weights
     model = _input_quantization(model, layouts, config, grid)
-    processor = _source_processor(directory, config, record, model, gguf_path, media=media)
+    processor = source_processor(directory, config, record, model, gguf_path, media=media)
     generation_config = _generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in

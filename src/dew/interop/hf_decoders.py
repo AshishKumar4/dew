@@ -37,7 +37,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import records
-from dew._model_types import _QWEN35_TEXT_TYPES, _QWEN35_TYPES
+from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
@@ -840,7 +840,7 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
-        default_tied = hf_config.get("model_type") not in _QWEN35_TYPES
+        default_tied = hf_config.get("model_type") not in QWEN35_TYPES
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             _refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
@@ -1001,7 +1001,7 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
-    **dict.fromkeys(_QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
+    **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
 
 
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
@@ -1059,7 +1059,7 @@ def _wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "audio_projector", bare[len("embed_audio."):]
     if audio and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
-    if ((bare.startswith("mtp.") and record["text_model_type"] in _QWEN35_TEXT_TYPES)
+    if ((bare.startswith("mtp.") and record["text_model_type"] in QWEN35_TEXT_TYPES)
             or bare == "lm_head.weight"):
         return "language_model", bare
     if bundled is not None:

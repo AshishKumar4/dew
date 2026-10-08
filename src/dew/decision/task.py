@@ -178,11 +178,11 @@ class Decide:
         overrides the compute dtype and `param_dtype` the storage dtype.
         """
         from dew.data.text import tokenizer_for
-        from dew.inference.tasks import _saved_model, run_record
+        from dew.inference.tasks import run_record, saved_model
         from dew.registry import from_record, objectives
 
         record = run_record(directory, step)
-        backbone = _saved_model(record, dtype).build()
+        backbone = saved_model(record, dtype).build()
         width, head_dtype = DecisionModel.head_size(backbone)
         model = DecisionModel(backbone, Head.from_record(records.json_value(record["head"], "head"),
                                                          width, dtype=head_dtype))

@@ -37,17 +37,17 @@ MODEL_TYPE = "mamba2"
 
 # The checkpoint's names onto the tree's, read one way on load and the other
 # on export. Linear weights are kernels; the conv taps keep `[D, 1, K]`.
-_TRUNK: Mapping[str, tuple[str, ...]] = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
+TRUNK: Mapping[str, tuple[str, ...]] = {"backbone.embeddings.weight": ("embed_tokens", "embedding"),
                                          "backbone.norm_f.weight": ("norm", "scale")}
-_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _TRUNK.items()}
-_LAYER: Mapping[str, tuple[str, ...]] = {
+_TRUNK_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in TRUNK.items()}
+LAYER: Mapping[str, tuple[str, ...]] = {
     "norm.weight": ("input_layernorm", "scale"), "mixer.norm.weight": ("self_attn", "norm", "weight"),
     **{f"mixer.{leaf}": ("self_attn", leaf) for leaf in ("A_log", "dt_bias", "D")},
     **{f"mixer.{linear}.{kind}": ("self_attn", linear, "kernel" if kind == "weight" else "bias")
        for linear in ("in_proj", "out_proj") for kind in ("weight", "bias")},
     **{f"mixer.conv1d.{kind}": ("self_attn", "conv1d", kind) for kind in ("weight", "bias")},
 }
-_LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in _LAYER.items()}
+_LAYER_NAMES: Mapping[tuple[str, ...], str] = {path: name for name, path in LAYER.items()}
 
 
 def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None) -> DecoderFields:
@@ -128,12 +128,12 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
     The tied head's copy comes back as None. An unknown name raises.
     """
     parts = name.split(".")
-    if name in _TRUNK:
-        return ("params", *_TRUNK[name])
+    if name in TRUNK:
+        return ("params", *TRUNK[name])
     if name == "lm_head.weight":
         return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
     if len(parts) >= 4 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit():
-        tail = _LAYER.get(".".join(parts[3:]))
+        tail = LAYER.get(".".join(parts[3:]))
         if tail is not None:
             return ("params", f"layers_{parts[2]}", *tail)
     raise ValueError(f"{name!r} has no place in a Mamba-2 CausalTransformer")
