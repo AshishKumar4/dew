@@ -17,6 +17,7 @@ from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
+from dew.registry import from_record, to_record
 from dew.training import Trainer
 
 
@@ -360,7 +361,7 @@ def test_builtin_process_records_preserve_noise_prediction_and_weights():
     from dew.diffusion.presets import EDM, Cosine, Flow
     for preset in (EDM(regime='pixel'), Flow(), Cosine()):
         original = preset()
-        rebuilt = Process.from_json(original.to_json())
+        rebuilt = from_record(Process, to_record(original, Process))
         time = jnp.linspace(.01, .99, 16)
         np.testing.assert_array_equal(original.schedule.rates(time)[0], rebuilt.schedule.rates(time)[0])
         np.testing.assert_array_equal(original.schedule.rates(time)[1], rebuilt.schedule.rates(time)[1])
@@ -453,7 +454,7 @@ def test_every_builtin_process_component_round_trips_nondefaults(component):
     weighting = value if isinstance(value, (transforms.ScheduleWeighting, transforms.MinSNR,
                                             transforms.VelocityLoss)) else transforms.ScheduleWeighting()
     original = Process(schedule=schedule, prediction=prediction, weighting=weighting)
-    rebuilt = Process.from_json(original.to_json())
+    rebuilt = from_record(Process, to_record(original, Process))
     time = jnp.linspace(.01, .99, 16)
     for method in ('rates', 'weight', 'model_time'):
         left, right = getattr(original.schedule, method)(time), getattr(rebuilt.schedule, method)(time)
