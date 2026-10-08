@@ -374,21 +374,32 @@ def test_processes_read_disjoint_windows_of_one_packing(tmp_path):
         assert report["windows"] % (worker.BATCH // 2) == 0, "a partial batch came out"
 
 
+WHOLE_VALIDATION_PARTS = 3
+"""The pools the objectives' passes are spread over: one pool ran all of them
+in 371 s, the longest test CI had, which no other test could run beside."""
+
+
 @pytest.mark.distributed
-def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tmp_path):
+@pytest.mark.parametrize("part", range(WHOLE_VALIDATION_PARTS))
+def test_every_objective_scores_every_record_of_a_split_once_on_two_processes(tmp_path, part):
     """`tests/test_whole_validation.py`'s passes on a pool of two: each
     process reads its share of a split of a batch and one record, the share
     that runs out first scoring its last batch's copy with every row a
     repeat, and every objective's loss and `Perplexity` count each record once.
-    A split of one record leaves process 1's share empty, and it is scored once."""
-    from test_whole_validation import assert_every_record_once, assert_the_metric_over_every_record
+    A split of one record leaves process 1's share empty, and it is scored once.
+    Each part is a pool of its own over every third objective, and the first
+    also scores `Perplexity`."""
+    from test_whole_validation import EVALUATED, assert_every_record_once, assert_the_metric_over_every_record
 
-    reports = run_pool("whole_validation", tmp_path / "out", 2, run_dir=tmp_path / "run", timeout=1800)
+    reports = run_pool("whole_validation", tmp_path / "out", 2, run_dir=tmp_path / "run", timeout=1800,
+                       part=f"{part}/{WHOLE_VALIDATION_PARTS}")
     assert reports[0]["passes"] == reports[1]["passes"]
+    assert sorted(reports[0]["passes"]) == EVALUATED[part::WHOLE_VALIDATION_PARTS]
     for name, report in reports[0]["passes"].items():
         assert_every_record_once(name, report)
-    assert_the_metric_over_every_record(reports[0]["perplexity"])
-    assert_the_metric_over_every_record(reports[0]["one"], 1)
+    if part == 0:
+        assert_the_metric_over_every_record(reports[0]["perplexity"])
+        assert_the_metric_over_every_record(reports[0]["one"], 1)
 
 
 @pytest.mark.distributed

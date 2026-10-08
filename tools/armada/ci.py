@@ -9,9 +9,9 @@ The plan prints a task matrix for each Python CI proves. Whole test files are
 packed heaviest first into the lightest of the tasks, each near `target`
 seconds, so a task imports only its own modules. A file heavier than that runs
 as groups of its tests (`groups`, tools/armada/split.py): runs of consecutive
-tests in node-id order, cut by their times in tests/test_durations.json so the
-heaviest run is as light as it can be, and as many runs as it takes to hold
-each to `target` with a heavier test alone. A file weighs armada's
+tests in node-id order, as many as it takes to hold each to `target` by their
+times in tests/test_durations.json, a heavier test alone, and each as light as
+that many runs let it be. A file weighs armada's
 median of its last green runs, else its tests' sum in
 tests/test_durations.json, else the mean. Each entry names its rows, one a
 file (or a file's group), so armada grades a task that leaves one out as not
@@ -25,7 +25,7 @@ running at its deadline, short of armada's own timeout, is interrupted and
 every row it holds is red, so a hang is graded with its stack dump rather
 than leaving the task without a verdict. Each row also carries its tests' own
 times, from which `durations` rewrites tests/test_durations.json: given green
-runs' verdicts (`armada verdict <sha> --json`), it records each test's median
+runs' verdicts (`armada verdict <sha> --json`), it records each test's least
 time as the floor's Python ran it.
 """
 
@@ -37,7 +37,6 @@ import math
 import os
 import re
 import signal
-import statistics
 import subprocess
 import sys
 import threading
@@ -85,13 +84,14 @@ def recorded_tests() -> dict[str, list[float]]:
     return tests
 
 
-def weights(files: list[str], timings: dict) -> dict[str, float | None]:
-    """Each file's seconds on armada: its median (a split task
-    reports its whole file's, `task`); else its tests' sum in
-    tests/test_durations.json, scaled by how much slower armada ran the
-    files measured both ways; else None, for a file nothing has timed."""
+def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
+    """Each file's seconds on armada under `python`: its median, which armada
+    sums over a split file's groups (`task`); else its tests' sum in
+    tests/test_durations.json, scaled by how much slower armada ran the files
+    measured both ways; else None, for a file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
-    measured = dict(timings.get("files", {}))
+    measured = {name: timings.get("files", {})[row(python, name, "")] for name in files
+                if row(python, name, "") in timings.get("files", {})}
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
@@ -119,11 +119,12 @@ def milliseconds(seconds: list[float]) -> list[int]:
 
 
 def groups(seconds: list[float], count: int) -> list[range]:
-    """`count` runs of consecutive `seconds`, the heaviest as light as `count` runs can be: how every
-    task of a file split `count` ways cuts the file's tests (split.py), in whole milliseconds, so
-    each container cuts them alike. A run past the last test is empty."""
+    """`count` runs of consecutive `seconds`, each filled up to the least capacity that needs no more
+    runs, a heavier test alone: how every task of a file split `count` ways cuts the file's tests
+    (split.py), in whole milliseconds, so each container cuts them alike. The runs beside a test
+    heavier than the rest are no heavier than they must be. A run past the last test is empty."""
     weights = milliseconds(seconds)
-    low, high = max(weights, default=0), sum(weights)
+    low, high = 0, sum(weights)
     while low < high:
         middle = (low + high) // 2
         low, high = (low, middle) if len(starts(weights, middle)) <= count else (middle + 1, high)
@@ -134,9 +135,8 @@ def groups(seconds: list[float], count: int) -> list[range]:
 
 def split(tests: list[float], seconds: float, target: float) -> list[float]:
     """The weights of the groups a file of `seconds` runs as: its recorded `tests`' times scaled to
-    `seconds`, cut (`groups`) into as many runs as it takes to hold each to `target` with a heavier
-    test alone, so no group outweighs both the target and the file's heaviest test. A file with no
-    recorded time runs as equal counts of its tests."""
+    `seconds`, cut (`groups`) into as many runs as it takes to hold each to `target`, a heavier test
+    alone. A file with no recorded time runs as equal counts of its tests."""
     if sum(tests) <= 0:
         count = math.ceil(seconds / target)
         return [seconds / count] * count
@@ -154,7 +154,7 @@ def plan(target: float, timings: dict) -> list[dict]:
     entries = []
     for python in PYTHONS:
         files = every if python == PYTHONS[0] else [name for name in every if name in NEWEST_FILES]
-        timed = weights(files, timings)
+        timed = weights(files, timings, python)
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         for name, seconds in timed.items():
@@ -189,17 +189,6 @@ def node_of(case: ET.Element) -> str:
     parts = (case.get("classname") or "").split(".")
     module = next((index for index, part in enumerate(parts) if part.startswith("test_")), len(parts) - 1)
     return "/".join(parts[:module + 1]) + ".py::" + "::".join([*parts[module + 1:], case.get("name") or ""])
-
-
-def file_share(name: str, cases: list[ET.Element]) -> float | None:
-    """How many times its `cases`' recorded durations the whole file `name`'s are, or None where the
-    durations do not cover them."""
-    if not DURATIONS.is_file():
-        return None
-    recorded = json.loads(DURATIONS.read_text())
-    group = sum(recorded.get(node_of(case), 0.0) for case in cases)
-    whole = sum(seconds for node, seconds in recorded.items() if node.split("::")[0] == name)
-    return whole / group if group > 0 else None
 
 
 def file_of(case: ET.Element) -> str:
@@ -312,25 +301,20 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
         if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
         seconds = own_seconds[name] * pace if pace else wall / len(tests)
-        # A group's own tests' time scaled by their share of the file's recorded durations, and the task's
-        # start-up once: its whole file's, however the file was split, so armada's median of a file holds
-        # across splits. Scaling the start-up too let a group of a few short tests weigh its file at far
-        # more than its groups took together: test_multiprocess.py's median read 2224 s, its groups'
-        # sums 1205 to 1558 s.
-        tested = own_seconds[name]
-        share = file_share(name, own) if split else None
-        whole = seconds if not split else wall - tested + tested * share if share else None
+        # armada times a file at the sum of its rows' timings, a split file's groups together, each
+        # Python's apart.
         rows.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
-                     **({} if whole is None else {"timings": {name: whole}})})
+                     "timings": {row(python, name, ""): seconds}})
     out.write_text(json.dumps({"rows": rows}))
     return 0
 
 
 def durations(verdicts: list[dict]) -> dict[str, float]:
-    """Each test's median time over green runs' `verdicts`, as their floor's Python ran it: a run
-    whose compilations missed the shared cache moves no test's time where two others did not."""
+    """Each test's least time over green runs' `verdicts`, as their floor's Python ran it: what it
+    takes where nothing slows it. A container can run three times as slowly as the rest of its run,
+    and a run's compilations can miss the shared cache, and neither moves a test's time."""
     times: dict[str, list[float]] = {}
     for verdict in verdicts:
         rows = verdict["rows"]
@@ -343,7 +327,7 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
         for row in floor:
             for node, seconds in row["tests"].items():
                 times.setdefault(node, []).append(seconds)
-    return {node: round(statistics.median(seconds), 3) for node, seconds in sorted(times.items())}
+    return {node: round(min(seconds), 3) for node, seconds in sorted(times.items())}
 
 
 def main() -> int:

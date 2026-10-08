@@ -221,5 +221,5 @@ jobs:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
         ARMADA_TOKEN: ${{ secrets.ARMADA_TOKEN }}
       run: |
-        armada="bunx --bun github:AshishKumar4/armada#2f735864d34fd2b0d4d201f8b5e51779539b7e7f"
+        armada="bunx --bun github:AshishKumar4/armada#84a1cdc24a8e82d2515e0db7152fb3b980f493c8"
         $armada verdict ${{ github.sha }} || $armada run ${{ github.sha }} --label="${{ github.ref_name }}"
