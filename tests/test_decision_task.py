@@ -248,7 +248,8 @@ def passed(objective, variables, examples):
     for batch in objective.held_out(examples, batch=8)(DataPartition()):
         probabilities = np.asarray(objective.evaluate(variables, batch, step).probabilities)
         logits = np.asarray(objective._logits(variables, laid_out(batch)))
-        for row in np.flatnonzero(batch[VALID_ROWS]):
+        # A batch the pass filled with repeats marks its real rows.
+        for row in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
             count = int(batch["options"][row, 0].sum())
             rows.append((int(batch["kinds"][row, 0]), logits[row, 0, :count], probabilities[row, 0, :count]))
     return rows
