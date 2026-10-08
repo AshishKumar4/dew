@@ -26,12 +26,12 @@ class Local:
         self.entries[key] = value
 
 
-def entry(milliseconds: int) -> bytes:
-    """A cache entry as JAX writes one, for a program that took `milliseconds` to compile."""
+def entry(seconds: int) -> bytes:
+    """A cache entry as JAX writes one, for a program that took `seconds` to compile."""
     from jax._src import compilation_cache
 
     return compilation_cache.compress_executable(
-        compilation_cache.combine_executable_and_time(b"executable", milliseconds))
+        compilation_cache.combine_executable_and_time(b"executable", seconds))
 
 
 @pytest.fixture
@@ -97,9 +97,9 @@ def test_a_slow_compilation_one_task_makes_is_read_by_the_next(worker):
     url, stored, seen = worker
     first = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
     first.load_names()
-    first.put("jit_step-1", entry(1500))
-    first.put("jit_step-2", entry(10))
-    first.put("jit_init-3", entry(10))
+    first.put("jit_step-1", entry(2))
+    first.put("jit_step-2", entry(0))
+    first.put("jit_init-3", entry(0))
     first.drain()
     assert sorted(stored) == ["/jax/cpu/jit_step-1", "/jax/cpu/names/jit_step"]
 
@@ -109,9 +109,9 @@ def test_a_slow_compilation_one_task_makes_is_read_by_the_next(worker):
     second.load_names()
     assert second.names == {"jit_step", "jit_a", "jit_b"}  # over two pages
     seen.clear()
-    assert second.get("jit_step-1") == entry(1500)
-    assert second.base.get("jit_step-1") == entry(1500)  # kept locally, so the next read is local
-    assert second.get("jit_step-1") == entry(1500)
+    assert second.get("jit_step-1") == entry(2)
+    assert second.base.get("jit_step-1") == entry(2)  # kept locally, so the next read is local
+    assert second.get("jit_step-1") == entry(2)
     assert second.get("jit_step-2") is None and second.get("jit_init-3") is None
     assert seen == ["/jax/cpu/jit_step-1", "/jax/cpu/jit_step-2"] and second.available
 
@@ -120,10 +120,10 @@ def test_a_wrong_token_leaves_the_remote_alone_and_never_raises(worker):
     url, stored, _ = worker
     cache = remote_cache.RemoteCache(Local(), url, "wrong", "jax/cpu")
     cache.load_names()
-    cache.put("jit_step-1", entry(1500))
+    cache.put("jit_step-1", entry(2))
     cache.drain()
     assert not cache.available and stored == {} and cache.get("jit_step-2") is None
-    assert cache.base.get("jit_step-1") == entry(1500)
+    assert cache.base.get("jit_step-1") == entry(2)
 
 
 def test_an_unreachable_remote_only_slows_a_task_by_one_failed_listing(monkeypatch):
@@ -142,11 +142,11 @@ def test_an_unreachable_remote_only_slows_a_task_by_one_failed_listing(monkeypat
     cache.load_names()
     for index in range(10):
         assert cache.get(f"jit_step-{index}") is None
-        cache.put(f"jit_step-{index}", entry(1500))
+        cache.put(f"jit_step-{index}", entry(2))
     cache.drain()
     assert time.monotonic() - began < 10
     assert not cache.available and len(opened) == 1
-    assert all(cache.base.get(f"jit_step-{index}") == entry(1500) for index in range(10))
+    assert all(cache.base.get(f"jit_step-{index}") == entry(2) for index in range(10))
 
 
 def test_a_process_compiles_through_the_shared_layer_and_the_next_reads_it(worker, tmp_path):
@@ -164,7 +164,7 @@ import jax
 import remote_cache
 from dew.cache import enable_compilation_cache
 enable_compilation_cache(sys.argv[1])
-remote_cache.REMOTE_MS = 0
+remote_cache.REMOTE_SECONDS = 0
 remote = remote_cache.install(sys.argv[2], "token")
 assert remote is not None
 print(float(jax.jit(lambda x: (x * 3.0).sum())(jax.numpy.arange(4.0))))

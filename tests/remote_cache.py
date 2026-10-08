@@ -6,13 +6,13 @@ the suite spends most of its time in XLA: a parallelism-matrix cell ran 367
 s cold and 99 s with its compilations cached. With DEW_XLA_CACHE_URL and
 DEW_XLA_CACHE_TOKEN set (.armada.json), `install` puts `RemoteCache` over
 JAX's own cache: a local miss is fetched from the URL, the dew-xla-cache
-Worker (tools/armada/xla_cache), and an entry that took at least `REMOTE_MS`
+Worker (tools/armada/xla_cache), and an entry that took at least `REMOTE_SECONDS`
 to compile is written to both. Entries are keyed under jax's and jaxlib's
 versions, the backend and the Python minor, beside JAX's own key of the
 program and its flags.
 
 A test that runs a model eagerly compiles thousands of small programs, each
-quicker than `REMOTE_MS`, so never in the remote: asking the Worker about each
+quicker than `REMOTE_SECONDS`, so never in the remote: asking the Worker about each
 one took a DeepSeek drafting test from 103 s to 962 s. So the remote also
 keeps the name of each program it holds (`names/<module>`), a process lists
 those names once, and `get` asks only about a program of one of them.
@@ -36,7 +36,7 @@ import urllib.parse
 import urllib.request
 
 FAILURES = 3
-REMOTE_MS = 1000
+REMOTE_SECONDS = 1
 TIMEOUT_SECONDS = 10.0
 DRAIN_SECONDS = 60.0
 MAX_BYTES = 256 * 1024 * 1024
@@ -127,7 +127,7 @@ class RemoteCache:
 
     def put(self, key: str, value: bytes) -> None:
         self.base.put(key, value)
-        if self.available and len(value) <= MAX_BYTES and compile_ms(value) >= REMOTE_MS:
+        if self.available and len(value) <= MAX_BYTES and compile_seconds(value) >= REMOTE_SECONDS:
             future = self.uploads.submit(self._upload, key, bytes(value))
             with self.lock:
                 self.pending.add(future)
@@ -150,8 +150,9 @@ def module(key: str) -> str:
     return key.rsplit("-", 1)[0]
 
 
-def compile_ms(value: bytes) -> int:
-    """How long the entry `value` took to compile, as JAX records it in the entry's first bytes."""
+def compile_seconds(value: bytes) -> int:
+    """How long the entry `value` took to compile, in whole seconds, as JAX records it in the entry's
+    first bytes."""
     from jax._src import compilation_cache
 
     try:
