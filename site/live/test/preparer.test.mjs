@@ -42,7 +42,7 @@ async function preparation(failSmoke) {
 		if (failSmoke) await assert.rejects(run, /offline smoke failed/);
 		else assert.equal((await run).commit, 'a'.repeat(64));
 	} finally { globalThis.fetch = originalFetch; }
-	return { starts, destroys, alarm, status: await runner.status() };
+	return { starts, destroys, alarm, status: await runner.status(), runner };
 }
 
 test('managed preparation snapshots once and validates its restore without internet', async () => {
@@ -54,10 +54,15 @@ test('managed preparation snapshots once and validates its restore without inter
 	assert.equal(result.destroys, 2);
 	assert.equal(result.alarm, false);
 	assert.equal(result.status.phase, 'complete');
+	assert.deepEqual((await result.runner.snapshots()).map(({ id, state, trial }) => [id, state, trial]), [['snapshot', 'ready', false]]);
+	await result.runner.forget(['snapshot']);
+	assert.deepEqual(await result.runner.snapshots(), []);
 });
 test('the shared preparation lifecycle tears down after an offline smoke failure', async () => {
 	const result = await preparation(true);
 	assert.equal(result.destroys, 2);
 	assert.equal(result.alarm, false);
 	assert.equal(result.status.phase, 'offline restore');
+	// The snapshot of a preparation that failed its smoke is recorded, so an operator deletes it.
+	assert.deepEqual((await result.runner.snapshots()).map(({ id, state }) => [id, state]), [['snapshot', 'failed']]);
 });
