@@ -187,6 +187,9 @@ class CausalSelfAttention(nn.Module):
     def setup(self):
         if self.alibi and not self.nope:
             raise ValueError('ALiBi requires unrotated attention (nope=True)')
+        if self.rotary_per_axis and self.rotary_axes is None:
+            raise ValueError('rotary_per_axis turns each of the rotary_axes in its own halves, '
+                             'so it needs rotary_axes')
         if self.exclusive_self_attention and self.kv_shared:
             raise ValueError(
                 "exclusive self attention subtracts the token's own value, and a "
@@ -522,9 +525,10 @@ class CausalSelfAttention(nn.Module):
         """Query or key heads in the layout their rotation reads: with
         `rotary_per_axis`, each axis's halves gathered into the head's two
         (`dew.nn.rope.axis_halves`), which moves query and key alike."""
-        if self.rotary_per_axis and self.rotary_axes is not None:
-            return axis_halves(heads, self.rotary_axes)
-        return heads
+        if not self.rotary_per_axis:
+            return heads
+        assert self.rotary_axes is not None  # setup refuses per-axis halves without axes
+        return axis_halves(heads, self.rotary_axes)
 
     def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
                         decode: bool, S: int):
