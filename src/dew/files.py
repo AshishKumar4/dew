@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import contextlib
 import os
+import secrets
 import shutil
-import tempfile
+import stat
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -30,20 +31,22 @@ def replacing(path: str | os.PathLike) -> Iterator[epath.Path]:
 
     The temporary sits in `path`'s directory, so the rename never crosses a
     filesystem, and is created for this write alone, so concurrent writers of
-    one target (threads, processes) never share it. A location with a scheme
-    yields `path` itself.
+    one target (threads, processes) never share it. The file published has
+    the mode a plain write gives: the target's own, or a new file's under the
+    umask. A location with a scheme yields `path` itself.
     """
     if "://" in str(path):
         yield epath.Path(path)
         return
     target = Path(path)
-    descriptor, name = tempfile.mkstemp(dir=target.parent, prefix=f".{target.name}.", suffix=".tmp")
-    os.close(descriptor)
-    temporary = epath.Path(name)
+    temporary = epath.Path(_beside(target, ".tmp"))
+    os.close(os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o666))
     try:
         yield temporary
         with open(temporary, "rb+") as written:
             os.fsync(written.fileno())
+        with contextlib.suppress(FileNotFoundError):
+            os.chmod(temporary, stat.S_IMODE(os.stat(target).st_mode))
         os.replace(temporary, target)
     finally:
         temporary.unlink(missing_ok=True)
@@ -64,10 +67,12 @@ def staged(directory: Path) -> Iterator[Path]:
     when the block ends and removed if the block raises.
 
     A `directory` another writer published first is kept, whole, and this
-    write dropped: every writer publishes by the one rename.
+    write dropped: every writer publishes by the one rename. The directory
+    has the mode `mkdir` gives under the umask.
     """
     directory.parent.mkdir(parents=True, exist_ok=True)
-    staging = Path(tempfile.mkdtemp(dir=directory.parent, prefix=f".{directory.name}."))
+    staging = _beside(directory, "")
+    staging.mkdir()
     try:
         yield staging
         try:
@@ -77,3 +82,8 @@ def staged(directory: Path) -> Iterator[Path]:
                 raise
     finally:
         shutil.rmtree(staging, ignore_errors=True)
+
+
+def _beside(target: Path, suffix: str) -> Path:
+    """A name in `target`'s directory that no other write uses."""
+    return target.with_name(f".{target.name}.{secrets.token_hex(8)}{suffix}")
