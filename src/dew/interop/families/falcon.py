@@ -6,8 +6,7 @@ from functools import partial
 import numpy as np
 
 from dew import records
-from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,
@@ -16,6 +15,7 @@ from dew.interop.hf_decoders import (
     renamed_name,
     renamed_path,
 )
+from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
 

@@ -17,9 +17,7 @@ from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.families.deepseek import deepseek_config, deepseek_layout, deepseek_mixture
-from dew.interop.families.qwen import single_prediction_depth
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     KindFields,
@@ -38,6 +36,8 @@ from dew.interop.hf_decoders import (
     specified_layer_types,
     translated,
 )
+from dew.interop.families.deepseek import deepseek_config, deepseek_layout, deepseek_mixture
+from dew.interop.families.qwen import single_prediction_depth
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind

@@ -5,8 +5,7 @@ from functools import partial
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
@@ -15,6 +14,7 @@ from dew.interop.hf_decoders import (
     renamed_name,
     renamed_path,
 )
+from dew.interop.families.gpt_neox import gpt_neox_export_weights, gpt_neox_prepare
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 

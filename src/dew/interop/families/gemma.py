@@ -17,7 +17,7 @@ from flax.traverse_util import flatten_dict
 
 from dew import records
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
     GEMMA3_MODEL_TYPE,
     MOE_SHARED,

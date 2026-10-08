@@ -31,7 +31,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 if TYPE_CHECKING:
-    from dew.interop.hf_decoders import DecoderFields
+    from dew.interop.decoder_parts import DecoderFields
 
 MODEL_TYPE = "mamba2"
 

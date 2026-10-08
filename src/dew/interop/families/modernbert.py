@@ -18,7 +18,7 @@ import numpy as np
 
 from dew import records
 from dew.interop.config_records import native_fields
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     ACTIVATIONS,
     DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,

@@ -7,7 +7,7 @@ import jax
 import numpy as np
 
 from dew import records
-from dew.interop.hf_decoders import (
+from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     Renames,

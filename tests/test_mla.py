@@ -24,7 +24,8 @@ import pytest
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 
-from dew.interop.hf_decoders import translate_weights, yarn_record
+from dew.interop.decoder_parts import yarn_record
+from dew.interop.hf_decoders import translate_weights
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mla import MLAMixer, MultiHeadLatentAttention
