@@ -1,24 +1,19 @@
 {
-	"about": "The screen framework.py left on a terminal, written by site/scripts/capture_snippets.py.",
-	"arguments": [
-		"--section",
-		"lm",
-		"--out",
-		"/tmp/rec/out"
-	],
-	"script_sha256": "5e01545363a1a30f0e81a59adbf6ed34b3bed980597a1abbba8a38d6c81d4e5f",
+	"about": "The screen lm.py left on a terminal, written by site/scripts/capture_snippets.py.",
+	"arguments": [],
+	"script_sha256": "f9b6ce426799fac56990a452831d170e6f0ba0202d7d75b508ca41326857628c",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "9d81a3dc7e71e141ede6afb1b060f21a450a2f96",
+		"dew": "898a4ec7f2af4f4ee3b51c1842d43070e4a957e4",
 		"date": "2026-10-08"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 17.1,
+		"seconds": 16.9,
 		"columns": 96,
 		"screen": [
 			[
@@ -211,7 +206,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 2.21 s                   "
+					"text": "after 2.02 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -231,7 +226,7 @@
 					"dim": true
 				},
 				{
-					"text": "119.7 step/s                   "
+					"text": "121.1 step/s                   "
 				},
 				{
 					"text": "\u2502",
@@ -251,7 +246,7 @@
 					"dim": true
 				},
 				{
-					"text": "0.7% of the wall time in steps "
+					"text": "0.8% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -286,26 +281,6 @@
 				{
 					"text": "\u2570\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256f",
 					"fg": "00afd7"
-				}
-			],
-			[
-				{
-					"text": "{"
-				}
-			],
-			[
-				{
-					"text": "  \"steps\": 3,"
-				}
-			],
-			[
-				{
-					"text": "  \"parameters\": 18560"
-				}
-			],
-			[
-				{
-					"text": "}"
 				}
 			]
 		]

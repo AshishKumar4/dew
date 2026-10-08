@@ -150,7 +150,7 @@ test('homepage text and diffusion cells run at once in their own contexts of one
 	await page.close();
 });
 
-test('a training cell waits its turn on the host, then shows the run', { timeout: 10_000 }, async () => {
+test('a pool cell waits its turn on the host, then its live run replaces the recording', { timeout: 10_000 }, async () => {
 	const page = await browser.newPage();
 	await page.route('https://challenges.cloudflare.com/**', (route) => route.fulfill({
 		contentType: 'text/javascript',
@@ -174,13 +174,15 @@ test('a training cell waits its turn on the host, then shows the run', { timeout
 		});
 	});
 	await page.goto(`http://127.0.0.1:${server.address().port}/`);
-	const panel = page.locator('[data-live-train="finetune"]');
-	await panel.locator('[data-train-run]').click();
-	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent
-		.startsWith('This host trains one run at a time; 1 run is ahead of yours'));
+	const panel = page.locator('[data-landing-cell="finetune"]');
+	assert.ok(await panel.locator('[data-cell-showcase] .hero-output').isVisible());
+	await panel.locator('[data-cell-run]').click();
+	await page.waitForFunction(() => document.querySelector('[data-landing-cell="finetune"] [data-cell-status]').textContent
+		.startsWith('This host runs one cell at a time; 1 run is ahead of yours'));
+	assert.ok(await panel.locator('[data-cell-showcase]').isHidden());
 	turn.resolve();
-	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent.startsWith('Ran in'));
-	assert.match(await panel.locator('[data-train-output]').textContent(), /^Live run: steps 1000 -> 20\./);
+	await page.waitForFunction(() => document.querySelector('[data-landing-cell="finetune"] [data-cell-status]').textContent.startsWith('Ran in'));
+	assert.match(await panel.locator('[data-cell-output]').textContent(), /^Live run: steps 1000 -> 20\./);
 	assert.deepEqual(sent.map(({ cell, kernel }) => [cell, kernel]), [['finetune', 'train']]);
 	await page.close();
 });
@@ -207,13 +209,13 @@ test('a live stream shows nothing while it is blank, then its text without blank
 		});
 	});
 	await page.goto(`http://127.0.0.1:${server.address().port}/`);
-	const panel = page.locator('[data-live-train="finetune"]');
-	await panel.locator('[data-train-run]').click();
-	const stream = panel.locator('[data-train-output] pre.nb-stream');
+	const panel = page.locator('[data-landing-cell="finetune"]');
+	await panel.locator('[data-cell-run]').click();
+	const stream = panel.locator('[data-cell-output] pre.nb-stream');
 	await stream.waitFor({ state: 'attached' });
 	assert.deepEqual(await stream.evaluate((pre) => [pre.hidden, pre.textContent]), [true, '']);
 	printed.resolve();
-	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent.startsWith('Ran in'));
+	await page.waitForFunction(() => document.querySelector('[data-landing-cell="finetune"] [data-cell-status]').textContent.startsWith('Ran in'));
 	assert.equal(await stream.count(), 1);
 	assert.deepEqual(await stream.evaluate((pre) => [pre.hidden, pre.textContent]), [false, 'hello']);
 	await page.close();
@@ -259,22 +261,30 @@ test('editable Python highlighting follows edits, scrolling and theme', async ()
 	await page.close();
 });
 
-test('standalone examples copy the edited cell and reset its original text', async () => {
+test('every landing cell copies its edited code, runs on the pool or in Colab, and shows its recording; nothing resets', async () => {
 	const page = await browser.newPage({ permissions: ['clipboard-read', 'clipboard-write'] });
 	await page.goto(`http://127.0.0.1:${server.address().port}/`);
-	const examples = page.locator('[data-example-editor]');
-	assert.ok(await examples.count() >= 11);
-	const editor = examples.first();
-	assert.deepEqual(await editor.locator('button').allTextContents(), ['Copy', 'Reset']);
+	assert.equal(await page.getByRole('button', { name: 'Reset' }).count(), 0);
+	const cells = page.locator('[data-landing-cell]');
+	assert.equal(await cells.count(), 13);
+	for (const cell of await cells.all()) {
+		const actions = [...await cell.locator('.sampler-editor-actions button').allTextContents(),
+			...await cell.locator('.sampler-editor-actions a').allTextContents()];
+		assert.ok(['Copy,Run', 'Copy,Run in Colab'].includes(actions.join()), actions.join());
+		assert.ok(await cell.locator('[data-cell-showcase] .hero-output-meta').isVisible());
+	}
+	const colab = page.locator('[data-landing-cell="pretrained"] [data-cell-colab]');
+	assert.equal(await colab.getAttribute('href'),
+		'https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/landing/pretrained.ipynb');
+	const editor = cells.nth(1);
 	const text = editor.locator('textarea');
-	const original = await text.inputValue();
-	const edited = `${original}\n# edited`;
+	const edited = `${await text.inputValue()}\n# edited`;
 	await text.fill(edited);
-	await editor.locator('[data-example-copy]').click();
+	await editor.locator('[data-cell-copy]').click();
 	await editor.getByRole('button', { name: 'Copied', exact: true }).waitFor();
 	assert.equal(await page.evaluate(() => navigator.clipboard.readText()), edited);
-	await editor.locator('[data-example-reset]').click();
-	assert.equal(await text.inputValue(), original);
+	assert.ok(await page.locator('[data-live-text] [data-text-output]').textContent().then((text) => text.includes('Paris')));
+	assert.ok(await page.locator('[data-live-sampler] [data-final]').isVisible());
 	await page.close();
 });
 

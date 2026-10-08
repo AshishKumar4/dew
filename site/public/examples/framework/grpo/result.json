@@ -1,5 +1,0 @@
-{
-  "steps": 150,
-  "reward": "Adjacent response tokens counting up modulo 13",
-  "reports": "tracking/scalars.jsonl"
-}

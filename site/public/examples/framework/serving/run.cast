@@ -1,3 +1,2 @@
-{"version": 2, "width": 96, "height": 200, "timestamp": 1791418484, "env": {"TERM": "xterm-256color"}}
-[61.312988, "o", "[' Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital', ' Tokyo. The capital of the United States is Washington, D.C. The capital of France is Paris. The capital of']\r\n"]
-[112.614327, "o", "{\r\n  \"text\": [\r\n    \" Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital\",\r\n    \" Tokyo. The capital of the United States is Washington, D.C. The capital of France is Paris. The capital of\"\r\n  ],\r\n  \"weight_formats\": [\r\n    \"int8\",\r\n    \"fp8\"\r\n  ]\r\n}\r\n"]
+{"version": 2, "width": 96, "height": 200, "timestamp": 1791480543, "env": {"TERM": "xterm-256color"}}
+[61.714706, "o", "[' Paris. The capital of France is also the capital of the Republic of France. The capital of France is also the capital', ' Tokyo. The capital of the United States is Washington, D.C. The capital of France is Paris. The capital of']\r\n"]

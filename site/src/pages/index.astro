@@ -1,9 +1,9 @@
 ---
-import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 import { example, trainingExample } from '../data/framework-examples.mjs';
+import { cellRecording, checked, samplerRecording, textRecording } from '../data/recordings.mjs';
 import LandingCell from '../components/landing/LandingCell.astro';
 import LiveSampler from '../components/landing/LiveSampler.astro';
 import LiveText from '../components/landing/LiveText.astro';
@@ -21,18 +21,11 @@ import { live } from '../live.mjs';
 import '../styles/landing.css';
 
 const readPublic = (...parts: string[]) => readFileSync(path.join(process.cwd(), 'public', ...parts), 'utf8');
-const sha256 = (text: string) => createHash('sha256').update(text).digest('hex');
-// Each cell shows the recording of exactly its code: a recording of other code fails the build.
-const recorded = (name: string, code: string, recording: { script_sha256: string }) => {
-	if (recording.script_sha256 !== sha256(code)) throw new Error(`${name}: the recording is of other code; record it again (site/scripts/capture_snippets.py)`);
-	return recording;
-};
 const names = [...cells.pool, ...cells.colab];
 const code = Object.fromEntries(names.map((name) => [name, example(framework, name)]));
-const records = Object.fromEntries(names.map((name) => [name,
-	recorded(name, code[name], JSON.parse(readPublic('examples', 'framework', name, 'capture.json')))]));
+const records = Object.fromEntries(names.map((name) => [name, cellRecording(name, code[name])]));
 const cell = (name: string) => ({ code: code[name], cell: name, recording: records[name], colab: cells.colab.includes(name) ? colabUrl(name) : undefined });
-recorded('hero', heroCode, capture);
+checked('hero', heroCode, { script_sha256: capture.meta.script_sha256 });
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const terminalReplay = JSON.parse(readPublic('hero', 'train.json'));
 const expanded = [...terminalReplay.frames.at(-1).screen];
@@ -120,7 +113,7 @@ const tutorialNames: Record<string, string> = {
 		<section class="band" data-reveal>
 			<h2 class="band-title">Inference</h2>
 			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. Run the cell to generate on a shared CPU host.</p>
-			<LiveText cell={textCell} recording={textRecording} />
+			<LiveText cell={textCell} recording={textRecording(textCell)} />
 			<p class="framework-note"><code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache:</p>
 			<LandingCell {...cell('serving')} title="Batched decoding" />
 			<p class="framework-note">Store weights in int8 or fp8:</p>
@@ -138,7 +131,7 @@ const tutorialNames: Record<string, string> = {
 		<section class="band replay" data-replays data-reveal>
 			<h2 class="band-title">Diffusion</h2>
 			<p class="band-lede">The process sets how training adds noise and what the model learns to predict. At generation time a solver runs the process in reverse, and you can switch solvers without retraining.</p>
-			<LiveSampler cell={samplerCell} recording={samplerRecording} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
+			<LiveSampler cell={samplerCell} recording={samplerRecording(samplerCell)} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
 			<LandingCell {...cell('diffusion')} title="Define and train a DiT" />
 			<p class="framework-note">A {modelSize}M-parameter text-to-image model at {resolution}, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
 			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>

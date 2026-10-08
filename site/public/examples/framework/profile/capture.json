@@ -1,7 +1,7 @@
 {
-	"about": "The screen jepa.py left on a terminal, written by site/scripts/capture_snippets.py.",
+	"about": "The screen profile.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "54e4a3993c0bc9b5edade0baf7611c63dbc7d9b0ef6cdbe6bb414add36096ec1",
+	"script_sha256": "b3545bf1749091aad178297b5916ada2bb6fab75fd46b9814e58dc3e36765f33",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
@@ -13,12 +13,12 @@
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 26.8,
+		"seconds": 5.7,
 		"columns": 96,
 		"screen": [
 			[
 				{
-					"text": "validation: 256 records held out of train"
+					"text": "Wrote profile for 2 steps to profile"
 				}
 			],
 			[
@@ -37,12 +37,12 @@
 					"dim": true
 				},
 				{
-					"text": "JepaEncoder",
+					"text": "CausalTransformer",
 					"fg": "00afd7",
 					"bold": true
 				},
 				{
-					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
+					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
 					"fg": "00afd7"
 				}
 			],
@@ -52,7 +52,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": " 18,736 parameters"
+					"text": " 18,560 parameters"
 				},
 				{
 					"text": "  \u00b7  on ",
@@ -66,14 +66,14 @@
 					"dim": true
 				},
 				{
-					"text": "64"
+					"text": "8"
 				},
 				{
 					"text": "  \u00b7  ",
 					"dim": true
 				},
 				{
-					"text": "float32                                    "
+					"text": "float32                                     "
 				},
 				{
 					"text": "\u2502",
@@ -106,7 +106,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
+					"text": "\u2501\u2501\u2501\u2501\u2501\u2501\u2501",
 					"fg": "5fafd7"
 				},
 				{
@@ -125,22 +125,22 @@
 					"text": "  "
 				},
 				{
-					"text": "3",
+					"text": "5",
 					"bold": true
 				},
 				{
-					"text": "/3",
+					"text": "/5",
 					"dim": true
 				},
 				{
-					"text": "  100%  6.6"
+					"text": "  100%  15.6"
 				},
 				{
 					"text": " step/s",
 					"dim": true
 				},
 				{
-					"text": "  0:00:06 "
+					"text": "  0:00:02 "
 				},
 				{
 					"text": "\u2502",
@@ -176,12 +176,12 @@
 					"fg": "5faf5f"
 				},
 				{
-					"text": "JepaEncoder",
+					"text": "CausalTransformer",
 					"fg": "00afd7",
 					"bold": true
 				},
 				{
-					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
+					"text": "  \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u256e",
 					"fg": "00afd7"
 				}
 			],
@@ -198,7 +198,7 @@
 					"dim": true
 				},
 				{
-					"text": "3 steps in 0:00:08             "
+					"text": "5 steps in 0:00:03             "
 				},
 				{
 					"text": "\u2502",
@@ -218,7 +218,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 8.21 s                   "
+					"text": "after 2.53 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -238,7 +238,7 @@
 					"dim": true
 				},
 				{
-					"text": "17.9 step/s                    "
+					"text": "23.2 step/s                    "
 				},
 				{
 					"text": "\u2502",
@@ -258,7 +258,7 @@
 					"dim": true
 				},
 				{
-					"text": "1.3% of the wall time in steps "
+					"text": "6.3% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -278,7 +278,7 @@
 					"dim": true
 				},
 				{
-					"text": "1.739                         ",
+					"text": "5.570                         ",
 					"bold": true
 				},
 				{

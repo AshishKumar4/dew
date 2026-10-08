@@ -5,6 +5,7 @@
 import StarlightPage from '@astrojs/starlight/components/StarlightPage.astro';
 import LiveSampler from '../components/landing/LiveSampler.astro';
 import samplerCell from '../data/sampler.py?raw';
+import { samplerRecording } from '../data/recordings.mjs';
 import '../styles/landing.css';
 ---
 
@@ -26,6 +27,7 @@ import '../styles/landing.css';
 	<div class="landing not-content">
 		<LiveSampler
 			cell={samplerCell}
+			recording={samplerRecording(samplerCell)}
 			colab="https://colab.research.google.com/github/AshishKumar4/dew/blob/main/site/notebooks/sample-text-to-image.ipynb"
 		/>
 	</div>

@@ -1,0 +1,31 @@
+{
+	"about": "The screen formats.py left on a terminal, written by site/scripts/capture_snippets.py.",
+	"arguments": [],
+	"script_sha256": "e68d27e50346caff1a4acc7c3eed313c0f227519d78e001460a92fd74355a03f",
+	"meta": {
+		"where": "a 4-vCPU Cloudflare container",
+		"python": "3.12.15",
+		"jax": "0.11.2.post3",
+		"flax": "0.12.10",
+		"optax": "0.2.8",
+		"dew": "898a4ec7f2af4f4ee3b51c1842d43070e4a957e4",
+		"date": "2026-10-08"
+	},
+	"hero": {
+		"returncode": 0,
+		"seconds": 86.3,
+		"columns": 96,
+		"screen": [
+			[
+				{
+					"text": "int8  Paris. The capital of Italy is Rome. The capital of"
+				}
+			],
+			[
+				{
+					"text": "fp8  Paris. The capital of France is also the capital of the"
+				}
+			]
+		]
+	}
+}
