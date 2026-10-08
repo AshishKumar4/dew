@@ -1456,6 +1456,17 @@ def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
     return (out if scale is None else out * scale).astype(x.dtype)
 
 
+def test_a_per_axis_rotary_without_its_axes_is_refused():
+    """Turning each axis in its own halves needs the axes; without them the
+    layer would rotate by its positions and drop the per-axis layout."""
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    layer = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=2, head_dim=4, max_seq_len=4,
+                                causal=False, rotary_per_axis=True)
+    with pytest.raises(ValueError, match="needs rotary_axes"):
+        layer.init(jax.random.key(0), jnp.zeros((1, 4, 8)))
+
+
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("pairs, scale, packed", [(64, None, False), (64, 0.0884, False), (24, None, True)],
                          ids=["full", "scaled", "partial-packed"])
