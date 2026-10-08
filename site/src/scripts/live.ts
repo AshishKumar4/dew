@@ -125,7 +125,8 @@ export class LiveSession {
 		const onMessage = (event: MessageEvent) => {
 			if (JSON.parse(String(event.data)).type === 'ready') resolve();
 		};
-		const onClose = () => reject(new Error('The live kernel could not start. Try again in a minute.'));
+		const onClose = (event: CloseEvent) => reject(new Error(event.reason
+			? `The live kernel could not start: ${event.reason}.` : 'The live kernel could not start. Try again in a minute.'));
 		socket.addEventListener('message', onMessage);
 		socket.addEventListener('close', onClose);
 		try {
