@@ -16,7 +16,7 @@ fi
 cmake -S "$here" -B "$here/build" -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build "$here/build" --parallel "${JOBS:-4}"
 stage=$(mktemp -d)
-cp -r "$here/dew_flash_attn" "$here/pyproject.toml" "$stage/"
+cp -r "$here/dew_flash_attn" "$here/pyproject.toml" "$here/README.md" "$stage/"
 cp "$here/build/libdew_flash_attn.so" "$stage/dew_flash_attn/"
 cp "$here/upstream/LICENSE" "$stage/LICENSE"
 sed -i "s/dew-flash-attn-cuXX/dew-flash-attn-cu$major/" "$stage/pyproject.toml"

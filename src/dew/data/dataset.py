@@ -666,7 +666,6 @@ class Dataset:
         batch. `validation` is read once, in order, and every record is scored, with
         the last batch padded (`VALID_ROWS`).
         """
-        held = None if validation is None else in_memory(validation)
         source = in_memory(records)
         if len(source) < batch:
             raise ValueError(
@@ -674,11 +673,18 @@ class Dataset:
                 f"batch would hold a record twice and an epoch would take no steps")
         return cls(
             train=train_stream(source, [], batch=batch, seed=seed, loading=loading),
-            val=None if held is None else validation_pass(held, [], batch=batch, seed=seed,
-                                                          loading=loading),
+            val=None if validation is None else cls.validation(validation, batch=batch, loading=loading),
             records=len(source),
             batch=batch,
         )
+
+    @staticmethod
+    def validation(records: InMemory, *, batch: int, loading: Loading = _DEFAULT_LOADING) -> Reader:
+        """A validation split over records the caller holds, as `from_records`
+        reads them: each record scored once, in order, the last batch padded
+        (`VALID_ROWS`), however few there are. `fit(validation=...)` and
+        `EvalSuite` take it beside the dataset's own."""
+        return validation_pass(in_memory(records), [], batch=batch, seed=0, loading=loading)
 
     @classmethod
     def from_torch(cls, dataset: TorchDataset, *, batch: int, fields: Sequence[str] | None = None,

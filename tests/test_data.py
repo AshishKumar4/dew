@@ -1636,6 +1636,16 @@ def test_held_out_records_too_few_for_one_batch_are_one_filled_batch():
     np.testing.assert_array_equal(batches[0][VALID_ROWS], [True, True, True, False])
 
 
+def test_a_validation_split_needs_no_training_records():
+    """A second held-out split, beside a dataset's own, is the same ordered
+    pass over its records, a short last batch filled and marked."""
+    batches = list(Dataset.validation(_columns(5), batch=4)(DataPartition()))
+
+    marked = [np.asarray(batch.get(VALID_ROWS, np.ones(4, bool))).tolist() for batch in batches]
+    assert marked == [[True] * 4, [True, False, False, False]]
+    assert _indices(Dataset.validation(_columns(5), batch=4)(DataPartition()), 1) == [[0, 1, 2, 3]]
+
+
 def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
     """Token ids of varying length are the usual cause, and grain's own
     message names the batch structure rather than what to change."""

@@ -385,6 +385,20 @@ class ProgramModule(NamedTuple):
     False for a frozen teacher or reference."""
 
 
+@jax.custom_jvp
+def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
+    """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`)."""
+    return value
+
+
+@_ruled.defjvp
+def _ruled_jvp(primals, tangents):
+    value, rule, _ = primals
+    moved_value, _, moved = tangents
+    return value, moved_value + sum(jnp.vdot(leaf, change) for leaf, change in
+                                    zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+
+
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
@@ -647,15 +661,25 @@ class Objective(ABC, Generic[Loss, Effects]):
         dtype = jnp.promote_types(values.dtype, jnp.float32)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
-        valid = batch.get(VALID_ROWS)
-        if valid is None:
+        if VALID_ROWS not in batch:
             return Ratio(jnp.sum(values, axes), jnp.asarray(math.prod(values.shape[a] for a in axes), dtype))
         held = (rows,) if isinstance(rows, int) else rows
         shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
-        real = jnp.asarray(valid, bool).reshape(shape)
+        real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
         return Ratio(jnp.sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
+
+    @staticmethod
+    def row_weights(batch: Batch, rows: int) -> jax.Array:
+        """Each of the batch's `rows` rows' weight, float32: 1 for a real row
+        and 0 for a repeat that fills an evaluation batch (`VALID_ROWS`), and 1
+        for every row of a training batch. A rule an objective computes itself
+        weights its rows by this, as `row_mean` does."""
+        valid = batch.get(VALID_ROWS)
+        if valid is None:
+            return jnp.ones((rows,), jnp.float32)
+        return jnp.asarray(valid, jnp.float32).reshape(rows)
 
     @staticmethod
     def accuracy(correct: jax.Array, batch: Batch, weights: jax.Array | None = None, *,
@@ -708,22 +732,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         as it does the total's own derivative. A
         `loss` that computes its own update rule (e-prop's eligibility traces,
         a forward-gradient or evolution-strategies estimate, a synthetic
-        gradient) returns this. Each statistic keeps its value, which adds
-        zero, `<gradient, params - stop_gradient(params)>`, whose derivative
-        is `gradient`; so the trainer's one gradient path, with its
-        microbatching, accumulation, sharding and logging, applies the rule
-        as it applies `jax.grad`'s.
+        gradient) returns this. Each statistic keeps its value and takes the
+        rule as its derivative in `params` (a custom JVP), so the trainer's
+        one gradient path, with its microbatching, accumulation, sharding and
+        logging, applies the rule as it applies `jax.grad`'s, and a pass that
+        reads only the values, a validation pass's, never computes the rule.
         """
-        moved = jax.tree.leaves(jax.tree.map(lambda leaf: leaf - jax.lax.stop_gradient(leaf), params))
-
         def held(value, gradient):
             value = jax.lax.stop_gradient(jnp.asarray(value))
             if gradient is None:
                 return value
             if value.ndim:
                 raise ValueError(f"a statistic with supplied gradients is a scalar, not {value.shape}")
-            pairs = zip(jax.tree.leaves(gradient), moved, strict=True)
-            return value + sum(jnp.vdot(jax.lax.stop_gradient(rule), change) for rule, change in pairs)
+            if len(jax.tree.leaves(gradient)) != len(jax.tree.leaves(params)):
+                raise ValueError("a statistic's gradients hold one rule for each trained parameter")
+            return _ruled(value, jax.lax.stop_gradient(gradient), params)
 
         return jax.tree.map(held, stats, gradients)
 
@@ -985,12 +1008,14 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
 
 __all__ = [
     "FROZEN",
+    "OMITTED",
     "VALID_ROWS",
     "Aux",
     "Batch",
     "EMASpec",
     "Metric",
     "Objective",
+    "Omitted",
     "Path",
     "PathFilter",
     "Prediction",
