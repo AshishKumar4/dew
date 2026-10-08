@@ -207,9 +207,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         """The sequence length, canvas budget, tokenizer and block process."""
         from dew.diffusion.block import BlockProcess
         from dew.inference.tasks import recorded_tokenizer
+        from dew.registry import to_record
         return {'seq_len': self.sequence_length, 'max_new_tokens': self.canvas_size,
                 'tokenizer': recorded_tokenizer(self.processor),
-                'process': BlockProcess(self.canvas_size, self.model.vocab_size).to_json()}
+                'process': to_record(BlockProcess(self.canvas_size, self.model.vocab_size), BlockProcess)}
 
     def build_task(self, variables: Variables, *,
                    processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
