@@ -205,6 +205,33 @@ def test_a_cell_whose_context_died_is_told_and_its_next_run_starts_a_new_one(gat
     asyncio.run(asyncio.wait_for(scenario(), 10))
 
 
+def test_the_sweep_leaves_a_session_whose_first_context_is_starting(gateway):
+    """A sweep that ran while a session's first context started closed the session, so the
+    context, once started, had no session to join: the page was refused, and the context leaked."""
+    async def scenario():
+        session = str(uuid.uuid4())
+        starting, release = asyncio.Event(), asyncio.Event()
+        start = gateway.start
+
+        async def slow(session, kernel="python3"):
+            starting.set()
+            await release.wait()
+            return await start(session, kernel)
+
+        gateway.start, gateway.idle = slow, 0
+        creating = asyncio.create_task(gateway.create(session))
+        await starting.wait()
+        await gateway.reap()
+        release.set()
+        cells = await creating
+        assert gateway.contexts[session] is cells and list(cells.values()) == gateway.kernels
+        # Once it has its context, a session no page holds is swept as before.
+        await gateway.reap()
+        assert session not in gateway.contexts
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))
+
+
 def test_the_memory_guard_picks_the_context_holding_the_most(bridge, tmp_path):
     (tmp_path / "meminfo").write_text("MemTotal: 12000000 kB\nMemAvailable:  1000000 kB\n")
     assert bridge.available(tmp_path / "meminfo") == 1000000 << 10
