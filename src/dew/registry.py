@@ -341,17 +341,6 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     return built
 
 
-def from_record_among[ValueT](members: tuple[type[ValueT], ...], value: Configured, *,
-                              dtypes: bool = True) -> ValueT:
-    """Return the record `value` as the one of `members` it names (`from_record`)."""
-    declared = functools.reduce(operator.or_, members)
-    with _reading(value):
-        built = _rebuilt(declared, value, dtypes=dtypes)
-    if not isinstance(built, members):
-        raise ValueError(f"{value!r} builds {type(built).__name__}, not one of {declared}")
-    return built
-
-
 def to_record(value, annotation) -> JSON:
     """Return `value` as the record `from_record(annotation, ...)` rebuilds it from.
 

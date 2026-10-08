@@ -113,6 +113,15 @@ def test_a_run_reloads_the_guidance_it_evaluated_with(tmp_path, guidance):
     assert TextToImage.from_run(str(tmp_path)).guidance == guidance
 
 
+def test_a_guidance_from_outside_dew_reloads_when_its_package_is_trusted(tmp_path):
+    from diffusion_stubs import OutsideGuidance
+
+    make_run(tmp_path, guidance=OutsideGuidance(3.0))
+    with pytest.raises(ValueError, match="trust"):
+        TextToImage.from_run(str(tmp_path))
+    assert TextToImage.from_run(str(tmp_path), trust=("diffusion_stubs",)).guidance == OutsideGuidance(3.0)
+
+
 def test_pipeline_generates_from_a_run_directory(tmp_path):
     """The whole offline path: the run.json and checkpoint a run wrote, the
     model, process, inputs and weights rebuilt from them, and a sample out."""
