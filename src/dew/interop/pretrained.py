@@ -361,7 +361,7 @@ class Pretrained:
         from dew.inference.tasks import run_record
         from dew.records import record, text
         from dew.registry import models, objectives
-        declaration = run_record(str(directory), step, trust)
+        declaration, step = run_record(str(directory), step, trust)
         model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         model = model_config.build()
         kind = text(declaration['objective'], 'objective')

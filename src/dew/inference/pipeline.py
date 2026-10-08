@@ -106,7 +106,8 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
     from dew.records import text
     from dew.registry import objectives
 
-    kind = text(run_record(str(root), step, trust)['objective'], 'objective')
+    record, step = run_record(str(root), step, trust)
+    kind = text(record['objective'], 'objective')
     task = objectives[kind].saved_task
     if task is None:
         raise TypeError(f"a run of the {kind!r} objective ({objectives[kind].__name__}) loads as no task: "
