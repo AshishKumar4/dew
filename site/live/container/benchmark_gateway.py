@@ -70,6 +70,12 @@ for path in ("/opt/train/escape", "/opt/live/escape", "/work/../escape"):
     else:
         raise AssertionError(f"a training context wrote {path}")
 Path("/tmp/inside").write_text("x")
+try:
+    bytearray(7 * 1024 * 1024 * 1024)
+except MemoryError:
+    pass
+else:
+    raise AssertionError("a training context exceeded its memory allowance")
 from dew import Trainer
 from dew.config import OptimConfig
 from dew.data import load
@@ -80,6 +86,10 @@ model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_hea
                           mlp_features=64, max_seq_len=64)
 state = Trainer(LMObjective(model, seq_len=32), OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=1000)
 assert int(state.step) == 20
+from dew.interop import PretrainedDecoder
+from dew.sampling import Sampling
+model = PretrainedDecoder.load("HuggingFaceTB/SmolLM2-135M-Instruct", dtype="float32", max_seq_len=256)
+assert model.text_generation(sampling=Sampling(temperature=0))("ROMEO:", 4, key=0).text[0]
 """
 
 
@@ -95,7 +105,7 @@ def training():
         lines = execute(client, TRAINING_PROBE).splitlines()
         assert lines[0] == "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host.", lines
         assert lines[1] == ("Live run: steps 1000 -> 20, log_every 100 -> 5, "
-                            "so it ends in about a minute."), lines
+                            "so it finishes in about two minutes."), lines
     finally:
         client.stop_channels()
         request("/api/kernels/" + kernel["id"], method="DELETE")

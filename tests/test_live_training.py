@@ -32,5 +32,6 @@ def test_the_caps_print_what_they_changed_before_the_run(tmp_path, monkeypatch, 
 
     assert int(state.step) == 20 and data.batch == 8
     lines = capsys.readouterr().out.splitlines()
-    assert lines[:2] == ["Live run: batch 64 -> 8, so it fits a shared 4-vCPU host.",
-                         "Live run: steps 1000 -> 20, log_every 100 -> 5, so it ends in about a minute."]
+    assert lines[:2] == [
+        "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host.",
+        "Live run: steps 1000 -> 20, log_every 100 -> 5, so it finishes in about two minutes."]
