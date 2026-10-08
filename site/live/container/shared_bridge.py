@@ -28,8 +28,7 @@ MAX_OUTPUT = 2_000_000
 # Python contexts one page may hold, and one host; start-gateway.sh starts at most MAX_CONTEXTS kernels.
 MAX_CELLS = 6
 MAX_CONTEXTS = 24
-PRELOAD = ("from model_client import CFG, DPMSolverMultistep, EulerAncestral, Heun, "
-           "from_pretrained, text_model")
+PRELOAD = "import model_client; model_client.install()"
 
 
 class Context:

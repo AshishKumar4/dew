@@ -1,17 +1,13 @@
 ---
 import PythonEditor from './PythonEditor.astro';
 interface Props {
-	models: { id: string; label: string }[];
 	cell: string;
 	recorded: string;
 }
-const { models, cell, recorded } = Astro.props;
+const { cell, recorded } = Astro.props;
 ---
 
 <div class="live-text" data-live-text>
-	{models.length > 1 && <label class="live-text-model">Model
-		<select data-model>{models.map((model) => <option value={model.id}>{model.label}</option>)}</select>
-	</label>}
 	<div class="live-text-grid">
 		<div class="sampler-editor">
 			<div class="sampler-editor-bar"><span>generate.py</span><span class="sampler-editor-actions">
@@ -36,7 +32,6 @@ const { models, cell, recorded } = Astro.props;
 	const panel = document.querySelector<HTMLElement>('[data-live-text]');
 	if (panel) {
 		const editor = panel.querySelector<HTMLTextAreaElement>('textarea[data-text-cell]')!;
-		const picker = panel.querySelector<HTMLSelectElement>('[data-model]');
 		const run = panel.querySelector<HTMLButtonElement>('[data-text-run]')!;
 		const output = panel.querySelector<HTMLElement>('[data-text-output]')!;
 		const status = panel.querySelector<HTMLElement>('[data-text-status]')!;
@@ -49,12 +44,7 @@ const { models, cell, recorded } = Astro.props;
 			session = undefined;
 			if (!running) status.textContent = `${message} Press Run to start a new one.`;
 		});
-		picker?.addEventListener('change', () => {
-			editor.value = editor.value.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(picker.value)}`);
-		});
-		panel.querySelector('[data-text-reset]')!.addEventListener('click', () => {
-			editor.value = picker ? original.replace(/^model\s*=.*$/m, `model = ${JSON.stringify(picker.value)}`) : original;
-		});
+		panel.querySelector('[data-text-reset]')!.addEventListener('click', () => { editor.value = original; });
 		const execute = async () => {
 			running = true;
 			stopping = false;
