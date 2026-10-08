@@ -36,7 +36,7 @@ from .precision import (
     precision_names,
     rounded_to,
 )
-from .rope import apply_rotary
+from .rope import rotate
 from .sharding import (
     HEADS,
     KV_HEADS,
@@ -1947,8 +1947,8 @@ class NormalAttention(nn.Module):
             key = self.k_norm(key)
         if freqs_cis is not None:
             freqs_cos, freqs_sin = freqs_cis
-            query = apply_rotary(query, freqs_cos, freqs_sin)
-            key = apply_rotary(key, freqs_cos, freqs_sin)
+            query = rotate(query, freqs_cos, freqs_sin)
+            key = rotate(key, freqs_cos, freqs_sin)
 
         hidden_states = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,

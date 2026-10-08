@@ -1,6 +1,7 @@
-"""Rotary position embeddings: the angles, the rotate-half rotation the HF
-decoders use and DeepSeek's interleaved-pair one, Llama 3.1's frequency
-ramp, and YaRN's frequency ramp and attention factor.
+"""Rotary position embeddings: the angles of one axis or several, the one
+rotation every model applies (half-split or adjacent pairs, leading or
+trailing), Llama 3.1's frequency ramp, and YaRN's frequency ramp and
+attention factor.
 
 YaRN's ramp is transformers 5.16.1's `_compute_yarn_parameters` and its
 scale `yarn_apply_mscale` (models/deepseek_v3), with `dim` at the rope
@@ -13,8 +14,10 @@ transformers' float32 `pow`.
 
 import dataclasses
 import math
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
+from typing import Literal
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
@@ -148,7 +151,7 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
       `theta ** (2i / head_dim)` for the rot_dim // 2 rotated pairs, the rest at
       frequency zero; head_dim // 2 wide.
     - 'default' (Qwen3.5, modeling_qwen3_5.py:117-124): a rot_dim-wide rope,
-      `theta ** (2i / rot_dim)`, rot_dim // 2 wide; `apply_rotary` passes the
+      `theta ** (2i / rot_dim)`, rot_dim // 2 wide; `rotate` passes the
       rest through, the reference's `q_rot, q_pass` split.
 
     `rope_scaling` (Llama 3.1's ramp) applies before a proportional rope pads
@@ -188,15 +191,42 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
     return cos, sin
 
 
-def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
-    """Rotate [B, S, H, D] heads, rotate-half convention as in the HF decoders.
+def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], theta: float, *,
+                                            dtype: DTypeLike) -> tuple[P, P]:
+    """cos and sin of the rotary angles of ids on several axes: `[..., sum(axes) // 2]`.
 
-    The freqs are [S, pairs] for one sequence, or [B, S, pairs] when a packed
-    batch restarts positions per document. Freqs narrower than D // 2 rotate
-    the first 2 * pairs dimensions and pass the rest through, which is the
-    sliced partial rotary of `rotary_freqs(partial_rotary_type='default')`.
-    `scale` multiplies the whole head inside the arithmetic, at least fp32,
-    so a query's attention scale narrows once, with the product.
+    `positions` is `[..., len(axes)]`. Axis i turns its id at
+    `inverse_frequencies(theta, axes[i])`, `axes[i] // 2` pairs, and the axes'
+    angles concatenate in order: Flux's `EmbedND`, Wan's three-axis rope and
+    the vision towers' patch grids. The angles are computed in `dtype`. NumPy
+    ids compute on the host, where `dtype` may be float64, as
+    `FluxPosEmbed` computes its static grid; JAX ids compute on the device.
+    """
+    angles = [positions[..., axis, None].astype(dtype) * inverse_frequencies(theta, dim, dtype=dtype)
+              for axis, dim in enumerate(axes)]
+    if isinstance(positions, np.ndarray):
+        joined = np.concatenate(angles, axis=-1)
+        return np.cos(joined), np.sin(joined)
+    joined = jnp.concatenate(angles, axis=-1)
+    return jnp.cos(joined), jnp.sin(joined)
+
+
+def rotate(x, cos, sin, *, pairs: Literal['half', 'adjacent'] = 'half',
+           span: Literal['leading', 'trailing'] = 'leading', scale: float | None = None):
+    """Rotate the channel pairs of `[B, S, H, D]` heads or `[B, S, D]` rows.
+
+    `cos` and `sin` hold one angle a pair, `[S, P]` for one sequence or
+    `[B, S, P]` when each row has its own positions (a packed batch, an
+    image's grid). The `2 * P` rotated channels lead the last axis or, with
+    `span='trailing'`, end it (DeepSeek V4's nope-then-rope heads), and the
+    rest pass through: the sliced partial rotary of
+    `rotary_freqs(partial_rotary_type='default')`. 'half' pairs channel i
+    with i + P, the rotate-half convention of the HF decoders. 'adjacent'
+    pairs 2i with 2i + 1, the complex numbers of Flux, Llama 4's vision and
+    DeepSeek V4, and each pair lands back in place, so a rotation by `-sin`
+    undoes it. The arithmetic runs in at least fp32 and rounds once to x's
+    dtype; `scale` multiplies the whole of x inside it, so a query's
+    attention scale narrows once, with the product.
 
     The halves rotate as `x1 cos - x2 sin` and `x2 cos + x1 sin`, which is
     `x cos + rotate_half(x) sin` without the rotated copy. On a TPU v6e the
@@ -204,14 +234,21 @@ def apply_rotary(x, freqs_cos, freqs_sin, scale: float | None = None):
     training step at 8 x 1024 took 140.6 against 145.6 ms, and Qwen3-1.7B's
     at 4 x 1024 150.0 against 153.8 (docs/performance.md).
     """
-    if freqs_cos.ndim == 3:
-        cos, sin = freqs_cos[:, :, None, :], freqs_sin[:, :, None, :]
-    else:
-        cos, sin = freqs_cos[None, :, None, :], freqs_sin[None, :, None, :]
+    if x.ndim == 4:
+        cos, sin = cos[..., None, :], sin[..., None, :]
     wide = x.astype(at_least_fp32(x.dtype))
-    pairs = cos.shape[-1]
-    x1, x2, passed = wide[..., :pairs], wide[..., pairs:2 * pairs], wide[..., 2 * pairs:]
-    out = jnp.concatenate([x1 * cos - x2 * sin, x2 * cos + x1 * sin, passed], axis=-1)
+    count = cos.shape[-1]
+    start = 0 if span == 'leading' else wide.shape[-1] - 2 * count
+    lead, turned, tail = wide[..., :start], wide[..., start:start + 2 * count], wide[..., start + 2 * count:]
+    if pairs == 'half':
+        first, second = turned[..., :count], turned[..., count:]
+        rotated = [first * cos - second * sin, second * cos + first * sin]
+    else:
+        split = turned.reshape(*turned.shape[:-1], count, 2)
+        first, second = split[..., 0], split[..., 1]
+        rotated = [jnp.stack([first * cos - second * sin, second * cos + first * sin],
+                             axis=-1).reshape(turned.shape)]
+    out = jnp.concatenate([part for part in (lead, *rotated, tail) if part.shape[-1]], axis=-1)
     return (out if scale is None else out * scale).astype(x.dtype)
 
 
@@ -324,23 +361,10 @@ def yarn_rope_freqs(positions, head_dim: int, theta: float,
     return jnp.cos(angles) * factor, jnp.sin(angles) * factor
 
 
-def apply_rotary_interleave(x, freqs_cos, freqs_sin):
-    """Rotate `[B, S, H, D]` heads pairwise, DeepSeek's rope convention.
-
-    Pairs `(x0, x1), (x2, x3), ...` each rotate by one frequency
-    (`modeling_deepseek_v3.apply_rotary_pos_emb_interleave`): the even and
-    odd slices turn against the first half of the cos/sin, and the halves
-    stack real over imaginary without interleaving back. Query and key
-    take the same layout, so the dot product keeps the complex structure.
-    """
-    if freqs_cos.ndim == 3:
-        cos = freqs_cos[:, :, None, :]
-        sin = freqs_sin[:, :, None, :]
-    else:
-        cos = freqs_cos[None, :, None, :]
-        sin = freqs_sin[None, :, None, :]
-    wide = x.astype(at_least_fp32(x.dtype))
-    even, odd = wide[..., 0::2], wide[..., 1::2]
-    out = jnp.concatenate([even * cos - odd * sin, odd * cos + even * sin],
-                          axis=-1)
-    return out.astype(x.dtype)
+def deinterleaved(x):
+    """`x`'s even channels, then its odd ones: the half layout
+    `modeling_deepseek_v3.apply_rotary_pos_emb_interleave` moves adjacent
+    pairs into before it rotates them, and leaves them in. A query and key
+    in that layout rotate with `rotate`'s 'half' pairs, and their dot product
+    keeps the complex structure."""
+    return jnp.concatenate([x[..., 0::2], x[..., 1::2]], axis=-1)

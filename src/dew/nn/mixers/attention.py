@@ -44,9 +44,9 @@ from dew.nn.rope import (
     LongRopeScaling,
     RopeScaling,
     YarnScaling,
-    apply_rotary,
     inverse_frequencies,
     rotary_freqs,
+    rotate,
     yarn_rope_freqs,
 )
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -309,7 +309,7 @@ class CausalSelfAttention(nn.Module):
 
     def _rotary_angles(self, rotary_positions, heads: jax.Array):
         """Build the rotary cos and sin this layer rotates its heads by, in
-        the arithmetic `apply_rotary` rotates `heads` in.
+        the arithmetic `rotate` rotates `heads` in.
 
         Interleaved mRoPE, YaRN and the plain rope each build their own
         angles; YaRN rotates whole heads at its own frequencies, so it
@@ -433,21 +433,21 @@ class CausalSelfAttention(nn.Module):
         freqs_cos = freqs_sin = None
         if self.nope:
             # NoPE rotates nothing; the query still carries the logit scale
-            # the checkpoint asks for, which apply_rotary folds in otherwise.
+            # the checkpoint asks for, which rotate folds in otherwise.
             if self.attention_scale is not None:
                 query = scaled(query, self.attention_scale * math.sqrt(self.head_dim))
         else:
             freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query)
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
             # query carries the ratio to the scale the checkpoint asks for.
-            query = apply_rotary(
+            query = rotate(
                 query, freqs_cos, freqs_sin,
                 scale=(None if self.attention_scale is None
                        else self.attention_scale * math.sqrt(self.head_dim)))
         own_value = value
         if not self.kv_shared:
             if freqs_cos is not None and freqs_sin is not None:
-                key = apply_rotary(key, freqs_cos, freqs_sin)
+                key = rotate(key, freqs_cos, freqs_sin)
             if kv_store is not None and self.kv_store_key is not None:
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).

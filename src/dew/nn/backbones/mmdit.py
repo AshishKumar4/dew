@@ -28,7 +28,7 @@ from ..dit import (
     stronger_remat,
 )
 from ..precision import at_least_fp32
-from ..rope import apply_rotary, rotary_freqs
+from ..rope import rotary_freqs, rotate
 from ..sharding import logical_axes
 
 
@@ -127,8 +127,8 @@ class MMDiTBlock(nn.Module):
         # RoPE rotates the image tokens by their raster index (`rope_for_scan`)
         if freqs_cis is not None:
             freqs_cos, freqs_sin = freqs_cis
-            q_i = apply_rotary(q_i, freqs_cos, freqs_sin)
-            k_i = apply_rotary(k_i, freqs_cos, freqs_sin)
+            q_i = rotate(q_i, freqs_cos, freqs_sin)
+            k_i = rotate(k_i, freqs_cos, freqs_sin)
 
         q = jnp.concatenate([q_t, q_i], axis=1)
         k = jnp.concatenate([k_t, k_i], axis=1)
