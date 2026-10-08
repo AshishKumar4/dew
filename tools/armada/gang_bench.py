@@ -75,8 +75,10 @@ def relay() -> dict:
 
 
 def main() -> None:
+    print(f"rank {RANK} started at {time.time():.3f}", file=sys.stderr, flush=True)
     try:
         measured = relay()
+        print(f"rank {RANK} relayed at {time.time():.3f}", file=sys.stderr, flush=True)
     except Exception:
         # The relay's own account of what it could not reach.
         print(Path("/armada/relay.log").read_text()[-4000:], file=sys.stderr, flush=True)
@@ -86,7 +88,7 @@ def main() -> None:
 
     jax.config.update("jax_cpu_collectives_implementation", "gloo")
     jax.distributed.initialize(coordinator_address="rank0:8476", num_processes=WORLD, process_id=RANK,
-                               initialization_timeout=900)
+                               initialization_timeout=int(os.environ.get("GANG_INIT_TIMEOUT", "900")))
     joined = time.monotonic() - began
     import jax.numpy as jnp
     import numpy as np
