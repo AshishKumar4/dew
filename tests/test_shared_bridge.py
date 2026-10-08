@@ -217,3 +217,4 @@ def test_the_memory_guard_picks_the_context_holding_the_most(bridge, tmp_path):
     # The model process (uid 5000) holds the most, but only guests are candidates; a context is
     # all of its uid's processes, so two of 2 GB outweigh one of 3 GB.
     assert sorted(bridge.largest_guest(tmp_path)) == [11, 14]
+    assert bridge.resident(tmp_path) == {"5000": 8789, "6101": 3906, "6102": 2929, "6103": 0}
