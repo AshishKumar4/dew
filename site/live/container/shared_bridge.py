@@ -1,4 +1,9 @@
-"""Relay authenticated sessions to private Kernel Gateway contexts."""
+"""Relay authenticated sessions to private Kernel Gateway contexts.
+
+A session is one page. Each of its cells runs in a context of its own, so the
+cells of a page run at the same time; a message's "cell" names the context, and
+a message without one uses the page's only cell.
+"""
 
 import asyncio
 import hmac
@@ -20,6 +25,9 @@ from websockets.http11 import Response
 
 MAX_CODE = 100_000
 MAX_OUTPUT = 2_000_000
+# Python contexts one page may hold, and one host; start-gateway.sh starts at most MAX_CONTEXTS kernels.
+MAX_CELLS = 6
+MAX_CONTEXTS = 24
 PRELOAD = ("from model_client import CFG, DPMSolverMultistep, EulerAncestral, Heun, "
            "from_pretrained, text_model")
 
@@ -29,7 +37,6 @@ class Context:
         self.identifier, self.channels = identifier, channels
         self.lock = asyncio.Lock()
         self.last_used = time.monotonic()
-        self.connected = False
         self.setup = 0
 
     async def execute(self, code, send):
@@ -65,10 +72,11 @@ class Context:
 
 
 class Gateway:
-    def __init__(self):
-        self.token = Path("/run/dew/gateway-token").read_text()
-        self.secret = os.environ["DEW_SHARED_SECRET"]
-        self.contexts = {}
+    def __init__(self, token, secret, commit):
+        self.token, self.secret, self.commit = token, secret, commit
+        # session -> cell -> context; None holds the context made ready before the page names a cell.
+        self.contexts: dict[str, dict[str | None, Context]] = {}
+        self.connected = set()
         self.allocating = asyncio.Lock()
         self.started = time.monotonic()
         self.idle = int(os.environ.get("DEW_LIVE_IDLE_SECONDS", "300"))
@@ -85,11 +93,12 @@ class Gateway:
                 return json.loads(raw) if raw else None
         return await asyncio.to_thread(call)
 
-    async def create(self, session):
+    async def start(self, session):
+        """A new context for `session`, its inference client loaded."""
         async with self.allocating:
-            if session in self.contexts:
-                return self.contexts[session]
-            if len(self.contexts) >= 8:
+            if len(self.contexts.get(session, {})) >= MAX_CELLS:
+                raise ValueError("this page has more live cells than one session runs")
+            if sum(map(len, self.contexts.values())) >= MAX_CONTEXTS:
                 raise ValueError("the shared container has no free Python contexts")
             started = time.monotonic()
             kernel = await self.api("/api/kernels", {"name": "python3"})
@@ -103,7 +112,6 @@ class Gateway:
                 if result["status"] != "ok":
                     raise RuntimeError("the isolated Python context could not load its inference client")
                 context.setup = time.monotonic() - started
-                self.contexts[session] = context
                 return context
             except Exception:
                 if channels:
@@ -111,9 +119,25 @@ class Gateway:
                 await self.api(f"/api/kernels/{kernel['id']}", method="DELETE")
                 raise
 
+    async def create(self, session):
+        if session not in self.contexts:
+            self.contexts[session] = {}
+            try:
+                self.contexts[session][None] = await self.start(session)
+            except Exception:
+                del self.contexts[session]
+                raise
+        return self.contexts[session]
+
+    async def context(self, session, cell):
+        """The context of `cell`: the ready one when the page has not used it, else a new one."""
+        cells = self.contexts[session]
+        if cell not in cells:
+            cells[cell] = cells.pop(None) if None in cells else await self.start(session)
+        return cells[cell]
+
     async def close(self, session):
-        context = self.contexts.pop(session, None)
-        if context:
+        for context in self.contexts.pop(session, {}).values():
             await context.channels.close()
             await self.api(f"/api/kernels/{context.identifier}", method="DELETE")
 
@@ -143,29 +167,35 @@ class Gateway:
 
     async def websocket(self, socket):
         session = socket.request.path.split("/")[2]
-        context = await self.create(session)
-        if context.connected:
+        cells = await self.create(session)
+        if session in self.connected:
             await socket.close(1008, "this context is already connected")
             return
-        context.connected = True
+        self.connected.add(session)
         await socket.send(json.dumps({"type": "ready", "uptime": time.monotonic() - self.started,
-                                      "setup": context.setup,
-                                      "dew": Path("/opt/live/dew-commit").read_text().strip()}))
-        executing = None
+                                      "setup": next(iter(cells.values())).setup if cells else 0,
+                                      "dew": self.commit}))
+        running = {}
 
-        async def run(message):
+        async def run(message, cell):
+            context = None
             try:
+                context = await self.context(session, cell)
                 result = await context.execute(message["code"],
                     lambda output: socket.send(json.dumps({"id": message["id"], **output})))
                 await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
             except Exception as error:
-                with suppress(OSError):
-                    await self.api(f"/api/kernels/{context.identifier}/interrupt", {}, "POST")
+                if context:
+                    with suppress(OSError):
+                        await self.api(f"/api/kernels/{context.identifier}/interrupt", {}, "POST")
                 await socket.send(json.dumps({"id": message["id"], "type": "error",
                                               "ename": type(error).__name__,
                                               "evalue": str(error), "traceback": []}))
                 await socket.send(json.dumps({"id": message["id"], "type": "done",
                                               "status": "error", "count": None}))
+
+        def busy():
+            return any(not task.done() for task in running.values())
 
         try:
             deadline = time.monotonic() + self.wall
@@ -173,40 +203,49 @@ class Gateway:
                 try:
                     raw = await asyncio.wait_for(socket.recv(), timeout=min(15, deadline - time.monotonic()))
                 except TimeoutError:
-                    if ((not executing or executing.done()) and
-                            time.monotonic() - context.last_used > self.idle):
+                    used = max((context.last_used for context in cells.values()), default=0)
+                    if not busy() and time.monotonic() - used > self.idle:
                         break
                     continue
                 message = json.loads(raw)
-                context.last_used = time.monotonic()
+                cell = message.get("cell", "")
+                if not isinstance(cell, str) or len(cell) > 64:
+                    raise ValueError("invalid cell name")
+                for context in cells.values():
+                    context.last_used = time.monotonic()
                 if message.get("op") == "interrupt":
-                    await self.api(f"/api/kernels/{context.identifier}/interrupt", {}, "POST")
+                    if cell in cells:
+                        await self.api(f"/api/kernels/{cells[cell].identifier}/interrupt", {}, "POST")
                 elif message.get("op") == "execute":
-                    if executing and not executing.done():
+                    if cell in running and not running[cell].done():
                         raise ValueError("a cell is already running in this context")
                     if (not isinstance(message.get("code"), str) or len(message["code"]) > MAX_CODE or
                             not isinstance(message.get("id"), str) or len(message["id"]) > 128):
                         raise ValueError("invalid or oversized cell")
-                    executing = asyncio.create_task(run(message))
+                    running[cell] = asyncio.create_task(run(message, cell))
                 else:
                     raise ValueError("unsupported kernel operation")
         finally:
-            if executing and not executing.done():
-                executing.cancel()
+            for task in running.values():
+                task.cancel()
+            for task in running.values():
                 with suppress(asyncio.CancelledError):
-                    await executing
+                    await task
+            self.connected.discard(session)
             await self.close(session)
 
     async def sweep(self):
         while True:
             await asyncio.sleep(15)
-            for session, context in list(self.contexts.items()):
-                if not context.connected and time.monotonic() - context.last_used > self.idle:
+            for session, cells in list(self.contexts.items()):
+                used = max((context.last_used for context in cells.values()), default=0)
+                if session not in self.connected and time.monotonic() - used > self.idle:
                     await self.close(session)
 
 
 async def main():
-    gateway = Gateway()
+    gateway = Gateway(Path("/run/dew/gateway-token").read_text(), os.environ["DEW_SHARED_SECRET"],
+                      Path("/opt/live/dew-commit").read_text().strip())
     async with serve(gateway.websocket, "0.0.0.0", 8888, process_request=gateway.http,
                      max_size=MAX_CODE * 4, ping_interval=20, ping_timeout=20):
         await gateway.sweep()

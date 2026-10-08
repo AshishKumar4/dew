@@ -34,3 +34,9 @@ test('an overdue session releases its host through the shared pool', async () =>
 	assert.equal(result.status.active, 0);
 	assert.equal(result.closed, true);
 });
+test('a visitor can have three tabs open at once, and a fourth waits', async () => {
+	const { tabs, other } = await run('tabs');
+	assert.deepEqual(tabs.map((tab) => tab.ok), [true, true, true, false]);
+	assert.equal(tabs[3].reason, 'too-many-tabs');
+	assert.equal(other.ok, true);
+});
