@@ -17,14 +17,14 @@ def test_each_native_landing_cell_defines_its_imports_and_data():
         import {readFileSync} from 'node:fs';
         import {example, trainingExample} from './site/src/data/framework-examples.mjs';
         const source = readFileSync('site/snippets/framework.py', 'utf8');
-        const names = ['lm', 'jepa', 'diffusion', 'pretrained', 'serving', 'formats',
+        const names = ['lm', 'jepa', 'diffusion', 'pretrained', 'decide', 'serving', 'formats',
                        'mesh', 'grpo', 'reliability', 'profile'];
         const cells = Object.fromEntries(names.map(name => [name, example(source, name)]));
         cells.hero = trainingExample(readFileSync('site/src/data/hero.py', 'utf8'));
         process.stdout.write(JSON.stringify(cells));
     """
     cells = json.loads(subprocess.check_output(["node", "--input-type=module", "-e", script], cwd=ROOT))
-    assert len(cells) == 11
+    assert len(cells) == 12
     for name, code in cells.items():
         compile(code, f"{name}.py", "exec")
         imports = [node for node in ast.parse(code).body if isinstance(node, (ast.Import, ast.ImportFrom))]

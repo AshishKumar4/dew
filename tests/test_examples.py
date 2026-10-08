@@ -145,7 +145,8 @@ def test_moe_mesh_example_routes_and_serves_on_eight_cpu_devices(tmp_path):
 
 @pytest.mark.parametrize(
     "section",
-    ["lm", "diffusion", "sample_public", "jepa", "grpo", "pretrained", "serving", "mesh", "reliability"],
+    ["lm", "diffusion", "sample_public", "jepa", "grpo", "pretrained", "decide", "serving", "mesh",
+     "reliability"],
 )
 def test_landing_snippet_runs(section, tmp_path):
     smoke("landing", tmp_path, "--section", section,
