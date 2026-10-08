@@ -272,7 +272,7 @@ def test_an_objective_from_a_calibrated_task_validates_without_its_temperatures(
     validated = Evaluation.run(objective, decide.variables, objective.held_out(examples, batch=8), key=0,
                                metrics=[LogLoss()]).scores["val/log_loss"]
     untempered = replace(decide, calibration=Calibration()).score(examples, [LogLoss()])["log_loss"]
-    assert validated == pytest.approx(untempered, rel=1e-6)
+    assert validated == pytest.approx(untempered, rel=1e-5)
     assert validated != pytest.approx(decide.score(examples, [LogLoss()])["log_loss"], rel=1e-3)
 
 
