@@ -320,34 +320,35 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record[ValueT](annotation: type[ValueT] | tuple[type[ValueT], ...], value: Configured, *,
-                        dtypes: bool = True) -> ValueT:
+def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
     `ValueError` naming what the record built instead, so a caller reads a
     value of the type it asked for rather than one it has to narrow again. A
     container annotation, `tuple[ParamGroup, ...]` or `Mapping[str, ...]`,
-    builds every entry and witnesses the container. A tuple of classes is
-    any one of them, as `isinstance` reads one, and the record names which.
+    builds every entry and witnesses the container.
     `dtypes` is the one policy the two readers differ in: a module field
     takes a `dtype` as the dtype its name says (True), and a run record
     keeps the name it wrote (`RunConfig.from_dict`, False).
     """
-    if isinstance(annotation, tuple):
-        declared = functools.reduce(operator.or_, annotation)
-        with _reading(value):
-            built = _rebuilt(declared, value, dtypes=dtypes)
-        if not isinstance(built, annotation):
-            raise ValueError(f"{value!r} builds {type(built).__name__}, "
-                             f"not the {declared} the field declares")
-        return built
     with _reading(value):
         built = _rebuilt(annotation, value, dtypes=dtypes)
     witness: type[ValueT] = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
                          f"not the {witness.__name__} the field declares")
+    return built
+
+
+def from_record_among[ValueT](members: tuple[type[ValueT], ...], value: Configured, *,
+                              dtypes: bool = True) -> ValueT:
+    """Return the record `value` as the one of `members` it names (`from_record`)."""
+    declared = functools.reduce(operator.or_, members)
+    with _reading(value):
+        built = _rebuilt(declared, value, dtypes=dtypes)
+    if not isinstance(built, members):
+        raise ValueError(f"{value!r} builds {type(built).__name__}, not one of {declared}")
     return built
 
 
