@@ -392,9 +392,9 @@ def test_a_host_step_differentiates_its_moving_leaves_only(monkeypatch):
 
     monkeypatch.setattr(jax, "vjp", counted)
     model = decoder()
+    initial = LMObjective(model, 8).init(jax.random.key(0))
     # Every layer's gate kernel frozen: the bank they share is held whole.
-    for trainable in (lambda path: True, lambda path: path[-2:] != ("gate_proj", "kernel")):
-        start = freeze(LMObjective(model, 8).init(jax.random.key(0)), trainable)
+    for start in (initial, freeze(initial, lambda path: path[-2:] != ("gate_proj", "kernel"))):
         objective = LMObjective(model, 8, head_chunks=1, variables=jax.tree.map(np.asarray, start))
         updated(objective, tokens(), HOST)
     every, moving = differentiated
