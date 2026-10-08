@@ -276,3 +276,17 @@ def test_a_supplied_rule_is_computed_only_where_something_differentiates():
     np.testing.assert_allclose(statistic(params, x), np.mean(np.square(x @ np.asarray(params["w"]) - 1.0)),
                                rtol=1e-6)
     np.testing.assert_array_equal(jax.grad(statistic)(params, x)["w"], jnp.sin(x).sum(0))
+
+
+def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
+    """The last batch of a pass over five records at four a batch holds one
+    real record and three repeats, weighted 1 and 0; a training batch carries
+    no mark, and every row weighs 1. row_mean weighs rows the same way."""
+    from dew.data import DataPartition, Dataset
+
+    records = {"x": np.arange(5, dtype=np.float32)}
+    last = list(Dataset.validation(records, batch=4)(DataPartition()))[-1]
+    np.testing.assert_array_equal(Objective.row_weights(last, 4), [1.0, 0.0, 0.0, 0.0])
+    assert Objective.row_weights(last, 4).dtype == jnp.float32
+    np.testing.assert_array_equal(Objective.row_weights({"x": last["x"]}, 4), np.ones(4, np.float32))
+    assert float(Objective.row_mean(jnp.asarray(last["x"]), last).mean()) == 4.0
