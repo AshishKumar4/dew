@@ -4,37 +4,36 @@
 		"--section",
 		"serving",
 		"--out",
-		"/mnt/scratch/dew/tmp/landing-framework/review2/serving",
-		"--no-profile"
+		"/tmp/rec/out"
 	],
-	"script_sha256": "9691808d8795be615f2e8b56978a30e4360db75a6541eca76b18064ba0c53481",
+	"script_sha256": "5e01545363a1a30f0e81a59adbf6ed34b3bed980597a1abbba8a38d6c81d4e5f",
 	"meta": {
-		"where": "one RTX 4080",
-		"python": "3.12.13",
+		"where": "a 4-vCPU Cloudflare container",
+		"python": "3.12.15",
 		"jax": "0.11.2.post3",
-		"flax": "0.12.9",
+		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "b474bc5f1310a226a829b58e86bcd4184c801349",
-		"date": "2026-10-01"
+		"dew": "9d81a3dc7e71e141ede6afb1b060f21a450a2f96",
+		"date": "2026-10-08"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 138.0,
+		"seconds": 115.7,
 		"columns": 96,
 		"screen": [
 			[
 				{
-					"text": "[' Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is"
+					"text": "[' Paris. The capital of France is also the capital of the Republic of France. The capital of Fr"
 				}
 			],
 			[
 				{
-					"text": "Beijing. The', ' Tokyo. The capital of the United States is Washington, D.C. The capital of Fran"
+					"text": "ance is also the capital', ' Tokyo. The capital of the United States is Washington, D.C. The cap"
 				}
 			],
 			[
 				{
-					"text": "ce is Paris. The capital of']"
+					"text": "ital of France is Paris. The capital of']"
 				}
 			],
 			[
@@ -44,42 +43,17 @@
 			],
 			[
 				{
-					"text": "  \"source\": \"Qwen/Qwen3-0.6B\","
-				}
-			],
-			[
-				{
-					"text": "  \"prompts\": ["
-				}
-			],
-			[
-				{
-					"text": "    \"The capital of France is\","
-				}
-			],
-			[
-				{
-					"text": "    \"The capital of Japan is\""
-				}
-			],
-			[
-				{
-					"text": "  ],"
-				}
-			],
-			[
-				{
 					"text": "  \"text\": ["
 				}
 			],
 			[
 				{
-					"text": "    \" Paris. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China"
+					"text": "    \" Paris. The capital of France is also the capital of the Republic of France. The capital of"
 				}
 			],
 			[
 				{
-					"text": "is Beijing. The\","
+					"text": " France is also the capital\","
 				}
 			],
 			[
