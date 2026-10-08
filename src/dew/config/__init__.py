@@ -46,23 +46,23 @@ import dew.io
 from dew import registry
 from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
-from dew.config.sweep import RandomSearch, Search, Space, _read, _write
+from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
 from dew.data import Dataset, DatasetSpec, Ramp
 from dew.data.dataset import Reader, ramped, record_argument
 from dew.files import write_atomically
-from dew.lora import LoRA, _Adapted, adapted
+from dew.lora import AdaptedClass, LoRA, adapted
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.records import JSON, duration, recorded_duration
 from dew.registry import (
     Annotation,
     Configured,
-    _declared_type,
-    _parameter_type,
     datasets,
+    declared_type,
     from_record,
     models,
     objectives,
+    parameter_type,
     parameters,
     schedules,
     to_record,
@@ -80,7 +80,7 @@ from dew.training.optim import (
     power_profiles,
     weight_decay_mask,
 )
-from dew.training.quantization import Quantization, _quantize, _Quantized
+from dew.training.quantization import Quantization, QuantizedClass, quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
@@ -157,10 +157,10 @@ class ModelConfig:
         """Return the module's class and constructor fields, its adapter and quantization apart."""
         model_type = type(model)
         adapter, quantization = None, None
-        if isinstance(model_type, _Adapted):
+        if isinstance(model_type, AdaptedClass):
             adapter = model_type._dew_lora_record()
             model_type = model_type._dew_lora_base
-        if isinstance(model_type, _Quantized):
+        if isinstance(model_type, QuantizedClass):
             quantization = model_type._dew_quantization
             model_type = model_type._unquantized_type
         return cls(registry.import_path(model_type), registry.record_fields(model, model_type),
@@ -267,13 +267,13 @@ def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]
         for field in dataclasses.fields(member):
             if field.init and field.name not in ("parent", "name"):
                 default = (field.default_factory() if callable(field.default_factory) else field.default)
-                yield field.name, default, _declared_type(member, field.name)
+                yield field.name, default, declared_type(member, field.name)
         return
     for name, (parameter, owner) in registry.parameters(member)[0].items():
         if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:
             continue  # what the caller builds, the model first
         try:
-            annotation = _parameter_type(owner, name)
+            annotation = parameter_type(owner, name)
         except ValueError:
             annotation = None
         default = dataclasses.MISSING if parameter.default is parameter.empty else parameter.default
@@ -801,13 +801,13 @@ def _placed(config: "RunConfig", path: str) -> tuple[list[str], Annotation]:
         member = models[held.name] if isinstance(held, ModelConfig) else objectives[held.name]
         # A flag's annotation types the value, as `--model.<field>` reads it;
         # an argument without a flag (the loss a `Supervised` is given) takes JSON.
-        annotation = _declared_type(_member_flags(member, held.fields)[0], field)
+        annotation = declared_type(_member_flags(member, held.fields)[0], field)
         if annotation is None and field not in parameters(member)[0]:
             raise KeyError(f"{path} names no argument of {held.name}")
         return [*groups, "fields", field], annotation
     if not (dataclasses.is_dataclass(held) and field in _names(held)):
         raise KeyError(f"{path} names no field of the run record")
-    return [*groups, field], _declared_type(type(held), field)
+    return [*groups, field], declared_type(type(held), field)
 
 
 def _names(held: "DataclassInstance | type[DataclassInstance]") -> set[str]:
@@ -866,7 +866,7 @@ class RunConfig:
         import path and its fields.
         """
         with registry.recording():
-            return {field.name: to_record(getattr(self, field.name), _declared_type(type(self), field.name))
+            return {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
                     for field in dataclasses.fields(self)}
 
     @classmethod
@@ -1018,7 +1018,7 @@ class RunConfig:
         """The run a class record (`record`) names, as its class, which must be
         this one or derive from it."""
         registry.import_trusted(record, trust)
-        named = registry._class_record(record)
+        named = registry.class_record(record)
         if named is None:
             raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
         run_class = registry.imported(named[0])
@@ -1118,7 +1118,7 @@ class RunConfig:
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
         if self.trainer.quantization is not None:
-            _quantize(objective, self.trainer.quantization)
+            quantize_trunk(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
@@ -1193,14 +1193,14 @@ class RunConfig:
             raise ValueError("a sweep needs trainer.name: every trial trains under "
                              "<trainer.name>/trial-<index>, and trials sharing one name would "
                              "resume from each other")
-        finished = _read(path, space)
+        finished = read_ledger(path, space)
         for index in range(len(finished), trials):
             point = search(space, finished)
             name = f"{self.trainer.name}/trial-{index}"
             value = train(self.override({**point, "trainer.name": name}))
             trial = TrialFinished(index, name, point, value)
             finished.append(trial)
-            _write(path, space, finished)
+            write_ledger(path, space, finished)
             tracker.log({"sweep/value": value}, index)
             tracker.artifact(trial, index)
         return finished

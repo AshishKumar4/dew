@@ -35,7 +35,7 @@ _ALIASES = {
 }
 # Mamba-2's trunk and layer names, and the attention, MLP and expert layers beside them.
 _LAYER: Mapping[str, tuple[str, ...]] = {
-    **mamba2._LAYER,
+    **mamba2.LAYER,
     **{f"mixer.{linear}.{kind}": ("self_attn", linear, "kernel" if kind == "weight" else "bias")
        for linear in ("q_proj", "k_proj", "v_proj", "o_proj", "up_proj", "down_proj")
        for kind in ("weight", "bias")},
@@ -168,8 +168,8 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Map independent mixers and the router's balancing buffer to their collections."""
-    if name in mamba2._TRUNK:
-        return ("params", *mamba2._TRUNK[name])
+    if name in mamba2.TRUNK:
+        return ("params", *mamba2.TRUNK[name])
     if name == "lm_head.weight":
         return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
     parts = name.split(".")

@@ -49,7 +49,7 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import head_cross_entropy, logits_cross_entropy, reads_states
-from dew.objectives.lm.objective import TEXT_KEY, _batch_text, _text_preview
+from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
 from dew.records import JSON
 from dew.sampling.sample import sample
 from dew.sampling.solvers import Solver
@@ -188,7 +188,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         the media's slot, which the model reads and nothing masks or predicts.
         """
         params = thaw(params)
-        prepared = _batch_text(batch)
+        prepared = batch_text(batch)
         tokens = prepared.tokens
         if tokens.shape[-1] != self.seq_len:
             raise ValueError(
@@ -236,6 +236,6 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             weights, count = prepared
             return self._sample(weights, step.key, count=count), None
 
-        return _text_preview("masked diffusion preview",
+        return text_preview("masked diffusion preview",
                              lambda: (self.evaluation_variables(params, step), self.samples), generate,
                              self.decode)

@@ -81,23 +81,31 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew.inference.pages import Pages
-from dew.inference.projections import _pack_projections, _projection_groups
+from dew.inference.projections import pack_projections, projection_groups
 from dew.inference.serving_kernel import (
     Admission,
     Dense,
     Draws,
     Paged,
     Placement,
-    _joined,
-    _mixed_refusal,
-    _opened,
-    _opened_in,
-    _program,
-    _resident_formats,
-    _split,
-    _state_shardings,
+    decode_programs,
+    joined,
+    mixed_refusal,
+    opened,
+    opened_in,
+    resident_formats,
+    split_donated,
+    state_shardings,
 )
-from dew.inference.tasks import Processor, TextGeneration, _bucket, _ceiling, _decoded, _prepared, _sized
+from dew.inference.tasks import (
+    Processor,
+    TextGeneration,
+    cache_ceiling,
+    cache_sized,
+    decoded_rows,
+    prepared_inputs,
+    shape_bucket,
+)
 from dew.nn.inputs import ModelInputs, host_token_rows, mesh_of, request_key
 from dew.nn.kv_cache import CURSOR, POOLED, TABLE, KVCache, Layered, is_paged, leaf_name
 from dew.nn.protocols import ProjectionGroup
@@ -106,14 +114,7 @@ from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
-from dew.sampling.text import (
-    Generation,
-    Sampling,
-    _check_inputs,
-    prediction_depths,
-    rebuild_position,
-    resolve,
-)
+from dew.sampling.text import Generation, Sampling, check_inputs, prediction_depths, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
@@ -442,7 +443,7 @@ class Server:
         with self._context():
             source_shapes = unfreeze(dict(jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)))
-            for group in _projection_groups(model, variables):
+            for group in projection_groups(model, variables):
                 node = source_shapes["params"]
                 for part in group.path:
                     node = node[part]
@@ -453,11 +454,11 @@ class Server:
                                             for field, leaf in packed.items()}
                     self._weight_groups.append(group)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
-            shapes = jax.eval_shape(functools.partial(_opened, model, pad_id=self.pad_id, slots=slots,
+            shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
             rows.check(shapes.decoder.cache)
             # None selects the one mixed forward of `_mixed_step`.
-            self.mixed_refusal = _mixed_refusal(model, self.variables, shapes, rows.placement, rows.width)
+            self.mixed_refusal = mixed_refusal(model, self.variables, shapes, rows.placement, rows.width)
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
 
             The mixed forward covers each row's last draw and the admitted
@@ -473,12 +474,12 @@ class Server:
             if isinstance(rows, PagedRows) and prediction_depths(model):
                 raise ValueError("a paged server runs no prediction depths; their cache is seeded "
                                  "over the whole prompt at once")
-            formats = _resident_formats(
+            formats = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
-                _state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
-            self._step, self._admitting = _program(formats, self._admitted)
-            self._resident, self._carried = _split(
-                _opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
+                state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
+            self._step, self._admitting = decode_programs(formats, self._admitted)
+            self._resident, self._carried = split_donated(
+                opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
 
     def _context(self) -> contextlib.AbstractContextManager[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
@@ -548,7 +549,7 @@ class Server:
             raise ValueError("a server runs the row-wise sampler; beam and speculative loops are batch-wide")
         if chunk is not None and (type(chunk) is not int or chunk < 1):
             raise ValueError("chunk must be a positive number of prompt tokens per piece")
-        ceiling = _ceiling(task.model)
+        ceiling = cache_ceiling(task.model)
         if ceiling is None:
             raise ValueError("a server needs a model that declares max_seq_len for its cache")
         if type(capacity) is not int or capacity < 1:
@@ -570,7 +571,7 @@ class Server:
             raise ValueError(
                 f"a capacity of {capacity} rounds to {rounded}, over the model's max_seq_len of {ceiling}"
             )
-        model = _sized(model, rounded)
+        model = cache_sized(model, rounded)
         groups = _row_groups(mesh)
         rows: Rows
         if layout.page_size is None:
@@ -606,7 +607,7 @@ class Server:
     @property
     def cache(self) -> Variables:
         """The resident cache, updated in place by every step."""
-        return _joined(self._resident, self._carried).decoder.cache
+        return joined(self._resident, self._carried).decoder.cache
 
     @property
     def occupancy(self) -> int:
@@ -646,7 +647,7 @@ class Server:
             incoming_structure, [jnp.asarray(np.asarray(new, dtype=old.dtype)
                                              if isinstance(new, np.ndarray) else new, dtype=old.dtype)
                                  for (_, new), (_, old) in zip(incoming, source, strict=True)])
-        packed = _pack_projections(normalized, self._weight_groups)
+        packed = pack_projections(normalized, self._weight_groups)
         incoming, _ = jax.tree_util.tree_flatten_with_path(packed)
         served, structure = jax.tree_util.tree_flatten_with_path(self.variables)
         leaves = []
@@ -686,7 +687,7 @@ class Server:
     def _prepared(self, prompt: Prompt, max_new_tokens: int | None, seed: int | jax.Array, fold: int) -> _Row:
         positions = None
         if isinstance(prompt, (str, ModelInputs)):
-            inputs = _prepared(self.processor, prompt, images=None)
+            inputs = prepared_inputs(self.processor, prompt, images=None)
             if set(inputs.token_fields) - {"attention_mask", "positions"} or inputs.conditioning:
                 raise ValueError(
                     "a served prompt carries tokens and validity only; "
@@ -703,7 +704,7 @@ class Server:
         budget = self.default_budget if max_new_tokens is None else max_new_tokens
         if budget is None:
             raise ValueError("max_new_tokens is required; the source declares no default budget")
-        valid = _check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
+        valid = check_inputs(self.model, ids, fields, budget, self.sampling, 1).astype(bool)
         if positions is not None and (positions.shape != valid.shape or not np.array_equal(
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")
@@ -747,7 +748,7 @@ class Server:
         through `TextGeneration` would.
         """
         base = _seed(key)
-        inputs = _prepared(self.processor, prompts, images=None)
+        inputs = prepared_inputs(self.processor, prompts, images=None)
         valid = inputs.token_fields.get("attention_mask")
         rows = np.asarray(inputs.tokens)
         mask = np.ones(rows.shape, bool) if valid is None else np.asarray(valid).astype(bool)
@@ -786,7 +787,8 @@ class Server:
         chosen = [(group * share + index, slot, row) for group, waiting in enumerate(pending)
                   for index, (slot, row) in enumerate(waiting)]
         # The capacity is whole tiles, not a bucket, so a piece's width bucket can pass it.
-        width = min(_bucket(max(len(row.prompt) - row.prefilled for _, _, row in chosen), 64), self.capacity)
+        longest = max(len(row.prompt) - row.prefilled for _, _, row in chosen)
+        width = min(shape_bucket(longest, 64), self.capacity)
         width = width if self.rows.chunk is None else min(width, self.rows.chunk)
         count, capacity = share * self.groups, self.capacity
         tokens = np.zeros((count, width), np.int32)
@@ -887,7 +889,7 @@ class Server:
         drawn[0, :count] = row.tokens
         behavior[0, :count] = row.behavior
         raw[0, :count] = row.raw
-        decoder = None if self.processor is None else functools.partial(_decoded, self.processor)
+        decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
         row.ticket.finished = time.perf_counter()
         row.ticket.set_result(Generation(
             np.concatenate([row.prompt[None], drawn], axis=1), np.array([count], np.int32),

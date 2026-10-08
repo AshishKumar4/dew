@@ -161,13 +161,13 @@ def _host_array(leaf) -> np.ndarray:
     return array if array.flags.c_contiguous else np.ascontiguousarray(array)
 
 
-def _flatten(params) -> dict[str, np.ndarray]:
+def flatten(params) -> dict[str, np.ndarray]:
     """The leaves under their '/'-joined names; `_publish` brings each to the host."""
     leaves, _ = jax.tree_util.tree_flatten_with_path(params)
     return {_leaf_name(path): leaf for path, leaf in leaves}
 
 
-def _unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
+def unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
     tree: ParamTree = {}
     for name, tensor in tensors.items():
         insert(tree, tuple(name.split(SEPARATOR)), tensor, name)
@@ -176,7 +176,7 @@ def _unflatten(tensors: Mapping[str, np.ndarray]) -> ParamTree:
 
 def save_params(params, path) -> None:
     """Write a parameter tree to a safetensors file, one tensor per leaf."""
-    _publish(lambda: _flatten(params), path)
+    _publish(lambda: flatten(params), path)
 
 
 def load_params(path) -> ParamTree:
@@ -186,7 +186,7 @@ def load_params(path) -> ParamTree:
     is placed on a device until the caller asks for it.
     """
     tensors, _ = read_file(path)
-    return _unflatten(tensors)
+    return unflatten(tensors)
 
 
 WEIGHT_STEMS = ("diffusion_pytorch_model", "model")
@@ -428,7 +428,7 @@ def save_hf_layout(params, config: Mapping[str, object], directory,
     os.makedirs(directory, exist_ok=True)
     if not isinstance(params, LazyTensors):
         # Leaves stay where they are; `save_sharded` brings one shard at a time to the host.
-        params = _flatten(params)
+        params = flatten(params)
     save_sharded(params, directory, max_shard_size)
     with open(os.path.join(directory, CONFIG_FILE), "w") as handle:
         json.dump(config, handle, indent=2)

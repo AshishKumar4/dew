@@ -91,7 +91,7 @@ def _recorded(space: Space) -> dict[str, list[Choice]]:
     return {field: list(values) for field, values in space.items()}
 
 
-def _read(path: Path, space: Space) -> list[TrialFinished]:
+def read_ledger(path: Path, space: Space) -> list[TrialFinished]:
     """Read the ledger's finished trials, refusing a ledger of another space."""
     if not path.exists():
         return []
@@ -103,7 +103,7 @@ def _read(path: Path, space: Space) -> list[TrialFinished]:
                           float(row['value'])) for row in ledger['trials']]
 
 
-def _write(path: Path, space: Space, trials: Sequence[TrialFinished]) -> None:
+def write_ledger(path: Path, space: Space, trials: Sequence[TrialFinished]) -> None:
     """Replace the ledger with `trials`, whole, so an interrupt cannot leave
     half a ledger behind."""
     path.parent.mkdir(parents=True, exist_ok=True)

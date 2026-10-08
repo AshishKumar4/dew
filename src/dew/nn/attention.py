@@ -377,7 +377,7 @@ class LayerNorm(nn.Module):
                                 canonicalize_dtype(x, scale, bias, dtype=self.dtype))
 
 
-def _cache_positions(module: nn.Module, batch: int, length: int, valid):
+def cache_positions(module: nn.Module, batch: int, length: int, valid):
     """Allocate compact cache slots for real tokens, independently per row.
 
     A row's tokens fill its slots in order, so the cursor alone says which
@@ -396,7 +396,7 @@ def _cache_positions(module: nn.Module, batch: int, length: int, valid):
 
 def cached_validity(module: nn.Module, length: int) -> jax.Array:
     """Which of `module`'s `length` cache slots hold a token, `[rows, length]`:
-    those before the row's cursor, which `_cache_positions` fills in order.
+    those before the row's cursor, which `cache_positions` fills in order.
 
     Derived where it is read rather than stored beside the cursor, so a
     decode step writes no `[rows, capacity]` copy of it a layer: 28 kernels
@@ -429,7 +429,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
     store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype)
-    positions, allocated = _cache_positions(module, batch, length, valid)
+    positions, allocated = cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 
 
@@ -1159,7 +1159,7 @@ def fused_attention(query, key, value, bias, mask, causal, sliding_window, imple
     return out if v_head_dim == out.shape[-1] else out[..., :v_head_dim]
 
 
-_FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
+FORWARD_MODE = contextvars.ContextVar("forward_mode_attention", default=False)
 
 
 @contextlib.contextmanager
@@ -1172,11 +1172,11 @@ def forward_mode_attention():
     `[B, H, Q, K]` probabilities once. Consistency models (sCM, rCM) run their
     JVP inside it and train outside it, on the fused backward.
     """
-    token = _FORWARD_MODE.set(True)
+    token = FORWARD_MODE.set(True)
     try:
         yield
     finally:
-        _FORWARD_MODE.reset(token)
+        FORWARD_MODE.reset(token)
 
 
 def attention_kernel(query, key, value, dtype=None, precision=None,
@@ -1206,7 +1206,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         _attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
         causal=causal, sliding_window=sliding_window, mask=mask, masked=masked, softcap=softcap,
         segment_ids=segment_ids, lengths=lengths)
-    if not _FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'tpu'):
+    if not FORWARD_MODE.get() or resolved not in ('cudnn', 'triton', 'tpu'):
         return call(query, key, value, bias=bias, sinks=sinks, implementation=resolved)
 
     def fused(query, key, value, bias, sinks):
