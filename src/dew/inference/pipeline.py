@@ -76,13 +76,15 @@ def pipeline(
     param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
     root = epath.Path(source)
     if not root.is_dir():
-        # A run published whole (`HfApi().upload_folder`) is pulled at the commit
-        # its metadata resolved, and loads as the run.
+        # A Hub source is read at the commit its metadata resolved; one holding
+        # a run (`HfApi().upload_folder`) is pulled whole and loads as the run.
         from dew.interop import sources
         from dew.interop.hub import pull_from_hub
         metadata = sources.snapshot(source, revision, weights=False)
         if (metadata / RUN_FILE).is_file():
             root, revision = epath.Path(pull_from_hub(source, metadata.name)), None
+        else:
+            revision = metadata.name
     if root.is_dir() and (
             (root / RUN_FILE).is_file() or any(path.name.isdecimal() for path in root.iterdir())):
         if revision is not None:
