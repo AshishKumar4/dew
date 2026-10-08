@@ -334,13 +334,20 @@ def from_record[ValueT](annotation: type[ValueT] | tuple[type[ValueT], ...], val
     takes a `dtype` as the dtype its name says (True), and a run record
     keeps the name it wrote (`RunConfig.from_dict`, False).
     """
-    declared = functools.reduce(operator.or_, annotation) if isinstance(annotation, tuple) else annotation
+    if isinstance(annotation, tuple):
+        declared = functools.reduce(operator.or_, annotation)
+        with _reading(value):
+            built = _rebuilt(declared, value, dtypes=dtypes)
+        if not isinstance(built, annotation):
+            raise ValueError(f"{value!r} builds {type(built).__name__}, "
+                             f"not the {declared} the field declares")
+        return built
     with _reading(value):
-        built = _rebuilt(declared, value, dtypes=dtypes)
-    witness = annotation if isinstance(annotation, tuple) else typing.get_origin(annotation) or annotation
+        built = _rebuilt(annotation, value, dtypes=dtypes)
+    witness: type[ValueT] = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
-        named = witness.__name__ if isinstance(witness, type) else declared
-        raise ValueError(f"{value!r} builds {type(built).__name__}, not the {named} the field declares")
+        raise ValueError(f"{value!r} builds {type(built).__name__}, "
+                         f"not the {witness.__name__} the field declares")
     return built
 
 
