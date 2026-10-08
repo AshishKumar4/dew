@@ -6,7 +6,7 @@ runs its share of each pool's processes, which join at rank0, so a pool's collec
 coordinator and its checkpoints cross separate machines and separate disks. Every rank runs this
 module in the same order, so the n-th pool of a run is the same pool on every rank; ranks swap what
 their processes reported over the gang (`exchange`), and each asserts on the whole pool. Outside a
-gang the module is skipped: `tools/armada/ci.py plan --multihost` plans it.
+gang the module is skipped: CI's multihost job runs it on a gang of four.
 """
 
 import json
