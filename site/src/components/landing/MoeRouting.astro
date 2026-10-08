@@ -15,13 +15,13 @@ const payload = JSON.stringify(data).replace(/</g, '\\u003c');
 	<div class="moe-controls">
 		<button type="button" data-moe-play>Play</button>
 		<label>Router <select data-moe-layer>{data.frames[0].layers.map((layer, index) => <option value={index}>{layer.layer}</option>)}</select></label>
-		<label class="moe-frame-control">Recorded frame <input data-moe-frame type="range" min="0" max={data.frames.length - 1} value="0" /></label>
+		<label class="moe-frame-control">Step <input data-moe-frame type="range" min="0" max={data.frames.length - 1} value="0" /></label>
 	</div>
 	<p class="moe-frame-label" data-moe-label>{data.frames[0].label}</p>
-	<svg viewBox="0 0 400 440" role="img" data-moe-routes aria-label="Recorded expert routing among eight simulated CPU devices" />
+	<svg viewBox={`0 0 ${data.mesh.data * (data.mesh.fsdp * 130 + 40) - 30} ${data.mesh.expert * 190 + 20}`} role="img" data-moe-routes aria-label="Recorded expert routing among eight simulated CPU devices" />
 	<figcaption>
 		Eight simulated CPU devices: data {data.mesh.data} × expert {data.mesh.expert} × FSDP {data.mesh.fsdp}.
-		Arrows show the recorded assignments sent between devices; each circle shows assignments kept locally.
+		Arrows show the recorded assignments sent between devices; each circle shows the assignments kept locally.{' '}
 		<a href="/examples/moe-mesh/moe-mesh.json">Full routing record</a>.
 	</figcaption>
 	<script type="application/json" data-moe-data set:html={payload} />
@@ -53,18 +53,35 @@ const payload = JSON.stringify(data).replace(/</g, '\\u003c');
 			const marker = element('marker', { id: 'moe-arrow', markerWidth: 6, markerHeight: 6, refX: 5, refY: 3, orient: 'auto' });
 			marker.append(element('path', { d: 'M0,0 L6,3 L0,6 Z', fill: 'currentColor' }));
 			defs.append(marker); svg.append(defs);
-			const points = data.devices.map((_: string, index: number) => [100 + index % 2 * 200, 50 + Math.floor(index / 2) * 100]);
+			// Devices sit by their mesh coordinates: a panel per data index, a row per expert
+			// index and a column per FSDP index, so the exchanges between expert groups run down.
+			const { data: groups, expert: rows, fsdp: columns } = data.mesh;
+			const at = (index: number) => {
+				const column = index % columns, row = Math.floor(index / columns) % rows;
+				const group = Math.floor(index / (columns * rows)) % groups;
+				return [70 + group * (columns * 130 + 40) + column * 130, 70 + row * 190];
+			};
+			for (let group = 0; group < groups; group++) {
+				const x = 70 + group * (columns * 130 + 40) + (columns - 1) * 65;
+				svg.append(element('text', { x, y: 14, class: 'moe-axis', 'text-anchor': 'middle' }, `data ${group}`));
+			}
+			const points = data.devices.map((_: string, index: number) => at(index));
 			for (let source = 0; source < points.length; source++) for (let destination = 0; destination < points.length; destination++) {
 				const count = routed.sent[source][destination];
 				if (!count || source === destination) continue;
 				const [sx, sy] = points[source], [tx, ty] = points[destination];
 				const distance = Math.hypot(tx - sx, ty - sy);
 				const ux = (tx - sx) / distance, uy = (ty - sy) / distance;
-				const bend = source < destination ? 20 : -20;
-				const edge = element('path', { class: 'moe-edge', d: `M${sx + ux * 33},${sy + uy * 33} Q${(sx + tx) / 2 + bend},${(sy + ty) / 2 + bend} ${tx - ux * 38},${ty - uy * 38}`,
-					'stroke-width': 1 + Math.sqrt(count) / 5, 'marker-end': 'url(#moe-arrow)' });
+				// The two directions between a pair bend to opposite sides of the line between them.
+				const [nx, ny] = source < destination ? [-uy, ux] : [uy, -ux];
+				const bend = 26 * (source < destination ? 1 : -1);
+				const mx = (sx + tx) / 2 + nx * bend, my = (sy + ty) / 2 + ny * bend;
+				const edge = element('path', { class: 'moe-edge', d: `M${sx + ux * 34},${sy + uy * 34} Q${mx},${my} ${tx - ux * 40},${ty - uy * 40}`,
+					'stroke-width': 1 + Math.sqrt(count) / 4, 'marker-end': 'url(#moe-arrow)' });
 				edge.append(element('title', {}, `${data.devices[source]} → ${data.devices[destination]}: ${count} assignments`));
 				svg.append(edge);
+				svg.append(element('text', { x: (sx + tx) / 2 + nx * bend * 1.3, y: (sy + ty) / 2 + ny * bend * 1.3 + 4,
+					class: 'moe-count', 'text-anchor': 'middle' }, String(count)));
 			}
 			for (let index = 0; index < points.length; index++) {
 				const [x, y] = points[index];
@@ -74,7 +91,9 @@ const payload = JSON.stringify(data).replace(/</g, '\\u003c');
 				group.append(element('text', { x, y: y - 4, 'text-anchor': 'middle' }, data.devices[index]));
 				group.append(element('text', { x, y: y + 13, class: 'moe-local', 'text-anchor': 'middle' }, `local ${routed.sent[index][index]}`));
 				const [first, end] = data.experts_held[index];
-				group.append(element('text', { x, y: y + 50, class: 'moe-experts', 'text-anchor': 'middle' }, `experts ${first}–${end - 1}`));
+				// Expert labels sit outside the rows, clear of the exchanges between them.
+				const above = Math.floor(index / columns) % rows === 0;
+				group.append(element('text', { x, y: above ? y - 42 : y + 50, class: 'moe-experts', 'text-anchor': 'middle' }, `experts ${first}–${end - 1}`));
 				svg.append(group);
 			}
 		};
@@ -91,7 +110,7 @@ const payload = JSON.stringify(data).replace(/</g, '\\u003c');
 	}
 </script>
 <style>
-	.moe-routing { max-width: 42rem; margin-inline: auto; }
+	.moe-routing { max-width: 42rem; margin: 0; }
 	.moe-controls { display: flex; flex-wrap: wrap; gap: 0.75rem 1rem; align-items: center; }
 	.moe-controls button, .moe-controls select { color: var(--sl-color-white); background: var(--sl-color-gray-6); border: 1px solid var(--dew-rule); border-radius: 0.4rem; padding: 0.35rem 0.6rem; font: inherit; }
 	.moe-frame-control { display: flex; flex: 1; align-items: center; gap: 0.5rem; }
@@ -102,4 +121,7 @@ const payload = JSON.stringify(data).replace(/</g, '\\u003c');
 	.moe-routing :global(.moe-device circle) { fill: var(--sl-color-gray-6); stroke: var(--dew-rule); }
 	.moe-routing :global(.moe-device text) { fill: var(--sl-color-white); font: 12px var(--dew-font-mono); }
 	.moe-routing :global(.moe-device .moe-local), .moe-routing :global(.moe-device .moe-experts) { fill: var(--dew-muted); font-size: 10px; }
+	.moe-routing :global(.moe-count) { fill: var(--sl-color-white); font: 10px var(--dew-font-mono); }
+	.moe-routing :global(.moe-axis) { fill: var(--dew-muted); font: 11px var(--dew-font-mono); }
+	.moe-routing figcaption { font-size: 0.85rem; color: var(--dew-muted); }
 </style>
