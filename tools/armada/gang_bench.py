@@ -27,50 +27,67 @@ RELAY_PORT, STREAM = 9100, 32 << 20
 
 
 def relay() -> dict:
-    """This rank's round trips and stream to the next rank, while every rank streams to its own."""
+    """This rank's round trips and stream to the next rank, while every rank streams to its own.
+
+    A connection to another rank always opens, since this host's relay takes it; one the peer had
+    nothing listening for closes before its server's first byte, and is opened again. A rank returns
+    once its predecessor is done with its server too, so no rank takes its server away early.
+    """
     server = socket.create_server(("0.0.0.0", RELAY_PORT), backlog=8)
+    served = threading.Event()
 
     def serve():
         while True:
             conn = server.accept()[0]
             with conn:
                 kind = conn.recv(1)
+                conn.sendall(b"r")
                 while data := conn.recv(1 << 16):
                     if kind == b"e":
                         conn.sendall(data)
+                if kind == b"s":
+                    conn.sendall(b"d")
+                    served.set()
 
     threading.Thread(target=serve, daemon=True).start()
     peer = f"rank{(RANK + 1) % WORLD}"
     deadline = time.monotonic() + 600
-    while True:
-        try:
-            echo = socket.create_connection((peer, RELAY_PORT), timeout=60)
-            break
-        except OSError:
+
+    def ready(kind: bytes) -> socket.socket:
+        while True:
+            conn = socket.create_connection((peer, RELAY_PORT), timeout=120)
+            conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            conn.sendall(kind)
+            if conn.recv(1) == b"r":
+                return conn
+            conn.close()
             if time.monotonic() > deadline:
-                raise
+                raise ConnectionError(f"rank {RANK}: {peer} never answered")
             time.sleep(0.5)
-    echo.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-    echo.sendall(b"e")
-    trips = []
-    for _ in range(50):
-        start = time.perf_counter()
-        echo.sendall(b"x" * 64)
-        got = b""
-        while len(got) < 64:
-            chunk = echo.recv(64 - len(got))
+
+    def exactly(conn: socket.socket, size: int) -> None:
+        got = 0
+        while got < size:
+            chunk = conn.recv(size - got)
             if not chunk:
-                raise ConnectionError(f"rank {RANK}: {peer} closed the echo")
-            got += chunk
-        trips.append(time.perf_counter() - start)
-    echo.close()
-    sink = socket.create_connection((peer, RELAY_PORT), timeout=60)
-    sink.sendall(b"s")
-    start = time.perf_counter()
-    sink.sendall(bytes(STREAM))
-    sink.shutdown(socket.SHUT_WR)
-    sink.recv(1)
-    seconds = time.perf_counter() - start
+                raise ConnectionError(f"rank {RANK}: {peer} closed mid-answer")
+            got += len(chunk)
+
+    with ready(b"e") as echo:
+        trips = []
+        for _ in range(50):
+            start = time.perf_counter()
+            echo.sendall(b"x" * 64)
+            exactly(echo, 64)
+            trips.append(time.perf_counter() - start)
+    with ready(b"s") as sink:
+        start = time.perf_counter()
+        sink.sendall(bytes(STREAM))
+        sink.shutdown(socket.SHUT_WR)
+        exactly(sink, 1)
+        seconds = time.perf_counter() - start
+    if not served.wait(timeout=600):
+        raise ConnectionError(f"rank {RANK}: rank{(RANK - 1) % WORLD} never streamed")
     return {"rtt_ms_p50": round(1000 * statistics.median(trips), 2), "MBps": round(STREAM / seconds / 1e6, 2)}
 
 
