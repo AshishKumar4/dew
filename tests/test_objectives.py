@@ -289,4 +289,4 @@ def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
     np.testing.assert_array_equal(Objective.row_weights(last, 4), [1.0, 0.0, 0.0, 0.0])
     assert Objective.row_weights(last, 4).dtype == jnp.float32
     np.testing.assert_array_equal(Objective.row_weights({"x": last["x"]}, 4), np.ones(4, np.float32))
-    assert float(Objective.row_mean(jnp.asarray(last["x"]), last).mean()) == 4.0
+    assert float(Objective.row_mean(jnp.asarray(last["x"]), last).mean()[0]) == 4.0
