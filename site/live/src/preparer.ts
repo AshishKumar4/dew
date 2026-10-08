@@ -190,7 +190,14 @@ export class ManagedPreparer extends DurableObject<Env> {
 			if (job.outcome.generation) await this.phase('complete');
 			await this.ctx.storage.put('job', job);
 		}
-		await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
+		try {
+			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
+		} catch (error) {
+			// The job, its outcome kept, holds this preparer until a later alarm reports it.
+			console.error('preparation report failed', error);
+			await this.ctx.storage.setAlarm(Date.now() + 60_000);
+			return;
+		}
 		await this.ctx.storage.delete('job');
 		await this.ctx.storage.deleteAlarm();
 	}

@@ -1,32 +1,61 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Prepared, Reply } from '../src/preparer';
-import { SnapshotRegistry } from '../src/snapshots';
+import { SnapshotRegistry, type SnapshotGeneration } from '../src/snapshots';
 export class Registry extends SnapshotRegistry {
 	async runAlarm() { await this.alarm(); }
 }
 
 export class Preparer extends DurableObject<Env> {
 	async prepare(commit: string, reply: Reply) { await this.queue({ commit, trial: false, reply }); }
-	async trial(commit: string, reply: Reply) { await this.queue({ commit, trial: true, reply }); }
+	async trial(commit: string, reply: Reply) {
+		if (await this.ctx.storage.get('reject')) {
+			await this.ctx.storage.delete('reject');
+			await scheduler.wait(200);
+			throw new Error('preparer unreachable');
+		}
+		await this.queue({ commit, trial: true, reply });
+	}
 	private async queue(job: { commit: string; trial: boolean; reply: Reply }) {
 		await this.ctx.storage.put('calls', ((await this.ctx.storage.get<number>('calls')) ?? 0) + 1);
 		await this.ctx.storage.put('job', job);
 	}
-	/** Report how the queued preparation ended, as the preparer's alarm does once its smoke is over. */
+	/**
+	 * Report how the queued preparation ended, as the preparer's alarm does once its smoke is over,
+	 * keeping the outcome to send again should the registry fail to take it.
+	 */
 	async finish() {
-		const job = await this.ctx.storage.get<{ commit: string; trial: boolean; reply: Reply }>('job');
+		const job = await this.ctx.storage.get<{ commit: string; trial: boolean; reply: Reply; outcome?: Prepared }>('job');
 		if (!job) throw new Error('no preparation is queued');
-		const outcome: Prepared = { commit: job.commit, trial: job.trial, token: job.reply.token };
-		if (await this.ctx.storage.get('fail')) outcome.failure = 'Error: offline smoke failed';
-		else outcome.generation = { snapshot: { id: crypto.randomUUID() }, commit: job.commit, created: Date.now(),
-			prepareSeconds: 1, snapshotSeconds: 1, smokeSeconds: 1 };
-		await this.env.REGISTRY.get(this.env.REGISTRY.idFromString(job.reply.registry)).prepared(outcome);
+		if (!job.outcome) {
+			job.outcome = { commit: job.commit, trial: job.trial, token: job.reply.token };
+			if (await this.ctx.storage.get('fail')) job.outcome.failure = 'Error: offline smoke failed';
+			else job.outcome.generation = { snapshot: { id: crypto.randomUUID() }, commit: job.commit, created: Date.now(),
+				prepareSeconds: 1, snapshotSeconds: 1, smokeSeconds: 1 };
+			await this.ctx.storage.put('job', job);
+		}
+		await this.env.REGISTRY.get(this.env.REGISTRY.idFromString(job.reply.registry)).prepared(job.outcome);
+		await this.ctx.storage.delete('job');
 	}
 	async fail() { await this.ctx.storage.put('fail', true); }
+	async rejectNext() { await this.ctx.storage.put('reject', true); }
 	async calls() { return (await this.ctx.storage.get<number>('calls')) ?? 0; }
 }
 
-interface Env { REGISTRY: DurableObjectNamespace<Registry>; PREPARER: DurableObjectNamespace<Preparer>; }
+export class Pool extends DurableObject {
+	async configure(generation: SnapshotGeneration) {
+		if (await this.ctx.storage.get('fail')) {
+			await this.ctx.storage.delete('fail');
+			throw new Error('pool unreachable');
+		}
+		await this.ctx.storage.put('configured', generation.snapshot.id);
+	}
+	async failOnce() { await this.ctx.storage.put('fail', true); }
+	async configured() { return (await this.ctx.storage.get<string>('configured')) ?? null; }
+}
+
+interface Env {
+	REGISTRY: DurableObjectNamespace<Registry>; PREPARER: DurableObjectNamespace<Preparer>; POOL: DurableObjectNamespace<Pool>;
+}
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
 export default {
@@ -79,6 +108,26 @@ export default {
 			await trials.finish();
 			return Response.json({ pending, cut, trialled: await registry.trialled(), active: await registry.previous(),
 				renewal, alarm: (await registry.status()).alarm, trialCalls: await trials.calls(), trustedCalls: await preparer.calls() });
+		}
+		if (scenario === 'overlap') {
+			// The first trial's preparer answers late, with an error, after a second trial began.
+			const trials = env.PREPARER.get(env.PREPARER.idFromName('trial'));
+			await trials.rejectNext();
+			const first = registry.trial(A);
+			await scheduler.wait(50);
+			await registry.trial(B);
+			await first;
+			return Response.json({ trialled: await registry.trialled() });
+		}
+		if (scenario === 'handoff') {
+			const pool = env.POOL.get(env.POOL.idFromName('global'));
+			await pool.failOnce();
+			await registry.refresh(A);
+			const first = await preparer.finish().then(() => null, (error) => String(error));
+			const missed = await pool.configured();
+			await preparer.finish();
+			return Response.json({ first, missed, configured: await pool.configured(),
+				active: (await registry.previous())?.snapshot.id, status: await registry.status() });
 		}
 		if (scenario === 'concurrent') {
 			const started = await Promise.all(Array.from({ length: 10 }, () => registry.refresh(A)));
