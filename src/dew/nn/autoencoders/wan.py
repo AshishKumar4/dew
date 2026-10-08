@@ -38,6 +38,7 @@ from dew import records
 from dew.interop.components import bind_component, component_source
 from dew.objectives.base import Variables
 
+from ..attention import scaled_dot_product_attention
 from ..conv import Conv
 from .api import AutoEncoder
 from .kl import posterior_latent
@@ -145,7 +146,8 @@ class WanAttention(nn.Module):
         qkv = causal_conv(3 * channels, 1, 2, self.dtype, "to_qkv")(normalized)
         frames = qkv.shape[0]
         query, key, value = jnp.split(qkv.reshape(frames, height * width, 1, 3 * channels), 3, axis=-1)
-        attended = jax.nn.dot_product_attention(query, key, value).reshape(frames, height, width, channels)
+        attended = scaled_dot_product_attention(query, key, value, dtype=self.dtype).reshape(
+            frames, height, width, channels)
         return causal_conv(channels, 1, 2, self.dtype, "attention_out")(attended).reshape(x.shape) + x
 
 

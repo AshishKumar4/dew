@@ -287,7 +287,9 @@ def test_a_pretrained_run_refuses_a_model_of_its_own():
 def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pipelines):
     """Flux from scratch in pixel space, conditioned by the Flux pipeline's
     CLIP and T5 towers: the conditioner's record goes in under `conditioning`,
-    where the published family reads it."""
+    where the published family reads it, and ten steps on one batch lower
+    its loss (one step draws its own noise, which a single step's loss on
+    the evaluation's draw need not follow)."""
     directory = pipelines / "flux" / "pipeline"
     config = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {
@@ -305,8 +307,10 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
     trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
     initial = trainer.initial_state()
     before = value(objective, initial.variables, batch)
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
-    assert bool(accepted)
+    step, state = trainer.compile(initial, batch), initial
+    for _ in range(10):
+        state, _, _, _, accepted = step(state, batch)
+        assert bool(accepted)
     assert value(objective, state.variables, batch) < before
 
 

@@ -204,10 +204,10 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
             path.append("self_attention" if kind == "attn1" else "cross_attention")
             projection = parts.pop(0)
             if projection == "to_out" and parts == ["0"]:
-                path.append("output")
+                path.append("to_out_0")
                 parts = []
             elif projection in ("to_q", "to_k", "to_v"):
-                path.append(projection[-1])
+                path.append(projection)
             else:
                 raise ValueError(f"Unknown UNet attention tensor {name}")
         elif kind == "ff":
@@ -275,7 +275,7 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
                     if root.startswith("up_")
                     else model.stages[-1]
                 )
-                if path[-2] in ("q", "k", "v"):
+                if path[-2] in ("to_q", "to_k", "to_v"):
                     value = value.reshape(value.shape[0], stage.heads, stage.features // stage.heads)
                     transpose = (1, 2, 0)
                 else:
@@ -378,9 +378,9 @@ def _dit_block(block: tuple[str, ...], rest: list[str], leaf: str, name: str, *,
         return _dit_attention(block, rest[0], rest[1:], leaf, name, joint=True)
     if len(rest) > 1 and rest[0] in ("ff", "ff_context"):
         if rest[1:] == ["net", "0", "proj"]:
-            return (*block, rest[0], "net_0_proj", _dit_leaf(leaf))
+            return (*block, rest[0], "up_proj", _dit_leaf(leaf))
         if rest[1:] == ["net", "2"]:
-            return (*block, rest[0], "net_2", _dit_leaf(leaf))
+            return (*block, rest[0], "down_proj", _dit_leaf(leaf))
     raise ValueError(f"unknown tensor name {name!r}")
 
 
@@ -493,7 +493,8 @@ def _flux2_path(name: str) -> tuple[str, ...]:
         block, rest = (f"{parts[0]}_{parts[1]}",), parts[2:-1]
         if parts[0] == "transformer_blocks":
             if len(rest) == 2 and rest[0] in ("ff", "ff_context") and rest[1] in ("linear_in", "linear_out"):
-                return (*block, *rest, _dit_leaf(leaf))
+                return (*block, rest[0], "gate_up_proj" if rest[1] == "linear_in" else "down_proj",
+                        _dit_leaf(leaf))
             if len(rest) > 1 and rest[0] == "attn":
                 return _dit_attention(block, "attn", rest[1:], leaf, name, joint=True)
         # A single block's fused maps and head norms sit under `attn` in the
@@ -563,8 +564,8 @@ _Z_IMAGE_BLOCK = {
     "attention.to_q": ("attention", "to_q"), "attention.to_k": ("attention", "to_k"),
     "attention.to_v": ("attention", "to_v"), "attention.to_out.0": ("attention", "to_out_0"),
     "attention.norm_q": ("attention", "norm_q"), "attention.norm_k": ("attention", "norm_k"),
-    "feed_forward.w1": ("feed_forward", "w1"), "feed_forward.w2": ("feed_forward", "w2"),
-    "feed_forward.w3": ("feed_forward", "w3"), "adaLN_modulation.0": ("modulation",),
+    "feed_forward.w1": ("feed_forward", "gate_proj"), "feed_forward.w2": ("feed_forward", "down_proj"),
+    "feed_forward.w3": ("feed_forward", "up_proj"), "adaLN_modulation.0": ("modulation",),
     **{norm: (norm,) for norm in ("attention_norm1", "attention_norm2", "ffn_norm1", "ffn_norm2")},
 }
 
@@ -666,7 +667,7 @@ def _wan_path(name: str) -> tuple[str, ...]:
         if rest[0] == "norm2" and len(rest) == 2:
             return (*block, "norm2", "scale" if rest[1] == "weight" else _dit_leaf(rest[1]))
         if rest[:2] == ["ffn", "net"] and rest[2:-1] in (["0", "proj"], ["2"]):
-            return (*block, "ffn", "net_" + "_".join(rest[2:-1]), _dit_leaf(rest[-1]))
+            return (*block, "ffn", "up_proj" if rest[2] == "0" else "down_proj", _dit_leaf(rest[-1]))
     stem, _, leaf = name.rpartition(".")
     if stem in _WAN_MODULES:
         return (*_WAN_MODULES[stem], _dit_leaf(leaf))

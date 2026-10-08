@@ -36,7 +36,8 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
-from .joint import FeedForward, Modulation, embedding, layer_norm, modulate
+from .decoder_block import GatedMLP
+from .joint import Modulation, embedding, layer_norm, modulate
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -143,8 +144,9 @@ class WanBlock(nn.Module):
         normalized = (LayerNorm(epsilon=self.epsilon, dtype=x.dtype, name="norm2")(x)
                       if self.cross_attn_norm else x)
         x = x + WanAttention(self.heads, head_dim, name="attn2", **attention)(normalized, context)
-        fed = FeedForward(self.features, self.ffn_dim, dtype=self.dtype, precision=self.precision,
-                          name="ffn")(modulate(norm(x), shift_mlp, scale_mlp).astype(x.dtype))
+        fed = GatedMLP(self.ffn_dim, self.features, activation="gelu", use_bias=True, dtype=self.dtype,
+                       precision=self.precision, name="ffn")(
+            modulate(norm(x), shift_mlp, scale_mlp).astype(x.dtype))
         return (x.astype(wide) + fed.astype(wide) * gate_mlp[:, None]).astype(x.dtype)
 
 
