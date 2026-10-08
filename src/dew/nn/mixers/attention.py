@@ -10,7 +10,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -44,6 +44,8 @@ from dew.nn.rope import (
     LongRopeScaling,
     RopeScaling,
     YarnScaling,
+    axis_halves,
+    axis_tables,
     inverse_frequencies,
     rotary_freqs,
     rotate,
@@ -150,6 +152,24 @@ class CausalSelfAttention(nn.Module):
     force_fp32_for_softmax: bool = True
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None
+    rotary_axes: tuple[int, ...] | None = None
+    """The channel widths of a rotary over several axes (`dew.nn.rope.axis_tables`),
+    a vision tower's patch grid, whose ids `attention_metadata.rotary_positions`
+    carries `[B, S, len(rotary_axes)]`; None rotates by the positions."""
+    rotary_pairs: Literal['half', 'adjacent'] = 'half'
+    """The channels each angle turns (`dew.nn.rope.rotate`): the HF decoders'
+    halves, or the adjacent pairs of Llama 4's vision tower."""
+    rotary_per_axis: bool = False
+    """Whether each of the `rotary_axes` turns its own channels in halves,
+    Gemma 4's vision rope (`apply_multidimensional_rope`), where Qwen 3.5's
+    turns the axes' angles together over the whole head."""
+    packed: bool = False
+    """Whether the queries, keys and values project through one kernel,
+    `qkv_proj`, at init as from a checkpoint that stores them so (the Qwen 3.5
+    and DeepSeek-V4.1 vision towers)."""
+    linear: Callable[..., nn.Dense] = nn.Dense
+    """The projections' module: Gemma 4's vision tower clips their inputs and
+    outputs (`dew.nn.vision.gemma4.Gemma4ClippableLinear`)."""
     kv_cache: KVCache = KVCache()  # the decode cache's storage: dense or paged, full or quantized
     nope: bool = False
     """No positional encoding: q and k enter the kernel unrotated, and the
@@ -172,13 +192,13 @@ class CausalSelfAttention(nn.Module):
                 "exclusive self attention subtracts the token's own value, and a "
                 "KV-sharing layer projects none of its own")
         dense = functools.partial(
-            nn.Dense, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision,
+            self.linear, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
         # The gate doubles the query projection: the reference chunks its
         # output in half, one half the query and the other the gate the
         # branch multiplies by (modeling_qwen3_5.py:670-673, 701).
         query_width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
-        if self.has_variable('params', 'qkv_proj'):
+        if self._packed():
             # A Server packs its constant weights once, not on every decode
             # step. The ordinary parameter tree remains the training layout.
             self.qkv_proj = dense(query_width + 2 * self.num_kv_heads * self.head_dim, name='qkv_proj')
@@ -187,7 +207,7 @@ class CausalSelfAttention(nn.Module):
         # A sharing layer reads another layer's keys and values, so it owns
         # no projections or key norm of its own, as the reference skips them
         # (modeling_gemma4.py, Gemma4TextAttention.__init__).
-        if not self.kv_shared and not self.has_variable('params', 'qkv_proj'):
+        if not self.kv_shared and not self._packed():
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
             if not self.k_eq_v:
                 self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
@@ -217,6 +237,11 @@ class CausalSelfAttention(nn.Module):
         """Whether its call takes `train` (`ReadsTrain`): it drops attention
         probabilities while training."""
         return bool(self.attention_dropout_rate)
+
+    def _packed(self) -> bool:
+        """Whether one `qkv_proj` holds the projections: the layer's own
+        layout, or a server's packing of the three (`projection_groups`)."""
+        return self.packed or self.has_variable('params', 'qkv_proj')
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its query, key and value projections packed as `qkv_proj`
@@ -316,6 +341,11 @@ class CausalSelfAttention(nn.Module):
         takes neither a partial rotary nor a Llama 3.1 ramp.
         """
         dtype = at_least_fp32(heads.dtype)
+        if self.rotary_axes is not None:
+            if rotary_positions is None or rotary_positions.ndim != 3:
+                raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "
+                                 "[B, S, axes] from attention_metadata.rotary_positions")
+            return axis_tables(rotary_positions, self.rotary_axes, self.rope_theta, dtype=dtype)
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
             return self._multimodal_rotary(rotary_positions, dtype)
         if self.yarn is None:
@@ -390,7 +420,7 @@ class CausalSelfAttention(nn.Module):
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
         projected_kv = None
-        if self.has_variable('params', 'qkv_proj'):
+        if self._packed():
             width = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
             projected, key, value = jnp.split(
                 self.qkv_proj(x), (width, width + self.num_kv_heads * self.head_dim), axis=-1)
@@ -441,13 +471,13 @@ class CausalSelfAttention(nn.Module):
             # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
             # query carries the ratio to the scale the checkpoint asks for.
             query = rotate(
-                query, freqs_cos, freqs_sin,
+                self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
                 scale=(None if self.attention_scale is None
                        else self.attention_scale * math.sqrt(self.head_dim)))
         own_value = value
         if not self.kv_shared:
             if freqs_cos is not None and freqs_sin is not None:
-                key = rotate(key, freqs_cos, freqs_sin)
+                key = rotate(self._turned(key), freqs_cos, freqs_sin, pairs=self.rotary_pairs)
             if kv_store is not None and self.kv_store_key is not None:
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
@@ -482,8 +512,19 @@ class CausalSelfAttention(nn.Module):
             else:
                 key_positions = positions
             bias = alibi_bias(key_positions, self.num_heads, dtype=query.dtype)
+        if attention_metadata is not None and attention_metadata.position_bias is not None:
+            position_bias = attention_metadata.position_bias
+            bias = position_bias if bias is None else bias + position_bias
         attention = self._attended(masking, positions, append, sinks, train, bias=bias)
         return self._output(attention, gate, B, S, own_value)
+
+    def _turned(self, heads):
+        """Query or key heads in the layout their rotation reads: with
+        `rotary_per_axis`, each axis's halves gathered into the head's two
+        (`dew.nn.rope.axis_halves`), which moves query and key alike."""
+        if self.rotary_per_axis and self.rotary_axes is not None:
+            return axis_halves(heads, self.rotary_axes)
+        return heads
 
     def _step_positions(self, key, positions, segment_ids, attention_metadata: AttentionMetadata | None,
                         decode: bool, S: int):
@@ -858,7 +899,7 @@ class CausalSelfAttention(nn.Module):
         if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection("qk")):
             return False
         return metadata is None or (
-            metadata.pairwise_mask is None
+            metadata.pairwise_mask is None and metadata.position_bias is None
             and not (self.bidirectional_images and metadata.image_groups is not None))
 
     def _output(self, attention, gate, batch: int, length: int, own_value):
