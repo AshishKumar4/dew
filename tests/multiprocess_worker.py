@@ -644,6 +644,94 @@ def mode_fit(args) -> dict:
     }
 
 
+def mode_pool_refusals(args) -> dict:
+    """What a pool refuses on every process before any trains on it, each a
+    fit of the affine regression over a stream that differs on process 1
+    only: another corpus under the same name and length, another length,
+    a first read that fails there, and a batch without a field. A newest
+    checkpoint the processes list differently is refused as well. Each
+    outcome is the error's text, or None for a fit that trained."""
+    import jax
+    import optax
+    import orbax.checkpoint as ocp
+    from affine_run import FEATURES, Regression
+
+    from dew.data import Dataset
+    from dew.data.dataset import train_stream
+    from dew.training import Checkpoints, MeshSpec, Trainer
+
+    rank = jax.process_index()
+
+    class Corpus:
+        """Records under one name, each process reading its own copy."""
+
+        def __init__(self, count: int, shift: int):
+            self.count, self.shift = count, shift
+
+        def __repr__(self) -> str:
+            return "Corpus('shared')"
+
+        def __len__(self) -> int:
+            return self.count
+
+        def __getitem__(self, index: int) -> dict:
+            x = np.full((FEATURES,), index + self.shift, np.float32)
+            return {"x": x, "y": 2 * x[:2]}
+
+    class Reads:
+        """Batches of this process's rows, failing at the first read or
+        missing `y` where asked."""
+
+        def __init__(self, fail: bool, fields: tuple[str, ...]):
+            self.fail, self.fields = fail, fields
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> dict:
+            if self.fail:
+                raise ValueError("this process's share holds no rows")
+            x = np.ones((BATCH // jax.process_count(), FEATURES), np.float32)
+            return {name: value for name, value in {"x": x, "y": 2 * x[:, :2]}.items() if name in self.fields}
+
+    def stream(count: int, shift: int) -> Dataset:
+        return Dataset(train=train_stream(Corpus(count, shift), [], batch=BATCH, seed=0,
+                                          loading=Loading(workers=0)),
+                       val=None, records=count, batch=BATCH)
+
+    def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y")) -> Data:
+        return Data(lambda partition: Reads(fail, fields))
+
+    def trained(data, checkpoints=None, **flags) -> str | None:
+        trainer = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
+                          checkpoints=checkpoints)
+        try:
+            trainer.fit(data, steps=2, log_every=1, **flags)
+        except (ValueError, RuntimeError) as error:
+            return f"{type(error).__name__}: {error}"
+        return None
+
+    other = rank == 1
+    outcomes = {
+        "same": trained(stream(64, 0)),
+        "content": trained(stream(64, int(other))),
+        "count": trained(stream(64 + 32 * other, 0)),
+        "first_read": trained(reads(fail=other)),
+        "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
+        "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
+    }
+    listed = Checkpoints(str(Path(args.run_dir) / "saved"))
+    outcomes["latest"] = listed.latest
+    if other:
+        # A listing of the shared directory taken before step 2 was committed.
+        ocp.CheckpointManager.latest_step = lambda manager: 1
+    try:
+        outcomes["stale"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
+    except (ValueError, RuntimeError) as error:
+        outcomes["stale"] = f"{type(error).__name__}: {error}"
+    return outcomes
+
+
 def mode_profile_failure(args) -> dict:
     """A scheduled profile window whose directory is a file on rank 0 only.
 
@@ -1327,6 +1415,27 @@ def _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank) -
     return invalid_errors
 
 
+def _meshless_rollout(state, local, rollout, rank) -> dict:
+    """A rollout over weights on no mesh, which samples each process's own
+    prompts: process 1's zero prompt length is its own refusal, and process
+    0 samples its rows without waiting on it."""
+    import jax
+    from jax.experimental import multihost_utils
+
+    broken = {name: np.array(value, copy=True) for name, value in local.items()}
+    if rank == 1:
+        broken["prompt_length"][0] = 0
+    outcome = {}
+    try:
+        outcome["rows"] = len(rollout(state, broken, jax.random.key(29))["input_ids"])
+    except (ValueError, RuntimeError) as error:
+        outcome["refused"] = str(error)
+    reached = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+    if reached.tolist() != [0, 1]:
+        raise AssertionError("a rank did not return from its own rollout")
+    return outcome
+
+
 def mode_rollout(args) -> dict:
     """One sampled rollout and one GRPO update across the pool.
 
@@ -1401,9 +1510,10 @@ def mode_rollout(args) -> dict:
     direct = generate(
         model, state.variables, local["prompt"], 4, key=jax.random.key(27), sampling=controls
     ).host()
-    invalid_errors = {}
+    invalid_errors, meshless = {}, {}
     if processes > 1:
         invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank)
+        meshless = _meshless_rollout(trainer.initial_state(), local, rollout, rank)
     single = None
     if processes == 1:
         single = rolled
@@ -1419,6 +1529,7 @@ def mode_rollout(args) -> dict:
         "eos": eos,
         "prompt_lengths": local["prompt_length"].tolist(),
         "invalid_errors": invalid_errors,
+        "meshless": meshless,
         "input_ids": np.asarray(rolled["input_ids"]).tolist(),
         "response_mask": np.asarray(rolled["response_mask"]).tolist(),
         "old_log_probs": np.asarray(rolled["old_log_probs"]).tolist(),
@@ -1790,7 +1901,9 @@ def mode_decoding_components(args) -> dict:
         if not np.array_equal(getattr(result, name), getattr(equivalent, name)):
             raise AssertionError(f"unused sampling filters changed {name}")
 
-    refused = []
+    independent = {str(asking): _meshless_request(model, params, prompts, mask, asking)
+                   for asking in ((0, 1) if processes == 1 else (rank,))}
+    refused, undefined = [], None
     if processes > 1:
         divergences = {
             "criterion payload": (
@@ -1827,6 +1940,7 @@ def mode_decoding_components(args) -> dict:
             arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
             if arrivals.tolist() != list(range(processes)):
                 raise AssertionError("a rank did not return from the rejected request")
+        undefined = _undefined_draw(task, request, rank, processes)
         agreed = task(request, 4, key=7, logits=chain,
                       stopping=(decoding.EndOfSequence(jnp.asarray([5], jnp.int32)),)).host()
         if int(agreed.lengths.sum()) < 1:
@@ -1839,11 +1953,53 @@ def mode_decoding_components(args) -> dict:
         "lengths": result.lengths.tolist(),
         "behavior": np.round(result.behavior_log_probs, 5).tolist(),
         "refused": refused,
+        "undefined": undefined,
+        "independent": independent,
         "beam_tokens": searched.tokens.tolist(),
         "beam_lengths": searched.lengths.tolist(),
         "draft_tokens": drafted.tokens.tolist(),
         "draft_lengths": drafted.lengths.tolist(),
     }
+
+
+def _meshless_request(model, params, prompts, mask, asking: int) -> dict:
+    """What weights on no mesh answer a process that asks for 1 + 2 * `asking`
+    rows and 3 + `asking` tokens: its own request, whatever another asks."""
+    import jax.numpy as jnp
+
+    from dew.inference import TextGeneration
+    from dew.nn.inputs import ModelInputs
+    from dew.sampling import Sampling
+
+    rows = 1 + 2 * asking
+    own = ModelInputs(jnp.asarray(prompts[:rows]), {"attention_mask": jnp.asarray(mask[:rows])})
+    alone = TextGeneration(model, params, sampling=Sampling(temperature=0.8, top_k=5, pad_token_id=12))
+    answer = alone(own, 3 + asking, key=11).host()
+    return {"tokens": answer.tokens.tolist(), "lengths": answer.lengths.tolist()}
+
+
+def _undefined_draw(task, request, rank: int, processes: int) -> str:
+    """One chain on every rank, which leaves no distribution on the last
+    process's rows only: the check reads every row, so every rank refuses,
+    and all return before the next request."""
+    import jax
+    import jax.numpy as jnp
+    from jax.experimental import multihost_utils
+
+    def undefined_where_the_last_process_reads(state, scores):
+        rows = jnp.arange(scores.shape[0])[:, None]
+        return jnp.where(rows >= scores.shape[0] * (processes - 1) // processes, -jnp.inf, scores)
+
+    try:
+        task(request, 4, key=7, logits=(jax.tree_util.Partial(undefined_where_the_last_process_reads),))
+    except ValueError as failure:
+        undefined = str(failure)
+    else:
+        raise AssertionError("a row without a distribution was drawn from")
+    arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int32))
+    if arrivals.tolist() != list(range(processes)):
+        raise AssertionError("a rank did not return from the undefined draw")
+    return undefined
 
 
 def _ragged_decoding_checks(model, params, prompts, placed, request):
@@ -2047,7 +2203,7 @@ MODES = {"host_training": mode_host_training, "step_fits": mode_step_fits,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
          "builtin_preview_failures": mode_builtin_preview_failures,
-         "profile_failure": mode_profile_failure}
+         "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals}
 
 
 def parse_args(argv=None):

@@ -30,7 +30,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.protocols import IntervalModel
-from dew.objectives.base import Aux, Step
+from dew.objectives.base import Aux, Step, training_rngs
 from dew.sampling.solvers import Euler, Solver
 
 from .objective import DiffusionObjective, _own_loss
@@ -196,7 +196,7 @@ class MeanFlowObjective(DiffusionObjective):
             def average(z, t, r) -> jax.Array:
                 output = self.model.apply(variables, z, schedule.model_time(t), **conditions,
                                           duration=schedule.model_time(t) - schedule.model_time(r),
-                                          train=train, rngs={"dropout": dropout_key})
+                                          train=train, rngs=training_rngs(dropout_key))
                 assert isinstance(output, jax.Array)
                 return output
             return average
@@ -297,7 +297,7 @@ class ShortcutObjective(DiffusionObjective):
                     **conditions,
                     duration=schedule.model_time(sigma) - schedule.model_time(following),
                     train=train,
-                    rngs={"dropout": dropout_key},
+                    rngs=training_rngs(dropout_key),
                 )
                 assert isinstance(output, jax.Array)
                 return output
