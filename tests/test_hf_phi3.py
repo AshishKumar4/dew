@@ -116,7 +116,8 @@ def test_phi3_dense_server_and_generate_share_the_per_row_crossing_rebuild():
     from dew.sampling import Sampling
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
-    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0, eos_id=None))
+    task = TextGeneration(loaded.model, loaded.variables,
+                          sampling=Sampling(temperature=0, eos_token_ids=None))
     ids = np.load(DIRECTORY / 'input_ids.npy').astype(np.int32)
     prompts = (ids[0, :4], ids[1, :2])
     server = Server.from_task(task, slots=2, capacity=64, admission=2)

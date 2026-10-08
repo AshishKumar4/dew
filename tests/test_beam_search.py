@@ -60,7 +60,7 @@ def every_sequence(model, params, prompt, budget, eos_ids=()):
 
 def searched(model, params, prompt, budget, width, penalty=1.0, early=False, eos=None, n=1):
     return generate(model, params, jnp.asarray([prompt], jnp.int32), budget,
-                    key=jax.random.key(0), sampling=Sampling(eos_id=eos, pad_id=0), n=n,
+                    key=jax.random.key(0), sampling=Sampling(eos_token_ids=eos, pad_token_id=0), n=n,
                     strategy=Beam(width=width, length_penalty=penalty, early_stopping=early,
                                   stop_ids=0 if eos is None else 1))
 
@@ -87,7 +87,7 @@ def test_beams_are_transformers_beam_search(name):
     eos, pad = int(reference["eos"]), int(reference["pad"])
     for case, (penalty, early) in enumerate(json.loads(str(reference["settings"]))):
         found = generate(pretrained.model, pretrained.variables, inputs, 6, key=jax.random.key(0),
-                         sampling=Sampling(eos_id=eos, pad_id=pad), n=3,
+                         sampling=Sampling(eos_token_ids=eos, pad_token_id=pad), n=3,
                          strategy=Beam(width=3, length_penalty=penalty, early_stopping=early, stop_ids=1))
         want = reference[f"case_{case}_tokens"]
         np.testing.assert_array_equal(np.asarray(found.tokens)[:, width:], want, err_msg=f"case {case}")
@@ -136,7 +136,7 @@ def test_the_returned_rows_are_prompt_major_and_carry_no_behaviour_probability(m
     module, params = model
     prompts = jnp.asarray([[1, 2, 3], [7, 8, 9]], jnp.int32)
     found = generate(module, params, prompts, 3, key=jax.random.key(0),
-                     sampling=Sampling(pad_id=0), strategy=Beam(width=4), n=2)
+                     sampling=Sampling(pad_token_id=0), strategy=Beam(width=4), n=2)
     assert found.tokens.shape == (4, 6) and found.rows == 4
     np.testing.assert_array_equal(np.asarray(found.tokens)[:, :3],
                                   np.repeat(np.asarray(prompts), 2, axis=0))
@@ -179,7 +179,8 @@ def test_a_renormalized_biased_search_is_transformers(name):
     entries = [(list(tokens), bias) for tokens, bias in json.loads(str(reference["shaped_bias"]))]
     penalty, early = json.loads(str(reference["shaped_setting"]))
     found = generate(pretrained.model, pretrained.variables, inputs, 6, key=jax.random.key(0),
-                     sampling=Sampling(eos_id=int(reference["eos"]), pad_id=int(reference["pad"])),
+                     sampling=Sampling(eos_token_ids=int(reference["eos"]),
+                                       pad_token_id=int(reference["pad"])),
                      logits=(decoding.sequence_bias(entries), decoding.Renormalize()), n=3,
                      strategy=Beam(width=3, length_penalty=penalty, early_stopping=early, stop_ids=1))
     want = reference["shaped_tokens"]

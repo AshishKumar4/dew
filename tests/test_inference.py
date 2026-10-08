@@ -421,7 +421,8 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     model_config = ModelConfig("causal_transformer", {**fields,
                                                     "dtype": "float32", "attention_impl": "reference"})
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
-                            samples=Samples([1, 2, 3], 4, sampling=Sampling(temperature=0, eos_id=255)),
+                            samples=Samples([1, 2, 3], 4,
+                                            sampling=Sampling(temperature=0, eos_token_ids=255)),
                             processor=RunProcessor(ByteTokenizer()))
     rng = np.random.RandomState(0)
     batch = {"text": rng.randint(1, 250, (8, 9)).astype(np.int32)}
@@ -512,14 +513,14 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
     objective, state = make_lm_run(tmp_path)
     task = dew.pipeline(str(tmp_path))
     assert isinstance(task, TextGeneration)
-    assert task.max_new_tokens == 4 and task.sampling.eos_id == (255,)
-    result = task("the ", key=2, sampling=Sampling(temperature=0, eos_id=255))
+    assert task.max_new_tokens == 4 and task.sampling.eos_token_ids == (255,)
+    result = task("the ", key=2, sampling=Sampling(temperature=0, eos_token_ids=255))
     assert result.rows == 1 and result.host().tokens.shape == (1, 4 + 4)
     assert isinstance(result.text[0], str)
     trained = objective.pipeline(state, processor=task.processor)
     assert trained.max_new_tokens == 4
     np.testing.assert_array_equal(
-        trained("the ", key=2, sampling=Sampling(temperature=0, eos_id=255)).host().tokens,
+        trained("the ", key=2, sampling=Sampling(temperature=0, eos_token_ids=255)).host().tokens,
         result.host().tokens)
     with pytest.raises(TypeError, match="seed"):
         task("the ", seed=2)
@@ -546,7 +547,7 @@ def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp
     task = dew.pipeline("user/byte-lm", revision="main", step=2)
     assert isinstance(task, TextGeneration)
     assert (resolved, pulled) == (["main"], ["3f2a9c"])
-    greedy = Sampling(temperature=0, eos_id=255)
+    greedy = Sampling(temperature=0, eos_token_ids=255)
     local = dew.pipeline(str(snapshot), step=2)
     np.testing.assert_array_equal(task("the ", key=2, sampling=greedy).host().tokens,
                                   local("the ", key=2, sampling=greedy).host().tokens)
@@ -849,7 +850,7 @@ def test_saved_sampling_policy_survives_a_disabled_preview_budget(tmp_path):
 
     (tmp_path / "run").mkdir()
     objective, state = make_lm_run(tmp_path / "run")
-    policy = Sampling(temperature=0.37, top_k=3, eos_id=255)
+    policy = Sampling(temperature=0.37, top_k=3, eos_token_ids=255)
     checkpoints = Checkpoints(str(tmp_path / "unbudgeted"))
     checkpoints.save(int(state.step), state, None, artifact={
         **objective.inference_record(), "max_new_tokens": 0, "sampling": dataclasses.asdict(policy)})

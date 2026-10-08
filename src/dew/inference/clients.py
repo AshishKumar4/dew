@@ -180,7 +180,7 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     if sampling is not None:
         if not isinstance(sampling, Sampling):
             raise TypeError("sampling must be a Sampling value")
-        if sampling.eos_id is not None or sampling.pad != 0:
+        if sampling.eos_token_ids is not None or sampling.pad != 0:
             raise ValueError("Ollama text completion cannot implement native EOS-token or padding IDs")
         unmatched = sampling.active(("repetition_penalty", "presence_penalty", "frequency_penalty",
                                      "no_repeat_ngram_size", "min_new_tokens", "typical_p", "stop"))
@@ -487,7 +487,7 @@ class OpenAICompletion:
             raise ValueError(f"remote text completion cannot implement {unmatched} as Dew does; "
                              "an OpenAI-compatible server strips stop strings from the text")
         if self.provider == "openai" and (
-            sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_id is not None
+            sampling.top_k is not None or sampling.min_p != 0 or sampling.eos_token_ids is not None
             or sampling.repetition_penalty != 1.0
         ):
             raise ValueError("top-k, min-p, repetition-penalty and EOS-token controls require "
@@ -499,7 +499,7 @@ class OpenAICompletion:
         controls: dict[str, object] = {"top_k": -1 if sampling.top_k is None else sampling.top_k,
                                       "min_p": sampling.min_p,
                                       "repetition_penalty": sampling.repetition_penalty}
-        if sampling.eos_id is not None:
+        if sampling.eos_token_ids is not None:
             controls["stop_token_ids"] = list(sampling.stops)
         extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
         if self.provider == "openai" and controls.keys() & extra.keys():

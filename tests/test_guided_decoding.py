@@ -45,7 +45,7 @@ def tokenizer(tmp_path_factory):
     return AutoTokenizer.from_pretrained(path, local_files_only=True)
 
 
-_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_id=EOS)
+_DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_token_ids=EOS)
 
 
 def task(tokenizer, grammar, sampling=_DEFAULT_TASK_SAMPLING):
@@ -158,7 +158,8 @@ def test_a_json_schema_guided_row_writes_a_document_the_schema_accepts(tokenizer
               "properties": {"color": {"enum": ["red", "green"]}, "ok": {"type": "boolean"}},
               "required": ["color", "ok"]}
     grammar = guided.json_schema(tokenizer, schema, EOS, vocab_size=EOS + 1)
-    for sampling in (Sampling(temperature=0, eos_id=EOS), Sampling(temperature=1.0, eos_id=EOS)):
+    for sampling in (Sampling(temperature=0, eos_token_ids=EOS),
+                     Sampling(temperature=1.0, eos_token_ids=EOS)):
         for seed in range(3):
             generation = task(tokenizer, grammar, sampling)("hi", 64, key=seed)
             assert bool(generation.host().terminated[0])
@@ -172,7 +173,7 @@ def test_a_served_guided_request_draws_what_it_draws_alone(tokenizer):
     and every continuation matches the pattern in full."""
     pattern = r"[0-9]{3}-[a-c]{2,4}"
     grammar = guided.regex(tokenizer, pattern, EOS, vocab_size=EOS + 1)
-    bound = task(tokenizer, grammar, Sampling(temperature=1.0, eos_id=EOS))
+    bound = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))
     prompts = ["a", "bcd", "hello there", "x"]
     alone = [bound(prompt, 16, key=index) for index, prompt in enumerate(prompts)]
     server = Server.from_task(bound, slots=2, capacity=64)
@@ -190,7 +191,7 @@ def test_the_raw_likelihood_is_the_models_own_and_the_behaviour_one_the_masked(t
     reports as the model's: forcing a single allowed token makes the
     behaviour likelihood one while the raw one is the model's log-softmax."""
     grammar = guided.regex(tokenizer, "7", EOS, vocab_size=EOS + 1)
-    rows = task(tokenizer, grammar, Sampling(temperature=1.0, eos_id=EOS))("q", 4, key=0).host()
+    rows = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))("q", 4, key=0).host()
     assert continuation(tokenizer, rows) == "7" and bool(rows.terminated[0])
     np.testing.assert_allclose(rows.behavior_log_probs[0, :2], 0.0, atol=1e-6)
     assert np.all(rows.raw_log_probs[0, :2] < 0)
@@ -224,7 +225,7 @@ def test_a_length_penalty_on_a_masked_eos_leaves_the_row_drawing(tokenizer):
     forbids EOS the score stays -inf, so the row keeps drawing inside the
     pattern and ends where the pattern completes."""
     grammar = guided.regex(tokenizer, "[0-9]{4}", EOS, vocab_size=EOS + 1)
-    bound = task(tokenizer, grammar, Sampling(temperature=1.0, eos_id=EOS))
+    bound = task(tokenizer, grammar, Sampling(temperature=1.0, eos_token_ids=EOS))
     rows = bound("q", 8, key=0, logits=(decoding.ExponentialDecayLengthPenalty(
         1, 1.5, jnp.array([EOS], jnp.int32)),)).host()
     assert re.fullmatch("[0-9]{4}", continuation(tokenizer, rows)) and bool(rows.terminated[0])

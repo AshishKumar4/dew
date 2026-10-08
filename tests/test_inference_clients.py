@@ -72,7 +72,7 @@ def test_vllm_sampling_controls_are_explicit_and_generic_openai_is_not_guessed(c
         "openai", lambda http, request, body: http.Response(200, json=response([choice(0, "ok")]))
     )
     from dataclasses import replace
-    sampling = Sampling(temperature=0.7, top_k=4, top_p=0.8, min_p=0.1, eos_id=2)
+    sampling = Sampling(temperature=0.7, top_k=4, top_p=0.8, min_p=0.1, eos_token_ids=2)
     with pytest.raises(ValueError, match="vllm"):
         task("prompt", 5, sampling=sampling)
     vllm = replace(task, provider="vllm")
