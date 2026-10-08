@@ -3,7 +3,7 @@
 set -eu
 umask 077
 # The gateway, the model process and the bridge inherit this, so the OOM killer never picks them;
-# each guest raises its own score to 1000 (guest_entry.py).
+# the gateway launches each guest at 1000, floor included (gateway_manager.py).
 echo -1000 > /proc/self/oom_score_adj
 mkdir -p /run/dew/model
 chmod 0711 /run/dew
