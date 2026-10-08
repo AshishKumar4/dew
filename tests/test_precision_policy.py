@@ -22,7 +22,8 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.dit import TextContext
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.llama4 import Llama4Attention
+from dew.nn.llama4 import Llama4Mixer
+from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
@@ -83,12 +84,11 @@ LAYERS = {
     "packed": lambda **policy: CausalTransformer(
         vocab_size=64, num_layers=1, emb_features=32, num_heads=4, num_kv_heads=2,
         max_seq_len=32, **policy),
-    "llama4_chunk": lambda **policy: Llama4Attention(
-        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
-        attention_chunk_size=4, **policy),
-    "llama4_global": lambda **policy: Llama4Attention(
-        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
-        use_rope=False, **policy),
+    "llama4_chunk": lambda **policy: Llama4Mixer().build(MixerContext(
+        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32, attention_chunk=4,
+        qk_norm=False))(**policy),
+    "llama4_global": lambda **policy: Llama4Mixer(use_rope=False).build(MixerContext(
+        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32, qk_norm=False))(**policy),
     "mla": lambda **policy: MultiHeadLatentAttention(
         emb_features=32, num_heads=4, max_seq_len=32, q_lora_rank=16, kv_lora_rank=8,
         qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, **policy),
