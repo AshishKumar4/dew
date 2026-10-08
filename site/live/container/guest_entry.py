@@ -7,10 +7,6 @@ from guest_limits import install
 
 if os.environ.get("DEW_GUEST_TRACE") == "1":
     print("GUEST_ENTRY started",flush=True)
-# When the host runs out of memory, the kernel's OOM killer takes a guest first: the trusted
-# processes run at -1000 (start-shared.sh), and a process may raise its own score.
-with open("/proc/self/oom_score_adj", "w") as score:
-    score.write("1000")
 install(os.environ.get("DEW_GUEST_PROFILE", "cell"))
 # The launcher's host PID is outside this private PID namespace; unshare owns the child lifetime.
 os.environ.pop("JPY_PARENT_PID", None)
