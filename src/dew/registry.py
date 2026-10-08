@@ -320,7 +320,15 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT:
+@overload
+def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT: ...
+
+
+@overload
+def from_record(annotation: types.UnionType, value: Configured, *, dtypes: bool = True) -> object: ...
+
+
+def from_record(annotation, value: Configured, *, dtypes: bool = True):
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
