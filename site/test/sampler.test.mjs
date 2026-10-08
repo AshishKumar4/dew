@@ -187,12 +187,13 @@ test('editable Python highlighting follows edits, scrolling and theme', async ()
 	await page.close();
 });
 
-test('standalone examples copy and save the edited cell and reset its original text', async () => {
+test('standalone examples copy the edited cell and reset its original text', async () => {
 	const page = await browser.newPage({ permissions: ['clipboard-read', 'clipboard-write'] });
 	await page.goto(`http://127.0.0.1:${server.address().port}/`);
 	const examples = page.locator('[data-example-editor]');
 	assert.ok(await examples.count() >= 11);
 	const editor = examples.first();
+	assert.deepEqual(await editor.locator('button').allTextContents(), ['Copy', 'Reset']);
 	const text = editor.locator('textarea');
 	const original = await text.inputValue();
 	const edited = `${original}\n# edited`;
@@ -200,13 +201,6 @@ test('standalone examples copy and save the edited cell and reset its original t
 	await editor.locator('[data-example-copy]').click();
 	await editor.getByRole('button', { name: 'Copied', exact: true }).waitFor();
 	assert.equal(await page.evaluate(() => navigator.clipboard.readText()), edited);
-	const saved = page.waitForEvent('download');
-	await editor.locator('[data-example-download]').click();
-	const download = await saved;
-	assert.equal(download.suggestedFilename(), 'train.py');
-	const chunks = [];
-	for await (const chunk of await download.createReadStream()) chunks.push(chunk);
-	assert.equal(Buffer.concat(chunks).toString(), edited);
 	await editor.locator('[data-example-reset]').click();
 	assert.equal(await text.inputValue(), original);
 	await page.close();
