@@ -144,3 +144,22 @@ def compare_released(checkpoint: LayaCheckpoint) -> None:
                 np.concatenate([found[key] for key in keys]),
                 np.concatenate([reference[key] for key in keys]),
                 np.concatenate([reference[f"{key}/f64"] for key in keys]), "released Laya logits")
+
+
+def test_offline_a_repo_id_is_probed_in_the_hub_cache(tmp_path, monkeypatch):
+    """With HF_HUB_OFFLINE, Decide.from_pretrained("org/name") picks the checkpoint kind
+    from the files a previous load cached: a Laya config there, no Clef head."""
+    import huggingface_hub.constants as hub
+
+    from dew.decision import ClefCheckpoint
+
+    snapshot = tmp_path / "models--org--laya" / "snapshots" / ("0" * 40)
+    snapshot.mkdir(parents=True)
+    (snapshot / "rl_agent_config.json").write_text("{}")
+    (tmp_path / "models--org--laya" / "refs").mkdir()
+    (tmp_path / "models--org--laya" / "refs" / "main").write_text("0" * 40)
+    monkeypatch.setattr(hub, "HF_HUB_CACHE", str(tmp_path))
+    monkeypatch.setattr(hub, "HF_HUB_OFFLINE", True)
+    assert LayaCheckpoint.exists("org/laya")
+    assert not ClefCheckpoint.exists("org/laya")
+    assert not LayaCheckpoint.exists("org/other")

@@ -139,6 +139,21 @@ def repo_files(name: str, directory: Path) -> set[str]:
         return {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
 
+def has_file(repo_id: str, filename: str, revision: str | None) -> bool:
+    """Whether the Hub repo `repo_id` holds `filename` at `revision`.
+
+    It asks the Hub; offline (`HF_HUB_OFFLINE`) it answers from the local
+    cache, where a file never fetched counts as absent.
+    """
+    from huggingface_hub import file_exists, try_to_load_from_cache
+    from huggingface_hub.errors import OfflineModeIsEnabled
+
+    try:
+        return file_exists(repo_id, filename, revision=revision)
+    except OfflineModeIsEnabled:
+        return isinstance(try_to_load_from_cache(repo_id, filename, revision=revision), str)
+
+
 def snapshot(name_or_dir: str, revision: str | None, *,
               weights: bool | tuple[str, ...] = True) -> Path:
     """Resolve a snapshot with the root's (True), no (False) or the named

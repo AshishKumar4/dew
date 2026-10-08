@@ -1,22 +1,26 @@
-"""Run the landing page's script on a terminal and record what it showed.
+"""Run a landing page cell on a terminal and record what it showed.
 
-The landing page shows src/data/hero.py next to the terminal it ran on, kept
-in src/data/capture.json, so the output must come from running exactly that
-file. Run this after changing it, in an environment with Dew and pyte
-installed, and commit the JSON it writes:
+The page shows each cell beside the terminal it ran on, so a recording must come
+from running exactly that code. Run this after changing a cell, in an
+environment with Dew and pyte installed, and commit what it writes:
 
-    python site/scripts/capture_snippets.py --where "a workstation"
+    python site/scripts/capture_snippets.py --where "a 4-vCPU Cloudflare container" --cell lm
 
-The script's stdout is a pseudo-terminal of `--columns` columns, so
+`--cell NAME` runs the cell NAME of site/snippets/framework.py alone, as
+site/snippets/cells.py extracts it for the page, in a directory of its own,
+and writes site/public/examples/framework/NAME/: capture.json, run.cast and the
+files cells.json says the page shows beside it. `--script` runs a whole file
+instead (src/data/hero.py by default, to src/data/capture.json), and with
+`--display` keeps the value of its last line, as a notebook shows it.
+
+The program's stdout is a pseudo-terminal of `--columns` columns, so
 `Trainer.fit` draws its live display there as it would for a person; its
 stderr (JAX's and Python's warnings) is kept apart. Every byte written to the
 terminal goes to `--cast`, an asciinema v2 recording, and capture.json keeps
-the screen as it was when the script exited, cell by cell with its colours.
-
-`--where` names the machine for the caption. Dew's commit comes from the
-imported checkout (with clean source) or pip's record of a git install.
-`--script` and `--output` also record the other small landing examples through
-this same path; arguments after `--` go to that script.
+the screen as it was when the program exited, cell by cell with its colours,
+and the sha256 of the code it ran. `--where` names the machine for the caption.
+Dew's commit comes from the imported checkout (with clean source) or pip's
+record of a git install.
 """
 
 from __future__ import annotations
@@ -30,9 +34,11 @@ import os
 import platform
 import pty
 import select
+import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import termios
 import time
 from importlib.metadata import distribution, version
@@ -41,7 +47,20 @@ from pathlib import Path
 
 import pyte
 
-DATA = Path(__file__).resolve().parents[1] / "src/data"
+SITE = Path(__file__).resolve().parents[1]
+DATA = SITE / "src/data"
+sys.path.insert(0, str(SITE / "snippets"))
+import cells  # noqa: E402
+
+# Runs a file as a notebook cell runs: the value of its last line, an image, is saved to the second argument.
+NOTEBOOK = """import ast, sys
+path, out = sys.argv[1:3]
+tree = ast.parse(open(path).read(), path)
+last = tree.body.pop()
+scope = {"__name__": "__main__"}
+exec(compile(tree, path, "exec"), scope)
+eval(compile(ast.Expression(last.value), path, "eval"), scope).save(out)
+"""
 # Enough rows that nothing the script prints scrolls off the screen.
 ROWS = 200
 
@@ -59,18 +78,19 @@ def installed_commit() -> str:
     return json.loads(record)["vcs_info"]["commit_id"]
 
 
-def run_on_terminal(script: Path, columns: int, arguments: list[str] | None = None) -> tuple[int, float, list[tuple[float, str]], str]:
-    """Run `script` with stdout on a pseudo-terminal: its exit code, its
-    seconds, what it wrote to the terminal with the time of each write, and
-    its stderr."""
+def run_on_terminal(command: list[str], cwd: Path,
+                    columns: int) -> tuple[int, float, list[tuple[float, str]], str]:
+    """Run `command` in `cwd` with stdout on a pseudo-terminal: its exit code,
+    its seconds, what it wrote to the terminal with the time of each write,
+    and its stderr."""
     primary, secondary = pty.openpty()
     fcntl.ioctl(secondary, termios.TIOCSWINSZ, struct.pack("HHHH", ROWS, columns, 0, 0))
     env = {**os.environ, "PYTHONUNBUFFERED": "1", "TERM": "xterm-256color", "COLUMNS": str(columns),
            "LINES": str(ROWS)}
     env.pop("NO_COLOR", None)
     started = time.monotonic()
-    child = subprocess.Popen([sys.executable, str(script), *(arguments or [])], stdin=subprocess.DEVNULL, stdout=secondary,
-                             stderr=subprocess.PIPE, env=env, cwd=script.parent)
+    child = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=secondary, stderr=subprocess.PIPE,
+                             env=env, cwd=cwd)
     os.close(secondary)
     writes: list[tuple[float, str]] = []
     decoder = codecs.getincrementaldecoder("utf-8")()
@@ -161,26 +181,43 @@ def main() -> None:
     parser.add_argument("--where", required=True, help='the machine, for the caption: "a workstation"')
     # Wide enough for the display's header line to name the whole mesh.
     parser.add_argument("--columns", type=int, default=96)
-    parser.add_argument("--cast", type=Path, default=Path("hero.cast"), help="where to write the recording")
+    parser.add_argument("--cell", help="a cell of site/snippets/framework.py")
     parser.add_argument("--script", type=Path, default=DATA / "hero.py")
+    parser.add_argument("--display", type=Path, help="where to save the value of the script's last line")
+    parser.add_argument("--cast", type=Path, default=Path("hero.cast"), help="where to write the recording")
     parser.add_argument("--output", type=Path, default=DATA / "capture.json")
     parser.add_argument("arguments", nargs=argparse.REMAINDER, help="script arguments after --")
     options = parser.parse_args()
 
-    script = options.script.resolve()
-    arguments = options.arguments
-    if arguments[:1] == ["--"]:
-        arguments = arguments[1:]
-    code, seconds, writes, stderr = run_on_terminal(script, options.columns, arguments)
+    arguments = options.arguments[1:] if options.arguments[:1] == ["--"] else options.arguments
+    if options.cell:
+        code = cells.cell(options.cell)
+        target = SITE / "public/examples/framework" / options.cell
+        work = Path(tempfile.mkdtemp(prefix=f"cell-{options.cell}-"))
+        script = work / f"{options.cell}.py"
+        script.write_text(code + "\n")
+        options.cast, options.output = target / "run.cast", target / "capture.json"
+        digest = cells.digest(code)
+    else:
+        script = options.script.resolve()
+        work, digest = script.parent, hashlib.sha256(script.read_bytes()).hexdigest()
+    command = [sys.executable, str(script), *arguments]
+    if options.display:
+        command = [sys.executable, "-c", NOTEBOOK, str(script), str(options.display.resolve())]
+    code, seconds, writes, stderr = run_on_terminal(command, work, options.columns)
     if code != 0:
         raise SystemExit(f"{script.name} exited {code}:\n{stderr}")
+    options.output.parent.mkdir(parents=True, exist_ok=True)
+    for kept in cells.CELLS["keep"].get(options.cell, []) if options.cell else []:
+        (options.output.parent / kept).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(work / kept, options.output.parent / kept)
     header = {"version": 2, "width": options.columns, "height": ROWS, "timestamp": int(time.time()),
               "env": {"TERM": "xterm-256color"}}
     options.cast.write_text("\n".join([json.dumps(header)] + [json.dumps([round(t, 6), "o", text]) for t, text in writes]) + "\n")
     capture = {
         "about": f"The screen {script.name} left on a terminal, written by site/scripts/capture_snippets.py.",
         "arguments": arguments,
-        "script_sha256": hashlib.sha256(script.read_bytes()).hexdigest(),
+        "script_sha256": digest,
         "meta": {"where": options.where, "python": platform.python_version(),
                  "jax": version("jax"), "flax": version("flax"), "optax": version("optax"),
                  "dew": installed_commit(), "date": time.strftime("%Y-%m-%d")},

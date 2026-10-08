@@ -1,0 +1,153 @@
+---
+// A landing cell: its code, editable, and under it the recorded output of
+// exactly that code (site/scripts/capture_snippets.py). Run runs the edited cell
+// on the live pool in a training context running Dew itself
+// (site/live/container/live_training.py), and its live output replaces the
+// recording. A host runs one such cell at a time: while a run waits, the bridge
+// reports how many are ahead as a display output {"dew-wait": {"ahead": n}}.
+// A cell too large for a pool host opens in Colab instead (`colab`).
+import HeroOutput from './HeroOutput.astro';
+import PythonEditor from './PythonEditor.astro';
+import type { Run } from '../../scripts/terminal-replay';
+import { live } from '../../live.mjs';
+
+interface Recording {
+	meta: { where: string; jax: string; dew: string; date: string };
+	hero: { screen: Run[][]; seconds: number; columns: number; rows?: number; source_rows?: number; replay?: string };
+}
+interface Props {
+	code: string;
+	title: string;
+	cell: string;
+	recording: Recording;
+	colab?: string;
+	file?: string;
+	side?: boolean;
+	playbackSeconds?: number;
+}
+const { code, title, cell, recording, colab, file = `${cell}.py`, side = false, playbackSeconds = 0 } = Astro.props;
+const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey) && !colab;
+const { hero } = recording;
+---
+<div class:list={['landing-cell', { 'run-grid': side }]} data-landing-cell={cell}>
+	<div class="landing-cell-code">
+		<div class="sampler-editor">
+			<div class="sampler-editor-bar">
+				<span>{title}, editable</span>
+				<span class="sampler-editor-actions">
+					<button type="button" data-cell-copy>Copy</button>
+					{liveEnabled && <button type="button" class="sampler-run" data-cell-run>Run</button>}
+					{colab && <a class="sampler-run" href={colab} target="_blank" rel="noopener" data-cell-colab>Run in Colab</a>}
+				</span>
+			</div>
+			<PythonEditor code={code.trimEnd()} kind="example" rows={Math.min(20, code.trimEnd().split('\n').length + 1)} label={title} />
+		</div>
+		{liveEnabled && <p class="sampler-status" data-cell-status aria-live="polite">Run runs the cell on a shared 4-vCPU host; training stops after 20 steps.</p>}
+		{colab && <p class="sampler-status">This cell needs more memory than a shared host has, so Run in Colab opens it on a GPU.</p>}
+		<div class="turnstile-holder" data-cell-turnstile></div>
+	</div>
+	<div class="landing-cell-result">
+		<div class="landing-cell-showcase" data-cell-showcase>
+			<HeroOutput screen={hero.screen} meta={recording.meta} seconds={hero.seconds} columns={hero.columns}
+				rows={hero.rows} source_rows={hero.source_rows ?? hero.screen.length} replay={hero.replay}
+				playbackSeconds={playbackSeconds} command={`python ${file}`} />
+			<slot />
+		</div>
+		<div class="live-text-output" data-cell-output hidden></div>
+	</div>
+</div>
+
+<script>
+	import type { LiveSession } from '../../scripts/live';
+	import { renderOutput } from '../../scripts/live';
+	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
+
+	for (const panel of document.querySelectorAll<HTMLElement>('[data-landing-cell]')) {
+		const cell = panel.dataset.landingCell!;
+		const editor = panel.querySelector<HTMLTextAreaElement>('textarea')!;
+		const copy = panel.querySelector<HTMLButtonElement>('[data-cell-copy]')!;
+		const run = panel.querySelector<HTMLButtonElement>('[data-cell-run]');
+		const showcase = panel.querySelector<HTMLElement>('[data-cell-showcase]')!;
+		const output = panel.querySelector<HTMLElement>('[data-cell-output]')!;
+		const status = panel.querySelector<HTMLElement>('[data-cell-status]');
+		const holder = panel.querySelector<HTMLElement>('[data-cell-turnstile]')!;
+		copy.addEventListener('click', async () => {
+			await navigator.clipboard.writeText(editor.value).catch(() => editor.select());
+			copy.textContent = 'Copied';
+			setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
+		});
+		if (!run || !status) continue;
+		let session: LiveSession | undefined;
+		let running = false;
+		let stopping = false;
+		onKernelClose((message) => {
+			session = undefined;
+			if (!running) status.textContent = `${message} Press Run to start a new one.`;
+		});
+		const execute = async () => {
+			running = true;
+			stopping = false;
+			run.textContent = 'Stop';
+			// The live run replaces the recording.
+			showcase.hidden = true;
+			output.replaceChildren();
+			output.hidden = false;
+			let phase = 'Starting';
+			let since = performance.now();
+			const setPhase = (text: string) => {
+				phase = text;
+				since = performance.now();
+				status.textContent = text;
+			};
+			const timer = window.setInterval(() => {
+				if (!stopping) status.textContent = `${phase} · ${Math.round((performance.now() - since) / 1000)} s`;
+			}, 1000);
+			try {
+				session = await landingKernel(holder, setPhase);
+				if (stopping) throw new Error('Stopped.');
+				const started = performance.now();
+				setPhase('Running');
+				const result = await session.run(editor.value, (message) => {
+					if (message.type === 'display' && message.text?.startsWith('{"dew-wait"')) {
+						const { ahead } = JSON.parse(message.text)['dew-wait'];
+						setPhase(`This host runs one cell at a time; ${ahead} ${ahead === 1 ? 'run is' : 'runs are'} ahead of yours`);
+						return;
+					}
+					if (phase !== 'Running') setPhase('Running');
+					renderOutput(output, message);
+				}, cell, 'train');
+				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
+					: result.status === 'ok' ? `Ran in ${((performance.now() - started) / 1000).toFixed(0)} s on a shared 4-vCPU host.`
+					: 'The cell stopped with an error.';
+			} catch (error) {
+				status.textContent = error instanceof Error ? error.message : String(error);
+			} finally {
+				window.clearInterval(timer);
+				running = false;
+				run.textContent = 'Run';
+				run.disabled = false;
+			}
+		};
+		run.addEventListener('click', () => {
+			if (!running) void execute();
+			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt(cell); }
+		});
+	}
+</script>
+
+<style>
+	.landing-cell { display: grid; gap: 0.75rem; min-width: 0; }
+	.landing-cell-code, .landing-cell-result, .landing-cell-showcase { display: grid; gap: 0.65rem; align-content: start; min-width: 0; }
+	.landing-cell-showcase[hidden] { display: none; }
+	.landing-cell .live-text-output { min-height: 0; max-height: 28rem; overflow: auto; }
+	.landing-cell .sampler-editor-bar { flex-wrap: wrap; }
+	.landing-cell a.sampler-run {
+		padding: 0.3rem 0.8rem;
+		border-radius: 0.45rem;
+		border: 1px solid color-mix(in srgb, var(--dew-accent-fill) 60%, var(--dew-rule));
+		background: color-mix(in srgb, var(--dew-accent-fill) 12%, transparent);
+		color: var(--sl-color-white);
+		font: 600 0.78rem var(--__sl-font);
+		text-decoration: none;
+	}
+</style>

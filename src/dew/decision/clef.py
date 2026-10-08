@@ -129,13 +129,11 @@ class ClefCheckpoint:
         """Return whether `name_or_dir` holds a Clef checkpoint.
 
         A Clef checkpoint is a backbone with a `joint_head_config.json` beside it.
-        For a Hub repo id, it asks the Hub without downloading anything.
+        For a Hub repo id, it asks the Hub without downloading anything (`sources.has_file`).
         """
         if Path(name_or_dir).is_dir():
             return (Path(name_or_dir) / HEAD_CONFIG).is_file()
-        from huggingface_hub import file_exists
-
-        return file_exists(str(name_or_dir), HEAD_CONFIG, revision=revision)
+        return sources.has_file(str(name_or_dir), HEAD_CONFIG, revision=revision)
 
     @classmethod
     def load(cls, name_or_dir: str | Path = "Cloudflare/clef-flash", *, revision: str | None = None,

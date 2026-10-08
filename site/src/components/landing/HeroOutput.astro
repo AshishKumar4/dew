@@ -10,8 +10,9 @@ interface Props {
 	source_rows: number;
 	playbackSeconds: number;
 	meta: { where: string; jax: string; dew: string; date: string };
+	command?: string;
 }
-const { screen, seconds, meta, replay, rows = screen.length, columns, source_rows, playbackSeconds } = Astro.props;
+const { screen, seconds, meta, replay, rows = screen.length, columns, source_rows, playbackSeconds, command = 'python train.py' } = Astro.props;
 
 // pyte names the eight ANSI colours (yellow as "brown") and gives any other
 // colour as hex. The named ones take the site's palette, so they read in either
@@ -30,7 +31,7 @@ const attributes = (run: Run) => {
 
 <div class="hero-output" data-terminal-replay={replay} style={`--terminal-lines: ${rows}`}>
 	<div class="hero-output-bar">
-		<span class="hero-output-command"><span aria-hidden="true">$</span> python train.py</span>
+		<span class="hero-output-command"><span aria-hidden="true">$</span> {command}</span>
 		{replay && <div class="terminal-controls" hidden>
 			<span data-terminal-clock></span>
 			<button type="button" data-terminal-toggle>Pause</button>
