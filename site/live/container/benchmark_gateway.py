@@ -47,7 +47,8 @@ class Silent(TimeoutError):
         self.output = output
 
 
-def collect(client, message, timeout=30):
+def collect(client, message, timeout=30, displays=False):
+    """The stdout a cell printed, and with `displays` the text of its displays too."""
     stdout = ""
     while True:
         try:
@@ -58,7 +59,7 @@ def collect(client, message, timeout=30):
             continue
         if result["msg_type"] == "stream":
             stdout += result["content"]["text"]
-        if result["msg_type"] in ("display_data", "update_display_data"):
+        if displays and result["msg_type"] in ("display_data", "update_display_data"):
             stdout += result["content"]["data"].get("text/plain", "") + "\n"
         if result["msg_type"] == "error":
             raise RuntimeError(str(result["content"]))
@@ -148,7 +149,7 @@ def cells():
         print(f"{name} starts; memory {memory()}", flush=True)
         try:
             client.wait_for_ready(timeout=30)
-            output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
+            output = collect(client, client.execute(code, allow_stdin=False), timeout=240, displays=True)
         except Exception as error:
             raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
                                  f"memory {memory()}") from None
