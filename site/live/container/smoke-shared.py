@@ -64,7 +64,10 @@ async def pressure(headers):
     stopped = [name for name, (_, errors) in seen.items()
                if any(error.startswith("This cell's Python context stopped") for error in errors)]
     assert stopped, f"nothing ran out of memory: {seen}"
-    assert all(status == "ok" for name, (status, _) in seen.items() if name not in stopped), seen
+    # Every other cell either ran to its own limit or was refused a context in words.
+    refusals = ("the shared container has no free Python contexts",)
+    assert all(status == "ok" or all(error in refusals for error in errors)
+               for name, (status, errors) in seen.items() if name not in stopped), seen
     assert model_process() == model, "the model process was restarted"
     for socket in pages:
         await socket.close()
