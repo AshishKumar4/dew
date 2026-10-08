@@ -171,17 +171,25 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path):
                            + ["tests/test_split.py::test_unrecorded"])
 
 
-def test_durations_are_recorded_from_a_green_runs_floor(ci):
-    """`durations` reads each test's time from a green verdict's floor rows,
-    and refuses a red run or rows that carry no times."""
-    rows = [{"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 1.2346}},
-            {"name": "3.12:tests/test_a.py#2/2", "exitCode": 0, "tests": {"tests/test_a.py::test_y": 2.0}},
-            {"name": "3.14:tests/test_a.py", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 9.0}}]
-    assert ci.durations({"rows": rows}) == {"tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
+def test_durations_are_each_tests_median_over_green_runs_floors(ci):
+    """`durations` records each test's median time over green verdicts' floor
+    rows, so one slow run moves nothing, and refuses a red run or rows that
+    carry no times."""
+    def verdict(x, y):
+        return {"rows": [
+            {"name": "3.12:tests/test_a.py#1/2", "exitCode": 0, "tests": {"tests/test_a.py::test_x": x}},
+            {"name": "3.12:tests/test_a.py#2/2", "exitCode": 0, "tests": {"tests/test_a.py::test_y": y}},
+            {"name": "3.14:tests/test_a.py", "exitCode": 0, "tests": {"tests/test_a.py::test_x": 90.0}}]}
+
+    assert ci.durations([verdict(1.2346, 2.0)]) == {
+        "tests/test_a.py::test_x": 1.235, "tests/test_a.py::test_y": 2.0}
+    assert ci.durations([verdict(1.0, 2.0), verdict(30.0, 60.0), verdict(1.5, 2.5)]) == {
+        "tests/test_a.py::test_x": 1.5, "tests/test_a.py::test_y": 2.5}
+    red = {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}
     with pytest.raises(SystemExit, match="red"):
-        ci.durations({"rows": [*rows, {"name": "3.12:tests/test_b.py", "exitCode": 1, "tests": {}}]})
+        ci.durations([verdict(1.0, 2.0), {"rows": [*verdict(1.0, 2.0)["rows"], red]}])
     with pytest.raises(SystemExit, match="no test times"):
-        ci.durations({"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]})
+        ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
 
 
 def test_a_split_group_scales_to_its_whole_file_by_the_recorded_durations(ci):

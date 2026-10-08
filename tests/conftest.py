@@ -35,6 +35,11 @@ def pytest_sessionfinish(session, exitstatus):
         _remote.drain()
 
 
+def pytest_terminal_summary(terminalreporter):
+    if _remote is not None:
+        terminalreporter.write_line(_remote.summary())
+
+
 def pytest_runtest_setup(item):
     marker = item.get_closest_marker("mesh")
     needed = marker.kwargs.get("devices", lane_environment.MESH_DEVICES) if marker else 0
