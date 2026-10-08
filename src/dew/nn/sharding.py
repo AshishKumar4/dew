@@ -559,4 +559,4 @@ def declared_axes(path, ndim: int) -> LogicalAxes | None:
 
 
 __all__ = ["DATA_AXIS", "FSDP_AXIS", "RESIDUAL", "LayoutRefused", "Link", "LogicalAxes", "LogicalAxisRules",
-           "Schedule", "logical_spec"]
+           "Schedule", "logical_axes", "logical_spec"]

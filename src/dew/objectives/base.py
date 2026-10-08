@@ -385,6 +385,20 @@ class ProgramModule(NamedTuple):
     False for a frozen teacher or reference."""
 
 
+@jax.custom_jvp
+def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
+    """`value`, whose derivative in `params` is `rule` (`Objective.with_gradients`)."""
+    return value
+
+
+@_ruled.defjvp
+def _ruled_jvp(primals, tangents):
+    value, rule, _ = primals
+    moved_value, _, moved = tangents
+    return value, moved_value + sum(jnp.vdot(leaf, change) for leaf, change in
+                                    zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
+
+
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
@@ -708,22 +722,21 @@ class Objective(ABC, Generic[Loss, Effects]):
         as it does the total's own derivative. A
         `loss` that computes its own update rule (e-prop's eligibility traces,
         a forward-gradient or evolution-strategies estimate, a synthetic
-        gradient) returns this. Each statistic keeps its value, which adds
-        zero, `<gradient, params - stop_gradient(params)>`, whose derivative
-        is `gradient`; so the trainer's one gradient path, with its
-        microbatching, accumulation, sharding and logging, applies the rule
-        as it applies `jax.grad`'s.
+        gradient) returns this. Each statistic keeps its value and takes the
+        rule as its derivative in `params` (a custom JVP), so the trainer's
+        one gradient path, with its microbatching, accumulation, sharding and
+        logging, applies the rule as it applies `jax.grad`'s, and a pass that
+        reads only the values, a validation pass's, never computes the rule.
         """
-        moved = jax.tree.leaves(jax.tree.map(lambda leaf: leaf - jax.lax.stop_gradient(leaf), params))
-
         def held(value, gradient):
             value = jax.lax.stop_gradient(jnp.asarray(value))
             if gradient is None:
                 return value
             if value.ndim:
                 raise ValueError(f"a statistic with supplied gradients is a scalar, not {value.shape}")
-            pairs = zip(jax.tree.leaves(gradient), moved, strict=True)
-            return value + sum(jnp.vdot(jax.lax.stop_gradient(rule), change) for rule, change in pairs)
+            if len(jax.tree.leaves(gradient)) != len(jax.tree.leaves(params)):
+                raise ValueError("a statistic's gradients hold one rule for each trained parameter")
+            return _ruled(value, jax.lax.stop_gradient(gradient), params)
 
         return jax.tree.map(held, stats, gradients)
 
@@ -985,12 +998,14 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
 
 __all__ = [
     "FROZEN",
+    "OMITTED",
     "VALID_ROWS",
     "Aux",
     "Batch",
     "EMASpec",
     "Metric",
     "Objective",
+    "Omitted",
     "Path",
     "PathFilter",
     "Prediction",
