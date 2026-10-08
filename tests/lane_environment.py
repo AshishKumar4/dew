@@ -102,14 +102,16 @@ def outside_any_cluster(environ: Mapping[str, str]) -> dict[str, str]:
     """`environ` as a process on a machine in no cluster jax detects sees it,
     for a program the test places itself or a launch that stands in for a
     cluster with variables of its own: no Slurm or Open MPI variables, no
-    Cloud TPU VM worker list, no Kubernetes pod, and TPU_SKIP_MDS_QUERY,
-    jax's switch for a host whose metadata names no TPU cluster (the
-    variables `jax._src.clusters` reads). A Colab TPU VM otherwise shows
-    jax a TPU cluster of one process ahead of any of them."""
+    Cloud TPU VM worker list, no Kubernetes pod, no pool a `dew launch`
+    declared, and TPU_SKIP_MDS_QUERY, jax's switch for a host whose metadata
+    names no TPU cluster (the variables `jax._src.clusters` reads). A Colab
+    TPU VM otherwise shows jax a TPU cluster of one process ahead of any of
+    them."""
     kept = {name: value for name, value in environ.items()
             if not name.startswith(("SLURM_", "OMPI_"))
             and name not in ("TPU_WORKER_HOSTNAMES", "TPU_PROCESS_ADDRESSES",
-                             "TPU_PROCESS_ADDRESSES_PATH", "KUBERNETES_SERVICE_HOST")}
+                             "TPU_PROCESS_ADDRESSES_PATH", "KUBERNETES_SERVICE_HOST",
+                             "DEW_PROCESS_COUNT", "DEW_PROCESS_ID", "JAX_COORDINATOR_ADDRESS")}
     return {**kept, "TPU_SKIP_MDS_QUERY": "1"}
 
 

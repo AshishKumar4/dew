@@ -69,15 +69,15 @@ def main() -> None:
         batch = rollout.project(records)
         arrays = collective_host(shard_batch(trainer.device_mesh, batch), phase="episode pool test batch")
         np.savez(output.with_suffix(".batch.npz"), **arrays)
-    public = []
+    public, bindings = [], set()
     for episode in records:
         row = asdict(episode)
-        row.pop("_binding_id")
+        bindings.add(row.pop("_binding_id"))
         for transition in row["transitions"]:
-            transition["action"].pop("_binding_id")
+            bindings.add(transition["action"].pop("_binding_id"))
         public.append(row)
     output.write_text(json.dumps({
-        "episodes": public, "error": failed, "opened": len(harness.opened),
+        "episodes": public, "bindings": sorted(bindings), "error": failed, "opened": len(harness.opened),
         "closed": len(harness.closed), "updates": int(state.updates) if state is not None else None,
     }))
     if processes > 1:

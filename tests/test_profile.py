@@ -83,6 +83,25 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
     assert result.is_ready()
 
 
+def test_each_process_of_a_pool_captures_beneath_its_own_directory(tmp_path, native_reports, monkeypatch):
+    """Every process of a pool profiles into the one directory the run names:
+    each capture lands beneath that process's own process-<rank>, whose
+    manifest names it, and leaves the others' and what the directory
+    already held alone."""
+    sentinel = tmp_path / "existing.txt"
+    sentinel.write_text("keep")
+    monkeypatch.setattr(jax, "process_count", lambda: 2)
+    for rank in (1, 0):
+        monkeypatch.setattr(jax, "process_index", lambda rank=rank: rank)
+        with dew.Profiler(tmp_path):
+            work()
+    assert captures(tmp_path) == [] and sentinel.read_text() == "keep"
+    for rank in (0, 1):
+        [capture] = captures(tmp_path / f"process-{rank}")
+        assert (manifest(capture)["process_index"], manifest(capture)["process_count"]) == (rank, 2)
+        assert list(capture.glob("plugins/profile/*/*.xplane.pb"))
+
+
 def test_body_failure_keeps_trace_and_releases_for_next_capture(tmp_path, native_reports):
     failure = ValueError("user computation failed")
     with pytest.raises(ValueError) as raised, dew.Profiler(tmp_path):

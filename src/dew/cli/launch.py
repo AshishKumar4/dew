@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import ipaddress
 import os
 import re
 import shlex
@@ -271,9 +272,17 @@ class Launch:
         return 0
 
     def coordinator_address(self, hosts: Sequence[str]) -> str:
+        """Where every process reaches process 0: this machine's name when it
+        is one of several hosts and named as itself. A name that resolves
+        only to loopback is refused, since every other host would reach
+        itself at it."""
         host = self.coordinator or hosts[0]
         if host in LOCAL_HOSTS and any(name not in LOCAL_HOSTS for name in hosts):
             host = socket.getfqdn()
+            if loopback_only(host):
+                raise ValueError(
+                    f"this machine's name, {host}, resolves only to loopback, where the other hosts "
+                    f"would reach themselves; pass --coordinator with an address they reach this machine at")
         return f"{host}:{self.port if self.port is not None else free_port(hosts[0])}"
 
     def layout(self, first_host: str) -> tuple[int, int | None]:
@@ -410,6 +419,16 @@ def gpu_count(host: str, visible: str | None) -> int | None:
     if host in LOCAL_HOSTS:
         return local_gpu_count()
     return listed_gpus(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"))
+
+
+def loopback_only(host: str) -> bool:
+    """Whether every address `host` resolves to here is a loopback one. A name
+    that does not resolve here is left to the hosts that use it."""
+    try:
+        resolved = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return host in LOCAL_HOSTS
+    return all(ipaddress.ip_address(str(entry[4][0]).split("%")[0]).is_loopback for entry in resolved)
 
 
 def free_port(host: str) -> int:

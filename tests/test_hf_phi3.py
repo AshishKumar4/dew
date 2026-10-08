@@ -45,6 +45,34 @@ def test_phi3_cached_greedy_crosses_the_longrope_boundary():
     np.testing.assert_array_equal(generated.tokens, np.load(DIRECTORY / 'generated.npy'))
 
 
+@pytest.mark.parametrize(('budget', 'rebuilds'), [(3, 0), (6, 1)])
+def test_greedy_decoding_forwards_the_prompt_once_and_one_token_a_step(monkeypatch, budget, rebuilds):
+    """Run eagerly, every backbone forward of a greedy decode from a prompt
+    of 4: the prompt once, then one token for each of the budget's steps,
+    and the whole 48-slot history again only at the step a row crosses
+    LongRoPE's original 8 positions (6 new tokens cross it once, 3 never).
+    The answers alone cannot tell a decode that recomputes its prefix every
+    step from one that does not."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling, generate
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    ids = np.load(DIRECTORY / 'input_ids.npy')[:, :4]
+    widths = []
+    forward = CausalTransformer.hidden_and_mtp_inputs
+
+    def counted(self, tokens, *args, **kwargs):
+        widths.append(tokens.shape[1])
+        return forward(self, tokens, *args, **kwargs)
+
+    monkeypatch.setattr(CausalTransformer, 'hidden_and_mtp_inputs', counted)
+    with jax.disable_jit():
+        generate(loaded.model, loaded.variables, ids, budget, key=jax.random.key(0),
+                 sampling=Sampling(temperature=0))
+    assert widths[0] == 4 and widths.count(48) == rebuilds, widths
+    assert sorted(widths[1:]) == [1] * budget + [48] * rebuilds, widths
+
+
 def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_the_crossing():
     from dew.nn.inputs import ModelInputs
     from dew.sampling.text import decode_ops, prefill_state
