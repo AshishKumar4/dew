@@ -29,11 +29,20 @@ from websockets.http11 import Response
 
 MAX_CODE = 100_000
 MAX_OUTPUT = 2_000_000
-# Python contexts one page may hold, and one host; start-gateway.sh starts at most MAX_CONTEXTS kernels.
+# Python contexts one page may hold, and one host, besides its one training context;
+# start-gateway.sh starts at most MAX_CONTEXTS + 1 kernels.
 MAX_CELLS = 6
 MAX_CONTEXTS = 24
 PRELOAD = {"python3": "import model_client; model_client.install()",
            "dew-train": "import live_training; live_training.install()"}
+
+
+class Stopped(RuntimeError):
+    """The context's kernel died while a cell ran: the kernel's OOM killer stops guests first."""
+
+    def __init__(self):
+        super().__init__("This cell's Python context stopped, most likely out of memory on the shared host. "
+                         "Run it again to start a new one.")
 
 
 class Context:
@@ -58,9 +67,12 @@ class Context:
             reply, idle, size = None, False, 0
             while reply is None or not idle:
                 message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
+                kind, content = message["msg_type"], message["content"]
+                # The gateway announces a kernel that died, and restarts it, outside any request.
+                if kind == "status" and content["execution_state"] in ("restarting", "dead"):
+                    raise Stopped
                 if message.get("parent_header", {}).get("msg_id") != identifier:
                     continue
-                kind, content = message["msg_type"], message["content"]
                 if kind == "execute_reply":
                     reply = {"status": content["status"], "count": content.get("execution_count")}
                 elif kind == "status" and content["execution_state"] == "idle":
@@ -106,7 +118,7 @@ class Gateway:
         async with self.allocating:
             if kernel == "python3" and len(self.contexts.get(session, {})) >= MAX_CELLS:
                 raise ValueError("this page has more live cells than one session runs")
-            if sum(map(len, self.contexts.values())) >= MAX_CONTEXTS:
+            if kernel == "python3" and sum(map(len, self.contexts.values())) >= MAX_CONTEXTS:
                 raise ValueError("the shared container has no free Python contexts")
             started = time.monotonic()
             kernel = {**await self.api("/api/kernels", {"name": kernel}), "preload": PRELOAD[kernel]}
@@ -249,7 +261,12 @@ class Gateway:
                     result = await context.execute(message["code"], send)
                 await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
             except Exception as error:
-                if context:
+                if isinstance(error, Stopped) and context is not None and cells.get(cell) is context:
+                    # The next run of this cell starts a new context, with its client loaded again.
+                    del cells[cell]
+                    with suppress(OSError):
+                        await self.stop(context)
+                elif context:
                     with suppress(OSError):
                         await self.api(f"/api/kernels/{context.identifier}/interrupt", {}, "POST")
                 await socket.send(json.dumps({"id": message["id"], "type": "error",
