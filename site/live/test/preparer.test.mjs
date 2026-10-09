@@ -14,7 +14,7 @@ const bundle = await build({
 });
 const { ManagedPreparer } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
-function preparer({ failSmoke = false, failReport = 0, duringReport = async () => {} } = {}) {
+function preparer({ failSmoke = false, failReport = 0, during = async () => {} } = {}) {
 	const starts = [];
 	const reports = [];
 	const state = { destroys: 0, alarm: null };
@@ -25,18 +25,18 @@ function preparer({ failSmoke = false, failReport = 0, duringReport = async () =
 		async setInactivityTimeout() {},
 		async exec() { return { exitCode: Promise.resolve(0), output: async () => ({ exitCode: 0 }) }; },
 		async snapshotContainer() { return { id: 'snapshot' }; },
-		async destroy() { this.running = false; state.destroys++; },
+		async destroy() { await during(); this.running = false; state.destroys++; },
 		monitor: () => new Promise(() => {}),
 	};
 	const ctx = { container, storage: {
-		async setAlarm(at) { state.alarm = at; }, async deleteAlarm() { state.alarm = null; },
+		async setAlarm(at) { state.alarm = at; }, async deleteAlarm() { state.alarm = null; }, async getAlarm() { return state.alarm; },
 		async put(key, value) { storage.set(key, structuredClone(value)); }, async get(key) { return structuredClone(storage.get(key)); },
 		async delete(key) { storage.delete(key); },
 	} };
 	const env = { SNAPSHOTS: { idFromString: (id) => id, get: (registry) => ({ async prepared(outcome) {
 		// A report that outlives its alarm is cut off with it: an alarm past those 15 minutes sends it again.
 		assert.ok(state.alarm > Date.now() + 15 * 60_000);
-		await duringReport();
+		await during();
 		if (failReport-- > 0) throw new Error('registry unreachable');
 		reports.push([registry, outcome]);
 	} }) } };
@@ -141,28 +141,33 @@ test('a snapshot no running job holds is not preparing, and an abandoned job hol
 	const prepared = preparer();
 	const snapshot = (id, created) => ({ id, commit: 'c', created, trial: false, state: 'preparing' });
 	prepared.storage.set('snapshots', { old: snapshot('old', 0), current: snapshot('current', 1) });
-	prepared.storage.set('job', { queued: Date.now(), record: { id: 'current', state: 'preparing' } });
+	prepared.storage.set('job', { record: { id: 'current', state: 'preparing' } });
+	prepared.state.alarm = Date.now() + 60_000;
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'preparing']]);
 	await assert.rejects(prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' }), /already running/);
-	// A job whose alarms all failed, with no alarm left, is abandoned once past any preparation's budget.
-	prepared.storage.set('job', { queued: Date.now() - 40 * 60_000, record: { id: 'current', state: 'preparing' } });
+	// The runtime gave up on the job's alarm: no alarm will run it again.
+	prepared.state.alarm = null;
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'failed']]);
 	await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
 	assert.equal(prepared.storage.get('job').reply.token, 'lease');
 });
-test('a job abandoned while its report is out leaves the job that replaced it alone', async () => {
-	for (const failReport of [0, 1]) {
-		const prepared = preparer({ failReport, duringReport: async () => {
-			// The report outlived the job's budget, and the registry's next lease queued another.
-			prepared.storage.set('job', { ...prepared.storage.get('job'), queued: Date.now() - 40 * 60_000 });
-			await prepared.runner.queue('b'.repeat(64), false, { registry: 'registry', token: 'next' });
-		} });
-		await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
-		prepared.storage.set('job', { ...prepared.storage.get('job'), outcome: { commit: 'a'.repeat(64), trial: false, token: 'lease', failure: 'x' } });
-		await prepared.runner.alarm();
-		assert.equal(prepared.storage.get('job').reply.token, 'next');
-		assert.ok(prepared.state.alarm < Date.now() + 2000);
-	}
+test('a job an alarm runs, or will run, is running, so no other replaces it', async () => {
+	const refused = [];
+	const prepared = preparer({ during: async () => {
+		await prepared.runner.queue('b'.repeat(64), false, { registry: 'registry', token: 'next' })
+			.then(() => refused.push(false), () => refused.push(true));
+	} });
+	await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
+	prepared.storage.set('job', { ...prepared.storage.get('job'), stage: 'smoke', began: Date.now() - 6 * 60_000,
+		built: { snapshot: { id: 'snapshot' }, prepareSeconds: 1, snapshotSeconds: 1 } });
+	prepared.storage.set('phase', { phase: 'browser relay smoke', at: Date.now() - 5 * 60_000 });
+	prepared.container.running = true;
+	// The runtime clears the alarm it runs: while the cut-off smoke's container goes, and while the
+	// report is out, the job is the alarm's.
+	prepared.state.alarm = null;
+	await prepared.runner.alarm();
+	assert.deepEqual(refused, [true, true]);
+	assert.equal(prepared.storage.get('job'), undefined);
 });
 test('a stage cut off fails the preparation, and a report the registry missed is sent again', async () => {
 	const prepared = preparer({ failReport: 2 });
