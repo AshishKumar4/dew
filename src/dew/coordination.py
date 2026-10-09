@@ -155,13 +155,18 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
     return materialized if held else None
 
 
+def from_every_process(value) -> list:
+    """Every rank's JSON-encodable `value`, in rank order, in one round of the
+    coordination service (`_round`). For the small host values a pool
+    shares; a device array goes through a collective."""
+    if jax.process_count() == 1:
+        return [json.loads(json.dumps(value))]
+    return [json.loads(word) for word in _round(json.dumps(value))]
+
+
 def broadcast_from_process_zero(value):
-    """A JSON-encodable value broadcast from rank zero to every rank."""
-    payload = np.frombuffer(json.dumps(value).encode(), np.uint8)
-    length = int(multihost_utils.broadcast_one_to_all(np.asarray(len(payload), np.int64)))
-    if jax.process_index() != 0:
-        payload = np.zeros(length, np.uint8)
-    return json.loads(multihost_utils.broadcast_one_to_all(payload).tobytes())
+    """A JSON-encodable value broadcast from rank zero to every rank (`from_every_process`)."""
+    return from_every_process(value if jax.process_index() == 0 else None)[0]
 
 
 def agreed[T](phase: str, operation: Callable[[], T]) -> T:
@@ -196,8 +201,8 @@ def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
     `find` returns a JSON value, and the ranks compare a digest of it, so a
     large one costs no more to agree than a small one. A failure in `find`
     is agreed as in `agreed`; a rank that found something else than process
-    0 is refused on every rank, both values named. On one process this is a
-    plain call.
+    0 is refused on every rank, both values named, which takes a second
+    round. On one process this is a plain call.
     """
     held: tuple[T] | None = None
     error: BaseException | None = None
@@ -212,14 +217,15 @@ def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
         return held[0]
     found = "" if held is None else json.dumps(held[0], sort_keys=True)
     try:
-        words = _agree(phase, error, f"{hashlib.sha256(found.encode()).hexdigest()} {_shown(found)}")
+        digests = _agree(phase, error, hashlib.sha256(found.encode()).hexdigest())
     except BaseException as failure:
         if error is None:
             raise PeerFailure(str(failure)) from failure
         raise
-    digests, shown = zip(*(word.split(" ", 1) for word in words), strict=True)
     other = next((rank for rank, digest in enumerate(digests) if digest != digests[0]), None)
     if other is not None:
+        # Every rank saw the same digests, so all take this second round, which names the values.
+        shown = _round(_shown(found))
         raise ValueError(f"the {phase} differs between the processes: process {other} has "
                          f"{shown[other]}, and process 0 has {shown[0]}")
     assert held is not None
@@ -291,10 +297,8 @@ def _round(word: str) -> list[str]:
     word, meets the service's barrier and reads every rank's. A rank still
     busy on its host keeps the others waiting there rather than inside an
     execution, which the pool's bound (`dew.training.runtime.EXECUTION_TIMEOUT`)
-    would end, and no device computation runs, so an agreement costs a few
-    round trips to process 0 at any pool size: 33 ms on 8 CPU hosts joined
-    by a 5 ms relay and 63 ms on 32, where a 4-byte allgather took 147 and
-    593 ms (tools/armada/gang_bench.py).
+    would end, and no device computation runs, so a round costs a few round
+    trips to process 0 at any pool size (`docs/performance.md`).
     """
     client, rank, number = _client(), jax.process_index(), next(_agreements)
     directory = f"dew/agreement/{number}/"
@@ -469,4 +473,5 @@ __all__ = [
     "broadcast_from_process_zero",
     "collective_host",
     "end_pool_on_failure",
+    "from_every_process",
 ]

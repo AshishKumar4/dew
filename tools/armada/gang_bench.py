@@ -127,31 +127,20 @@ def gradient_sync(mesh) -> dict:
 
 
 def agreements() -> dict:
-    """The median seconds of each way the pool agrees on the host (`dew.coordination`), and of
-    their parts: the coordination service's barrier alone, a 4-byte allgather alone, and a round of
-    the service's key-value store (each rank sets a key, meets the barrier and reads every key)."""
+    """The median seconds of each way the pool shares a host value (`dew.coordination`): a
+    coordination-service barrier alone, a 4-byte device allgather (how agreements once went), a
+    round of the service (`from_every_process`), an agreement on an outcome and on a value."""
     import numpy as np
     from jax.experimental import multihost_utils
 
-    from dew.coordination import _client, agree_process_phase, agreed, agreed_same
+    from dew.coordination import _client, agree_process_phase, agreed_same, from_every_process
 
     client = _client()
     rounds = iter(range(1_000_000))
-
-    def barrier():
-        client.wait_at_barrier(f"bench/barrier/{next(rounds)}", 60_000)
-
-    def key_values():
-        directory = f"bench/kv/{next(rounds)}/"
-        client.key_value_set(directory + str(RANK), "0")
-        client.wait_at_barrier(directory, 60_000)
-        assert len(client.key_value_dir_get(directory)) == WORLD
-
-    ways = {"barrier": barrier,
+    ways = {"barrier": lambda: client.wait_at_barrier(f"bench/barrier/{next(rounds)}", 60_000),
             "allgather_4B": lambda: multihost_utils.process_allgather(np.asarray(RANK, np.int32)),
-            "key_value_round": key_values,
+            "from_every_process": lambda: from_every_process(RANK),
             "agree_process_phase": lambda: agree_process_phase(None, phase="bench"),
-            "agreed": lambda: agreed("bench", lambda: None),
             "agreed_same": lambda: agreed_same("bench", lambda: "same")}
     timed = {}
     for name, way in ways.items():
