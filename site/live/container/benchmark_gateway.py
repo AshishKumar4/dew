@@ -35,6 +35,16 @@ def request(path, data=None, method=None):
         return json.loads(raw) if raw else None
 
 
+def ready(client):
+    """Wait for `client`'s kernel to start; one that dies first fails with the gateway's log,
+    where its launcher says why."""
+    try:
+        client.wait_for_ready(timeout=30)
+    except RuntimeError as error:
+        log = pathlib.Path("/run/dew/gateway.log").read_text(errors="replace").splitlines()[-30:]
+        raise RuntimeError(f"{error}; gateway log:\n" + "\n".join(log)) from None
+
+
 def execute(client, code):
     return collect(client, client.execute(code, allow_stdin=False))
 
@@ -133,7 +143,7 @@ def training():
     client.load_connection_file()
     client.start_channels()
     try:
-        client.wait_for_ready(timeout=30)
+        ready(client)
         lines = execute(client, TRAINING_PROBE).splitlines()
         assert lines[0] == "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host.", lines
         assert lines[1] == ("Live run: steps 1000 -> 20, log_every 100 -> 5, "
@@ -172,7 +182,7 @@ def cell(name, code):
     client.start_channels()
     started = time.perf_counter()
     try:
-        client.wait_for_ready(timeout=30)
+        ready(client)
         output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
     except Exception as error:
         raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
@@ -207,7 +217,7 @@ def main():
             client.start_channels()
             kernels.append((model["id"], client, 0))
             try:
-                client.wait_for_ready(timeout=30)
+                ready(client)
             except Exception:
                 print('KERNEL_STATUS',request('/api/kernels/'+model['id']),flush=True)
                 dump_processes()

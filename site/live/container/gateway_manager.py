@@ -94,7 +94,7 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             # overlay of its own: the Hub and datasets libraries write locks and records beside
             # what they read, and no context may change what the next one reads. Its writes land
             # in this tmpfs, which bounds them: the page's cells write only empty locks.
-            self.overlay.mkdir(mode=0o700, parents=True, exist_ok=True)
+            self.overlay.mkdir(mode=0o700, exist_ok=True)
             _private_tmpfs(self.overlay, uid, "64m")
             for name in ("upper", "work"):
                 (self.overlay / name).mkdir(mode=0o700)
