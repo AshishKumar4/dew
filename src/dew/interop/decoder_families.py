@@ -23,6 +23,7 @@ from dew.interop.families.gpt_oss import GPT_OSS
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
+from dew.interop.families.mamba import MAMBA
 from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA
 from dew.interop.families.modernbert import MODERNBERT
 from dew.interop.families.nemotron_h import NEMOTRON_H
@@ -90,6 +91,7 @@ ENTRIES = (
     GRANITEMOE,
     MIXTRAL,
     MISTRAL,
+    MAMBA,
     DecoderFamily(
         ("mamba2",),
         mamba2.config_from_hf,

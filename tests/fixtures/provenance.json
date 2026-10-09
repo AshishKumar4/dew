@@ -3713,6 +3713,26 @@
   "hf/starcoder2-tiny/padded_logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/mamba-tiny/generated.npy": {
+   "tool": "tools/mamba_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/mamba-tiny/logits.npy": {
+   "tool": "tools/mamba_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/mamba-tiny/logits_f64.npy": {
+   "tool": "tools/mamba_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/mamba-tiny/padded_logits.npy": {
+   "tool": "tools/mamba_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/mamba-tiny/padded_logits_f64.npy": {
+   "tool": "tools/mamba_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   }
  },
  "inputs": [
@@ -4139,6 +4159,11 @@
    "tool": "tools/hf_reference.py",
    "what": "GPTBigCode multi-query and multi-head and Starcoder2 weights, probe token ids and padded validity masks",
    "files": ["hf/gpt-bigcode-tiny/attention_mask.npy", "hf/gpt-bigcode-tiny/input_ids.npy", "hf/gpt-bigcode-tiny/model.safetensors", "hf/gpt-bigcode-tiny/padded_ids.npy", "hf/gpt-bigcode-mha-tiny/attention_mask.npy", "hf/gpt-bigcode-mha-tiny/input_ids.npy", "hf/gpt-bigcode-mha-tiny/model.safetensors", "hf/gpt-bigcode-mha-tiny/padded_ids.npy", "hf/starcoder2-tiny/attention_mask.npy", "hf/starcoder2-tiny/input_ids.npy", "hf/starcoder2-tiny/model.safetensors", "hf/starcoder2-tiny/padded_ids.npy"]
+  },
+  {
+   "tool": "tools/mamba_reference.py",
+   "what": "Mamba weights, probe token ids and padded validity masks",
+   "files": ["hf/mamba-tiny/attention_mask.npy", "hf/mamba-tiny/input_ids.npy", "hf/mamba-tiny/model.safetensors", "hf/mamba-tiny/padded_ids.npy"]
   }
  ]
 }

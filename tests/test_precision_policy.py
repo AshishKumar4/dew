@@ -213,8 +213,8 @@ PER_ARCH = {
 COMPOSITES = ("diffusion_gemma", "multimodal_transformer")
 RES, FRAMES = 16, 2
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
-FIXTURE_DECODERS = ("mamba2-tiny", "deepseek-v4-tiny", "glm5-next-tiny", "kimi-k3-tiny")
-"""Tiny released configs whose mixers no toy case reaches: Mamba-2,
+FIXTURE_DECODERS = ("mamba-tiny", "mamba2-tiny", "deepseek-v4-tiny", "glm5-next-tiny", "kimi-k3-tiny")
+"""Tiny released configs whose mixers no toy case reaches: Mamba, Mamba-2,
 DeepSeek V4's compressed attention and hyper-connections, GLM-5 Next's
 k-pool sparse attention and Kimi's delta attention, depth attention and
 SiTU. DeepSeek V4.1's KV quantizers round through float32 bits on

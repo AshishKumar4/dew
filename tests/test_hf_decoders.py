@@ -582,7 +582,7 @@ def test_the_real_gemma3_1b_config_translates():
 
 
 @pytest.mark.parametrize("field, value, message", [
-    ('model_type', 'mamba', "model_type 'mamba'"),
+    ('model_type', 'falcon_mamba', "model_type 'falcon_mamba'"),
     ('use_bidirectional_attention', True, "use_bidirectional_attention"),
     ('hidden_activation', 'relu', "hidden_act 'relu'"),
     ('rope_parameters', {'rope_type': 'linear', 'factor': 8.0, 'rope_theta': 1e6},
