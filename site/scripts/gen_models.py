@@ -48,6 +48,7 @@ DECODERS = {
     "olmo3": ("OLMo 3", "Dense decoders"),
     "mixtral": ("Mixtral", "Mixture of experts"),
     "minimax_m2": ("MiniMax-M2", "Mixture of experts"),
+    "mimo_v2_flash": ("MiMo-V2-Flash", "Mixture of experts"),
     "granitemoe": ("Granite MoE", "Mixture of experts"),
     "qwen3_moe": ("Qwen3-MoE", "Mixture of experts"),
     "qwen2_moe": ("Qwen 2 MoE", "Mixture of experts"),
