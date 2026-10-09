@@ -26,6 +26,7 @@ function preparer({ failSmoke = false, failReport = 0 } = {}) {
 		async exec() { return { exitCode: Promise.resolve(0), output: async () => ({ exitCode: 0 }) }; },
 		async snapshotContainer() { return { id: 'snapshot' }; },
 		async destroy() { this.running = false; state.destroys++; },
+		monitor: () => new Promise(() => {}),
 	};
 	const ctx = { container, storage: {
 		async setAlarm(at) { state.alarm = at; }, async deleteAlarm() { state.alarm = null; },
