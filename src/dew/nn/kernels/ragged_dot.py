@@ -20,11 +20,14 @@
 ragged_dot.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801;
 license header above), which no jax wheel ships: `DEFAULT_BLOCK_M` through
 `_hyperparam_selection_rule`, restyled to this tree's lint gate and moved
-from `jax._src` imports to their public equivalents, with two lines of logic
-changed and marked `# Dew:`: tgmm's output cast, and gmm's
-zeroing when every group is empty. The file's `ragged_dot_general`
-adapter is left out: Dew calls the kernels itself, through
-`dew.nn.moe.expert_projection`'s custom VJP, the way MaxText calls megablox.
+from `jax._src` imports to their public equivalents, with three changes of
+logic marked `# Dew:`: tgmm's output cast, gmm's zeroing when every group is
+empty, and gmm's MXFP4 rhs, `[g, n, k / 2]` E2M1 codes beside `[g, n, k /
+32]` E8M0 exponents, which each program decodes one `[n, k]` tile at a time
+(`dew.interop.codecs.decode_e2m1_device`), so only the routed groups' bytes
+are read. The file's `ragged_dot_general` adapter is left out: Dew calls the
+kernels itself, through `dew.nn.moe.expert_projection`'s custom VJP, the way
+MaxText calls megablox.
 
 Every global load and store is masked on every dimension, rows included, and
 rows past the routed ones are written as zeros. The kernels multiply in
@@ -45,6 +48,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 from jax.typing import DTypeLike
+
+from dew.interop.codecs import GROUP, decode_e2m1_device
 
 DEFAULT_BLOCK_M = 64
 DEFAULT_BLOCK_N = 64
@@ -129,7 +134,7 @@ def _make_gmm_group_metadata(
 def _gpu_ragged_dot_kernel(
   # inputs
   x_ref,  # [m, k]
-  A_ref,  # [k, n] or [n, k]
+  A_ref,  # [k, n] or [n, k]; Dew: or MXFP4's [n, k / 2] codes and [n, k / 32] exponents
   group_metadata_ref: GMMGroupLookupMetadata,
   # outputs
   y_ref,  # [k, n]
@@ -169,7 +174,14 @@ def _gpu_ragged_dot_kernel(
       _load = partial(plgpu.load, other=0)
       mask = lhs_rows_mask[:, None] & inner_mask[None, :]
       x = _load(x_ref.at[lhs_rows_idx, inner_idx], mask=mask)
-      if not trans_rhs:
+      if isinstance(A_ref, tuple):
+        # Dew: an MXFP4 tile, each byte of a part covering `per_byte` inputs.
+        A = decode_e2m1_device(*(
+          _load(part.at[pid.gi, rhs_cols_idx, pl.ds(k * (block.k // per_byte), block.k // per_byte)],
+                mask=rhs_cols_mask[:, None]
+                & ((k * block.k + arange(block.k // per_byte) * per_byte) < size.k)[None, :])
+          for part, per_byte in zip(A_ref, (2, GROUP), strict=True)), compute_dtype)
+      elif not trans_rhs:
         mask = inner_mask[:, None] & rhs_cols_mask[None, :]
         A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
       else:
@@ -223,7 +235,7 @@ def _gpu_ragged_dot_kernel(
 @jax.jit(static_argnums=list(range(3, 14)))
 def gmm(
   x: jax.Array,  # [m, k]
-  A: jax.Array,  # [g, k, n]
+  A: jax.Array | tuple[jax.Array, jax.Array],  # [g, k, n]; Dew: or MXFP4 codes and exponents
   group_sizes: jax.Array,  # [g]
   block_m: int = DEFAULT_BLOCK_M,
   block_k: int = DEFAULT_BLOCK_K,
@@ -239,29 +251,36 @@ def gmm(
 ) -> jax.Array:
   """Compute grouped matmul on GPU via a Pallas lowering."""
 
+  # Dew: an MXFP4 rhs is output-major, as checkpoints store it.
+  mxfp4 = isinstance(A, tuple)
+  rhs = A[0] if isinstance(A, tuple) else A
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
-  msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
-  if not (A.ndim == 3 and x.ndim == 2):
+  msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {rhs.shape=}"
+  if not (rhs.ndim == 3 and x.ndim == 2) or (mxfp4 and not trans_rhs):
     raise ValueError(msg)
   msg = f"Group sizes {group_sizes.shape=} must match first dimension of "
-  msg += f"{A.shape=}"
-  if not A.shape[:1] == group_sizes.shape:
+  msg += f"{rhs.shape=}"
+  if not rhs.shape[:1] == group_sizes.shape:
     raise ValueError(msg)
-  n = A.shape[-1] if not trans_rhs else A.shape[-2]
-  Ak = A.shape[-2] if not trans_rhs else A.shape[-1]
+  n = rhs.shape[-1] if not trans_rhs else rhs.shape[-2]
+  Ak = rhs.shape[-2] if not trans_rhs else rhs.shape[-1] * (2 if mxfp4 else 1)
   assert Ak == x.shape[1], msg
-  size = RaggedDotSizes(m=x.shape[0], k=x.shape[1], n=n, g=A.shape[0])
+  size = RaggedDotSizes(m=x.shape[0], k=x.shape[1], n=n, g=rhs.shape[0])
 
   # normalize the block sizes for GPU
   block_m, block_k, block_n = (
     pl.next_power_of_2(min(b, s))
     for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n], strict=True)
   )
-  block_k, block_n = max(block_k, 16), max(block_n, 16)
+  # Dew: an MXFP4 tile holds whole groups.
+  block_k, block_n = max(block_k, GROUP if mxfp4 else 16), max(block_n, 16)
 
   A_spec = pl.BlockSpec((size.g, size.k, block_n), lambda i, j: (0, 0, j))
   if trans_rhs:  # transposed spec
     A_spec = pl.BlockSpec((size.g, block_n, size.k), lambda i, j: (0, j, 0))
+  if mxfp4:
+    A_spec = tuple(pl.BlockSpec((size.g, block_n, size.k // per_byte), lambda i, j: (0, j, 0))
+                   for per_byte in (2, GROUP))
 
   group_metadata = _make_gmm_group_metadata(
     group_sizes=group_sizes, m=size.m, chunk_m=chunk_m

@@ -57,6 +57,9 @@ KERNELS: dict[str, dict[str, str]] = {
     # JAX's Pallas grouped matmul runs 5x-61x faster than XLA's ragged_dot on sm80-sm89; on TPU XLA
     # wins except tokamax's mosaic_tpu_v2 (1.11x-1.38x at 8 experts), not a dependency.
     'grouped_matmul': {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas', 'v5e': 'xla', 'v6e': 'xla'},
+    # MXFP4 experts (`dew.nn.moe.MXFP4Experts`): 'pallas' decodes each tile inside the grouped matmul and
+    # reads only the routed experts' bytes; 'xla' decodes every expert, then runs 'grouped_matmul''s choice.
+    'mxfp4_grouped_matmul': {},
     # The kernel 'tokamax' names. Its own dispatch tries Mosaic first, 4x-13x slower than XLA on a TPU
     # and over shared memory on sm89; its Triton backward faults on sm80 and sm89, so only the forward
     # runs on it.

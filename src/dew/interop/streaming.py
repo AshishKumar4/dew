@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.interop.codecs import MXFP4_PARTS, decode_mxfp4_parts
 from dew.interop.weights import swapped
 from dew.training.host import evict
 
@@ -164,6 +165,9 @@ class WeightLayout:
     Kimi K3 ships each KDA layer's `A_log` for 96 heads padded to 128
     entries. The family's prepare step checks and trims the tail, and export
     writes the zeros back.
+
+    A leaf kept as MXFP4 parts (`dew.interop.codecs.MXFP4_PARTS`) exports
+    the float32 matrix they hold, as the loader would have decoded it.
     """
 
     name: str
@@ -176,7 +180,7 @@ class WeightLayout:
     padded: int | None = None
 
     def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
-              scalar_mode: str | None) -> np.ndarray | jax.Array:
+              scalar_mode: str | None, expert: int | None = None) -> np.ndarray | jax.Array:
         if path[-1] == "layer_scalar":
             if scalar_mode not in ("frozen", "trainable"):
                 raise ValueError("layer_scalar export requires an explicit model mode")
@@ -186,11 +190,22 @@ class WeightLayout:
             if not isinstance(node, Mapping):
                 raise ValueError(f"parameter path {path} does not traverse a mapping")
             node = node[part]
-        if not isinstance(node, (np.ndarray, jax.Array)):
-            raise ValueError(
-                f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array"
-            )
-        return node
+        mxfp4 = isinstance(node, Mapping) and set(node) == set(MXFP4_PARTS)
+        arrays: list[np.ndarray | jax.Array] = []
+        for leaf in [node[part] for part in MXFP4_PARTS] if isinstance(node, Mapping) and mxfp4 else [node]:
+            if not isinstance(leaf, (np.ndarray, jax.Array)):
+                raise ValueError(
+                    f"{self.name} reads {path}, which holds {type(leaf).__name__} rather than an array"
+                )
+            if expert is not None:
+                # Slice the expert where the leaf lives. One stacked leaf
+                # answers for E source tensors, so copying it to the host
+                # per tensor would move the whole stack E times.
+                if leaf.ndim == 0 or not 0 <= expert < leaf.shape[0]:
+                    raise ValueError(f"{self.name} is expert {expert} of {path}, which holds {leaf.shape}")
+                leaf = leaf[expert]
+            arrays.append(leaf)
+        return decode_mxfp4_parts(*map(np.asarray, arrays)) if mxfp4 else arrays[0]
 
     def stored_dtype(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.dtype:
         """The dtype `export` writes, read from the leaf without copying it."""
@@ -200,19 +215,7 @@ class WeightLayout:
 
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         """The source tensor, built from its leaves and brought to the host."""
-        leaves = []
-        for path in self.paths:
-            node = self._leaf(variables, path, scalar_mode)
-            if self.expert_index is not None:
-                # Slice the expert where the leaf lives. One stacked leaf
-                # answers for E source tensors, so copying it to the host
-                # per tensor would move the whole stack E times.
-                if node.ndim == 0 or not 0 <= self.expert_index < node.shape[0]:
-                    raise ValueError(
-                        f"{self.name} is expert {self.expert_index} of {path}, which "
-                        f"holds {node.shape}")
-                node = node[self.expert_index]
-            leaves.append(node)
+        leaves = [self._leaf(variables, path, scalar_mode, self.expert_index) for path in self.paths]
         if (len(leaves) == 1 and self.transpose is not None
                 and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype):
             # One leaf is transposed on its device and copied to the host

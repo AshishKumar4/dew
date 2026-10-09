@@ -42,7 +42,12 @@ The arithmetic is NumPy's on a host copy. XLA on CPU reads and writes
 float32 subnormals as zero, and these formats keep them: an MXFP4 group of
 2 ** -127 weights encodes to the 0.5 code at the 2 ** -126 scale and
 decodes back to 2 ** -127, which the same code under jax.numpy returns as
-zeros (measured, jax 0.11 CPU, scale bytes 0 and 1).
+zeros (measured, jax 0.11 CPU, scale bytes 0 and 1). `decode_e2m1_device`
+is `decode_e2m1` for a model that keeps the codes on its device: it builds
+each value's bits with integer arithmetic, so it keeps those subnormals on
+any backend, and it is what the MXFP4 grouped matmul decodes its tiles with.
+A source's MXFP4 weights can stay as stored for such a model
+(`SourceQuantization.stored`, `StoredMXFP4`).
 """
 
 from __future__ import annotations
@@ -55,6 +60,7 @@ from functools import partial
 from types import MappingProxyType
 from typing import Literal
 
+import jax
 import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
@@ -114,6 +120,67 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
     values = _E2M1_BYTES[codes].reshape(*scales.shape, GROUP)
     values *= scales[..., None]
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
+
+
+def decode_e2m1_device(codes: jax.Array, exponents: jax.Array, dtype: DTypeLike) -> jax.Array:
+    """`decode_e2m1` in jax.numpy: uint8 codes [..., n / 2] under uint8 exponent
+    bytes [..., n / 32] to [..., n] in `dtype`, the bits of `decode_e2m1`'s
+    float32 cast to `dtype`, NaN (byte 255), infinities and subnormals included.
+
+    The values are built from their float32 bits, not multiplied, so XLA's
+    CPU backend cannot flush them. A nonzero code of magnitude bits m is
+    1.F * 2 ** E with E = (m >> 1) - 1 and F the low bit for m >= 2 (m = 1
+    is 0.5, F = 0), so under byte b its float32 biased exponent is X = E + b:
+    an infinity from 255 on, `X << 23 | F << 22` from 1 on, and down to 1 the
+    subnormal significand `(2 + F) << (X + 21)`, exact since X >= -1. Every
+    value's significand fits bfloat16's, which therefore takes the high half
+    of the bits; any other dtype is cast from float32, as `decode_e2m1`'s
+    callers cast. Only shifts, masks, selects and bitcasts, so the MXFP4
+    grouped matmul runs it on its tiles too.
+    """
+    pairs = jnp.stack((codes & 15, codes >> 4), axis=-1)
+    nibbles = pairs.reshape(*exponents.shape, GROUP).astype(jnp.int32)
+    biased = exponents[..., None].astype(jnp.int32)
+    magnitude = nibbles & 7
+    exponent = (magnitude >> 1) - 1 + biased
+    fraction = jnp.where(magnitude > 1, magnitude & 1, 0)
+    bits = jnp.where(exponent >= 1, (exponent << 23) | (fraction << 22),
+                     (2 + fraction) << (jnp.minimum(exponent, 1) + 21))
+    bits = jnp.where(magnitude == 0, 0, jnp.where(exponent >= 255, 0x7F800000, bits))
+    bits = jnp.where(biased == 255, 0x7FC00000, bits | (nibbles >> 3) << 31)
+    shape = (*codes.shape[:-1], 2 * codes.shape[-1])
+    if jnp.dtype(dtype) == jnp.bfloat16:
+        high = jax.lax.shift_right_logical(bits, 16).astype(jnp.uint16)
+        return jax.lax.bitcast_convert_type(high, jnp.bfloat16).reshape(shape)
+    return jax.lax.bitcast_convert_type(bits, jnp.float32).reshape(shape).astype(dtype)
+
+
+MXFP4_PARTS = ('codes', 'exponents')
+"""The two uint8 arrays an MXFP4 matrix `[..., in, out]` is held as, by these
+names in a model's variables: E2M1 codes `[..., out, in / 2]` and E8M0
+exponent bytes `[..., out, in / 32]`, the layout GPT OSS's blocks and
+compressed-tensors' pairs share."""
+
+
+@dataclass(frozen=True)
+class StoredMXFP4:
+    """One MXFP4 weight as its checkpoint stores it, for a model that keeps
+    it so (`MXFP4_PARTS`): views of the source's bytes, never decoded on the
+    host. `shape` is that of the float tensor the codec decodes it to."""
+
+    codes: np.ndarray
+    exponents: np.ndarray
+    shape: tuple[int, ...]
+
+    def stand_in(self) -> np.ndarray:
+        """A float32 array of the decoded shape that holds no values (zero
+        strides), for code that reads only a source tensor's geometry."""
+        return np.broadcast_to(np.float32(0), self.shape)
+
+
+def decode_mxfp4_parts(codes: ArrayLike, exponents: ArrayLike) -> np.ndarray:
+    """The float32 matrices `[..., in, out]` that `MXFP4_PARTS` hold."""
+    return decode_e2m1(codes, exponents).swapaxes(-1, -2)
 
 
 def encode_e2m1(quotients: np.ndarray, *, ties: Literal['even', 'away']) -> np.ndarray:
@@ -219,7 +286,9 @@ class SourceQuantization:
     them, and `source_quantization(..., grid=)` hands them back to `encode`.
     ModelOpt also retains original packed words there: its author reader
     maps code 8 to +0, so only those words preserve the source's signed-zero
-    code for a byte-exact untrained export.
+    code for a byte-exact untrained export. `stored(tensors, name)` is an
+    MXFP4 weight's own bytes (`StoredMXFP4`), for a model that decodes it on
+    its device; the other formats have none.
     """
 
     names: Callable[[Mapping[str, np.ndarray]], tuple[str, ...]]
@@ -228,6 +297,7 @@ class SourceQuantization:
     encode: Callable[[str, np.ndarray], dict[str, np.ndarray]]
     scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = lambda tensors: None
     grid: Callable[[str], tuple[str, ...]] = lambda name: ()
+    stored: Callable[[Mapping[str, np.ndarray], str], StoredMXFP4] | None = None
     input_scale_dtype: Literal['unrounded', 'float8_e4m3fn'] | None = None
     input_format: Literal['compressed-tensors', 'modelopt'] = 'compressed-tensors'
     input_suffix: Literal['.input_global_scale', '.input_scale'] = '.input_global_scale'
@@ -289,12 +359,22 @@ def _paired(tensors: Mapping[str, np.ndarray], suffixes: tuple[str, ...], weight
 MXFP4_SUFFIXES = ('_blocks', '_scales')
 """GPT OSS's `<stem>_blocks` and `<stem>_scales`."""
 
+
+def _stored_mxfp4(tensors: Mapping[str, np.ndarray], name: str) -> StoredMXFP4:
+    """GPT OSS's blocks with each output's groups run together, `[E, out, in / 2]`."""
+    blocks, scales = _mxfp4_arrays(*(tensors[name + suffix] for suffix in MXFP4_SUFFIXES))
+    codes = _bytes(blocks, _CODE_DTYPES).reshape(*scales.shape[:2], -1)
+    exponents = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
+    return StoredMXFP4(codes, exponents, (codes.shape[0], 2 * codes.shape[2], codes.shape[1]))
+
+
 MXFP4 = SourceQuantization(
     lambda tensors: _paired(tensors, MXFP4_SUFFIXES, ''),
     lambda name: tuple(name + suffix for suffix in MXFP4_SUFFIXES),
     lambda tensors, name: dequantize_mxfp4(*(tensors[name + suffix] for suffix in MXFP4_SUFFIXES)),
     lambda name, weight: dict(zip((name + suffix for suffix in MXFP4_SUFFIXES), quantize_mxfp4(weight),
-                                  strict=True)))
+                                  strict=True)),
+    stored=_stored_mxfp4)
 """GPT OSS's MXFP4 (`quant_method: mxfp4`), [E, in, out] weights under their stems."""
 
 
@@ -405,8 +485,8 @@ def _packed_partners(name: str) -> tuple[str, ...]:
     return tuple(name.removesuffix('.weight') + suffix for suffix in PACKED_SUFFIXES)
 
 
-def _decode_packed(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
-    """A packed Linear's weight, FP32 `[output, input]`."""
+def _packed_pair(tensors: Mapping[str, np.ndarray], name: str) -> tuple[np.ndarray, np.ndarray]:
+    """A packed Linear's codes and scales, refused unless they are its U8 pair."""
     packed, scales = (tensors[partner] for partner in _packed_partners(name))
     if (packed.dtype != np.uint8 or scales.dtype != np.uint8 or packed.ndim != 2
             or packed.shape[1] % (GROUP // 2)
@@ -414,7 +494,17 @@ def _decode_packed(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
         raise ValueError(
             f"{name} packs U8 [output, input / 2] codes beside U8 [output, input / {GROUP}] scales, "
             f"got {packed.dtype} {packed.shape} and {scales.dtype} {scales.shape}")
-    return decode_e2m1(packed, scales)
+    return packed, scales
+
+
+def _decode_packed(tensors: Mapping[str, np.ndarray], name: str) -> np.ndarray:
+    """A packed Linear's weight, FP32 `[output, input]`."""
+    return decode_e2m1(*_packed_pair(tensors, name))
+
+
+def _stored_packed(tensors: Mapping[str, np.ndarray], name: str) -> StoredMXFP4:
+    packed, scales = _packed_pair(tensors, name)
+    return StoredMXFP4(packed, scales, (packed.shape[0], 2 * packed.shape[1]))
 
 
 def _encode_packed(name: str, weight: np.ndarray) -> dict[str, np.ndarray]:
@@ -423,7 +513,8 @@ def _encode_packed(name: str, weight: np.ndarray) -> dict[str, np.ndarray]:
     return dict(zip(_packed_partners(name), quantize_packed_mxfp4(weight), strict=True))
 
 
-PACKED_MXFP4 = SourceQuantization(_packed_names, _packed_partners, _decode_packed, _encode_packed)
+PACKED_MXFP4 = SourceQuantization(_packed_names, _packed_partners, _decode_packed, _encode_packed,
+                                  stored=_stored_packed)
 """compressed-tensors' `mxfp4-pack-quantized`, `<module>.weight` under its pair."""
 
 

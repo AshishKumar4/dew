@@ -32,7 +32,14 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, PredictionPhase
-from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, GatedActivation, SparseMLP, gated_product
+from ..moe import (
+    EXPERT_DISPATCHES,
+    EXPERT_STORAGES,
+    GROUPED_MATMULS,
+    GatedActivation,
+    SparseMLP,
+    gated_product,
+)
 from ..precision import scaled
 from ..protocols import ProjectionGroup, declared_groups
 from ..sharding import MLP_HIDDEN, RESIDUAL, constrain, logical_axes
@@ -87,6 +94,9 @@ class Mixture:
     mesh axis that divides the expert count. `hash_layers` route by DeepSeek
     V4's token table, `latent_features` gives Kimi K3's latent MoE, and
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
+    `expert_storage` holds the routed experts' matrices (`moe.expert_kernel`):
+    'float' trains, and 'mxfp4' serves an MXFP4 checkpoint's own bytes,
+    decoded on the device (`Pretrained.load(..., expert_storage='mxfp4')`).
     """
 
     experts: int
@@ -107,6 +117,7 @@ class Mixture:
     implementation: str = 'auto'
     dispatch: str = 'global'
     capacity_factor: float | None = None
+    expert_storage: str = 'float'
     hash_layers: tuple[int, ...] | None = None
     latent_features: int | None = None
     latent_norm: bool = False
@@ -143,6 +154,8 @@ class Mixture:
                 f"{list(GROUPED_MATMULS)}, got {self.implementation!r}")
         if self.dispatch not in EXPERT_DISPATCHES:
             raise ValueError(f"dispatch must be one of {EXPERT_DISPATCHES}, got {self.dispatch!r}")
+        if self.expert_storage not in EXPERT_STORAGES:
+            raise ValueError(f"expert_storage must be one of {EXPERT_STORAGES}, got {self.expert_storage!r}")
         if self.capacity_factor is not None and not self.capacity_factor > 0:
             raise ValueError(
                 f"capacity_factor scales each expert's share of a sequence, so it is "
@@ -150,11 +163,12 @@ class Mixture:
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
-                or self.scale_inputs or self.shared_features or self.latent_features is not None):
+                or self.scale_inputs or self.shared_features or self.latent_features is not None
+                or self.expert_storage != 'float'):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, input scaling "
-                "or shared branch to set")
+                "score function, scaling, groups, balancing bias, input scaling, "
+                "shared branch or expert storage to set")
 
     def build(self, *, out_features: int, hidden_features: int, activation: GatedActivation,
               dense: Callable[..., nn.Module], norm: Callable[..., nn.Module] | None = None,
@@ -169,6 +183,7 @@ class Mixture:
             hidden_features=hidden_features if self.expert_features is None else self.expert_features,
             out_features=out_features, activation=activation,
             implementation=self.implementation, dispatch=self.dispatch, capacity_factor=self.capacity_factor,
+            expert_storage=self.expert_storage,
             score_function=self.score_function, normalize_weights=self.norm_topk_prob,
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,

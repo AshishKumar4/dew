@@ -13,18 +13,51 @@ jax 0.11.2 deprecating Pallas Triton (it warns at each lowering, left to the
 user's filters): JAX's Mosaic GPU grouped matmul needs wgmma, which those
 lack, and tokamax's sm80 Mosaic config overflows an Ada card's shared memory
 and has no backward (`dew.nn.kernels.generation.triton_runs`).
+
+The matrix may be `MXFP4Experts`, an MXFP4 checkpoint's own bytes: `gmm`
+decodes them tile by tile, and every other lowering decodes every expert
+for `jax.lax.ragged_dot`. Either way the product is the decoded matrices'.
 """
 
 from __future__ import annotations
 
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
 
+from dew.interop.codecs import decode_e2m1_device
+
 from ..precision import asks_default_precision
+
+
+class MXFP4Experts(NamedTuple):
+    """Stacked expert matrices `[exp, in, out]` as an MXFP4 checkpoint stores
+    them (`dew.interop.codecs.MXFP4_PARTS`): uint8 E2M1 `codes` `[exp, out,
+    in / 2]` and E8M0 `exponents` `[exp, out, in / 32]`, 4.25 bits a weight.
+
+    `dew.nn.moe.expert_kernel` reads a layer's experts as one under
+    `expert_storage='mxfp4'`. Its values are exactly bfloat16's, so its
+    `dtype` is bfloat16 wherever a dtype is promoted.
+    """
+
+    codes: jax.Array
+    exponents: jax.Array
+
+    dtype = jnp.dtype(jnp.bfloat16)
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        experts, outputs, packed = self.codes.shape
+        return experts, 2 * packed, outputs
+
+    def decoded(self, dtype: Dtype) -> jax.Array:
+        """Every expert's matrix `[exp, in, out]` in `dtype`, bit for bit
+        what `dew.interop.codecs.dequantize_mxfp4` cast to it holds."""
+        return decode_e2m1_device(self.codes, self.exponents, dtype).swapaxes(-1, -2)
 
 
 def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
@@ -57,7 +90,10 @@ def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):
     # which jax 0.11.2 deprecates, and importing a model must not load it.
     from . import ragged_dot
     compute = tokens.dtype
-    return ragged_dot.gmm(tokens, kernel.astype(compute), sizes,
+    # MXFP4 parts are stored output-major, the kernel's transposed rhs.
+    rhs, trans_rhs = (((kernel.codes, kernel.exponents), True) if isinstance(kernel, MXFP4Experts)
+                      else (kernel.astype(compute), trans_rhs))
+    return ragged_dot.gmm(tokens, rhs, sizes,
                           **ragged_dot._hyperparam_selection_rule(np.dtype(compute)), trans_rhs=trans_rhs,
                           interpret=interpret, compute_dtype=compute, out_dtype=out_dtype)
 
@@ -120,6 +156,8 @@ def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
         return _gmm(inputs, matrix, sizes, out_dtype, trans_rhs=False, interpret=interpret)
 
     def fallback(inputs, matrix, sizes):
+        if isinstance(matrix, MXFP4Experts):
+            matrix = matrix.decoded(inputs.dtype)
         return xla_ragged_dot(inputs, matrix, sizes, preferred_element_type=out_dtype)
 
     branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
@@ -144,7 +182,7 @@ def _backward(inputs, matrix, sizes, cotangent, work, interpret_on_cpu):
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
-def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+def grouped_projection(x: jax.Array, kernel: jax.Array | MXFP4Experts, group_sizes: jax.Array,
                        compute: Dtype, interpret_on_cpu: bool) -> jax.Array:
     """Compute `dew.nn.moe.expert_projection` with the kernels, differentiable in first-order reverse mode.
 
@@ -154,13 +192,15 @@ def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     the compute-dtype cotangent and the rounded operands, which with 16-bit
     compute means exact products. Only a CUDA lowering runs the kernels
     (`interpret_on_cpu` adds the CPU's interpreter). Every other lowering
-    runs `jax.lax.ragged_dot` under the same contract.
+    runs `jax.lax.ragged_dot` under the same contract. `MXFP4Experts` take
+    no gradient, and the input's runs through every expert decoded.
     """
     return _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu)[0]
 
 
 def _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu):
-    inputs, matrix = x.astype(compute), kernel.astype(compute)
+    inputs = x.astype(compute)
+    matrix = kernel if isinstance(kernel, MXFP4Experts) else kernel.astype(compute)
     sizes = group_sizes.astype(jnp.int32)
     output = _forward(inputs, matrix, sizes, jnp.promote_types(compute, jnp.float32),
                       interpret_on_cpu)
@@ -174,6 +214,13 @@ def _projection_bwd(compute, interpret_on_cpu, residuals, cotangent):
     del compute
     inputs, matrix, sizes, x_like, kernel_like = residuals
     work = jnp.result_type(inputs.dtype, x_like.dtype, kernel_like.dtype, jnp.float32)
+    if isinstance(matrix, MXFP4Experts):
+        transposed = jnp.swapaxes(matrix.decoded(inputs.dtype), 1, 2)
+        d_inputs = xla_ragged_dot(cotangent.astype(inputs.dtype), transposed, sizes,
+                                  preferred_element_type=work)
+        return (d_inputs.astype(x_like.dtype),
+                MXFP4Experts(*(np.zeros(part.shape, jax.dtypes.float0) for part in matrix)),
+                np.zeros(sizes.shape, jax.dtypes.float0))
     d_inputs, d_matrix = _backward(inputs, matrix, sizes, cotangent.astype(inputs.dtype), work,
                                    interpret_on_cpu)
     return (d_inputs.astype(x_like.dtype), d_matrix.astype(kernel_like.dtype),

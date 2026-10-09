@@ -11,13 +11,17 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.interop.codecs import MXFP4_PARTS
 from dew.nn.moe import (
+    MXFP4Experts,
     Routes,
     chosen_experts,
     expert_compute_dtype,
     expert_dispatch,
+    expert_kernel,
     expert_projection,
     gather_expert_bias,
+    mxfp4_axes,
 )
 from dew.nn.sharding import LogicalAxes, logical_axes
 
@@ -34,7 +38,8 @@ class GptOssExperts(nn.Module):
     """Interleaved gate/up matrices with the reference's clamped 1.702 SwiGLU.
 
     `implementation` names the grouped matmul, as `moe.expert_projection` takes it;
-    `dispatch` and `capacity_factor` move the tokens, as `moe.expert_dispatch` takes them.
+    `dispatch` and `capacity_factor` move the tokens, as `moe.expert_dispatch` takes them;
+    `storage` holds the two matrices, as `moe.expert_kernel` does.
     """
 
     hidden_size: int
@@ -43,6 +48,7 @@ class GptOssExperts(nn.Module):
     implementation: str = 'auto'
     dispatch: str = 'global'
     capacity_factor: float | None = None
+    storage: str = 'float'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -50,12 +56,13 @@ class GptOssExperts(nn.Module):
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
         initializer = nn.initializers.variance_scaling(
             1.0, "fan_in", "truncated_normal", in_axis=-2, out_axis=-1, batch_axis=(0,))
-        gate_up = self.param("gate_up_proj", initializer,
-                             (self.num_local_experts, self.hidden_size, 2 * self.intermediate_size))
+        gate_up = expert_kernel(self, "gate_up_proj", initializer,
+                                (self.num_local_experts, self.hidden_size, 2 * self.intermediate_size),
+                                self.storage)
         gate_bias = self.param("gate_up_proj_bias", nn.initializers.zeros,
                                (self.num_local_experts, 2 * self.intermediate_size))
-        down = self.param("down_proj", initializer,
-                          (self.num_local_experts, self.intermediate_size, self.hidden_size))
+        down = expert_kernel(self, "down_proj", initializer,
+                             (self.num_local_experts, self.intermediate_size, self.hidden_size), self.storage)
         down_bias = self.param("down_proj_bias", nn.initializers.zeros,
                                (self.num_local_experts, self.hidden_size))
         # Infer the shared compute dtype from every original operand, while
@@ -72,8 +79,8 @@ class GptOssExperts(nn.Module):
         return jnp.sum(slots * weights[..., None], axis=-2)
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, expert_ids: jax.Array,
-                 parameters: tuple[jax.Array, jax.Array, jax.Array, jax.Array], *,
-                 dtype: Dtype) -> jax.Array:
+                 parameters: tuple[jax.Array | MXFP4Experts, jax.Array, jax.Array | MXFP4Experts, jax.Array],
+                 *, dtype: Dtype) -> jax.Array:
         gate_up, gate_bias, down, down_bias = parameters
         projected = jnp.asarray(expert_projection(
             tokens, gate_up, sizes, dtype, self.implementation, self.precision))
@@ -89,12 +96,15 @@ class GptOssExperts(nn.Module):
 @logical_axes({
     ("router",): ("embed", "exp"),
     **{("experts", name): axes for name, axes in FUSED_EXPERT_AXES.items()},
+    **{("experts", name, part): mxfp4_axes(FUSED_EXPERT_AXES[name])
+       for name in ("gate_up_proj", "down_proj") for part in MXFP4_PARTS},
 })
 class GptOssMLP(nn.Module):
     """Softmax over the selected biased logits, then the selected expert sum.
 
     The experts keep the reference's fused leaves, stacked on the expert
-    dimension the expert mesh axis splits, like `moe.SparseMLP`'s.
+    dimension the expert mesh axis splits, like `moe.SparseMLP`'s, and
+    `expert_storage='mxfp4'` keeps the release's MXFP4 bytes for them.
     """
 
     hidden_size: int
@@ -104,6 +114,7 @@ class GptOssMLP(nn.Module):
     implementation: str = 'auto'
     dispatch: str = 'global'
     capacity_factor: float | None = None
+    expert_storage: str = 'float'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -118,5 +129,5 @@ class GptOssMLP(nn.Module):
         return GptOssExperts(
             self.hidden_size, self.intermediate_size, self.num_local_experts,
             implementation=self.implementation, dispatch=self.dispatch,
-            capacity_factor=self.capacity_factor, dtype=self.dtype,
+            capacity_factor=self.capacity_factor, storage=self.expert_storage, dtype=self.dtype,
             precision=self.precision, name="experts")(x, weights, indices)

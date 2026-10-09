@@ -850,6 +850,7 @@ class CausalTransformer(nn.Module):
                 implementation=mixture.implementation,
                 dispatch=mixture.dispatch,
                 capacity_factor=mixture.capacity_factor,
+                expert_storage=mixture.expert_storage,
                 dtype=self.dtype, precision=self.precision)
         elif mixture.parallel:
             # The branch rides beside every sparse layer's dense feed-forward.

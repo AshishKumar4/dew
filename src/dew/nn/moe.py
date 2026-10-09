@@ -33,10 +33,12 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
 from jax.sharding import PartitionSpec as P
 
+from dew.interop.codecs import GROUP, MXFP4_PARTS
+
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
 from .kernels.generation import measured_kernel, ran_kernel, triton_runs
-from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
+from .kernels.grouped_matmul import MXFP4Experts, grouped_projection, ragged_dot_refusal, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
 from .protocols import ProjectionGroup, declared_groups
 from .sharding import (
@@ -57,9 +59,12 @@ from .sharding import (
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-# 'auto' resolves per hardware generation through `KERNELS['grouped_matmul']`.
+# 'auto' resolves per hardware generation through `KERNELS['grouped_matmul']`,
+# and for MXFP4 experts through `KERNELS['mxfp4_grouped_matmul']`.
 GROUPED_MATMULS = ('auto', 'xla', 'pallas', 'tokamax')
 EXPERT_DISPATCHES = ('global', 'exchange')
+# How a layer holds its routed experts' matrices (`expert_kernel`).
+EXPERT_STORAGES = ('float', 'mxfp4')
 
 # DeepSeek divides the selected weights by their sum plus this, so a token
 # whose sigmoid scores are all zero stays finite
@@ -335,26 +340,27 @@ class Router(nn.Module):
 
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
-                          precision: PrecisionLike) -> str:
+                          precision: PrecisionLike, choice: str = 'grouped_matmul') -> str:
     """The one choice of grouped matmul: 'xla', 'pallas' or 'tokamax'.
 
-    'auto' takes the generation's measured one (`KERNELS['grouped_matmul']`).
-    'pallas' needs a GPU the kernels compile for and a product they compute
-    exactly (`ragged_dot_refusal`), else 'xla', which `ran_kernel` logs where
-    'pallas' was measured fastest. `operands` are the input and kernel dtypes
-    as stored.
+    'auto' takes the generation's measured one (`KERNELS[choice]`: MXFP4
+    experts choose under 'mxfp4_grouped_matmul'). 'pallas' needs a GPU the
+    kernels compile for and a product they compute exactly
+    (`ragged_dot_refusal`), else 'xla', which `ran_kernel` logs where 'pallas'
+    was measured fastest. `operands` are the input and kernel dtypes as
+    stored.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
             f"implementation must be one of {list(GROUPED_MATMULS)}, got "
             f"{implementation!r}")
-    chosen = measured_kernel('grouped_matmul', 'xla') if implementation == 'auto' else implementation
+    chosen = measured_kernel(choice, 'xla') if implementation == 'auto' else implementation
     if chosen != 'pallas':
         return chosen
     placed = triton_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
     refusal = ragged_dot_refusal(compute, operands, precision) or (
         None if placed else "the Pallas kernels need a GPU of sm80 or later")
-    return 'pallas' if refusal is None else ran_kernel('grouped_matmul', 'xla', refusal)
+    return 'pallas' if refusal is None else ran_kernel(choice, 'xla', refusal)
 
 
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,
@@ -408,7 +414,20 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
     return values.at[expert_ids].get(mode='fill', fill_value=0).astype(dtype)
 
 
-def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
+def mxfp4_axes(axes: LogicalAxes) -> LogicalAxes:
+    """The axes of an MXFP4 matrix's parts, `[exp, out, in / 2]` and `[exp,
+    out, in / 32]`, from the matrix's `[exp, in, out]`. The packed input axis
+    stays whole, so no split can cut a group from its exponent."""
+    experts, _inputs, outputs = axes
+    return experts, outputs, None
+
+
+def _promotable(kernel: jax.Array | MXFP4Experts) -> jax.Array:
+    """`kernel` as flax's dtype promotion reads it: MXFP4 experts as a scalar of their dtype."""
+    return jnp.zeros((), kernel.dtype) if isinstance(kernel, MXFP4Experts) else kernel
+
+
+def expert_projection(x: jax.Array, kernel: jax.Array | MXFP4Experts, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
                       precision: PrecisionLike) -> jax.Array:
     """`grouped_matmul` under one precision contract for both dispatches.
@@ -425,11 +444,24 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     (`dew.nn.kernels.grouped_matmul`), and a trace the kernels cannot take
     (`_local`) runs 'xla'. tests/test_moe_precision.py measures it against
     float64 sums and three Adam steps on every expert/fsdp layout.
+
+    `MXFP4Experts` compute what their decoded matrices would, bit for bit.
+    'pallas' decodes each tile inside the grouped matmul, so only the
+    routed experts' bytes are read (`KERNELS['mxfp4_grouped_matmul']`); any
+    other kernel takes every expert decoded first. They take no gradient,
+    and an input's passes through them.
     """
-    compute = canonicalize_dtype(x, kernel, dtype=dtype)
-    chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
-    if chosen == 'pallas' and _local(x) and _local(kernel):
+    choice, stored = (('mxfp4_grouped_matmul', kernel.codes) if isinstance(kernel, MXFP4Experts)
+                      else ('grouped_matmul', kernel))
+    compute = canonicalize_dtype(x, _promotable(kernel), dtype=dtype)
+    chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision, choice)
+    if chosen == 'pallas' and _local(x) and _local(stored):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
+    if isinstance(kernel, MXFP4Experts):
+        if chosen == 'pallas':
+            ran_kernel('mxfp4_grouped_matmul', 'xla', "a mesh axis outside the dispatch's row map "
+                       "splits the tokens or the experts")
+        return expert_projection(x, kernel.decoded(compute), group_sizes, dtype, implementation, precision)
     return _projection(x, kernel, group_sizes, dtype,
                        'xla' if chosen == 'pallas' else chosen, precision)
 
@@ -566,24 +598,48 @@ def gated_product(activation: GatedActivation) -> Callable[[jax.Array, jax.Array
     return product
 
 
+def expert_kernel(module: nn.Module, name: str, initializer: Callable[..., jax.Array],
+                  shape: tuple[int, int, int], storage: str) -> jax.Array | MXFP4Experts:
+    """The stacked expert matrices `[exp, in, out]` a module reads as its
+    parameter `name`, held as `storage` names (`EXPERT_STORAGES`).
+
+    'float' is an fp32 master `initializer` draws. 'mxfp4' is a checkpoint's
+    own bytes, `{codes, exponents}` (`MXFP4_PARTS`), read as `MXFP4Experts`;
+    they initialize to zero codes for a load to replace, and they serve:
+    nothing trains them.
+    """
+    if storage not in EXPERT_STORAGES:
+        raise ValueError(f"expert storage must be one of {EXPERT_STORAGES}, got {storage!r}")
+    if storage == 'float':
+        return module.param(name, initializer, shape, jnp.float32)
+    experts, inputs, outputs = shape
+    if inputs % GROUP:
+        raise ValueError(f"MXFP4 groups {GROUP} inputs under one exponent; {name} takes {inputs}")
+    parts = module.param(name, lambda _: dict(zip(MXFP4_PARTS, (
+        jnp.zeros((experts, outputs, inputs // 2), jnp.uint8),
+        jnp.zeros((experts, outputs, inputs // GROUP), jnp.uint8)), strict=True)))
+    return MXFP4Experts(*(parts[part] for part in MXFP4_PARTS))
+
+
 class ExpertLinear(nn.Module):
-    """One matrix per expert, `[exp, in_features, features]`; `ExpertMLP`
-    reads the kernel and projects tokens sorted by expert through
-    `expert_projection`."""
+    """One matrix per expert, `[exp, in_features, features]`, held as
+    `storage` names (`expert_kernel`); `ExpertMLP` reads the kernel and
+    projects tokens sorted by expert through `expert_projection`."""
     num_experts: int
     in_features: int
     features: int
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
+    storage: str = 'float'
 
     def setup(self):
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching nn.Dense of a dense MLP.
-        self.kernel = self.param(
-            'kernel',
+        self.kernel = expert_kernel(
+            self, 'kernel',
             normal_kernel(self.init_std, nn.initializers.variance_scaling(
                 1.0, 'fan_in', 'truncated_normal', in_axis=-2, out_axis=-1,
                 batch_axis=(0,)))['kernel_init'],
-            (self.num_experts, self.in_features, self.features), jnp.float32)
+            (self.num_experts, self.in_features, self.features), self.storage)
 
 
 def capacity_positions(indices: jax.Array, num_experts: int,
@@ -686,14 +742,14 @@ def _stored_primal(run, x, indices, parameters, input_weights):
     return run(x, indices, parameters, input_weights)
 
 
-def expert_compute_dtype(x: jax.Array, *parameters: jax.Array, dtype: Dtype | None) -> Dtype:
+def expert_compute_dtype(x: jax.Array, *parameters: jax.Array | MXFP4Experts, dtype: Dtype | None) -> Dtype:
     """The dtype an expert layer computes in: `dtype` when the model names
     one, else flax's promotion of the stream and the parameters, except that
     16-bit parameters are never widened. A wider stream then rounds to them
     and every product accumulates in fp32, as a bf16 checkpoint's reference
     runs it; promoted, each layer's experts were copied to fp32, 14.35 GiB
     of live temporaries serving gpt-oss-20b over four RTX 3090s."""
-    compute = canonicalize_dtype(x, *parameters, dtype=dtype)
+    compute = canonicalize_dtype(x, *map(_promotable, parameters), dtype=dtype)
     stored = {parameter.dtype for parameter in parameters}
     if dtype is None and len(stored) == 1:
         (kind,) = stored
@@ -773,8 +829,14 @@ def _dispatched[Parameters](
     # binary reducer, and JAX wraps this one's add in a sharding constraint).
     if mesh.shape.get(STAGE_AXIS, 1) > 1 and STAGE_AXIS not in mesh.manual_axes:
         manual.add(STAGE_AXIS)
+    # MXFP4 experts' parts are leaves of their own, in the order the tree flattens them.
+    leaves: list[tuple[jax.Array, LogicalAxes]] = []
+    whole = jax.tree.leaves(parameters, is_leaf=lambda leaf: isinstance(leaf, MXFP4Experts))
+    for parameter, axes in zip(whole, parameter_axes, strict=True):
+        leaves += ([(part, mxfp4_axes(axes)) for part in parameter] if isinstance(parameter, MXFP4Experts)
+                   else [(parameter, axes)])
     stored = []
-    for leaf, axes in zip(jax.tree.leaves(parameters), parameter_axes, strict=True):
+    for leaf, axes in leaves:
         kept = [tuple(axis for axis in mesh_axes(entry) if axis in manual)
                 for entry in logical_spec(axes, leaf.shape)]
         stored.append(P(*(entry if entry else None for entry in kept)))
@@ -948,7 +1010,7 @@ class ExpertMLP(nn.Module):
     projection on both sides. `scale_inputs` is Llama 4's placement of the
     routing weight on each expert's input with outputs summed unweighted
     (`Llama4TextMoe.forward`), not the same as weighting outputs, since the gate
-    is not linear.
+    is not linear. `storage` holds the matrices (`expert_kernel`).
     """
     num_experts: int
     hidden_features: int
@@ -961,6 +1023,7 @@ class ExpertMLP(nn.Module):
     scale_inputs: bool = False
     init_std: float | None = None  # gate/up normal std; None: per-expert lecun normal
     output_init_std: float | None = None  # down normal std; None follows init_std
+    storage: str = 'float'
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -969,7 +1032,7 @@ class ExpertMLP(nn.Module):
             raise ValueError(
                 f"swiglu_limit caps the gate and up projections, so it is "
                 f"positive, got {self.swiglu_limit}; None leaves them unclamped")
-        expert = functools.partial(ExpertLinear, num_experts=self.num_experts)
+        expert = functools.partial(ExpertLinear, num_experts=self.num_experts, storage=self.storage)
         if self.activation == 'relu2':
             if self.swiglu_limit is not None:
                 raise ValueError('swiglu_limit requires gated experts')
@@ -986,8 +1049,8 @@ class ExpertMLP(nn.Module):
                                           else self.output_init_std))
 
     def _project(self, tokens: jax.Array, sizes: jax.Array, _expert_ids: jax.Array,
-                 kernels: tuple[jax.Array, ...], *, dtype: Dtype) -> jax.Array:
-        def linear(x: jax.Array, kernel: jax.Array) -> jax.Array:
+                 kernels: tuple[jax.Array | MXFP4Experts, ...], *, dtype: Dtype) -> jax.Array:
+        def linear(x: jax.Array, kernel: jax.Array | MXFP4Experts) -> jax.Array:
             return jnp.asarray(expert_projection(
                 x, kernel, sizes, dtype, self.implementation, self.precision))
 
@@ -1034,6 +1097,8 @@ class ExpertMLP(nn.Module):
     # dimension is named here and the longer path wins over the dense
     # projection of the same name.
     **{("experts", name): axes for name, axes in EXPERT_AXES.items()},
+    **{("experts", name, "kernel", part): mxfp4_axes(axes)
+       for name, axes in EXPERT_AXES.items() for part in MXFP4_PARTS},
     # The shared branch is one dense gated MLP beside the experts, sharded
     # like the dense layers' own.
     ("shared_experts", "gate_proj"): ("embed", "mlp"),
@@ -1060,6 +1125,9 @@ class SparseMLP(nn.Module):
     latent width the experts run at, and their weighted sum goes through
     `latent_norm` and `routed_expert_up_proj` back to `out_features`. The shared
     branch reads the full width.
+
+    `expert_storage` holds the routed experts' matrices (`expert_kernel`):
+    'mxfp4' keeps an MXFP4 checkpoint's bytes and decodes them on the device.
     """
     num_experts: int
     top_k: int
@@ -1069,6 +1137,7 @@ class SparseMLP(nn.Module):
     implementation: str = 'auto'
     dispatch: str = 'global'
     capacity_factor: float | None = None
+    expert_storage: str = 'float'
     score_function: str = 'softmax'
     normalize_weights: bool = True
     routed_scaling_factor: float = 1.0
@@ -1114,6 +1183,7 @@ class SparseMLP(nn.Module):
             swiglu_limit=self.swiglu_limit,
             scale_inputs=self.scale_inputs,
             init_std=self.init_std, output_init_std=self.output_init_std,
+            storage=self.expert_storage,
             dtype=self.dtype, precision=self.precision, name='experts')
         if self.latent_features is not None:
             dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)

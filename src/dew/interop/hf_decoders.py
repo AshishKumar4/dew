@@ -37,6 +37,7 @@ import numpy as np
 
 from dew import records
 from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew.interop.codecs import MXFP4_PARTS, StoredMXFP4
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
@@ -496,13 +497,31 @@ def translate_wrapper_weights(
     return variables
 
 
+def _stacked(leaves: list[SourceLeaf | LazyTree], name: str) -> SourceLeaf | LazyTree:
+    """One expert projection's kernels stacked: leaves, or MXFP4 parts each stacked."""
+    if all(isinstance(leaf, SourceLeaf) for leaf in leaves):
+        return SourceLeaf.stack([leaf for leaf in leaves if isinstance(leaf, SourceLeaf)], name)
+    parts = [leaf for leaf in leaves if isinstance(leaf, dict) and set(leaf) == set(MXFP4_PARTS)]
+    if len(parts) != len(leaves):
+        raise ValueError(f"{name} mix MXFP4 and float kernels")
+    stacked: LazyTree = {}
+    for part in MXFP4_PARTS:
+        members = [leaf[part] for leaf in parts]
+        if not all(isinstance(member, SourceLeaf) for member in members):
+            raise ValueError(f"{name} hold no {part}")
+        stacked[part] = SourceLeaf.stack([member for member in members if isinstance(member, SourceLeaf)],
+                                         f"{name} {part}")
+    return stacked
+
+
 def _stack_experts(params: LazyTree) -> None:
     """Stack per-expert `experts/K/projection` dicts into `[E, ...]` leaves.
 
     A checkpoint names one tensor per expert while the tree keeps one leaf
     per projection stacked on an expert dimension, so after the flat map
-    each sparse layer's digit-keyed dicts stack in expert order. A layer
-    whose experts do not form a dense `0..E-1` run refuses.
+    each sparse layer's digit-keyed dicts stack in expert order; a kernel
+    kept in MXFP4 stacks each of its parts. A layer whose experts do not
+    form a dense `0..E-1` run refuses.
     """
     blocks = [(layer, block) for layer, block in params.items()
               if isinstance(block, dict) and layer.startswith('layers_')]
@@ -529,15 +548,15 @@ def _stack_experts(params: LazyTree) -> None:
         if not isinstance(first, dict):
             raise ValueError(f"{layer} expert {indices[0]} is a tensor, not projections")
         for projection in first:
-            leaves = []
+            leaves: list[SourceLeaf | LazyTree] = []
             for index in indices:
                 expert = experts[index]
                 node = expert.get(projection) if isinstance(expert, dict) else None
                 leaf = node.get('kernel') if isinstance(node, dict) else None
-                if not isinstance(leaf, SourceLeaf):
+                if not isinstance(leaf, SourceLeaf | dict):
                     raise ValueError(f"{layer} expert {index} has no {projection} kernel")
                 leaves.append(leaf)
-            stacked[projection] = {'kernel': SourceLeaf.stack(leaves, f"{layer} experts' {projection}")}
+            stacked[projection] = {'kernel': _stacked(leaves, f"{layer} experts' {projection}")}
         mlp['experts'] = stacked
 
 
@@ -548,6 +567,7 @@ def translate_weights(
     *,
     param_dtype: str = "float32",
     lazy: bool = False,
+    stored: Mapping[str, StoredMXFP4] = MappingProxyType({}),
 ) -> Variables:
     """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by default.
 
@@ -567,6 +587,12 @@ def translate_weights(
     With `lazy`, every leaf is a `SourceLeaf` over the stored tensors that is read
     only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
     whole here.
+
+    `stored` holds MXFP4 weights kept as their checkpoint's bytes, by the name
+    they decode to (`SourceQuantization.stored`): each lands at its leaf's
+    path as its two uint8 parts (`MXFP4_PARTS`), for a model whose routed
+    experts are held so (`Mixture.expert_storage`). The family's `prepare`
+    does not see them.
 
     `model_type` names the source's own family when the caller read it from a
     config.json. Without it, the family comes from the record, which describes
@@ -601,6 +627,12 @@ def translate_weights(
             SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
             name,
         )
+    for name, weight in stored.items():
+        path = family.weight_path(name, config)
+        if path is None:
+            raise ValueError(f"{name} is kept in MXFP4 and maps to no parameter")
+        for part in MXFP4_PARTS:
+            insert(variables, (*path, part), SourceLeaf((getattr(weight, part),), np.dtype(np.uint8)), name)
     _stack_experts(params)
     return variables if lazy else materialize(variables)
 
