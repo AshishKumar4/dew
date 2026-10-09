@@ -414,6 +414,27 @@ def placed_experts(mesh, activation, skewed, scale_inputs, limit, implementation
     return model, parameters, specs, tokens, x, weights, choices
 
 
+def test_a_bf16_combine_weighs_its_experts_in_fp32_and_rounds_once():
+    """Two experts answer 1 and -1, weighted 1/2 + 2^-11 and 1/2 - 2^-11. In
+    fp32 the weighted sum is 2^-10, which bf16 holds; bf16 weights are both
+    1/2 and cancel to 0. The layer's bf16 output is the float64 dot of its
+    slots and weights, rounded once to bf16."""
+    layer = ExpertMLP(num_experts=2, hidden_features=1, out_features=1, activation="relu2",
+                      implementation="xla", dtype=jnp.bfloat16, precision="highest")
+    x = jnp.ones((1, 1), jnp.float32)
+    weights = jnp.asarray([[0.5 + 2 ** -11, 0.5 - 2 ** -11]], jnp.float32)
+    indices = jnp.asarray([[0, 1]], jnp.int32)
+    params = {"up_proj": {"kernel": jnp.ones((2, 1, 1), jnp.float32)},
+              "down_proj": {"kernel": jnp.asarray([[[1.0]], [[-1.0]]], jnp.float32)}}
+    initialized = layer.init(jax.random.key(0), x, weights, indices)["params"]
+    assert jax.tree.map(jnp.shape, initialized) == jax.tree.map(jnp.shape, params)
+    expected = np.asarray(np.dot([1.0, -1.0], np.asarray(weights[0], np.float64)), ml_dtypes.bfloat16)
+    for apply in (layer.apply, jax.jit(layer.apply)):
+        combined = apply({"params": params}, x, weights, indices)
+        assert combined.dtype == jnp.bfloat16
+        assert float(combined[0, 0]) == float(expected) == 2.0 ** -10
+
+
 @pytest.mark.parametrize('activation', ['swiglu', 'geglu', 'geglu_exact'])
 @pytest.mark.parametrize('skewed,scale_inputs,limit', [(False, False, None), (True, True, .7)])
 @pytest.mark.parametrize('expert,fsdp', (*MESH_LAYOUTS, DATA_LAYOUT))

@@ -47,6 +47,7 @@ from dew.objectives.base import (
     Step,
     Variables,
     thaw,
+    training_rngs,
 )
 from dew.objectives.lm.chunked import head_cross_entropy, logits_cross_entropy, reads_states
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
@@ -209,7 +210,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         masked = jnp.where(is_masked, masked, tokens)
 
         over_states = reads_states(self.model)
-        read = self.model.apply(params, masked, train=train, rngs={"dropout": dropout_key},
+        read = self.model.apply(params, masked, train=train, rngs=training_rngs(dropout_key),
                                 method="hidden_states" if over_states else "logits", mutable=False,
                                 capture_intermediates=False, **prepared.kwargs())
         # MDLM's SUBS parameterization gives the mask token no mass: it is

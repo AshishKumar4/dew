@@ -28,7 +28,7 @@ import optax
 from flax import linen as nn
 
 from dew.inputs import InputSpec
-from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables
+from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables, training_rngs
 
 type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
 """What a model returns: an array, or a tree of them."""
@@ -79,7 +79,7 @@ class Supervised(Objective[Ratio]):
         # BatchNorm's running statistics, update as it runs, and the trainer
         # keeps the updates (`Aux.variables`).
         held = [name for name in variables if name not in ("params", FROZEN)]
-        outputs, updates = self.model.apply(variables, batch[self.sample.key], rngs={"dropout": step.key},
+        outputs, updates = self.model.apply(variables, batch[self.sample.key], rngs=training_rngs(step.key),
                                             mutable=held)
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+import ipaddress
 import os
 import re
 import shlex
@@ -271,9 +272,17 @@ class Launch:
         return 0
 
     def coordinator_address(self, hosts: Sequence[str]) -> str:
+        """Where every process reaches process 0: this machine's name when it
+        is one of several hosts and named as itself. A name that is loopback
+        in itself is refused, since every other host would reach itself at
+        it."""
         host = self.coordinator or hosts[0]
         if host in LOCAL_HOSTS and any(name not in LOCAL_HOSTS for name in hosts):
             host = socket.getfqdn()
+            if names_loopback(host):
+                raise ValueError(
+                    f"this machine's name, {host}, is a loopback one, where the other hosts would reach "
+                    f"themselves; pass --coordinator with an address they reach this machine at")
         return f"{host}:{self.port if self.port is not None else free_port(hosts[0])}"
 
     def layout(self, first_host: str) -> tuple[int, int | None]:
@@ -410,6 +419,20 @@ def gpu_count(host: str, visible: str | None) -> int | None:
     if host in LOCAL_HOSTS:
         return local_gpu_count()
     return listed_gpus(("ssh", "-o", "BatchMode=yes", host, "nvidia-smi -L"))
+
+
+def names_loopback(host: str) -> bool:
+    """Whether `host` is a loopback address by what it says: a local name, a
+    name under `localhost.`, or a loopback IP. Each other host resolves a
+    name itself, so what this one resolves it to says nothing of theirs
+    (Debian gives a machine's own name 127.0.1.1 here, where the cluster's
+    DNS gives the other hosts its address)."""
+    if host in LOCAL_HOSTS or host.startswith("localhost."):
+        return True
+    try:
+        return ipaddress.ip_address(host.split("%")[0]).is_loopback
+    except ValueError:
+        return False
 
 
 def free_port(host: str) -> int:

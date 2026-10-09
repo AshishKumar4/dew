@@ -122,8 +122,9 @@ class Quantization:
     bwd_stochastic_rounding: Rounding | None = None
     """The stochastic rounding mode for the quantized gradients; unset rounds deterministically.
 
-    A run that sets it passes a `stochastic_rounding` RNG stream at apply
-    time, and Qwix draws from that stream."""
+    Qwix draws from the `stochastic_rounding` RNG stream, which Dew's
+    objectives fold off each step's key (`dew.objectives.base.training_rngs`);
+    a custom objective passes it the same way."""
 
     def __post_init__(self) -> None:
         if self.dtype not in ("int8", "fp8"):

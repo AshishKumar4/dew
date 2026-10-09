@@ -122,6 +122,21 @@ class Step:
     or None when the objective keeps no EMA."""
 
 
+ROUNDING_STREAM = 0x726F756E
+"""What `training_rngs` folds its key with for the stochastic rounding stream."""
+
+
+def training_rngs(key: jax.Array) -> dict[str, jax.Array]:
+    """The RNG streams a model draws from `key` in a training pass: `dropout`,
+    and `stochastic_rounding`, which a `dew.training.Quantization` with
+    `bwd_stochastic_rounding` rounds its gradients from.
+
+    The rounding stream is a fold of `key`, so its draws are not dropout's.
+    A step's key is the same on every process of a pool, and so is every
+    rounding draw. An objective passes it as a model apply's `rngs`."""
+    return {"dropout": key, "stochastic_rounding": jax.random.fold_in(key, ROUNDING_STREAM)}
+
+
 @struct.dataclass
 class Aux(Generic[Effects]):
     """Everything a loss returns besides its statistics.
@@ -1035,5 +1050,6 @@ __all__ = [
     "part",
     "select",
     "thaw",
+    "training_rngs",
     "under",
 ]

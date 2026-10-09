@@ -276,7 +276,9 @@ def main() -> None:
                 print(f"{name} {key}: the reference sits {np.max(np.abs(reference - exact)):.3e} (max) and "
                       f"{np.sqrt(np.mean(np.square(reference - exact))):.3e} (rms) from float64")
             print(f"{name} loss: float64 {arrays['loss_f64']:.9f}, the reference {float(stored['loss']):.9f}")
-        np.savez(directory / "numerics.npz", **arrays)
+        # float64 throughout: no matmul of it takes a reduced precision.
+        np.savez(directory / "numerics.npz", **arrays,
+                 precision="ieee" if jax.config.jax_enable_x64 else "float32")
 
 
 def symmetric(fixture: Path, drawn: Path) -> None:

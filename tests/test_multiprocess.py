@@ -979,7 +979,8 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     A shared padded shape and fixed decode trip count keep collectives in
     the same order despite different validity masks. Both ranks reach the
     rendezvous after sampling and after a peer rejects invalid input or a
-    decoding component only it can describe.
+    decoding component only it can describe, and over weights on no mesh
+    each rank's input is its own.
     The sampled rows, lengths and likelihoods match a single process over
     the same prompts, and the update that follows moves the same parameters.
     """
@@ -992,6 +993,10 @@ def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
         assert "prompt_length" in report["invalid_errors"]["length"]
         assert "single JAX PRNG key" in report["invalid_errors"]["key"]
         assert "memory address" in report["invalid_errors"]["component"]
+    # Over weights on no mesh, rank 1's zero prompt length is its own refusal
+    # and rank 0 samples its rows without hearing of it.
+    assert reports[0]["meshless"] == {"rows": 2 * len(reports[0]["prompt_lengths"])}
+    assert "prompt_length" in reports[1]["meshless"]["refused"]
     assert all(report["sampled_seconds"] < 300 for report in reports)
     for report in reports:
         assert report["process_count"] == 2
@@ -1294,9 +1299,14 @@ def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_pat
     reports = run_pool("decoding_components", tmp_path, 2, devices=2, fsdp_size=2, timeout=240)
     single = run_worker("decoding_components", tmp_path / "single.json", fsdp_size=1, devices=1)
 
-    for report in reports:
+    for rank, report in enumerate(reports):
         assert report["rows"] == 3
         assert report["refused"] == ["criterion payload", "transform identity", "transform payload"]
+        # A chain both ranks agreed on, undefined on rank 1's rows alone,
+        # is refused on both; weights on no mesh answer each rank's own
+        # request of its own size as one process answers it.
+        assert "without a distribution" in report["undefined"], report["undefined"]
+        assert report["independent"] == {str(rank): single["independent"][str(rank)]}
     assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
     assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
     np.testing.assert_allclose(reports[0]["behavior"] + reports[1]["behavior"],
@@ -1343,6 +1353,29 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
     assert "NotADirectoryError" in reports[0]["failed"]
     assert "profiling window start" in reports[1]["failed"]
     assert all(report["recovered"] == 2 for report in reports)
+
+@pytest.mark.distributed
+def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):
+    """Each process opens its own stream over its own copy of the corpus, reads
+    its first batch on its own prefetch thread and lists the checkpoints itself.
+    Where one process's corpus holds other records under the same name and
+    length, or another count of them, where its first read fails, where its
+    batch lacks a field, or where its listing has not yet seen the newest
+    checkpoint a resume reads, every process refuses with the cause, rather
+    than one raising alone while its peers enter a step or a restore it
+    never joins."""
+    reports = run_pool("pool_refusals", tmp_path / "pool", 2, devices=4, timeout=300,
+                       run_dir=str(tmp_path / "runs"))
+    for rank, report in enumerate(reports):
+        assert report["same"] is None and report["saved"] is None and report["latest"] == 2, report
+        assert "training data differs between the processes" in report["content"], report
+        assert "64 records" in report["count"] and "96 records" in report["count"], report
+        assert "holds no rows" in report["first_read"], report
+        assert "training batch layout differs" in report["layout"], report
+        assert "newest checkpoint differs" in report["stale"], report
+        if rank == 0:
+            assert "first training read" in report["first_read"], report
+
 
 @pytest.mark.distributed
 def test_a_step_fits_only_where_it_fits_every_process(tmp_path):

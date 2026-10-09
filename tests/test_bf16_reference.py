@@ -45,6 +45,7 @@ from reference_error import (
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
+    ieee_fixture,
 )
 from safetensors.numpy import load_file
 
@@ -140,6 +141,21 @@ def test_logits_coarser_than_the_reference_fail_the_rule():
     coarse = jax.lax.reduce_precision(logits, exponent_bits=5, mantissa_bits=2)
     with np.load(directory / "numerics.npz") as exact, pytest.raises(AssertionError, match="ratio"):
         assert_as_exact_as_the_reference(coarse, exact["bf16"], exact["f64"], "coarse")
+
+
+@pytest.mark.parametrize("recorded", [None, "tf32", "TRITON_F32_DEFAULT tf32x3", "ieee"])
+def test_a_reference_without_a_record_of_ieee_matmuls_is_refused(tmp_path, recorded):
+    """The same float32 arrays, regenerated with TF32 matmuls, sit farther
+    from float64 and so widen the budget the rule above takes from them.
+    Only the generator's record tells the two apart, so a file that does not
+    record 'ieee' is refused before any distance is taken."""
+    path = tmp_path / "reference.npz"
+    np.savez(path, logits=np.ones(3, np.float32), **({} if recorded is None else {"precision": recorded}))
+    if recorded == "ieee":
+        assert set(ieee_fixture(path)) == {"logits"}
+    else:
+        with pytest.raises(ValueError, match="not 'ieee'"):
+            ieee_fixture(path)
 
 
 def test_the_k_order_rule_holds_an_equally_exact_port_and_fails_a_coarser_one():

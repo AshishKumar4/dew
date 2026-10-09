@@ -52,6 +52,26 @@ import numpy as np
 
 FACTOR = 2.0
 
+PRECISION = "precision"
+"""The entry of a reference's array file that records the precision its generator's matmuls took."""
+
+
+def ieee_fixture(path) -> dict[str, np.ndarray]:
+    """The arrays of a reference's array file, refused unless its generator
+    recorded IEEE matmuls under `PRECISION`.
+
+    The rule above takes the reference's error as its budget. A reference
+    regenerated with TF32 matmuls, ten mantissa bits, sits farther from
+    float64 and so widens the budget to fit a coarser Dew, and the float32
+    arrays it stores look the same; only the generator's record tells."""
+    with np.load(path) as stored:
+        arrays = {name: stored[name] for name in stored.files}
+    recorded = str(arrays.pop(PRECISION)) if PRECISION in arrays else "no precision"
+    if recorded != "ieee":
+        raise ValueError(f"{path} records {recorded!r} for its matmuls, not 'ieee'; regenerate it "
+                         f"with IEEE matmuls")
+    return arrays
+
 
 def widened(tree):
     """`tree` as float64 host arrays, its integer leaves as they are: the

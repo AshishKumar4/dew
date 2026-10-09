@@ -1,0 +1,31 @@
+{
+  "activation_function": "gelu_pytorch_tanh",
+  "add_cross_attention": false,
+  "architectures": [
+    "GPTBigCodeForCausalLM"
+  ],
+  "attention_softmax_in_fp32": true,
+  "attn_pdrop": 0.0,
+  "bos_token_id": 1,
+  "dtype": "float32",
+  "embd_pdrop": 0.0,
+  "eos_token_id": null,
+  "initializer_range": 0.02,
+  "layer_norm_epsilon": 3e-05,
+  "model_type": "gpt_bigcode",
+  "multi_query": true,
+  "n_embd": 24,
+  "n_head": 3,
+  "n_inner": 48,
+  "n_layer": 2,
+  "n_positions": 48,
+  "num_key_value_heads": 1,
+  "pad_token_id": 0,
+  "resid_pdrop": 0.0,
+  "scale_attention_softmax_in_fp32": true,
+  "scale_attn_weights": true,
+  "tie_word_embeddings": true,
+  "transformers_version": "5.16.1",
+  "use_cache": true,
+  "vocab_size": 64
+}

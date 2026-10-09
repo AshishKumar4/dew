@@ -170,6 +170,23 @@ def test_gpu_hosts_are_the_granules_however_many_processes_each_runs():
         hybrid_devices(MeshSpec(fsdp=2, replicas=4), (4, 1, 2, 1, 1, 1), hosts)
 
 
+@pytest.mark.parametrize("slices", [True, False], ids=["slices", "processes"])
+@pytest.mark.mesh(devices=0)
+def test_granules_of_unequal_sizes_are_refused(slices):
+    """Eight devices whose two granules, slices or the processes of one slice,
+    hold two and six: every granule is built to the same inner mesh, so the
+    one short of its four is refused rather than routed as if it held them,
+    where four and four make two fsdp groups of a granule each."""
+    def devices(first: int) -> list[StandIn]:
+        return [StandIn(index, int(index >= first), int(index >= first) if slices else 0)
+                for index in range(8)]
+
+    with pytest.raises(ValueError, match="Number of devices 2 must equal"):
+        hybrid_devices(MeshSpec(fsdp=4, replicas=2), (2, 1, 4, 1, 1, 1), devices(2))
+    array = hybrid_devices(MeshSpec(fsdp=4, replicas=2), (2, 1, 4, 1, 1, 1), devices(4))
+    assert groups(array, "process_index", 2) == [[0], [1]]
+
+
 @pytest.mark.mesh(devices=0)
 def test_replicas_the_granules_cannot_hold_are_refused():
     with pytest.raises(ValueError, match="replicas 3 must divide both the 4 granules"):
@@ -424,7 +441,8 @@ def test_one_slurm_task_joins_no_pool():
     container on the node need not resolve that name (the box's did not):
     the process waited 300 s to register and aborted. One task is no pool,
     so the process starts on its own."""
-    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu"}
+    env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
+           "JAX_PLATFORMS": "cpu"}
     program = ("from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
                "import jax\n"
@@ -441,7 +459,7 @@ def test_a_slurm_step_that_leaves_gpus_idle_is_refused_before_it_joins():
     launch. jax gives each Slurm task the one GPU at its SLURM_LOCALID, so
     the run would train on one GPU of four and nothing would say so; the
     process refuses before it joins, naming the task count."""
-    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
+    env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
            "SLURM_NTASKS": "2", "SLURM_STEP_TASKS_PER_NODE": "1(x2)", "SLURM_NODEID": "0",
            "CUDA_VISIBLE_DEVICES": "0,1,2,3"}
     env.pop("JAX_PLATFORMS", None)
@@ -462,7 +480,8 @@ def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu",
+    env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src"),
+           "JAX_PLATFORMS": "cpu",
            "OMPI_MCA_orte_hnp_uri": "1531576320.0;tcp://127.0.0.1:34911",
            "OMPI_COMM_WORLD_SIZE": "1", "OMPI_COMM_WORLD_RANK": "0",
            "OMPI_COMM_WORLD_LOCAL_RANK": "0", "JAX_COORDINATOR_PORT": str(port)}
@@ -474,6 +493,25 @@ def test_an_mpirun_inside_one_slurm_task_forms_its_pool():
                           capture_output=True, text=True, timeout=120)
     assert done.returncode == 0, done.stdout + done.stderr
     assert "pool True" in done.stdout, done.stdout
+
+
+@pytest.mark.mesh(devices=0)
+def test_a_declared_pool_without_a_coordinator_is_refused():
+    """DEW_PROCESS_COUNT declares a pool of two and nothing names its
+    coordinator, as when a launcher's environment reached a rank in part.
+    The rank refuses rather than train alone as if it were the pool; with
+    no pool declared, the same process runs alone."""
+    program = ("from dew.training.runtime import prepare_process\n"
+               "prepare_process()\n"
+               "import jax\n"
+               "print('processes', jax.process_count())\n")
+    env = {**outside_any_cluster(os.environ), "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu"}
+    declared = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, capture_output=True, text=True,
+                              env={**env, "DEW_PROCESS_COUNT": "2", "DEW_PROCESS_ID": "1"}, timeout=120)
+    alone = subprocess.run([sys.executable, "-c", program], cwd=REPO_ROOT, capture_output=True, text=True,
+                           env=env, timeout=120)
+    assert declared.returncode != 0 and "coordinator_address" in declared.stderr, declared.stdout
+    assert alone.returncode == 0 and "processes 1" in alone.stdout, alone.stdout + alone.stderr
 
 
 @pytest.mark.mesh(devices=2)
@@ -488,7 +526,7 @@ def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
 
     if jax.default_backend() != "gpu":
         pytest.skip("a cluster pins device ids on GPU; the CPU backend takes none")
-    env = {**os.environ, **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src")}
+    env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src")}
     program = ("from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
                "import jax\n"
