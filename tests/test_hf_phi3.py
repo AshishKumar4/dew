@@ -1,5 +1,6 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
 
+import functools
 import json
 from pathlib import Path
 
@@ -47,8 +48,8 @@ def test_phi3_cached_greedy_crosses_the_longrope_boundary():
 
 @pytest.mark.parametrize(('budget', 'rebuilds'), [(3, 0), (6, 1)])
 def test_greedy_decoding_forwards_the_prompt_once_and_one_token_a_step(monkeypatch, budget, rebuilds):
-    """Run eagerly, every backbone forward of a greedy decode from a prompt
-    of 4: the prompt once, then one token for each of the budget's steps,
+    """Every backbone forward a greedy decode from a prompt of 4 runs: the
+    prompt once, then one token for each of the budget's steps,
     and the whole 48-slot history again only at the step a row crosses
     LongRoPE's original 8 positions (6 new tokens cross it once, 3 never).
     The answers alone cannot tell a decode that recomputes its prefix every
@@ -62,15 +63,16 @@ def test_greedy_decoding_forwards_the_prompt_once_and_one_token_a_step(monkeypat
     forward = CausalTransformer.hidden_and_mtp_inputs
 
     def counted(self, tokens, *args, **kwargs):
-        # A forward run on values; tracing one for its shapes computes nothing.
-        if not isinstance(tokens, jax.core.Tracer):
-            widths.append(tokens.shape[1])
+        # Recorded as the forward runs: in the decode loop once a step, in a
+        # branch only when it is taken, and never for a trace of its shapes.
+        jax.debug.callback(functools.partial(widths.append, tokens.shape[1]))
         return forward(self, tokens, *args, **kwargs)
 
     monkeypatch.setattr(CausalTransformer, 'hidden_and_mtp_inputs', counted)
     with jax.disable_jit():
         generate(loaded.model, loaded.variables, ids, budget, key=jax.random.key(0),
                  sampling=Sampling(temperature=0))
+    jax.effects_barrier()
     said = " ".join(map(str, widths))
     assert widths[0] == 4 and sorted(widths[1:]) == [1] * budget + [48] * rebuilds, said
 
