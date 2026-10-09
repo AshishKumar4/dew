@@ -815,8 +815,10 @@ def test_a_convolution_whose_kernel_splits_its_input_channels_computes_one_devic
                                  terms * np.finfo(np.float32).eps * np.asarray(magnitude))
 
 
-@pytest.mark.parametrize("host", [(), ("variables",)], ids=["resident", "host"])
-def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused(host):
+@pytest.mark.parametrize("layout", [Layout(min_shard=TINY_SHARD),
+                                    Layout(host=("variables",), min_shard=1, tolerance=1.)],
+                         ids=["resident", "host"])
+def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused(layout):
     """A DiT has no layer stack to pipeline: on a stage axis of two every
     stage computed the whole step, twice the work for the same result, and
     the run said nothing. The step refuses it when it traces, whether the
@@ -829,7 +831,7 @@ def test_a_stage_axis_under_a_model_with_no_pipeline_is_refused(host):
         SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=4, mlp_ratio=2),
         presets.Flow(), InputSpec(Field("image", (8, 8, 3))), guidance=None, steps=2)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.key(0),
-                      mesh=MeshSpec(fsdp=2, stage=2), layout=Layout(host=host, min_shard=TINY_SHARD),
+                      mesh=MeshSpec(fsdp=2, stage=2), layout=layout,
                       checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     batch = shard_batch(trainer.device_mesh, {"image": np.zeros((BATCH, 8, 8, 3), np.float32)})

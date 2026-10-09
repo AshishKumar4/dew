@@ -1901,7 +1901,7 @@ def mode_decoding_components(args) -> dict:
         if not np.array_equal(getattr(result, name), getattr(equivalent, name)):
             raise AssertionError(f"unused sampling filters changed {name}")
 
-    independent = {str(asking): _meshless_request(model, params, prompts, mask, asking)
+    independent = {str(asking): _meshless_request(model, prompts, mask, asking)
                    for asking in ((0, 1) if processes == 1 else (rank,))}
     refused, undefined = [], None
     if processes > 1:
@@ -1962,15 +1962,18 @@ def mode_decoding_components(args) -> dict:
     }
 
 
-def _meshless_request(model, params, prompts, mask, asking: int) -> dict:
+def _meshless_request(model, prompts, mask, asking: int) -> dict:
     """What weights on no mesh answer a process that asks for 1 + 2 * `asking`
-    rows and 3 + `asking` tokens: its own request, whatever another asks."""
+    rows and 3 + `asking` tokens: its own request, whatever another asks.
+    The weights are initialized afresh, since `place` puts the leaves of the
+    tree it is given on its mesh."""
     import jax
     import jax.numpy as jnp
 
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, generate
 
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     rows = 1 + 2 * asking
     own = ModelInputs(jnp.asarray(prompts[:rows]), {"attention_mask": jnp.asarray(mask[:rows])})
     answer = generate(model, params, own, 3 + asking, key=jax.random.key(11),
