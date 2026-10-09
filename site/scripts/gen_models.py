@@ -31,6 +31,8 @@ DECODERS = {
     "phi3": ("Phi-3", "Dense decoders"),
     "falcon": ("Falcon", "Dense decoders"),
     "gptj": ("GPT-J", "Dense decoders"),
+    "gpt_bigcode": ("GPTBigCode", "Dense decoders"),
+    "starcoder2": ("StarCoder2", "Dense decoders"),
     "llama": ("Llama", "Dense decoders"),
     "mistral": ("Mistral", "Dense decoders"),
     "ministral": ("Ministral", "Dense decoders"),

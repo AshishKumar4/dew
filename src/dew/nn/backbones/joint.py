@@ -112,8 +112,9 @@ class JointAttention(nn.Module):
     puts the image first in the joined sequence, and Flux's processor puts
     the context first. Without a context, it is self-attention over the
     image. The rotation is the cosines and sines of every joined token, one
-    angle per channel pair, `[B or 1, S, D // 2]`, and `lengths` is the
-    number of real keys in each row.
+    angle per channel pair, `[B or 1, S, D // 2]`, or of the image's tokens
+    alone, which turn before the join and leave the context as it is (Dew's
+    MM-DiT); `lengths` is the number of real keys in each row.
     """
 
     heads: int
@@ -163,6 +164,9 @@ class JointAttention(nn.Module):
             added = (self._norm("norm_added_q", self._heads("add_q_proj", context)),
                      self._norm("norm_added_k", self._heads("add_k_proj", context)),
                      self._heads("add_v_proj", context))
+            if rotation is not None and rotation[0].shape[-2] == image.shape[1]:
+                query, key = (rotate(part, *rotation, pairs=self.rotary_pairs) for part in (query, key))
+                rotation = None
             streams = (added, (query, key, value)) if self.context_first else ((query, key, value), added)
             query, key, value = (jnp.concatenate(pair, axis=1) for pair in zip(*streams, strict=True))
         if rotation is not None:
