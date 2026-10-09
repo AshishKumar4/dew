@@ -1,7 +1,8 @@
 import { DurableObject } from 'cloudflare:workers';
 import { limitsOf } from './limits';
 export const SESSION_HEADER = 'X-Dew-Session';
-import { restore, type SnapshotGeneration } from './snapshots';
+import { health, restore } from './container';
+import type { SnapshotGeneration } from './snapshots';
 
 const PORT = 8888;
 const START_MS = 180_000;
@@ -33,8 +34,8 @@ export class SharedHost extends DurableObject<Env> {
 
 	/** The bridge's report of the host's memory and contexts, or null while it is not running. */
 	async health(): Promise<Record<string, unknown> | null> {
-		if (!this.ctx.container?.running) return null;
-		try { return await (await this.ctx.container.getTcpPort(PORT).fetch('http://container/health')).json(); }
+		const response = this.ctx.container && await health(this.ctx.container, PORT);
+		try { return response ? await response.json() : null; }
 		catch { return null; }
 	}
 
@@ -50,9 +51,7 @@ export class SharedHost extends DurableObject<Env> {
 	}
 
 	async available(): Promise<boolean> {
-		if (!this.ctx.container?.running) return false;
-		try { return (await this.ctx.container.getTcpPort(PORT).fetch('http://container/health')).ok; }
-		catch { return false; }
+		return !!this.ctx.container && (await health(this.ctx.container, PORT))?.ok === true;
 	}
 
 	private async boot(): Promise<void> {
