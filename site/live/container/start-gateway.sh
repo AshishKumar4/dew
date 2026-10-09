@@ -3,8 +3,8 @@
 # memory/concurrency checks; no production configuration invokes this script.
 set -eu
 umask 077
-mkdir -p /run/dew/gateway /sessions/connections /sessions/ipc /work
-chmod 0711 /sessions /sessions/connections /sessions/ipc
+mkdir -p /run/dew/gateway /sessions/connections /sessions/ipc /sessions/overlay /work
+chmod 0711 /sessions /sessions/connections /sessions/ipc /sessions/overlay
 : > /kernel.json
 for index in $(seq 0 99); do
   id -u "ctx$index" >/dev/null 2>&1 || useradd --uid "$((6100+index))" --no-create-home --home-dir /work --shell /usr/sbin/nologin "ctx$index"
