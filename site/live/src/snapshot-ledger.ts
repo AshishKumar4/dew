@@ -14,12 +14,13 @@ export interface SnapshotRecord {
 
 // A snapshot is preparing from the end of its build to the end of its smoke, a 15-minute alarm (preparer.ts).
 const PREPARING_MS = 20 * 60_000;
-const NEWEST = 2;
+// One fallback generation: each is a few GB of the account's registry, whose total is limited.
+const NEWEST = 1;
 
 /**
  * The recorded snapshots to keep and to delete. `live` holds every snapshot a pool host was
  * started from and the ones the pool and the registry serve; besides those it keeps a
- * preparation's while it runs and the `NEWEST` newest other generations. A failed preparation
+ * preparation's while it runs and the `NEWEST` newest other generation. A failed preparation
  * and a finished trial go at once.
  */
 export function prunable(records: SnapshotRecord[], live: Set<string>, now: number): { keep: string[]; delete: string[] } {
