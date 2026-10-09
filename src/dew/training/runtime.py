@@ -137,7 +137,8 @@ def _join_process_pool(multi_host: bool | None) -> None:
     off: the launcher placed its processes, and a Slurm step around it would
     otherwise pin each to the GPU at SLURM_LOCALID. On a machine with no cluster
     environment it raises a ValueError naming the missing coordinator
-    address, the single-host signature. Every other failure propagates,
+    address, the single-host signature, unless the environment declared a
+    pool of several processes. Every other failure propagates,
     since a pod run would otherwise continue on one host. multi_host=True
     requires the pool, multi_host=False never asks for it. A Slurm step of
     one task forms no pool unless the run asks for one with multi_host=True
@@ -169,7 +170,10 @@ def _join_process_pool(multi_host: bool | None) -> None:
         else:
             jax.distributed.initialize()
     except ValueError as e:
-        if multi_host or "coordinator_address" not in str(e):
+        # Alone only where nothing declared a pool: a rank whose pool lacks its
+        # coordinator would otherwise train by itself as if it were the pool.
+        declared = int(os.environ.get(PROCESS_COUNT, 1)) > 1 or (cluster is not None and cluster.count > 1)
+        if multi_host or declared or "coordinator_address" not in str(e):
             raise
     else:
         _joined()

@@ -963,6 +963,37 @@ def test_stochastic_rounding_draws_from_its_own_stream():
                                         jax.tree.leaves(other), strict=True)) > 0.0
 
 
+def test_an_objective_rounds_its_gradients_from_the_step_key():
+    """An LM objective's training loss under int8 gradients with stochastic
+    rounding: the step's key alone feeds Qwix's rounding stream, which the
+    objective folds off the key it hands dropout. The same key repeats the
+    gradients, as every process of a pool holds the same step key; another
+    key moves them, by far more than a repeat (GPU embedding scatters add
+    in any order), and deterministic rounding does not move with the key."""
+    pytest.importorskip("qwix")
+    batch = token_batch()
+
+    def gradients(spec, key):
+        _, qmodel, variables, _ = quantized_forward(spec)
+        objective = LMObjective(qmodel, SEQ_LEN)
+        step = Step(step=jnp.zeros((), jnp.int32), key=key, ema=None)
+        return jax.jit(jax.grad(lambda params: objective.scalar_loss(
+            {**variables, "params": params}, batch, step), has_aux=True))(variables["params"])[0]
+
+    def apart(first, second):
+        return max(float(jnp.max(jnp.abs(a - b)))
+                   for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True))
+
+    stochastic = Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform")
+    drawn = gradients(stochastic, jax.random.key(0))
+    assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(drawn))
+    repeat = apart(drawn, gradients(stochastic, jax.random.key(0)))
+    moved = apart(drawn, gradients(stochastic, jax.random.key(1)))
+    fixed = Quantization(bwd_qtype="int8")
+    still = apart(gradients(fixed, jax.random.key(0)), gradients(fixed, jax.random.key(1)))
+    assert moved > 100 * max(repeat, still, 1e-9), (moved, repeat, still)
+
+
 # --------------------------------------------------------------------------
 # The trainer's knob
 # --------------------------------------------------------------------------

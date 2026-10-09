@@ -66,6 +66,7 @@ from dew.objectives.base import (
     merge,
     merge_totals,
     thaw,
+    training_rngs,
 )
 from dew.objectives.lm.chunked import (
     chunked_tile,
@@ -1028,7 +1029,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         inputs, _ = self._rows(prepared.tokens)
         collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
         _, gathered = self._hidden_states(
-            thaw(params), inputs, train=True, rngs={"dropout": step.key},
+            thaw(params), inputs, train=True, rngs=training_rngs(step.key),
             collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
         total, mass = self._indexer_term(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": total / jnp.where(mass > 0, mass, 1)}
@@ -1084,7 +1085,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         rate = self.balance_rate
         alpha = self.aux_loss_alpha
         scores = self.token_scores(
-            params, prepared, train=train, rngs={"dropout": step.key} if train else None,
+            params, prepared, train=train, rngs=training_rngs(step.key) if train else None,
             routing=rate is not None or alpha is not None or bool(self.router_z_loss),
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
             qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers)
