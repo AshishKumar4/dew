@@ -55,6 +55,10 @@ class _BoundedIterator(Forwarding):
         self._source: Iterator[Batch] | None = source
         self._iterator: Iterator[Batch] = itertools.islice(source, batches)
 
+    @property
+    def endless(self) -> bool:
+        return False
+
     def __iter__(self):
         return self
 

@@ -648,7 +648,8 @@ def mode_pool_refusals(args) -> dict:
     """What a pool refuses on every process before any trains on it, each a
     fit of the affine regression over a stream that differs on process 1
     only: another corpus under the same name and length, another length,
-    a first read that fails there, and a batch without a field. A resume
+    a first read that fails there, a stream that runs out after one batch
+    there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
     well. Each outcome is the error's text, or None for a fit that trained."""
     import jax
@@ -679,11 +680,11 @@ def mode_pool_refusals(args) -> dict:
             return {"x": x, "y": 2 * x[:2]}
 
     class Reads:
-        """Batches of this process's rows, failing at the first read or
-        missing `y` where asked."""
+        """Batches of this process's rows, failing at the first read, running
+        out after `ends` batches, or missing `y`, where asked."""
 
-        def __init__(self, fail: bool, fields: tuple[str, ...]):
-            self.fail, self.fields = fail, fields
+        def __init__(self, fail: bool, fields: tuple[str, ...], ends: int | None):
+            self.fail, self.fields, self.ends = fail, fields, ends
 
         def __iter__(self):
             return self
@@ -691,6 +692,10 @@ def mode_pool_refusals(args) -> dict:
         def __next__(self) -> dict:
             if self.fail:
                 raise ValueError("this process's share holds no rows")
+            if self.ends is not None:
+                if not self.ends:
+                    raise StopIteration
+                self.ends -= 1
             x = np.ones((BATCH // jax.process_count(), FEATURES), np.float32)
             return {name: value for name, value in {"x": x, "y": 2 * x[:, :2]}.items() if name in self.fields}
 
@@ -699,15 +704,15 @@ def mode_pool_refusals(args) -> dict:
                                           loading=Loading(workers=0)),
                        val=None, records=count, batch=BATCH)
 
-    def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y")) -> Data:
-        return Data(lambda partition: Reads(fail, fields))
+    def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Data:
+        return Data(lambda partition: Reads(fail, fields, ends))
 
     def trained(data, checkpoints=None, **flags) -> str | None:
         trainer = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
                           checkpoints=checkpoints)
         try:
             trainer.fit(data, steps=2, log_every=1, **flags)
-        except (ValueError, RuntimeError) as error:
+        except (ValueError, RuntimeError, StopIteration) as error:
             return f"{type(error).__name__}: {error}"
         return None
 
@@ -717,6 +722,7 @@ def mode_pool_refusals(args) -> dict:
         "content": trained(stream(64, int(other))),
         "count": trained(stream(64 + 32 * other, 0)),
         "first_read": trained(reads(fail=other)),
+        "eof": trained(reads(ends=1 if other else None)),
         "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
     }
