@@ -82,7 +82,8 @@ from transformers import (
     GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
     PhiConfig, PhiForCausalLM, Phi3Config, Phi3ForCausalLM,
     FalconConfig, FalconForCausalLM,
-    GPTJConfig, GPTJForCausalLM,
+    GPTJConfig, GPTJForCausalLM, GPTBigCodeConfig, GPTBigCodeForCausalLM, Starcoder2Config,
+    Starcoder2ForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -187,6 +188,30 @@ def tiny_falcon(multi_query: bool = True) -> FalconForCausalLM:
 
 
 GPTJ_CONFIG = ('gpt-j-6b', 'EleutherAI/gpt-j-6b', '47e169305d2e8376be1d31e765533382721b2cc1')
+GPT_BIGCODE_CONFIG = ('gpt-bigcode-santacoder', 'bigcode/gpt_bigcode-santacoder',
+                      '291931872cae83498cf984b16319f47f5e9e7a07')
+STARCODER2_CONFIG = ('starcoder2-3b', 'bigcode/starcoder2-3b', '733247c55e3f73af49ce8e9c7949bf14af205928')
+
+
+def tiny_gpt_bigcode(multi_query: bool = True) -> GPTBigCodeForCausalLM:
+    """GPT-2's block under torch Linears, its fused c_attn one key and value
+    head wide (multi-query) or every head's q, k and v side by side."""
+    torch.manual_seed(0)
+    return GPTBigCodeForCausalLM(GPTBigCodeConfig(
+        vocab_size=64, n_embd=24, n_inner=48, n_layer=2, n_head=3, n_positions=48, multi_query=multi_query,
+        layer_norm_epsilon=3e-5, resid_pdrop=0., embd_pdrop=0., attn_pdrop=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+def tiny_starcoder2() -> Starcoder2ForCausalLM:
+    """Grouped-query rotary attention under a window shorter than the
+    sequence, biased LayerNorms and an ungated biased feed-forward."""
+    torch.manual_seed(0)
+    return Starcoder2ForCausalLM(Starcoder2Config(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, max_position_embeddings=48, sliding_window=5, norm_epsilon=3e-5, use_bias=True,
+        rope_parameters={'rope_type': 'default', 'rope_theta': 10000.0}, residual_dropout=0.,
+        embedding_dropout=0., attention_dropout=0., bos_token_id=1, eos_token_id=None, pad_token_id=0))
 
 
 def tiny_gptj() -> GPTJForCausalLM:
@@ -1611,13 +1636,54 @@ def write_released_config(name: str, repo: str, revision: str | None = None,
           f"{layers} layers, {len(config)} fields")
 
 
+def write_classic_family(family: str) -> None:
+    """One classic decoder's tiny fixtures and its pinned released configs."""
+    if family == 'bloom':
+        write_classic_tiny('bloom-tiny', tiny_bloom())
+        write_released_config(*BLOOM_CONFIG)
+        write_released_config(*BLOOMZ_CONFIG)
+        return
+    if family == 'gpt_neo':
+        write_classic_tiny('gpt-neo-tiny', tiny_gpt_neo())
+        write_released_config(*GPT_NEO_CONFIG)
+        return
+    if family == 'phi':
+        write_classic_tiny('phi-tiny', tiny_phi())
+        write_released_config(*PHI_CONFIG)
+        return
+    if family == 'falcon':
+        write_classic_tiny('falcon-tiny', tiny_falcon())
+        write_classic_tiny('falcon-mha-tiny', tiny_falcon(multi_query=False))
+        write_released_config(*FALCON_CONFIG)
+        return
+    if family == 'gptj':
+        write_classic_tiny('gptj-tiny', tiny_gptj())
+        write_released_config(*GPTJ_CONFIG)
+        return
+    if family == 'gpt_bigcode':
+        write_classic_tiny('gpt-bigcode-tiny', tiny_gpt_bigcode())
+        write_classic_tiny('gpt-bigcode-mha-tiny', tiny_gpt_bigcode(multi_query=False))
+        write_released_config(*GPT_BIGCODE_CONFIG)
+        return
+    if family == 'starcoder2':
+        write_classic_tiny('starcoder2-tiny', tiny_starcoder2())
+        write_released_config(*STARCODER2_CONFIG)
+        return
+    if family == 'phi3':
+        write_classic_tiny('phi3-tiny', tiny_phi3())
+        for config in PHI3_CONFIGS:
+            write_released_config(*config)
+        return
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--skip-real", action="store_true",
                         help="only the tiny fixtures, no 1.5 GB download")
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
-    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'phi3', 'falcon', 'gptj'),
+    parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'phi3', 'falcon', 'gptj',
+                                                     'gpt_bigcode', 'starcoder2'),
                         help='only this classic decoder fixture and its pinned released configs')
     parser.add_argument('--minimax-m2-only', action='store_true',
                         help='only MiniMax-M2 with transformers 5.18.0 and its pinned configs')
@@ -1630,32 +1696,8 @@ def main() -> None:
     args = parser.parse_args()
 
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-    if args.classic_family == 'bloom':
-        write_classic_tiny('bloom-tiny', tiny_bloom())
-        write_released_config(*BLOOM_CONFIG)
-        write_released_config(*BLOOMZ_CONFIG)
-        return
-    if args.classic_family == 'gpt_neo':
-        write_classic_tiny('gpt-neo-tiny', tiny_gpt_neo())
-        write_released_config(*GPT_NEO_CONFIG)
-        return
-    if args.classic_family == 'phi':
-        write_classic_tiny('phi-tiny', tiny_phi())
-        write_released_config(*PHI_CONFIG)
-        return
-    if args.classic_family == 'falcon':
-        write_classic_tiny('falcon-tiny', tiny_falcon())
-        write_classic_tiny('falcon-mha-tiny', tiny_falcon(multi_query=False))
-        write_released_config(*FALCON_CONFIG)
-        return
-    if args.classic_family == 'gptj':
-        write_classic_tiny('gptj-tiny', tiny_gptj())
-        write_released_config(*GPTJ_CONFIG)
-        return
-    if args.classic_family == 'phi3':
-        write_classic_tiny('phi3-tiny', tiny_phi3())
-        for config in PHI3_CONFIGS:
-            write_released_config(*config)
+    if args.classic_family is not None:
+        write_classic_family(args.classic_family)
         return
     if args.minimax_m2_only:
         write_minimax_m2()
