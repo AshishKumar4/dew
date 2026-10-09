@@ -3653,6 +3653,66 @@
     }
    ],
    "note": "Includes Qwen3 prompt states and pipeline/transformer outputs; timestep exp table locally rounded from float64."
+  },
+  "hf/gpt-bigcode-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-mha-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-mha-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-mha-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-mha-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/gpt-bigcode-mha-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/starcoder2-tiny/generated.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/starcoder2-tiny/logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/starcoder2-tiny/logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/starcoder2-tiny/padded_logits.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/starcoder2-tiny/padded_logits_f64.npy": {
+   "tool": "tools/hf_reference.py",
+   "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   }
  },
  "inputs": [
@@ -4074,6 +4134,11 @@
     "tokenizers/t5-small/tokenizer.json",
     "tokenizers/t5-small/tokenizer_config.json"
    ]
+  },
+  {
+   "tool": "tools/hf_reference.py",
+   "what": "GPTBigCode multi-query and multi-head and Starcoder2 weights, probe token ids and padded validity masks",
+   "files": ["hf/gpt-bigcode-tiny/attention_mask.npy", "hf/gpt-bigcode-tiny/input_ids.npy", "hf/gpt-bigcode-tiny/model.safetensors", "hf/gpt-bigcode-tiny/padded_ids.npy", "hf/gpt-bigcode-mha-tiny/attention_mask.npy", "hf/gpt-bigcode-mha-tiny/input_ids.npy", "hf/gpt-bigcode-mha-tiny/model.safetensors", "hf/gpt-bigcode-mha-tiny/padded_ids.npy", "hf/starcoder2-tiny/attention_mask.npy", "hf/starcoder2-tiny/input_ids.npy", "hf/starcoder2-tiny/model.safetensors", "hf/starcoder2-tiny/padded_ids.npy"]
   }
  ]
 }
