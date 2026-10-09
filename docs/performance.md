@@ -852,14 +852,27 @@ took 122.15-122.23 ms against 126.76-126.81 without it, and the 256-wide
 decoder 75.80-75.96 against 91.65-92.49, with its parity tests against xla
 passing at six shapes.
 
-On a Colab L4 (sm89) it gained under 3% on Qwen3-0.6B, ran SimpleDiT-B
-slower than tokamax's Triton kernel, and its backward refuses heads wider
-than 192 off sm80 and sm90, so `KERNELS['attention']` names it for sm80
-alone. `'auto'` sends it a call with no window, mask, bias, softcap or sinks
-and a square causal mask, since FlashAttention-2 aligns its causal mask to
-the last key where jax.nn aligns it to the first. Its backward sums the
-query gradient with atomics, so a run with `--xla_gpu_deterministic_ops`
-stays off it.
+On a Colab L4 (sm89) it gained under 3% on Qwen3-0.6B and ran SimpleDiT-B
+slower than tokamax's Triton kernel. On the RTX 4080 (sm89, 2026-10-09,
+three alternating rounds of `tools/benchmark_step.py`, tokamax not
+installed), it ran every step faster than cuDNN at the same peak memory and
+loss:
+
+| step | cuDNN | FlashAttention-2 |
+|---|---:|---:|
+| 24-layer decoder, 16 heads of 64, 4 x 1024 | 151.28-152.01 ms | 147.81-148.40 |
+| Qwen3-0.6B's shape, 2 x 1024 | 149.51-149.76 | 146.40-147.11 |
+| SimpleDiT-B, batch 32, 64 px | 76.02-76.17 | 74.13-74.56 |
+
+So `KERNELS['attention']` names it for sm80 and sm89, and tokamax's Triton
+kernel, where it is installed, keeps the calls it takes. Its backward refuses
+heads wider than 192 off sm80 and sm90 ("FlashAttention backward for head
+dim > 192 requires A100/A800 or H100/H800"), so on sm89 `'auto'` sends it
+heads up to 192 wide. `'auto'` sends it a call with no window, mask, bias,
+softcap or sinks and a square causal mask, since FlashAttention-2 aligns its
+causal mask to the last key where jax.nn aligns it to the first. Its backward
+sums the query gradient with atomics, so a run with
+`--xla_gpu_deterministic_ops` stays off it.
 
 ### Splash's tiles on the TPU, 2026-10-02
 
