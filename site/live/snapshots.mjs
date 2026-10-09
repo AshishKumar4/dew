@@ -85,10 +85,10 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
 		const before = (await call('trial')).last?.at;
 		await call(`trial?commit=${commit}`, { method: 'POST' });
 		console.log(`live: preparing ${commit} as a trial`);
-		// The registry reads a trial silent for 35 minutes as cut off; this wait outlasts that.
-		for (const deadline = Date.now() + 40 * 60_000; ;) {
+		// The registry reads a trial silent past its lease, 39 minutes, as cut off (src/snapshots.ts).
+		for (const deadline = Date.now() + 45 * 60_000; ;) {
 			if (Date.now() > deadline) {
-				console.log('live: the trial left no outcome in 40 minutes');
+				console.log('live: the trial left no outcome in 45 minutes');
 				break;
 			}
 			await new Promise((resolve) => setTimeout(resolve, 30_000));

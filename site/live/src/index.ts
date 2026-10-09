@@ -118,7 +118,7 @@ export default {
 			const preparers = ['trusted', 'trial'].map((name) => env.PREPARER.get(env.PREPARER.idFromName(name)));
 			const active = (await env.SNAPSHOTS.get(env.SNAPSHOTS.idFromName('global')).previous())?.snapshot.id;
 			const live = new Set([...await env.POOL.get(env.POOL.idFromName('global')).snapshots(), ...(active ? [active] : [])]);
-			const plan = prunable((await Promise.all(preparers.map((preparer) => preparer.snapshots()))).flat(), live, Date.now());
+			const plan = prunable((await Promise.all(preparers.map((preparer) => preparer.snapshots()))).flat(), live);
 			if (request.method === 'POST') await Promise.all(preparers.map((preparer) => preparer.forget(plan.delete)));
 			return Response.json({ ...plan, live: [...live] });
 		}
