@@ -799,22 +799,30 @@ def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
 
 
 FLASH_MAX_HEAD_DIM = 256
-# Its backward takes heads up to 192 wide off sm80: "FlashAttention backward for head dim > 192
-# requires A100/A800 or H100/H800", measured on an RTX 4080.
+# Its backward takes heads up to 192 wide on sm8x parts other than sm80: "FlashAttention backward for
+# head dim > 192 requires A100/A800 or H100/H800", measured on an RTX 4080.
 FLASH_MAX_BACKWARD_HEAD_DIM = 192
+
+
+def flash_built_for(generation: str) -> bool:
+    """Whether the dew_flash_attn wheel holds code `generation` runs: sm80's, which every 8.x
+    part runs, or sm120's (kernels/flash_attn/CMakeLists.txt)."""
+    return generation.startswith('sm8') or generation == 'sm120'
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
     """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
     or None where it does: `KERNELS` names it for the GPU, the query is bf16
-    or fp16 with heads a multiple of 8 up to 256 wide (192 off sm80, whose
-    backward alone takes wider ones), a causal call is square, the call has
-    no window, mask, bias, softcap or sinks, no deterministic ops are asked
-    for, which its backward's atomic sum of the query gradient would not
-    keep, and dew_flash_attn is installed."""
+    or fp16 with heads a multiple of 8 up to 256 wide (192 on sm8x parts other
+    than sm80, whose backward takes no wider), a causal call is square, the
+    call has no window, mask, bias, softcap or sinks, no deterministic ops are
+    asked for, which its backward's atomic sum of the query gradient would
+    not keep, and dew_flash_attn is installed."""
     head_dim = query.shape[-1]
-    widest = FLASH_MAX_HEAD_DIM if device_generation() == 'sm80' else FLASH_MAX_BACKWARD_HEAD_DIM
+    generation = device_generation()
+    narrow = generation.startswith('sm8') and generation != 'sm80'
+    widest = FLASH_MAX_BACKWARD_HEAD_DIM if narrow else FLASH_MAX_HEAD_DIM
     return first_refusal(
         (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash',
          "KERNELS names it for no other device"),
@@ -836,10 +844,11 @@ def flash_attention(query, key, value, causal: bool):
     arrays at jax.nn's default scale. Its causal mask is aligned to the last
     key, where jax.nn's is aligned to the first, so a causal call is square.
     On a mesh it runs per shard, as `triton_attention` does. The wheel holds
-    sm80 code alone, which compute capability 8.x runs and no other does."""
+    sm80 code, which compute capability 8.x runs, and sm120 code
+    (`flash_built_for`), and no other device runs either."""
     generation = device_generation()
-    if not generation.startswith('sm8'):
-        raise ValueError(f"FlashAttention-2 is built for sm8x and this device is {generation}; "
+    if not flash_built_for(generation):
+        raise ValueError(f"FlashAttention-2 is built for sm8x and sm120 and this device is {generation}; "
                          "use attention_impl 'cudnn' or 'xla'")
     try:
         flash = importlib.import_module('dew_flash_attn')

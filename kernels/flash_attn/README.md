@@ -12,9 +12,10 @@ Python from 3.11:
 
 With it installed, Dew's `attention_impl="auto"` runs FlashAttention-2
 on an A100 (sm80) for calls without a window, mask, bias or softcap and with
-heads up to 256 wide. `attention_impl="flash"` asks for it on any sm8x GPU.
+heads up to 256 wide. `attention_impl="flash"` asks for it on any sm8x or sm120 GPU.
 
-The kernels are compiled for sm80, which every compute capability 8.x runs.
+The kernels are compiled for sm80, which every compute capability 8.x runs, and for sm120, Blackwell's
+workstation and consumer parts (the RTX PRO 6000 and the RTX 50 series).
 
 Called directly:
 

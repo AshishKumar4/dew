@@ -178,6 +178,7 @@ def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, 
     ("sm89", True, {"head_dim": 192}, "flash", None),
     ("sm89", True, {"head_dim": 256}, "xla", "the heads are 256 wide"),
     ("sm90", True, {}, "cudnn", None),
+    ("sm120", True, {}, "cudnn", None),
 ])
 def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
                                                                 call, chosen, refusal,
@@ -209,14 +210,14 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm75", "cpu"])
 def test_flash_refuses_a_device_its_wheel_has_no_code_for(monkeypatch, generation, without_deterministic_ops):
-    """The wheel holds sm80 code, which compute capability 8.x runs: an
-    explicit 'flash' on any other device is refused by name, before a CUDA
-    launch could fail without one."""
+    """The wheel holds sm80 code, which compute capability 8.x runs, and
+    sm120 code: an explicit 'flash' on any other device is refused by name,
+    before a CUDA launch could fail without one."""
     from dew.nn import attention, kernels
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
     monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     query = jnp.zeros((1, 128, 4, 64), jnp.bfloat16)
-    with pytest.raises(ValueError, match=f"built for sm8x and this device is {generation}"):
+    with pytest.raises(ValueError, match=f"built for sm8x and sm120 and this device is {generation}"):
         attention.flash_attention(query, query, query, causal=True)
 
 
