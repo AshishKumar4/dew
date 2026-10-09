@@ -172,6 +172,29 @@ def place_leaf(value, target: NamedSharding) -> jax.Array:
     return landed
 
 
+def _mapped(array: np.ndarray) -> tuple[np.memmap, mmap.mmap] | None:
+    """The memory map `array` is a view of, and that map's `mmap`; None for any other array."""
+    root: np.ndarray = array
+    while isinstance(root.base, np.ndarray):
+        root = root.base
+    mapping = root.base
+    return (root, mapping) if isinstance(root, np.memmap) and isinstance(mapping, mmap.mmap) else None
+
+
+def stored_range(array: np.ndarray) -> tuple[str, int] | None:
+    """The file a C-contiguous view of a memory-mapped checkpoint stores its
+    `nbytes` in, and their offset there, so a reader can fetch them without
+    faulting the map (`dew.interop.streaming.ParallelReader`); None for any
+    other array."""
+    mapped = _mapped(array)
+    filename = None if mapped is None else mapped[0].filename
+    if mapped is None or filename is None or not array.flags.c_contiguous:
+        return None
+    root = mapped[0]
+    into = array.__array_interface__["data"][0] - root.__array_interface__["data"][0]
+    return filename, root.offset + into
+
+
 def evict(array: np.ndarray) -> None:
     """Drop a memory-mapped checkpoint tensor's pages from this process.
 
@@ -184,12 +207,10 @@ def evict(array: np.ndarray) -> None:
     boundary page shared with a neighbour stays until the neighbour is
     placed. A later read of an evicted page faults it back from the file. An
     array that is not such a view is left alone."""
-    root: np.ndarray = array
-    while isinstance(root.base, np.ndarray):
-        root = root.base
-    mapping = root.base
-    if not isinstance(root, np.memmap) or not isinstance(mapping, mmap.mmap) or array.nbytes == 0:
+    mapped = _mapped(array)
+    if mapped is None or array.nbytes == 0:
         return
+    root, mapping = mapped
     # The map starts at the allocation granule below the memmap's file
     # offset; the memmap's data sits that remainder into it.
     start = root.__array_interface__["data"][0] - root.offset % mmap.ALLOCATIONGRANULARITY

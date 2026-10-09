@@ -10,13 +10,23 @@ the leaf is kept in. `read(index)` builds only the part a device asks for,
 and `dew.training.host.place_leaf` puts each part on its device before it
 reads the next, so a process holds one device shard of one leaf at a time.
 
+`ParallelReader` fetches the stored bytes of mapped tensors into memory,
+many reads in flight, so a reader that knows what it needs next, such as a
+decode step's experts, reads at the drive's rate rather than one page fault
+at a time.
+
 `WeightLayout` is the way back: which leaves one source tensor is built
 from and how its storage is rebuilt, one tensor at a time.
 """
 from __future__ import annotations
 
+import errno
 import math
+import mmap
+import os
+import threading
 from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 
 import jax
@@ -24,7 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop.weights import swapped
-from dew.training.host import evict
+from dew.training.host import evict, stored_range
 
 
 @dataclass(frozen=True, eq=False)
@@ -132,6 +142,120 @@ class SourceLeaf:
         """Give back the mapped pages the reads faulted in."""
         for member in self.members:
             evict(member)
+
+
+@dataclass(frozen=True)
+class Loading:
+    """Arrays a `ParallelReader` is reading: `result` waits for the reads and returns them."""
+
+    arrays: list[np.ndarray]
+    reads: list[Future[None]]
+
+    def result(self) -> list[np.ndarray]:
+        for read in self.reads:
+            read.result()
+        return self.arrays
+
+
+class ParallelReader:
+    """Reads the stored bytes of memory-mapped checkpoint tensors into memory.
+
+    `load` reads every tensor it is given in page-aligned spans of `chunk`
+    bytes, `threads` spans in flight across all of them, so the experts a
+    decode step needs arrive at the drive's sequential rate rather than at
+    one page fault a time. Through the page cache by default, so a checkpoint
+    the host holds is read from memory; with `direct`, past it (O_DIRECT
+    where the file system takes it), for a caller that keeps its own cache
+    and would only evict the host's. An array that is not a C-contiguous view
+    of a mapped file (`dew.training.host.stored_range`) comes back as it is.
+
+    A disk bank's layer reads keep their page faults: on Qwen3-0.6B's layers,
+    read through the page cache, building leaves from a parallel read's copy
+    decoded 1.11-1.13 against 1.19-1.22 tokens/s, the extra copy outweighing
+    the parallel reads (tools/benchmark_disk_banks.py decode).
+
+    The defaults read gpt-oss-120b's 13.2 MB experts directly, four a step
+    with two steps in flight (`start`), at 1.04 times the rate of 1 GiB
+    sequential reads from the same files (tools/benchmark_disk_banks.py
+    experts; one at a time, 0.78).
+    """
+
+    PAGE = 4096
+
+    def __init__(self, threads: int = 32, chunk: int = 2 << 20, *, direct: bool = False):
+        if threads < 1 or chunk < self.PAGE or chunk % self.PAGE:
+            raise ValueError(f"threads must be positive and chunk a positive multiple of {self.PAGE}")
+        self.chunk = chunk
+        self.direct = direct
+        self._pool = ThreadPoolExecutor(threads, thread_name_prefix="dew-parallel-read")
+        self._files: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    def __enter__(self) -> ParallelReader:
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def close(self) -> None:
+        self._pool.shutdown(wait=True)
+        with self._lock:
+            for descriptor in self._files.values():
+                os.close(descriptor)
+            self._files.clear()
+
+    def _descriptor(self, path: str) -> int:
+        with self._lock:
+            if path not in self._files:
+                self._files[path] = self._open(path, self.direct)
+            return self._files[path]
+
+    @staticmethod
+    def _open(path: str, direct: bool) -> int:
+        """`path` for reading, past the page cache when `direct` and the file system takes O_DIRECT."""
+        if direct:
+            try:
+                return os.open(path, os.O_RDONLY | os.O_DIRECT)
+            except OSError as error:
+                if error.errno != errno.EINVAL:
+                    raise
+        return os.open(path, os.O_RDONLY)
+
+    def load(self, arrays: Sequence[np.ndarray]) -> list[np.ndarray]:
+        """Each of `arrays` in memory, with its shape and dtype, read in parallel."""
+        return self.start(arrays).result()
+
+    def start(self, arrays: Sequence[np.ndarray]) -> Loading:
+        """Start reading `arrays` and return at once: a caller that knows its next reads keeps them
+        in flight behind the current ones, so the drive's queue never drains between them."""
+        loaded, spans = [], []
+        for array in arrays:
+            stored = stored_range(array)
+            if stored is None or array.nbytes == 0:
+                loaded.append(array)
+                continue
+            path, offset = stored
+            start = offset - offset % self.PAGE
+            size = -(-(offset - start + array.nbytes) // self.PAGE) * self.PAGE
+            buffer = mmap.mmap(-1, size)
+            loaded.append(np.frombuffer(buffer, np.uint8, array.nbytes, offset - start)
+                          .view(array.dtype).reshape(array.shape))
+            descriptor = self._descriptor(path)
+            spans += [(descriptor, buffer, start, position, min(self.chunk, size - position))
+                      for position in range(0, size, self.chunk)]
+        return Loading(loaded, [self._pool.submit(self._read, *span) for span in spans])
+
+    @classmethod
+    def _read(cls, descriptor: int, buffer: mmap.mmap, start: int, position: int, size: int) -> None:
+        """Fill `buffer[position:position + size]` from the file at `start + position`. A span
+        past the end of the file stops short, at the file's last byte."""
+        view, done = memoryview(buffer)[position:position + size], 0
+        while done < size:
+            count = os.preadv(descriptor, [view[done:]], start + position + done)
+            done += count
+            # A regular file reads short only at its end, which also leaves `done` off the page grid.
+            if count == 0 or done % cls.PAGE:
+                return
 
 
 type LazyTree = dict[str, np.ndarray | SourceLeaf | LazyTree]

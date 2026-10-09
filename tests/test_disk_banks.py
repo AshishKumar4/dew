@@ -105,6 +105,38 @@ def test_disk_source_reads_shards_and_bounds_cache(tmp_path):
         assert source.stats().bytes_read > 0
 
 
+@pytest.mark.parametrize("direct", [False, True])
+def test_parallel_reads_return_every_stored_byte_wherever_it_sits_in_its_file(tmp_path, direct):
+    """`ParallelReader` reads a mapped tensor's own bytes from its file,
+    through the page cache or past it: off the page grid, smaller than a
+    page, across several spans of its chunk, at the end of the file, and a
+    view of one expert of a stacked tensor. An array that is not a mapped
+    view comes back as it is."""
+    from dew.interop.safetensors_io import read_file, save_params
+    from dew.interop.streaming import ParallelReader
+    from dew.training.host import stored_range
+
+    rng = np.random.default_rng(0)
+    params = {"a_small": rng.standard_normal(3, np.float32),
+              "b_experts": rng.standard_normal((4, 37, 129), np.float32),
+              "c_tail": rng.integers(0, 255, 70_001, np.uint8)}
+    save_params(params, tmp_path / "model.safetensors")
+    tensors, _ = read_file(tmp_path / "model.safetensors")
+    path, offset = stored_range(tensors["b_experts"][2])
+    with open(path, "rb") as stored:
+        stored.seek(offset)
+        assert stored.read(tensors["b_experts"][2].nbytes) == tensors["b_experts"][2].tobytes()
+    assert stored_range(tensors["b_experts"][:, 1]) is None and stored_range(params["a_small"]) is None
+    wanted = [tensors["a_small"], tensors["b_experts"], tensors["b_experts"][2], tensors["c_tail"],
+              params["a_small"]]
+    with ParallelReader(threads=3, chunk=16_384, direct=direct) as reader:
+        loaded = reader.load(wanted)
+    for array, read in zip(wanted, loaded, strict=True):
+        assert read.shape == array.shape and read.dtype == array.dtype and stored_range(read) is None
+        np.testing.assert_array_equal(read, array)
+    assert loaded[-1] is params["a_small"]
+
+
 @pytest.mark.parametrize("bank_layers", [None, 1])
 def test_disk_source_also_builds_ordinary_resident_banks(bank_layers):
     from dew.inference.banks import SafetensorsBanks

@@ -1,12 +1,22 @@
 #!/usr/bin/env python3
 """Measure one disk-cache budget per process, without loading the resident model.
 
-Run each cache size in a fresh process for independent peak RSS and device
-allocator statistics. `read_seconds` includes mmap faults, copy, cast and
-transpose; it overlaps GPU work and must not be added to end-to-end time.
+    python tools/benchmark_disk_banks.py decode --checkpoint DIR [--cache-gib G]
+    python tools/benchmark_disk_banks.py experts --checkpoint DIR [--experts 256 --per-step 4]
+
+`decode` runs each cache size in a fresh process for independent peak RSS and
+device allocator statistics. `read_seconds` includes the reads, copy, cast
+and transpose; it overlaps GPU work and must not be added to end-to-end time.
 The optional trace records SSD reads, callback copies and GPU kernels for
 timeline attribution. The serial probe reports isolated row-read and H2D
 costs, not a subtraction-based estimate of overlapping compute.
+
+`experts` reads randomly chosen experts' stored bytes through the reader the
+banks use (`ParallelReader`), directly, a decode step's misses at a time, beside a
+sequential read of whole expert tensors from the same files: how near a MoE
+decode's expert reads come to the drive's own rate. The two alternate over
+`rounds`, each round reading bytes no other round read, so a drive shared
+with other work slows both alike, and the ratio is the median round's.
 """
 
 from __future__ import annotations
@@ -14,6 +24,9 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import os
+import random
+import re
 import resource
 import sys
 import time
@@ -28,6 +41,8 @@ import tyro
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.inference.banks import SafetensorsBanks
 from dew.interop.hf_decoders import translate_config
+from dew.interop.safetensors_io import read_weights
+from dew.interop.streaming import ParallelReader
 from dew.objectives.base import merge
 from dew.registry import models
 from dew.training import Layout, MeshSpec
@@ -46,6 +61,9 @@ class DiskConfig:
     probe_layers: int = 2
     read_ahead: bool = True
     warmup: bool = True
+    cold: bool = False
+    """Drop the checkpoint's files from the page cache before each run, as a host too small to hold
+    the model finds them."""
     trace: str | None = None
 
 
@@ -62,6 +80,16 @@ def storage_reads():
     with open("/proc/self/io") as handle:
         return {name.rstrip(":"): int(count) for line in handle
                 for name, count in [line.split()] if name in ("read_bytes:", "rchar:")}
+
+
+def drop_cached(checkpoint: Path) -> None:
+    """Give the page cache's copies of the checkpoint's weight files back to the kernel."""
+    for path in checkpoint.glob("*.safetensors"):
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+        finally:
+            os.close(descriptor)
 
 
 def serial_probe(source, layers, device):
@@ -109,6 +137,8 @@ def measure(config: DiskConfig):
             merge(read, held), token, decode=True, mutable=["cache"]))
 
         def run():
+            if config.cold:
+                drop_cached(config.checkpoint)
             started = time.perf_counter()
             logits, held = jax.block_until_ready(prefill(variables, cache, prompt))
             prefill_seconds = time.perf_counter() - started
@@ -163,5 +193,79 @@ def measure(config: DiskConfig):
         print(json.dumps(report, default=str))
 
 
+@dataclass(frozen=True)
+class ExpertReads:
+    checkpoint: Path
+    experts: int = 64
+    """How many (layer, expert) records each round reads."""
+    per_step: int = 4
+    """Records read together, as one layer's misses in a decode step."""
+    sequential_gib: float = 1.0
+    """How much of the whole expert tensors each round reads for the drive's sequential rate."""
+    in_flight: int = 2
+    """Steps whose reads are in flight at once, as a decode that starts the next layer's reads early."""
+    rounds: int = 5
+    threads: int = 32
+    chunk_mib: int = 2
+    seed: int = 0
+
+
+def expert_records(tensors: dict[str, np.ndarray]) -> dict[tuple[int, int], list[np.ndarray]]:
+    """Each (layer, expert)'s stored arrays: its slice of every tensor that stacks the experts on a
+    leading axis (GPT-OSS's `experts.gate_up_proj_blocks`), or every tensor named for it alone
+    (`experts.7.gate_proj.weight_packed`)."""
+    records: dict[tuple[int, int], list[np.ndarray]] = {}
+    for name, array in sorted(tensors.items()):
+        found = re.search(r"layers\.(\d+)\..*\.experts\.(?:(\d+)\.)?", name)
+        if found is None:
+            continue
+        layer = int(found.group(1))
+        if found.group(2) is not None:
+            records.setdefault((layer, int(found.group(2))), []).append(array)
+        else:
+            for expert in range(array.shape[0]):
+                records.setdefault((layer, expert), []).append(array[expert])
+    return records
+
+
+def expert_reads(config: ExpertReads):
+    tensors = read_weights(config.checkpoint)
+    records = expert_records(tensors)
+    if not records:
+        raise ValueError(f"no expert tensors in {config.checkpoint}")
+    keys = sorted(records)
+    random.Random(config.seed).shuffle(keys)
+    # Whole expert tensors cut into pieces of the round's sequential budget, never one read twice.
+    piece = int(config.sequential_gib * 2**30)
+    pieces = [array.reshape(-1)[start:start + piece // array.itemsize]
+              for name, array in sorted(tensors.items()) if ".experts." in name
+              for start in range(0, array.size, piece // array.itemsize)]
+    rounds = []
+    with ParallelReader(threads=config.threads, chunk=config.chunk_mib << 20, direct=True) as reader:
+        for index in range(config.rounds):
+            chosen = keys[index * config.experts:(index + 1) * config.experts]
+            started = time.perf_counter()
+            sequential = sum(array.nbytes for array in reader.load([pieces[-1 - index]]))
+            sequential_seconds = time.perf_counter() - started
+            started, read, pending = time.perf_counter(), 0, []
+            for step in range(0, len(chosen), config.per_step):
+                pending.append(reader.start(
+                    [array for key in chosen[step:step + config.per_step] for array in records[key]]))
+                if len(pending) == config.in_flight:
+                    read += sum(array.nbytes for array in pending.pop(0).result())
+            read += sum(array.nbytes for loading in pending for array in loading.result())
+            seconds = time.perf_counter() - started
+            rounds.append({"sequential_gb_per_second": sequential / sequential_seconds / 1e9,
+                           "expert_gb_per_second": read / seconds / 1e9,
+                           "ms_per_step": 1e3 * seconds / -(-len(chosen) // config.per_step)})
+    ratios = sorted(round_["expert_gb_per_second"] / round_["sequential_gb_per_second"] for round_ in rounds)
+    print(json.dumps({
+        "checkpoint": str(config.checkpoint.resolve()), "config": dataclasses.asdict(config),
+        "expert_records": len(records), "record_bytes": sum(array.nbytes for array in records[keys[0]]),
+        "rounds": rounds, "median_ratio": ratios[len(ratios) // 2],
+    }, default=str))
+
+
 if __name__ == "__main__":
-    measure(tyro.cli(DiskConfig))
+    chosen = tyro.extras.subcommand_cli_from_dict({"decode": DiskConfig, "experts": ExpertReads})
+    expert_reads(chosen) if isinstance(chosen, ExpertReads) else measure(chosen)
