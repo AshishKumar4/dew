@@ -83,7 +83,7 @@ from transformers import (
     PhiConfig, PhiForCausalLM, Phi3Config, Phi3ForCausalLM,
     FalconConfig, FalconForCausalLM,
     GPTJConfig, GPTJForCausalLM, GPTBigCodeConfig, GPTBigCodeForCausalLM, Starcoder2Config,
-    Starcoder2ForCausalLM,
+    Starcoder2ForCausalLM, MiMoV2FlashConfig, MiMoV2FlashForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -212,6 +212,31 @@ def tiny_starcoder2() -> Starcoder2ForCausalLM:
         num_key_value_heads=2, max_position_embeddings=48, sliding_window=5, norm_epsilon=3e-5, use_bias=True,
         rope_parameters={'rope_type': 'default', 'rope_theta': 10000.0}, residual_dropout=0.,
         embedding_dropout=0., attention_dropout=0., bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+MIMO_V2_FLASH_CONFIGS = (
+    ('mimo-v2-flash', 'XiaomiMiMo/MiMo-V2-Flash', '1afd314a2406c282e0956375c34a676501c78649'),
+    ('mimo-v2-flash-base', 'XiaomiMiMo/MiMo-V2-Flash-Base', 'e4187012dd10281638071e417a56164dd7805fbd'),
+)
+
+
+def tiny_mimo_v2_flash() -> MiMoV2FlashForCausalLM:
+    """A full layer, then two sliding ones under a window shorter than the
+    sequence with twice the key and value heads and sinks, 12-wide queries
+    and keys over 8-wide scaled values, a third of each head rotated under
+    each kind's base, and grouped sigmoid routing after a dense first layer."""
+    torch.manual_seed(0)
+    return MiMoV2FlashForCausalLM(MiMoV2FlashConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=3, num_attention_heads=4,
+        num_key_value_heads=1, head_dim=12, v_head_dim=8, sliding_window=5, moe_intermediate_size=16,
+        n_routed_experts=4, num_experts_per_tok=2, n_group=2, topk_group=1, routed_scaling_factor=1.5,
+        max_position_embeddings=48, rms_norm_eps=3e-5,
+        layer_types=['full_attention', 'sliding_attention', 'sliding_attention'],
+        mlp_layer_types=['dense', 'sparse', 'sparse'],
+        rope_parameters={
+            'full_attention': {'rope_type': 'default', 'rope_theta': 5e6, 'partial_rotary_factor': 0.334},
+            'sliding_attention': {'rope_type': 'default', 'rope_theta': 1e4, 'partial_rotary_factor': 0.334}},
+        attention_value_scale=0.707, bos_token_id=1, eos_token_id=None, pad_token_id=0))
 
 
 def tiny_gptj() -> GPTJForCausalLM:
@@ -1669,6 +1694,14 @@ def write_classic_family(family: str) -> None:
         write_classic_tiny('starcoder2-tiny', tiny_starcoder2())
         write_released_config(*STARCODER2_CONFIG)
         return
+    if family == 'mimo_v2_flash':
+        model = tiny_mimo_v2_flash()
+        # The eager experts, since torch's grouped_mm takes no float64.
+        model.set_experts_implementation('eager')
+        write_classic_tiny('mimo-v2-flash-tiny', model)
+        for config in MIMO_V2_FLASH_CONFIGS:
+            write_released_config(*config)
+        return
     if family == 'phi3':
         write_classic_tiny('phi3-tiny', tiny_phi3())
         for config in PHI3_CONFIGS:
@@ -1683,7 +1716,7 @@ def main() -> None:
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
     parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'phi3', 'falcon', 'gptj',
-                                                     'gpt_bigcode', 'starcoder2'),
+                                                     'gpt_bigcode', 'starcoder2', 'mimo_v2_flash'),
                         help='only this classic decoder fixture and its pinned released configs')
     parser.add_argument('--minimax-m2-only', action='store_true',
                         help='only MiniMax-M2 with transformers 5.18.0 and its pinned configs')

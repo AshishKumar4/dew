@@ -130,6 +130,9 @@ class CausalSelfAttention(nn.Module):
     num_kv_heads: int
     head_dim: int
     max_seq_len: int
+    value_head_dim: int | None = None
+    """The value heads' width; None is `head_dim`. A narrower value is cached
+    at its own width and widened only inside the kernel."""
     causal: bool = True
     rope_theta: float = 10000.0
     rope_scaling: RopeScaling | LongRopeScaling | None = None
@@ -148,6 +151,9 @@ class CausalSelfAttention(nn.Module):
     attention_bias: bool = False  # q/k/v biases, as config.attention_bias in HF
     o_proj_bias: bool | None = None  # None follows attention_bias; Qwen2 biases q/k/v only
     attention_scale: float | None = None  # None: the kernel's own 1/sqrt(head_dim)
+    value_scale: float | None = None
+    """Multiplies the values as projected, before the cache and the kernel
+    read them (MiMo-V2-Flash's `attention_value_scale`)."""
     temperature_tuning: tuple[float, float] | None = None
     """Llama 4's (floor_scale, attn_scale): an unrotated layer scales each
     query by its position (`temperature_scale`)."""
@@ -207,6 +213,10 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(
                 "exclusive self attention subtracts the token's own value, and a "
                 "KV-sharing layer projects none of its own")
+        if self.value_dim != self.head_dim and (self.output_gate or self.k_eq_v):
+            raise ValueError(
+                f"values {self.value_dim} wide under {self.head_dim}-wide heads take no output gate "
+                "and are not the keys")
         dense = functools.partial(
             self.linear, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
@@ -217,7 +227,8 @@ class CausalSelfAttention(nn.Module):
         if self._packed():
             # A Server packs its constant weights once, not on every decode
             # step. The ordinary parameter tree remains the training layout.
-            self.qkv_proj = dense(query_width + 2 * self.num_kv_heads * self.head_dim, name='qkv_proj')
+            self.qkv_proj = dense(query_width + self.num_kv_heads * (self.head_dim + self.value_dim),
+                                  name='qkv_proj')
         else:
             self.q_proj = dense(query_width, name='q_proj')
         # A sharing layer reads another layer's keys and values, so it owns
@@ -226,7 +237,7 @@ class CausalSelfAttention(nn.Module):
         if not self.kv_shared and not self._packed():
             self.k_proj = dense(self.num_kv_heads * self.head_dim, name='k_proj')
             if not self.k_eq_v:
-                self.v_proj = dense(self.num_kv_heads * self.head_dim, name='v_proj')
+                self.v_proj = dense(self.num_kv_heads * self.value_dim, name='v_proj')
         self.o_proj = dense(self.emb_features, name='o_proj', use_bias=(
             self.attention_bias if self.o_proj_bias is None else self.o_proj_bias),
             **normal_kernel(self.init_std if self.output_init_std is None else self.output_init_std))
@@ -259,6 +270,11 @@ class CausalSelfAttention(nn.Module):
         layout, or a server's packing of the three (`projection_groups`)."""
         return self.packed or self.has_variable('params', 'qkv_proj')
 
+    @property
+    def value_dim(self) -> int:
+        """The width of one value head."""
+        return self.head_dim if self.value_head_dim is None else self.value_head_dim
+
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its query, key and value projections packed as `qkv_proj`
         (`ProjectionSites`), which `setup` reads in their place, where it
@@ -267,7 +283,8 @@ class CausalSelfAttention(nn.Module):
             return ()
         query = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
         group = ProjectionGroup(tuple(self.path), 'qkv_proj', ('q_proj', 'k_proj', 'v_proj'),
-                                (query, self.num_kv_heads * self.head_dim, self.num_kv_heads * self.head_dim))
+                                (query, self.num_kv_heads * self.head_dim,
+                                 self.num_kv_heads * self.value_dim))
         return (group,) if group.held(self.variables.get('params', {})) else ()
 
     def _rot_dim(self) -> int | None:
@@ -338,7 +355,9 @@ class CausalSelfAttention(nn.Module):
         key = checkpoint_name(key, 'k_proj')
         if not self.k_eq_v:
             value = checkpoint_name(value, 'v_proj')
-        value = value.reshape(batch, length, self.num_kv_heads, self.head_dim)
+        value = value.reshape(batch, length, self.num_kv_heads, self.value_dim)
+        if self.value_scale is not None:
+            value = scaled(value, self.value_scale)
         if whole:
             key = self.k_norm(key)
         key = key.reshape(batch, length, self.num_kv_heads, self.head_dim)
@@ -563,7 +582,7 @@ class CausalSelfAttention(nn.Module):
             if self.causal:
                 if not self.kv_shared:
                     positions, append = open_kv_cache(
-                        self, key, self.max_seq_len,
+                        self, key, self.max_seq_len, value_dim=self.value_dim,
                         valid=None if attention_metadata is None else attention_metadata.valid,
                         layout=self.kv_cache)
             elif self.kv_cache != KVCache():
@@ -807,7 +826,7 @@ class CausalSelfAttention(nn.Module):
         up to their own slot."""
         index = self.variable("cache", "cache_index", jnp.zeros, (0,), jnp.int32)
         store = KVStore.open(self, self.kv_cache, index.value.shape[0], self.max_seq_len,
-                             self.num_kv_heads, self.head_dim, key.dtype)
+                             self.num_kv_heads, self.head_dim, key.dtype, value_dim=self.value_dim)
         rows, pieces = index.value.shape[0], admitted.slots.shape[0]
         width = (query.shape[1] - rows) // pieces
         positions = positions[0]
@@ -935,7 +954,7 @@ class CausalSelfAttention(nn.Module):
             attention = attention * jax.nn.sigmoid(gate).astype(attention.dtype)
         attention = constrain(attention, HEADS)
         return checkpoint_name(
-            self.o_proj(attention.reshape(batch, length, self.num_heads * self.head_dim)), 'o_proj')
+            self.o_proj(attention.reshape(batch, length, self.num_heads * self.value_dim)), 'o_proj')
 
 
 @dataclasses.dataclass(frozen=True)

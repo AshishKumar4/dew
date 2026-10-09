@@ -416,7 +416,8 @@ def cached_validity(module: nn.Module, length: int) -> jax.Array:
 _DEFAULT_CACHE = KVCache()
 
 
-def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE):
+def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE,
+                  value_dim: int | None = None):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
@@ -424,7 +425,8 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     every row empty. The writer returns full cache arrays, including unused
     slots which the caller excludes with `cached_validity`. `layout` chooses the
     storage behind the slots, dense or paged, full or quantized
-    (`dew.nn.kv_cache`); the slots and the cursor are the same for all.
+    (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
+    are `value_dim` wide, None for the keys' width.
     """
     shards = sequence_shards()
     if shards > 1:
@@ -436,7 +438,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     batch, length, heads, head_dim = key.shape
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype)
+    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim)
     positions, allocated = cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 
