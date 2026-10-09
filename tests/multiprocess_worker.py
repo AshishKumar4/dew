@@ -648,9 +648,9 @@ def mode_pool_refusals(args) -> dict:
     """What a pool refuses on every process before any trains on it, each a
     fit of the affine regression over a stream that differs on process 1
     only: another corpus under the same name and length, another length,
-    a first read that fails there, and a batch without a field. A newest
-    checkpoint the processes list differently is refused as well. Each
-    outcome is the error's text, or None for a fit that trained."""
+    a first read that fails there, and a batch without a field. A resume
+    from a newest checkpoint the processes list differently is refused as
+    well. Each outcome is the error's text, or None for a fit that trained."""
     import jax
     import optax
     import orbax.checkpoint as ocp
@@ -720,13 +720,14 @@ def mode_pool_refusals(args) -> dict:
         "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
     }
-    listed = Checkpoints(str(Path(args.run_dir) / "saved"))
-    outcomes["latest"] = listed.latest
+    outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
     if other:
         # A listing of the shared directory taken before step 2 was committed.
         ocp.CheckpointManager.latest_step = lambda manager: 1
+    resumed = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
+                      checkpoints=Checkpoints(str(Path(args.run_dir) / "saved")))
     try:
-        outcomes["stale"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
+        outcomes["stale"] = int(resumed.place()[0].step)
     except (ValueError, RuntimeError) as error:
         outcomes["stale"] = f"{type(error).__name__}: {error}"
     return outcomes
