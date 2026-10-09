@@ -3,17 +3,17 @@
 	"arguments": [],
 	"script_sha256": "3870d3a4ee3b319a3f51ee0eae1df8fc750217942d30e11ab13b1a9c2a7f311e",
 	"meta": {
-		"where": "a 4-vCPU Cloudflare container",
-		"python": "3.12.15",
+		"where": "one A100",
+		"python": "3.12.3",
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "898a4ec7f2af4f4ee3b51c1842d43070e4a957e4",
-		"date": "2026-10-08"
+		"dew": "9235af7f3e8e80169dac359b2c60a295a8c92845",
+		"date": "2026-10-09"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 150.7,
+		"seconds": 105.0,
 		"columns": 96,
 		"screen": []
 	}

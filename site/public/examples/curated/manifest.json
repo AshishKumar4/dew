@@ -1,22 +1,22 @@
 {
  "model": {
   "model": "dewml/hybrid-dit-176m",
-  "revision": "403c4215556ac77826d69b3c3c7c30f9bb81ab9c",
+  "revision": "f9f06d778860501a257a900ca58faabf853f03cc",
   "loaded_with": "dew.sampling.TextToImage.from_run(pull_from_hub('dewml/hybrid-dit-176m', revision=...)), the run from_pretrained loads",
   "checkpoint_step": 1350000,
   "parameters": 175640848,
-  "dew_commit": "0829ae01fcfddcf1bf02451042c6fc551385c7f2",
+  "dew_commit": "9235af7f3e8e80169dac359b2c60a295a8c92845",
   "device": "NVIDIA A100-SXM4-40GB",
   "jax": "0.11.2.post3",
   "compute": "published run dtypes, unquantized",
-  "run_json_sha256": "ba2160cd785227b4460c8ce1d76b28d74386039601b7cd1b5acbc7f32f1f477a",
+  "run_json_sha256": "70b25756ea0e3b564a7765fd0e004f12286307b653c87531858c6f1ad1cc6724",
   "tools_commit": "each entry's call, run again on one A100"
  },
  "grid": [
   6,
   4
  ],
- "note": "Each image is one call (see call); key is the sampling key (the old seed). Every image is band-free at 256x256. The set was chosen from RTX 4080 draws of revision 3664c055, on which clip_score and aesthetic were measured; these are the same calls run again on one A100 at 403c4215.",
+ "note": "Each image is one call (see call); key is the sampling key (the old seed). Every image is band-free at 256x256. The set was chosen from RTX 4080 draws of revision 3664c055, on which clip_score and aesthetic were measured; these are the same calls run again on one A100 at f9f06d77.",
  "images": [
   {
    "id": "dpm40_cfg7.5i_negB/aurora2.vivid.s05",
