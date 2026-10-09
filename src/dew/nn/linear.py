@@ -38,7 +38,7 @@ from .attention import unweighted_rmsnorm
 from .blocks import normal_kernel
 from .inputs import AttentionMetadata
 from .precision import asks_default_precision, at_least_fp32
-from .sharding import logical_axes
+from .sharding import logical_axes, rows_like
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -162,7 +162,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     batch, channels, _ = x.shape
     width = kernel.shape[1] - 1
     if state is None:
-        state = jnp.zeros((batch, channels, width), x.dtype)
+        state = rows_like(jnp.zeros((batch, channels, width), x.dtype), x)
     valid = jnp.asarray(valid, bool)
     rank, source = _stream_order(valid)
     # Gathered in bounds from one appended zero column: an out-of-range 'fill'

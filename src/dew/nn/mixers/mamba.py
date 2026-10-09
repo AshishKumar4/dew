@@ -44,7 +44,7 @@ from dew.nn.linear import DepthwiseConv1d
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba2 import held_scan
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import LayoutRefused, logical_axes, sequence_shards
+from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
 
 CHUNK_SIZE = 64
 """Tokens per associative scan. Each chunk materialises its `[B, C, D, N]`
@@ -73,7 +73,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, channels = x.shape
     chunk_size = min(chunk_size, length)
-    carried = jnp.zeros((batch, channels, A.shape[-1]), work) if state is None else jnp.asarray(state, work)
+    carried = (rows_like(jnp.zeros((batch, channels, A.shape[-1]), work), x) if state is None
+               else jnp.asarray(state, work))
     pad = (chunk_size - length % chunk_size) % chunk_size
 
     def chunks(t):  # [B, S, ...] -> [NC, B, C, ...], chunks leading for the scan
