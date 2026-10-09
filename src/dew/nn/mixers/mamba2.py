@@ -486,8 +486,8 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     taps, bias, dt_bias, A, D = weights
     width = taps.shape[1] - 1
     mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
-    batch, _, length = mixed.shape
-    history = jnp.zeros_like(mixed[..., :width])
+    batch, channels, length = mixed.shape
+    history = rows_like(jnp.zeros((batch, channels, width), mixed.dtype), mixed)
     forward = None
     if axis is not None:
         if length < width:
