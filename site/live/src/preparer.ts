@@ -38,6 +38,8 @@ const STAGE_MS = 16 * 60_000;
 // again, once: a smoke restores the same snapshot every time, and a rebuild would make another.
 const RESTORE_MS = 6 * 60_000;
 const RESTORES = 2;
+/** The longest a preparation runs, from its build's start to its report: a build, a restore cut off, and a smoke. */
+export const PREPARATION_MS = STAGE_MS + RESTORE_MS + STAGE_MS;
 
 interface Job {
 	commit: string;
@@ -132,7 +134,10 @@ export class ManagedPreparer extends DurableObject<Env> {
 
 	/** Every snapshot this preparer made that an operator has not forgotten (snapshot-ledger.ts). */
 	async snapshots(): Promise<SnapshotRecord[]> {
-		return Object.values((await this.ctx.storage.get<Record<string, SnapshotRecord>>('snapshots')) ?? {});
+		const preparing = (await this.ctx.storage.get<Job>('job'))?.record?.id;
+		// A snapshot is preparing while its job runs; one no job holds was cut off before it recorded its end.
+		return Object.values((await this.ctx.storage.get<Record<string, SnapshotRecord>>('snapshots')) ?? {})
+			.map((record) => record.state === 'preparing' && record.id !== preparing ? { ...record, state: 'failed' } : record);
 	}
 
 	/** Forget snapshots an operator is about to delete. */
