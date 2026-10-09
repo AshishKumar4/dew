@@ -14,8 +14,8 @@ vision tower beside a pipelined decoder, a tensor or sequence axis over
 experts, and a data axis Explicit (`MeshSpec.explicit`), alone and beside
 fsdp, wherever an operation is placed from its rows rather than its
 operands: the embedding's gather and scatter-add, GRPO's shifted scores,
-MDLM's mask draw, Mamba-2's state, unpatchify, JEPA's repeat and covariance,
-and a vision tower's placed slots.
+MDLM's mask draw, Mamba-1's and Mamba-2's states and conv histories,
+unpatchify, JEPA's repeat and covariance, and a vision tower's placed slots.
 
 The tool draws every parameter an initializer leaves all zeros, so a
 DiT's zeroed output and modulations do not hide the layers above them
@@ -39,6 +39,7 @@ CELLS: dict[str, tuple[str, ...]] = {
     "moe_grpo": ("expert4", "expert2_fsdp2", "tensor4", "sequence4"),
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4", "data4_explicit"),
+    "mamba1_packed": ("fsdp2_explicit",),
     "mmdit": ("tensor4", "fsdp2_tensor2"),
     "dit": ("sequence4", "tensor4", "fsdp2_explicit"),
     "unet": ("tensor4", "fsdp2_tensor2", "sequence4"),
