@@ -27,7 +27,7 @@ from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
 from .kernels import decode_attention
-from .kernels.generation import bf16_dot_runs, device_generation, measured_kernel
+from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
 from .precision import (
     at_default_precision,
@@ -68,10 +68,11 @@ the dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
 'auto', every module's default, resolves per trace (`resolve_implementation`):
-flash where `flash_runs`; triton where cudnn's kernel runs and
+flash where `flash_refusal` finds none; triton where cudnn's kernel runs and
 `triton_runs`; cudnn where its kernel runs; tpu where splash's does;
 the reference path where the call asks for arithmetic only it honours; and
-xla anywhere else.
+xla anywhere else. A call off the kernel `KERNELS` measured fastest on the
+device is logged once a process with the reason (`ran_kernel`).
 """
 
 
@@ -797,19 +798,29 @@ def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
 FLASH_MAX_HEAD_DIM = 256
 
 
-def flash_runs(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None) -> bool:
-    """Whether 'auto' sends a call to FlashAttention-2 (`flash_attention`):
-    dew_flash_attn is installed, `KERNELS` names it for the GPU, the query
-    is bf16 or fp16 with heads a multiple of 8 up to 256 wide, a causal call
-    is square, the call has no window, mask, bias or softcap, and no
+def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
+                  sinks=None) -> str | None:
+    """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
+    or None where it does: `KERNELS` names it for the GPU, the query is bf16
+    or fp16 with heads a multiple of 8 up to 256 wide, a causal call is
+    square, the call has no window, mask, bias, softcap or sinks, no
     deterministic ops are asked for, which its backward's atomic sum of the
-    query gradient would not keep."""
+    query gradient would not keep, and dew_flash_attn is installed."""
     head_dim = query.shape[-1]
-    return (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash'
-            and query.dtype in CUDNN_DTYPES and head_dim % 8 == 0 and head_dim <= FLASH_MAX_HEAD_DIM
-            and (not causal or query.shape[-3] == key.shape[-3])
-            and sliding_window is None and mask is None and bias is None and softcap is None
-            and not deterministic_ops_requested() and importlib.util.find_spec('dew_flash_attn') is not None)
+    return first_refusal(
+        (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash',
+         "KERNELS names it for no other device"),
+        (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
+        (head_dim % 8 == 0 and head_dim <= FLASH_MAX_HEAD_DIM, f"the heads are {head_dim} wide"),
+        (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
+        (sliding_window is None, "the call has a sliding window"),
+        (mask is None, "the call has a mask"),
+        (bias is None, "the call has a bias"),
+        (softcap is None, "the call has a logit softcap"),
+        (sinks is None, "the call has attention sinks"),
+        (not deterministic_ops_requested(), "--xla_gpu_deterministic_ops is set"),
+        (importlib.util.find_spec('dew_flash_attn') is not None, "dew_flash_attn is not installed"),
+    )
 
 
 def flash_attention(query, key, value, causal: bool):
@@ -1396,11 +1407,11 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     backend (both 'auto' and 'xla' take the reference path where jax.nn's
     xla kernel would narrow the call, `_xla_kernel_narrows`): the reference
     path when the call asks for arithmetic no fused kernel performs
-    (`reference_only`), else flash where `flash_runs` and the call has no
-    sinks, cudnn where `cudnn_runs` and the call has no sinks and no
-    bidirectional window (triton in its place where `triton_runs`), the tpu
-    kernel where
-    `tpu_runs`, and xla anywhere else. Any other name is returned as it is,
+    (`reference_only`), else flash where `flash_refusal` has no refusal,
+    cudnn where `cudnn_runs` and the call has no sinks and no bidirectional
+    window (triton in its place where `triton_runs`), the tpu kernel where
+    `tpu_runs`, and xla anywhere else; a call off flash where it was measured
+    fastest is logged (`ran_kernel`). Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'flash', 'tpu'):
@@ -1411,16 +1422,19 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
         return implementation
     if reference_only(query, dtype, precision, force_fp32_for_softmax):
         return 'reference'
-    if sinks is None and flash_runs(query, key, causal, sliding_window, mask, bias, softcap):
+    refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks)
+    if refusal is None:
         return 'flash'
     # cuDNN keeps a window behind the query only (jax.nn.dot_product_attention
     # refuses a right window without the causal mask), so a bidirectional
     # window goes past it.
     if sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None):
-        return 'triton' if triton_runs(query, sliding_window, mask, bias) else 'cudnn'
-    if tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask, bias=bias):
-        return 'tpu'
-    return 'xla'
+        chosen = 'triton' if triton_runs(query, sliding_window, mask, bias) else 'cudnn'
+    elif tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask, bias=bias):
+        chosen = 'tpu'
+    else:
+        chosen = 'xla'
+    return ran_kernel('attention', chosen, refusal)
 
 
 def kernel_for_materialized_mask(implementation: str, query, *, dtype=None, precision=None,

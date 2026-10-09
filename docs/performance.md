@@ -2428,6 +2428,8 @@ other GPU.
 
 Each kernel's implementation is chosen in one place and keyed by hardware generation (`dew.nn.kernels.device_generation`: `sm80`, `sm86`, `sm89`, `v5e`, `v6e`, ...), and a generation without a measurement here runs the XLA path. `tools/benchmark_kernels.py` and `tools/benchmark_lm_head.py` reproduce the rows. Each row is one process with jax 0.11.1 and bf16 compute, on a Colab NVIDIA L4 (the RTX 4080's architecture, sm_89), a Colab TPU v6e-1, or, for the kernel-level rows, the local RTX 4080. The step rows come from `tools/benchmark_kernels.py step` (built on `tools/benchmark_step.py`'s trainer), with 30 timed steps after 5 warmup. lm-moe has 321.8M parameters with 8 experts and top-2 routing, and lm-dense has 359.8M; both run at sequence 1024. The batch is 4 (moe) and 1 (dense) on the L4, and 8 and 8 on the v6e. "before" is main at c1f7e2dd.
 
+A call that runs another kernel where a row here measured one fastest logs a warning, once a process for each kernel and reason, on the `dew` logger: `attention runs 'cudnn', not 'flash', the kernel measured fastest on sm80: dew_flash_attn is not installed` (`dew.nn.kernels.ran_kernel`). A change that sends calls off the measured kernel shows in a run's log, not only in its step time.
+
 ### The MoE grouped matmul: `KERNELS['grouped_matmul']`
 
 | device | path | ms/step | p50 ms | peak GiB |
