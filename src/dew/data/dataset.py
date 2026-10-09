@@ -1227,7 +1227,7 @@ class LengthGroups:
     window: int = 64
 
 
-class _Grouped[Record](pygrain.MapDataset[Record]):
+class _Grouped(pygrain.MapDataset[Batch]):
     """`parent` with each window of `rows * window` records sorted by length
     and cut into batches of `rows`, the batches shuffled within the window
     from `seed`. A window's order is computed when one of its records is first
@@ -1236,7 +1236,7 @@ class _Grouped[Record](pygrain.MapDataset[Record]):
 
     _MUTATES_ELEMENT_SPEC = False
 
-    def __init__(self, parent: pygrain.MapDataset[Record], groups: LengthGroups, rows: int, seed: int):
+    def __init__(self, parent: pygrain.MapDataset[Batch], groups: LengthGroups, rows: int, seed: int):
         super().__init__(parent)
         self._groups, self._rows, self._seed = groups, rows, seed
         self._span = rows * groups.window
@@ -1246,11 +1246,11 @@ class _Grouped[Record](pygrain.MapDataset[Record]):
         return len(self._parent)
 
     @overload
-    def __getitem__(self, index: slice) -> pygrain.MapDataset[Record]: ...
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
     @overload
-    def __getitem__(self, index: int) -> Record: ...
+    def __getitem__(self, index: int) -> Batch | None: ...
 
-    def __getitem__(self, index: int | slice) -> Record | pygrain.MapDataset[Record]:
+    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch] | None:
         if isinstance(index, slice):
             return self.slice(index)
         start = index - index % self._span
@@ -1260,7 +1260,9 @@ class _Grouped[Record](pygrain.MapDataset[Record]):
         order = self._orders.get(start)
         if order is None:
             size = min(self._span, len(self._parent) - start)
-            ranked = np.argsort([self._groups.length(self._parent[start + offset]) for offset in range(size)],
+            records = [self._parent[start + offset] for offset in range(size)]
+            # A record the parent filtered out reads as None and is skipped wherever it lands.
+            ranked = np.argsort([0 if record is None else self._groups.length(record) for record in records],
                                 kind="stable")
             batches = [ranked[first:first + self._rows] for first in range(0, size, self._rows)]
             shuffled = np.random.default_rng([self._seed, start]).permutation(len(batches))
