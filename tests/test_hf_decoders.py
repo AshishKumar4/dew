@@ -137,9 +137,13 @@ TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-
 TINY = ("qwen3-tiny", "gemma3-tiny", "llama-tiny", "mistral-tiny", "qwen2-tiny",
         "gemma-tiny", "gemma2-tiny", "olmo3-tiny", "olmo3-yarn-tiny",
         "llama31-tiny", "gpt2-tiny", "opt-tiny", "gpt-neox-tiny",
-        "bloom-tiny", "gpt-neo-tiny", "phi-tiny", "falcon-tiny", "falcon-mha-tiny", "gptj-tiny", "phi3-tiny")
+        "bloom-tiny", "gpt-neo-tiny", "phi-tiny", "falcon-tiny", "falcon-mha-tiny", "gptj-tiny", "phi3-tiny",
+        "gpt-bigcode-tiny", "starcoder2-tiny")
+# A multi-head GPTBigCode's record is GPT-2's, so a weight translation from
+# the record alone reads GPT-2's Conv1D layout; the loader names the source's
+# family, and tests/test_hf_bigcode_starcoder2.py holds it to the reference.
 CLASSIC = ('bloom-tiny', 'gpt-neo-tiny', 'phi-tiny', 'falcon-tiny', 'falcon-mha-tiny', 'gptj-tiny',
-           'phi3-tiny')
+           'phi3-tiny', 'gpt-bigcode-tiny', 'starcoder2-tiny')
 DEEPSEEK = ("deepseek-v3-tiny", "deepseek-v32-tiny")
 ROUTED = (*DEEPSEEK, "kimi-k2-tiny", "mixtral-tiny", "qwen3-moe-tiny")
 HYBRID = ("nemotron-h-tiny", "nemotron-h-moe-tiny", "nemotron-h-moe-latent-tiny")
