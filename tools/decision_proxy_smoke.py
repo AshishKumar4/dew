@@ -31,7 +31,8 @@ def _suite(kit: Path, directory: Path) -> list[dict]:
         for number in area["benchmarks"]:
             ids = sorted(admitted[number]) if number in admitted else []
             tracks = NAMES[number] if number == 30 else [constants.HEADLINE.get(number, "synthetic")]
-            for group in range(100):
+            count = min(100, len(ids) // len(tracks)) if ids else 100
+            for group in range(count):
                 for variant, track in enumerate(tracks):
                     gold = "yes" if group % 2 else "no"
                     question = {"type": "choice", "instructions": "Synthetic choice", "criteria": {
