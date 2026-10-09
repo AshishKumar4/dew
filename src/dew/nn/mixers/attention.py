@@ -134,7 +134,10 @@ class CausalSelfAttention(nn.Module):
     rope_theta: float = 10000.0
     rope_scaling: RopeScaling | LongRopeScaling | None = None
     qk_norm: bool = True
-    qk_norm_scope: str = 'head'  # 'head': one RMSNorm per head; 'projection': over the whole q/k
+    qk_norm_scope: str = 'head'
+    """'head': one RMSNorm scale over each head; 'projection': over the whole q/k;
+    'head_layernorm': a bias-free LayerNorm over each head under that head's own
+    scale, [heads, head_dim] (StableLM's per-head norms, Cohere's q/k norms)."""
     qk_norm_weight: bool = True  # False: Llama 4's weightless L2 norm (Llama4TextL2Norm)
     v_norm: bool = False
     norm_eps: float = 1e-5
@@ -231,12 +234,20 @@ class CausalSelfAttention(nn.Module):
             self.attention_bias if self.o_proj_bias is None else self.o_proj_bias),
             **normal_kernel(self.init_std if self.output_init_std is None else self.output_init_std))
         if self.qk_norm:
-            if self.qk_norm_scope not in ('head', 'projection'):
+            if self.qk_norm_scope not in ('head', 'projection', 'head_layernorm'):
                 raise ValueError(
-                    f"qk_norm_scope is 'head' or 'projection', got {self.qk_norm_scope!r}")
-            norm = functools.partial(
-                RMSNorm, epsilon=self.norm_eps, with_scale=self.qk_norm_weight,
-                scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast, dtype=self.dtype)
+                    f"qk_norm_scope is 'head', 'projection' or 'head_layernorm', got {self.qk_norm_scope!r}")
+            if self.qk_norm_scope == 'head_layernorm':
+                # The mean comes off and the variance is the exact two-pass
+                # one, both in fp32, as CohereLayerNorm and torch's LayerNorm
+                # compute them; the scale spans the heads and their dims.
+                norm = functools.partial(
+                    nn.LayerNorm, epsilon=self.norm_eps, use_bias=False, use_fast_variance=False,
+                    reduction_axes=-1, feature_axes=(-2, -1), dtype=self.dtype)
+            else:
+                norm = functools.partial(
+                    RMSNorm, epsilon=self.norm_eps, with_scale=self.qk_norm_weight,
+                    scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast, dtype=self.dtype)
             self.q_norm = norm(name='q_norm')
             if not self.kv_shared:
                 self.k_norm = norm(name='k_norm')
@@ -960,6 +971,9 @@ class AttentionMixer(MixerBase):
     """XSA (arXiv 2603.09078, lm-engine's `exclusive_self_attention`): each
     head's output loses its component along the token's own value
     (`exclusive_self_attention`)."""
+    rotary_pairs: Literal['half', 'adjacent'] = 'half'
+    """The channels each angle turns: the halves of most decoders, or the
+    adjacent pairs Cohere's rotary interleaves (`dew.nn.rope.rotate`)."""
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout.
     mixed_step = True

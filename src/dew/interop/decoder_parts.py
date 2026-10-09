@@ -170,6 +170,24 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
     # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
     # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
     # modeling_qwen3_5_moe.py:1868).
+    # StableLM 2 12B's own code read these; StableLmDecoderLayer builds its
+    # norms biased whatever use_norm_bias says, and that checkpoint stores
+    # the biases, and StableLmRotaryEmbedding scales no frequency.
+    'stablelm': {'use_norm_bias': _any_value,
+                 'rotary_scaling_factor': lambda key, hf_config: hf_config[key] == 1.0},
+    # Command A's own code read these: Cohere2Attention rotates every
+    # channel of a sliding layer's heads in adjacent pairs, Cohere2Config's
+    # legacy pattern puts the sliding layers first, and Cohere2DecoderLayer
+    # is the gated parallel block over the head's own tied table. How a
+    # tensor-parallel run splits the table computes nothing.
+    'cohere2': {'rotary_pct': lambda key, hf_config: hf_config[key] == 1.0,
+                'position_embedding_type': lambda key, hf_config: hf_config[key] == 'rope_gptj',
+                'order_of_interleaved_layers': lambda key, hf_config: hf_config[key] == 'local_attn_first',
+                'use_gated_activation': lambda key, hf_config: hf_config[key] is True,
+                'use_parallel_block': lambda key, hf_config: hf_config[key] is True,
+                'use_embedding_sharing': lambda key, hf_config: hf_config[key] == hf_config.get(
+                    'tie_word_embeddings', True),
+                'use_parallel_embedding': _any_value},
     'qwen3_5': {'hidden_size': _repeats('hidden_size', section='text_config')},
     'qwen3_5_moe': {'hidden_size': _repeats('hidden_size', section='text_config')},
 }

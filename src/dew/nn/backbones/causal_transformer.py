@@ -212,7 +212,10 @@ class CausalTransformer(nn.Module):
     shared_parallel_norm: bool = False
     """Both parallel branches read one LayerNorm, as in Phi, Falcon-7B and GPT-J."""
     qk_norm: bool = True
-    qk_norm_scope: str = 'head'              # 'head' per head (Qwen3); 'projection' whole (OLMo 3)
+    qk_norm_scope: str = 'head'
+    """'head' one RMSNorm per head (Qwen3), 'projection' the whole projection
+    (OLMo 3), 'head_layernorm' a LayerNorm per head with each head's own scale
+    (StableLM, Cohere)."""
     v_norm: bool = False                     # Gemma 4's scale-free values norm
     attention_k_eq_v: bool = False           # Gemma 4's global layers read their values off the keys
     layer_scalar: Literal["frozen", "trainable"] | None = None

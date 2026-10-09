@@ -48,8 +48,10 @@ class MixerContext:
     """The kind-resolved llama3 ramp over the base frequencies, or None for plain rope."""
     qk_norm: bool = True
     qk_norm_scope: str = 'head'
-    """Where the q/k RMSNorm applies: 'head' norms each head after the split
-    (Qwen3, the Gemmas), 'projection' the whole projection before it (OLMo 3)."""
+    """Where the q/k norm applies: 'head' RMS-norms each head after the split
+    (Qwen3, the Gemmas), 'projection' the whole projection before it (OLMo 3),
+    and 'head_layernorm' LayerNorms each head under its own scale (StableLM,
+    Cohere)."""
     v_norm: bool = False
     k_eq_v: bool = False
     """Gemma 4's attention_k_eq_v on this layer: no value projection, the

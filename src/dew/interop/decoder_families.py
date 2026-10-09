@@ -3,6 +3,7 @@
 from dew.interop import mamba2
 from dew.interop.decoder_parts import DecoderFamily
 from dew.interop.families.bloom import BLOOM
+from dew.interop.families.cohere import COHERE, COHERE2
 from dew.interop.families.deepseek import (
     DEEPSEEK_V2,
     DEEPSEEK_V3,
@@ -39,6 +40,7 @@ from dew.interop.families.qwen import (
     QWEN3_MOE,
     QWEN3_NEXT,
 )
+from dew.interop.families.stablelm import STABLELM
 from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
@@ -52,6 +54,9 @@ ENTRIES = (
     MINIMAX_M2,
     MODERNBERT,
     NEMOTRON_H,
+    STABLELM,
+    COHERE2,
+    COHERE,
     STARCODER2,
     GPT_NEOX,
     OPT,

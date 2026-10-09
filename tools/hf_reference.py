@@ -83,7 +83,8 @@ from transformers import (
     PhiConfig, PhiForCausalLM, Phi3Config, Phi3ForCausalLM,
     FalconConfig, FalconForCausalLM,
     GPTJConfig, GPTJForCausalLM, GPTBigCodeConfig, GPTBigCodeForCausalLM, Starcoder2Config,
-    Starcoder2ForCausalLM,
+    Starcoder2ForCausalLM, StableLmConfig, StableLmForCausalLM, CohereConfig, CohereForCausalLM,
+    Cohere2Config, Cohere2ForCausalLM,
     Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
     MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
     Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
@@ -212,6 +213,55 @@ def tiny_starcoder2() -> Starcoder2ForCausalLM:
         num_key_value_heads=2, max_position_embeddings=48, sliding_window=5, norm_epsilon=3e-5, use_bias=True,
         rope_parameters={'rope_type': 'default', 'rope_theta': 10000.0}, residual_dropout=0.,
         embedding_dropout=0., attention_dropout=0., bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+STABLELM_CONFIGS = (
+    ('stablelm-2-1_6b', 'stabilityai/stablelm-2-1_6b', 'f499ead74c53749bd93cebc6ce8bc0d7bdf1eaef'),
+    ('stablelm-2-12b', 'stabilityai/stablelm-2-12b', '74dd3f536b71d18aa122a11af0d1b83105cb2d38'),
+)
+# CohereLabs' repos answer 403 without an accepted licence; Unsloth's
+# re-uploads carry the released configs plus their own markers.
+COHERE_CONFIG = ('command-r-08-2024', 'unsloth/c4ai-command-r-08-2024',
+                 'b67ed911c4bb801e596c5127b60474edc4395b89')
+COHERE2_CONFIG = ('command-a-03-2025', 'unsloth/c4ai-command-a-03-2025',
+                  '26b8ba0749d8c9424ad8f9ab45b5e99356d587ac')
+
+
+def tiny_stablelm(parallel: bool = False) -> StableLmForCausalLM:
+    """Half the head rotated, biased q/k/v over a bias-free output and a
+    gated feed-forward. The parallel one shares its norm between branches,
+    groups its keys and norms each query and key head under its own scale."""
+    torch.manual_seed(0)
+    return StableLmForCausalLM(StableLmConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2 if parallel else 4, max_position_embeddings=48, layer_norm_eps=3e-5,
+        rope_parameters={'rope_type': 'default', 'rope_theta': 10000.0, 'partial_rotary_factor': 0.5},
+        use_qkv_bias=True, qk_layernorm=parallel, use_parallel_residual=parallel, hidden_dropout=0.,
+        attention_dropout=0., bos_token_id=1, eos_token_id=None, pad_token_id=0))
+
+
+def tiny_cohere() -> CohereForCausalLM:
+    """Adjacent-pair rotary, per-head query and key norms, biased attention
+    and a logit scale that is no power of two."""
+    torch.manual_seed(0)
+    return CohereForCausalLM(CohereConfig(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, max_position_embeddings=48, layer_norm_eps=3e-5,
+        logit_scale=0.8333333333333334, rope_parameters={'rope_type': 'default', 'rope_theta': 10000.0},
+        attention_bias=True, use_qk_norm=True, attention_dropout=0., bos_token_id=1, eos_token_id=None,
+        pad_token_id=0))
+
+
+def tiny_cohere2() -> Cohere2ForCausalLM:
+    """A rotated sliding layer under a window shorter than the sequence,
+    then an unrotated full one."""
+    torch.manual_seed(0)
+    return Cohere2ForCausalLM(Cohere2Config(
+        vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=2, num_attention_heads=4,
+        num_key_value_heads=2, max_position_embeddings=48, layer_norm_eps=3e-5, logit_scale=0.25,
+        rope_parameters={'rope_type': 'default', 'rope_theta': 10000.0}, sliding_window=5,
+        layer_types=['sliding_attention', 'full_attention'], attention_dropout=0.,
+        bos_token_id=1, eos_token_id=None, pad_token_id=0))
 
 
 def tiny_gptj() -> GPTJForCausalLM:
@@ -1669,6 +1719,20 @@ def write_classic_family(family: str) -> None:
         write_classic_tiny('starcoder2-tiny', tiny_starcoder2())
         write_released_config(*STARCODER2_CONFIG)
         return
+    if family == 'stablelm':
+        write_classic_tiny('stablelm-tiny', tiny_stablelm())
+        write_classic_tiny('stablelm-parallel-tiny', tiny_stablelm(parallel=True))
+        for config in STABLELM_CONFIGS:
+            write_released_config(*config)
+        return
+    if family == 'cohere':
+        write_classic_tiny('cohere-tiny', tiny_cohere())
+        write_released_config(*COHERE_CONFIG)
+        return
+    if family == 'cohere2':
+        write_classic_tiny('cohere2-tiny', tiny_cohere2())
+        write_released_config(*COHERE2_CONFIG)
+        return
     if family == 'phi3':
         write_classic_tiny('phi3-tiny', tiny_phi3())
         for config in PHI3_CONFIGS:
@@ -1683,7 +1747,8 @@ def main() -> None:
     parser.add_argument("--nemotron-h-only", action="store_true",
                         help="only the Nemotron-H tiny fixture and two pinned released configs")
     parser.add_argument('--classic-family', choices=('bloom', 'gpt_neo', 'phi', 'phi3', 'falcon', 'gptj',
-                                                     'gpt_bigcode', 'starcoder2'),
+                                                     'gpt_bigcode', 'starcoder2', 'stablelm', 'cohere',
+                                                     'cohere2'),
                         help='only this classic decoder fixture and its pinned released configs')
     parser.add_argument('--minimax-m2-only', action='store_true',
                         help='only MiniMax-M2 with transformers 5.18.0 and its pinned configs')
