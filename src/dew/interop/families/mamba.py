@@ -66,7 +66,8 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # the forward reads at fp32.
     used.update(("time_step_scale", "time_step_min", "time_step_max", "time_step_init_scheme",
                  "time_step_floor", "rescale_prenorm_residual", "residual_in_fp32", "use_mambapy",
-                 "use_associative_scan", "layer_norm_epsilon"))
+                 "use_associative_scan"))
+    used.add("layer_norm_epsilon")
     mixer = MambaMixer(
         intermediate_size=expand * hidden,
         state_size=integer("state_size", 16),

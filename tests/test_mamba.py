@@ -97,6 +97,14 @@ def test_the_reference_catches_a_shared_decay():
                                          np.load(TINY / 'logits_f64.npy'), 'mamba with a shared decay')
 
 
+def test_a_decode_step_scans_one_token():
+    """One token is the recurrence's one step, not a chunk padded out to 64."""
+    x, dt, A, B, C, D = operands(length=1)
+    jaxpr = jax.make_jaxpr(lambda *args: selective_scan(*args, chunk_size=64))(x, dt, A, B, C, D)
+    shapes = [getattr(var.aval, 'shape', ()) for equation in jaxpr.eqns for var in equation.outvars]
+    assert all(64 not in shape for shape in shapes)
+
+
 def test_the_layer_decodes_as_it_prefills():
     mixer = Mamba(emb_features=8, intermediate_size=16, state_size=4, time_step_rank=2, chunk_size=4)
     x = jax.random.normal(jax.random.key(0), (2, 9, 8))

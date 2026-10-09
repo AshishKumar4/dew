@@ -66,11 +66,13 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     `x` and `dt` `[B, S, D]`, `A` `[D, N]`, `B` and `C` `[B, S, N]`, `D` `[D]`;
     returns `(output [B, S, D], state [B, D, N])` computed in `at_least_fp32`
     and cast back. `starts` `[B, S]` marks packed documents' first tokens,
-    whose entering state drops.
+    whose entering state drops. A call shorter than a chunk scans its own
+    length, so a decode step is the recurrence's one step.
     """
     dtype, work = x.dtype, at_least_fp32(x.dtype)
     x, dt, A, B, C, D = (jnp.asarray(t, work) for t in (x, dt, A, B, C, D))
     batch, length, channels = x.shape
+    chunk_size = min(chunk_size, length)
     carried = jnp.zeros((batch, channels, A.shape[-1]), work) if state is None else jnp.asarray(state, work)
     pad = (chunk_size - length % chunk_size) % chunk_size
 
