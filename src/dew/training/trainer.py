@@ -31,7 +31,6 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
@@ -1514,9 +1513,8 @@ class Trainer(Generic[Loss, Effects]):
             checkpoint_due = False
             if current % plan.log_every == 0:
                 elapsed = time.perf_counter() - run.last_checkpoint
-                due = np.asarray(elapsed >= plan.checkpoint_every.total_seconds())
-                checkpoint_due = bool(due) if jax.process_count() == 1 else bool(
-                    np.asarray(multihost_utils.process_allgather(due)).any())
+                due = elapsed >= plan.checkpoint_every.total_seconds()
+                checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
         else:
             checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
         due = plan.due(current)
