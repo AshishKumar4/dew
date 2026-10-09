@@ -273,8 +273,10 @@ def gmm(
     pl.next_power_of_2(min(b, s))
     for b, s in zip([block_m, block_k, block_n], [size.m, size.k, size.n], strict=True)
   )
-  # Dew: an MXFP4 tile holds whole groups.
+  # Dew: an MXFP4 tile holds whole groups, each beside its one exponent;
+  # a power of two from GROUP up is a multiple of it.
   block_k, block_n = max(block_k, GROUP if mxfp4 else 16), max(block_n, 16)
+  assert not (mxfp4 and block_k % GROUP), f"MXFP4 tiles of {block_k} inputs split a group of {GROUP}"
 
   A_spec = pl.BlockSpec((size.g, size.k, block_n), lambda i, j: (0, 0, j))
   if trans_rhs:  # transposed spec

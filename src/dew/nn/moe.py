@@ -621,6 +621,15 @@ def expert_kernel(module: nn.Module, name: str, initializer: Callable[..., jax.A
     return MXFP4Experts(*(parts[part] for part in MXFP4_PARTS))
 
 
+def held_mxfp4(params: Mapping[str, object], path: tuple[str, ...] = ()) -> list[str]:
+    """The '/'-joined paths of the expert matrices `params` holds as an MXFP4
+    checkpoint's bytes (`expert_kernel`), which serve and do not train."""
+    if set(params) == set(MXFP4_PARTS):
+        return ['/'.join(path)]
+    return [held for name, child in params.items() if isinstance(child, Mapping)
+            for held in held_mxfp4(child, (*path, name))]
+
+
 class ExpertLinear(nn.Module):
     """One matrix per expert, `[exp, in_features, features]`, held as
     `storage` names (`expert_kernel`); `ExpertMLP` reads the kernel and

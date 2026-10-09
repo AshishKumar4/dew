@@ -322,6 +322,29 @@ def test_dew_pipeline_holds_mxfp4_experts_where_the_fused_kernel_was_measured(gp
     assert_bitwise(*(jax.jit(task.model.apply)(task.variables, ids) for task in tasks))
 
 
+def test_a_trainer_refuses_experts_held_in_mxfp4(gpt_oss_mxfp4):
+    """Held experts serve: an optimizer would move their uint8 codes as
+    numbers, so the trainer refuses them where it first reads the tree, and
+    the same checkpoint loaded with float experts builds its state."""
+    import optax
+
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer
+
+    def state(storage: str):
+        loaded = Pretrained.load(str(gpt_oss_mxfp4), dtype="float32", attention_impl="xla",
+                                 expert_storage=storage)
+        trainer = Trainer(LMObjective(loaded, 7, ema_decay=None, pad_id=0), optax.adamw(1e-3),
+                          key=jax.random.key(0))
+        return jax.eval_shape(trainer.initial_state)
+
+    with pytest.raises(ValueError, match=r"layers_0/mlp/experts/gate_up_proj is held as the checkpoint's "
+                                         r"bytes .* load with expert_storage='float' to train"):
+        state("mxfp4")
+    experts = state("float").variables["params"]["layers_0"]["mlp"]["experts"]
+    assert experts["gate_up_proj"].dtype == np.float32
+
+
 def test_a_source_without_mxfp4_experts_is_refused():
     with pytest.raises(ValueError, match="ships none"):
         Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla", expert_storage="mxfp4")

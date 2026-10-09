@@ -48,6 +48,7 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.nn.kernels.generation import measured_kernel
+from dew.nn.moe import held_mxfp4
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -629,6 +630,12 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
                 "the optimizer moves params and treats every other collection as state")
+        held = held_mxfp4(params["params"])
+        if held:
+            # An optimizer would move the uint8 codes as numbers: decoupled
+            # weight decay alone rewrites every byte.
+            raise ValueError(f"params/{held[0]} is held as the checkpoint's bytes (expert_storage='mxfp4'), "
+                             "which serves only; load with expert_storage='float' to train")
         ema = self.objective.ema
         return TrainState(
             step=jnp.zeros((), jnp.int32),
