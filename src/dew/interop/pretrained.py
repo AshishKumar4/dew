@@ -1078,15 +1078,16 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
 
 
 class _Decoded(NamedTuple):
-    """A source's tensors with its quantized weights decoded, those it keeps
-    MXFP4 apart (`stored`), and what `save` needs to write them back: the
-    quantized names, the scales' dtype and the integer formats' grid."""
+    """A source's tensors with its quantized weights decoded, the routed
+    experts it keeps MXFP4 apart (`mxfp4`), and what `save` needs to write
+    them back: the quantized names, the scales' dtype and the integer
+    formats' grid."""
 
     tensors: Mapping[str, np.ndarray]
     quantized_tensors: tuple[str, ...]
     scale_dtype: str | None
     grid: dict[str, np.ndarray]
-    stored: dict[str, StoredMXFP4]
+    mxfp4: dict[str, StoredMXFP4]
 
 
 def _routed_experts(config: Mapping[str, object]) -> Callable[[str], bool] | None:
@@ -1111,9 +1112,9 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
             expert_storage == "auto" and measured_kernel("mxfp4_grouped_matmul", "xla") == "pallas")):
         routed = _routed_experts(config)
     quantized_tensors = () if quantization is None else quantization.names(tensors)
-    stored = {} if keeps is None or routed is None else {
+    mxfp4 = {} if keeps is None or routed is None else {
         name: keeps(tensors, name) for name in quantized_tensors if routed(name)}
-    if expert_storage == "mxfp4" and not stored:
+    if expert_storage == "mxfp4" and not mxfp4:
         raise ValueError("expert_storage='mxfp4' keeps the routed experts a decoder checkpoint ships in "
                          "MXFP4 (quant_method mxfp4, or compressed-tensors mxfp4-pack-quantized), and this "
                          "source ships none")
@@ -1126,12 +1127,12 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
     if param_dtype != "float32":
         aliases = decoders.validate_source_aliases(
             quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
-    parts = {part for name in stored for part in quantization.partners(name)}
+    parts = {part for name in mxfp4 for part in quantization.partners(name)}
     tensors = quantization.dequantize({name: tensor for name, tensor in tensors.items() if name not in parts},
                                       param_dtype=param_dtype)
-    decoded = tuple(name for name in quantized_tensors if name not in stored)
+    decoded = tuple(name for name in quantized_tensors if name not in mxfp4)
     _share_quantized_aliases(tensors, aliases, decoded)
-    return _Decoded(tensors, quantized_tensors, scale_dtype, grid, stored)
+    return _Decoded(tensors, quantized_tensors, scale_dtype, grid, mxfp4)
 
 
 def _input_quantization(model: nn.Module, layouts: tuple[WeightLayout, ...],
@@ -1262,9 +1263,9 @@ def _derived_weights(model: CausalTransformer, variables: Mapping[str, object],
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
                     verified: verify.VerifiedMapping | None, *, dtype: str, attention_impl: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool,
-                    stored: Mapping[str, StoredMXFP4]) -> _Built:
+                    mxfp4: Mapping[str, StoredMXFP4]) -> _Built:
     """A decoder of a registered family, or of one it was verified as (tier
-    2), whose routed experts hold the `stored` MXFP4 weights if any."""
+    2), whose routed experts hold the `mxfp4` weights as stored if any."""
     if verified is None:
         record = decoders.translate_config(config)
         # translate_config refused every model_type but a registered family's name.
@@ -1274,7 +1275,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
-    if stored:
+    if mxfp4:
         mixture = record.get("mixture")
         if not isinstance(mixture, NativeFields):
             raise ValueError(f"expert_storage='mxfp4' keeps routed experts; this {family} decoder has none")
@@ -1282,7 +1283,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
-        tensors, record, family, param_dtype=param_dtype, lazy=lazy, mxfp4=stored), record, directory)
+        tensors, record, family, param_dtype=param_dtype, lazy=lazy, mxfp4=mxfp4), record, directory)
     decoder_parts.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
@@ -1294,7 +1295,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     layouts, retained = ((), {})
     if entry.preserve_source_layout or entry.prepare is decoder_parts.DecoderFamily.prepare:
         # A kept MXFP4 weight binds as the float tensor it decodes to, which export rebuilds.
-        bound = {**tensors, **{name: weight.stand_in() for name, weight in stored.items()}}
+        bound = {**tensors, **{name: weight.stand_in() for name, weight in mxfp4.items()}}
         layouts, retained = _decoder_layouts(bound, record, family, variables)
     return _Built(model, variables, record, built, layouts, retained)
 
@@ -1329,7 +1330,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
     storage = declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype
-    tensors, quantized_tensors, scale_dtype, grid, stored = _decoded(tensors, config, storage, expert_storage)
+    tensors, quantized_tensors, scale_dtype, grid, mxfp4 = _decoded(tensors, config, storage, expert_storage)
     export_adapter = None
     media = _media_wrapper(config)
     if family == "diffusion_gemma":
@@ -1349,7 +1350,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     else:
         model, variables, record, built, layouts, retained = _decoder_source(
             config, tensors, directory, verified, dtype=dtype, attention_impl=attention_impl,
-            max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, stored=stored)
+            max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, mxfp4=mxfp4)
         if (isinstance(family, str) and family in decoders.families()
                 and not decoders.families()[family].preserve_source_layout
                 and source_quantization(config) is None):

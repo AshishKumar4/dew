@@ -47,9 +47,9 @@ their bytes back. K3's decoder adds to Kimi Linear's:
 
 K3's routed experts ship as compressed-tensors MXFP4
 (`text_config.quantization_config`), which `Pretrained.load` decodes before
-this map runs. Each KDA layer's `A_log` ships padded from its heads to a
-longer zero tail (128 for 96 heads), which `_kimi_k3_prepare` checks and
-trims.
+this map runs, or keeps as stored under `expert_storage='mxfp4'`. Each KDA
+layer's `A_log` ships padded from its heads to a longer zero tail (128 for 96
+heads), which `_kimi_k3_prepare` checks and trims.
 """
 
 from __future__ import annotations
