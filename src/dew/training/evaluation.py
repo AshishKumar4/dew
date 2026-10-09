@@ -16,7 +16,13 @@ from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 
 from dew.artifacts import Artifact, Artifacts
-from dew.coordination import agree_process_phase, agreed, broadcast_from_process_zero, collective_host
+from dew.coordination import (
+    agree_process_phase,
+    agreed,
+    agreed_same,
+    broadcast_from_process_zero,
+    collective_host,
+)
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
 from dew.objectives.base import VALID_ROWS, Batch, Effects, Loss, Metric, Objective, Step, Variables
 
@@ -206,11 +212,8 @@ def _agree_configuration(
         return [batches is not None, split,
                 [[metric.name, metric.reads.__module__, metric.reads.__qualname__] for metric in metrics]]
 
-    configuration = [agreed("configuration", checked), loss, training]
-    root_configuration = broadcast_from_process_zero(configuration)
-    error = None if configuration == root_configuration else ValueError(
-        "validation availability, split and ordered metric names/types must agree across ranks")
-    agree_process_phase(error, phase="configuration agreement")
+    agreed_same("validation availability, split, ordered metric names and types, and loss",
+                lambda: [checked(), loss, training])
 
 
 def _event(key: jax.Array, step: int | jax.Array, schedule_step: int | jax.Array | None,

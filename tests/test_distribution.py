@@ -1016,7 +1016,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "coordination.collective_host(tree, phase='t')\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
     assert done.returncode != 0, done.stdout + done.stderr
-    assert "Process phase t transfer preflight failed on rank 1" in done.stdout, done.stdout
+    assert "Process phase t global array gather plan failed on rank 1" in done.stdout, done.stdout
 
 
 @pytest.mark.mesh(devices=2)
