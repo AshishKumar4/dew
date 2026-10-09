@@ -261,7 +261,7 @@ One registry replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap` (`d
 class CausalTransformer(nn.Module): ...
 ```
 
-Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/distributed.py:115-217`), declared on the module it names. `Layout` merges the declarations of the modules in the tree; Muon reads them through the same function. Models stay plain Flax modules with no partitioning metadata in `init`, which is the reason the table exists (`distributed.py:57-62`). A test asserts that every parameter of every registered model is declared or explicitly heuristic.
+Same table and the same `logical_axes` and `_mesh_spec` machinery (`training/distributed.py:115-217`), declared on the module it names. Each class keeps its own declarations, and a suffix has one set of axes across the process: a second class that declares it otherwise is refused at the decorator, both named, and a class outside Dew qualifies a one-name suffix with its holder's name (`("head", "readout")`), so it places no other model's `readout`. `Layout` merges the declarations of the modules in the tree; Muon reads them through the same function. Models stay plain Flax modules with no partitioning metadata in `init`, which is the reason the table exists (`distributed.py:57-62`). A test asserts that every parameter of every registered model is declared or explicitly heuristic.
 
 ### 3.9 Config and CLI
 
