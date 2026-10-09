@@ -819,21 +819,21 @@ def test_a_rank_that_stalls_between_collectives_ends_the_pool():
 @pytest.mark.mesh(devices=2)
 def test_a_failure_stays_published_until_its_diagnostic_reaches_the_pool():
     """A second failure cannot replace the first while its diagnostic is
-    still in flight. Pause at the real diagnostic broadcast, try publishing
-    another failure, then complete the broadcast on both ranks.
+    still in flight. Pause at the agreement's round, which carries the
+    diagnostic, try publishing another failure, then complete the round on
+    both ranks.
     """
     program = ("from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
-               "import jax, numpy as np\n"
-               "from jax.experimental import multihost_utils\n"
+               "import jax\n"
                "from dew import coordination\n"
-               "broadcast = multihost_utils.broadcast_one_to_all\n"
+               "round_ = coordination._round\n"
                "replaced = []\n"
-               "def during_diagnostic(value, *args, **kwargs):\n"
-               "    if value.dtype == np.uint8 and jax.process_index() == 0:\n"
+               "def during_diagnostic(word):\n"
+               "    if jax.process_index() == 0:\n"
                "        replaced.append(coordination.publish_failure(ValueError('second'), 'transfer'))\n"
-               "    return broadcast(value, *args, **kwargs)\n"
-               "multihost_utils.broadcast_one_to_all = during_diagnostic\n"
+               "    return round_(word)\n"
+               "coordination._round = during_diagnostic\n"
                "error = ValueError('original') if jax.process_index() == 0 else None\n"
                "try:\n"
                "    coordination.agree_process_phase(error, phase='diagnostic')\n"

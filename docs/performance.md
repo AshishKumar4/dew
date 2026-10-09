@@ -73,6 +73,15 @@ and `pipe` layouts are refused across containers: each container is its own slic
 cross slices. On the GPU, `moe` reaches the loss in 13.3 s, and `fsdp` takes 0.99 s a step. A container multiplies
 float32 matrices at 540 GFLOP/s.
 
+Packing the gradient into one buffer does not help from Dew's side: a gradient raveled after the backward pass, or
+the gradient of raveled parameters, still compiles to one all-reduce of every parameter's buffer, since the
+partitioner sums each matmul's partial gradient where it is made. One flat sum needs the data axis's reduction
+written by hand, outside the partitioner.
+
+Where the processes agree on the host (a fit's first read, a log interval, a checkpoint), each agreement is one round
+through the coordination service, about 33 ms on 8 containers and 63 ms on 32; it was a barrier and a device
+allgather, 143 and 549 ms (`gang_bench.py`'s `agreements`).
+
 Accumulating gradients (`Trainer(accumulation=K)`) does not spare those sums. The accumulated gradient is placed as
 the parameters are, whole on every replica (`Trainer.shardings`), so each of the K microbatches sums its gradient
 across the replicas before it joins the window: K all-reduces where one at the update would do. Deferring the sum
