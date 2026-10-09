@@ -180,7 +180,7 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
         "type": "noul", "instructions": "Is it urgent? " + "Consider every detail. " * 300}}})
     mixture = _mixture(tmp_path, rows, ["nothing these rows share at all"], held=8)
     clef = _module("clef")
-    storage = [] if param_dtype == "float32" else ["--model.param_dtype", param_dtype]
+    storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
     config = DecisionRunConfig.cli([*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                                     "--head.feedforward", "40", "--head.layers", "1",
