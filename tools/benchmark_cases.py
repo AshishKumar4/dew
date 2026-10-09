@@ -109,11 +109,15 @@ class Case:
                 f"{mesh_label(self.mesh)}{order}")
 
 
-def mesh_label(mesh: Mapping[str, int]) -> str:
-    """`fsdp2-tensor2`, the mesh's sharded axes in MeshSpec order; `data` for none."""
+def mesh_label(mesh: Mapping[str, int | tuple[str, ...]]) -> str:
+    """`fsdp2-tensor2`, the mesh's sharded axes in MeshSpec order, then the
+    axes it makes Explicit (`fsdp2-explicit_data`); `data` for none."""
     named = [f"{name}{mesh[name]}"
              for name in ("fsdp", "expert", "tensor", "sequence", "stage", "microbatches", "replicas")
              if mesh.get(name) not in (None, 1)]
+    explicit = mesh.get("explicit")
+    if isinstance(explicit, tuple):
+        named += [f"explicit_{axis}" for axis in explicit]
     return "-".join(named) or "data"
 
 
