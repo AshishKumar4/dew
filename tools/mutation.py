@@ -128,9 +128,22 @@ def selected_target(target: Target, filename: Path | None) -> Target:
     return dataclasses.replace(target, path=relative, tests=FILE_TESTS.get(relative, target.tests))
 
 
+# A mutant runs the same suite as the unmutated baseline, so it gets twice the baseline's time before it
+# counts as a timeout: a fixed per-mutant limit the suite has outgrown times out the baseline itself.
+BASELINE_MULTIPLE = 2.0
+
+
+def mutant_timeout(timeout: float, baseline_seconds: float) -> float:
+    """The limit each mutant runs under: `timeout`, or twice the unmutated suite's time if longer."""
+    return max(timeout, BASELINE_MULTIPLE * baseline_seconds)
+
+
 def run(target: Target, directory: Path, shard: int, shards: int, timeout: float, *,
         resume: bool = False, seconds: float | None = None) -> dict:
-    """Partition deterministically; retain a bounded run's pending work for resume."""
+    """Partition deterministically; retain a bounded run's pending work for resume.
+
+    The unmutated suite runs once under the whole budget (`seconds`, else ten
+    times `timeout`) and sets each mutant's limit (`mutant_timeout`)."""
     from cosmic_ray.commands import init
     from cosmic_ray.modules import find_modules
     from cosmic_ray.mutating import mutate_and_test
@@ -155,11 +168,12 @@ def run(target: Target, directory: Path, shard: int, shards: int, timeout: float
     with use_db(directory / "baseline.sqlite") as baseline:
         baseline.clear()
         baseline.add_work_item(WorkItem(job_id="baseline", mutations=()))
-        result = mutate_and_test((), command, timeout)
+        result = mutate_and_test((), command, seconds if seconds is not None else 10 * timeout)
         baseline.set_result("baseline", result)
         if classify(result) != "survived":
             raise RuntimeError(f"unmutated tests failed: {classify(result)}\n{result.output}")
     baseline_seconds = time.monotonic() - started
+    timeout = mutant_timeout(timeout, baseline_seconds)
     with use_db(directory / "population.sqlite") as population:
         if not resume:
             init(modules, population, {})
@@ -178,7 +192,7 @@ def run(target: Target, directory: Path, shard: int, shards: int, timeout: float
         finally:
             results = report(session)
             results.update(identity)
-            results.update(population=len(work), baseline_seconds=baseline_seconds)
+            results.update(population=len(work), baseline_seconds=baseline_seconds, mutant_timeout=timeout)
             (directory / "report.json").write_text(json.dumps(results, indent=2) + "\n")
     return results
 
@@ -221,7 +235,8 @@ def main() -> None:
     parser.add_argument("--seconds", type=float, help="stop admitting work before this budget expires")
     parser.add_argument("--shard", type=int, default=0)
     parser.add_argument("--shards", type=int, default=1)
-    parser.add_argument("--timeout", type=float, default=180)
+    parser.add_argument("--timeout", type=float, default=180,
+                        help="each mutant's least limit; twice the unmutated suite's time where longer")
     arguments = parser.parse_args()
     if arguments.summarize is not None:
         print(json.dumps(summarize(arguments.summarize), indent=2))
