@@ -12,7 +12,6 @@ compiles on CPU in seconds.
 
 import ast
 import dataclasses
-import importlib.util
 import json
 import subprocess
 import sys
@@ -23,9 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from tool_support import FIXTURES, REPO_ROOT, load
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-FIXTURES = REPO_ROOT / "tests" / "fixtures"
 CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The existing family parity contracts, not bounds fitted to a CI CPU:
@@ -43,16 +41,7 @@ T5_OUTPUTS = {"last_hidden_state": 1e-4}
 VAE_OUTPUTS = {"latent": 1e-5, "decoded": 1e-5}
 
 
-def load(name: str):
-    """tools/ holds scripts, not a package, so a tool is loaded from its file,
-    registered as the Python docs' recipe for a source file does: a
-    dataclass looks its module up while the module executes."""
-    spec = importlib.util.spec_from_file_location(
-        f"{name}_under_test", REPO_ROOT / "tools" / f"{name}.py")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+
 
 
 def assert_fixture_arrays(written: Path, committed: Path, numerical: dict[str, float]) -> None:
@@ -306,7 +295,7 @@ def test_lm_step_parity_records_a_repeatable_fixed_batch_run():
 def test_lm_serving_benchmark_draws_the_full_budget_without_stopping(monkeypatch, tmp_path):
     import argparse
 
-    from test_serving import task
+    from model_support import serving_task as task
 
     import dew
     from dew.sampling import Sampling

@@ -121,6 +121,9 @@ test = [
     # dew against a different reference while the tolerances stayed. The
     # library accepts this release and later; the reference suite pins it.
     "transformers==5.16.1",
+    # tests/test_reference_helpers.py holds tools/kimi_k3_reference.py's MXFP4
+    # encoding, this release's compressor, the one that tool's environment names.
+    "compressed-tensors==0.17.1",
     # test_hf_data.py and test_online_loader.py read Hugging Face datasets,
     # unbounded so the suite runs the release `pip install dewml[streaming]`
     # installs. Both files pass on datasets 5.0.1 with pyarrow 25.0.1.

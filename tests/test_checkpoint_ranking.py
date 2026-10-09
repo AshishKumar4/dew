@@ -1,4 +1,7 @@
-"""Evaluation ranks precisely the weights saved, with independent best trackers."""
+"""Evaluation ranks precisely the weights saved, with independent best trackers.
+
+Restoring the ranked training state is Dew's lifecycle; Orbax oracles storage and selection.
+"""
 import dataclasses
 import datetime
 from typing import ClassVar

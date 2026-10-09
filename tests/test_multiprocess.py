@@ -15,21 +15,29 @@ leaves, so the production join and the rendezvous right after it are what
 every pool test runs.
 """
 
-import contextlib
 import json
-import os
 import re
 import shutil
 import signal
-import socket
 import subprocess
-import sys
 import time
 from pathlib import Path
 
 import multiprocess_worker as worker
 import numpy as np
 import pytest
+from process_support import (
+    DEVICES,
+    free_port,
+    report_of,
+    run_pool,
+    run_worker,
+    spawn,
+    stuck,
+    terminate,
+    worker_env as worker_env,
+)
+from token_support import write_token_corpus
 
 from dew.checkpoints import FROZEN_STORE
 from dew.position import ENVELOPE
@@ -39,11 +47,7 @@ pytestmark = pytest.mark.mesh
 
 
 
-REPO_ROOT = Path(__file__).resolve().parents[1]
-WORKER = Path(__file__).with_name("multiprocess_worker.py")
-
 # The simulated mesh the rest of the suite runs on, split among the processes.
-DEVICES = 8
 # tests/test_parallelism.py's tolerance for the same step on another topology.
 PARITY = {"rtol": 2e-4, "atol": 2e-5}
 
@@ -55,106 +59,7 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 
 
-def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
 
-
-def worker_env(devices: int) -> dict:
-    """A worker's environment: this worktree's dew, on `devices` CPU devices,
-    with Python's faulthandler on, so a worker stopped by SIGABRT prints every
-    thread's stack first (`stuck`)."""
-    return {**os.environ, "JAX_PLATFORMS": "cpu",
-            "PYTHONPATH": str(REPO_ROOT / "src"), "PYTHONFAULTHANDLER": "1",
-            "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
-
-
-def spawn(mode, out, processes=1, process_id=0, coordinator=None, devices=None, **flags):
-    """One worker process, started and not waited for.
-
-    Its own session, so killing it takes down anything it spawned with it.
-    """
-    command = [sys.executable, str(WORKER), mode, "--out", str(out),
-               "--processes", str(processes), "--process-id", str(process_id)]
-    if coordinator is not None:
-        command += ["--coordinator", coordinator]
-    for name, value in flags.items():
-        flag = "--" + name.replace("_", "-")
-        if value is True:
-            command.append(flag)
-        elif value is not None:
-            command += [flag, str(value)]
-    return subprocess.Popen(
-        command, cwd=REPO_ROOT, env=worker_env(DEVICES // processes if devices is None else devices),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        start_new_session=True)
-
-
-def stuck(pool, what: str) -> str:
-    """A pool that never reached `what`, stopped with each worker's output
-    and, through faulthandler, the stacks of every thread it had when it
-    stopped: where a stuck pool waits is what its failure has to say."""
-    for process in pool:
-        with contextlib.suppress(ProcessLookupError):
-            os.kill(process.pid, signal.SIGABRT)
-    outputs = []
-    for index, process in enumerate(pool):
-        try:
-            output = process.communicate(timeout=60)[0]
-        except subprocess.TimeoutExpired:
-            terminate(process)
-            output = process.communicate()[0]
-        outputs.append(f"--- process {index}, exit {process.returncode}\n{output}")
-    return f"the pool did not {what}\n" + "\n".join(outputs)
-
-
-def terminate(process) -> None:
-    """SIGKILL the worker and every process in its session."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(process.pid, signal.SIGKILL)
-    process.wait(timeout=60)
-
-
-def report_of(process, out: Path, timeout=600, pool=None) -> dict:
-    """What the worker recorded, once it has exited cleanly. A worker of a
-    `pool` that does not finish fails with every worker's stacks (`stuck`)."""
-    try:
-        log = process.communicate(timeout=timeout)[0]
-    except subprocess.TimeoutExpired:
-        if pool is not None:
-            pytest.fail(stuck(pool, f"let {out.name} finish within {timeout}s"))
-        terminate(process)
-        pytest.fail(f"{out.name} did not finish within {timeout}s")
-    assert process.returncode == 0, f"{out.name} exited {process.returncode}\n{log}"
-    return json.loads(out.read_text())
-
-
-def run_worker(mode, out: Path, **flags) -> dict:
-    """One worker process, run to completion."""
-    return report_of(spawn(mode, out, **flags), out)
-
-
-def run_pool(mode, directory: Path, processes: int, *, timeout=600, start=spawn,
-             **flags) -> list[dict]:
-    """`processes` workers in one pool, and their reports in process order.
-
-    `start` launches each worker; another worker script's launcher takes
-    `spawn`'s arguments and builds its own command."""
-    directory.mkdir(parents=True, exist_ok=True)
-    coordinator = f"127.0.0.1:{free_port()}"
-    outs = [directory / f"process{index}.json" for index in range(processes)]
-    running = [
-        start(mode, out, processes=processes, process_id=index, coordinator=coordinator,
-              **flags)
-        for index, out in enumerate(outs)]
-    try:
-        return [report_of(process, out, timeout=timeout, pool=running)
-                for process, out in zip(running, outs, strict=True)]
-    finally:
-        for process in running:
-            if process.poll() is None:
-                terminate(process)
 
 
 def dumped_params(out: Path) -> dict:
@@ -207,14 +112,8 @@ def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
     i * seq_len and a process can report the records it read by index, with
     no contents.
     """
-    directory.mkdir(parents=True, exist_ok=True)
     tokens = np.arange(records * seq_len + 1, dtype=np.uint16)
-    (directory / "train.bin").write_bytes(tokens.tobytes())
-    (directory / "val.bin").write_bytes(tokens.tobytes())
-    (directory / "meta.json").write_text(json.dumps({
-        "tokenizer": "byte", "vocab_size": int(tokens.max()) + 1, "dtype": "uint16",
-        "train_tokens": len(tokens), "val_tokens": len(tokens)}))
-    return directory
+    return write_token_corpus(directory, tokens, tokens, vocab_size=int(tokens.max()) + 1)
 
 
 def document_corpus(directory: Path, documents: int, length) -> Path:
@@ -225,7 +124,6 @@ def document_corpus(directory: Path, documents: int, length) -> Path:
     packed window name the documents packed into it and padding, which is
     also 0, names none.
     """
-    directory.mkdir(parents=True, exist_ok=True)
     lengths = [length] * documents if isinstance(length, int) else list(length)
     # The dtype has to stay uint16 through the join, or the file holds twice
     # the bytes and reads back as a different corpus entirely.
@@ -233,12 +131,7 @@ def document_corpus(directory: Path, documents: int, length) -> Path:
         np.array([index + 1] * lengths[index] + [0], np.uint16)
         for index in range(documents)])
     assert stream.dtype == np.uint16
-    (directory / "train.bin").write_bytes(stream.tobytes())
-    (directory / "val.bin").write_bytes(stream.tobytes())
-    (directory / "meta.json").write_text(json.dumps({
-        "tokenizer": "byte", "vocab_size": documents + 1, "dtype": "uint16",
-        "eos_id": 0, "train_tokens": len(stream), "val_tokens": len(stream)}))
-    return directory
+    return write_token_corpus(directory, stream, stream, vocab_size=documents + 1, eos_id=0)
 
 
 @pytest.fixture(scope="module")

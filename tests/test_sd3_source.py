@@ -11,7 +11,6 @@ it, with the Euler trajectory and its input gradient.
 
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
@@ -19,6 +18,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from interop_support import extract_fixture
 
 from dew.diffusion.process import DenoisingCondition
 from dew.diffusion.schedules.source import SourceSchedule
@@ -31,10 +31,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("sd3-source")
-    with tarfile.open(ROOT / "tests/fixtures/sd3_source.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/sd3_source.tar.xz", tmp_path_factory.mktemp("sd3-source"))
 
 
 def relative_gap(actual, expected) -> float:
@@ -459,7 +456,7 @@ def test_a_trained_step_keeps_the_frozen_buffer_and_exports_for_the_source(sourc
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        from test_trainer import raw_leaf
+        from affine_run import raw_leaf
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"

@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from token_support import write_token_corpus
 
 import dew
 from dew.config import ObjectiveConfig
@@ -26,16 +27,14 @@ TOKENIZER = REPO_ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"
 
 
 def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=None):
-    root.mkdir(parents=True, exist_ok=True)
     rng = np.random.RandomState(0)
-    for name, count in (("train.bin", train_tokens), ("val.bin", val_tokens)):
+    splits = []
+    for count in (train_tokens, val_tokens):
         tokens = rng.randint(1, 250, count).astype(np.uint8)
         if eos_id is not None:
             tokens[::7] = eos_id
-        (root / name).write_bytes(tokens.tobytes())
-    (root / "meta.json").write_text(json.dumps(
-        {"tokenizer": tokenizer, "vocab_size": 256, "dtype": "uint8", "eos_id": eos_id}))
-    return root
+        splits.append(tokens)
+    return write_token_corpus(root, *splits, tokenizer=tokenizer, eos_id=eos_id)
 
 
 def model_flags(record):
@@ -448,13 +447,8 @@ def test_a_trained_export_round_trips_with_its_tokenizer(tmp_path):
 
     tokenizer = tokenizer_for(str(TOKENIZER), local_files_only=True)
     ids = np.asarray(tokenizer.encode((REPO_ROOT / "CONTRIBUTING.md").read_text()), np.uint16)
-    tokens = tmp_path / "tokens"
-    tokens.mkdir(parents=True)
-    (tokens / "train.bin").write_bytes(ids[:40 * SEQ].tobytes())
-    (tokens / "val.bin").write_bytes(ids[40 * SEQ:48 * SEQ].tobytes())
-    (tokens / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(TOKENIZER), "vocab_size": tokenizer.vocab_size,
-         "dtype": "uint16", "eos_id": None}))
+    tokens = write_token_corpus(tmp_path / "tokens", ids[:40 * SEQ], ids[40 * SEQ:48 * SEQ],
+                                tokenizer=str(TOKENIZER), vocab_size=tokenizer.vocab_size)
     checkpoint = export_tiny_decoder(tmp_path / "checkpoint", tokenizer=str(TOKENIZER),
                                      vocab_size=tokenizer.vocab_size)
 

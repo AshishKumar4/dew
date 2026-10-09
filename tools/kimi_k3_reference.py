@@ -10,9 +10,8 @@ and IEEE forced on the one that sets it (the third item below). The routed
 experts are encoded by compressed-tensors' MXFP4 compressor over the scales
 its `generate_mx_scales` gives each group's largest magnitude, and the
 reference computes with the library's own decompression of them, so the
-packed file and the logits describe one model. Those are the scales the
-library's `calculate_qparams` takes, less its clamp to [0, 255], which only
-an all-zero group reaches; the fixture has none.
+packed file and the logits describe one model. `calculate_qparams` clamps
+the scale exponents and substitutes a finite scale for an all-zero group.
 
 Environment (~/.cache/dew/reference-venvs/kimi-k3): torch 2.8.0+cu128,
 transformers 4.56.2, fla-core 0.5.2, compressed-tensors 0.17.1.
@@ -165,15 +164,16 @@ def mxfp4(weight: torch.Tensor):
     """compressed-tensors' MXFP4 encoding of a Linear weight and its decoding."""
     from compressed_tensors.compressors.mxfp4.base import MXFP4PackedCompressor
     from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
-    from compressed_tensors.quantization.utils.mxfp_utils import generate_mx_scales
+    from compressed_tensors.quantization.utils.helpers import calculate_qparams
 
     args = QuantizationArgs(num_bits=4, type="float", strategy="group", group_size=32,
                             symmetric=True, scale_dtype=torch.uint8)
     scheme = QuantizationScheme(targets=["Linear"], weights=args)
-    rows, columns = weight.shape
-    peaks = weight.detach().float().cpu().reshape(rows, columns // 32, 32).abs().amax(-1)
-    scale = 2.0 ** (generate_mx_scales(peaks) - 127)
-    packed = MXFP4PackedCompressor.compress({"weight": weight.detach().float().cpu(), "weight_scale": scale}, scheme)
+    weight = weight.detach().float().cpu()
+    groups = weight.unflatten(-1, (-1, args.group_size))
+    scale, zero = calculate_qparams(groups.amin(-1), groups.amax(-1), args)
+    packed = MXFP4PackedCompressor.compress(
+        {"weight": weight, "weight_scale": scale, "weight_zero_point": zero}, scheme)
     decoded = MXFP4PackedCompressor.decompress(dict(packed), scheme)["weight"].float()
     return packed["weight_packed"].contiguous(), packed["weight_scale"].contiguous(), decoded
 
@@ -213,7 +213,8 @@ def main() -> None:
     config = tiny_config()
     DESTINATION.mkdir(parents=True, exist_ok=True)
     torch.manual_seed(3180)
-    model = modeling.KimiK3ForConditionalGeneration(configuration.KimiK3Config(**copy.deepcopy(config))).float()
+    model = modeling.KimiK3ForConditionalGeneration(
+        configuration.KimiK3Config(**copy.deepcopy(config))).float()
     model.language_model.config._attn_implementation = "eager"
     scatter(model)
     tensors = {}
@@ -226,7 +227,8 @@ def main() -> None:
                 tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"] = packed, scale
             elif name.endswith(".self_attn.A_log"):
                 width = config["text_config"]["linear_attn_config"]["head_dim"]
-                tensors[name] = torch.nn.functional.pad(parameter.detach().cpu(), (0, width - parameter.numel()))
+                tensors[name] = torch.nn.functional.pad(
+                    parameter.detach().cpu(), (0, width - parameter.numel()))
             else:
                 tensors[name] = parameter.detach().cpu().contiguous().clone()
     save_file(tensors, str(DESTINATION / "model.safetensors"))
@@ -240,17 +242,20 @@ def main() -> None:
     ids, mask = fixture_batch()
     input_ids = torch.tensor(ids, device="cuda")
     attention_mask = torch.tensor(mask, device="cuda")
-    logits, loss, updated = sgd_step(model, input_ids, attention_mask, lambda name: name.startswith("language_model."))
+    logits, loss, updated = sgd_step(
+        model, input_ids, attention_mask, lambda name: name.startswith("language_model."))
     for name, parameter in model.named_parameters():
         if name in tensors:
             source = tensors[name]
             with torch.no_grad():
-                parameter.copy_(source[:parameter.numel()].to(parameter) if name.endswith("A_log") else source.to(parameter))
+                parameter.copy_(source[:parameter.numel()].to(parameter)
+                                if name.endswith("A_log") else source.to(parameter))
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if ".block_sparse_moe.experts." in name:
                 stem = name.removesuffix(".weight")
-                parameter.copy_(mxfp4_decode(tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"]).to(parameter))
+                parameter.copy_(mxfp4_decode(
+                    tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"]).to(parameter))
         again = model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         assert torch.equal(again, logits), "restoring the written weights must restore the logits"
         # The wrapper carries no GenerationMixin under transformers 4.56.2;
@@ -315,7 +320,8 @@ def mxfp4_decode(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     args = QuantizationArgs(num_bits=4, type="float", strategy="group", group_size=32,
                             symmetric=True, scale_dtype=torch.uint8)
     scheme = QuantizationScheme(targets=["Linear"], weights=args)
-    return MXFP4PackedCompressor.decompress({"weight_packed": packed, "weight_scale": scale}, scheme)["weight"].float()
+    return MXFP4PackedCompressor.decompress(
+        {"weight_packed": packed, "weight_scale": scale}, scheme)["weight"].float()
 
 
 if __name__ == "__main__":

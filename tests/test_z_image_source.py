@@ -16,13 +16,13 @@ here.
 """
 
 import json
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, fixture_arrays
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, translate_z_image_weights, z_image_fields
@@ -37,10 +37,8 @@ GRADIENT = 1e-4
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("z-image-source")
-    with tarfile.open(ROOT / "tests/fixtures/z_image_source.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/z_image_source.tar.xz",
+                           tmp_path_factory.mktemp("z-image-source"))
 
 
 @pytest.fixture(scope="module")
@@ -50,8 +48,7 @@ def record(source):
 
 @pytest.fixture(scope="module")
 def arrays(source):
-    with np.load(source / "z_image.npz") as loaded:
-        return dict(loaded)
+    return fixture_arrays(source / "z_image.npz")
 
 
 def relative_gap(actual, expected) -> float:

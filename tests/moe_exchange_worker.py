@@ -19,7 +19,7 @@ def main() -> None:
     rank, coordinator, output = int(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
     jax.distributed.initialize(coordinator_address=coordinator, num_processes=2,
                                process_id=rank, local_device_ids=[0], initialization_timeout=30)
-    from test_moe_exchange import objective, routing_case
+    from moe_support import objective, routing_case
 
     mesh = MeshSpec(expert=2).build()
     split = NamedSharding(mesh, P('expert'))

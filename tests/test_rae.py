@@ -20,13 +20,13 @@ scaled by max(1, |reference|).
 import importlib.util
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, fixture_arrays
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
@@ -40,16 +40,13 @@ VARIANTS = ("dinov2", "siglip2", "mae")
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("rae")
-    with tarfile.open(ROOT / "tests/fixtures/rae.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/rae.tar.xz", tmp_path_factory.mktemp("rae"))
 
 
 @pytest.fixture(scope="module", params=VARIANTS)
 def variant(request, source):
     directory = source / request.param
-    return directory, load_rae(directory), dict(np.load(directory / "reference.npz"))
+    return directory, load_rae(directory), fixture_arrays(directory / "reference.npz")
 
 
 def channels_last(array):

@@ -21,6 +21,7 @@ import numpy as np
 import optax
 import pytest
 from absl import flags
+from token_support import write_token_corpus
 
 from dew.data import ByteTokenizer, DataPartition, Loading, TokenCorpus, TokenWindows
 from dew.nn import attention
@@ -50,25 +51,14 @@ def _token_dir(tmp_path, train_tokens, val_tokens=None, dtype=np.uint16,
         train, val = tokens, None
     else:
         val, train = tokens[:val_tokens], tokens[val_tokens:]
-    (tmp_path / "train.bin").write_bytes(train.astype(dtype).tobytes())
-    if val is not None:
-        (tmp_path / "val.bin").write_bytes(val.astype(dtype).tobytes())
-    meta = {
-        "tokenizer": "byte", "vocab_size": vocab_size,
-        "dtype": np.dtype(dtype).name,
-        "train_tokens": len(train), "val_tokens": len(val) if val is not None else 0,
-    }
-    if eos_id is not None:
-        meta["eos_id"] = eos_id
-    (tmp_path / "meta.json").write_text(json.dumps(meta))
-    return tmp_path
+    return write_token_corpus(tmp_path, train.astype(dtype), None if val is None else val.astype(dtype),
+                              vocab_size=vocab_size, eos_id=eos_id)
 
 
 def _document_dir(tmp_path, documents, eos_id=0, dtype=np.uint16):
     """A token directory whose stream is `documents`, each closed by eos_id."""
     stream = np.concatenate([np.asarray([*d, eos_id], np.int64) for d in documents])
-    _token_dir(tmp_path, train_tokens=0, body=stream, dtype=dtype, eos_id=eos_id)
-    (tmp_path / "val.bin").write_bytes(stream.astype(dtype).tobytes())
+    write_token_corpus(tmp_path, stream.astype(dtype), stream.astype(dtype), eos_id=eos_id)
     return tmp_path, stream
 
 
@@ -173,8 +163,8 @@ def test_readers_that_miss_the_cache_together_share_one_load(tmp_path):
 
 def _stream_dir(tmp_path, body, dtype=np.uint16):
     """A token directory whose train and val splits are both `body`."""
-    _token_dir(tmp_path, train_tokens=0, body=body, dtype=dtype)
-    (tmp_path / "val.bin").write_bytes(np.asarray(body).astype(dtype).tobytes())
+    stream = np.asarray(body).astype(dtype)
+    write_token_corpus(tmp_path, stream, stream)
     return tmp_path
 
 

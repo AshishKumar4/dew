@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from test_text_rollout_contract import decoder
+from model_support import decoder
 
 from dew.diffusion.block import BlockProcess
 from dew.inference import BlockGeneration, TextGeneration

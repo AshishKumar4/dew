@@ -24,7 +24,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
-from test_quantized import fetch
+from interop_support import fetch
 
 from dew.interop import Pretrained, codecs
 from dew.interop.safetensors_io import _STORED_DTYPES, read_weights, save_hf_layout
@@ -125,17 +125,7 @@ def bfloat16_bits(values: np.ndarray) -> np.ndarray:
     return np.asarray(values, np.float32).astype(ml_dtypes.bfloat16).view(np.int16)
 
 
-def e4m3_codes(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
-    """Random E4M3FN bytes, both NaN codes left out."""
-    codes = rng.integers(0, 0x7f, shape, dtype=np.uint8) | rng.choice(np.uint8([0, 0x80]), shape)
-    return codes.view(codecs.E4M3)
 
-
-def e8m0_codes(rng: np.random.Generator, shape: tuple[int, ...]) -> np.ndarray:
-    """Random E8M0 bytes around 1, with byte 0 (2 ** -127) and byte 254 (2 ** 127) in."""
-    exponents = rng.integers(110, 140, shape, dtype=np.uint8)
-    exponents.flat[:2] = 0, 254
-    return exponents.view(ml_dtypes.float8_e8m0fnu)
 
 
 @pytest.mark.parametrize("release, block", [("v4", 128), ("v4_1", 32)])

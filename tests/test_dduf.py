@@ -16,8 +16,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, packed, unpacked
 from reference_error import assert_as_exact_as_the_reference
-from test_flux_source import packed, unpacked
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop import Pretrained
@@ -30,13 +30,10 @@ PUBLISHED = ("DDUF/tiny-flux-dev-pipe-dduf", "fluxpipeline.dduf", "4fa81aa2c667f
 def packed_pipeline(tmp_path, monkeypatch):
     """The committed Flux pipeline packed into `repo/pipeline.dduf`, with
     Dew's cache under `tmp_path`."""
-    import tarfile
-
     from huggingface_hub import export_folder_as_dduf
 
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    with tarfile.open(Path(__file__).parent / "fixtures" / "flux_source.tar.xz") as archive:
-        archive.extractall(tmp_path / "source", filter="data")
+    extract_fixture(Path(__file__).parent / "fixtures" / "flux_source.tar.xz", tmp_path / "source")
     repo = tmp_path / "repo"
     repo.mkdir()
     export_folder_as_dduf(repo / "pipeline.dduf", tmp_path / "source" / "pipeline")

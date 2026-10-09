@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
-from moe_support import exchange_worker
+from moe_support import exchange_worker, objective, routing_case
 from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -29,18 +29,7 @@ MAXTEXT = Path(__file__).resolve().parent / "fixtures" / "maxtext" / "capacity.n
 pytestmark = pytest.mark.mesh
 
 
-def routing_case(tokens: int, experts: int, top_k: int, skewed: bool):
-    rng = np.random.default_rng(219)
-    x = rng.normal(size=(tokens, 8)).astype(np.float32)
-    weights = rng.uniform(0.1, 0.9, size=(tokens, top_k)).astype(np.float32)
-    choices = (np.tile(np.arange(top_k), (tokens, 1)) if skewed
-               else np.argsort(rng.normal(size=(tokens, experts)), axis=-1)[:, :top_k])
-    return x, weights, choices.astype(np.int32)
 
-
-def objective(module, indices, parameters, x, weights):
-    out = module.apply(parameters, x, weights, indices)
-    return jnp.sum(jnp.sin(out.astype(jnp.promote_types(out.dtype, jnp.float32)))), out
 
 
 @pytest.mark.parametrize("shards,fsdp,tokens,top_k,skewed,scale_inputs,activation,limit", [
@@ -305,7 +294,7 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
 
 
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):
-    from test_multiprocess import run_pool
+    from process_support import run_pool
 
     reports = run_pool(Path(__file__).with_name('moe_exchange_worker.py'), tmp_path, 2,
                        timeout=120, start=exchange_worker)

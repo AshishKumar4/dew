@@ -1,4 +1,7 @@
-"""Request identities, bound policy snapshots and filtered draw likelihoods."""
+"""Request identities, bound policy snapshots and filtered draw likelihoods.
+
+Bindings, shape buckets and cache pause/gather are Dew policies; Transformers oracles their tokens.
+"""
 
 from dataclasses import replace
 
@@ -7,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from test_text_rollout_contract import decoder
+from model_support import decoder
 from transformers.generation.logits_process import (
     MinPLogitsWarper,
     TemperatureLogitsWarper,

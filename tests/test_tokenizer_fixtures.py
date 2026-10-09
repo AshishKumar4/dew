@@ -1,7 +1,7 @@
 """Generated tokenizer inputs preserve their encoded IDs and rendered chat."""
 
 import pytest
-from test_tools import FIXTURES, load
+from tool_support import FIXTURES, load
 from transformers import AutoTokenizer
 
 

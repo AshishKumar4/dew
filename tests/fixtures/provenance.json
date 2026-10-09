@@ -2715,6 +2715,11 @@
    ],
    "note": "indexer_loss.npz: NumPy transcription documented at tools/indexer_reference.py:12; meta.json present. maxtext.npz: executes MLA.calculate_indexer_loss and Indexer.generate_mask fetched at 538fe7a3 (EPS and DEFAULT_MASK_VALUE from the same commit) under JAX behind Indexer.__call__'s masking and jax.lax.top_k, in float32 and float64."
   },
+  "kda/torch.json": {
+   "note": "Torch 2.14.1+cpu executes the published fp32 chunk/recurrent KDA bodies and l2norm, with only optional hub-kernel decorators removed. Ragged tokens, vector decay, nonzero initial state, outputs, final state and all six operand gradients.",
+   "sources": [{"repo": "huggingface/transformers", "version": "93c8b7b485963a10800c91f55304db6be211c2bd", "runs": "fetched"}, {"repo": "pytorch/pytorch", "version": "2.14.1", "runs": "torch"}],
+   "tool": "tools/kda_reference.py"
+  },
   "jepa/vjepa.npz": {
    "tool": "tools/vjepa_reference.py",
    "sources": [

@@ -17,7 +17,7 @@ def main() -> None:
     if processes > 1:
         jax.distributed.initialize(coordinator_address=coordinator, num_processes=processes,
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
-    from test_tool_episodes import Harness, SquareSession, build
+    from episode_support import Harness, SquareSession, build
 
     from dew.coordination import collective_host
     from dew.data import Dataset

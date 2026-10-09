@@ -22,6 +22,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+from interop_support import fetch
 
 from dew.interop import Pretrained
 from dew.interop.codecs import (
@@ -703,11 +704,7 @@ SOURCES = (("deepseek-ai/DeepSeek-V3", None), ("deepseek-ai/DeepSeek-V3.2-Exp", 
 zero's kv_a_proj lives in the first shard of both."""
 
 
-def fetch(url, start, end):
-    import requests
-    response = requests.get(url, headers={"Range": f"bytes={start}-{end}"}, timeout=120)
-    response.raise_for_status()
-    return response.content
+
 
 
 @pytest.mark.network

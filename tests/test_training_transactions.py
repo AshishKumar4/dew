@@ -1,4 +1,7 @@
-"""Effective-loss and checkpoint transactions over tiny deterministic objectives."""
+"""Effective-loss and checkpoint transactions over tiny deterministic objectives.
+
+Replay and effect commits are Dew transaction policies; Optax and Flax oracle their arithmetic.
+"""
 import dataclasses
 import json
 
