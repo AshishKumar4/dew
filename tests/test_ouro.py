@@ -1,7 +1,6 @@
 """Ouro's looped decoder against its own remote code on transformers 4.56.2:
 tools/ouro_reference.py writes tests/fixtures/hf/ouro-tiny and the 1.4B probe."""
 
-import dataclasses
 import json
 from pathlib import Path
 
@@ -9,7 +8,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop import Pretrained
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
 from dew.nn.backbones.decoder_stack import Loop
@@ -17,6 +16,7 @@ from dew.nn.backbones.decoder_stack import Loop
 ROOT = Path(__file__).parent / 'fixtures' / 'hf'
 TINY = ROOT / 'ouro-tiny'
 RELEASED = ROOT / 'ouro-1.4b'
+SOURCE = 'ByteDance/Ouro-1.4B'
 
 
 def load():
@@ -52,13 +52,9 @@ def test_every_pass_gates_its_exit_as_the_remote_code_does():
                                      'Ouro exit gates')
 
 
-def test_export_writes_the_remote_codes_names_and_reloads_bit_for_bit(tmp_path):
+def test_a_saved_checkpoint_reloads_bit_for_bit(tmp_path):
     loaded = load()
     loaded.save(tmp_path)
-    config = json.loads((tmp_path / 'config.json').read_text())
-    assert config['model_type'] == 'ouro'
-    assert (config['total_ut_steps'], config['early_exit_threshold']) == (3, 1.0)
-    assert config['auto_map']['AutoModelForCausalLM'] == 'ByteDance/Ouro-1.4B--modeling_ouro.OuroForCausalLM'
     original, exported = load_shards(TINY), load_shards(tmp_path)
     assert set(original) == set(exported)
     for tensor in original:
@@ -69,6 +65,30 @@ def test_export_writes_the_remote_codes_names_and_reloads_bit_for_bit(tmp_path):
                                   loaded.model.apply(loaded.variables, ids))
 
 
+def test_a_looped_model_exports_in_the_remote_codes_layout(tmp_path):
+    """A model built in Dew writes the config Ouro's remote code reads, which
+    names that code; a loop it would not compute, one without the norm between
+    passes, is refused, while how the loop trained is not part of it."""
+    loaded = load()
+
+    def exported(**loop):
+        return PretrainedDecoder.from_model(loaded.model.clone(loop=Loop(3, exit_gate=True, **loop)),
+                                            loaded.variables)
+
+    exported(backprop_steps=1).save(tmp_path)
+    config = json.loads((tmp_path / 'config.json').read_text())
+    assert config['model_type'] == 'ouro' and config['total_ut_steps'] == 3
+    assert config['early_exit_threshold'] == 1.0
+    assert config['auto_map']['AutoModelForCausalLM'] == f'{SOURCE}--modeling_ouro.OuroForCausalLM'
+    assert set(load_shards(tmp_path)) == set(load_shards(TINY))
+    ids = fixture('input_ids')
+    restored = Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, ids),
+                                  loaded.model.apply(loaded.variables, ids))
+    with pytest.raises(ValueError, match='loop'):
+        exported(step_norm=False)
+
+
 @pytest.mark.parametrize('label, loop', [
     ('a pass fewer', Loop(2, exit_gate=True)),
     ('no norm between passes', Loop(3, step_norm=False, exit_gate=True))])
@@ -77,18 +97,6 @@ def test_the_reference_catches_each_mechanism_left_out(label, loop):
     logits = loaded.model.clone(loop=loop).apply(loaded.variables, fixture('input_ids'))
     with pytest.raises(AssertionError, match=r'allowed 2\.0'):
         assert_as_exact_as_the_reference(logits, fixture('logits'), fixture('logits_f64'), label)
-
-
-def test_a_loop_the_remote_code_does_not_read_is_not_exported(tmp_path):
-    loaded = load()
-
-    def looping(**loop):
-        return dataclasses.replace(loaded, model=loaded.model.clone(loop=Loop(3, exit_gate=True, **loop)))
-
-    looping(backprop_steps=1).save(tmp_path / 'truncated')
-    assert json.loads((tmp_path / 'truncated' / 'config.json').read_text())['total_ut_steps'] == 3
-    with pytest.raises(ValueError, match='loop'):
-        looping(step_norm=False).save(tmp_path / 'unnormed')
 
 
 def test_the_released_config_translates_its_computation():
