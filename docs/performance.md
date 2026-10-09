@@ -95,9 +95,14 @@ the parameters are, whole on every replica (`Trainer.shardings`), so each of the
 across the replicas before it joins the window: K all-reduces where one at the update would do. Deferring the sum
 needs JAX's unreduced shardings. On a mesh whose axes are all Explicit, a window of three microbatches compiles to one
 all-reduce; with only the data axis Explicit, JAX 0.11.2 asserts in a matmul's transpose (fixed after the release in
-[jax-ml/jax@37cd914](https://github.com/jax-ml/jax/commit/37cd914ca1)), and Dew's layers name the data axis in their
-sharding constraints, which JAX takes only on Auto axes. Inside one compiled step XLA folds the window's sums into one;
-Dew dispatches each microbatch on its own, which keeps a partial window checkpointable.
+[jax-ml/jax@37cd914](https://github.com/jax-ml/jax/commit/37cd914ca1)). Dew's models do train with the data axis
+Explicit (`MeshSpec.explicit`): their sharding constraints name only the Auto axes, and each operation JAX cannot place
+from its operands' types (the embedding's gather and scatter-add, a reshape or repeat across the rows, a contraction
+over them, a draw or a constant joined to them) takes its placement from the rows (`dew.nn.sharding.take_rows`,
+`add_rows`, `rows_spec`, `rows_like`). Every model of tools/layout_parity.py's zoo matches one device under
+`data4_explicit` and `fsdp2_explicit`, judged against the fp64 anchor (armada-dew2, four CPU devices), but for
+DiffusionGemma, whose layer scalar no layout can be judged at. Inside one compiled step XLA folds the window's sums
+into one; Dew dispatches each microbatch on its own, which keeps a partial window checkpointable.
 
 Cost, at list prices on 2026-10-08:
 
