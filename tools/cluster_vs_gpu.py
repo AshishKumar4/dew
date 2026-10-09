@@ -180,7 +180,8 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--target", type=float, help="the loss to stop at; the shape's own by default")
     parser.add_argument("--dtype", default=None, help="compute dtype; float32 on CPU, bfloat16 on a GPU")
     parser.add_argument("--scan-layers", action="store_true",
-                        help="the decoder's layers under one scan, so a step gathers one layer's weights at a time")
+                        help="the decoder's layers under one scan, so a step gathers a layer's weights at a "
+                             "time")
     parser.add_argument("--diloco", type=int, metavar="H",
                         help="DiLoCo (Douillard et al. 2023): each host trains its own copy on its own "
                              "share of every global batch, and every H steps the hosts sync (`Outer`)")
