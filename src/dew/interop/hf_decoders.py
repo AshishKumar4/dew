@@ -848,8 +848,10 @@ _RESOLVED: Mapping[str, Callable[[CausalTransformer], object]] = {
     "position_embedding_size": lambda model: (
         model.position_embedding_size or model.max_seq_len if model.position_embedding == "learned" else None
     ),
+    "loop": lambda model: model.loop and dataclasses.replace(model.loop, backprop_steps=None),
 }
-"""Fields whose None stands for a value the forward derives, spelled out."""
+"""Fields whose None stands for a value the forward derives, spelled out, and
+the loop without `backprop_steps`, which says how it trains."""
 
 
 def refuse_lossy_export(model: CausalTransformer, config: Mapping[str, object]) -> None:

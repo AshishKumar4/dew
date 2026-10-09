@@ -86,7 +86,7 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
-from .decoder_stack import DecoderBank, StackView, _merged, run_pipeline, run_stack
+from .decoder_stack import WRITTEN, DecoderBank, Loop, PassView, StackView, _merged, run_pipeline, run_stack
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
 
 INTERMEDIATES = "intermediates"
@@ -343,6 +343,9 @@ class CausalTransformer(nn.Module):
     draws for a given seed. The split bounds the memory needed to build a
     host-resident bank and read it back, so set it for a deep stack that is
     offloaded to the host."""
+    loop: Loop | None = None
+    """The layer stack run several times over its own output, its parameters
+    shared (`Loop`), as Ouro's looped decoder runs it. None runs it once."""
     remat: RematPolicy | None = None
     """The rematerialization policy. Each block is recomputed in the backward
     pass, keeping its inputs, any K/V passed to later layers, and the residuals
@@ -372,7 +375,7 @@ class CausalTransformer(nn.Module):
         for name, record in (("altup", AltUp), ("hyper_connections", HyperConnections),
                              ("mtp_hyper_connections", HyperConnections),
                              ("attention_residuals", AttentionResiduals), ("engram", Engram),
-                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture)):
+                             ("dspark", DSpark), ("yarn", YarnScaling), ("mixture", Mixture), ("loop", Loop)):
             value = getattr(self, name)
             if isinstance(value, Mapping):
                 object.__setattr__(self, name, record(**value))
@@ -710,6 +713,11 @@ class CausalTransformer(nn.Module):
             if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
                 raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
         self.refuse_unbuildable_kinds(kinds)
+        carried = [name for name in ("altup", "hyper_connections", "attention_residuals", "dspark")
+                   if getattr(self, name) is not None]
+        if self.loop is not None and carried:
+            raise ValueError(f"a loop norms the one residual between its passes, and {carried} carry "
+                             "others beside it; a model with them runs its stack once (loop=None)")
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
@@ -973,6 +981,9 @@ class CausalTransformer(nn.Module):
             self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
             dtype=self.dtype)(name='norm')
+        if self.loop is not None and self.loop.exit_gate:
+            self.early_exit_gate = nn.Dense(1, dtype=self.dtype, precision=self.precision,
+                                            name='early_exit_gate', **normal_kernel(self.initializer_range))
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
@@ -1501,7 +1512,7 @@ class CausalTransformer(nn.Module):
             self.sow("embeddings", "prepared", prepared,
                      reduce_fn=lambda _, value: value, init_fn=lambda: prepared)
         ple = self._layer_inputs(tokens, x, routed_experts, routed)
-        residual = self.stack(
+        residual = self.looped(
             self._expand(x),
             train=train,
             decode=decode,
@@ -1512,6 +1523,7 @@ class CausalTransformer(nn.Module):
         )
         streams, x = self._collapse(residual)
         hidden = constrain(self.norm(x), RESIDUAL)
+        self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
             # head that contracts them, the chunked losses' included, as
@@ -1552,6 +1564,34 @@ class CausalTransformer(nn.Module):
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
             admitted=admitted)
+
+    def looped(self, x, **stack):
+        """Run the layer stack over `x` once, or as `loop` says: each pass after
+        the first reads the last one's output, normed under `step_norm`, and
+        the passes before the last `backprop_steps` pass no gradient back."""
+        loop = self.loop
+        if loop is None:
+            return self.stack(x, **stack)
+        x = self.stack(x, **stack)
+        for step in range(1, loop.steps):
+            normed = self.norm(x)
+            self._gate_exit(normed)
+            x = normed if loop.step_norm else x
+            if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
+                x = jax.lax.stop_gradient(x)
+            view = PassView(step, self.num_layers)
+            run = nn.map_variables(type(self).stack, mapped_collections=WRITTEN, trans_in_fn=view.inside,
+                                   trans_out_fn=view.outside, mutable=True)
+            x = run(self, x, **stack)
+        return x
+
+    def _gate_exit(self, normed):
+        """Sow the exit gate's logit for a pass's normed states into `exits`."""
+        if self.loop is None or not self.loop.exit_gate:
+            return
+        logit = self.early_exit_gate(normed)
+        if not self.is_initializing():
+            self.sow('exits', 'logits', logit)
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
               per_layer_input, attention_metadata=None):

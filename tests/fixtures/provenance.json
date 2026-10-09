@@ -3753,6 +3753,38 @@
   "hf/mimo-v2-flash-tiny/padded_logits_f64.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/exit_logits.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/exit_logits_f64.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/generated.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/logits.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/logits_f64.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/padded_logits.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/padded_logits_f64.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-1.4b/probe.npz": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
   }
  },
  "inputs": [
@@ -4189,6 +4221,11 @@
    "tool": "tools/hf_reference.py",
    "what": "MiMo-V2-Flash weights, probe token ids and padded validity masks",
    "files": ["hf/mimo-v2-flash-tiny/attention_mask.npy", "hf/mimo-v2-flash-tiny/input_ids.npy", "hf/mimo-v2-flash-tiny/model.safetensors", "hf/mimo-v2-flash-tiny/padded_ids.npy"]
+  },
+  {
+   "tool": "tools/ouro_reference.py",
+   "what": "Ouro weights, probe token ids and padded validity masks",
+   "files": ["hf/ouro-tiny/attention_mask.npy", "hf/ouro-tiny/input_ids.npy", "hf/ouro-tiny/model.safetensors", "hf/ouro-tiny/padded_ids.npy"]
   }
  ]
 }
