@@ -5,8 +5,10 @@ cmake_minimum_required(VERSION 3.24)
 project(dew_flash_attn LANGUAGES CXX CUDA)
 
 set(UPSTREAM "${CMAKE_CURRENT_SOURCE_DIR}/upstream" CACHE PATH "flash_attn_jax checkout")
-# sm80 code runs on every compute capability 8.x; FlashAttention-2 is not Hopper's kernel.
-set(CMAKE_CUDA_ARCHITECTURES 80-real)
+# sm80 code runs on every compute capability 8.x, and sm120 code on Blackwell's workstation and consumer
+# parts (the RTX PRO 6000 and RTX 50 series), which run Ampere's MMA instructions but not sm80 code.
+# FlashAttention-2 is not Hopper's or the datacenter Blackwell's kernel.
+set(CMAKE_CUDA_ARCHITECTURES 80-real 120-real)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 17)
