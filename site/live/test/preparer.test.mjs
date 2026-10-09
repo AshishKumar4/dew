@@ -14,7 +14,7 @@ const bundle = await build({
 });
 const { ManagedPreparer } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
-function preparer({ failSmoke = false, failReport = 0 } = {}) {
+function preparer({ failSmoke = false, failReport = 0, duringReport = async () => {} } = {}) {
 	const starts = [];
 	const reports = [];
 	const state = { destroys: 0, alarm: null };
@@ -36,6 +36,7 @@ function preparer({ failSmoke = false, failReport = 0 } = {}) {
 	const env = { SNAPSHOTS: { idFromString: (id) => id, get: (registry) => ({ async prepared(outcome) {
 		// A report that outlives its alarm is cut off with it: an alarm past those 15 minutes sends it again.
 		assert.ok(state.alarm > Date.now() + 15 * 60_000);
+		await duringReport();
 		if (failReport-- > 0) throw new Error('registry unreachable');
 		reports.push([registry, outcome]);
 	} }) } };
@@ -148,6 +149,20 @@ test('a snapshot no running job holds is not preparing, and an abandoned job hol
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'failed']]);
 	await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
 	assert.equal(prepared.storage.get('job').reply.token, 'lease');
+});
+test('a job abandoned while its report is out leaves the job that replaced it alone', async () => {
+	for (const failReport of [0, 1]) {
+		const prepared = preparer({ failReport, duringReport: async () => {
+			// The report outlived the job's budget, and the registry's next lease queued another.
+			prepared.storage.set('job', { ...prepared.storage.get('job'), queued: Date.now() - 40 * 60_000 });
+			await prepared.runner.queue('b'.repeat(64), false, { registry: 'registry', token: 'next' });
+		} });
+		await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
+		prepared.storage.set('job', { ...prepared.storage.get('job'), outcome: { commit: 'a'.repeat(64), trial: false, token: 'lease', failure: 'x' } });
+		await prepared.runner.alarm();
+		assert.equal(prepared.storage.get('job').reply.token, 'next');
+		assert.ok(prepared.state.alarm < Date.now() + 2000);
+	}
 });
 test('a stage cut off fails the preparation, and a report the registry missed is sent again', async () => {
 	const prepared = preparer({ failReport: 2 });

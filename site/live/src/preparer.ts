@@ -236,16 +236,22 @@ export class ManagedPreparer extends DurableObject<Env> {
 		}
 		// Should the report outlive this alarm's 15 minutes, the alarm after it sends it again.
 		await this.ctx.storage.setAlarm(Date.now() + STAGE_MS);
+		let reported = true;
 		try {
 			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
 		} catch (error) {
-			// The job, its outcome kept, holds this preparer until a later alarm reports it.
 			console.error('preparation report failed', error);
-			await this.ctx.storage.setAlarm(Date.now() + 60_000);
-			return;
+			reported = false;
 		}
-		await this.ctx.storage.delete('job');
-		await this.ctx.storage.deleteAlarm();
+		// A job abandoned while its report was out may have been replaced (`running`): that one's alarm stands.
+		if ((await this.ctx.storage.get<Job>('job'))?.secret !== job.secret) return;
+		if (reported) {
+			await this.ctx.storage.delete('job');
+			await this.ctx.storage.deleteAlarm();
+		} else {
+			// The job, its outcome kept, holds this preparer until a later alarm reports it.
+			await this.ctx.storage.setAlarm(Date.now() + 60_000);
+		}
 	}
 }
 
