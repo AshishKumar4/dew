@@ -42,6 +42,32 @@ runuser -u model -- env HF_HOME=/opt/hf JAX_PLATFORMS=cpu \
     JAX_PERSISTENT_CACHE_MIN_ENTRY_SIZE_BYTES=-1 XLA_FLAGS=--xla_cpu_max_isa=AVX2 \
     /opt/venv/bin/python /opt/live/warm-managed.py
 if ! wait "$cells"; then tail -c 4000 /root/prepare-cells.log >&2; exit 1; fi
+# A file both the model process and a training context read, as SmolLM2's weights, is stored once.
+/opt/venv/bin/python - <<'PY'
+import hashlib
+import os
+from pathlib import Path
+
+
+def files(root):
+    return [path for path in Path(root).rglob("*") if path.is_file() and not path.is_symlink()
+            and path.stat().st_size > 1 << 20]
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+models = {}
+for path in files("/opt/models"):
+    models.setdefault(path.stat().st_size, []).append(path)
+for path in files("/opt/train"):
+    twin = next((model for model in models.get(path.stat().st_size, []) if digest(model) == digest(path)), None)
+    if twin:
+        path.unlink()
+        os.link(twin, path)
+PY
 chmod 0750 /opt/models /opt/hf /opt/xla
 # Training contexts read /opt/train (gateway_manager.py); nothing may write it after preparation.
 chown -R root:root /opt/train

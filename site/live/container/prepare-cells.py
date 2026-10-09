@@ -16,6 +16,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from huggingface_hub import scan_cache_dir
+
 sys.path.insert(0, "/opt/live/cells")
 import cells
 
@@ -46,3 +48,8 @@ for name, code in programs.items():
         subprocess.run([sys.executable, "-c", FETCH], input=code, text=True, cwd=work, env=env, check=True,
                        timeout=600, stdout=subprocess.DEVNULL)
     print(f"prepared {name} in {time.monotonic() - started:.0f} s", flush=True)
+# A cell reads a dataset from the arrow files `datasets` prepared from the Hub's copy, never from
+# the copy, which would only double what the snapshot holds (CIFAR-10's 138 MB).
+hub = scan_cache_dir(Path(env["HF_HOME"]) / "hub")
+hub.delete_revisions(*(revision.commit_hash for repo in hub.repos if repo.repo_type == "dataset"
+                       for revision in repo.revisions)).execute()
