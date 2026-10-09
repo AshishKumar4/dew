@@ -7,9 +7,10 @@ the cheaper question under that one, and the reason a candidate step change
 is worth measuring at all: which kernel wins at this shape, forward-only and
 forward+backward.
 
-Three of the paths are the attention kernels the trainer can log for a GPU
-run: the flax reference einsum, xla, and cudnn. The fourth, `triton`, is
-tokamax's Pallas-Triton flash attention, called directly through
+Four of the paths are the attention kernels the trainer can log for a GPU
+run: the flax reference einsum, xla, cudnn, and flash, FlashAttention-2 from
+the dew_flash_attn wheel on any sm8x part. The fifth, `triton`, is tokamax's
+Pallas-Triton flash attention, called directly through
 `tokamax.dot_product_attention`; Dew has no route to it, and this tool is
 where the case for one is measured. Batch and head counts are picked so
 every implementation sees the same token x head count, which is the fair
@@ -35,7 +36,7 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'triton')
+IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'flash', 'triton')
 # B chosen so batch * sequence * heads is constant across the sequence sweep:
 # 512k query tokens at every row, so a slower row is a slower kernel, not a
 # smaller one.

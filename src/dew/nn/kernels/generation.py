@@ -51,9 +51,10 @@ def device_generation() -> str:
 # The kernel each choice runs per generation, as measured (docs/performance.md, "Kernel choices per
 # generation"); a generation a row does not name runs the choice's portable path.
 KERNELS: dict[str, dict[str, str]] = {
-    # FlashAttention-2 (dew_flash_attn) beat cuDNN by 4-8% in Qwen3-0.6B's training step, and the
-    # xla path 256-wide heads take by 17%; on the L4 it gained under 3%.
-    'attention': {'sm80': 'flash'},
+    # FlashAttention-2 (dew_flash_attn) beat cuDNN by 4-8% in Qwen3-0.6B's training step on the A100,
+    # and the xla path 256-wide heads take by 17%; on the RTX 4080 by 1.9-2.5% in the decoder and DiT
+    # steps, and on the L4 by under 3%.
+    'attention': {'sm80': 'flash', 'sm89': 'flash'},
     # JAX's Pallas grouped matmul runs 5x-61x faster than XLA's ragged_dot on sm80-sm89; on TPU XLA
     # wins except tokamax's mosaic_tpu_v2 (1.11x-1.38x at 8 experts), not a dependency.
     'grouped_matmul': {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas', 'v5e': 'xla', 'v6e': 'xla'},
