@@ -899,7 +899,11 @@ class CausalSelfAttention(nn.Module):
 
     def _page_kernel_runs(self, query) -> bool:
         """Whether a decode step may read a paged pool through its device's
-        paged kernel (`KVStore.decode`) rather than the gathered rows."""
+        paged kernel (`KVStore.decode`) rather than the gathered rows. The
+        paged kernels read keys and values of one width, so narrower values
+        take the gathered rows, which the attention core widens."""
+        if self.value_dim != self.head_dim:
+            return False
         if jax.default_backend() != 'gpu':
             return self.attention_impl in ('auto', 'tpu')
         return (self.attention_impl in ('auto', 'cudnn')

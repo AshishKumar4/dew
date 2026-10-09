@@ -96,6 +96,23 @@ def test_the_reference_catches_each_mechanism_left_out(label):
     assert_another_model(model.apply(variables, np.load(TINY / 'input_ids.npy')), label)
 
 
+def test_narrow_values_read_a_paged_pool_through_the_gathered_rows():
+    """The paged kernels take keys and values of one width, so a layer whose
+    values are narrower than its heads never reaches them."""
+    import jax.numpy as jnp
+
+    from dew.nn.kv_cache import KVCache
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    def layer(value_head_dim):
+        return CausalSelfAttention(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=12, max_seq_len=16,
+                                   value_head_dim=value_head_dim, kv_cache=KVCache(page_size=4))
+
+    query = jnp.zeros((1, 1, 4, 12), jnp.bfloat16)
+    assert not layer(8)._page_kernel_runs(query)
+    assert layer(None)._page_kernel_runs(query) == layer(12)._page_kernel_runs(query)
+
+
 def test_the_released_configs_translate_their_computation():
     """The release spells the layout in the authors' own fields, which
     transformers derives from its defaults instead; they read as that model."""
