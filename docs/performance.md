@@ -78,9 +78,17 @@ the gradient of raveled parameters, still compiles to one all-reduce of every pa
 partitioner sums each matmul's partial gradient where it is made. One flat sum needs the data axis's reduction
 written by hand, outside the partitioner.
 
-Where the processes agree on the host (a fit's first read, a log interval, a checkpoint), each agreement is one round
-through the coordination service, about 33 ms on 8 containers and 63 ms on 32; it was a barrier and a device
-allgather, 143 and 549 ms (`gang_bench.py`'s `agreements`).
+Where the processes agree on the host (a fit's first read, a log interval, a checkpoint) or share a small host value,
+each takes one round through the coordination service, with no device computation:
+
+| `gang_bench.py`'s `agreements`, median | 8 containers | 32 containers |
+|---|---|---|
+| an agreement (`agree_process_phase`), before: a barrier and a device allgather | 143 ms | 549 ms |
+| an agreement on a value (`agreed_same`), before | 674 ms | 2121 ms |
+| an agreement now, one round | 35 ms | 89 ms |
+| an agreement on a value now | 32 ms | 84 ms |
+
+Before: jobs 20261009034328-7537edca and -6c17c0b3; now: 20261009043355-c4bdea20 and -c2f53803.
 
 Accumulating gradients (`Trainer(accumulation=K)`) does not spare those sums. The accumulated gradient is placed as
 the parameters are, whole on every replica (`Trainer.shardings`), so each of the K microbatches sums its gradient
