@@ -80,6 +80,9 @@ export async function smokeSnapshot(container: Container, plan: PreparationPlan,
 	await phase('offline restore');
 	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false,
 		entrypoint: plan.entrypoint, env: plan.env });
+	// The restored container stops only when destroyed or when it fails; say which, and when.
+	container.monitor().then(() => console.log('preparation container exited', snapshot.id, Date.now() - started))
+		.catch((error) => console.error('preparation container stopped', snapshot.id, Date.now() - started, String(error)));
 	await container.setInactivityTimeout(15 * 60_000);
 	await plan.smoke(container, phase);
 	return (Date.now() - started) / 1000;
@@ -136,7 +139,10 @@ export class ManagedPreparer extends DurableObject<Env> {
 		await this.ctx.storage.put('snapshots', { ...records, [record.id]: record });
 	}
 
-	private phase = async (phase: string) => { await this.ctx.storage.put('phase', { phase, at: Date.now() }); };
+	private phase = async (phase: string) => {
+		console.log('preparation phase', phase);
+		await this.ctx.storage.put('phase', { phase, at: Date.now() });
+	};
 
 	protected plan(job: Job): PreparationPlan {
 		return livePreparation(job.commit, job.commit, job.secret);
@@ -158,8 +164,10 @@ export class ManagedPreparer extends DurableObject<Env> {
 		}
 		if (!job.outcome) {
 			const failed = (failure: string): Prepared => ({ commit: job.commit, trial: job.trial, token: job.reply.token, failure });
-			if (job.began) job.outcome = failed(`the ${job.stage} was cut off: it outlived its alarm's 15 minutes, or a deploy restarted it`);
-			else {
+			if (job.began) {
+				job.outcome = failed(`the ${job.stage} was cut off in its ${(await this.status())?.phase ?? 'first'} phase: `
+					+ 'it outlived its alarm\'s 15 minutes, or the runtime restarted it');
+			} else {
 				job.began = Date.now();
 				await this.ctx.storage.put('job', job);
 				// Should this alarm be cut off, the next one fails the preparation.
