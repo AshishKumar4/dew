@@ -448,8 +448,8 @@ Each source control has one rule for its consumer, neutral value, mode and refus
 Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `TextToImage`, `Images`, `DenoisingInputs` and `RunProcessor` from `dew.inference`. `dew.pipeline` is the same function. [Inference](../concepts/inference.md) describes placement and the three workflows.
 
 ```text
-pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, ema=None, step=None,
-         revision=None) -> TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
+pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None, expert_storage=None, ema=None,
+         step=None, revision=None) -> TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 Objective.pipeline(state, *, ema=None, processor=OMITTED) -> the objective's task (build_task) over
     state.averaged or state.variables; processor omitted keeps the objective's own, None clears it
 Objective.build_task(variables, *, processor=OMITTED) -> TextGeneration (LM, GRPO, PPO's actor),
@@ -470,7 +470,8 @@ task(request, max_new_tokens=None, *, key=None, n=None, process=None,
      images=None) -> CanvasGeneration
 Pretrained.load(name_or_dir, *, dtype=jnp.bfloat16, param_dtype=jnp.float32, attention_impl="auto",
                 max_seq_len=None, revision=None, gguf_file=None, single_file=None, dduf_file=None,
-                mesh=None, layout=None, fallback=None) -> the kind it is called on, or the kind the source is
+                mesh=None, layout=None, fallback=None, expert_storage="float")
+    -> the kind it is called on, or the kind the source is
 PretrainedDecoder.text_generation(*, sampling=None) -> TextGeneration
 PretrainedMaskedDecoder.text_generation() -> MaskedGeneration
 PretrainedBlockDecoder.block_generation() -> BlockGeneration

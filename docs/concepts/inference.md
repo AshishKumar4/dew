@@ -58,7 +58,7 @@ Trained 150 steps in 0:00:11: first step after 2.49 s, then 17.0 step/s
 
 ```text
 pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
-         ema=None, step=None, revision=None)
+         expert_storage=None, ema=None, step=None, revision=None)
 ```
 
 | Argument | Meaning |
@@ -67,6 +67,7 @@ pipeline(source, *, mesh=None, layout=None, dtype=None, param_dtype=None,
 | `mesh`, `layout` | Where the weights are placed. Without `mesh`, `MeshSpec()` puts the current process pool's devices on data parallelism. |
 | `dtype` | Compute dtype. |
 | `param_dtype` | Parameter storage. `None` and `"auto"` keep each tensor in the dtype it is stored in, for a run or a published source; a quantized source's packed weights decode to the dtype its `config.json` declares. `"float32"` gives a published source float32 master weights. |
+| `expert_storage` | How a published source's MXFP4 routed experts (GPT OSS, Kimi K3) are held. `"mxfp4"` keeps the checkpoint's bytes and decodes them on the device, with the same logits ([MXFP4 experts](moe.md#mxfp4-experts)); `"float"` decodes them on the host. `None` holds them as MXFP4 on a hardware generation where that was measured faster (`KERNELS['mxfp4_grouped_matmul']`) and decodes them elsewhere. A run's experts are float. |
 | `ema` | `None` (default): the run's moving-average weights when it stored them, else the live ones. `True` requires the average; `False` reads the live weights. |
 | `step` | Which of a run's checkpoints to load; refused for a source checkpoint. |
 | `revision` | Pins a Hub source; refused for a run directory. |
