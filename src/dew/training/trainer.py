@@ -649,10 +649,11 @@ class Trainer(Generic[Loss, Effects]):
         """The axes the objective's modules box on their own parameters
         (`nn.with_logical_partitioning`), which its init returns and the state
         unboxes: what `initial_state` last traced, else one abstract init, for
-        a state the trainer did not build."""
+        a state the trainer did not build. A checkpoint records them for its
+        restore."""
         if self._boxed is None:
             self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
-        return ruled_boxes(self._boxed, self.layout.axis_rules)
+        return self._boxed
 
     def shardings(self, state: TrainState) -> Placement[TrainState]:
         """Return where each field of `state` is placed, on the axes that suit its kind.
@@ -662,7 +663,7 @@ class Trainer(Generic[Loss, Effects]):
         state, the frozen collection is the exception: it stays where the realization
         reads it (`execution.resident`) for the whole run.
         """
-        with boxed(self._boxed_axes()):
+        with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
             return self._shardings(state)
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
@@ -1988,7 +1989,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
                          ranking=ranking, control=control, weights_only=weights_only,
-                         rung=self._rung(), artifact=self._artifact())
+                         rung=self._rung(), artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -2010,7 +2011,8 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control=control, rung=self._rung(), artifact=self._artifact())
+                               control=control, rung=self._rung(), artifact=self._artifact(),
+                               boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused

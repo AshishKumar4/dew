@@ -365,7 +365,8 @@ class BoxedReadout(Objective):
         return Readouts().init(key, jnp.ones((1, 16)))
 
     def loss(self, variables, batch, step):
-        return jnp.sum(Readouts().apply(variables, batch["image"][:, 0, 0, :16]) ** 2), Aux({})
+        features = batch["image"].reshape(batch["image"].shape[0], -1)[:, :16].astype(jnp.float32) / 255
+        return jnp.sum(Readouts().apply(variables, features) ** 2), Aux({})
 
 
 def test_a_boxed_parameter_places_by_its_own_names_and_its_namesake_elsewhere_does_not():
@@ -391,6 +392,23 @@ def test_a_boxed_parameter_places_by_its_own_names_and_its_namesake_elsewhere_do
     boxed, plain = moments[("readout", "kernel")], moments[("decoder", "readout", "kernel")]
     assert (len(boxed[1]), set(boxed[1])) == (2, {P(None, "fsdp")})
     assert (len(plain[1]), set(plain[1])) == (1, {P("fsdp")})
+
+
+def test_a_restored_run_places_its_boxed_parameters_by_their_names(tmp_path):
+    """The trainer records the axes the model boxes with each checkpoint, and
+    a restore onto a mesh (`Checkpoints.variables`, which `from_run` and
+    `dew.pipeline` read) places by them, the state having held them unboxed."""
+    layout = Layout(min_shard=1, rules=(("vocab", "fsdp"),))
+    Trainer(BoxedReadout(), optax.adam(1e-3), key=jax.random.key(0), mesh=MeshSpec(fsdp=2), layout=layout,
+            checkpoints=Checkpoints(str(tmp_path))).fit(Data(batches), steps=1)
+
+    checkpoints = Checkpoints(str(tmp_path))
+    assert checkpoints.boxed() == {("params", "readout", "kernel"): (None, "vocab"),
+                                   ("params", "foreign", "kernel"): ("foreign_a", "foreign_b")}
+    params = checkpoints.variables(mesh=MeshSpec(fsdp=2), layout=layout)["params"]
+    assert params["readout"]["kernel"].sharding.spec == P(None, "fsdp")
+    assert params["decoder"]["readout"]["kernel"].sharding.spec == P("fsdp")
+    assert params["foreign"]["kernel"].sharding.spec == P("fsdp")
 
 
 def test_rule_override_changes_only_declared_axes():
