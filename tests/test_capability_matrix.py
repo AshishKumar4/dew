@@ -319,6 +319,7 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = {
         Family("causal_transformer+gated_delta_hybrid", "causal_transformer", DECODER_LM, 256,
                released("qwen35-tiny")),
         Family("causal_transformer+mamba2", "causal_transformer", DECODER_LM, 32, released("mamba2-tiny")),
+        Family("causal_transformer+mamba", "causal_transformer", DECODER_LM, 64, released("mamba-tiny")),
         # Kimi K2.5's language model; Dew reads no Kimi vision tower.
         Family("causal_transformer+kimi_k25", "causal_transformer", DECODER_LM, 256,
                released("kimi-k25-tiny")),
