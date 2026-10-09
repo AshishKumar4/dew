@@ -338,7 +338,7 @@ def test_a_trainer_refuses_experts_held_in_mxfp4(gpt_oss_mxfp4):
                           key=jax.random.key(0))
         return jax.eval_shape(trainer.initial_state)
 
-    with pytest.raises(ValueError, match=r"layers_0/mlp/experts/gate_up_proj is held as the checkpoint's "
+    with pytest.raises(ValueError, match=r"params/layers_0/mlp/experts/\w+_proj is held as the checkpoint's "
                                          r"bytes .* load with expert_storage='float' to train"):
         state("mxfp4")
     experts = state("float").variables["params"]["layers_0"]["mlp"]["experts"]
