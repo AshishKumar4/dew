@@ -29,8 +29,7 @@ def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
     return {} if default is None else {"kernel_init": default}
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(2,))
-def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
+def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     """`table[ids]` in `dtype`, the table's rows gathered before the cast so
     the gradient accumulates in the table's dtype: casting the table first
     would scatter-add repeated tokens' cotangents in bf16. Under an Explicit
@@ -38,6 +37,11 @@ def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     placed = explicit_spec(ids, table.ndim - 1)
     rows = jnp.take(table, ids, axis=0) if placed is None else table.at[ids].get(out_sharding=placed)
     return rows.astype(dtype)
+
+
+# `jax.custom_vjp` is generic in its return type, and a `functools.partial`
+# decorator loses that binding, so it is built by hand, as `ssd_chunk_scan` is.
+table_rows = jax.custom_vjp(_table_rows, nondiff_argnums=(2,))
 
 
 def _table_rows_forward(table: jax.Array, ids: jax.Array, dtype: Dtype):
