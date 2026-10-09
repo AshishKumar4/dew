@@ -66,7 +66,9 @@ from jax.experimental import multihost_utils
 from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
-from dew import position
+from dew import position, records
+from dew.nn import sharding
+from dew.nn.sharding import LogicalAxes
 from dew.objectives.base import Variables
 from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
@@ -767,6 +769,11 @@ class _ProfileSteps(preservation.PreservationPolicy):
         return [checkpoint.step in self.steps for checkpoint in checkpoints]
 
 
+def _boxed_record(boxed: Mapping[tuple[str, ...], LogicalAxes] | None) -> list[dict[str, list[str | None]]]:
+    """The boxed axes as a step's metadata holds them, one path and its names each."""
+    return [{"path": list(path), "names": list(names)} for path, names in (boxed or {}).items()]
+
+
 class Checkpoints:
     """Manages the checkpoints of one run in one directory.
 
@@ -1075,13 +1082,16 @@ class Checkpoints:
         primary: str | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
     ) -> None:
         """Write `state` under `step`, asynchronously.
 
         `state` is a run's `TrainState`, or a mapping of arrays in its place
         for a state that is not a training run's, such as a simulation's,
-        which has no optimizer, average or loss scale. A mapping is written as
-        it is, with `metrics`, `ranking` and `control` as a train state's are,
+        which has no optimizer, average or loss scale. `boxed` is the axes the
+        model's modules box on their own parameters (`dew.nn.sharding.boxed_axes`),
+        which the state holds unboxed; `variables` places with them. A mapping is
+        written as it is, with `metrics`, `ranking` and `control` as a train state's are,
         and `restore` reads it back through a mapping template; it takes no
         data position, share, weights-only split, rung or artifact. It is
         written whole at every step, without the store a train state's
@@ -1155,6 +1165,7 @@ class Checkpoints:
                     "weights_only": weights_only,
                     "rung": rung,
                     "artifact": artifact,
+                    "boxed": _boxed_record(boxed),
                     "frozen": frozen,
                     "tree": mapping,
                 },
@@ -1352,6 +1363,7 @@ class Checkpoints:
         control: dict | None = None,
         rung: JSON = None,
         artifact: JSON = None,
+        boxed: Mapping[tuple[str, ...], LogicalAxes] | None = None,
     ) -> None:
         """Write `state` under `step` to this process's local directory, asynchronously.
 
@@ -1381,6 +1393,7 @@ class Checkpoints:
                     "control": copy.deepcopy(control or {}),
                     "rung": rung,
                     "artifact": artifact,
+                    "boxed": _boxed_record(boxed),
                 },
             )
         if _written_in_place(state_tree):
@@ -1409,6 +1422,25 @@ class Checkpoints:
         checkpointer = self._open_local() if step == self._local_latest() else self._open()
         return json_value((checkpointer.metadata(step).custom_metadata or {}).get('rung'), 'rung')
 
+    def boxed(self, step: int | str | None = None) -> dict[tuple[str, ...], LogicalAxes]:
+        """The axes the model at `step` boxed on its own parameters, as `save`
+        recorded them; a checkpoint saved without them has none."""
+        resolved = self.pinned(step)
+        snapshot = self._step_metadata(resolved, local=resolved == self._local_latest())
+        recorded = (snapshot.custom_metadata or {}).get('boxed') or []
+        if not isinstance(recorded, list):
+            raise ValueError(f"step {resolved}'s boxed axes are a list of path and names records, "
+                             f"got {recorded!r}")
+        table = {}
+        for entry in recorded:
+            entry = records.record(entry, 'boxed')
+            names = entry['names']
+            if not isinstance(names, list):
+                raise ValueError(f"step {resolved}'s boxed names are a list, got {names!r}")
+            table[records.strings(entry['path'], 'boxed path')] = tuple(
+                None if name is None else records.text(name, 'boxed name') for name in names)
+        return table
+
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,
                   mesh=None, layout=None, param_dtype: jax.typing.DTypeLike | None = None,
                   parameter_roots: tuple[tuple[str, ...], ...] = (("params",), ("frozen",))) -> Variables:
@@ -1422,6 +1454,7 @@ class Checkpoints:
         from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
 
         target = resolve_dtype(param_dtype)
+        step = self.pinned(step)
         stored = self.stored(step)
         template = {"variables": stored["variables"]}
         if ema and stored.get("ema") is None:
@@ -1431,7 +1464,8 @@ class Checkpoints:
             template["ema"] = stored["ema"]
         device_mesh = (DefaultMesh() if mesh is None else mesh).build()
         chosen_layout = DefaultLayout() if layout is None else layout
-        placement = chosen_layout.shardings(device_mesh, template)
+        with sharding.boxed(self.boxed(step)):
+            placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in template.items()}
         chosen_layout.check(template["variables"], placement["variables"], device_mesh)
         selected = set()
         if target is not None:
