@@ -100,10 +100,11 @@ test('a stage cut off fails the preparation, and a report the registry missed is
 	await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
 	// An alarm began the build and was cut off: the next alarm finds its start.
 	prepared.storage.set('job', { ...prepared.storage.get('job'), began: Date.now() - 15 * 60_000 });
+	prepared.storage.set('phase', { phase: 'install and warm', at: Date.now() - 14 * 60_000 });
 	for (const _ of [1, 2]) {
 		await prepared.runner.alarm();
 		// The registry did not take it: the outcome is kept, and another alarm will send it.
-		assert.match(prepared.storage.get('job').outcome.failure, /build was cut off/);
+		assert.match(prepared.storage.get('job').outcome.failure, /build was cut off in its install and warm phase/);
 		assert.ok(prepared.state.alarm > Date.now());
 	}
 	await prepared.runner.alarm();
