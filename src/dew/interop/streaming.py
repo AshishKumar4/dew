@@ -179,8 +179,9 @@ class WeightLayout:
     dtype: np.dtype | None = None
     padded: int | None = None
 
-    def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
-              scalar_mode: str | None, expert: int | None = None) -> np.ndarray | jax.Array:
+    def _arrays(self, variables: Mapping[str, object], path: tuple[str, ...],
+                scalar_mode: str | None) -> list[np.ndarray | jax.Array]:
+        """The arrays at `path`: one leaf, or a matrix's MXFP4 parts."""
         if path[-1] == "layer_scalar":
             if scalar_mode not in ("frozen", "trainable"):
                 raise ValueError("layer_scalar export requires an explicit model mode")
@@ -190,32 +191,39 @@ class WeightLayout:
             if not isinstance(node, Mapping):
                 raise ValueError(f"parameter path {path} does not traverse a mapping")
             node = node[part]
-        mxfp4 = isinstance(node, Mapping) and set(node) == set(MXFP4_PARTS)
-        arrays: list[np.ndarray | jax.Array] = []
-        for leaf in [node[part] for part in MXFP4_PARTS] if isinstance(node, Mapping) and mxfp4 else [node]:
-            if not isinstance(leaf, (np.ndarray, jax.Array)):
-                raise ValueError(
-                    f"{self.name} reads {path}, which holds {type(leaf).__name__} rather than an array"
-                )
-            if expert is not None:
-                # Slice the expert where the leaf lives. One stacked leaf
-                # answers for E source tensors, so copying it to the host
-                # per tensor would move the whole stack E times.
-                if leaf.ndim == 0 or not 0 <= expert < leaf.shape[0]:
-                    raise ValueError(f"{self.name} is expert {expert} of {path}, which holds {leaf.shape}")
-                leaf = leaf[expert]
-            arrays.append(leaf)
-        return decode_mxfp4_parts(*map(np.asarray, arrays)) if mxfp4 else arrays[0]
+        held = ([node[part] for part in MXFP4_PARTS]
+                if isinstance(node, Mapping) and set(node) == set(MXFP4_PARTS) else [node])
+        arrays = [leaf for leaf in held if isinstance(leaf, (np.ndarray, jax.Array))]
+        if len(arrays) != len(held):
+            raise ValueError(
+                f"{self.name} reads {path}, which holds {type(node).__name__} rather than an array"
+            )
+        return arrays
+
+    def _leaf(self, variables: Mapping[str, object], path: tuple[str, ...],
+              scalar_mode: str | None) -> np.ndarray | jax.Array:
+        arrays = self._arrays(variables, path, scalar_mode)
+        if self.expert_index is not None:
+            # Slice the expert where the leaf lives. One stacked leaf
+            # answers for E source tensors, so copying it to the host
+            # per tensor would move the whole stack E times.
+            if any(leaf.ndim == 0 or not 0 <= self.expert_index < leaf.shape[0] for leaf in arrays):
+                raise ValueError(f"{self.name} is expert {self.expert_index} of {path}, which "
+                                 f"holds {arrays[0].shape}")
+            arrays = [leaf[self.expert_index] for leaf in arrays]
+        return arrays[0] if len(arrays) == 1 else decode_mxfp4_parts(*map(np.asarray, arrays))
 
     def stored_dtype(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.dtype:
-        """The dtype `export` writes, read from the leaf without copying it."""
+        """The dtype `export` writes, read from the leaf without copying it:
+        float32 for MXFP4 parts, which export decodes."""
         if self.dtype is not None:
             return np.dtype(self.dtype)
-        return np.dtype(self._leaf(variables, self.paths[0], scalar_mode).dtype)
+        arrays = self._arrays(variables, self.paths[0], scalar_mode)
+        return np.dtype(arrays[0].dtype if len(arrays) == 1 else np.float32)
 
     def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
         """The source tensor, built from its leaves and brought to the host."""
-        leaves = [self._leaf(variables, path, scalar_mode, self.expert_index) for path in self.paths]
+        leaves = [self._leaf(variables, path, scalar_mode) for path in self.paths]
         if (len(leaves) == 1 and self.transpose is not None
                 and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype):
             # One leaf is transposed on its device and copied to the host
