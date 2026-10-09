@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import records
-from dew.interop.config_records import native_fields
+from dew.interop.config_records import NativeFields
 from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
@@ -26,7 +26,6 @@ from dew.interop.decoder_parts import (
     Ropes,
     base_config,
     decoder_kinds,
-    decoder_tensors,
     plain_partial_rope,
     refuse,
     renamed_name,
@@ -126,12 +125,13 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
         o_proj_bias=False, partial_rotary_factor=None if full_factor == 1.0 else full_factor,
         partial_rotary_type='default',
         attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
-        mixture=native_fields(Mixture)(
+        mixture=NativeFields(Mixture, {
             **deepseek_layout({**hf, 'routed_scaling_factor': hf.get('routed_scaling_factor') or 1.0},
                               count, used, sparse_layers=sparse),
-            score_function='sigmoid', bias=True,
-            groups=records.integer(hf.get('n_group') or 1, 'n_group'),
-            groups_per_token=records.integer(hf.get('topk_group') or 1, 'topk_group')) if sparse else None)
+            'score_function': 'sigmoid', 'bias': True,
+            'groups': records.integer(hf.get('n_group') or 1, 'n_group'),
+            'groups_per_token': records.integer(hf.get('topk_group') or 1, 'topk_group'),
+        }) if sparse else None)
     return config
 
 
@@ -176,6 +176,6 @@ def _matches(fields: CausalTransformer) -> bool:
 MIMO_V2_FLASH = DecoderFamily(
     ('mimo_v2_flash',), _mimo_v2_flash_config, _matches, 'mimo_v2_flash', 'MiMoV2FlashForCausalLM',
     _mimo_v2_flash_export, weight_path=_mimo_v2_flash_path, export_path=partial(renamed_name, _NAMES),
-    # Its partial rotary turns heads as they are stored, so the shared writer writes them unchanged.
-    export_weights=decoder_tensors, preserve_source_layout=False,
+    # Its experts are stored one tensor each, so a save writes them back through the source's own names.
+    preserve_source_layout=True,
 )

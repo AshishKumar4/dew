@@ -459,14 +459,19 @@ class CausalTransformer(nn.Module):
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             yarn=self.yarn if kind.yarn is None else kind.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
-            # LongRoPE's factors fix the rotated width on every layer;
-            # Gemma's windowed layers otherwise rotate whole heads.
-            partial_rotary_factor=(kind.partial_rotary_factor if kind.partial_rotary_factor is not None
-                                   else self.partial_rotary_factor if kind.window is None
-                                   or isinstance(kind.rope_scaling or self.rope_scaling, LongRopeScaling)
-                                   else None),
+            partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
             mixer=kind.mixer)
+
+    def _kind_rotary(self, kind: LayerKind) -> float | None:
+        """The fraction of a kind's head its rotary turns, None for all of
+        it: the kind's own, else the model's on a kind that attends the whole
+        sequence. LongRoPE's factors fix the rotated width on every layer;
+        Gemma's windowed layers otherwise rotate whole heads."""
+        factor = (kind.partial_rotary_factor if kind.partial_rotary_factor is not None
+                  else self.partial_rotary_factor if kind.window is None
+                  or isinstance(kind.rope_scaling or self.rope_scaling, LongRopeScaling) else None)
+        return None if factor == 1.0 else factor
 
     @property
     def hash_layers(self) -> set:

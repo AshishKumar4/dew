@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
-from dew.interop import Pretrained, PretrainedDecoder
+from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.interop.sources import load_shards
 
@@ -51,7 +51,7 @@ def test_export_reads_in_transformers_and_reloads_bit_for_bit(tmp_path):
     from transformers import AutoModelForCausalLM
 
     loaded = load()
-    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
+    loaded.save(tmp_path)
     assert json.loads((tmp_path / 'config.json').read_text())['model_type'] == 'mimo_v2_flash'
     original, exported = load_shards(TINY), load_shards(tmp_path)
     assert set(original) == set(exported)
