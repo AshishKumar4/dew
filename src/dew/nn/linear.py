@@ -132,15 +132,18 @@ def _stream_order(valid):
     return rank, source
 
 
-def held_conv1d(x, kernel, valid, held=None):
+def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None):
     """`[B, D, S]` convolved causally after the `held` history, `[B, D, K - 1]`
     or None for none, and the history the next call holds: a linear-attention
-    layer's conv over its decode cache, padded slots read and advanced by none
-    (`_masked_conv1d`)."""
-    if valid is not None:
-        return _masked_conv1d(x, kernel, valid, held)
+    or state-space layer's conv over its decode cache, padded slots read and
+    advanced by none (`_masked_conv1d`). `bias` is added before the silu, and
+    packed `segments` convolve each document alone."""
+    if valid is not None or segments is not None:
+        valid = jnp.ones(x.shape[::2], bool) if valid is None else valid
+        return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments)
     history = x if held is None else jnp.concatenate([held, x], axis=2)
-    return causal_conv1d(history, kernel)[..., -x.shape[2]:], history[:, :, -(kernel.shape[-1] - 1):]
+    return (causal_conv1d(history, kernel, bias=bias)[..., -x.shape[2]:],
+            history[:, :, -(kernel.shape[-1] - 1):])
 
 
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
