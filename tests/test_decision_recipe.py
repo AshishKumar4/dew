@@ -148,7 +148,7 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     benchmark = _module("benchmark")
     scored = benchmark.held(tmp_path / "runs" / "run", mixture)
     assert set(scored) == {"sources", "macro"}
-    assert scored["sources"]["rows"]["rows"] == 12
+    assert scored["sources"]["rows"]["rows"] == made["rows"]["rows"]["held"]
     assert scored["sources"]["hard"]["rows"] == 2
     for source, metrics in scored["sources"].items():
         assert set(metrics) == {"rows", "questions", "log_loss", "accuracy"}
