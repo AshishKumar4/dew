@@ -1,5 +1,5 @@
 import { DurableObject } from 'cloudflare:workers';
-import type { Prepared, Reply } from './preparer';
+import { PREPARATION_MS, type Prepared, type Reply } from './preparer';
 
 export interface SnapshotGeneration {
 	snapshot: ContainerSnapshot;
@@ -22,8 +22,8 @@ interface SnapshotEnv {
 
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 const RENEW_MS = 7 * 24 * 60 * 60_000;
-// A preparation's two stages, the snapshot and its smoke, each have an alarm's 15 minutes.
-const REBUILD_MS = 35 * 60_000;
+// A preparation reports within PREPARATION_MS; a minute more covers the alarms that hand it on.
+const REBUILD_MS = PREPARATION_MS + 60_000;
 // A failed preparation is retried after 5 minutes, then twice as long each time, up to 6 hours:
 // each attempt may leave a snapshot behind until an operator prunes (snapshot-ledger.ts).
 const RETRY_MS = 5 * 60_000;
@@ -108,7 +108,7 @@ export class SnapshotRegistry extends DurableObject<SnapshotEnv> {
 		// The preparer reports every end; a trial silent for longer than both its stages may run was cut off.
 		const cut = open && now - last.at > REBUILD_MS;
 		return { pending: open && !cut ? last.commit : null,
-			last: cut ? { ...last, failure: 'the trial left no outcome in 35 minutes' } : last };
+			last: cut ? { ...last, failure: `the trial left no outcome in ${REBUILD_MS / 60_000} minutes` } : last };
 	}
 
 	override async alarm(): Promise<void> {
