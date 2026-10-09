@@ -147,3 +147,25 @@ def test_the_released_config_is_pinned():
     filename = hf_hub_download(source['repo'], 'config.json', revision=source['revision'])
     pinned = json.loads((ROOT / 'mamba-130m-hf' / 'config.json').read_text())
     assert json.loads(Path(filename).read_text()) == pinned
+
+
+@pytest.mark.network
+def test_state_spaces_mamba_130m_computes_the_references_logits():
+    """state-spaces/mamba-130m-hf in fp32 on CPU, in Dew and in
+    transformers 5.16.1, on two prompts cut to a common length."""
+    torch = pytest.importorskip("torch")
+    transformers = pytest.importorskip("transformers")
+    source = json.loads((ROOT / 'mamba-130m-hf' / 'source.json').read_text())
+    tokenizer = transformers.AutoTokenizer.from_pretrained(source['repo'], revision=source['revision'])
+    prompts = ["The capital of France is Paris, and the capital of Germany is",
+               "def fibonacci(n):\n    if n < 2:\n        return n\n    return"]
+    rows = [tokenizer(prompt)["input_ids"] for prompt in prompts]
+    ids = np.asarray([row[:min(map(len, rows))] for row in rows], np.int32)
+    reference = transformers.MambaForCausalLM.from_pretrained(
+        source['repo'], revision=source['revision'], dtype=torch.float32).eval()
+    with torch.no_grad():
+        expected = reference(torch.from_numpy(ids.astype(np.int64))).logits.numpy()
+    loaded = Pretrained.load(source['repo'], revision=source['revision'], dtype='float32')
+    logits = np.asarray(loaded.model.apply(loaded.variables, ids), np.float32)
+    assert float(np.max(np.abs(logits - expected))) < 1e-3
+    assert np.array_equal(logits.argmax(-1), expected.argmax(-1))
