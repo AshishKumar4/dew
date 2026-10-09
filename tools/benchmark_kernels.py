@@ -11,6 +11,16 @@ mark, so a row is one process.
 - `step`: a whole training step of `lm-dense` (359.8M) or `lm-moe` (321.8M,
   8 experts top-2), through `tools/benchmark_step.py`'s trainer, with the
   grouped matmul, the state dtype and the vocabulary head chosen.
+- `mxfp4-projection`: one expert projection at gpt-oss-20b's shapes (32
+  experts, 2880 to 5760 or 2880 to 2880) over bf16 experts or MXFP4 ones
+  (`dew.nn.moe.MXFP4Experts`): the Pallas kernel that decodes MXFP4 tiles
+  (`fused`), every expert decoded and then the bf16 grouped matmul
+  (`decoded`), or the routed experts gathered, decoded and multiplied
+  (`gathered`), with whether the output is the bf16 path's bit for bit.
+- `mxfp4-decode`: greedy decoding of a gpt-oss-20b-shaped decoder cut to
+  `--layers` layers, random weights drawn as MXFP4 and held as bf16 or as
+  MXFP4: milliseconds a token, parameter bytes, the process's peak, and
+  the prefill logits and tokens to `--out` for a bitwise comparison.
 
 The docs/performance.md section "Kernel choices per generation" was measured
 with these commands, for example:
@@ -19,11 +29,15 @@ with these commands, for example:
     PYTHONPATH=src python tools/benchmark_kernels.py adam --state-dtype bfloat16
     PYTHONPATH=src python tools/benchmark_kernels.py step --path lm-moe --batch 4 \\
         --implementation auto --state-dtype bfloat16
+    PYTHONPATH=src python tools/benchmark_kernels.py mxfp4-projection --path fused --rows 4
+    PYTHONPATH=src python tools/benchmark_kernels.py mxfp4-decode --layers 8 --storage mxfp4 --out mxfp4.npz
 """
 
 import argparse
 import json
 import time
+import zlib
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -33,7 +47,8 @@ from benchmark_cases import Case
 from benchmark_models import batches, build_trainer
 
 from dew.config import OptimConfig
-from dew.nn.moe import expert_projection
+from dew.interop.codecs import MXFP4_PARTS
+from dew.nn.moe import MXFP4Experts, expert_projection
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
 
@@ -101,6 +116,137 @@ def projection(args: argparse.Namespace) -> dict[str, object]:
             "forward_backward": timed(both, (x, kernel), args.repeats),
             "forward_error": relative(output, oracle), "input_gradient_error": relative(dx, dx_oracle),
             "kernel_gradient_error": relative(dk, dk_oracle)}
+
+
+def mxfp4_parts(key: jax.Array, shape: tuple[int, ...]) -> MXFP4Experts:
+    """Random MXFP4 matrices `[exp, in, out]`: uniform codes under exponent
+    bytes 117 to 121, the scales of weights near 0.02."""
+    experts, inputs, outputs = shape
+    codes, exponents = jax.random.split(key)
+    return MXFP4Experts(
+        jax.random.bits(codes, (experts, outputs, inputs // 2), jnp.uint8),
+        jax.random.randint(exponents, (experts, outputs, inputs // 32), 117, 122).astype(jnp.uint8))
+
+
+@jax.jit
+def bf16(held: MXFP4Experts) -> jax.Array:
+    return held.decoded(jnp.bfloat16)
+
+
+def mxfp4_projection(args: argparse.Namespace) -> dict[str, object]:
+    experts, width = 32, 2880
+    features = 2 * width if args.shape == "gate_up" else width
+    rng = np.random.default_rng(0)
+    if args.rows <= experts:
+        # A decode step: each row its own expert, as one token's top-k are.
+        sizes = np.zeros(experts, np.int32)
+        sizes[rng.choice(experts, args.rows, replace=False)] = 1
+    else:
+        sizes = np.floor(rng.dirichlet(np.ones(experts)) * args.rows).astype(np.int32)
+        sizes[-1] += args.rows - sizes.sum()
+    group_sizes = jnp.asarray(sizes)
+    held = mxfp4_parts(jax.random.key(0), (experts, width, features))
+    x = jnp.asarray(rng.normal(size=(args.rows, width)), jnp.bfloat16)
+    routed = min(args.rows, experts)
+
+    def project(x, kernel, sizes=group_sizes, implementation="auto"):
+        return jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, implementation, None))
+
+    def gathered(x, held):
+        present = jnp.nonzero(group_sizes, size=routed, fill_value=0)[0]
+        sizes = jnp.where(jnp.arange(routed) < jnp.count_nonzero(group_sizes), group_sizes[present], 0)
+        return project(x, bf16(MXFP4Experts(held.codes[present], held.exponents[present])), sizes)
+
+    paths = {"bf16": project, "fused": lambda x, held: project(x, held, implementation="pallas"),
+             "decoded": lambda x, held: project(x, bf16(held)), "gathered": gathered}
+    operand = bf16(held) if args.path == "bf16" else held
+    forward = jax.jit(paths[args.path])
+    reference = np.asarray(jax.jit(project)(x, bf16(held)), np.float32)
+    output = np.asarray(forward(x, operand), np.float32)
+    return {"path": args.path, "shape": [args.rows, width, features, experts],
+            "routed": int((sizes > 0).sum()), "forward": timed(forward, (x, operand), args.repeats),
+            "operand_bytes": sum(leaf.nbytes for leaf in jax.tree.leaves(operand)),
+            "bitwise_equal_to_bf16": bool(np.array_equal(output.view(np.uint32), reference.view(np.uint32))),
+            "max_abs_difference": float(np.max(np.abs(output - reference)))}
+
+
+def gpt_oss_decoder(layers: int, storage: str, implementation: str, length: int):
+    """gpt-oss-20b's decoder (tests/fixtures/hf/gpt-oss-20b) cut to `layers`,
+    holding its experts as `storage`."""
+    from dew.interop.hf_decoders import translate_config
+    from dew.registry import models
+
+    source = Path(__file__).resolve().parent.parent / "tests/fixtures/hf/gpt-oss-20b/config.json"
+    config = json.loads(source.read_text())
+    config = {**config, "num_hidden_layers": layers, "layer_types": config["layer_types"][:layers]}
+    fields = translate_config(config)
+    mixture = fields["mixture"]
+    assert isinstance(mixture, dict)
+    mixture.update(expert_storage=storage, implementation=implementation)
+    return models.build("causal_transformer", {**fields, "max_seq_len": length, "dtype": "bfloat16"})
+
+
+def drawn(shapes, storage: str):
+    """Weights for the MXFP4 decoder's `shapes`, each drawn from a key its path
+    names, so both storages hold one model: the experts' parts as
+    `mxfp4_parts` draws them, decoded to bf16 on the device one leaf at a
+    time under 'float', and every other weight N(0, 0.02) in bf16."""
+    def walk(path, node):
+        key = jax.random.fold_in(jax.random.key(0), zlib.crc32(jax.tree_util.keystr(path).encode()))
+        if isinstance(node, dict) and set(node) == set(MXFP4_PARTS):
+            codes = node["codes"].shape
+            held = mxfp4_parts(key, (codes[0], 2 * codes[2], codes[1]))
+            if storage == "mxfp4":
+                return dict(zip(MXFP4_PARTS, held, strict=True))
+            return jax.block_until_ready(bf16(held))
+        if isinstance(node, dict):
+            return {name: walk((*path, jax.tree_util.DictKey(name)), child) for name, child in node.items()}
+        if not jnp.issubdtype(node.dtype, jnp.floating):
+            return jnp.zeros(node.shape, node.dtype)
+        return (jax.random.normal(key, node.shape, jnp.float32) * 0.02).astype(jnp.bfloat16)
+
+    return walk((), shapes)
+
+
+def mxfp4_decode(args: argparse.Namespace) -> dict[str, object]:
+    from dew.sampling import Sampling, generate
+
+    length = args.prompt + args.tokens + 8
+    model = gpt_oss_decoder(args.layers, args.storage, args.implementation, length)
+    probe = jnp.zeros((1, 8), jnp.int32)
+    held = jax.eval_shape(gpt_oss_decoder(args.layers, "mxfp4", args.implementation, length).init,
+                          jax.random.key(0), probe)
+    variables = drawn(held, args.storage)
+    own = jax.eval_shape(model.init, jax.random.key(0), probe)
+    assert jax.tree.map(np.shape, variables) == jax.tree.map(np.shape, own), "drawn for another tree"
+    ids = jnp.asarray(np.random.default_rng(0).integers(100, 200000, (1, args.prompt)), jnp.int32)
+    logits = np.asarray(jax.jit(model.apply)(variables, ids), np.float32)
+
+    def greedy(tokens: int):
+        return generate(model, variables, ids, tokens, key=jax.random.key(1),
+                        sampling=Sampling(temperature=0))
+
+    # One token is the prefill and its sample; the difference to `--tokens` is the decode steps alone.
+    samples: dict[int, list[float]] = {}
+    for tokens in (1, args.tokens):
+        jax.block_until_ready(greedy(tokens).tokens)
+        for _ in range(args.repeats):
+            start = time.perf_counter()
+            jax.block_until_ready(greedy(tokens).tokens)
+            samples.setdefault(tokens, []).append(time.perf_counter() - start)
+    generated = greedy(args.tokens)
+    if args.out:
+        np.savez(args.out, logits=logits, tokens=np.asarray(generated.tokens),
+                 log_probs=np.asarray(generated.raw_log_probs, np.float32))
+    per_token = (np.median(samples[args.tokens]) - np.median(samples[1])) / (args.tokens - 1)
+    experts = [leaf.nbytes for path, leaf in jax.tree_util.tree_leaves_with_path(variables)
+               if ".experts." in jax.tree_util.keystr(path, simple=True, separator=".")
+               and "bias" not in jax.tree_util.keystr(path)]
+    return {"layers": args.layers, "storage": args.storage, "implementation": args.implementation,
+            "prompt": args.prompt, "tokens": args.tokens, "ms_per_token": float(per_token * 1e3),
+            "tokens_per_second": float(1 / per_token), "seconds": {str(k): v for k, v in samples.items()},
+            "parameter_bytes": sum(leaf.nbytes for leaf in jax.tree.leaves(variables)),
+            "expert_bytes": sum(experts)}
 
 
 def lm_dense_tree() -> dict[str, jax.Array]:
@@ -228,8 +374,22 @@ def main(argv: list[str] | None = None) -> None:
     run.add_argument("--steps", type=int, default=30)
     run.add_argument("--trace", default=None,
                      help="a directory for a jax.profiler trace of three steady-state steps")
+    mxfp4 = modes.add_parser("mxfp4-projection")
+    mxfp4.add_argument("--path", choices=("bf16", "fused", "decoded", "gathered"), required=True)
+    mxfp4.add_argument("--shape", choices=("gate_up", "down"), default="gate_up")
+    mxfp4.add_argument("--rows", type=int, default=4)
+    mxfp4.add_argument("--repeats", type=int, default=100)
+    decoding = modes.add_parser("mxfp4-decode")
+    decoding.add_argument("--layers", type=int, default=8)
+    decoding.add_argument("--storage", choices=("float", "mxfp4"), required=True)
+    decoding.add_argument("--implementation", default="auto")
+    decoding.add_argument("--prompt", type=int, default=16)
+    decoding.add_argument("--tokens", type=int, default=65)
+    decoding.add_argument("--repeats", type=int, default=3)
+    decoding.add_argument("--out", default=None, help="an .npz for the prefill logits and greedy tokens")
     args = parser.parse_args(argv)
-    result = {"projection": projection, "adam": adam, "step": step}[args.mode](args)
+    result = {"projection": projection, "adam": adam, "step": step, "mxfp4-projection": mxfp4_projection,
+              "mxfp4-decode": mxfp4_decode}[args.mode](args)
     result.update(device_kind=jax.devices()[0].device_kind, jax=jax.__version__,
                   peak_bytes=peak_bytes())
     print(json.dumps(result))

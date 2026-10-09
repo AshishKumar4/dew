@@ -71,7 +71,8 @@ def test_the_device_decode_is_the_host_decode_bit_for_bit(dtype, bits):
     backend would flush or round were the values multiplied."""
     codes = np.tile(np.arange(256, dtype=np.uint8), (256, 1))
     exponents = np.repeat(np.arange(256, dtype=np.uint8)[:, None], 16, axis=1)
-    expected = decode_e2m1(codes, exponents).astype(dtype)
+    with np.errstate(over="ignore"):
+        expected = decode_e2m1(codes, exponents).astype(dtype)
     actual = np.asarray(jax.jit(decode_e2m1_device, static_argnums=2)(codes, exponents, dtype))
     assert np.isnan(expected[255]).all() and np.isinf(expected[254]).any() and (expected[0] != 0).any()
     np.testing.assert_array_equal(actual.view(bits), expected.view(bits))

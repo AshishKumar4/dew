@@ -567,7 +567,7 @@ def translate_weights(
     *,
     param_dtype: str = "float32",
     lazy: bool = False,
-    stored: Mapping[str, StoredMXFP4] = MappingProxyType({}),
+    mxfp4: Mapping[str, StoredMXFP4] = MappingProxyType({}),
 ) -> Variables:
     """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by default.
 
@@ -588,7 +588,7 @@ def translate_weights(
     only when it is placed (`dew.interop.streaming`); otherwise each leaf is read
     whole here.
 
-    `stored` holds MXFP4 weights kept as their checkpoint's bytes, by the name
+    `mxfp4` holds MXFP4 weights kept as their checkpoint's bytes, by the name
     they decode to (`SourceQuantization.stored`): each lands at its leaf's
     path as its two uint8 parts (`MXFP4_PARTS`), for a model whose routed
     experts are held so (`Mixture.expert_storage`). The family's `prepare`
@@ -627,7 +627,7 @@ def translate_weights(
             SourceLeaf((stored,), dtype, transposed=path[-1] == "kernel" and stored.ndim == 2),
             name,
         )
-    for name, weight in stored.items():
+    for name, weight in mxfp4.items():
         path = family.weight_path(name, config)
         if path is None:
             raise ValueError(f"{name} is kept in MXFP4 and maps to no parameter")

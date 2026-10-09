@@ -1256,7 +1256,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
     variables = decoders.with_constants(decoders.translate_weights(
-        tensors, record, family, param_dtype=param_dtype, lazy=lazy, stored=stored), record, directory)
+        tensors, record, family, param_dtype=param_dtype, lazy=lazy, mxfp4=stored), record, directory)
     decoder_parts.check_decoder_tree(variables, model)
     # The bindings are what an adapter loader resolves source names through
     # and what a quantized source is written back through, so a
