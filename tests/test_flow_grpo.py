@@ -345,6 +345,8 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
         assert report["updates"] == 1 and report["parameter_change"] > 0
         assert report["reference_unchanged"]
         assert_same_parameters(dumped_params(output), dumped_params(baseline_path))
+        # The same rows as each process's own arrays, which process 0 would score for every sample.
+        assert "held by this process alone" in report["local_refusal"], report["local_refusal"]
 
 
 

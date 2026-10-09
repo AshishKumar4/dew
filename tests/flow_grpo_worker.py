@@ -89,6 +89,12 @@ def main() -> None:
     width = 4 // processes
     local = jax.tree.map(lambda value: value[rank * width:(rank + 1) * width], global_batch)
     initial = trainer.place()[0]
+    refusal = None
+    if processes > 1:
+        try:
+            rollout(initial, local, jax.random.key(71))
+        except ValueError as error:
+            refusal = str(error)
     rolled = rollout(initial, shard_batch(trainer.device_mesh, local), jax.random.key(71))
     reassembled = shard_batch(trainer.device_mesh, rolled)
     scores = objective.log_probs(initial.variables, reassembled)
@@ -119,7 +125,7 @@ def main() -> None:
         "updates": int(final.updates), "reference_unchanged": frozen,
         "metric_rows": metric.rows, "preview_rows": tracker.preview_rows,
         "validation_mean": tracker.scalars.get("val/pixel_mean"),
-        "x64_enabled": jax.config.jax_enable_x64,
+        "x64_enabled": jax.config.jax_enable_x64, "local_refusal": refusal,
     }))
     if processes > 1:
         jax.distributed.shutdown()

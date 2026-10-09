@@ -69,6 +69,11 @@ and `pipe` layouts are refused across containers: each container is its own slic
 cross slices. On the GPU, `moe` reaches the loss in 13.3 s, and `fsdp` takes 0.99 s a step. A container multiplies
 float32 matrices at 540 GFLOP/s.
 
+Accumulating gradients (`Trainer(accumulation=K)`) does not spare those sums. The accumulated gradient is placed as
+the parameters are, whole on every replica (`Trainer.shardings`), so each of the K microbatches sums its gradient
+across the replicas before it joins the window: K all-reduces where one at the update would do. Deferring the sum
+needs JAX's unreduced shardings, which JAX 0.11.2 accepts only on Explicit mesh axes, and Dew's axes are Auto.
+
 Cost, at list prices on 2026-10-08:
 
 - A container costs $0.000020 per vCPU-second of active CPU, $0.0000025 per GiB-second of memory and $0.00000007 per

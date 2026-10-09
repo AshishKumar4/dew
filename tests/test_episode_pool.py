@@ -24,6 +24,9 @@ def test_two_process_variable_turns_match_single_process_actions_and_update(tmp_
     pool = run(tmp_path / "pool", 2)
     pooled = [episode for report in pool for episode in report["episodes"]]
     assert pooled == single["episodes"]
+    # Rank 0 names the cohort once for the pool: every episode and action on
+    # both ranks carries the one binding.
+    assert pool[0]["bindings"] == pool[1]["bindings"] and len(pool[0]["bindings"]) == 1
     assert {len(episode["transitions"]) for episode in pooled} == {1, 2}
     assert all(report["opened"] == report["closed"] == 4 for report in pool)
     assert all(report["updates"] == 1 and report["error"] is None for report in pool)

@@ -21,7 +21,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict
-from reference_error import FACTOR, assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
+from reference_error import (
+    FACTOR,
+    assert_as_exact_as_the_reference,
+    assert_as_exact_over_orders,
+    distance,
+    ieee_fixture,
+)
 from residual_orders import permuted
 from safetensors.numpy import load_file
 from scipy.special import log_softmax
@@ -42,10 +48,7 @@ TINY = ROOT / "kimi-linear-tiny"
 @pytest.fixture(scope="module")
 def source():
     loaded = Pretrained.load(TINY, dtype="float32", attention_impl="reference")
-    with np.load(TINY / "reference.npz") as stored, np.load(TINY / "numerics.npz") as exact:
-        reference = {name: stored[name] for name in stored.files} | {
-            name: exact[name] for name in exact.files
-        }
+    reference = ieee_fixture(TINY / "reference.npz") | ieee_fixture(TINY / "numerics.npz")
     inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
                          {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
     return loaded, inputs, reference
@@ -154,8 +157,8 @@ def test_update_exports_the_trained_model_back_in_the_source_layout(source, tmp_
     valid = reference["attention_mask"].astype(bool)
     updated = jax.jit(lambda params: loaded.model.apply(
         {**loaded.variables, "params": stepped(params)}, inputs.tokens, **inputs.kwargs()))
-    with np.load(TINY / "orders.npz") as drawn:
-        orders, theirs = drawn["orders"], drawn["updated_logits"]
+    drawn = ieee_fixture(TINY / "orders.npz")
+    orders, theirs = drawn["orders"], drawn["updated_logits"]
     truth = reference["updated_logits_f64"][valid]
     mine = [distance(np.asarray(updated(permuted(loaded.variables, order)["params"]))[valid], truth)
             for order in orders]

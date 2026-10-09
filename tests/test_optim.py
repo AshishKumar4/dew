@@ -13,11 +13,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from jax.sharding import NamedSharding, PartitionSpec as P
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
+from dew.training import MeshSpec
 from dew.training.optim import Cosine, ParamGroup, muon_weight_dimension_numbers, scale_by_qk_clip
 from tools.muonclip_reference import clip_qk_kernel, clip_scale
 
@@ -302,6 +304,37 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
 
     updates, grads = group_updates(params)
     grad = at(grads, path)
+    reference = optax.contrib.muon(LR)
+    for expert in range(experts):
+        one = {'kernel': grad[expert]}
+        expected, _ = reference.update(one, reference.init(one), one)
+        np.testing.assert_allclose(np.asarray(at(updates, path)[expert]),
+                                   np.asarray(expected['kernel']), atol=1e-8)
+
+
+@pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("spec", [{"expert": 4}, {"expert": 2, "fsdp": 2}], ids=["expert", "expert-fsdp"])
+def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_time(spec):
+    """The contract above with the stack placed as a run places it, its
+    experts over the expert axis and each matrix split over fsdp, and the
+    step compiled there. The experts' gradients are one matrix at four
+    scales, so each normalized alone takes optax's update for that matrix
+    alone, where normalizing the stack as one would share a scale among them."""
+    experts, embed, mlp = 4, 8, 16
+    path = ('params', 'layers_0', 'mlp', 'experts', 'gate_proj', 'kernel')
+    mesh = MeshSpec(**spec).build(jax.devices()[:4])
+    placement = NamedSharding(mesh, P("expert", "fsdp" if "fsdp" in spec else None, None))
+    grad = (jnp.asarray([1.0, 16.0, 0.25, 2.0])[:, None, None]
+            * jnp.concatenate([jnp.eye(embed), jnp.zeros((embed, mlp - embed))], axis=1))
+
+    def stacked(value):
+        return {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
+            'kernel': jax.device_put(value, placement)}}}}}}
+
+    params, grads = stacked(jnp.zeros((experts, embed, mlp))), stacked(grad)
+    solver = muon_solver()
+    with jax.set_mesh(mesh):
+        updates, _ = jax.jit(solver.update)(grads, solver.init(params), params)
     reference = optax.contrib.muon(LR)
     for expert in range(experts):
         one = {'kernel': grad[expert]}

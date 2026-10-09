@@ -1,5 +1,6 @@
 """Phi-3's fused GQA and LongRoPE against transformers 5.16.1."""
 
+import functools
 import json
 from pathlib import Path
 
@@ -43,6 +44,38 @@ def test_phi3_cached_greedy_crosses_the_longrope_boundary():
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0))
     generated = task(ids[:, :4], max_new_tokens=6, key=0)
     np.testing.assert_array_equal(generated.tokens, np.load(DIRECTORY / 'generated.npy'))
+
+
+@pytest.mark.parametrize(('budget', 'rebuilds'), [(3, 0), (6, 1)])
+def test_greedy_decoding_forwards_the_prompt_once_and_one_token_a_step(monkeypatch, budget, rebuilds):
+    """Every backbone forward a greedy decode from a prompt of 4 runs: the
+    prompt once, and otherwise one token at a time, at least once a step,
+    with the whole 48-slot history again only at the step a row crosses
+    LongRoPE's original 8 positions (6 new tokens cross it once, 3 never).
+    The answers alone cannot tell a decode that recomputes its prefix every
+    step from one that does not."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling, generate
+
+    loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=48)
+    ids = np.load(DIRECTORY / 'input_ids.npy')[:, :4]
+    widths = []
+    forward = CausalTransformer.hidden_and_mtp_inputs
+
+    def counted(self, tokens, *args, **kwargs):
+        # Recorded as the forward runs: in the decode loop once a step, in a
+        # branch only when it is taken, and never for a trace of its shapes.
+        jax.debug.callback(functools.partial(widths.append, tokens.shape[1]))
+        return forward(self, tokens, *args, **kwargs)
+
+    monkeypatch.setattr(CausalTransformer, 'hidden_and_mtp_inputs', counted)
+    with jax.disable_jit():
+        generate(loaded.model, loaded.variables, ids, budget, key=jax.random.key(0),
+                 sampling=Sampling(temperature=0))
+    jax.effects_barrier()
+    said = " ".join(map(str, widths))
+    assert set(widths) <= {1, 4, 48} and widths.count(4) == 1, said
+    assert widths.count(48) == rebuilds and widths.count(1) >= budget, said
 
 
 def test_phi3_cache_rebuild_logits_match_uncached_transformers_on_both_sides_of_the_crossing():

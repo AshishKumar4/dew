@@ -26,6 +26,7 @@ import bisect
 import contextlib
 import dataclasses
 import functools
+import hashlib
 import itertools
 import json
 import logging
@@ -336,7 +337,7 @@ class Budgeted(Protocol):
 
 
 class Forwarding:
-    """Forwards a stream wrapper's stop signal, stop budget and close to its source.
+    """Forwards a stream wrapper's stop signal, stop budget, close and identity to its source.
 
     Subclasses keep the source at `_source` and override `close` for their own
     cleanup around `super().close()`.
@@ -368,6 +369,9 @@ class Forwarding:
         source = self._forwarded()
         if isinstance(source, Closeable):
             source.close()
+
+    def identity(self) -> str:
+        return stream_identity(self._forwarded())
 
 
 _QUIET_STOP_SECONDS = 5.0
@@ -795,6 +799,23 @@ class Checkpointable(Protocol):
     def set_state(self, state: Position) -> None: ...
 
 
+@runtime_checkable
+class Identified(Protocol):
+    """A training stream that names the records it reads.
+
+    Each process of a pool opens its own stream, over its own copy of the
+    corpus, and `Trainer.fit` refuses a pool whose streams name different
+    records before any process reads one.
+    """
+
+    def identity(self) -> str: ...
+
+
+def stream_identity(stream: Iterator[Batch] | None) -> str:
+    """What `stream` reads, as `Identified` names it, or else its type."""
+    return stream.identity() if isinstance(stream, Identified) else type(stream).__name__
+
+
 def tokenized(stream: Reader, tokenize: Tokenize | None) -> Reader:
     """Return `stream` with each batch's captions replaced by the fields `tokenize` makes from them.
 
@@ -1004,6 +1025,31 @@ def _endless(source: Records, seed: int, offset: int) -> pygrain.MapDataset[Batc
     `offset` records."""
     order = pygrain.MapDataset.source(source).seed(seed).shuffle(seed).repeat(None)
     return order[offset:] if offset else order
+
+
+SAMPLED_RECORDS = 16
+"""How many records, spread evenly over a corpus, `sampled` reads."""
+
+
+def sampled(source: Indexed) -> str:
+    """A digest of `SAMPLED_RECORDS` records spread evenly over `source`, read
+    as stored, before any transformation.
+
+    Two copies of a corpus with one name and one length can hold different
+    records, and a pool whose hosts read different copies trains on neither.
+    The digest is a sample, not a checksum: it reads a few records of a corpus
+    that may be terabytes.
+    """
+    digest, count = hashlib.sha256(), len(source)
+    spread = {count * part // SAMPLED_RECORDS for part in range(SAMPLED_RECORDS)} if count else set()
+    for index in sorted(spread):
+        record = source[index]
+        digest.update(str(jax.tree.structure(record)).encode())
+        for leaf in jax.tree.leaves(record):
+            value = np.asarray(leaf)
+            digest.update(f"{value.dtype}{value.shape}".encode())
+            digest.update(type(leaf).__name__.encode() if value.dtype == object else value.tobytes())
+    return digest.hexdigest()[:16]
 
 
 def _described(corpus: Corpus) -> str:
@@ -1288,10 +1334,11 @@ class GlobalStream:
     """
 
     def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
-                 batch: int, order: str, loading: Loading):
+                 batch: int, order: str, loading: Loading, content: Callable[[], str] | None = None):
         self._open = open_at
         self._batch = batch
         self._order = order
+        self._content = content
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
@@ -1316,6 +1363,15 @@ class GlobalStream:
     def order(self) -> str:
         """The order's description, which a saved position is compared against."""
         return self._order
+
+    def identity(self) -> str:
+        """The order, and a sample of the records it reads (`sampled`) when
+        the stream can read them as stored.
+
+        The order names the corpus by its source, length and seed, and two
+        hosts' copies of a corpus can hold different records under one name.
+        """
+        return self._order if self._content is None else f"{self._order}, sampled {self._content()}"
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
@@ -1435,6 +1491,10 @@ class PhasedStream:
                 f"of phase {phase} at {self._ends[phase]}")
         self.close()
         self._records = saved.records
+
+    def identity(self) -> str:
+        return "; ".join([*(stream.identity() for stream in self._streams),
+                          f"phases ending at records {list(self._ends)}"])
 
     def close(self) -> None:
         if self._current is not None:
@@ -1605,7 +1665,8 @@ def train_stream(source: Records, operations: Sequence[pygrain.Transformation], 
     def records() -> pygrain.MapDataset[Batch]:
         return _endless(source, seed, offset).apply(list(operations))
 
-    return _global_stream(records, order, batch=batch, loading=loading)
+    return _global_stream(records, order, batch=batch, loading=loading,
+                          content=functools.partial(sampled, source))
 
 
 def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transformation], *,
@@ -1627,16 +1688,20 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
     def records() -> pygrain.MapDataset[Batch]:
         return mixture(corpora, seed).seed(seed).apply(list(operations))
 
-    return _global_stream(records, order, batch=batch, loading=loading)
+    def content() -> str:
+        return ", ".join(sampled(corpus.source) for corpus in corpora)
+
+    return _global_stream(records, order, batch=batch, loading=loading, content=content)
 
 
 def _global_stream(records: Callable[[], pygrain.MapDataset[Batch]], order: str, *,
-                   batch: int, loading: Loading) -> Callable[[DataPartition], GlobalStream]:
+                   batch: int, loading: Loading,
+                   content: Callable[[], str]) -> Callable[[DataPartition], GlobalStream]:
     """A `GlobalStream` factory over the endless order `records` builds.
 
     Each reader gets its own pipeline over its share, opened at whatever
     record offset a restore hands it, and `order` is the description a saved
-    position is compared against.
+    position is compared against. `content` samples the corpus under it.
     """
     def stream(partition: DataPartition) -> GlobalStream:
         rows = partition.rows(batch)
@@ -1645,7 +1710,7 @@ def _global_stream(records: Callable[[], pygrain.MapDataset[Batch]], order: str,
             return _batches(records(), rows=rows, partition=partition, loading=loading,
                             offset=offset)
 
-        return GlobalStream(open_at, batch, order, loading)
+        return GlobalStream(open_at, batch, order, loading, content)
 
     return stream
 
@@ -1688,6 +1753,7 @@ __all__ = [
     "DatasetSpec",
     "Forwarding",
     "GlobalStream",
+    "Identified",
     "Loading",
     "PhasedStream",
     "Ramp",

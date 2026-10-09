@@ -194,6 +194,20 @@ def released_modules():
     return configuration, modeling, linear
 
 
+def matmul_precision() -> str:
+    """What each array file records of this run's matmuls: 'ieee' where torch,
+    Triton's default and fla's intra-chunk solve all keep fp32, else those
+    that do not (tests/reference_error.py refuses all but 'ieee')."""
+    from fla.ops.kda import chunk_intra
+
+    reduced = torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+    modes = {"torch": "tf32" if reduced else "ieee",
+             "TRITON_F32_DEFAULT": os.environ.get("TRITON_F32_DEFAULT", "tf32"),
+             "the intra-chunk solve": str(getattr(chunk_intra.SOLVE_TRIL_DOT_PRECISION, "value",
+                                                  chunk_intra.SOLVE_TRIL_DOT_PRECISION))}
+    return ", ".join(f"{name} {mode}" for name, mode in modes.items() if mode != "ieee") or "ieee"
+
+
 def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
     """Copy stored tensors into `model`: MXFP4 experts decoded, A_log cut to its heads."""
     with torch.no_grad():
@@ -272,7 +286,7 @@ def main() -> None:
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
              generated=generated, step_logits=step_logits,
              situ_gate=gate.reshape(-1).numpy(), situ_up=up.reshape(-1).numpy(),
-             situ=situ_out.reshape(-1).numpy())
+             situ=situ_out.reshape(-1).numpy(), precision=matmul_precision())
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 
@@ -308,7 +322,7 @@ def orders(drawn: Path) -> None:
             assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
         distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
     np.savez(DESTINATION / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
-             updated_logits=np.asarray(distances))
+             updated_logits=np.asarray(distances), precision=matmul_precision())
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
 

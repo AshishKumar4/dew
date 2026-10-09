@@ -280,6 +280,28 @@ def test_a_share_of_gpus_that_does_not_divide_is_refused_and_cpu_pools_ignore_gp
     assert rehearsal.layout("localhost") == (4, None)
 
 
+@pytest.mark.parametrize(("name", "refused"), [
+    ("localhost", True), ("localhost.localdomain", True), ("127.0.1.1", True), ("::1", True),
+    ("box.lan", False), ("10.0.0.5", False),
+])
+def test_a_coordinator_name_other_hosts_would_reach_themselves_at_is_refused(monkeypatch, name, refused):
+    """Run from one of several hosts that names itself `localhost`, the
+    launcher offers the pool this machine's name. A name that is loopback in
+    itself would have every other host dial itself, so the pool is refused
+    before any process starts, naming --coordinator; any other name is the
+    other hosts' to resolve."""
+    from dew.cli import launch
+
+    monkeypatch.setattr(socket, "getfqdn", lambda: name)
+    plan = launch.Launch(command=("python",), port=4321)
+    if refused:
+        with pytest.raises(ValueError, match="--coordinator"):
+            plan.coordinator_address(["localhost", "worker.example"])
+    else:
+        assert plan.coordinator_address(["localhost", "worker.example"]) == f"{name}:4321"
+    assert plan.coordinator_address(["localhost"]) == "localhost:4321"
+
+
 def test_a_hostfile_names_hosts_by_the_first_word_of_each_line(tmp_path):
     """An MPI hostfile's `slots=` and comments are not host names."""
     from dew.cli.launch import Launch
