@@ -205,17 +205,22 @@ class _Rows:
         return f"{type(self).__name__}({self.origin})"
 
 
-class _Characters:
-    """A record's length as `LengthGroups` ranks it: the characters of its
-    example's state and of the questions its row asks, which order rows as
-    their token counts do without tokenizing every row up front."""
+class _Tokens:
+    """A record's length as `LengthGroups` ranks it: the tokens of its row laid
+    out without augmentation, counted when the order first reads it and kept,
+    so a later pass does not lay it out twice."""
 
-    def __init__(self, corpora: Sequence[_Rows]):
-        self.sizes = [[len(str(example.state)) + sum(len(str(example.questions[name])) for name in names)
-                       for example, names in rows.rows] for rows in corpora]
+    def __init__(self, encoding: Encoding, corpora: Sequence[_Rows]):
+        self.encoding, self.corpora = encoding, corpora
+        self.counted: dict[tuple[int, int], int] = {}
 
     def __call__(self, record: Batch) -> int:
-        return self.sizes[int(record["corpus"])][int(record["row"])]
+        key = int(record["corpus"]), int(record["row"])
+        count = self.counted.get(key)
+        if count is None:
+            example, names = self.corpora[key[0]].rows[key[1]]
+            count = self.counted[key] = int(np.sum(self.encoding(example, names, None)["valid"]))
+        return count
 
 
 class _Encode(pygrain.RandomMapTransform):
@@ -470,7 +475,7 @@ class DecisionObjective(Objective[Ratio]):
         scoring = (None if held is None
                    else _held_pass(held, encoding, batch=batch, seed=seed, loading=loading))
         encode = [_Encode(encoding, corpora, augment=True)]
-        bucketed = {} if self.bucket is None else {"groups": LengthGroups(_Characters(corpora)),
+        bucketed = {} if self.bucket is None else {"groups": LengthGroups(_Tokens(encoding, corpora)),
                                                    "cut": _Cut(self.bucket, self.layout.max_len)}
         if len(corpora) == 1:
             return Dataset(train=train_stream(corpora[0], encode, batch=batch, seed=seed, loading=loading,
