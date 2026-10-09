@@ -35,8 +35,8 @@ from jax.sharding import PartitionSpec as P
 
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
-from .kernels.generation import measured_kernel, triton_runs
-from .kernels.grouped_matmul import grouped_projection, ragged_dot_runs, xla_ragged_dot
+from .kernels.generation import measured_kernel, ran_kernel, triton_runs
+from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
 from .protocols import ProjectionGroup, declared_groups
 from .sharding import (
@@ -340,8 +340,9 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
 
     'auto' takes the generation's measured one (`KERNELS['grouped_matmul']`).
     'pallas' needs a GPU the kernels compile for and a product they compute
-    exactly (`ragged_dot_runs`), else 'xla'. `operands` are the input and kernel
-    dtypes as stored.
+    exactly (`ragged_dot_refusal`), else 'xla', which `ran_kernel` logs where
+    'pallas' was measured fastest. `operands` are the input and kernel dtypes
+    as stored.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(
@@ -350,9 +351,10 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
     chosen = measured_kernel('grouped_matmul', 'xla') if implementation == 'auto' else implementation
     if chosen != 'pallas':
         return chosen
-    runs = ragged_dot_runs(compute, operands, precision)
     placed = triton_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
-    return 'pallas' if runs and placed else 'xla'
+    refusal = ragged_dot_refusal(compute, operands, precision) or (
+        None if placed else "the Pallas kernels need a GPU of sm80 or later")
+    return 'pallas' if refusal is None else ran_kernel('grouped_matmul', 'xla', refusal)
 
 
 def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array, *,

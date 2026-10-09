@@ -143,36 +143,43 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
     assert attention.resolve_implementation('auto', query, query, **call) == chosen
 
 
-@pytest.mark.parametrize("generation, installed, call, chosen", [
-    ("sm80", True, {}, "flash"),
-    ("sm80", True, {"causal": True}, "flash"),
-    ("sm80", True, {"head_dim": 256}, "flash"),
-    ("sm80", True, {"causal": True, "keys": 256}, "cudnn"),
-    ("sm80", True, {"keys": 256}, "flash"),
-    ("sm80", True, {"sliding_window": 64, "causal": True}, "cudnn"),
-    ("sm80", True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn"),
-    ("sm80", True, {"softcap": 30.0}, "xla"),
-    ("sm80", True, {"dtype": jnp.float32}, "xla"),
-    ("sm80", False, {}, "cudnn"),
-    ("sm89", True, {}, "cudnn"),
+@pytest.mark.parametrize("generation, installed, call, chosen, refusal", [
+    ("sm80", True, {}, "flash", None),
+    ("sm80", True, {"causal": True}, "flash", None),
+    ("sm80", True, {"head_dim": 256}, "flash", None),
+    ("sm80", True, {"causal": True, "keys": 256}, "cudnn", "a causal call has more keys than queries"),
+    ("sm80", True, {"keys": 256}, "flash", None),
+    ("sm80", True, {"sliding_window": 64, "causal": True}, "cudnn", "the call has a sliding window"),
+    ("sm80", True, {"mask": jnp.ones((1, 1, 128, 128), bool)}, "cudnn", "the call has a mask"),
+    ("sm80", True, {"softcap": 30.0}, "xla", "the call has a logit softcap"),
+    ("sm80", True, {"dtype": jnp.float32}, "xla", "the query is float32"),
+    ("sm80", False, {}, "cudnn", "dew_flash_attn is not installed"),
+    ("sm89", True, {}, "cudnn", None),
 ])
-def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, generation, installed, call,
-                                                                chosen, without_deterministic_ops):
+def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
+                                                                call, chosen, refusal,
+                                                                without_deterministic_ops):
     """With dew_flash_attn installed, 'auto' takes FlashAttention-2 where it
     was measured faster than cuDNN, for a bf16 call with no window, mask, bias
-    or softcap, heads up to 256 wide and a square causal mask if any."""
+    or softcap, heads up to 256 wide and a square causal mask if any. A call
+    it turns down there logs why, once however often it is traced; on a
+    device where it was not measured, nothing is logged."""
     from importlib import util
 
     from dew.nn import attention
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    monkeypatch.setattr(kernels.generation, '_logged', set())
     found = util.find_spec
     monkeypatch.setattr(util, 'find_spec', lambda name: (object() if installed else None)
                         if name == 'dew_flash_attn' else None if name == 'tokamax' else found(name))
     query = jnp.zeros((1, 128, 4, call.pop("head_dim", 128)), call.pop("dtype", jnp.bfloat16))
     key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
-    assert attention.resolve_implementation('auto', query, key, **call) == chosen
+    assert [attention.resolve_implementation('auto', query, key, **call) for _ in range(2)] == [chosen] * 2
+    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
+    measured = f"attention runs {chosen!r}, not 'flash', the kernel measured fastest on sm80"
+    assert logged == ([] if refusal is None else [f"{measured}: {refusal}"])
 
 
 @pytest.mark.parametrize("generation", ["sm90", "sm100", "sm75", "cpu"])

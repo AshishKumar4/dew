@@ -19,7 +19,7 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.records import JSON
 
 from ..activations import UNGATED, ungated_activation
-from ..attention import RMSNorm
+from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..blocks import normal_kernel
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
@@ -41,13 +41,18 @@ STREAMS = ("activation_batch", "activation_length", None, "activation_embed")
 """Manifold-constrained hyper-connections' `[B, S, hc_mult, D]` residual streams."""
 
 
-def decoder_norm(kind: Literal['rms', 'layer'], *, epsilon: float,
+def decoder_norm(kind: Literal['rms', 'layer', 'fast_layer'], *, epsilon: float,
                  bias: bool, scale_offset: bool, scale_after_cast: bool,
                  dtype: Dtype | None) -> Callable[..., nn.Module]:
-    """The decoder's norm factory, preserving each reference's variance formula."""
+    """The decoder's norm factory. 'layer' keeps torch's exact variance, the
+    reference decoders' formula; 'fast_layer' is flax's E[x^2] - E[x]^2
+    (`dew.nn.attention.LayerNorm`), whose mean and square reduce in one pass,
+    which the vision towers run."""
     if kind == 'layer':
         return functools.partial(nn.LayerNorm, epsilon=epsilon, use_bias=bias,
                                  use_fast_variance=False, dtype=dtype)
+    if kind == 'fast_layer':
+        return functools.partial(LayerNorm, epsilon=epsilon, use_bias=bias, dtype=dtype)
     return functools.partial(RMSNorm, epsilon=epsilon, scale_offset=scale_offset,
                              scale_after_cast=scale_after_cast, dtype=dtype)
 
@@ -494,7 +499,7 @@ class DecoderBlock(nn.Module):
     emb_features: int
     wiring: BlockWiring
     norm_eps: float = 1e-5
-    norm_type: Literal['rms', 'layer'] = 'rms'
+    norm_type: Literal['rms', 'layer', 'fast_layer'] = 'rms'
     norm_bias: bool = False
     scale_offset: bool = False
     scale_after_cast: bool = False
