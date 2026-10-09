@@ -590,6 +590,50 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+@pytest.mark.parametrize("decode_steps", [1, 3])
+def test_a_paged_kernel_reads_one_key_of_each_idle_row(monkeypatch, request, decode_steps):
+    """A freed row keeps its last request's slot count on the device until
+    the next request is admitted, and the paged kernel reads every key under
+    the count it is given: the four-slot server's second run decodes one row
+    beside three idle ones, each of which reads one key, as the dense path's
+    per-row count reads. The kernel here is softmax attention over the
+    gathered rows, which records what it was told to read, so every draw is
+    still the lone call's. JAX's caches are cleared before and after: the
+    patched kernel is only read where the server's step is traced, and a
+    trace of it must not serve a later test."""
+    from dew.inference import serving_kernel
+    from dew.nn.kv_cache import KVStore
+
+    jax.clear_caches()
+    request.addfinalizer(jax.clear_caches)
+
+    reads = []
+
+    def recorded(store, query, lengths, softcap):
+        jax.debug.callback(lambda counts: reads.append(np.asarray(counts)), lengths)
+        keys, values = (jnp.repeat(part, query.shape[1] // part.shape[2], axis=2) for part in store.read())
+        scores = jnp.einsum("rhd,rkhd->rhk", query, keys) / np.sqrt(query.shape[-1])
+        scores = jnp.where(jnp.arange(keys.shape[1]) < lengths[:, None, None], scores, -jnp.inf)
+        return jnp.einsum("rhk,rkhd->rhd", jax.nn.softmax(scores, axis=-1), values).astype(query.dtype)
+
+    monkeypatch.setattr(KVStore, "kernel", lambda store: True)
+    monkeypatch.setattr(KVStore, "decode", recorded)
+    monkeypatch.setattr(CausalSelfAttention, "_page_kernel_runs", lambda layer, query: True)
+    monkeypatch.setattr(serving_kernel, "_PROGRAMS", {})
+    bound = task()
+    alone = bound(PROMPTS[2], BUDGETS[2], key=2)
+    server = Server.from_task(bound, slots=4, capacity=128, admission=2, decode_steps=decode_steps,
+                              kv_cache=KVCache(page_size=16, pages=12))
+    for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True)):
+        server.submit(prompt, budget, key=index)
+    server.run()
+    reads.clear()
+    ticket = server.submit(PROMPTS[2], BUDGETS[2], key=2)
+    server.run()
+    assert_same_generation(ticket.result(), alone)
+    assert reads and all(np.sum(counts > 1) <= 1 for counts in reads), reads
+
+
 @pytest.mark.mesh(devices=4)
 @pytest.mark.parametrize("mesh, options", [
     (MeshSpec(), {}),
