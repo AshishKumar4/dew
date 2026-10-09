@@ -68,6 +68,7 @@ DECODERS = {
     "glm5_next_text": ("GLM-5.3-Flash, text", "Hybrid and linear attention"),
     "kimi_linear": ("Kimi Linear", "Hybrid and linear attention"),
     "kimi_k3": ("Kimi K3, text", "Hybrid and linear attention"),
+    "mamba": ("Mamba", "Hybrid and linear attention"),
     "mamba2": ("Mamba-2", "Hybrid and linear attention"),
     "llada": ("LLaDA", "Diffusion language models"),
     "dream": ("Dream", "Diffusion language models"),
