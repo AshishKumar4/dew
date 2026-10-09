@@ -10,6 +10,18 @@ export interface SnapshotGeneration {
 	smokeSeconds: number;
 }
 
+/**
+ * Start `container` from `snapshot` without internet. A container stops only when destroyed or
+ * when it fails: the log says which, and after how long, of `what`.
+ */
+export function restore(container: Container, snapshot: ContainerSnapshot, what: string,
+	options: { entrypoint: string[]; env?: Record<string, string> }): void {
+	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false, ...options });
+	const started = Date.now();
+	container.monitor().then(() => console.log(`${what} container exited`, snapshot.id, Date.now() - started))
+		.catch((error) => console.error(`${what} container stopped`, snapshot.id, Date.now() - started, String(error)));
+}
+
 interface SnapshotEnv {
 	SNAPSHOT_COMMIT: string;
 	// Each queues a preparation, which the preparer's alarms run and report to `prepared`.
