@@ -12,6 +12,7 @@ import urllib.request
 
 from jupyter_client import BlockingKernelClient
 from jupyter_core.utils import ensure_event_loop
+from shared_bridge import load
 
 
 def dump_processes():
@@ -186,7 +187,7 @@ def cell(name, code):
         output = collect(client, client.execute(code, allow_stdin=False), timeout=240)
     except Exception as error:
         raise AssertionError(f"{name} failed after {time.perf_counter() - started:.0f} s: {error}; "
-                             f"memory {memory()}") from None
+                             f"memory {memory()}; load {load()}") from None
     finally:
         client.stop_channels()
         request("/api/kernels/" + kernel["id"], method="DELETE")

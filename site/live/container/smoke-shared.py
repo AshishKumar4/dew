@@ -6,6 +6,7 @@ import sys
 import uuid
 from pathlib import Path
 
+from shared_bridge import available, load, resident
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
@@ -50,15 +51,8 @@ def model_process():
 def memory():
     """The host's memory and what each process group holds, in MiB, for a failure's message."""
     lines = dict(line.split(":", 1) for line in Path("/proc/meminfo").read_text().splitlines())
-    held = {}
-    for status in Path("/proc").glob("[0-9]*/status"):
-        try:
-            fields = dict(line.split(":", 1) for line in status.read_text().splitlines() if ":" in line)
-            uid, rss = int(fields["Uid"].split()[1]), int(fields.get("VmRSS", "0 kB").split()[0])
-        except (OSError, KeyError, ValueError):
-            continue
-        held[uid] = held.get(uid, 0) + (rss >> 10)
-    return {"total": int(lines["MemTotal"].split()[0]) >> 10, "available": available(), "by_uid": held}
+    return {"total": int(lines["MemTotal"].split()[0]) >> 10, "available": available() >> 20,
+            "by_uid": resident()}
 
 
 def guests():
@@ -81,13 +75,21 @@ def gateway_log():
     return "\n".join(Path("/run/dew/gateway.log").read_text(errors="replace").splitlines()[-40:])
 
 
+def report():
+    return f"memory {memory()}; load {load()}; guests {guests()}; gateway log:\n{gateway_log()}"
+
+
+def step(text):
+    """Say what the smoke does next, so a smoke that fails or is cut off shows how far it got."""
+    print(f"relay smoke: {text}", file=sys.stderr, flush=True)
+
+
 async def page(headers):
     socket = await connect(f"ws://127.0.0.1:8888/contexts/{uuid.uuid4()}/ws", additional_headers=headers)
     try:
         assert json.loads(await socket.recv())["type"] == "ready"
     except ConnectionClosed as closed:
-        raise AssertionError(f"the bridge refused a page: {closed.rcvd}; memory {memory()}; "
-                             f"guests {guests()}; gateway log:\n{gateway_log()}") from None
+        raise AssertionError(f"the bridge refused a page: {closed.rcvd}; {report()}") from None
     return socket
 
 
@@ -101,11 +103,6 @@ async def outcomes(socket, count):
             errors.append(f"{message['ename']}: {message['evalue']}")
         seen[message["id"]] = (message["status"] if message["type"] == "done" else status, errors)
     return seen
-
-
-def available():
-    lines = Path("/proc/meminfo").read_text().splitlines()
-    return int(next(line for line in lines if line.startswith("MemAvailable:")).split()[1]) >> 10
 
 
 async def closed():
@@ -123,8 +120,10 @@ async def pressure(headers):
     space and a training run filling its writable memory. The bridge refuses contexts or stops
     guests, never the model process, every cell that does not finish says why, and the model
     still answers afterwards."""
-    model, before = model_process(), available()
+    model, before = model_process(), available() >> 20
+    step("pressure: opening four pages")
     pages = [await page(headers) for _ in range(4)]
+    step("pressure: filling memory from 24 page cells and a training cell")
     for number, socket in enumerate(pages):
         for cell in range(6):
             await socket.send(json.dumps({"op": "execute", "id": f"{number}.{cell}", "code": FILL,
@@ -148,6 +147,7 @@ async def pressure(headers):
     for socket in pages:
         await socket.close()
     await closed()
+    step("pressure: the model answers after it")
     socket = await page(headers)
     await socket.send(json.dumps({"op": "execute", "id": "after", "code": TEXT}))
     (status, errors), = (await outcomes(socket, 1)).values()
@@ -176,6 +176,7 @@ async def main():
             "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9))).pil()[0]",
         ]
         for index, code in enumerate(cells):
+            step(f"page cell {index}")
             await socket.send(json.dumps({"op": "execute", "id": str(index), "code": code}))
             outputs = []
             while True:
@@ -206,5 +207,14 @@ async def main():
     await pressure(headers)
 
 
+async def bounded(seconds):
+    """main(), failed in words past `seconds`: the preparation's smoke has one 15-minute alarm
+    for this and the context smoke after it (site/live/src/preparer.ts)."""
+    try:
+        await asyncio.wait_for(main(), seconds)
+    except TimeoutError:
+        raise TimeoutError(f"the relay smoke did not end within {seconds} s; {report()}") from None
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    asyncio.run(bounded(300))

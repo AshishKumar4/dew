@@ -245,3 +245,19 @@ def test_the_memory_guard_picks_the_context_holding_the_most(bridge, tmp_path):
     # all of its uid's processes, so two of 2 GB outweigh one of 3 GB.
     assert sorted(bridge.largest_guest(tmp_path)) == [11, 14]
     assert bridge.resident(tmp_path) == {"5000": 8789, "6101": 3906, "6102": 2929, "6103": 0}
+
+
+def test_the_load_report_names_the_busiest_processes_and_the_stalls(bridge, tmp_path):
+    (tmp_path / "loadavg").write_text("3.90 2.10 1.00 2/300 999\n")
+    (tmp_path / "pressure").mkdir()
+    (tmp_path / "pressure/cpu").write_text("some avg10=61.00 avg60=20.00 avg300=5.00 total=1\n"
+                                           "full avg10=0 avg60=0 avg300=0 total=0\n")
+    for pid, ticks, command in ((7, (500, 100), b"python\0model_service.py"), (8, (5, 5), b"sh")):
+        (tmp_path / str(pid)).mkdir()
+        fields = ["S"] + ["0"] * 10 + [str(ticks[0]), str(ticks[1])] + ["0"] * 5
+        (tmp_path / f"{pid}/stat").write_text(f"{pid} (a (b) c) " + " ".join(fields) + "\n")
+        (tmp_path / f"{pid}/cmdline").write_bytes(command)
+    report = bridge.load(tmp_path)
+    assert report["loadavg"].startswith("3.90")
+    assert report["stalls"] == {"cpu": "some avg10=61.00 avg60=20.00 avg300=5.00 total=1"}
+    assert report["cpu_ticks"] == [(600, "7", "python model_service.py"), (10, "8", "sh")]
