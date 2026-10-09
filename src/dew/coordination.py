@@ -294,21 +294,24 @@ def _round(word: str) -> list[str]:
     """Every rank's `word` for one agreement, in rank order.
 
     The ranks meet on the host, at the coordination service: each writes its
-    word, meets the service's barrier and reads every rank's. A rank still
-    busy on its host keeps the others waiting there rather than inside an
-    execution, which the pool's bound (`dew.training.runtime.EXECUTION_TIMEOUT`)
-    would end, and no device computation runs, so a round costs a few round
-    trips to process 0 at any pool size (`docs/performance.md`).
+    word, meets the service's barrier, reads every rank's and meets a second
+    barrier once it has. Process 0 hosts the service, and a process 0 that
+    raised at once after reading, as a refusal does, would take the service
+    down under a peer still reading. A rank still busy on its host keeps the
+    others waiting there rather than inside an execution, which the pool's
+    bound (`dew.training.runtime.EXECUTION_TIMEOUT`) would end, and no device
+    computation runs, so a round costs a few round trips to process 0 at any
+    pool size (`docs/performance.md`).
     """
-    client, rank, number = _client(), jax.process_index(), next(_agreements)
-    directory = f"dew/agreement/{number}/"
-    client.key_value_set(directory + str(rank), word)
-    client.wait_at_barrier(directory, int(AGREEMENT_PATIENCE_SECONDS * 1000))
+    client, number = _client(), next(_agreements)
+    directory, patience = f"dew/agreement/{number}", int(AGREEMENT_PATIENCE_SECONDS * 1000)
+    client.key_value_set(f"{directory}/{jax.process_index()}", word)
+    client.wait_at_barrier(directory, patience)
     said = dict(client.key_value_dir_get(directory))
-    if number:
-        # Every rank met this barrier, so every rank read the round before.
-        client.key_value_delete(f"dew/agreement/{number - 1}/{rank}")
-    return [said[directory + str(index)] for index in range(jax.process_count())]
+    client.wait_at_barrier(f"{directory}/read", patience)
+    if jax.process_index() == 0:
+        client.key_value_delete(directory)
+    return [said[f"{directory}/{index}"] for index in range(jax.process_count())]
 
 
 FAILURE_DIRECTORY = "dew/failure/"
