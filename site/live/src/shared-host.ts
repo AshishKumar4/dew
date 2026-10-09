@@ -1,7 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import { limitsOf } from './limits';
 export const SESSION_HEADER = 'X-Dew-Session';
-import type { SnapshotGeneration } from './snapshots';
+import { restore, type SnapshotGeneration } from './snapshots';
 
 const PORT = 8888;
 const START_MS = 180_000;
@@ -67,14 +67,10 @@ export class SharedHost extends DurableObject<Env> {
 		const limits = limitsOf(this.env);
 		if (!container.running) {
 			if (generation.created + LIFETIME_MS <= Date.now()) throw new Error('this snapshot expired; the model is warming up');
-			container.start({ containerSnapshot: generation.snapshot, instance: 'standard-4', enableInternet: false,
-				entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: secret,
-					DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds), DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds) } });
+			restore(container, generation.snapshot, 'model host', { entrypoint: ['sh', '/opt/live/start-shared.sh'],
+				env: { DEW_SHARED_SECRET: secret, DEW_LIVE_IDLE_SECONDS: String(limits.idleSeconds),
+					DEW_LIVE_WALL_SECONDS: String(limits.wallSeconds) } });
 			await this.ctx.storage.put('started', Date.now());
-			// A container stops only when destroyed or when it fails; say which, and after how long.
-			const started = Date.now();
-			container.monitor().then(() => console.log('model host container exited', generation.snapshot.id, Date.now() - started))
-				.catch((error) => console.error('model host container stopped', generation.snapshot.id, Date.now() - started, String(error)));
 		}
 		await container.setInactivityTimeout((limits.wallSeconds + limits.warmSeconds + 60) * 1000);
 		await this.ctx.storage.setAlarm(Date.now() + 30_000);

@@ -24,6 +24,12 @@ for _uid in range(6100, 6200):
     _uids.put(_uid)
 
 
+def _private_tmpfs(directory, uid, size):
+    """Mount a tmpfs of `size` on `directory` that only `uid` may use."""
+    subprocess.run(['mount', '-t', 'tmpfs', '-o', f'size={size},uid={uid},gid={uid},mode=0700,nosuid,nodev',
+                    'tmpfs', str(directory)], check=True)
+
+
 class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
     @default("transport")
     def _transport_default(self):
@@ -82,18 +88,14 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         directory = Path(self.ip).parent
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         os.chown(directory, uid, uid)
-        subprocess.run(['mount', '-t', 'tmpfs', '-o',
-                        f'size=1m,uid={uid},gid={uid},mode=0700,nosuid,nodev',
-                        'tmpfs', str(directory)], check=True)
+        _private_tmpfs(directory, uid, "1m")
         if self.kernel_name == "dew-train":
             # A training context reads the prepared cells' inputs (prepare-cells.py) through an
             # overlay of its own: the Hub and datasets libraries write locks and records beside
             # what they read, and no context may change what the next one reads. Its writes land
             # in this tmpfs, which bounds them: the page's cells write only empty locks.
             self.overlay.mkdir(mode=0o700, parents=True, exist_ok=True)
-            subprocess.run(['mount', '-t', 'tmpfs', '-o',
-                            f'size=64m,uid={uid},gid={uid},mode=0700,nosuid,nodev',
-                            'tmpfs', str(self.overlay)], check=True)
+            _private_tmpfs(self.overlay, uid, "64m")
             for name in ("upper", "work"):
                 (self.overlay / name).mkdir(mode=0o700)
                 os.chown(self.overlay / name, uid, uid)

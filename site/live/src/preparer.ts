@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { SnapshotRecord } from './snapshot-ledger';
-import type { SnapshotGeneration } from './snapshots';
+import { restore, type SnapshotGeneration } from './snapshots';
 
 type Phase = (name: string) => Promise<void>;
 
@@ -78,11 +78,7 @@ export async function smokeSnapshot(container: Container, plan: PreparationPlan,
 	phase: Phase): Promise<number> {
 	const started = Date.now();
 	await phase('offline restore');
-	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false,
-		entrypoint: plan.entrypoint, env: plan.env });
-	// The restored container stops only when destroyed or when it fails; say which, and when.
-	container.monitor().then(() => console.log('preparation container exited', snapshot.id, Date.now() - started))
-		.catch((error) => console.error('preparation container stopped', snapshot.id, Date.now() - started, String(error)));
+	restore(container, snapshot, 'preparation', { entrypoint: plan.entrypoint, env: plan.env });
 	await container.setInactivityTimeout(15 * 60_000);
 	await plan.smoke(container, phase);
 	return (Date.now() - started) / 1000;
