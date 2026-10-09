@@ -70,8 +70,9 @@ was red on 3.14 alone."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
 COLLECT_TASKS = 4
-SKIPPED = {"tests/test_gen_api.py"}
-"""CI runs it in the lint job, under the griffe it pins."""
+SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
+"""CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
+across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
 
 

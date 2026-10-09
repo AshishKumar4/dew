@@ -15,13 +15,13 @@ written out here, rather than with the functions under test.
 
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, packed, unpacked
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, translate_flux_weights
@@ -33,10 +33,7 @@ CASES = ("schnell", "dev", "rect", "deep", "mixed")
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("flux-source")
-    with tarfile.open(ROOT / "tests/fixtures/flux_source.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/flux_source.tar.xz", tmp_path_factory.mktemp("flux-source"))
 
 
 def relative_gap(actual, expected) -> float:
@@ -44,20 +41,7 @@ def relative_gap(actual, expected) -> float:
     return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
 
 
-def unpacked(packed: np.ndarray, rows: int, columns: int) -> np.ndarray:
-    """`FluxPipeline._unpack_latents`, read into NHWC: a position's channels
-    run channel-major over its own two rows and columns."""
-    batch, _, width = packed.shape
-    channels = width // 4
-    grouped = packed.reshape(batch, rows, columns, channels, 2, 2)
-    return grouped.transpose(0, 1, 4, 2, 5, 3).reshape(batch, rows * 2, columns * 2, channels)
 
-
-def packed(latent: np.ndarray) -> np.ndarray:
-    """`FluxPipeline._pack_latents` from NHWC."""
-    batch, height, width, channels = latent.shape
-    grouped = latent.reshape(batch, height // 2, 2, width // 2, 2, channels)
-    return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(batch, height * width // 4, channels * 4)
 
 
 def transformer_case(directory: Path, arrays, name: str, grid: tuple[int, int]):
@@ -314,7 +298,7 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
     checkpoints.wait()
     restored, _, _ = trainer.place()
     for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
-        from test_trainer import raw_leaf
+        from affine_run import raw_leaf
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
     export = tmp_path / "export"

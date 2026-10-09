@@ -1,7 +1,44 @@
 """What several interop tests read off a reference: a checkpoint's stored
 bytes and the audio features a checkpoint's own extractor makes."""
 
+import tarfile
+from pathlib import Path
+
 import numpy as np
+
+
+def extract_fixture(archive: Path, directory: Path) -> Path:
+    with tarfile.open(archive) as source:
+        source.extractall(directory, filter="data")
+    return directory
+
+
+def fixture_arrays(path: Path) -> dict[str, np.ndarray]:
+    with np.load(path, allow_pickle=False) as source:
+        return dict(source)
+
+
+def fetch(url: str, start: int, end: int) -> bytes:
+    import requests
+    response = requests.get(url, headers={"Range": f"bytes={start}-{end}"}, timeout=120)
+    response.raise_for_status()
+    return response.content
+
+
+def unpacked(packed: np.ndarray, rows: int, columns: int) -> np.ndarray:
+    """`FluxPipeline._unpack_latents`, read into NHWC: a position's channels
+    run channel-major over its own two rows and columns."""
+    batch, _, width = packed.shape
+    channels = width // 4
+    grouped = packed.reshape(batch, rows, columns, channels, 2, 2)
+    return grouped.transpose(0, 1, 4, 2, 5, 3).reshape(batch, rows * 2, columns * 2, channels)
+
+
+def packed(latent: np.ndarray) -> np.ndarray:
+    """`FluxPipeline._pack_latents` from NHWC."""
+    batch, height, width, channels = latent.shape
+    grouped = latent.reshape(batch, height // 2, 2, width // 2, 2, channels)
+    return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(batch, height * width // 4, channels * 4)
 
 
 def assert_same_stored_tensors(written: dict, original: dict) -> None:

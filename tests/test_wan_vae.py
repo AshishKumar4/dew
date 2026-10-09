@@ -18,13 +18,13 @@ same `WeightLayout`s an export uses. Every gap is scaled by max(1, |reference|).
 import json
 import math
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, fixture_arrays
 from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import save_file
 
@@ -45,15 +45,12 @@ GRADIENT = 1e-4
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("wan-vae")
-    with tarfile.open(ROOT / "tests/fixtures/wan_vae.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/wan_vae.tar.xz", tmp_path_factory.mktemp("wan-vae"))
 
 
 @pytest.fixture(scope="module")
 def reference(source):
-    return dict(np.load(source / "wan_vae.npz"))
+    return fixture_arrays(source / "wan_vae.npz")
 
 
 @pytest.fixture(scope="module")

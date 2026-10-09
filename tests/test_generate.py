@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import TINY_DECODER, greedy_walk as argmax_walk
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -24,19 +25,11 @@ SEPARATOR = 0
 
 
 def tiny(**overrides):
-    config = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 4,
-                  "mlp_features": 64, "max_seq_len": 16}
+    config = {"vocab_size": VOCAB, **TINY_DECODER}
     return CausalTransformer(**{**config, **overrides})
 
 
-def argmax_walk(model, params, prompt, steps):
-    """Greedy continuation without a cache: one full forward pass per token."""
-    sequence = prompt
-    for _ in range(steps):
-        logits = model.apply(params, sequence)
-        sequence = jnp.concatenate(
-            [sequence, jnp.argmax(logits[:, -1:], axis=-1).astype(jnp.int32)], axis=1)
-    return sequence
+
 
 
 def test_greedy_generation_follows_the_full_sequence_argmax(rng):

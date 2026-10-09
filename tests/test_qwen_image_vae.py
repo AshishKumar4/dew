@@ -16,13 +16,13 @@ the source tensor it names. Every gap is scaled by max(1, |reference|).
 
 import json
 import shutil
-import tarfile
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import extract_fixture, fixture_arrays
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
@@ -40,15 +40,13 @@ GRADIENT = 1e-4
 
 @pytest.fixture(scope="module")
 def source(tmp_path_factory):
-    directory = tmp_path_factory.mktemp("qwen-image-vae")
-    with tarfile.open(ROOT / "tests/fixtures/qwen_image_vae.tar.xz") as archive:
-        archive.extractall(directory, filter="data")
-    return directory
+    return extract_fixture(ROOT / "tests/fixtures/qwen_image_vae.tar.xz",
+                           tmp_path_factory.mktemp("qwen-image-vae"))
 
 
 @pytest.fixture(scope="module")
 def reference(source):
-    return dict(np.load(source / "qwen_image_vae.npz"))
+    return fixture_arrays(source / "qwen_image_vae.npz")
 
 
 @pytest.fixture(scope="module")

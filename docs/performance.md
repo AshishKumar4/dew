@@ -16,6 +16,78 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
     --learning-rate <lr> --out <json>
 ```
 
+## A CPU cluster against one GPU, 2026-10-08
+
+Could a gang of Cloudflare containers train faster or more cheaply than one A100? `tools/cluster_vs_gpu.py` trains
+one model the same way on both and times it to a loss, and `tools/armada/gang_bench.py` measures the gang's network.
+The containers are armada's `medium` size (Cloudflare's standard-4: 4 vCPU, 12 GiB), one process each, joined over
+the gang relay (armada 6809794 for the network and the 64-container run, 64c844c for the 8 and 32). The GPU is an
+A100-SXM4-40GB on Colab. Both run JAX 0.11.2, and the tools as of Dew dfd61e553.
+
+```
+echo '[{"gang": 64}]' | armada map --commit=<sha> --items=- --size=medium -- \
+    .venv-3.12/bin/python tools/armada/gang_bench.py
+echo '[{"gang": 64}]' | armada map --commit=<sha> --items=- --size=medium -- \
+    .venv-3.12/bin/python tools/cluster_vs_gpu.py --shape dense --diloco 50 --out /tmp/dense.json
+python tools/cluster_vs_gpu.py --shape dense --out a100.json
+```
+
+Containers have no inbound address, so every connection between them goes through the Worker. Each collective
+step therefore costs about one 5 ms round trip, and a ring takes 2(n - 1) steps:
+
+| containers | round trip, p50 | one connection | every rank at once | `jax.distributed` join | sum of 4 B | sum of 64 MB |
+|---|---|---|---|---|---|---|
+| 8 | 5.4 ms | 38 to 55 MB/s | 466 MB/s | 3.9 s | 0.09 s | 9.3 s |
+| 16 | 5.3 ms | 43 to 68 MB/s | 1.1 GB/s | 6.0 s | 0.15 s | 7.0 s |
+| 32 | 4.9 ms | 41 to 67 MB/s | 2.0 GB/s | 5.9 s | 0.29 s | 7.1 s |
+| 64 | 5.1 ms | 37 to 70 MB/s | 4.4 GB/s | 6.2 s | 0.54 s | 7.5 s |
+
+The time to a training loss of 1.2 uses the `dense` shape: a 14.3M-parameter byte decoder, a global batch of 256
+rows of 256 bytes, and AdamW at 1e-3. DiLoCo (`--diloco 50`) trains each container's copy on its own share of every
+batch and averages them every 50 steps:
+
+| run | time to loss 1.2 | steps |
+|---|---|---|
+| A100, bfloat16 | 11.9 s, after 8.6 s of compilation | 208 |
+| A100, float32 | 28.1 s, after 15.5 s | 195 |
+| 64 containers, DiLoCo | 699 s | 700 |
+| 32 containers, DiLoCo | 1557 s | 600 |
+| 8 containers, DiLoCo | not reached in 4497 s (1.22 at step 450) | |
+| 8 containers, synchronous | about 85 min, from 26 s a step | |
+| 64 containers, synchronous | about 7.4 h, from 137 s a step | |
+
+A DiLoCo run's loss is the containers' mean training loss at a sync, before the outer step, and a run on one device's
+is the mean of its last ten steps. The two criteria differ, though by far less than the times do. The times leave out
+compilation on both sides.
+
+The synchronous step on 8 containers spends 5 s on one container's 32 rows. Another 18 s goes to the gradient's
+all-reduce, because XLA:CPU runs a combined all-reduce as one gloo ring for each of its 68 buffers: 17.8 s as that
+tuple, against 5.4 s for the same 57 MB as one buffer ([openxla/xla#50283](https://github.com/openxla/xla/issues/50283)).
+The `fsdp` shape (1.6B parameters) does not fit, because XLA:CPU keeps all 170 gathered weights live at once: 21.4 GB
+of temporaries on 12 GiB containers ([openxla/xla#50284](https://github.com/openxla/xla/issues/50284)). The `moe`
+and `pipe` layouts are refused across containers: each container is its own slice, and only the data and fsdp axes
+cross slices. On the GPU, `moe` reaches the loss in 13.3 s, and `fsdp` takes 0.99 s a step. A container multiplies
+float32 matrices at 540 GFLOP/s.
+
+Cost, at list prices on 2026-10-08:
+
+- A container costs $0.000020 per vCPU-second of active CPU, $0.0000025 per GiB-second of memory and $0.00000007 per
+  GB-second of disk ([Cloudflare](https://developers.cloudflare.com/containers/pricing/)). That is $0.401 an hour for
+  a standard-4 with its CPU busy.
+- An A100 80GB on demand costs from $1.59 an hour ([RunPod](https://www.runpod.io/pricing)) through $2.79
+  ([Lambda](https://lambda.ai/pricing)) to $5.07 for GCP's a2-ultragpu-1g in us-central1
+  ([Google Cloud](https://cloud.google.com/products/compute/pricing/accelerator-optimized)). The run here was on an
+  A100 40GB, so the 80GB's price is an upper bound on it.
+
+| run | cost |
+|---|---|
+| 64 containers, DiLoCo, 699 s | $4.98 |
+| 32 containers, DiLoCo, 1557 s | $5.55 |
+| A100, bfloat16, 11.9 s | $0.005 to $0.017 |
+
+Here the cluster is 59 times slower than one A100 at best, and costs 300 to 1,100 times as much. It suits tests that
+need separate hosts (`tests/test_multihost.py`), not training.
+
 ## The performance gate, 2026-10-07
 
 CI checks correctness, and `tools/perf_gate.py` checks speed. It runs one fixed

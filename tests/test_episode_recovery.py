@@ -11,8 +11,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from test_sandbox import IDENTITY, action, environment
-from test_tool_episodes import CALL_THREE, EOS, NINE, START, build, collect
+from episode_support import CALL_THREE, EOS, IDENTITY, NINE, START, action, build, collect, environment
 
 from dew.objectives.rl import EpisodeFailure, EpisodeJournal, RecoverableEnvironment
 
