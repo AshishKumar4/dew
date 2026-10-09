@@ -88,6 +88,17 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
     return (work - jnp.where(norm > 0, along, 0) * value).astype(attention.dtype)
 
 
+def held_reads(index: jax.Array, positions: jax.Array) -> jax.Array:
+    """The keys each row's decode query reads from a paged cache: the row's
+    filled slots `index` `[rows]`, or one where its query is padding
+    (`positions` -1), as the dense path's per-row key count reads. A freed
+    row keeps its last request's count until the next one is admitted, and
+    the paged kernel reads every key under it: on an A100 at 128 slots and
+    32 requests a second, with 40 to 50 rows decoding, that was 5.1 ms of
+    attention a step against cuDNN's 2.0 over the dense cache."""
+    return jnp.where(jnp.asarray(positions) >= 0, index, 1)
+
+
 @logical_axes({
     ("q_proj",): ("embed", "heads"),
     ("k_proj",): ("embed", "kv"),
@@ -773,7 +784,7 @@ class CausalSelfAttention(nn.Module):
         plain_step = (append is not None and mask is cursor and S == 1 and sinks is None
                       and bias is None and not sowing)
         if append is not None and plain_step and self._page_kernel_runs(query) and append.store.kernel():
-            attention = self._paged(append, query)
+            attention = self._paged(append, query, jnp.asarray(positions).reshape(B, S)[:, 0])
         elif plain_step:
             attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0])
         else:
@@ -840,7 +851,8 @@ class CausalSelfAttention(nn.Module):
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
         if self._page_kernel_runs(query) and store.kernel():
-            decoded = store.decode(query[0, :rows], index.value, self.attn_logit_softcap)
+            decoded = store.decode(query[0, :rows], held_reads(index.value, positions[:rows]),
+                                   self.attn_logit_softcap)
             decoded = checkpoint_name(decoded[:, None], 'context')
         else:
             decoded = self._decode_attention(query[0, :rows, None], *store.read(), positions[:rows])
@@ -923,12 +935,13 @@ class CausalSelfAttention(nn.Module):
             return cursor, cursor
         return cursor, causal_attention_mask(positions, key_length, self.sliding_window, key_valid=valid)
 
-    def _paged(self, append: Append, query: jax.Array) -> jax.Array:
+    def _paged(self, append: Append, query: jax.Array, positions: jax.Array) -> jax.Array:
         """One decode step through the Pallas paged kernel, which reads the pool
-        through the page table; the gathered keys go unread and XLA drops the gather."""
-        return checkpoint_name(append.store.decode(
-            query[:, 0], self.get_variable("cache", "cache_index"), self.attn_logit_softcap)[:, None],
-            'context')
+        through the page table; the gathered keys go unread and XLA drops the gather.
+        A row whose query is padding (`positions` -1) reads one key (`held_reads`)."""
+        reads = held_reads(self.get_variable("cache", "cache_index"), positions)
+        return checkpoint_name(append.store.decode(query[:, 0], reads, self.attn_logit_softcap)[:, None],
+                               'context')
 
     def _runs_local(self, metadata: AttentionMetadata | None, decode: bool) -> bool:
         """Whether this call runs `local_attention`, which never builds the
