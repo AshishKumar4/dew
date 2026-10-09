@@ -1230,9 +1230,8 @@ class LengthGroups:
 class _Grouped(pygrain.MapDataset[Batch]):
     """`parent` with each window of `rows * window` records sorted by length
     and cut into batches of `rows`, the batches shuffled within the window
-    from `seed`. A window's order is computed when one of its records is first
-    read, and the last few windows' orders are kept (a cache the reading
-    threads share)."""
+    from `seed`. A window's order is computed once, by the first reading thread
+    to need it while the others wait, and the last few windows' orders are kept."""
 
     _MUTATES_ELEMENT_SPEC = False
 
@@ -1241,6 +1240,16 @@ class _Grouped(pygrain.MapDataset[Batch]):
         self._groups, self._rows, self._seed = groups, rows, seed
         self._span = rows * groups.window
         self._orders: dict[int, np.ndarray] = {}
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
 
     def __len__(self) -> int:
         return len(self._parent)
@@ -1259,17 +1268,23 @@ class _Grouped(pygrain.MapDataset[Batch]):
     def _order(self, start: int) -> np.ndarray:
         order = self._orders.get(start)
         if order is None:
-            size = min(self._span, len(self._parent) - start)
-            records = [self._parent[start + offset] for offset in range(size)]
-            # A record the parent filtered out reads as None and is skipped wherever it lands.
-            ranked = np.argsort([0 if record is None else self._groups.length(record) for record in records],
-                                kind="stable")
-            batches = [ranked[first:first + self._rows] for first in range(0, size, self._rows)]
-            shuffled = np.random.default_rng([self._seed, start]).permutation(len(batches))
-            order = np.concatenate([batches[index] for index in shuffled])
-            # A new dict rather than an edited one, so a thread reading the old one never sees it change.
-            self._orders = {**dict(list(self._orders.items())[-3:]), start: order}
+            with self._lock:
+                order = self._orders.get(start)
+                if order is None:
+                    order = self._ordered(start)
+                    # A new dict, so a thread reading the old one never sees it change.
+                    self._orders = {**dict(list(self._orders.items())[-3:]), start: order}
         return order
+
+    def _ordered(self, start: int) -> np.ndarray:
+        size = min(self._span, len(self._parent) - start)
+        records = [self._parent[start + offset] for offset in range(size)]
+        # A record the parent filtered out reads as None and is skipped wherever it lands.
+        ranked = np.argsort([0 if record is None else self._groups.length(record) for record in records],
+                            kind="stable")
+        batches = [ranked[first:first + self._rows] for first in range(0, size, self._rows)]
+        shuffled = np.random.default_rng([self._seed, start]).permutation(len(batches))
+        return np.concatenate([batches[index] for index in shuffled])
 
 
 class FilledBatch(pygrain.MapTransform):
