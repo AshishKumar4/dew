@@ -48,14 +48,16 @@ def test_every_pass_gates_its_exit_as_the_remote_code_does():
     logits, sown = loaded.model.apply(loaded.variables, fixture('input_ids'), mutable=['exits'])
     assert_as_exact_as_the_reference(logits, fixture('logits'), fixture('logits_f64'), 'Ouro logits')
     gates = np.stack(sown['exits']['logits'])
-    assert_as_exact_as_the_reference(gates, fixture('exit_logits'), fixture('exit_logits_f64'), 'Ouro exit gates')
+    assert_as_exact_as_the_reference(gates, fixture('exit_logits'), fixture('exit_logits_f64'),
+                                     'Ouro exit gates')
 
 
 def test_export_writes_the_remote_codes_names_and_reloads_bit_for_bit(tmp_path):
     loaded = load()
     loaded.save(tmp_path)
     config = json.loads((tmp_path / 'config.json').read_text())
-    assert (config['model_type'], config['total_ut_steps'], config['early_exit_threshold']) == ('ouro', 3, 1.0)
+    assert config['model_type'] == 'ouro'
+    assert (config['total_ut_steps'], config['early_exit_threshold']) == (3, 1.0)
     assert config['auto_map']['AutoModelForCausalLM'] == 'ByteDance/Ouro-1.4B--modeling_ouro.OuroForCausalLM'
     original, exported = load_shards(TINY), load_shards(tmp_path)
     assert set(original) == set(exported)
@@ -67,8 +69,9 @@ def test_export_writes_the_remote_codes_names_and_reloads_bit_for_bit(tmp_path):
                                   loaded.model.apply(loaded.variables, ids))
 
 
-@pytest.mark.parametrize('label, loop', [('a pass fewer', Loop(2, exit_gate=True)),
-                                         ('no norm between passes', Loop(3, step_norm=False, exit_gate=True))])
+@pytest.mark.parametrize('label, loop', [
+    ('a pass fewer', Loop(2, exit_gate=True)),
+    ('no norm between passes', Loop(3, step_norm=False, exit_gate=True))])
 def test_the_reference_catches_each_mechanism_left_out(label, loop):
     loaded = load()
     logits = loaded.model.clone(loop=loop).apply(loaded.variables, fixture('input_ids'))
@@ -78,12 +81,14 @@ def test_the_reference_catches_each_mechanism_left_out(label, loop):
 
 def test_a_loop_the_remote_code_does_not_read_is_not_exported(tmp_path):
     loaded = load()
-    trained = dataclasses.replace(loaded, model=loaded.model.clone(loop=Loop(3, backprop_steps=1, exit_gate=True)))
-    trained.save(tmp_path / 'truncated')
+
+    def looping(**loop):
+        return dataclasses.replace(loaded, model=loaded.model.clone(loop=Loop(3, exit_gate=True, **loop)))
+
+    looping(backprop_steps=1).save(tmp_path / 'truncated')
     assert json.loads((tmp_path / 'truncated' / 'config.json').read_text())['total_ut_steps'] == 3
-    unnormed = dataclasses.replace(loaded, model=loaded.model.clone(loop=Loop(3, step_norm=False, exit_gate=True)))
     with pytest.raises(ValueError, match='loop'):
-        unnormed.save(tmp_path / 'unnormed')
+        looping(step_norm=False).save(tmp_path / 'unnormed')
 
 
 def test_the_released_config_translates_its_computation():

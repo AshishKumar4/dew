@@ -28,8 +28,8 @@ def tokens(rng, length=12):
 def decoded(model, params, ids, prompt=4):
     """Prefill `prompt` tokens, then decode the rest one at a time: each
     position's logits and the cache after the last."""
-    cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache, mutable=['cache'])[1]['cache']
-    logits, cache = model.apply({**params, 'cache': cache}, ids[:, :prompt], decode=True, mutable=['cache'])
+    _, cache = model.apply(params, ids.shape[0], method=CausalTransformer.init_cache, mutable=['cache'])
+    logits, cache = model.apply({**params, **cache}, ids[:, :prompt], decode=True, mutable=['cache'])
     steps = [logits]
     for position in range(prompt, ids.shape[1]):
         logits, cache = model.apply({**params, **cache}, ids[:, position:position + 1], decode=True,
@@ -76,7 +76,8 @@ def test_decoding_a_loop_matches_its_prefill(rng, scan_layers):
 def test_scanned_runs_loop_as_the_plain_layers_do(rng):
     ids = tokens(rng)
     params = tiny().init(rng, ids)
-    np.testing.assert_allclose(tiny(scan_layers=True).apply(params, ids), tiny().apply(params, ids), atol=1e-6)
+    scanned = tiny(scan_layers=True).apply(params, ids)
+    np.testing.assert_allclose(scanned, tiny().apply(params, ids), atol=1e-6)
 
 
 def test_the_exit_gate_reads_every_pass(rng):
@@ -96,7 +97,10 @@ def test_backprop_steps_train_through_the_last_passes_alone(rng):
 
     def gradient(backprop_steps):
         model = tiny(loop=Loop(3, backprop_steps=backprop_steps))
-        loss = lambda tree: jnp.mean(model.apply(tree, ids) ** 2)
+
+        def loss(tree):
+            return jnp.mean(model.apply(tree, ids) ** 2)
+
         return jax.value_and_grad(loss)({'params': {name: value for name, value in params['params'].items()
                                                     if name != 'early_exit_gate'}})
 

@@ -982,8 +982,8 @@ class CausalTransformer(nn.Module):
             scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
             dtype=self.dtype)(name='norm')
         if self.loop is not None and self.loop.exit_gate:
-            self.early_exit_gate = nn.Dense(1, dtype=self.dtype, precision=self.precision, name='early_exit_gate',
-                                            **normal_kernel(self.initializer_range))
+            self.early_exit_gate = nn.Dense(1, dtype=self.dtype, precision=self.precision,
+                                            name='early_exit_gate', **normal_kernel(self.initializer_range))
         if not self.tie_embeddings:
             self.lm_head = nn.Dense(
                 features=self.vocab_size, use_bias=False, dtype=at_least_fp32(self.dtype),
@@ -1523,7 +1523,7 @@ class CausalTransformer(nn.Module):
         )
         streams, x = self._collapse(residual)
         hidden = constrain(self.norm(x), RESIDUAL)
-        self._exit(hidden)
+        self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
             # (h W) / s is (h / s) W: dividing the states in fp32 scores every
             # head that contracts them, the chunked losses' included, as
@@ -1575,7 +1575,7 @@ class CausalTransformer(nn.Module):
         x = self.stack(x, **stack)
         for step in range(1, loop.steps):
             normed = self.norm(x)
-            self._exit(normed)
+            self._gate_exit(normed)
             x = normed if loop.step_norm else x
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
@@ -1585,7 +1585,7 @@ class CausalTransformer(nn.Module):
             x = run(self, x, **stack)
         return x
 
-    def _exit(self, normed):
+    def _gate_exit(self, normed):
         """Sow the exit gate's logit for a pass's normed states into `exits`."""
         if self.loop is None or not self.loop.exit_gate:
             return
