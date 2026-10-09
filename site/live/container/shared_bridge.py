@@ -116,6 +116,23 @@ def resident(proc=Path("/proc")):
     return held
 
 
+def load(proc=Path("/proc")):
+    """The host's load, its CPU and IO stalls, and the processes that used the most CPU, for a
+    failure's message: a context that starts too slowly on an idle host was starved of one."""
+    used = []
+    for process in proc.glob("[0-9]*"):
+        try:
+            fields = (process / "stat").read_text().rsplit(")", 1)[1].split()
+            command = (process / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")[-60:]
+        except (OSError, IndexError):
+            continue
+        used.append((int(fields[11]) + int(fields[12]), process.name, command))
+    stalls = {kind: (proc / "pressure" / kind).read_text().split("\n")[0]
+              for kind in ("cpu", "io") if (proc / "pressure" / kind).exists()}
+    return {"loadavg": (proc / "loadavg").read_text().strip(), "stalls": stalls,
+            "cpu_ticks": sorted(used, reverse=True)[:5]}
+
+
 def largest_guest(proc=Path("/proc")):
     """The pids of the guest context holding the most memory, summed over its processes: each
     context runs as a uid of its own (gateway_manager.py). Empty when no guest runs."""
