@@ -1,5 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { SnapshotRecord } from './snapshot-ledger';
+import { health, restore } from './container';
 import type { SnapshotGeneration } from './snapshots';
 
 type Phase = (name: string) => Promise<void>;
@@ -78,11 +79,7 @@ export async function smokeSnapshot(container: Container, plan: PreparationPlan,
 	phase: Phase): Promise<number> {
 	const started = Date.now();
 	await phase('offline restore');
-	container.start({ containerSnapshot: snapshot, instance: 'standard-4', enableInternet: false,
-		entrypoint: plan.entrypoint, env: plan.env });
-	// The restored container stops only when destroyed or when it fails; say which, and when.
-	container.monitor().then(() => console.log('preparation container exited', snapshot.id, Date.now() - started))
-		.catch((error) => console.error('preparation container stopped', snapshot.id, Date.now() - started, String(error)));
+	restore(container, snapshot, 'preparation', { entrypoint: plan.entrypoint, env: plan.env });
 	await container.setInactivityTimeout(15 * 60_000);
 	await plan.smoke(container, phase);
 	return (Date.now() - started) / 1000;
@@ -92,13 +89,15 @@ export function livePreparation(commit: string, sourceCommit: string, relaySecre
 	return { commit: sourceCommit, sourceCommit, script: 'setup-managed.sh', args: [commit, sourceCommit],
 		name: 'dew-warm-pinned', entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: relaySecret },
 		async smoke(container, phase) {
-			const port = container.getTcpPort(8888);
 			const deadline = Date.now() + 180_000;
-			for (;;) {
-				try { if ((await port.fetch('http://container/health')).ok) break; } catch { /* Still starting. */ }
+			while (!(await health(container, 8888))?.ok) {
 				if (Date.now() > deadline || !container.running) {
-					const logs = await (await container.exec(['sh', '-c', 'tail -c 6000 /run/dew/model.log /run/dew/gateway.log 2>/dev/null'])).output();
-					throw new Error(`offline shared models did not become ready: ${new TextDecoder().decode(logs.stdout)}`);
+					// A container that never came up may not answer an exec either.
+					const logs = await Promise.race([
+						container.exec(['sh', '-c', 'tail -c 6000 /run/dew/model.log /run/dew/gateway.log 2>/dev/null'])
+							.then(async (process) => new TextDecoder().decode((await process.output()).stdout)),
+						scheduler.wait(10_000).then(() => 'its logs did not come within 10 s')]);
+					throw new Error(`offline shared models did not become ready: ${logs}`);
 				}
 				await scheduler.wait(500);
 			}
