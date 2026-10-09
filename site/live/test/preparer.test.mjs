@@ -12,9 +12,11 @@ const bundle = await build({
 			'export class DurableObject { constructor(ctx, env) { this.ctx = ctx; this.env = env; } }' }));
 	} }],
 });
+// A Worker's scheduler; the build waits on it between refused snapshots.
+globalThis.scheduler = { wait: async () => {} };
 const { ManagedPreparer } = await import(`data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`);
 
-function preparer({ failSmoke = false, failReport = 0 } = {}) {
+function preparer({ failSmoke = false, failReport = 0, refuseSnapshot = 0 } = {}) {
 	const starts = [];
 	const reports = [];
 	const state = { destroys: 0, alarm: null };
@@ -24,7 +26,10 @@ function preparer({ failSmoke = false, failReport = 0 } = {}) {
 		start(options) { starts.push(options); this.running = true; },
 		async setInactivityTimeout() {},
 		async exec() { return { exitCode: Promise.resolve(0), output: async () => ({ exitCode: 0 }) }; },
-		async snapshotContainer() { return { id: 'snapshot' }; },
+		async snapshotContainer() {
+			if (refuseSnapshot-- > 0) throw new Error('The snapshot could not be completed because snapshot resource limits were exceeded.');
+			return { id: 'snapshot' };
+		},
 		async destroy() { this.running = false; state.destroys++; },
 		monitor: () => new Promise(() => {}),
 	};
@@ -85,6 +90,12 @@ test('managed preparation snapshots in one alarm and validates its restore witho
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state, trial }) => [id, state, trial]), [['snapshot', 'ready', false]]);
 	await prepared.runner.forget(['snapshot']);
 	assert.deepEqual(await prepared.runner.snapshots(), []);
+});
+test('a snapshot the registry refuses is tried again', async () => {
+	const prepared = preparer({ refuseSnapshot: 2 });
+	await stages(prepared);
+	assert.ok(prepared.reports[0][1].generation);
+	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['snapshot', 'ready']]);
 });
 test('the shared preparation lifecycle tears down and reports an offline smoke failure', async () => {
 	const prepared = preparer({ failSmoke: true });

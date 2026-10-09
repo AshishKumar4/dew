@@ -47,6 +47,22 @@ interface Job {
 	outcome?: Prepared;
 }
 
+/**
+ * Snapshot `container`. The account's registry refuses a snapshot now and then with "snapshot
+ * resource limits were exceeded", with few snapshots stored, when others are being made at the
+ * same time; a refusal is tried again a minute later, twice, within the build's alarm.
+ */
+async function snapshotted(container: Container, name: string, attempts = 3): Promise<ContainerSnapshot> {
+	for (let attempt = 1; ; attempt++) {
+		try { return await container.snapshotContainer({ name }); }
+		catch (error) {
+			if (attempt === attempts) throw error;
+			console.error('snapshot refused', attempt, String(error));
+			await scheduler.wait(60_000);
+		}
+	}
+}
+
 /** Install and warm `plan` in `container` and snapshot it; `made` hears the snapshot. */
 export async function buildSnapshot(container: Container, plan: PreparationPlan, phase: Phase,
 	made: (snapshot: ContainerSnapshot) => Promise<void>): Promise<{ snapshot: ContainerSnapshot; prepareSeconds: number; snapshotSeconds: number }> {
@@ -67,7 +83,7 @@ export async function buildSnapshot(container: Container, plan: PreparationPlan,
 	const prepareSeconds = (Date.now() - started) / 1000;
 	const snapshotStart = Date.now();
 	await phase('snapshot');
-	const snapshot = await container.snapshotContainer({ name: plan.name });
+	const snapshot = await snapshotted(container, plan.name);
 	await made(snapshot);
 	const snapshotSeconds = (Date.now() - snapshotStart) / 1000;
 	await container.destroy();
