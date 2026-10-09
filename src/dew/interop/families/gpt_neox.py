@@ -51,8 +51,8 @@ def _gpt_neox_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 def gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
                        config: Mapping[str, object] | None = None, *,
-                       attention_name: str = 'attention', interleaved: bool = True
-                       ) -> Mapping[str, np.ndarray]:
+                       attention_name: str = 'attention', fused_name: str = 'query_key_value',
+                       interleaved: bool = True) -> Mapping[str, np.ndarray]:
     if config is None:
         raise ValueError('GPT-NeoX fused qkv preparation requires translated num_heads and head_dim')
     heads = records.integer(config['num_heads'], 'num_heads')
@@ -81,7 +81,7 @@ def gpt_neox_prepare(tensors: Mapping[str, np.ndarray],
                     f"{name} disagrees with the configured rotary frequencies in its stored dtype"
                 )
             continue
-        fused = f'{attention_name}.query_key_value'
+        fused = f'{attention_name}.{fused_name}'
         if f'.{fused}.' not in name:
             prepared[name] = tensor
             continue
@@ -127,16 +127,16 @@ def _gpt_neox_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def gpt_neox_export_weights(family: DecoderFamily, model: CausalTransformer, variables: Mapping[str, object],
-                            config: Mapping[str, object], *,
-                             attention_name: str = 'attention', interleaved: bool = True) -> LazyTensors:
+                            config: Mapping[str, object], *, attention_name: str = 'attention',
+                            fused_name: str = 'query_key_value', interleaved: bool = True) -> LazyTensors:
     """The shared writer's tensors with each layer's q, k and v interleaved by
-    head into `query_key_value`, the inverse of `gpt_neox_prepare`."""
+    head into `fused_name`, the inverse of `gpt_neox_prepare`."""
     tensors = decoder_tensors(family, model, variables, config)
     fused: dict[str, tuple[str, ...]] = {}
     for name in tensors:
         stem, found, leaf = name.partition('.self_attn.q_proj.')
         if found:
-            fused[f'{stem}.{attention_name}.query_key_value.{leaf}'] = tuple(
+            fused[f'{stem}.{attention_name}.{fused_name}.{leaf}'] = tuple(
                 f'{stem}.self_attn.{part}.{leaf}' for part in ('q_proj', 'k_proj', 'v_proj'))
     parts = {part for names in fused.values() for part in names}
     specs = {name: spec for name, spec in tensors.specs.items() if name not in parts}
