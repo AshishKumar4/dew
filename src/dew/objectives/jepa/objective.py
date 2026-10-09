@@ -34,7 +34,7 @@ from flax import linen as nn
 
 from dew.artifacts import Representations
 from dew.inputs import Field, InputSpec, unit_range
-from dew.nn.sharding import explicit_spec, summed_spec
+from dew.nn.sharding import explicit_spec, whole_spec
 from dew.objectives.base import (
     Aux,
     EMASpec,
@@ -73,7 +73,7 @@ def representation_health(z) -> dict[str, jax.Array]:
     batch_size, dim = z.shape
     z = z.astype(jnp.float32)
     centered = z - jnp.mean(z, axis=0, keepdims=True)
-    cov = jnp.matmul(centered.T, centered, out_sharding=summed_spec(centered, 2)) / max(batch_size - 1, 1)
+    cov = jnp.matmul(centered.T, centered, out_sharding=whole_spec(centered, 2)) / max(batch_size - 1, 1)
     off_diagonal = cov * (1.0 - jnp.eye(dim, dtype=cov.dtype))
     return {
         "repr_std": jnp.mean(jnp.std(z, axis=0)),

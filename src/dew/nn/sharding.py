@@ -537,11 +537,11 @@ def rows_spec(like: jax.Array, ndim: int) -> jax.sharding.NamedSharding | None:
     return jax.sharding.NamedSharding(placed.mesh, rows)
 
 
-def summed_spec(like: jax.Array, ndim: int) -> jax.sharding.NamedSharding | None:
-    """A whole placement for an array of `ndim` dimensions that sums over
-    `like`'s rows: a contraction over rows an Explicit axis splits, which JAX
-    asks to state where its sum lands; None where no Explicit axis splits
-    `like`."""
+def whole_spec(like: jax.Array, ndim: int) -> jax.sharding.NamedSharding | None:
+    """A whole placement for an array of `ndim` dimensions on `like`'s mesh,
+    where an Explicit axis splits `like`: where a contraction over its split
+    rows lands its sum, which JAX asks to be told, or where its rows are
+    gathered whole; None where no Explicit axis splits `like`."""
     placed = explicit_spec(like)
     if placed is None:
         return None
@@ -553,23 +553,6 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
     them: a whole `x` is cut to each device's rows, without a collective."""
     placed = rows_spec(like, x.ndim)
     return x if placed is None else jax.sharding.reshard(x, placed)
-
-
-def take_rows(table: jax.Array, ids: jax.Array) -> jax.Array:
-    """`table[ids]`: the rows of `table` at integer `ids`, laid out as `ids` is."""
-    placed = explicit_spec(ids, table.ndim - 1)
-    return jnp.take(table, ids, axis=0) if placed is None else table.at[ids].get(out_sharding=placed)
-
-
-def add_rows(table: jax.Array, ids: jax.Array, rows: jax.Array) -> jax.Array:
-    """`table` with each of `rows` added at its id, laid out as `table` is:
-    under an Explicit axis splitting the ids, each device's sums are added
-    across it."""
-    placed = explicit_spec(ids)
-    if placed is None:
-        return table.at[ids].add(rows)
-    whole = jax.sharding.PartitionSpec(*jax.typeof(table).sharding.spec)
-    return table.at[ids].add(rows, out_sharding=jax.sharding.NamedSharding(placed.mesh, whole))
 
 
 def _qualified(cls: type) -> str:
