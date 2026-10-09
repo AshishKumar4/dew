@@ -1230,7 +1230,7 @@ def test_evaluation_coordinates_root_consumers_keys_and_host_failures(tmp_path):
         for failure in ("deleted_first", "deleted_later", "deleted_batch", "deleted_preview"):
             assert "deleted" in report["results"][failure]["error"]
             assert failure in report["closed"]
-        assert "gather plans differ" in report["results"]["mismatched_plan"]["error"]
+        assert "gather plan differs between the processes" in report["results"]["mismatched_plan"]["error"]
 
 
 @pytest.mark.distributed
