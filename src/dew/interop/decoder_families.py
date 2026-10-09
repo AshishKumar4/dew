@@ -17,6 +17,7 @@ from dew.interop.families.falcon import FALCON
 from dew.interop.families.gemma import GEMMA, GEMMA2, GEMMA3_TEXT, GEMMA3N_TEXT, GEMMA4_TEXT
 from dew.interop.families.glm import GLM4_MOE, GLM5_NEXT_TEXT, GLM_MOE_DSA
 from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ
+from dew.interop.families.gpt_bigcode import GPT_BIGCODE
 from dew.interop.families.gpt_neox import GPT_NEOX
 from dew.interop.families.gpt_oss import GPT_OSS
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
@@ -38,6 +39,7 @@ from dew.interop.families.qwen import (
     QWEN3_MOE,
     QWEN3_NEXT,
 )
+from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
@@ -50,8 +52,10 @@ ENTRIES = (
     MINIMAX_M2,
     MODERNBERT,
     NEMOTRON_H,
+    STARCODER2,
     GPT_NEOX,
     OPT,
+    GPT_BIGCODE,
     GPT2,
     GLM5_NEXT_TEXT,
     DIFFUSION_GEMMA_TEXT,
