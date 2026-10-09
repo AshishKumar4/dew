@@ -44,16 +44,6 @@ def _block(stack: _AttentionStackOptions, remat: RematChoice, features: int, hea
         force_fp32_for_softmax=stack.force_fp32_for_softmax, name=name)
 
 
-def _joint_rotation(freqs_cis, text: int):
-    """The rotation over the text-first joint sequence: each image token turns
-    by its own angles, `freqs_cis`, and the text tokens turn by nothing."""
-    if freqs_cis is None:
-        return None
-    cos, sin = freqs_cis
-    return (jnp.concatenate([jnp.ones((text, cos.shape[-1]), cos.dtype), cos]),
-            jnp.concatenate([jnp.zeros((text, sin.shape[-1]), sin.dtype), sin]))
-
-
 class SimpleMMDiT(_DiTStackOptions):
     """SD3-style MM-DiT: a plain stack of dual-stream blocks, the image tokens
     rotated by their raster index (`rope_for_scan`)."""
@@ -79,8 +69,7 @@ class SimpleMMDiT(_DiTStackOptions):
         img, inv_idx = self.embed(x)
         txt = self.txt_embed(textcontext.hidden)
         cond_emb = self.conditioning(temb, textcontext)
-        rotation = _joint_rotation(
-            rope_for_scan(img, self.emb_features // self.num_heads, self.scan_order), txt.shape[1])
+        rotation = rope_for_scan(img, self.emb_features // self.num_heads, self.scan_order)
 
         for block in self.blocks:
             img, txt = block(img, txt, cond_emb, rotation, train)
@@ -291,9 +280,9 @@ class HierarchicalMMDiT(_AttentionStackOptions):
         skips = {}
         for stage in range(num_stages):
             txt = txts[stage]
-            rotation = _joint_rotation(rotary_freqs(
+            rotation = rotary_freqs(
                 jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA, dtype=at_least_fp32(img.dtype)), txt.shape[1])
+                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             for block in self.encoder_blocks[stage]:
                 img, txt = block(img, txt, conds[stage], rotation, train)
             skips[stage] = img
@@ -305,9 +294,9 @@ class HierarchicalMMDiT(_AttentionStackOptions):
             img, H_P, W_P = self.patch_expanders[i](img, H_P, W_P)
             img = self.fusion_layers[i](jnp.concatenate([img, skips[stage]], axis=-1))
             txt = txts[stage]
-            rotation = _joint_rotation(rotary_freqs(
+            rotation = rotary_freqs(
                 jnp.arange(img.shape[1]), self.emb_features[stage] // self.num_heads[stage],
-                ROPE_THETA, dtype=at_least_fp32(img.dtype)), txt.shape[1])
+                ROPE_THETA, dtype=at_least_fp32(img.dtype))
             for block in self.decoder_blocks[i]:
                 img, txt = block(img, txt, conds[stage], rotation, train)
 
