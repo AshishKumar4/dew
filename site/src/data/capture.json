@@ -6,18 +6,18 @@
 		"jax": "0.11.2.post3",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "a89d268282cda6a1585e2d2f125d7db9852dfd9a",
-		"date": "2026-10-08",
-		"wall_seconds": 106.0,
-		"script_sha256": "4678e170b38cca442737a1d36086ca0f56746a2a5364c7a3be69641b1706dc8d",
+		"dew": "9235af7f3e8e80169dac359b2c60a295a8c92845",
+		"date": "2026-10-09",
+		"wall_seconds": 109.6,
+		"script_sha256": "12530d343929a61cd3f4cd5f20ca88ec084e35bd8dfaadfa5f4229f109257e31",
 		"steps": 1000,
 		"device": "NVIDIA A100-SXM4-40GB",
 		"description": "Tiny Shakespeare from winglian/tiny-shakespeare, the first 1% of its tokens held out, freshly initialized weights, real recorded training",
-		"validation_perplexity_display": 3.891
+		"validation_perplexity_display": 3.89
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 106.0,
+		"seconds": 109.6,
 		"columns": 110,
 		"screen": [
 			[
@@ -132,14 +132,14 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  31.0"
+					"text": "  100%  30.8"
 				},
 				{
 					"text": " step/s",
 					"dim": true
 				},
 				{
-					"text": "  0:01:08 "
+					"text": "  0:01:07 "
 				},
 				{
 					"text": "\u2502",
@@ -367,7 +367,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     64.7%",
+					"text": "     64.6%",
 					"bold": true
 				},
 				{
@@ -397,7 +397,7 @@
 					"text": "  "
 				},
 				{
-					"text": "\u2191 22.5 pt",
+					"text": "\u2191 22.6 pt",
 					"fg": "5faf5f"
 				},
 				{
@@ -445,7 +445,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     33.92",
+					"text": "     33.96",
 					"bold": true
 				},
 				{
@@ -475,7 +475,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 3.6%",
+					"text": "   \u2193 4.0%",
 					"fg": "5faf5f"
 				},
 				{
@@ -502,7 +502,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     1,887",
+					"text": "     1,885",
 					"bold": true
 				},
 				{
@@ -532,7 +532,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2191 3.8%",
+					"text": "   \u2191 4.1%",
 					"fg": "5faf5f"
 				},
 				{
@@ -695,7 +695,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     3.891",
+					"text": "     3.890",
 					"bold": true
 				},
 				{
@@ -795,7 +795,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 23.34 s                   "
+					"text": "after 23.01 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -815,7 +815,7 @@
 					"dim": true
 				},
 				{
-					"text": "29.4 step/s                     "
+					"text": "29.3 step/s                     "
 				},
 				{
 					"text": "\u2502",
@@ -835,7 +835,7 @@
 					"dim": true
 				},
 				{
-					"text": "47.8% of the wall time in steps "
+					"text": "48.1% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -879,7 +879,7 @@
 					"dim": true
 				},
 				{
-					"text": "3.891",
+					"text": "3.890",
 					"bold": true
 				},
 				{
@@ -921,7 +921,7 @@
 			],
 			[
 				{
-					"text": "The means the chamber of the treacherous speech."
+					"text": "The means that he is not have to hear me to them."
 				}
 			],
 			[],
@@ -933,11 +933,16 @@
 			],
 			[
 				{
-					"text": "What say you should be so, that I have seen them again."
+					"text": "What say you should be so, that I have seen them at"
+				}
+			],
+			[
+				{
+					"text": "hand."
 				}
 			]
 		],
-		"rows": 34,
+		"rows": 35,
 		"source_rows": 200,
 		"viewer_rows": 200,
 		"replay": "/hero/train.json"
