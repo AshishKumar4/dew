@@ -11,6 +11,7 @@ coordinate through these, so they live apart from any one of them.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import itertools
 import json
 import os
@@ -109,9 +110,10 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
     leaves = []
     tree = None
     global_indices = []
-    plan = []
-    error = None
-    try:
+
+    def preflight() -> list:
+        nonlocal tree
+        plan = []
         paths, tree = jax.tree_util.tree_flatten_with_path(value)
         local = []
         for path, leaf in paths:
@@ -127,12 +129,9 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
             for index, home in zip(local, jax.device_get([leaves[index] for index in local]), strict=True):
                 leaves[index] = np.asarray(home)
         jax.block_until_ready(leaves)
-    except BaseException as failure:
-        error = failure
-    agree_process_phase(error, phase=f"{phase} transfer preflight")
-    root_plan = broadcast_from_process_zero(plan)
-    error = None if plan == root_plan else ValueError("global array gather plans differ across ranks")
-    agree_process_phase(error, phase=f"{phase} gather plan")
+        return plan
+
+    agreed_same(f"{phase} global array gather plan", preflight)
     for group in _gather_groups([leaves[index] for index in global_indices]):
         indices = [global_indices[position] for position in group]
         error = None
@@ -156,13 +155,18 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
     return materialized if held else None
 
 
+def from_every_process(value) -> list:
+    """Every rank's JSON-encodable `value`, in rank order, in one round of the
+    coordination service (`_round`). For the small host values a pool
+    shares; a device array goes through a collective."""
+    if jax.process_count() == 1:
+        return [json.loads(json.dumps(value))]
+    return [json.loads(word) for word in _round(json.dumps(value))]
+
+
 def broadcast_from_process_zero(value):
-    """A JSON-encodable value broadcast from rank zero to every rank."""
-    payload = np.frombuffer(json.dumps(value).encode(), np.uint8)
-    length = int(multihost_utils.broadcast_one_to_all(np.asarray(len(payload), np.int64)))
-    if jax.process_index() != 0:
-        payload = np.zeros(length, np.uint8)
-    return json.loads(multihost_utils.broadcast_one_to_all(payload).tobytes())
+    """A JSON-encodable value broadcast from rank zero to every rank (`from_every_process`)."""
+    return from_every_process(value if jax.process_index() == 0 else None)[0]
 
 
 def agreed[T](phase: str, operation: Callable[[], T]) -> T:
@@ -193,19 +197,44 @@ def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
     """What each rank finds for itself, refused when the ranks differ.
 
     For what every process reads or looks up on its own and the pool must
-    share, such as its data or its newest checkpoint. `find` returns a JSON
-    scalar. A rank that finds something else than process zero raises naming
-    both, and its peers hear it at the same agreement. On one process this is
-    a plain call.
+    share, such as its data, its newest checkpoint or the plan of a gather.
+    `find` returns a JSON value, and the ranks compare a digest of it, so a
+    large one costs no more to agree than a small one. A failure in `find`
+    is agreed as in `agreed`; a rank that found something else than process
+    0 is refused on every rank, both values named, which takes a second
+    round. On one process this is a plain call.
     """
-    value = agreed(f"{phase} lookup", find)
+    held: tuple[T] | None = None
+    error: BaseException | None = None
+    try:
+        held = (find(),)
+    except BaseException as failure:
+        error = failure
     if jax.process_count() == 1:
-        return value
-    root = broadcast_from_process_zero(value)
-    agree_process_phase(None if value == root else ValueError(
-        f"the {phase} differs between the processes: this one has {value}, and process 0 has {root}"),
-        phase=phase)
-    return value
+        if error is not None:
+            raise error
+        assert held is not None
+        return held[0]
+    found = "" if held is None else json.dumps(held[0], sort_keys=True)
+    try:
+        digests = _agree(phase, error, hashlib.sha256(found.encode()).hexdigest())
+    except BaseException as failure:
+        if error is None:
+            raise PeerFailure(str(failure)) from failure
+        raise
+    other = next((rank for rank, digest in enumerate(digests) if digest != digests[0]), None)
+    if other is not None:
+        # Every rank saw the same digests, so all take this second round, which names the values.
+        shown = _round(_shown(found))
+        raise ValueError(f"the {phase} differs between the processes: process {other} has "
+                         f"{shown[other]}, and process 0 has {shown[0]}")
+    assert held is not None
+    return held[0]
+
+
+def _shown(text: str, limit: int = 4096) -> str:
+    """`text` as an agreement carries it to the other ranks: whole up to `limit` characters."""
+    return text if len(text) <= limit else text[:limit - 32] + " ... [truncated]"
 
 
 class PeerFailure(RuntimeError):
@@ -231,46 +260,58 @@ def agree_process_phase(error: BaseException | None, *, phase: str,
     So a failing rank first publishes its error (`publish_failure`), which
     ends the pool within `FAILURE_GRACE_SECONDS` unless the agreement
     completes and withdraws it. Errors take priority over unavailable input.
-
-    The ranks meet on the host, at a coordination-service barrier, before
-    the device collectives that carry the outcome. A rank still busy on its
-    host keeps the others waiting there rather than inside an execution,
-    which the pool's bound (`dew.training.runtime.EXECUTION_TIMEOUT`) would
-    end.
     """
     if jax.process_count() == 1:
         if error is not None:
             raise error
         return int(available)
+    return _agree(phase, error, str(int(available))).count("1")
+
+
+def _agree(phase: str, error: BaseException | None, word: str) -> list[str]:
+    """Every rank's `word`, in rank order, once no rank failed at `phase`.
+
+    A rank that failed passes its error instead, and every rank raises: that
+    one its own error, noted with the first failure, the others a
+    RuntimeError naming it. Its published failure (`publish_failure`) is
+    withdrawn once every rank has met the agreement.
+    """
     published = error is not None and publish_failure(error, f"phase {phase}")
-    status = 2 if error is not None else int(available)
-    _client().wait_at_barrier(f"dew/agreement/{next(_agreements)}",
-                              int(AGREEMENT_PATIENCE_SECONDS * 1000))
-    statuses = np.asarray(multihost_utils.process_allgather(np.asarray(status, np.int32))).reshape(-1)
-    failed = np.flatnonzero(statuses == 2)
-    if not failed.size:
-        return int(np.count_nonzero(statuses))
-    source = int(failed[0])
-    is_source = jax.process_index() == source
-    message = b""
-    if is_source:
-        assert error is not None
-        message = f"{type(error).__name__}: {error}".encode("utf-8", errors="replace")
-        if len(message) > 4096:
-            message = message[:4064] + b" ... [diagnostic truncated]"
-    length = int(multihost_utils.broadcast_one_to_all(
-        np.asarray(len(message), np.int32), is_source=is_source))
-    payload = np.frombuffer(message, np.uint8) if is_source else np.zeros(length, np.uint8)
-    diagnostic = multihost_utils.broadcast_one_to_all(payload, is_source=is_source).tobytes()
+    words = _round(f"! {_shown(f'{type(error).__name__}: {error}')}" if error is not None else f"= {word}")
+    failed = [rank for rank, said in enumerate(words) if said.startswith("!")]
+    if not failed:
+        return [said[2:] for said in words]
     if published:
-        # Every rank took part in the agreement's collectives and holds the
-        # failure; one that met a peer's pending step instead never gets here.
         withdraw_failure()
-    context = f"Process phase {phase} failed on rank {source}: {diagnostic.decode('utf-8', errors='replace')}"
+    context = f"Process phase {phase} failed on rank {failed[0]}: {words[failed[0]][2:]}"
     if error is not None:
         error.add_note(context)
         raise error
     raise RuntimeError(context)
+
+
+def _round(word: str) -> list[str]:
+    """Every rank's `word` for one agreement, in rank order.
+
+    The ranks meet on the host, at the coordination service: each writes its
+    word, meets the service's barrier, reads every rank's and meets a second
+    barrier once it has. Process 0 hosts the service, and a process 0 that
+    raised at once after reading, as a refusal does, would take the service
+    down under a peer still reading. A rank still busy on its host keeps the
+    others waiting there rather than inside an execution, which the pool's
+    bound (`dew.training.runtime.EXECUTION_TIMEOUT`) would end, and no device
+    computation runs, so a round costs a few round trips to process 0 at any
+    pool size (`docs/performance.md`).
+    """
+    client, number = _client(), next(_agreements)
+    directory, patience = f"dew/agreement/{number}", int(AGREEMENT_PATIENCE_SECONDS * 1000)
+    client.key_value_set(f"{directory}/{jax.process_index()}", word)
+    client.wait_at_barrier(directory, patience)
+    said = dict(client.key_value_dir_get(directory))
+    client.wait_at_barrier(f"{directory}/read", patience)
+    if jax.process_index() == 0:
+        client.key_value_delete(directory)
+    return [said[f"{directory}/{index}"] for index in range(jax.process_count())]
 
 
 FAILURE_DIRECTORY = "dew/failure/"
@@ -435,4 +476,5 @@ __all__ = [
     "broadcast_from_process_zero",
     "collective_host",
     "end_pool_on_failure",
+    "from_every_process",
 ]

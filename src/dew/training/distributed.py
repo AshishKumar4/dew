@@ -20,7 +20,7 @@ from flax import linen as nn
 from jax.experimental import mesh_utils, multihost_utils
 from jax.sharding import AbstractMesh, AxisType, Mesh, NamedSharding, PartitionSpec as P
 
-from dew.coordination import agreed, broadcast_from_process_zero, stop_at_exit
+from dew.coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
@@ -226,9 +226,7 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
         if attempt >= 2:
             seconds.append(time.perf_counter() - began)
     received = (ways - 1) / ways * count * 4 / statistics.median(seconds)
-    if jax.process_count() == 1:
-        return received
-    return float(np.min(multihost_utils.process_allgather(np.asarray(received, np.float32))))
+    return min(from_every_process(received))
 
 
 def _slice(device) -> int:
