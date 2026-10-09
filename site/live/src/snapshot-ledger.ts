@@ -8,12 +8,10 @@ export interface SnapshotRecord {
 	commit: string;
 	created: number;
 	trial: boolean;
-	// `preparing` from the snapshot until its smoke ends.
+	// `preparing` from the snapshot until its smoke ends, while its preparer's job runs (preparer.ts).
 	state: 'preparing' | 'ready' | 'failed';
 }
 
-// A snapshot is preparing from the end of its build to the end of its smoke, a 15-minute alarm (preparer.ts).
-const PREPARING_MS = 20 * 60_000;
 // One fallback generation: each is a few GB of the account's registry, whose total is limited.
 const NEWEST = 1;
 
@@ -23,9 +21,8 @@ const NEWEST = 1;
  * preparation's while it runs and the `NEWEST` newest other generation. A failed preparation
  * and a finished trial go at once.
  */
-export function prunable(records: SnapshotRecord[], live: Set<string>, now: number): { keep: string[]; delete: string[] } {
-	const keep = new Set(records.filter((record) => live.has(record.id)
-		|| (record.state === 'preparing' && now - record.created < PREPARING_MS)).map((record) => record.id));
+export function prunable(records: SnapshotRecord[], live: Set<string>): { keep: string[]; delete: string[] } {
+	const keep = new Set(records.filter((record) => live.has(record.id) || record.state === 'preparing').map((record) => record.id));
 	records.filter((record) => !record.trial && record.state === 'ready' && !keep.has(record.id))
 		.sort((left, right) => right.created - left.created).slice(0, NEWEST).forEach((record) => keep.add(record.id));
 	return { keep: records.filter((record) => keep.has(record.id)).map((record) => record.id),
