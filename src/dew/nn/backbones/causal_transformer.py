@@ -173,6 +173,9 @@ class CausalTransformer(nn.Module):
     num_heads: int = 8
     num_kv_heads: int | None = None       # None: as many as the query heads
     head_dim: int | None = None  # None: emb_features // num_heads
+    value_head_dim: int | None = None
+    """The width of a value head; None is the query and key heads' width.
+    MiMo-V2-Flash attends 192-wide queries and keys over 128-wide values."""
     mlp: GatedActivation = "swiglu"  # 'swiglu' | 'geglu' | 'geglu_exact' | 'swigluoai', or Kimi K3's Situ
     mlp_bias: bool = False
     """Whether both feed-forward projections have a bias. The `mlp` activations gelu,
@@ -219,6 +222,9 @@ class CausalTransformer(nn.Module):
     attention_bias: bool = False             # q/k/v biases, and o_proj unless o_proj_bias says
     o_proj_bias: bool | None = None       # Qwen2 biases q/k/v while o_proj stays bias-free
     attention_scale: float | None = None  # None: head_dim ** -0.5
+    value_scale: float | None = None
+    """The factor that multiplies the values as they are projected, before
+    they are cached: MiMo-V2-Flash's `attention_value_scale`."""
     attention_sinks: bool = False
     yarn: YarnScaling | None = None
     attn_logit_softcap: float | None = None  # Gemma 2's attn_logit_softcapping
@@ -453,7 +459,19 @@ class CausalTransformer(nn.Module):
             rope_scaling=self.rope_scaling if kind.rope_scaling is None else kind.rope_scaling,
             yarn=self.yarn if kind.yarn is None else kind.yarn,
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
+            partial_rotary_factor=self._kind_rotary(kind),
+            sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
             mixer=kind.mixer)
+
+    def _kind_rotary(self, kind: LayerKind) -> float | None:
+        """The fraction of a kind's head its rotary turns, None for all of
+        it: the kind's own, else the model's on a kind that attends the whole
+        sequence. LongRoPE's factors fix the rotated width on every layer;
+        Gemma's windowed layers otherwise rotate whole heads."""
+        factor = (kind.partial_rotary_factor if kind.partial_rotary_factor is not None
+                  else self.partial_rotary_factor if kind.window is None
+                  or isinstance(kind.rope_scaling or self.rope_scaling, LongRopeScaling) else None)
+        return None if factor == 1.0 else factor
 
     @property
     def hash_layers(self) -> set:
@@ -515,10 +533,9 @@ class CausalTransformer(nn.Module):
                       kv_shared: bool) -> MixerContext:
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
-        `head_dim`, `rope_theta`, `window` and the two rotary ramps take the
-        layer kind's overrides. A windowed kind rotates every dimension, so the
-        partial rotary applies only to the kinds that attend the whole
-        sequence, which is where Gemma 4 puts it. Every other field is the
+        `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
+        rotary and the sinks take the layer kind's resolved values
+        (`kind_of`). Every other field is the
         model's field of the same name. A kind builds its `DecoderBlock` factory
         from this context and its own record, and `setup` chooses the mixer
         there and nowhere else.
@@ -530,10 +547,7 @@ class CausalTransformer(nn.Module):
             "attention_chunk": kind.chunk,
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
-            # LongRoPE's factors fix the rotated width on every layer;
-            # Gemma's windowed layers otherwise rotate whole heads.
-            "partial_rotary_factor": (self.partial_rotary_factor if kind.window is None
-                                      or isinstance(kind.rope_scaling, LongRopeScaling) else None),
+            "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
             "init_std": self.init_stds[0], "output_init_std": self.init_stds[1]}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
