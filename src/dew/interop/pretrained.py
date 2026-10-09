@@ -491,6 +491,8 @@ class Pretrained:
         if fallback not in (None, "torchax"):
             raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
                              "tier 3 through transformers' PyTorch forward")
+        if expert_storage not in ("float", "mxfp4", "auto"):
+            raise ValueError(f"expert_storage must be 'float' or 'mxfp4', got {expert_storage!r}")
         if expert_storage == "mxfp4" and (fallback is not None or single_file or dduf_file or gguf_file):
             raise ValueError(f"expert_storage={expert_storage!r} keeps a decoder checkpoint's MXFP4 experts; "
                              "a fallback, single-file, DDUF or GGUF source has none to keep")
