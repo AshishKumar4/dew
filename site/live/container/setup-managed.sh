@@ -69,7 +69,10 @@ for path in files("/opt/train"):
         os.link(twin, path)
 PY
 chmod 0750 /opt/models /opt/hf /opt/xla
-# Training contexts read /opt/train (gateway_manager.py); nothing may write it after preparation.
+# Training contexts see /opt/train through an overlay of their own (gateway_manager.py), and every
+# write goes to that overlay's upper layer. Overlayfs checks a write against the lower layer's modes,
+# so the lower layer is open to all: a context must open and create the datasets' lock files.
+find /opt/train -name '*.lock' -delete
 chown -R root:root /opt/train
-chmod -R a+rX,go-w /opt/train
+chmod -R a+rwX /opt/train
 rm -rf /var/lib/apt/lists/* /root/.cache /root/prepare-cells.log

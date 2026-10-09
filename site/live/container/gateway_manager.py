@@ -126,8 +126,8 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             **({"DEW_GUEST_TRACE": "1"} if os.environ.get("DEW_GUEST_TRACE") == "1" else {}),
         }
         if self.kernel_name == "dew-train":
-            # Dew runs in the context, reading the model and the corpus prepared read-only
-            # under /opt/train (warm-managed.py).
+            # Dew runs in the context, reading the model and the corpus prepared under
+            # /opt/train (warm-managed.py); its writes there land in its own overlay.
             env.update({"DEW_GUEST_PROFILE": "train", "HF_HOME": "/opt/train/hf",
                         "XDG_CACHE_HOME": "/opt/train/cache", "HF_HUB_DISABLE_PROGRESS_BARS": "1",
                         "TRANSFORMERS_VERBOSITY": "error", "TRANSFORMERS_NO_ADVISORY_WARNINGS": "1"})

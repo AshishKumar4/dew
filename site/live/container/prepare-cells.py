@@ -5,8 +5,8 @@ A training context (gateway_manager.py) runs offline over a private overlay of
 must be there already. Running a cell puts there exactly the files it reads;
 every cell reads them before `Trainer.fit`, so the run stops there (`FETCH`),
 and the build stays inside its 15-minute alarm (preparer.ts). The context
-smoke then runs each cell whole (benchmark_gateway.py). setup-managed.sh makes
-/opt/train read-only afterwards.
+smoke then runs each cell whole (benchmark_gateway.py). setup-managed.sh hands
+/opt/train to root afterwards; contexts write only to their own overlays.
 """
 
 import os
