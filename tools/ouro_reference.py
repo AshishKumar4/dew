@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """The Ouro fixtures tests/test_ouro.py checks against, from Ouro's own remote
-code (ByteDance/Ouro-1.4B at 574fa66c) on transformers 4.54.1, the version its
-card recommends: 5.16.1 no longer has the `ROPE_INIT_FUNCTIONS['default']` it
-calls, and 4.55's cache refuses its own. So 4.54.1 is installed apart, for
-the environment's Python, and put first on the path:
+code (ByteDance/Ouro-1.4B at 574fa66c) on transformers 4.56.2. 5.16.1 no
+longer has the `ROPE_INIT_FUNCTIONS['default']` the code calls, and before 4.56
+transformers' Cache refuses the cache fix it carries (its card still says
+4.54.1). So 4.56.2 is installed apart, for the environment's Python, and put
+first on the path:
 
-    uv pip install --python .venv-3.12/bin/python --target /tmp/tf454 --no-deps \\
-        transformers==4.54.1 tokenizers==0.21.4 huggingface_hub==0.34.4
-    PYTHONPATH=/tmp/tf454:src:tools .venv-3.12/bin/python tools/ouro_reference.py [--full]
+    uv pip install --python .venv-3.12/bin/python --target /tmp/tf456 --no-deps \\
+        transformers==4.56.2 tokenizers==0.22.1 huggingface_hub==0.35.3
+    PYTHONPATH=/tmp/tf456:src:tools .venv-3.12/bin/python tools/ouro_reference.py [--full]
 
 tests/fixtures/hf/ouro-tiny/ is a random OuroForCausalLM of two layers over a
 width of 16, four query heads of 8 over two key/value heads, its stack run
@@ -26,6 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+import transformers
 from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
 
@@ -121,6 +123,7 @@ def write_released(modeling, full: bool) -> None:
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--full', action='store_true', help="also run the released model for probe.npz")
+    assert transformers.__version__ == '4.56.2', f"transformers {transformers.__version__} is first on the path"
     modeling = remote()
     write_tiny(modeling)
     write_released(modeling, parser.parse_args().full)

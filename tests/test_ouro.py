@@ -1,4 +1,4 @@
-"""Ouro's looped decoder against its own remote code on transformers 4.54.1:
+"""Ouro's looped decoder against its own remote code on transformers 4.56.2:
 tools/ouro_reference.py writes tests/fixtures/hf/ouro-tiny and the 1.4B probe."""
 
 import dataclasses
