@@ -98,7 +98,8 @@ class Qwen35VisionTransformer(nn.Module):
         pixels = jnp.asarray(pixel_values)
         merge = cfg.spatial_merge_size
         patch = cfg.patch_size
-        if pixels.ndim == 4:
+        images = pixels.ndim == 4
+        if images:
             if grid_thw is not None:
                 raise ValueError("grid_thw accompanies packed pixels, not NCHW images")
             batch, channels, height, width = pixels.shape
@@ -135,8 +136,11 @@ class Qwen35VisionTransformer(nn.Module):
         hidden_states = hidden_states + _qwen35_pos_embeds(table, rows, columns, heights, widths)
         metadata = AttentionMetadata(rotary_positions=jnp.stack([rows, columns], axis=-1))
         # Attention stays inside each frame, and padding, segment 0, sees nothing.
-        valid = jnp.arange(length)[None, :] < jnp.prod(grid, axis=1, keepdims=True)
-        frames = jnp.where(valid, jnp.arange(length)[None, :] // area + 1, 0)
+        # An NCHW image is one frame with no padding, which attends unmasked.
+        frames = None
+        if not images:
+            valid = jnp.arange(length)[None, :] < jnp.prod(grid, axis=1, keepdims=True)
+            frames = jnp.where(valid, jnp.arange(length)[None, :] // area + 1, 0)
         for block in self.blocks:
             hidden_states = block(hidden_states, segment_ids=frames, attention_metadata=metadata)
         # A block without hyper-connections hands on the plain residual.
