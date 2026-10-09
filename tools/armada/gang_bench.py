@@ -8,7 +8,8 @@ streams to the next rank in a ring, all at once, after timing round trips to it.
 joins jax.distributed at rank0, and rank 0 prints one JSON line: the relay's round trip and
 throughput (each rank's, and their sum), how long the join took, a barrier's round, and for each
 payload the median time of a cross-process sum and the bandwidth that implies (the bytes a ring
-all-reduce moves per rank, 2 (n - 1) / n of the payload, over that time).
+all-reduce moves per rank, 2 (n - 1) / n of the payload, over that time), and what each way the
+pool agrees on the host takes (`agreements`).
 """
 
 import json
@@ -125,6 +126,45 @@ def gradient_sync(mesh) -> dict:
     return {"buffers": len(rows), "bytes": sum(4 * leaf.size for leaf in jax.tree.leaves(shapes)), **timed}
 
 
+def agreements() -> dict:
+    """The median seconds of each way the pool agrees on the host (`dew.coordination`), and of
+    their parts: the coordination service's barrier alone, a 4-byte allgather alone, and a round of
+    the service's key-value store (each rank sets a key, meets the barrier and reads every key)."""
+    import numpy as np
+    from jax.experimental import multihost_utils
+
+    from dew.coordination import _client, agree_process_phase, agreed, agreed_same
+
+    client = _client()
+    rounds = iter(range(1_000_000))
+
+    def barrier():
+        client.wait_at_barrier(f"bench/barrier/{next(rounds)}", 60_000)
+
+    def key_values():
+        directory = f"bench/kv/{next(rounds)}/"
+        client.key_value_set(directory + str(RANK), "0")
+        client.wait_at_barrier(directory, 60_000)
+        assert len(client.key_value_dir_get(directory)) == WORLD
+
+    ways = {"barrier": barrier,
+            "allgather_4B": lambda: multihost_utils.process_allgather(np.asarray(RANK, np.int32)),
+            "key_value_round": key_values,
+            "agree_process_phase": lambda: agree_process_phase(None, phase="bench"),
+            "agreed": lambda: agreed("bench", lambda: None),
+            "agreed_same": lambda: agreed_same("bench", lambda: "same")}
+    timed = {}
+    for name, way in ways.items():
+        way()
+        times = []
+        for _ in range(REPEATS):
+            start = time.monotonic()
+            way()
+            times.append(time.monotonic() - start)
+        timed[f"{name}_s"] = round(statistics.median(times), 4)
+    return timed
+
+
 def main() -> None:
     print(f"rank {RANK} started at {time.time():.3f}", file=sys.stderr, flush=True)
     try:
@@ -170,6 +210,7 @@ def main() -> None:
         moved = 2 * (WORLD - 1) / WORLD * size
         results.append({"bytes": size, "median_s": round(median, 4),
                         "bus_MBps": round(moved / median / 1e6, 2)})
+    agreeing = agreements()
     synced = gradient_sync(mesh)
     relays = multihost_utils.process_allgather(np.asarray([measured["rtt_ms_p50"], measured["MBps"]]))
     multihost_utils.sync_global_devices("bench end")
@@ -180,7 +221,7 @@ def main() -> None:
                                     "MBps_min": float(rates.min()), "MBps_median": float(np.median(rates)),
                                     "MBps_sum": float(rates.sum())},
                           "join_s": round(joined, 2), "barrier_s": round(barrier, 3), "sum": results,
-                          "gradient_sync": synced}),
+                          "agreements": agreeing, "gradient_sync": synced}),
               flush=True)
     jax.distributed.shutdown()
 
