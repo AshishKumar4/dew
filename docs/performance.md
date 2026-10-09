@@ -85,10 +85,10 @@ each takes one round through the coordination service, with no device computatio
 |---|---|---|
 | an agreement (`agree_process_phase`), before: a barrier and a device allgather | 143 ms | 549 ms |
 | an agreement on a value (`agreed_same`), before | 674 ms | 2121 ms |
-| an agreement now, one round | 35 ms | 89 ms |
-| an agreement on a value now | 32 ms | 84 ms |
+| an agreement now, one round | 38 ms | 91 ms |
+| an agreement on a value now | 35 ms | 89 ms |
 
-Before: jobs 20261009034328-7537edca and -6c17c0b3; now: 20261009043355-c4bdea20 and -c2f53803.
+Before: jobs 20261009034328-7537edca and -6c17c0b3; now: 20261009045908-dfdb460e and -4c0f670e.
 
 Accumulating gradients (`Trainer(accumulation=K)`) does not spare those sums. The accumulated gradient is placed as
 the parameters are, whole on every replica (`Trainer.shardings`), so each of the K microbatches sums its gradient
