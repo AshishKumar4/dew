@@ -713,7 +713,10 @@ class Trainer(Generic[Loss, Effects]):
         shardings = self.shardings(abstract)
         self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
         checkpoints = self.checkpoints
-        resume = None if checkpoints is None else checkpoints.latest
+        # Each process lists the checkpoints itself, and on a shared
+        # filesystem one listing can lag another's: every process resumes
+        # from one step or none does.
+        resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is None or resume is None:
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None

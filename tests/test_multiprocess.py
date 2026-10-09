@@ -1361,8 +1361,9 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
     Where one process's corpus holds other records under the same name and
     length, or another count of them, where its first read fails, where its
     batch lacks a field, or where its listing has not yet seen the newest
-    checkpoint, every process refuses with the cause, rather than one raising
-    alone while its peers enter a step or a restore it never joins."""
+    checkpoint a resume reads, every process refuses with the cause, rather
+    than one raising alone while its peers enter a step or a restore it
+    never joins."""
     reports = run_pool("pool_refusals", tmp_path / "pool", 2, devices=4, timeout=300,
                        run_dir=str(tmp_path / "runs"))
     for rank, report in enumerate(reports):
@@ -1371,7 +1372,7 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
         assert "64 records" in report["count"] and "96 records" in report["count"], report
         assert "holds no rows" in report["first_read"], report
         assert "training batch layout differs" in report["layout"], report
-        assert "newest persistent checkpoint differs" in report["stale"], report
+        assert "newest checkpoint differs" in report["stale"], report
         if rank == 0:
             assert "first training read" in report["first_read"], report
 

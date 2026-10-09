@@ -67,7 +67,6 @@ from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOpt
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position
-from dew.coordination import agreed_same
 from dew.objectives.base import Variables
 from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
@@ -1029,18 +1028,7 @@ class Checkpoints:
 
     @property
     def latest(self) -> int | None:
-        """Return the newest committed step a resume can read, local or persistent.
-
-        Each process lists the persistent directory itself, and on a shared
-        filesystem one listing can lag another's, so the processes agree on
-        the step before any restores it."""
-        persistent = agreed_same("newest persistent checkpoint", self._persistent_latest)
-        local = self._local_latest()
-        if persistent is None or local is None:
-            return local if persistent is None else persistent
-        return max(persistent, local)
-
-    def _persistent_latest(self) -> int | None:
+        """Return the newest committed step a resume can read, local or persistent."""
         persistent = self._open().latest_step()
         if persistent is not None and (not self._complete(persistent) or
                 (self._step_metadata(persistent).custom_metadata or {}).get('weights_only', False)):
@@ -1053,7 +1041,10 @@ class Checkpoints:
                 ),
                 default=None,
             )
-        return persistent
+        local = self._local_latest()
+        if persistent is None or local is None:
+            return local if persistent is None else persistent
+        return max(persistent, local)
 
     @property
     def best(self) -> int | None:
