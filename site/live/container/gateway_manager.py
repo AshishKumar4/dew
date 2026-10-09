@@ -35,13 +35,18 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             raise ValueError("the private connection file must be assigned before IPC startup")
         return str(Path('/sessions/ipc') / Path(self.connection_file).stem / 'kernel')
 
+    @property
+    def overlay(self):
+        """Where a training context's writes to /opt/train go: a small tmpfs of its own."""
+        return Path('/sessions/overlay') / Path(self.connection_file).stem
+
     def cleanup_ipc_files(self):
         super().cleanup_ipc_files()
-        directory = Path(self.ip).parent
-        if directory.is_mount():
-            subprocess.run(['umount', str(directory)], check=True)
-        if directory.exists():
-            directory.rmdir()
+        for directory in (Path(self.ip).parent, self.overlay):
+            if directory.is_mount():
+                subprocess.run(['umount', str(directory)], check=True)
+            if directory.exists():
+                directory.rmdir()
 
     def cleanup_connection_file(self):
         super().cleanup_connection_file()
@@ -80,6 +85,18 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
         subprocess.run(['mount', '-t', 'tmpfs', '-o',
                         f'size=1m,uid={uid},gid={uid},mode=0700,nosuid,nodev',
                         'tmpfs', str(directory)], check=True)
+        if self.kernel_name == "dew-train":
+            # A training context reads the prepared cells' inputs (prepare-cells.py) through an
+            # overlay of its own: the Hub and datasets libraries write locks and records beside
+            # what they read, and no context may change what the next one reads. Its writes land
+            # in this tmpfs, which bounds them: the page's cells write only empty locks.
+            self.overlay.mkdir(mode=0o700, parents=True, exist_ok=True)
+            subprocess.run(['mount', '-t', 'tmpfs', '-o',
+                            f'size=64m,uid={uid},gid={uid},mode=0700,nosuid,nodev',
+                            'tmpfs', str(self.overlay)], check=True)
+            for name in ("upper", "work"):
+                (self.overlay / name).mkdir(mode=0o700)
+                os.chown(self.overlay / name, uid, uid)
         arguments = ["/kernel.json" if arg == self.connection_file else arg for arg in kernel_cmd[3:]]
         command = [
             "bwrap", "--unshare-user", "--die-with-parent", "--new-session",
@@ -89,10 +106,8 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             "--ro-bind", str(connection), "/kernel.json",
             "--bind", str(directory), "/work/ipc",
             "--ro-bind", "/run/dew/model/model.sock", "/work/model.sock",
-            # A training context reads the prepared cells' inputs (prepare-cells.py) through an
-            # overlay of its own: the Hub and datasets libraries write locks and records beside
-            # what they read, and no context may change what the next one reads.
-            *(["--overlay-src", "/opt/train", "--tmp-overlay", "/opt/train"]
+            *(["--overlay-src", "/opt/train", "--overlay", str(self.overlay / "upper"),
+               str(self.overlay / "work"), "/opt/train"]
               if self.kernel_name == "dew-train" else []),
             "--chdir", "/work", "--cap-drop", "ALL",
             "/opt/venv/bin/python", "/opt/live/guest_entry.py", *arguments,
