@@ -135,8 +135,11 @@ LAYOUTS: dict[str, dict[str, int]] = {
     "tensor2_sequence2": {"tensor": 2, "sequence": 2},
     "stage2_sequence2": {"stage": 2, "sequence": 2, "microbatches": 4},
     "stage2_fsdp2": {"fsdp": 2, "stage": 2, "microbatches": 4},
+    "data4_explicit": {"explicit": ("data",)},
+    "fsdp2_explicit": {"fsdp": 2, "explicit": ("data",)},
 }
-"""Four-device layouts: every axis alone and the combinations worth running."""
+"""Four-device layouts: every axis alone and the combinations worth running,
+and the data axis Explicit (`MeshSpec.explicit`) alone and beside fsdp."""
 
 
 def _fixture(name: str) -> dict[str, Any]:
