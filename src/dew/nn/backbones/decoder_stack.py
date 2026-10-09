@@ -22,7 +22,7 @@ from jax.sharding import NamedSharding, PartitionSpec as P
 from ..mla import INDEXER_COLLECTION
 from ..sharding import STAGE_AXIS
 from .decoder_block import DecoderBlock
-from .layer_plan import LayerSpec, group_name
+from .layer_plan import LayerSpec, group_layers, group_name
 
 
 def _merged(bank: Mapping, rows: Mapping) -> dict:
@@ -85,6 +85,83 @@ WRITTEN = ('cache', 'router', 'qk', INDEXER_COLLECTION)
 router, its attention and its sparse indexer sow. A run whose parameters are
 fetched is applied in a scope of its own, so these are the names whose values
 the loop has to carry back out to the scope that asked for them."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Loop:
+    """A layer stack that runs `steps` times over its own output, the passes
+    sharing its parameters: a looped (universal) transformer, as Ouro
+    (arXiv 2510.25741) runs its whole stack four times.
+
+    Every pass reads the same positions and masks. With `step_norm`, the
+    decoder's final norm is applied between passes, as Ouro applies its
+    shared `model.norm` after each one; the last pass's output takes the
+    norm as any decoder's does. `backprop_steps` k trains through the last k
+    passes alone: the passes before them run under `stop_gradient`
+    (truncated backpropagation, as Huginn trains), so neither they nor the
+    embeddings get a gradient. None trains through every pass.
+    `exit_gate` adds Ouro's hazard head, a biased map of each pass's
+    normed states to one logit, which the decoder sows into its `exits`
+    collection; the decoder's output is always the last pass's.
+
+    A decode cache holds one entry per pass and layer, pass t's layer i at
+    `layers_{t * num_layers + i}`, as Ouro's cache indexes them (`PassView`).
+    """
+    steps: int
+    step_norm: bool = True
+    backprop_steps: int | None = None
+    exit_gate: bool = False
+
+    def __post_init__(self):
+        if self.steps < 1:
+            raise ValueError(f"a loop runs its stack at least once, got steps={self.steps}")
+        if self.backprop_steps is not None and not 1 <= self.backprop_steps <= self.steps:
+            raise ValueError(f"backprop_steps counts passes trained through, 1 to steps={self.steps}, "
+                             f"got {self.backprop_steps}")
+
+
+@dataclasses.dataclass
+class PassView:
+    """The collections a stack writes (`WRITTEN`), as pass `step` of a `Loop` over
+    `layers` layers sees them.
+
+    `inside` shows the pass its own entries under the names one pass uses,
+    `layers_{step * layers + i}` as `layers_i` (a run's name moves with its
+    first layer), and keeps the tree it was given; `outside` puts the pass's
+    entries back beside the other passes'. A name that is not a layer's is
+    every pass's. Flax calls `inside` before `outside` within one trace
+    (`nn.map_variables`), which is what holding the tree relies on.
+    """
+    step: int
+    layers: int
+    held: dict = dataclasses.field(default_factory=dict)
+
+    def _renamed(self, name: str, offset: int) -> str:
+        run = group_layers(name)
+        if run is None:
+            return name
+        return f'layers_{run.start + offset}' if len(run) == 1 else group_name(run.start + offset, len(run))
+
+    def _theirs(self, name: str) -> bool:
+        """Whether `name` is another pass's layer entry."""
+        run = group_layers(name)
+        return run is not None and run.start // self.layers != self.step
+
+    def inside(self, variables: Mapping[str, Mapping]) -> dict:
+        self.held = {collection: dict(tree) for collection, tree in variables.items()}
+        offset = -self.step * self.layers
+        return {collection: {self._renamed(name, offset): value for name, value in tree.items()
+                             if not self._theirs(name)}
+                for collection, tree in self.held.items()}
+
+    def outside(self, variables: Mapping[str, Mapping]) -> dict:
+        offset = self.step * self.layers
+        out = {collection: {name: value for name, value in tree.items() if self._theirs(name)}
+               for collection, tree in self.held.items()}
+        for collection, tree in variables.items():
+            out.setdefault(collection, {}).update(
+                {self._renamed(name, offset): value for name, value in tree.items()})
+        return out
 
 
 def _scanned_runs(runs, groups: Sequence[tuple[int, int]], specs: Sequence[LayerSpec], x, *, fetching: bool,
