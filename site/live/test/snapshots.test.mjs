@@ -83,7 +83,7 @@ test('a trial prepares a branch commit on its own preparer, promotes nothing and
 	assert.equal(result.pending.pending, 'b'.repeat(40));
 	// A trial that never reports reads as cut off once both its stages' time is over.
 	assert.equal(result.cut.pending, null);
-	assert.match(result.cut.last.failure, /no outcome in 35 minutes/);
+	assert.match(result.cut.last.failure, /no outcome in 39 minutes/);
 	assert.equal(result.trialled.pending, null);
 	assert.equal(result.trialled.last.commit, 'b'.repeat(40));
 	assert.equal(result.trialled.last.generation.commit, 'b'.repeat(40));

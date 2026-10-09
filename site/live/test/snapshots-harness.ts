@@ -90,8 +90,8 @@ export default {
 			return Response.json({ status: first, third, now: Date.now() });
 		}
 		if (scenario === 'silent') {
-			// A lease taken 36 minutes ago is past its end: its alarm fires at once and fails it.
-			await registry.refresh(A, Date.now() - 36 * 60_000);
+			// A lease taken 40 minutes ago is past its end: its alarm fires at once and fails it.
+			await registry.refresh(A, Date.now() - 40 * 60_000);
 			for (let tries = 0; (await registry.status()).rebuild && tries < 100; tries++) await scheduler.wait(50);
 			const status = await registry.status();
 			await preparer.finish();
@@ -103,7 +103,7 @@ export default {
 			const renewal = (await registry.status()).alarm;
 			await registry.trial(B);
 			const pending = await registry.trialled();
-			const cut = await registry.trialled(Date.now() + 36 * 60_000);
+			const cut = await registry.trialled(Date.now() + 40 * 60_000);
 			const trials = env.PREPARER.get(env.PREPARER.idFromName('trial'));
 			await trials.finish();
 			return Response.json({ pending, cut, trialled: await registry.trialled(), active: await registry.previous(),
