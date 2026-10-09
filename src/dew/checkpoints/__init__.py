@@ -62,11 +62,11 @@ import jax.numpy as jnp
 import numpy as np
 import orbax.checkpoint as ocp
 from etils import epath
-from jax.experimental import multihost_utils
 from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
 from dew import position, records
+from dew.coordination import broadcast_from_process_zero, from_every_process
 from dew.nn import sharding
 from dew.nn.sharding import LogicalAxes
 from dew.objectives.base import Variables
@@ -368,16 +368,15 @@ def _check_shared(directory: str) -> None:
     """
     if jax.process_count() == 1 or is_uri(directory):
         return
-    token = multihost_utils.broadcast_one_to_all(np.frombuffer(os.urandom(8), np.uint8))
-    marker = epath.Path(directory) / f".shared-{np.asarray(token).tobytes().hex()}"
+    marker = epath.Path(directory) / f".shared-{broadcast_from_process_zero(os.urandom(8).hex())}"
     if jax.process_index() == 0:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text("")
-    multihost_utils.sync_global_devices("dew checkpoints: directory marked")
-    seen = np.asarray(multihost_utils.process_allgather(np.asarray(marker.exists())))
+    from_every_process(None)  # process 0 has written it
+    seen = from_every_process(marker.exists())
     if jax.process_index() == 0:
         marker.unlink()
-    blind = [index for index, saw in enumerate(seen.reshape(-1)) if not saw]
+    blind = [index for index, saw in enumerate(seen) if not saw]
     if blind:
         raise ValueError(
             f"The checkpoint directory {directory} is not shared: process(es) {blind} of "
@@ -402,11 +401,16 @@ def gather_positions(saved: bytes, share: DataPartition) -> dict:
     position is the same bytes on every process, and gathering it lets
     `read_position` check that the rows agree before another partition reads it.
     """
-    lengths = multihost_utils.process_allgather(np.asarray(len(saved), np.int64))
-    row = np.zeros(int(lengths.max()), np.uint8)
-    row[:len(saved)] = np.frombuffer(saved, np.uint8)
-    return {'rows': multihost_utils.process_allgather(row), 'lengths': lengths,
-            'shares': multihost_utils.process_allgather(np.asarray([share.index, share.count], np.int64))}
+    told = from_every_process([saved.hex(), share.index, share.count])
+    every = [bytes.fromhex(hexed) for hexed, _, _ in told]
+    # The integer width a jax array of int64 takes, as the table's always had.
+    integer = jax.dtypes.canonicalize_dtype(np.int64)
+    lengths = np.asarray([len(entry) for entry in every], integer)
+    rows = np.zeros((len(every), int(lengths.max())), np.uint8)
+    for row, entry in zip(rows, every, strict=True):
+        row[:len(entry)] = np.frombuffer(entry, np.uint8)
+    return {'rows': rows, 'lengths': lengths,
+            'shares': np.asarray([[index, count] for _, index, count in told], integer)}
 
 
 def _row(table: dict, index: int) -> bytes:
@@ -1021,11 +1025,8 @@ class Checkpoints:
         """
         if self.local_directory is None:
             return None
-        mine = self._open_local().latest_step()
-        steps = multihost_utils.process_allgather(
-            np.asarray(-1 if mine is None else mine, np.int64))
-        held = int(steps[0])
-        return held if held >= 0 and bool(np.all(steps == held)) else None
+        steps = from_every_process(self._open_local().latest_step())
+        return steps[0] if None not in steps and len(set(steps)) == 1 else None
 
     def _complete(self, step: int) -> bool:
         if step in self._step_cache:
@@ -1207,15 +1208,13 @@ class Checkpoints:
             for path in root.iterdir():
                 if path.name not in referenced and ocp.utils.is_checkpoint_finalized(path):
                     path.rmtree()
-        stored = ({path.name for path in root.iterdir()}
-                  if jax.process_index() == 0 and root.exists() else set())
+        listed = root.exists() and jax.process_index() == 0
+        stored = set(broadcast_from_process_zero([path.name for path in root.iterdir()] if listed else []))
         written: set[str] = set()
         for tree, values in held.items():
             for name, value in values.items():
                 digest = digests[tree][name]
-                there = digest in written or bool(multihost_utils.broadcast_one_to_all(
-                    np.asarray(digest in stored)))
-                if not there:
+                if digest not in written and digest not in stored:
                     with region("checkpoint.frozen"):
                         ocp.PyTreeCheckpointer().save(root / digest, args=ocp.args.PyTreeSave(value))
                     written.add(digest)
