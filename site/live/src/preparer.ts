@@ -38,11 +38,16 @@ const STAGE_MS = 16 * 60_000;
 // again, once: a smoke restores the same snapshot every time, and a rebuild would make another.
 const RESTORE_MS = 6 * 60_000;
 const RESTORES = 2;
-/** The longest a preparation runs, from its build's start to its report: a build, a restore cut off, and a smoke. */
-export const PREPARATION_MS = STAGE_MS + RESTORE_MS + STAGE_MS;
+/**
+ * The longest a preparation runs, from its queueing to its report: a build, a restore cut off, a
+ * smoke, and a minute for the alarms that hand it on. A job older than this is abandoned: its
+ * alarms all failed.
+ */
+export const PREPARATION_MS = STAGE_MS + RESTORE_MS + STAGE_MS + 60_000;
 
 interface Job {
 	commit: string;
+	queued: number;
 	trial: boolean;
 	reply: Reply;
 	// The relay credential the snapshot's smoke starts it with.
@@ -133,8 +138,14 @@ export class ManagedPreparer extends DurableObject<Env> {
 	}
 
 	/** Every snapshot this preparer made that an operator has not forgotten (snapshot-ledger.ts). */
+	/** The job this preparer runs, unless it was abandoned. */
+	private async running(): Promise<Job | undefined> {
+		const job = await this.ctx.storage.get<Job>('job');
+		return job && Date.now() - job.queued < PREPARATION_MS ? job : undefined;
+	}
+
 	async snapshots(): Promise<SnapshotRecord[]> {
-		const preparing = (await this.ctx.storage.get<Job>('job'))?.record?.id;
+		const preparing = (await this.running())?.record?.id;
 		// A snapshot is preparing while its job runs; one no job holds was cut off before it recorded its end.
 		return Object.values((await this.ctx.storage.get<Record<string, SnapshotRecord>>('snapshots')) ?? {})
 			.map((record) => record.state === 'preparing' && record.id !== preparing ? { ...record, state: 'failed' } : record);
@@ -163,8 +174,9 @@ export class ManagedPreparer extends DurableObject<Env> {
 
 	/** Start preparing `commit`; this preparer's alarms run it and report its end to `reply`. */
 	protected async queue(commit: string, trial: boolean, reply: Reply): Promise<void> {
-		if (await this.ctx.storage.get('job')) throw new Error('snapshot preparation is already running');
-		await this.ctx.storage.put('job', { commit, trial, reply, secret: crypto.randomUUID(), stage: 'build' } satisfies Job);
+		if (await this.running()) throw new Error('snapshot preparation is already running');
+		await this.ctx.storage.put('job', { commit, queued: Date.now(), trial, reply, secret: crypto.randomUUID(),
+			stage: 'build' } satisfies Job);
 		await this.ctx.storage.setAlarm(Date.now() + 1000);
 	}
 
