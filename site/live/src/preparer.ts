@@ -158,8 +158,10 @@ export class ManagedPreparer extends DurableObject<Env> {
 		}
 		if (!job.outcome) {
 			const failed = (failure: string): Prepared => ({ commit: job.commit, trial: job.trial, token: job.reply.token, failure });
-			if (job.began) job.outcome = failed(`the ${job.stage} was cut off: it outlived its alarm's 15 minutes, or a deploy restarted it`);
-			else {
+			if (job.began) {
+				job.outcome = failed(`the ${job.stage} was cut off in its ${(await this.status())?.phase ?? 'first'} phase: `
+					+ 'it outlived its alarm\'s 15 minutes, or the runtime restarted it');
+			} else {
 				job.began = Date.now();
 				await this.ctx.storage.put('job', job);
 				// Should this alarm be cut off, the next one fails the preparation.
