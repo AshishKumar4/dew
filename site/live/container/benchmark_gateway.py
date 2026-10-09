@@ -85,8 +85,14 @@ except OSError:
 else:
     raise AssertionError("a training context reached the network")
 # The prepared cache is an overlay of the context's own (gateway_manager.py); training() checks
-# from outside that this write stayed in it.
+# from outside that this write stayed in it, and the overlay holds no more than 64 MiB.
 Path("/opt/train/escape").write_text("x")
+try:
+    Path("/opt/train/escape").write_bytes(bytes(65 * 1024 * 1024))
+except OSError:
+    pass
+else:
+    raise AssertionError("a training context wrote more than its overlay holds")
 for path in ("/opt/live/escape", "/work/../escape"):
     try:
         Path(path).write_text("x")
