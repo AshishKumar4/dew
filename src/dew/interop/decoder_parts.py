@@ -166,6 +166,22 @@ _INERT_FIELDS: Mapping[str | None, Mapping[str, Callable[[str, Mapping[str, obje
         'time_step_init_scheme': _any_value,
         'time_step_scale': _any_value,
     },
+    # The state-spaces/mamba-*-hf conversions keep mamba_ssm's MambaConfig
+    # beside the reference's: the same width, depth and inner width under
+    # their old names, the RMSNorm MambaBlock always applies, no layer
+    # arguments, a fused kernel's choice, and the multiple vocab_size was
+    # already padded to.
+    'mamba': {
+        'd_model': _repeats('hidden_size'),
+        'n_layer': _repeats('num_hidden_layers'),
+        'd_inner': lambda key, hf_config: hf_config[key] == (
+            records.integer(hf_config.get('expand', 2), 'expand')
+            * records.integer(hf_config.get('hidden_size', 768), 'hidden_size')),
+        'rms_norm': lambda key, hf_config: hf_config[key] is True,
+        'ssm_cfg': lambda key, hf_config: hf_config[key] == {},
+        'fused_add_norm': _any_value,
+        'pad_vocab_size_multiple': _any_value,
+    },
     # Ornith's Qwen3.5 wrappers repeat the text width at the top level.
     # Qwen3_5(Moe)Config declares no such field, and the wrapper's model sizes
     # its head from text_config.hidden_size (modeling_qwen3_5.py:1683,
