@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """The Ouro fixtures tests/test_ouro.py checks against, from Ouro's own remote
-code (ByteDance/Ouro-1.4B at 574fa66c) on transformers 4.55.0, the version it
-was written for: 5.16.1 no longer has the `ROPE_INIT_FUNCTIONS['default']` it
-calls. So 4.55.0 is installed apart and put first on the path:
+code (ByteDance/Ouro-1.4B at 574fa66c) on transformers 4.54.1, the version its
+card recommends: 5.16.1 no longer has the `ROPE_INIT_FUNCTIONS['default']` it
+calls, and 4.55's cache refuses its own. So 4.54.1 is installed apart, for
+the environment's Python, and put first on the path:
 
-    uv pip install --target /tmp/tf455 transformers==4.55.0 'tokenizers<0.22' 'huggingface_hub<1.0'
-    PYTHONPATH=/tmp/tf455:src:tools .venv-3.12/bin/python tools/ouro_reference.py [--full]
+    uv pip install --python .venv-3.12/bin/python --target /tmp/tf454 --no-deps \\
+        transformers==4.54.1 tokenizers==0.21.4 huggingface_hub==0.34.4
+    PYTHONPATH=/tmp/tf454:src:tools .venv-3.12/bin/python tools/ouro_reference.py [--full]
 
 tests/fixtures/hf/ouro-tiny/ is a random OuroForCausalLM of two layers over a
 width of 16, four query heads of 8 over two key/value heads, its stack run
