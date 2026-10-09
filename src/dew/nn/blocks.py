@@ -14,7 +14,7 @@ from jax.typing import DTypeLike
 from .attention import RMSNorm
 from .conv import Conv
 from .precision import at_least_fp32
-from .sharding import constrain
+from .sharding import add_rows, constrain, take_rows
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -34,7 +34,7 @@ def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     """`table[ids]` in `dtype`, the table's rows gathered before the cast so
     the gradient accumulates in the table's dtype: casting the table first
     would scatter-add repeated tokens' cotangents in bf16."""
-    return jnp.take(table, ids, axis=0).astype(dtype)
+    return take_rows(table, ids).astype(dtype)
 
 
 def _table_rows_forward(table: jax.Array, ids: jax.Array, dtype: Dtype):
@@ -55,7 +55,7 @@ def _table_rows_backward(dtype: Dtype, residuals: tuple[jax.Array, jax.Array],
     if cotangent.size * cotangent.dtype.itemsize < table.size * table.dtype.itemsize:
         cotangent = constrain(cotangent, (None,) * cotangent.ndim)
         ids = constrain(ids, (None,) * ids.ndim)
-    return jnp.zeros_like(table).at[ids].add(cotangent.astype(table.dtype)), None
+    return add_rows(jnp.zeros_like(table), ids, cotangent.astype(table.dtype)), None
 
 
 table_rows.defvjp(_table_rows_forward, _table_rows_backward)
