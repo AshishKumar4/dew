@@ -40,14 +40,12 @@ const RESTORE_MS = 6 * 60_000;
 const RESTORES = 2;
 /**
  * The longest a preparation runs, from its queueing to its report: a build, a restore cut off, a
- * smoke, and a minute for the alarms that hand it on. A job older than this is abandoned: its
- * alarms all failed.
+ * smoke, and a minute for the alarms that hand it on.
  */
 export const PREPARATION_MS = STAGE_MS + RESTORE_MS + STAGE_MS + 60_000;
 
 interface Job {
 	commit: string;
-	queued: number;
 	trial: boolean;
 	reply: Reply;
 	// The relay credential the snapshot's smoke starts it with.
@@ -137,13 +135,19 @@ export class ManagedPreparer extends DurableObject<Env> {
 		return (await this.ctx.storage.get<{ phase: string; at: number }>('phase')) ?? null;
 	}
 
-	/** Every snapshot this preparer made that an operator has not forgotten (snapshot-ledger.ts). */
-	/** The job this preparer runs, unless it was abandoned. */
+	// Whether an alarm runs now: one the runtime resets is gone, and with it this.
+	private alarming = false;
+
+	/**
+	 * The job this preparer runs: one an alarm runs or will run. A job with neither was abandoned:
+	 * the runtime gave up on its alarm.
+	 */
 	private async running(): Promise<Job | undefined> {
 		const job = await this.ctx.storage.get<Job>('job');
-		return job && Date.now() - job.queued < PREPARATION_MS ? job : undefined;
+		return job && (this.alarming || await this.ctx.storage.getAlarm() !== null) ? job : undefined;
 	}
 
+	/** Every snapshot this preparer made that an operator has not forgotten (snapshot-ledger.ts). */
 	async snapshots(): Promise<SnapshotRecord[]> {
 		const preparing = (await this.running())?.record?.id;
 		// A snapshot is preparing while its job runs; one no job holds was cut off before it recorded its end.
@@ -175,12 +179,17 @@ export class ManagedPreparer extends DurableObject<Env> {
 	/** Start preparing `commit`; this preparer's alarms run it and report its end to `reply`. */
 	protected async queue(commit: string, trial: boolean, reply: Reply): Promise<void> {
 		if (await this.running()) throw new Error('snapshot preparation is already running');
-		await this.ctx.storage.put('job', { commit, queued: Date.now(), trial, reply, secret: crypto.randomUUID(),
-			stage: 'build' } satisfies Job);
+		await this.ctx.storage.put('job', { commit, trial, reply, secret: crypto.randomUUID(), stage: 'build' } satisfies Job);
 		await this.ctx.storage.setAlarm(Date.now() + 1000);
 	}
 
 	override async alarm(): Promise<void> {
+		this.alarming = true;
+		try { await this.step(); } finally { this.alarming = false; }
+	}
+
+	/** One alarm's part of the job: a stage, or the report of how the job ended. */
+	private async step(): Promise<void> {
 		const container = this.ctx.container!;
 		const job = await this.ctx.storage.get<Job>('job');
 		if (!job) {
@@ -236,22 +245,16 @@ export class ManagedPreparer extends DurableObject<Env> {
 		}
 		// Should the report outlive this alarm's 15 minutes, the alarm after it sends it again.
 		await this.ctx.storage.setAlarm(Date.now() + STAGE_MS);
-		let reported = true;
 		try {
 			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
 		} catch (error) {
-			console.error('preparation report failed', error);
-			reported = false;
-		}
-		// A job abandoned while its report was out may have been replaced (`running`): that one's alarm stands.
-		if ((await this.ctx.storage.get<Job>('job'))?.secret !== job.secret) return;
-		if (reported) {
-			await this.ctx.storage.delete('job');
-			await this.ctx.storage.deleteAlarm();
-		} else {
 			// The job, its outcome kept, holds this preparer until a later alarm reports it.
+			console.error('preparation report failed', error);
 			await this.ctx.storage.setAlarm(Date.now() + 60_000);
+			return;
 		}
+		await this.ctx.storage.delete('job');
+		await this.ctx.storage.deleteAlarm();
 	}
 }
 
