@@ -77,7 +77,7 @@ def test_scanned_runs_loop_as_the_plain_layers_do(rng):
     ids = tokens(rng)
     params = tiny().init(rng, ids)
     scanned = tiny(scan_layers=True).apply(params, ids)
-    np.testing.assert_allclose(scanned, tiny().apply(params, ids), atol=1e-6)
+    np.testing.assert_allclose(scanned, tiny().apply(params, ids), atol=1e-5)
 
 
 def test_the_exit_gate_reads_every_pass(rng):

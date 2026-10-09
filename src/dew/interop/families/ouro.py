@@ -61,7 +61,7 @@ def _ouro_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
 
 
 def _ouro_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    return _GATE.get(name) or renamed_path(_NAMES, name, config)
+    return ('params', *_GATE[name]) if name in _GATE else renamed_path(_NAMES, name, config)
 
 
 def _ouro_name(dew_name: str, config: Mapping[str, object]) -> str | None:
