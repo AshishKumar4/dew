@@ -26,7 +26,7 @@ def _gpt_neo_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     layers = records.integer(hf.get('num_layers', 24), 'num_layers')
     hidden = records.integer(hf.get('hidden_size', 2048), 'hidden_size')
     positions = records.integer(hf.get('max_position_embeddings', 2048), 'max_position_embeddings')
-    config = _gpt2_config({**hf, 'n_embd': hidden, 'n_layer': layers,
+    config = gpt2_config({**hf, 'n_embd': hidden, 'n_layer': layers,
                            'n_head': hf.get('num_heads', 16), 'n_positions': positions,
                            'n_inner': hf.get('intermediate_size') or 4 * hidden,
                            'resid_pdrop': hf.get('resid_dropout', 0.),
@@ -72,7 +72,7 @@ _GPT_NEO_NAMES: Renames = (
 
 
 def _gpt_neo_export(model: CausalTransformer) -> Mapping[str, object]:
-    fields = dict(_gpt2_export(model))
+    fields = dict(gpt2_export(model))
     fields.update({
         'hidden_size': model.emb_features, 'num_layers': model.num_layers, 'num_heads': model.num_heads,
         'intermediate_size': model.hidden_features,
@@ -91,7 +91,7 @@ def _gpt_neo_export(model: CausalTransformer) -> Mapping[str, object]:
 
 
 def _gptj_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    config = _gpt2_config(hf, used)
+    config = gpt2_config(hf, used)
     head_dim = records.integer(config['head_dim'], 'head_dim')
     rotated = records.integer(hf.get('rotary_dim', 64), 'rotary_dim')
     if rotated < 2 or rotated > head_dim or rotated % 2:
@@ -158,7 +158,7 @@ def _gptj_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | Non
 
 
 def _gptj_export(model: CausalTransformer) -> Mapping[str, object]:
-    fields = dict(_gpt2_export(model))
+    fields = dict(gpt2_export(model))
     fields.update({
         'rotary_dim': int(model.features_per_head * (model.partial_rotary_factor or 1.)),
         'pad_token_id': None,
@@ -182,7 +182,7 @@ def _gptj_export_weights(family: DecoderFamily, model: CausalTransformer, variab
     return LazyTensors(tensors.specs, build)
 
 
-def _gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
+def gpt2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     hidden = records.integer(hf.get('n_embd', 768), 'n_embd')
     heads = records.integer(hf.get('n_head', 12), 'n_head')
     layers = records.integer(hf.get('n_layer', 12), 'n_layer')
@@ -276,7 +276,7 @@ def _gpt2_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | Non
     return renamed_path(_GPT2_NAMES, name, config)
 
 
-def _gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
+def gpt2_export(model: CausalTransformer) -> Mapping[str, object]:
     activation = model.mlp
     if not isinstance(activation, str) or activation not in ('gelu', 'gelu_exact', 'relu'):
         refuse('mlp', 'GPT-2 requires an ungated GELU or ReLU feed-forward')
@@ -317,11 +317,11 @@ GPTJ = DecoderFamily(
 
 GPT2 = DecoderFamily(
     ('gpt2',),
-    _gpt2_config,
+    gpt2_config,
     lambda fields: fields.position_embedding == 'learned',
     'gpt2',
     'GPT2LMHeadModel',
-    _gpt2_export,
+    gpt2_export,
     weight_path=_gpt2_path,
     export_path=partial(renamed_name, _GPT2_NAMES),
     prepare=_gpt2_prepare,

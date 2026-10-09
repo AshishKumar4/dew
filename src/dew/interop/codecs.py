@@ -19,11 +19,22 @@ one tensor at a time, and encodes dense weights back into those parts for
 - AutoAWQ's gemm packing (`quant_method: awq`) and GPTQ (`quant_method:
   gptq`): int32-packed codes with fp16 scales and packed zeros per group,
   which save back against the source's own scales and zeros.
+- compressed-tensors' other formats (`COMPRESSED_TENSORS_FORMATS`): integer
+  and FP8 codes under the one weights scheme a config declares, and
+  `nvfp4-pack-quantized`, E2M1 codes in groups of 16 whose dynamic local
+  input scales the checkpoint Qwix provider computes.
+- ModelOpt (`quant_method: modelopt`): NVFP4 with its stored input
+  multipliers, and the MIXED_PRECISION table that gives each layer NVFP4,
+  W4A16_NVFP4 or FP8 (`MODELOPT_ALGOS`).
 
-Every FP4 format here stores the OCP MX element that `decode_e2m1` and
-`encode_e2m1` read and write: E2M1 codes two to a byte, the even element in
-the low nibble, bit 3 the sign, 32 consecutive inputs under one E8M0
-exponent byte b meaning 2 ** (b - 127). The formats differ in where the
+MLX's affine groups, which declare no `quant_method`, are refused by their
+shape, and any other `quant_method` by its name.
+
+Every FP4 format here packs E2M1 codes two to a byte, the even element in
+the low nibble, bit 3 the sign. The MX formats put 32 consecutive inputs
+under one E8M0 exponent byte b meaning 2 ** (b - 127), the element that
+`decode_e2m1` and `encode_e2m1` read and write; NVFP4 puts 16 under an E4M3
+scale over one float32 global scale. The formats differ in where the
 bytes sit, in the rule that picks a group's exponent, and in where a value
 halfway between two E2M1 values goes.
 
@@ -1561,6 +1572,8 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     if method == "modelopt":
         return modelopt_nvfp4(config, quantization, grid)
     raise ValueError(
-        f"quantization_config names quant_method {method!r}; this loader reads DeepSeek's "
-        f"fp8 blocks and V4 `.scale` storage, GPT OSS's mxfp4, compressed-tensors' "
-        f"mxfp4-pack-quantized, AutoAWQ's gemm and GPTQ and nothing else")
+        f"quantization_config names quant_method {method!r}; this loader reads fp8 (DeepSeek's "
+        f"blocks and V4 `.scale` storage), mxfp4 (GPT OSS), compressed-tensors "
+        f"({', '.join(COMPRESSED_TENSORS_FORMATS)} and mxfp4-pack-quantized), awq (AutoAWQ's gemm), "
+        f"gptq and modelopt (NVFP4, or MIXED_PRECISION layers of {', '.join(MODELOPT_ALGOS)}) "
+        f"and nothing else")

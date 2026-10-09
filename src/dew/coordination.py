@@ -189,6 +189,25 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     return held[0]
 
 
+def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
+    """What each rank finds for itself, refused when the ranks differ.
+
+    For what every process reads or looks up on its own and the pool must
+    share, such as its data or its newest checkpoint. `find` returns a JSON
+    scalar. A rank that finds something else than process zero raises naming
+    both, and its peers hear it at the same agreement. On one process this is
+    a plain call.
+    """
+    value = agreed(f"{phase} lookup", find)
+    if jax.process_count() == 1:
+        return value
+    root = broadcast_from_process_zero(value)
+    agree_process_phase(None if value == root else ValueError(
+        f"the {phase} differs between the processes: this one has {value}, and process 0 has {root}"),
+        phase=phase)
+    return value
+
+
 class PeerFailure(RuntimeError):
     """Raised when another process failed at a phase agreement that this process passed."""
 
@@ -412,6 +431,7 @@ __all__ = [
     "PeerFailure",
     "agree_process_phase",
     "agreed",
+    "agreed_same",
     "broadcast_from_process_zero",
     "collective_host",
     "end_pool_on_failure",

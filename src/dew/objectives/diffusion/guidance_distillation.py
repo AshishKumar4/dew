@@ -24,7 +24,7 @@ from dew.diffusion.schedules import expand
 from dew.diffusion.transforms import broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
-from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, Variables
+from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, Variables, training_rngs
 
 from .objective import DiffusionObjective, _own_loss, teacher_weights
 
@@ -124,7 +124,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
             raise ValueError("the student's conditioning carries no guidance input to distill into")
         output = self.model.apply(self.model_variables(variables), noisy * c_in, schedule.model_time(t),
                                   **with_guidance(conditions, scale.astype(jnp.float32)), train=True,
-                                  rngs={"dropout": jax.random.fold_in(step.key, 1)})
+                                  rngs=training_rngs(jax.random.fold_in(step.key, 1)))
         assert isinstance(output, jax.Array)
         losses = optax.l2_loss(output, target)
         weighted = losses * expand(self.process.weight(t), losses)

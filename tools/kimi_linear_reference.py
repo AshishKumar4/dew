@@ -96,6 +96,18 @@ def ieee_only(module) -> int:
     return held
 
 
+def matmul_precision() -> str:
+    """What each array file records of this run's matmuls: 'ieee' where torch,
+    Triton's default and fla's triangular solve all keep fp32, else those that
+    do not (tests/reference_error.py refuses all but 'ieee'). `released_modules`
+    holds fla's autotuned recompute to its 'ieee' configurations."""
+    reduced = torch.backends.cuda.matmul.allow_tf32 or torch.backends.cudnn.allow_tf32
+    modes = {"torch": "tf32" if reduced else "ieee",
+             "TRITON_F32_DEFAULT": os.environ.get("TRITON_F32_DEFAULT", "tf32"),
+             "FLA_TRIL_PRECISION": os.environ.get("FLA_TRIL_PRECISION", "ieee")}
+    return ", ".join(f"{name} {mode}" for name, mode in modes.items() if mode != "ieee") or "ieee"
+
+
 def unbiased_gate(released):
     """`KimiMoEGate.forward` with the released selection weighed by the
     unshifted scores.
@@ -185,7 +197,7 @@ def main() -> None:
     np.savez(DESTINATION / "reference.npz", input_ids=ids, attention_mask=mask,
              logits=logits.detach().cpu().numpy(), loss=np.float32(loss.detach().cpu()),
              learning_rate=np.float32(LEARNING_RATE), updated_logits=updated.cpu().numpy(),
-             generated=generated, step_logits=step_logits)
+             generated=generated, step_logits=step_logits, precision=matmul_precision())
     print("wrote", DESTINATION, "tensors", len(tensors))
 
 
@@ -218,7 +230,7 @@ def orders(drawn: Path) -> None:
             assert np.array_equal(updated, recorded), "order 0 must reproduce the fixture's run"
         distances.append(np.sqrt(np.mean(np.square(updated[valid].astype(np.float64) - truth))))
     np.savez(DESTINATION / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
-             updated_logits=np.asarray(distances))
+             updated_logits=np.asarray(distances), precision=matmul_precision())
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
 
 

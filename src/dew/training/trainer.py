@@ -36,8 +36,17 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
-from dew.coordination import agree_process_phase, agreed
-from dew.data.dataset import Checkpointable, Closeable, DataPartition, Dataset, RampedStream, Reader, rows_of
+from dew.coordination import agree_process_phase, agreed, agreed_same
+from dew.data.dataset import (
+    Checkpointable,
+    Closeable,
+    DataPartition,
+    Dataset,
+    RampedStream,
+    Reader,
+    rows_of,
+    stream_identity,
+)
 from dew.nn.kernels.generation import measured_kernel
 from dew.nn.sharding import (
     BATCH_AXES,
@@ -147,6 +156,12 @@ each compiled on the first step that reads it."""
 def batch_shapes(batch: Batch) -> Shapes:
     """List a batch's leaf shapes in tree order."""
     return tuple(np.shape(leaf) for leaf in jax.tree.leaves(batch))
+
+
+def batch_layout(batch: Batch) -> str:
+    """A batch's fields, each with its dtype and global shape."""
+    return ", ".join(f"{jax.tree_util.keystr(path)} {jnp.asarray(leaf).dtype}{list(np.shape(leaf))}"
+                     for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
 
 
 class Rollout(Protocol):
@@ -416,6 +431,13 @@ class _FitRun:
     preempted: int | None = None
     notice: PreemptionNotice | None = None
 
+    def read(self) -> Batch:
+        """The training stream's next batch, read through this run each time:
+        a caller's alias would keep the closed stream reachable from a failed
+        run's traceback."""
+        assert self.train is not None
+        return next(self.train)
+
 
 @dataclasses.dataclass
 class _Interval:
@@ -649,10 +671,11 @@ class Trainer(Generic[Loss, Effects]):
         """The axes the objective's modules box on their own parameters
         (`nn.with_logical_partitioning`), which its init returns and the state
         unboxes: what `initial_state` last traced, else one abstract init, for
-        a state the trainer did not build."""
+        a state the trainer did not build. A checkpoint records them for its
+        restore."""
         if self._boxed is None:
             self._boxed = boxed_axes(jax.eval_shape(self.objective.initializer, jax.random.key(0)))
-        return ruled_boxes(self._boxed, self.layout.axis_rules)
+        return self._boxed
 
     def shardings(self, state: TrainState) -> Placement[TrainState]:
         """Return where each field of `state` is placed, on the axes that suit its kind.
@@ -662,7 +685,7 @@ class Trainer(Generic[Loss, Effects]):
         state, the frozen collection is the exception: it stays where the realization
         reads it (`execution.resident`) for the whole run.
         """
-        with boxed(self._boxed_axes()):
+        with boxed(ruled_boxes(self._boxed_axes(), self.layout.axis_rules)):
             return self._shardings(state)
 
     def _shardings(self, state: TrainState) -> Placement[TrainState]:
@@ -722,7 +745,10 @@ class Trainer(Generic[Loss, Effects]):
         shardings = self.shardings(abstract)
         self.layout.check(abstract.variables, shardings.variables, self.device_mesh)
         checkpoints = self.checkpoints
-        resume = None if checkpoints is None else checkpoints.latest
+        # Each process lists the checkpoints itself, and on a shared
+        # filesystem one listing can lag another's: every process resumes
+        # from one step or none does.
+        resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
         if checkpoints is None or resume is None:
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
@@ -1038,12 +1064,8 @@ class Trainer(Generic[Loss, Effects]):
         resumed, self._resumed_rung = self._resumed_rung, None
         with self._traced_on(mesh, links) as schedule:
             shapes = None if self.step is not None else self._loss_shape(state, batch)
-            if shapes is not None and mesh.shape[STAGE_AXIS] > 1 and not schedule.pipelined:
-                raise LayoutRefused(
-                    f"the stage axis of {mesh.shape[STAGE_AXIS]} holds a pipeline's stages of "
-                    f"a decoder's layer stack, and {type(self.objective).__name__}'s model runs "
-                    f"no pipeline, so every stage would compute the whole step; give those "
-                    f"devices to the data or fsdp axis")
+            if shapes is not None:
+                self._refuse_unpipelined(schedule)
             prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
             copies = self._narrow_copies(state, batch)
             if copies:
@@ -1146,14 +1168,24 @@ class Trainer(Generic[Loss, Effects]):
         return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,
                               state.ema)
 
+    def _refuse_unpipelined(self, schedule: Schedule) -> None:
+        """Refuse a stage axis under a model whose traced step ran no pipeline."""
+        stages = self.device_mesh.shape[STAGE_AXIS]
+        if stages > 1 and not schedule.pipelined:
+            raise LayoutRefused(
+                f"the stage axis of {stages} holds a pipeline's stages of a decoder's layer "
+                f"stack, and {type(self.objective).__name__}'s model runs no pipeline, so every "
+                f"stage would compute the whole step; give those devices to the data or fsdp axis")
+
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
         from dew.training.execution import HostExecution
         from dew.training.host import transfer
         cpu = self.state_mesh
         execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))
-        with self._traced_on(cpu):
+        with self._traced_on(cpu) as schedule:
             shapes = self._loss_shape(state, cpu_batch)
+            self._refuse_unpipelined(schedule)
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, shape_only=True)
             placement = self.shardings(prepared)
             transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes)
@@ -1304,9 +1336,6 @@ class Trainer(Generic[Loss, Effects]):
         seen = 0
         run.notice = PreemptionNotice()
         while run.current < plan.steps:
-            # Read through `run` each time: a local alias would keep the
-            # closed iterator reachable from a failed run's traceback.
-            assert run.train is not None
             # The window's capture opens before this iteration's first
             # read, so the step row records the read it waits on rather
             # than a compile that ran before capture began.
@@ -1320,7 +1349,10 @@ class Trainer(Generic[Loss, Effects]):
                           if capturing else contextlib.nullcontext())
             with step_scope:
                 with region("input.wait"):
-                    batch = next(run.train)
+                    # The first read restores the stream's position and opens
+                    # its reader on the prefetch worker, and a process whose
+                    # stream failed there stops its peers before they compile.
+                    batch = run.read() if seen else agreed("first training read", run.read)
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
@@ -1337,6 +1369,7 @@ class Trainer(Generic[Loss, Effects]):
                 with region("train.step"):
                     state, loss, aux, finite, accepted = train_step(state, batch)
                 run.loss = loss
+                assert run.train is not None
                 position = run.train.source_state
                 run.current += 1
                 self._display.step(run.current)
@@ -1437,6 +1470,11 @@ class Trainer(Generic[Loss, Effects]):
                                checkpointing=bool(plan.checkpoint_every or plan.local_every or (
                                    checkpoints is not None and plan.cadenced and plan.best and
                                    any(not choice.weights_only for choice in plan.best))))
+            if jax.process_count() > 1:
+                # Each process opened its own stream over its own copy of the
+                # corpus, and none reads a record before all agree it is one.
+                agreed_same("training data", lambda: (
+                    f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
@@ -1950,6 +1988,9 @@ class Trainer(Generic[Loss, Effects]):
         """
         shapes = batch_shapes(batch)
         if shapes not in compiled:
+            # A process whose reader changed a field or a shape would compile
+            # a program whose collectives its peers' never meet.
+            agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
                 compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
@@ -1988,7 +2029,7 @@ class Trainer(Generic[Loss, Effects]):
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
                          ranking=ranking, control=control, weights_only=weights_only,
-                         rung=self._rung(), artifact=self._artifact())
+                         rung=self._rung(), artifact=self._artifact(), boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step)
         interval.saved(step)
         self._display.status("")
@@ -2010,7 +2051,8 @@ class Trainer(Generic[Loss, Effects]):
         paused = time.perf_counter()
         self._display.status("writing a local checkpoint")
         checkpoints.save_local(step, state, position, share=DataPartition.of(self.device_mesh),
-                               control=control, rung=self._rung(), artifact=self._artifact())
+                               control=control, rung=self._rung(), artifact=self._artifact(),
+                               boxed=self._boxed_axes())
         self._report(CheckpointRequested(str(checkpoints.local_directory), local=True), step)
         self._display.status("")
         return time.perf_counter() - paused

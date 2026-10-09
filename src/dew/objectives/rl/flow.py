@@ -356,6 +356,7 @@ class FlowRollout:
         source = _source(self.objective.inputs, batch)
         count = source.shape[0]
         owned = self._owned_rows(source)
+        pooled = jax.process_count() > 1
 
         def repeat(leaf):
             value = jnp.asarray(leaf)
@@ -363,6 +364,12 @@ class FlowRollout:
                 return value
             if value.shape[0] != count:
                 raise ValueError("all flow source rows must share one batch dimension")
+            if pooled and value.is_fully_addressable:
+                # Process 0 scores every sample against the leaves it holds.
+                raise ValueError(
+                    f"a flow rollout over a pool of {jax.process_count()} processes reads a batch placed "
+                    f"across them (shard_batch), and a {value.shape} leaf of this one is held by this "
+                    f"process alone")
             return jnp.repeat(value, self.groups, axis=0)
 
         return jax.tree.map(repeat, batch), owned, count

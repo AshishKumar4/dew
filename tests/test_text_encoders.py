@@ -10,7 +10,7 @@ committed, so the comparison runs in CI without a download.
 Tolerances and the differences actually observed, fp32 on CPU:
 
 - tiny checkpoint: max |hidden state difference| 1.4e-06, max |pooled
-  difference| 9.5e-07, tolerance 1e-4, on hidden states reaching 2.8. Through
+  difference| 9.5e-07, tolerance 4e-6, on hidden states reaching 2.8. Through
   the projection heads, max |text embedding difference| 7.2e-07 on values
   reaching 2.5 and max |image embedding difference| 4.8e-07 on values
   reaching 2.8, the pixel values bit-identical.
@@ -59,7 +59,9 @@ from dew.nn.text_encoders import (
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "clip"
 TINY = FIXTURES / "tiny"
 REAL = FIXTURES / "large-patch14"
-TOLERANCE = 1e-4
+TOLERANCE = 4e-6
+"""Under three times the tiny checkpoint's largest residue, and five times under
+what a final norm off by one part in 2^17 moves its states by."""
 # The real checkpoint's outlier channels reach 33, where an fp32 sum carries
 # more error than this whole test asks for.
 REAL_TOLERANCE = 1e-3
@@ -159,6 +161,16 @@ def test_tiny_checkpoint_matches_the_reference():
                                  - expected["pooler_output"])))
     assert hidden < TOLERANCE, f"max |hidden state difference| {hidden:.3e}"
     assert pooled < TOLERANCE, f"max |pooled difference| {pooled:.3e}"
+
+
+def test_the_tolerance_refuses_a_final_norm_off_by_one_part_in_two_to_the_seventeenth():
+    """A final norm whose gain is 1 + 2^-17 changes no shape and keeps every
+    invariant the tower's own tests compare it with itself on; on states
+    reaching 2.8 it moves them by about 2e-5, which the tolerance refuses."""
+    expected = reference(TINY)
+    outputs = CLIPTextModel.from_pretrained(str(TINY))(expected["input_ids"], expected["attention_mask"])
+    gained = np.asarray(outputs.last_hidden_state, np.float32) * np.float32(1 + 2 ** -17)
+    assert float(np.max(np.abs(gained - expected["last_hidden_state"]))) > TOLERANCE
 
 
 def test_the_encoder_loads_and_encodes():
