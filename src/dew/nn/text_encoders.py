@@ -78,7 +78,9 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
                name: str | None = None) -> DecoderBlock:
     """One encoder layer of CLIP, SigLIP, Llama 4's vision tower or Qwen 3.5's
     as the decoder block runs it: a layer norm with its bias before the
-    attention and before the MLP, both residual.
+    attention and before the MLP, both residual. The norms take flax's
+    one-pass variance (`decoder_norm`'s 'fast_layer'), as Dew's towers
+    always ran; torch's exact one reduces twice.
 
     The attention is causal in CLIP's text tower and full elsewhere, with a
     bias on all four maps and `positions` the longest sequence it reads. The
@@ -98,8 +100,8 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
     mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width,
                             activation=_ACTIVATIONS[activation], use_bias=True, dtype=dtype,
                             precision=precision)
-    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type="layer", norm_bias=True,
-                        dtype=dtype, precision=precision, name=name)
+    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type="fast_layer",
+                        norm_bias=True, dtype=dtype, precision=precision, name=name)
 
 
 @logical_axes({("token_embedding",): ("vocab", "embed"), ("position_embedding",): (None, "embed")})
