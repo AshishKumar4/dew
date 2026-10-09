@@ -589,17 +589,22 @@ def test_auto_takes_the_measured_grouped_matmul_and_xla_elsewhere(monkeypatch, g
                                      None) == chosen
 
 
-def test_pallas_steps_aside_for_a_product_its_kernels_would_change(monkeypatch):
+def test_pallas_steps_aside_for_a_product_its_kernels_would_change(monkeypatch, caplog):
     """The kernels multiply at the operands' dtype and ignore precision, so
-    fp32 at HIGHEST runs XLA even where they compile."""
+    fp32 at HIGHEST runs XLA even where they compile, and on a generation
+    where they were measured fastest the first such call logs why."""
     import dew.nn.moe as moe
     from dew.nn import kernels
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: 'sm89')
+    monkeypatch.setattr(kernels.generation, '_logged', set())
     monkeypatch.setattr(moe, 'triton_runs', lambda: True)
-    assert moe.grouped_matmul_kernel('pallas', jnp.float32, (jnp.float32, jnp.float32),
-                                     'highest') == 'xla'
+    assert [moe.grouped_matmul_kernel(implementation, jnp.float32, (jnp.float32, jnp.float32), 'highest')
+            for implementation in ('pallas', 'auto')] == ['xla', 'xla']
     assert moe.grouped_matmul_kernel('pallas', jnp.float32, (jnp.float32, jnp.float32),
                                      'default') == 'pallas'
+    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
+    assert logged == ["grouped_matmul runs 'xla', not 'pallas', the kernel measured fastest on sm89: fp32 "
+                      "products above the default precision, and the kernels multiply in TF32"]
 
 
 @pytest.mark.mesh

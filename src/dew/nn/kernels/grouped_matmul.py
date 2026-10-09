@@ -1,7 +1,7 @@
 """The MoE grouped matmul on JAX's Pallas kernels, `gmm` and `tgmm`.
 
 `ragged_dot.py` vendors the kernels; this module adds which products they
-compute exactly (`ragged_dot_runs`) and the custom VJP that trains through
+compute exactly (`ragged_dot_refusal`) and the custom VJP that trains through
 them (`grouped_projection`), in MaxText's megablox shape: forward `gmm`,
 input gradient `gmm` against the transposed kernel, kernel gradient `tgmm`.
 
@@ -27,9 +27,9 @@ from flax.typing import Dtype, PrecisionLike
 from ..precision import asks_default_precision
 
 
-def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
-                    precision: PrecisionLike) -> bool:
-    """Return whether the kernels compute the product a caller asked for.
+def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
+                       precision: PrecisionLike) -> str | None:
+    """Why the kernels do not compute the product a caller asked for, or None where they do.
 
     The kernels multiply in `compute`, accumulate in fp32 and ignore
     `precision`. With 16-bit compute that gives exact products summed in
@@ -37,17 +37,19 @@ def ragged_dot_runs(compute: Dtype, operands: tuple[Dtype, ...],
     which only the default precision asks for (explicitly or through
     `jax_default_matmul_precision`). An operand or master wider than fp32
     needs its gradient summed wider than the kernels sum, and x64 widens
-    their int32 group offsets, so both return False.
+    their int32 group offsets, so both are refused.
     """
     if jax.config.jax_enable_x64:
-        return False
+        return "x64 widens the kernels' int32 group offsets"
     if jnp.result_type(compute, *operands, jnp.float32) != jnp.dtype(jnp.float32):
-        return False
+        return "an operand is wider than fp32, and the kernels sum gradients in fp32"
     compute = jnp.dtype(compute)
     if compute in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-        return True
-    return compute == jnp.dtype(jnp.float32) and asks_default_precision(
-        precision, configured=True)
+        return None
+    if compute != jnp.dtype(jnp.float32):
+        return f"the kernels do not multiply in {compute.name}"
+    return None if asks_default_precision(precision, configured=True) else (
+        "fp32 products above the default precision, and the kernels multiply in TF32")
 
 
 def _gmm(tokens, kernel, sizes, out_dtype, *, trans_rhs: bool, interpret: bool):

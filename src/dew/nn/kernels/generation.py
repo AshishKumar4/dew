@@ -7,7 +7,11 @@ and sends every other one to its portable path. The measurements are in
 docs/performance.md, "Kernel choices per generation".
 """
 
+import logging
+
 import jax
+
+_log = logging.getLogger(__name__)
 
 # `device_kind` of the TPU generations Dew names.
 TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',
@@ -72,6 +76,31 @@ KERNELS: dict[str, dict[str, str]] = {
 def measured_kernel(choice: str, default: str) -> str:
     """The kernel `KERNELS` names for `choice` on the default device's generation, else `default`."""
     return KERNELS[choice].get(device_generation(), default)
+
+
+# Each (choice, kernel, refusal) `ran_kernel` has logged in this process.
+_logged: set[tuple[str, str, str]] = set()
+
+
+def ran_kernel(choice: str, kernel: str, refusal: str) -> str:
+    """Return `kernel`, which a call to `choice` runs because the kernel `KERNELS` measured fastest on
+    this generation turned it down for `refusal`. The first such call in a process for each kernel and
+    refusal is logged as a warning naming both, so a change that sends calls off the measured kernel
+    shows in a run's log, not only in its step time. A generation without a measurement, or a call
+    that runs the measured kernel, logs nothing."""
+    generation = device_generation()
+    measured = KERNELS[choice].get(generation)
+    if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
+        _logged.add((choice, kernel, refusal))
+        _log.warning("%s runs %r, not %r, the kernel measured fastest on %s: %s",
+                     choice, kernel, measured, generation, refusal)
+    return kernel
+
+
+def first_refusal(*checks: tuple[bool, str]) -> str | None:
+    """The reason beside the first of `checks` that does not hold, or None where all hold: how a
+    kernel's eligibility says why it turns a call down (`ran_kernel`)."""
+    return next((reason for holds, reason in checks if not holds), None)
 
 
 def bf16_dot_runs() -> bool:
