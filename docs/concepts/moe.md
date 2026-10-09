@@ -110,7 +110,7 @@ The model is then built with `Mixture(expert_storage="mxfp4")`. Each expert matr
 
 `KERNELS['mxfp4_grouped_matmul']` picks how the projection decodes. `'pallas'` decodes each `[out, in]` tile inside the Pallas grouped matmul, so a decode step reads only its routed experts' bytes. Everywhere else, and under `implementation='xla'` or `'tokamax'`, the projection decodes every expert first and runs the grouped matmul that `KERNELS['grouped_matmul']` picks on the result. A call that runs XLA where Pallas was measured fastest logs why (`dew.nn.kernels.ran_kernel`).
 
-The experts serve: nothing trains them, and a loss's gradient flows through them to their inputs only. On a mesh, each part is split by its matrix's expert and output axes; the packed input axis stays whole, so a group of 32 weights never leaves its exponent. `save` writes the decoded values back through the source's codec, as a decoded load does. Every MXFP4 weight of the source has to be a routed expert, which holds for GPT OSS and Kimi K3; a checkpoint with other MXFP4 weights loads with the default `expert_storage='float'`.
+The experts serve: nothing trains them, and a loss's gradient flows through them to their inputs only. They are never decoded on the host, so a load on a mesh streams their bytes from the memory-mapped checkpoint to the devices. On a mesh, each part is split by its matrix's expert and output axes; the packed input axis stays whole, so a group of 32 weights never leaves its exponent. Only the weights the family maps into a routed `experts` module stay MXFP4: any other MXFP4 weight decodes on the host as `param_dtype` says. `save` writes the decoded values back through the source's codec, as a decoded load does.
 
 ## Dispatch and expert parallelism
 

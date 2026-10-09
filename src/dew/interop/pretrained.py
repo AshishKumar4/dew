@@ -68,6 +68,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
+from dew.nn.kernels.generation import measured_kernel
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, projectors, resolve_dtype, towers
@@ -426,8 +427,9 @@ class Pretrained:
         `quant_method: mxfp4`, Kimi K3's compressed-tensors `mxfp4-pack-quantized`)
         in the checkpoint's own bytes, 4.25 bits a weight against bf16's 16, and the
         expert projection decodes them on the device (`dew.nn.moe.expert_kernel`). The
-        logits are the ones the decoded experts give, bit for bit. Every MXFP4 weight
-        of the source must be a routed expert, and they serve: nothing trains them.
+        logits are the ones the decoded experts give, bit for bit. The experts are
+        neither decoded on the host nor trained; any other MXFP4 weight decodes as
+        `param_dtype` says.
 
         Without `mesh` or `layout`, the variables are host arrays. With either, they
         are placed on that mesh (the default `MeshSpec()` when only `layout` is given)
@@ -478,12 +480,18 @@ class Pretrained:
               dduf_file: str | None = None,
               mesh: MeshSpec | None = None, layout: Layout | None = None, fallback: str | None = None,
               prepare: Callable[[nn.Module, Variables], Variables] | None = None,
-              expert_storage: Literal["float", "mxfp4"] = "float") -> Self:
-        """Share the source reader with inference's pre-placement projection packing."""
+              expert_storage: Literal["float", "mxfp4", "auto"] = "float") -> Self:
+        """Share the source reader with inference's pre-placement projection packing.
+
+        `expert_storage='auto'` is `dew.pipeline`'s: 'mxfp4' where the
+        generation measured the MXFP4 grouped matmul faster
+        (`KERNELS['mxfp4_grouped_matmul']`) and the source ships MXFP4
+        experts, else 'float'.
+        """
         if fallback not in (None, "torchax"):
             raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
                              "tier 3 through transformers' PyTorch forward")
-        if expert_storage != "float" and (fallback is not None or single_file or dduf_file or gguf_file):
+        if expert_storage == "mxfp4" and (fallback is not None or single_file or dduf_file or gguf_file):
             raise ValueError(f"expert_storage={expert_storage!r} keeps a decoder checkpoint's MXFP4 experts; "
                              "a fallback, single-file, DDUF or GGUF source has none to keep")
         streaming = mesh is not None or layout is not None
@@ -511,7 +519,7 @@ class Pretrained:
                                          streaming=streaming, dtype=dtype, param_dtype=param_dtype,
                                          attention_impl=attention_impl, max_seq_len=max_seq_len,
                                          prepare=prepare, expert_storage=expert_storage)
-        elif expert_storage != "float":
+        elif expert_storage == "mxfp4":
             raise ValueError(f"expert_storage={expert_storage!r} keeps a decoder checkpoint's MXFP4 experts; "
                              f"{name_or_dir} is a {type(loaded).__name__} source")
         if not isinstance(loaded, cls):
@@ -1079,27 +1087,43 @@ class _Decoded(NamedTuple):
     stored: dict[str, StoredMXFP4]
 
 
+def _routed_experts(config: Mapping[str, object]) -> Callable[[str], bool] | None:
+    """Whether a source tensor is a routed expert's matrix: one its registered
+    decoder family maps under a routed `experts` module. None for a source no
+    registered family reads as a decoder (a media wrapper, a verified one)."""
+    family = config.get("model_type")
+    if not isinstance(family, str) or family not in decoders.families() or _media_wrapper(config):
+        return None
+    record, entry = decoders.translate_config(config), decoders.families()[family]
+    return lambda name: "experts" in (entry.weight_path(name, record) or ())
+
+
 def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str,
              expert_storage: str = "float") -> _Decoded:
-    """Decode a quantized source's weights; under `expert_storage='mxfp4'`
-    keep every MXFP4 weight as stored instead, as the routed experts it must be."""
+    """Decode a quantized source's weights, but where `expert_storage` holds
+    MXFP4 experts (`Pretrained._load`), keep the routed experts' MXFP4 as stored."""
     quantization = source_quantization(config)
     keeps = None if quantization is None else quantization.stored
-    if expert_storage == "mxfp4" and keeps is None:
-        raise ValueError("expert_storage='mxfp4' keeps a checkpoint's MXFP4 experts, and this source's "
-                         "quantization_config declares none (quant_method mxfp4, or compressed-tensors "
-                         "mxfp4-pack-quantized)")
+    routed = None
+    if keeps is not None and (expert_storage == "mxfp4" or (
+            expert_storage == "auto" and measured_kernel("mxfp4_grouped_matmul", "xla") == "pallas")):
+        routed = _routed_experts(config)
+    quantized_tensors = () if quantization is None else quantization.names(tensors)
+    stored = {} if keeps is None or routed is None else {
+        name: keeps(tensors, name) for name in quantized_tensors if routed(name)}
+    if expert_storage == "mxfp4" and not stored:
+        raise ValueError("expert_storage='mxfp4' keeps the routed experts a decoder checkpoint ships in "
+                         "MXFP4 (quant_method mxfp4, or compressed-tensors mxfp4-pack-quantized), and this "
+                         "source ships none")
     if quantization is None:
         return _Decoded(tensors, (), None, {}, {})
-    quantized_tensors, scale_dtype = quantization.names(tensors), quantization.scale_dtype(tensors)
+    scale_dtype = quantization.scale_dtype(tensors)
     grid = {part: tensors[part] for name in quantized_tensors for part in quantization.grid(name)
             if part in tensors}
     aliases: tuple[tuple[str, str], ...] = ()
     if param_dtype != "float32":
         aliases = decoders.validate_source_aliases(
             quantization.tensor_names(tensors), partial(quantization.read, tensors), config)
-    stored = ({name: keeps(tensors, name) for name in quantized_tensors}
-              if expert_storage == "mxfp4" and keeps is not None else {})
     parts = {part for name in stored for part in quantization.partners(name)}
     tensors = quantization.dequantize({name: tensor for name, tensor in tensors.items() if name not in parts},
                                       param_dtype=param_dtype)
@@ -1306,8 +1330,6 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     tensors, quantized_tensors, scale_dtype, grid, stored = _decoded(tensors, config, storage, expert_storage)
     export_adapter = None
     media = _media_wrapper(config)
-    if stored and (media or family == "diffusion_gemma"):
-        raise ValueError(f"expert_storage='mxfp4' keeps a decoder's routed experts; {family} is not one")
     if family == "diffusion_gemma":
         from dew.interop import diffusion_gemma
 

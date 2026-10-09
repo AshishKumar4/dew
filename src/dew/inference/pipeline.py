@@ -41,6 +41,7 @@ def pipeline(
     layout: Layout | None = None,
     dtype: DTypeLike | None = None,
     param_dtype: DTypeLike | Literal["auto"] | None = None,
+    expert_storage: Literal["float", "mxfp4"] | None = None,
     ema: bool | None = None,
     step: int | str | None = None,
     revision: str | None = None,
@@ -59,7 +60,10 @@ def pipeline(
     its name. `param_dtype` sets parameter storage. None and `'auto'` keep
     each tensor's stored dtype, a run's or a source's (a quantized source's
     packed weights decode to the dtype it declares); `jnp.float32` gives a
-    source FP32 masters. `ema`
+    source FP32 masters. `expert_storage` holds a source's routed MXFP4
+    experts (`Pretrained.load`): None keeps them as the checkpoint's bytes
+    where the generation measured that faster (`KERNELS['mxfp4_grouped_matmul']`)
+    and decodes them elsewhere; a run's experts are always float. `ema`
     selects a run's averaged weights: None reads them when the run kept them
     and its live weights otherwise, and True always reads them. `step`
     selects a run's checkpoint and `revision` pins a Hub source; passing
@@ -89,13 +93,16 @@ def pipeline(
             (root / RUN_FILE).is_file() or any(path.name.isdecimal() for path in root.iterdir())):
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
+        if expert_storage == "mxfp4":
+            raise ValueError("expert_storage='mxfp4' keeps a source checkpoint's MXFP4 experts; a run holds "
+                             "the float experts it trained")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,
                          param_dtype=None if param_dtype == "auto" else param_dtype, ema=ema, step=step,
                          trust=trust)
     if step is not None:
         raise ValueError("step selects a run's checkpoint; a source checkpoint has one set of weights")
     return _from_source(source, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype,
-                        revision=revision)
+                        revision=revision, expert_storage=expert_storage or "auto")
 
 
 def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
@@ -117,8 +124,9 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | None, layout: Layout | None,
 
 
 def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
-                 dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+                 dtype: str | None, param_dtype: str | None, revision: str | None,
+                 expert_storage: Literal["float", "mxfp4", "auto"]
+                 ) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
     from dew.inference.projections import inference_projections
     from dew.interop import (
         Pretrained,
@@ -135,10 +143,10 @@ def _from_source(source: str, *, mesh: MeshSpec | None, layout: Layout | None,
         with jax.set_mesh(placement.build()):
             return inference_projections(model, variables)
     loaded = (Pretrained._load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
-                              prepare=prepared)
+                              prepare=prepared, expert_storage=expert_storage)
               if dtype is None else
               Pretrained._load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
-                               layout=layout, prepare=prepared))
+                               layout=layout, prepare=prepared, expert_storage=expert_storage))
     match loaded:
         case PretrainedPipeline():
             return loaded.text_to_image()

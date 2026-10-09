@@ -248,22 +248,29 @@ def test_gpt_oss_held_in_mxfp4_loads_onto_a_mesh_and_gives_the_decoded_logits(gp
     assert_bitwise(*logits)
 
 
+def kimi_k3_inputs() -> ModelInputs:
+    reference = ieee_fixture(KIMI_K3 / "reference.npz")
+    return ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
+                       {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
+
+
+def kimi_k3_logits(loaded: Pretrained, inputs: ModelInputs) -> jax.Array:
+    return jax.jit(lambda variables: loaded.model.apply(variables, inputs.tokens, **inputs.kwargs()))(
+        loaded.variables)
+
+
 def test_kimi_k3_held_in_mxfp4_gives_the_decoded_logits_tokens_and_export():
     """K3's compressed-tensors experts, one `[out, in / 2]` pair per expert,
     stack into each layer's parts. Logits over the fixture's padded rows and
     four greedy steps are the decoded load's bits, and the export writes the
     tensors the decoded load writes."""
-    reference = ieee_fixture(KIMI_K3 / "reference.npz")
-    inputs = ModelInputs(jnp.asarray(reference["input_ids"], jnp.int32),
-                         {"attention_mask": jnp.asarray(reference["attention_mask"], bool)})
+    inputs = kimi_k3_inputs()
     loads = [Pretrained.load(KIMI_K3, dtype="float32", attention_impl="reference", expert_storage=storage)
              for storage in ("float", "mxfp4")]
     codes = flat_tree(loads[1].variables["params"])["layers_1.mlp.experts.gate_proj.kernel.codes"]
     assert codes.dtype == np.uint8 and codes.shape[0] == loads[1].model.mixture.experts
 
-    logits = [jax.jit(lambda variables, loaded=loaded: loaded.model.apply(
-        variables, inputs.tokens, **inputs.kwargs()))(loaded.variables) for loaded in loads]
-    assert_bitwise(*logits)
+    assert_bitwise(*(kimi_k3_logits(loaded, inputs) for loaded in loads))
     (tokens, log_probs), (held_tokens, held_log_probs) = (greedy(loaded, inputs) for loaded in loads)
     assert_bitwise(held_tokens, tokens)
     assert_bitwise(held_log_probs, log_probs)
@@ -273,6 +280,48 @@ def test_kimi_k3_held_in_mxfp4_gives_the_decoded_logits_tokens_and_export():
         assert_bitwise(held_export[name], tensor)
 
 
+def test_mxfp4_weights_outside_the_routed_experts_decode_on_the_host(tmp_path):
+    """K3 with its latent up projection, a Linear beside the routed experts,
+    also shipped as an MXFP4 pair: the held load keeps the routed experts'
+    bytes and decodes the up projection as the default load does, and the
+    two loads' logits are the same bits."""
+    from shutil import copytree
+
+    from safetensors.numpy import load_file, save_file
+
+    directory = copytree(KIMI_K3, tmp_path / "kimi-k3")
+    tensors = load_file(str(directory / "model.safetensors"))
+    stem = "language_model.model.layers.1.block_sparse_moe.routed_expert_up_proj"
+    tensors[stem + ".weight_packed"], tensors[stem + ".weight_scale"] = quantize_packed_mxfp4(
+        tensors.pop(stem + ".weight"))
+    save_file(tensors, str(directory / "model.safetensors"))
+    loads = [Pretrained.load(directory, dtype="float32", attention_impl="reference", expert_storage=storage)
+             for storage in ("float", "mxfp4")]
+    flat = flat_tree(loads[1].variables["params"])
+    assert flat["layers_1.mlp.routed_expert_up_proj.kernel"].dtype == np.float32
+    assert flat["layers_1.mlp.experts.up_proj.kernel.codes"].dtype == np.uint8
+    inputs = kimi_k3_inputs()
+    assert_bitwise(*(kimi_k3_logits(loaded, inputs) for loaded in loads))
+
+
+def test_dew_pipeline_holds_mxfp4_experts_where_the_fused_kernel_was_measured(gpt_oss_mxfp4, monkeypatch):
+    """`dew.pipeline`'s default: the checkpoint's MXFP4 bytes on a generation
+    where `KERNELS['mxfp4_grouped_matmul']` measured the fused kernel, the
+    decoded experts elsewhere. Here the CPU stands for both; with no GPU the
+    held experts run XLA, which `ran_kernel` logs, and the two tasks' logits
+    are the same bits."""
+    import dew
+    from dew.nn.kernels import KERNELS
+
+    tasks = []
+    for measured in ({}, {"cpu": "pallas"}):
+        monkeypatch.setitem(KERNELS, "mxfp4_grouped_matmul", measured)
+        tasks.append(dew.pipeline(str(gpt_oss_mxfp4), dtype="bfloat16"))
+    assert [task.model.mixture.expert_storage for task in tasks] == ["float", "mxfp4"]
+    ids = jnp.asarray(np.load(GPT_OSS / "input_ids.npy"), jnp.int32)
+    assert_bitwise(*(jax.jit(task.model.apply)(task.variables, ids) for task in tasks))
+
+
 def test_a_source_without_mxfp4_experts_is_refused():
-    with pytest.raises(ValueError, match="declares none"):
+    with pytest.raises(ValueError, match="ships none"):
         Pretrained.load(str(GPT_OSS), dtype="float32", attention_impl="xla", expert_storage="mxfp4")
