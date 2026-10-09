@@ -149,6 +149,7 @@ class Mamba(nn.Module):
         self.out_proj = dense(self.emb_features, use_bias=self.use_bias, name='out_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
+    @nn.compact
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
         del positions, kv_store

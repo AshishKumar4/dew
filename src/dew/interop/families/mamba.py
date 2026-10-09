@@ -18,7 +18,7 @@ from functools import partial
 from dew import records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
-from dew.interop.decoder_parts import DecoderFamily, DecoderFields, refuse
+from dew.interop.decoder_parts import DecoderFamily, DecoderFields, decoder_tensors, refuse
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.mixers.mamba import MambaMixer
 
@@ -115,6 +115,8 @@ MAMBA = DecoderFamily(
     _export,
     weight_path=partial(mamba2.weight_path, layer=LAYER, family="Mamba"),
     export_path=partial(mamba2.export_path, layer_names=_LAYER_NAMES, family="Mamba"),
+    # The path map names every leaf of the mixer, so the shared writer writes it whole.
+    export_weights=decoder_tensors,
     preserve_source_layout=True,
     tied_head_names=("lm_head.weight", "backbone.embeddings.weight"),
 )
