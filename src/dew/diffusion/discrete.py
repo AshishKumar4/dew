@@ -35,6 +35,7 @@ from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.nn.inputs import RESPONSE_FIELDS, ModelInputs, Request, continuation_keys, local_rows, mesh_of
 from dew.nn.protocols import Logits, TokenModel
+from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
 
 MDLM_STEPS = 128
@@ -103,7 +104,8 @@ class DiscreteProcess:
     def corrupt(self, key, tokens, t) -> tuple[jax.Array, jax.Array]:
         """Return `(masked tokens, is_masked)` at `t`, with one t per row."""
         move_chance = 1 - self.schedule.alpha(t)
-        is_masked = jax.random.uniform(key, tokens.shape) < move_chance[:, None]
+        draws = jax.random.uniform(key, tokens.shape, out_sharding=explicit_spec(tokens))
+        is_masked = draws < move_chance[:, None]
         return jnp.where(is_masked, self.mask_id, tokens), is_masked
 
     def weight(self, t) -> jax.Array:
