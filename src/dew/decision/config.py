@@ -88,14 +88,15 @@ class DecisionRunConfig(RunConfig):
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
         run after it trains. The checkpoint decides the backbone; the model
-        flags choose only its compute dtype and attention kernel."""
+        flags choose only its compute and parameter dtypes and attention kernel."""
         from dew.interop import Pretrained, sources
 
-        decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
+        decided = sorted(set(self.model.fields) - {"dtype", "param_dtype", "attention_impl"})
         if decided:
-            raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype and "
+            raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype, param_dtype and "
                              "attention_impl are choices")
         dtype = str(self.model.fields.get("dtype") or "float32")
+        param_dtype = str(self.model.fields.get("param_dtype") or "float32")
         attention_impl = str(self.model.fields.get("attention_impl", "auto"))
         stated = {"max_len": self.max_len, "head_max_len": self.head_max_len,
                   "option_tokens": self.option_tokens}
@@ -106,10 +107,10 @@ class DecisionRunConfig(RunConfig):
                 raise ValueError("--lora and --head shape a fresh backbone; a Laya checkpoint trains whole "
                                  "under its own head")
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
-                                           dtype=dtype, attention_impl=attention_impl)
+                                           dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl)
             derived["layout"] = dataclasses.replace(start.layout, **budgets)
         else:
-            start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
+            start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype, param_dtype=param_dtype,
                                     attention_impl=attention_impl)
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
             # The tokenizer of the commit the weights come from.

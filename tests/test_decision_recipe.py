@@ -4,6 +4,7 @@ import csv
 import dataclasses
 import importlib.util
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -141,24 +142,43 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     assert decide("charged twice", {"team": team})["team"].choice in team.options
 
 
-def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_path):
+@pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
+def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_path, param_dtype):
     """The Clef recipe end to end on the tiny Qwen 3.5: LoRA on its attention,
     Gated DeltaNet and MLP projections, a fresh joint head reading every
     question of a row; an example whose questions alone pass the row's 1,024
     tokens is dropped and counted; the run reloads as a task."""
+    from flax.traverse_util import flatten_dict
+
+    from dew.objectives.base import FROZEN
+
     rows = _requests(24, joint=True)
     rows.append({**rows[0], "questions": {**rows[0]["questions"], "urgent": {
         "type": "noul", "instructions": "Is it urgent? " + "Consider every detail. " * 300}}})
     mixture = _mixture(tmp_path, rows, ["nothing these rows share at all"], held=8)
     clef = _module("clef")
+    storage = [] if param_dtype == "float32" else ["--model.param_dtype", param_dtype]
     config = DecisionRunConfig.cli([*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                                     "--head.feedforward", "40", "--head.layers", "1",
-                                    "--head.routing-layers", "1", "--max-len", "1024"],
+                                    "--head.routing-layers", "1", "--max-len", "1024", *storage],
                                    default=clef.run_config())
     config.run()
     assert sum(_summary(tmp_path / "runs" / "run")["unfit"].values()) == 1
     decide = Decide.from_run(str(tmp_path / "runs" / "run"))
+    frozen = flatten_dict(decide.variables[FROZEN])
+    kernels = [value for path, value in frozen.items() if path[-1] == "kernel"]
+    assert kernels and all(str(value.dtype) == param_dtype for value in kernels)
+    moving = flatten_dict(decide.variables["params"])
+    factors = [value for path, value in moving.items() if path[-1] in ("lora_A", "lora_B")]
+    head = [value for path, value in moving.items() if path[0] == "head"]
+    assert factors and head and all(str(value.dtype) == "float32" for value in [*factors, *head])
+    assert decide.weights.step == 2
+    journal = tmp_path / "runs" / "run" / "tracking" / "scalars.jsonl"
+    scalars = [json.loads(line)["scalars"] for line in journal.read_text().splitlines()]
+    losses = [entry["train/loss"] for entry in scalars if "train/loss" in entry]
+    assert len(losses) == 2 and all(math.isfinite(float(loss)) for loss in losses)
     team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
     answers = decide("charged twice", {"team": team, "urgent": Noul("Is it urgent?")})
     assert answers["team"].choice in team.options and 0 <= answers["urgent"].noul <= 1
+    assert math.isfinite(-sum(math.log(value) for value in answers["team"].probabilities))
