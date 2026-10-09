@@ -41,6 +41,8 @@ class MixerContext:
     num_kv_heads: int
     head_dim: int
     max_seq_len: int
+    value_head_dim: int | None = None
+    """The value heads' width; None is `head_dim`."""
     causal: bool = True
     rope_theta: float = 10000.0
     """The kind-resolved rotary base; a kind's yarn record transforms it."""
@@ -70,6 +72,8 @@ class MixerContext:
     attention_bias: bool = False
     o_proj_bias: bool | None = None
     attention_scale: float | None = None
+    value_scale: float | None = None
+    """Multiplies the projected values before they are cached."""
     attention_dropout_rate: float = 0.0
     attention_sinks: bool = False
     yarn: YarnScaling | None = None

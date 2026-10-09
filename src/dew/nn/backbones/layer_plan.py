@@ -24,9 +24,10 @@ class LayerKind:
     The pattern names each layer's kind, and this record says what the kind
     means. A windowed kind is the "sliding attention" of the reference
     configs. `rope_theta` and `head_dim` are the model's unless the kind sets
-    its own. Rotary positions rotate every dimension of a windowed kind;
-    Gemma 4 puts its partial rotary on the global layers, and its sliding
-    layers rotate every dimension.
+    its own. Rotary positions rotate every dimension of a windowed kind
+    unless it states its own `partial_rotary_factor`: Gemma 4 puts its
+    partial rotary on the global layers, and its sliding layers rotate every
+    dimension, where MiMo-V2-Flash rotates a third of every head.
 
     `mixer` is the kind's token mixer, a value from the `mixers` registry;
     None uses the model's mixer. A hybrid stack names its per-layer mixers
@@ -60,6 +61,14 @@ class LayerKind:
     scales only its full-attention layers, so a YaRN ramp can belong to a
     kind as well as to the model."""
     head_dim: int | None = None
+    partial_rotary_factor: float | None = None
+    """The fraction of this kind's head the rotary turns; None takes the
+    model's on a kind that attends the whole sequence and every dimension on
+    a windowed one."""
+    sinks: bool | None = None
+    """Whether this kind's attention adds a learned sink logit per head
+    (`dew.nn.attention_sinks`); None takes the model's `attention_sinks`.
+    MiMo-V2-Flash sinks its windowed layers alone."""
     mixer: MixerBase | None = None
     """This kind's mixer value, or its record. None uses the model's mixer."""
 
@@ -98,6 +107,8 @@ class ResolvedKind:
     rope_scaling: RopeScaling | LongRopeScaling | None
     yarn: YarnScaling | None
     head_dim: int
+    partial_rotary_factor: float | None
+    sinks: bool
     mixer: MixerBase | None
 
 

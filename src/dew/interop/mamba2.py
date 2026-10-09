@@ -122,10 +122,12 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     return fields
 
 
-def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+def weight_path(name: str, config: Mapping[str, object], *, layer: Mapping[str, tuple[str, ...]] = LAYER,
+                family: str = "Mamba-2") -> tuple[str, ...] | None:
     """Return the variables-tree path for one `Mamba2ForCausalLM` tensor name.
 
-    The tied head's copy comes back as None. An unknown name raises.
+    The tied head's copy comes back as None. An unknown name raises. Mamba's
+    checkpoints share the `backbone` trunk and pass their own `layer` names.
     """
     parts = name.split(".")
     if name in TRUNK:
@@ -133,10 +135,10 @@ def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
     if name == "lm_head.weight":
         return None if config.get("tie_embeddings") else ("params", "lm_head", "kernel")
     if len(parts) >= 4 and parts[:2] == ["backbone", "layers"] and parts[2].isdigit():
-        tail = LAYER.get(".".join(parts[3:]))
+        tail = layer.get(".".join(parts[3:]))
         if tail is not None:
             return ("params", f"layers_{parts[2]}", *tail)
-    raise ValueError(f"{name!r} has no place in a Mamba-2 CausalTransformer")
+    raise ValueError(f"{name!r} has no place in a {family} CausalTransformer")
 
 
 def export_path(dew_name: str, config: Mapping[str, object], *,

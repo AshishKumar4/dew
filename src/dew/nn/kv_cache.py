@@ -274,7 +274,8 @@ def grouped(array: jax.Array, axis: int, groups: int) -> jax.Array:
 class KVStore:
     """Reads and writes one attention module's key and value storage, opened for `rows` rows.
 
-    `write` puts keys and values `[rows, tokens, kv_heads, head_dim]` at
+    `write` puts keys `[rows, tokens, kv_heads, head_dim]` and values as wide
+    as `value_dim` at
     compact slot positions `[rows, tokens]` and drops the ones at -1. `read`
     returns every slot of every row, `[rows, capacity, kv_heads, head_dim]`,
     dequantized and with the keys in the stored rotation. A slot that no token
@@ -291,11 +292,12 @@ class KVStore:
 
     @classmethod
     def open(cls, module: nn.Module, layout: KVCache, rows: int, capacity: int, kv_heads: int,
-             head_dim: int, dtype: jnp.dtype) -> KVStore:
+             head_dim: int, dtype: jnp.dtype, *, value_dim: int | None = None) -> KVStore:
         """Declare the module's cache variables, allocating them on first use, and return the store.
 
-        A paged layout raises `ValueError` when `capacity` is not a multiple
-        of `page_size`, or when `rows` does not split into the pool's groups.
+        Values are `value_dim` wide, None for the keys' `head_dim`. A paged
+        layout raises `ValueError` when `capacity` is not a multiple of
+        `page_size`, or when `rows` does not split into the pool's groups.
         """
         store = cls(module, layout, rows, kv_heads, head_dim, jnp.dtype(dtype))
         layout.key_rotation(head_dim)
@@ -312,8 +314,9 @@ class KVStore:
             pages = rows * per_row if layout.pages is None else layout.pages
             shape = (kv_heads, pages, layout.page_size, head_dim)
             module.variable("cache", TABLE, default_page_table, rows, per_row, pages, layout.groups)
-        for name in ("cached_key", "cached_value"):
-            module.variable("cache", name, jnp.zeros, shape, storage)
+        values = (*shape[:-1], head_dim if value_dim is None else value_dim)
+        for name, stored in (("cached_key", shape), ("cached_value", values)):
+            module.variable("cache", name, jnp.zeros, stored, storage)
         if layout.quantized is not None:
             for name in ("key_scale", "value_scale"):
                 module.variable("cache", name, jnp.ones, shape[:-1], jnp.float32)
