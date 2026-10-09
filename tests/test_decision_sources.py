@@ -70,7 +70,8 @@ def test_esci_rows_reproduce_the_kits_request(sources, label):
         "title": "blue shoes", "description": "Running shoes", "brand": "Example", "color": "blue"}}
     assert example.questions["answer"].wire() == {
         "type": "choice",
-        "instructions": "Classify the relevance of this product to the search query using the ESCI categories.",
+        "instructions": ("Classify the relevance of this product to the search query "
+                         "using the ESCI categories."),
         "criteria": {"E": "Exact: the product satisfies the search query.",
                      "S": "Substitute: a product that could substitute for the requested product.",
                      "C": "Complement: a product that complements the requested product.",

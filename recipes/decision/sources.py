@@ -76,9 +76,9 @@ def _github(repo: str, revision: str, path: str, *, media: bool = False) -> Path
         cached.parent.mkdir(parents=True, exist_ok=True)
         host = "media.githubusercontent.com/media" if media else "raw.githubusercontent.com"
         partial = cached.with_suffix(cached.suffix + ".partial")
-        with urllib.request.urlopen(f"https://{host}/{repo}/{revision}/{path}", timeout=300) as response:
-            with partial.open("wb") as target:
-                shutil.copyfileobj(response, target)
+        with (urllib.request.urlopen(f"https://{host}/{repo}/{revision}/{path}", timeout=300) as response,
+              partial.open("wb") as target):
+            shutil.copyfileobj(response, target)
         partial.replace(cached)
     return cached
 
@@ -481,10 +481,11 @@ class Esci(Source):
                     "C": "Complement: a product that complements the requested product.",
                     "I": "Irrelevant: the product does not address the requested product need."}
         product = {key.removeprefix("product_"): row[key] for key in
-                   ("product_title", "product_description", "product_bullet_point", "product_brand", "product_color")
+                   ("product_title", "product_description", "product_bullet_point",
+                    "product_brand", "product_color")
                    if row.get(key) is not None}
-        question = Choice("Classify the relevance of this product to the search query using the ESCI categories.",
-                          criteria)
+        question = Choice("Classify the relevance of this product to the search query "
+                          "using the ESCI categories.", criteria)
         return Example({"search_query": row["query"], "product": product}, {"answer": question},
                        {"answer": row["esci_label"]})
 
