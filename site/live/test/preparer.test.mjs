@@ -136,13 +136,18 @@ test('a smoke the runtime cuts off while it restores restores again, once', asyn
 	assert.equal(later.starts.length, 0);
 	assert.match(later.reports[0][1].failure, /smoke was cut off in its browser relay smoke phase/);
 });
-test('a snapshot no running job holds is not preparing', async () => {
+test('a snapshot no running job holds is not preparing, and an abandoned job holds nothing', async () => {
 	const prepared = preparer();
-	prepared.storage.set('snapshots', { old: { id: 'old', commit: 'c', created: 0, trial: false, state: 'preparing' } });
-	prepared.storage.set('job', { record: { id: 'current', state: 'preparing' } });
-	prepared.storage.set('snapshots', { ...prepared.storage.get('snapshots'),
-		current: { id: 'current', commit: 'c', created: 1, trial: false, state: 'preparing' } });
+	const snapshot = (id, created) => ({ id, commit: 'c', created, trial: false, state: 'preparing' });
+	prepared.storage.set('snapshots', { old: snapshot('old', 0), current: snapshot('current', 1) });
+	prepared.storage.set('job', { queued: Date.now(), record: { id: 'current', state: 'preparing' } });
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'preparing']]);
+	await assert.rejects(prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' }), /already running/);
+	// A job whose alarms all failed, with no alarm left, is abandoned once past any preparation's budget.
+	prepared.storage.set('job', { queued: Date.now() - 40 * 60_000, record: { id: 'current', state: 'preparing' } });
+	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['old', 'failed'], ['current', 'failed']]);
+	await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
+	assert.equal(prepared.storage.get('job').reply.token, 'lease');
 });
 test('a stage cut off fails the preparation, and a report the registry missed is sent again', async () => {
 	const prepared = preparer({ failReport: 2 });

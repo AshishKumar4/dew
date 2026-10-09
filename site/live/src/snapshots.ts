@@ -22,8 +22,8 @@ interface SnapshotEnv {
 
 const LIFETIME_MS = 30 * 24 * 60 * 60_000;
 const RENEW_MS = 7 * 24 * 60 * 60_000;
-// A preparation reports within PREPARATION_MS; a minute more covers the alarms that hand it on.
-const REBUILD_MS = PREPARATION_MS + 60_000;
+// A preparation reports within PREPARATION_MS, or its preparer has abandoned it.
+const REBUILD_MS = PREPARATION_MS;
 // A failed preparation is retried after 5 minutes, then twice as long each time, up to 6 hours:
 // each attempt may leave a snapshot behind until an operator prunes (snapshot-ledger.ts).
 const RETRY_MS = 5 * 60_000;
