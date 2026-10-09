@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 # build.sh names the CUDA major: dew-flash-attn-cu12 or dew-flash-attn-cu13.
 name = "dew-flash-attn-cuXX"
-version = "0.1.0"
+version = "0.1.1"
 description = "FlashAttention-2 for JAX: Dao-AILab's CUDA kernels as XLA FFI targets"
 readme = "README.md"
 license = "BSD-3-Clause"
