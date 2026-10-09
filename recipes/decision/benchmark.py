@@ -200,16 +200,60 @@ def battery(engine: Engine, laya: Path) -> dict:
     return scores
 
 
+def held(run: Path, mixture: Path) -> dict:
+    """Score every source's held-out rows with a trained `Decide` run, including its calibration.
+
+    Log loss is natural-log cross entropy per labelled question, against
+    either a one-hot answer or its soft target. Accuracy uses the target's
+    most likely option. Unlabelled questions are not scored. The macro means
+    give each source with scored questions equal weight, whatever its size;
+    a source without any reports null scores and is left out of that mean.
+    """
+    from dew.decision import Decide, Example
+
+    decide = Decide.from_run(str(run))
+    recorded = json.loads((mixture / "mixture.json").read_text())
+    scores = {}
+    for source, count in recorded["rows"].items():
+        path = mixture / f"{source}.held.jsonl"
+        examples = ([Example.of(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
+                    if count["held"] else [])
+        if len(examples) != count["held"]:
+            raise ValueError(f"{path} has {len(examples)} rows, but mixture.json records {count['held']}")
+        losses, correct = [], []
+        for example in examples:
+            answers = decide(example.state, example.questions)
+            for name, label in example.labels().items():
+                truth = example.distribution(name)
+                found = answers[name].probabilities
+                positive = truth > 0
+                losses.append(float(-np.sum(truth[positive] * np.log(found[positive]))))
+                correct.append(int(np.argmax(found)) == label)
+        scores[source] = {"rows": len(examples), "questions": len(losses),
+                          "log_loss": float(np.mean(losses)) if losses else None,
+                          "accuracy": float(np.mean(correct)) if correct else None}
+    scored = [value for value in scores.values() if value["questions"]]
+    macro = {metric: float(np.mean([value[metric] for value in scored])) if scored else None
+             for metric in ("log_loss", "accuracy")}
+    return {"sources": scores, "macro": macro}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    suites = ("typed-decisions", "battery", "open-jev-test", "open-jev-ood", "uniform")
+    suites = ("typed-decisions", "battery", "open-jev-test", "open-jev-ood", "uniform", "held")
     parser.add_argument("suite", choices=suites)
     parser.add_argument("--url", default="http://127.0.0.1:8000")
     parser.add_argument("--laya", type=Path, help="a checkout of NandhaKishorM/laya at LAYA_COMMIT")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--limit", type=int, help="ask only the first this many Open-Jev examples")
+    parser.add_argument("--run", type=Path, help="a trained Decide run for the held-out scorer")
+    parser.add_argument("--mixture", type=Path, help="the mixture directory holding per-source held-out rows")
     options = parser.parse_args()
-    if options.suite == "uniform":
+    if options.suite == "held":
+        if options.run is None or options.mixture is None:
+            parser.error("held needs --run and --mixture")
+        scores = held(options.run, options.mixture)
+    elif options.suite == "uniform":
         scores = typed_decisions(uniform)
     elif options.suite == "typed-decisions":
         scores = typed_decisions(http(options.url))

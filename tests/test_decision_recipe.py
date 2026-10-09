@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from dew.data.text import HFTokenizer
-from dew.decision import Choice, Decide, DecisionTable, Noul
+from dew.decision import Choice, Decide, DecisionTable, Example, Noul
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
@@ -140,6 +140,29 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     assert set(decide.calibration.temperatures.types) == {"choice"}
     team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
     assert decide("charged twice", {"team": team})["team"].choice in team.options
+    hard = [{**rows[1], "targets": {}, "answers": {"team": "technical"}},
+            {**rows[2], "targets": {}, "answers": {"team": "billing"}}]
+    (mixture / "hard.held.jsonl").write_text("".join(json.dumps(row) + "\n" for row in hard))
+    made["rows"]["hard"] = {"train": 0, "held": len(hard)}
+    (mixture / "mixture.json").write_text(json.dumps(made))
+    benchmark = _module("benchmark")
+    scored = benchmark.held(tmp_path / "runs" / "run", mixture)
+    assert set(scored) == {"sources", "macro"}
+    assert scored["sources"]["rows"]["rows"] == 12
+    assert scored["sources"]["hard"]["rows"] == 2
+    for source, metrics in scored["sources"].items():
+        assert set(metrics) == {"rows", "questions", "log_loss", "accuracy"}
+        expected = []
+        for line in (mixture / f"{source}.held.jsonl").read_text().splitlines():
+            example = Example.of(json.loads(line))
+            probabilities = decide(example.state, example.questions)["team"].probabilities
+            target = example.distribution("team")
+            expected.append(-sum(t * math.log(p) for t, p in zip(target, probabilities, strict=True)))
+        assert metrics["log_loss"] == pytest.approx(sum(expected) / len(expected))
+        assert math.isfinite(metrics["log_loss"]) and 0 <= metrics["accuracy"] <= 1
+    for metric in ("log_loss", "accuracy"):
+        assert scored["macro"][metric] == pytest.approx(
+            sum(value[metric] for value in scored["sources"].values()) / 2)
 
 
 @pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
