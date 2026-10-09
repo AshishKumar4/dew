@@ -32,6 +32,13 @@ export interface Prepared {
  * A preparation `ManagedPreparer.alarm` runs in two stages, the snapshot and then its smoke, each
  * in an alarm of its own: an alarm may run 15 minutes, and one alarm cannot hold both.
  */
+// An alarm may run 15 minutes; the alarm after a stage's start, a minute later, finds it cut off.
+const STAGE_MS = 16 * 60_000;
+// A restore that has not answered by now was cut off (the smoke waits 180 s for it) and is tried
+// again, once: a smoke restores the same snapshot every time, and a rebuild would make another.
+const RESTORE_MS = 6 * 60_000;
+const RESTORES = 2;
+
 interface Job {
 	commit: string;
 	trial: boolean;
@@ -41,6 +48,8 @@ interface Job {
 	stage: 'build' | 'smoke';
 	// When this stage's alarm began: an alarm that finds it set runs after one that was cut off.
 	began?: number;
+	// The smoke's restores so far: the runtime has reset the preparer a minute into one.
+	restores?: number;
 	record?: SnapshotRecord;
 	built?: { snapshot: ContainerSnapshot; prepareSeconds: number; snapshotSeconds: number };
 	// Kept until the registry has it, so a failed report is sent again.
@@ -163,18 +172,25 @@ export class ManagedPreparer extends DurableObject<Env> {
 		}
 		if (!job.outcome) {
 			const failed = (failure: string): Prepared => ({ commit: job.commit, trial: job.trial, token: job.reply.token, failure });
+			const phase = (await this.status())?.phase ?? 'first';
+			if (job.began && job.stage === 'smoke' && phase === 'offline restore' && (job.restores ?? 1) < RESTORES) {
+				console.error('preparation restore cut off; restoring again', job.built!.snapshot.id);
+				job.began = undefined;
+				job.restores = (job.restores ?? 1) + 1;
+			}
 			if (job.began) {
-				job.outcome = failed(`the ${job.stage} was cut off in its ${(await this.status())?.phase ?? 'first'} phase: `
+				job.outcome = failed(`the ${job.stage} was cut off in its ${phase} phase: `
 					+ 'it outlived its alarm\'s 15 minutes, or the runtime restarted it');
 			} else {
 				job.began = Date.now();
 				await this.ctx.storage.put('job', job);
-				// Should this alarm be cut off, the next one fails the preparation.
-				await this.ctx.storage.setAlarm(job.began + 16 * 60_000);
+				// Should this alarm be cut off, the next one finds it so: soon, while the smoke restores.
+				await this.ctx.storage.setAlarm(job.began + (job.stage === 'smoke' ? RESTORE_MS : STAGE_MS));
 				try {
 					const plan = this.plan(job);
+					// A stage the runtime cut off may have left its container running.
+					if (container.running) await container.destroy();
 					if (job.stage === 'build') {
-						if (container.running) await container.destroy();
 						job.built = await buildSnapshot(container, plan, this.phase, async (snapshot) => {
 							job.record = { id: snapshot.id, commit: job.commit, created: Date.now(), trial: job.trial, state: 'preparing' };
 							await this.record(job.record);
@@ -184,7 +200,11 @@ export class ManagedPreparer extends DurableObject<Env> {
 						await this.ctx.storage.setAlarm(Date.now() + 1000);
 						return;
 					}
-					const smokeSeconds = await smokeSnapshot(container, plan, job.built!.snapshot, this.phase);
+					const smokeSeconds = await smokeSnapshot(container, plan, job.built!.snapshot, async (name) => {
+						// Restored: the rest of the smoke has the stage's whole alarm.
+						if (name !== 'offline restore') await this.ctx.storage.setAlarm(job.began! + STAGE_MS);
+						await this.phase(name);
+					});
 					job.outcome = { commit: job.commit, trial: job.trial, token: job.reply.token, generation: {
 						commit: job.commit, snapshot: job.built!.snapshot, created: Date.now(),
 						prepareSeconds: job.built!.prepareSeconds, snapshotSeconds: job.built!.snapshotSeconds, smokeSeconds } };
@@ -198,7 +218,7 @@ export class ManagedPreparer extends DurableObject<Env> {
 			await this.ctx.storage.put('job', job);
 		}
 		// Should the report outlive this alarm's 15 minutes, the alarm after it sends it again.
-		await this.ctx.storage.setAlarm(Date.now() + 16 * 60_000);
+		await this.ctx.storage.setAlarm(Date.now() + STAGE_MS);
 		try {
 			await this.env.SNAPSHOTS.get(this.env.SNAPSHOTS.idFromString(job.reply.registry)).prepared(job.outcome);
 		} catch (error) {

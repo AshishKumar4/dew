@@ -43,7 +43,13 @@ function preparer({ failSmoke = false, failReport = 0 } = {}) {
 		plan(job) {
 			return { commit: job.commit, sourceCommit: 'b'.repeat(40), script: 'setup-managed.sh', args: ['c'.repeat(40), 'b'.repeat(40)],
 				name: 'live', entrypoint: ['sleep', 'infinity'], env: { DEW_SHARED_SECRET: job.secret },
-				async smoke(restored) { assert.equal(restored, container); if (failSmoke) throw new Error('offline smoke failed'); } };
+				async smoke(restored, phase) {
+					assert.equal(restored, container);
+					if (failSmoke) throw new Error('offline smoke failed');
+					state.restoring = state.alarm;
+					await phase('browser relay smoke');
+					state.smoking = state.alarm;
+				} };
 		}
 	}
 	return { runner: new Runner(ctx, env), starts, reports, state, storage };
@@ -95,6 +101,36 @@ test('the shared preparation lifecycle tears down and reports an offline smoke f
 	assert.match(prepared.reports[0][1].failure, /offline smoke failed/);
 	// The snapshot of a preparation that failed its smoke is recorded, so an operator deletes it.
 	assert.deepEqual((await prepared.runner.snapshots()).map(({ id, state }) => [id, state]), [['snapshot', 'failed']]);
+});
+test('a smoke the runtime cuts off while it restores restores again, once', async () => {
+	for (const [phase, restores] of [['offline restore', 2], ['browser relay smoke', 1]]) {
+		const prepared = preparer();
+		await prepared.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
+		prepared.storage.set('job', { ...prepared.storage.get('job'), stage: 'smoke', began: Date.now() - 6 * 60_000,
+			built: { snapshot: { id: 'snapshot' }, prepareSeconds: 1, snapshotSeconds: 1 } });
+		prepared.storage.set('phase', { phase, at: Date.now() - 5 * 60_000 });
+		prepared.starts.push('cut off');
+		await prepared.runner.alarm();
+		if (restores === 2) {
+			// Restored again, of the same snapshot: no rebuild, and so no other snapshot.
+			assert.deepEqual(prepared.starts.slice(1).map((start) => start.containerSnapshot), [{ id: 'snapshot' }]);
+			// While it restores, the next alarm is six minutes away; once restored, the stage's whole 16.
+			assert.ok(prepared.state.restoring < Date.now() + 6 * 60_000 + 1000);
+			assert.ok(prepared.state.smoking > Date.now() + 15 * 60_000);
+			assert.ok(prepared.reports[0][1].generation);
+			// A second restore cut off fails the preparation.
+			const again = preparer();
+			await again.runner.queue('a'.repeat(64), false, { registry: 'registry', token: 'lease' });
+			again.storage.set('job', { ...again.storage.get('job'), stage: 'smoke', began: Date.now() - 6 * 60_000, restores: 2,
+				built: { snapshot: { id: 'snapshot' }, prepareSeconds: 1, snapshotSeconds: 1 } });
+			again.storage.set('phase', { phase, at: Date.now() - 5 * 60_000 });
+			await again.runner.alarm();
+			assert.match(again.reports[0][1].failure, /smoke was cut off in its offline restore phase/);
+		} else {
+			assert.equal(prepared.starts.length, 1);
+			assert.match(prepared.reports[0][1].failure, /smoke was cut off in its browser relay smoke phase/);
+		}
+	}
 });
 test('a stage cut off fails the preparation, and a report the registry missed is sent again', async () => {
 	const prepared = preparer({ failReport: 2 });
