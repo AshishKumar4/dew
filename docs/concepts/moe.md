@@ -52,6 +52,7 @@ Every layer here routes to two of four experts, and the logits keep the usual `(
 | `implementation` | `'auto'` | Grouped matmul kernel: `'auto'`, `'xla'`, `'pallas'` or `'tokamax'`. |
 | `dispatch` | `'global'` | `'global'` or `'exchange'` (expert parallelism). |
 | `capacity_factor` | `None` | Per-expert slot capacity; `None` keeps every selected slot. |
+| `expert_storage` | `'float'` | How the routed experts' matrices are held: `'float'` parameters, or `'mxfp4'`, an MXFP4 checkpoint's own bytes, decoded on the device ([MXFP4 experts](#mxfp4-experts)). |
 | `hash_layers`, `latent_features`, `latent_norm`, `media_bias` | | DeepSeek V4 hash routing, Kimi K3 latent experts, DeepSeek-V4.1's media bias. |
 
 When you load a published checkpoint, its configuration sets these values. Changing them changes the architecture and can make the weights unusable.
@@ -84,6 +85,32 @@ The choice is the same on a mesh. The experts run inside the dispatch's `shard_m
 Left to its default, tokamax picks its v1 TPU kernel, which is 13 times slower than XLA on a v6e, so Dew names the kernel it wants. If a model asks for `'tokamax'` and the package cannot be imported, initialization fails; Dew does not fall back to XLA under that name.
 
 Install tokamax 0.0.15 or later ([Installation](../installation.md)). tokamax 0.0.13 and 0.0.14 pin `typeguard==2.13.3`, but tyro 1.0.16, which parses every recipe's command line, needs `typeguard>=4.0.0`. So installing either release downgrades typeguard, `uv pip check` reports the conflict, and every recipe then fails while parsing its arguments with `AttributeError: module 'typeguard' has no attribute 'TypeCheckError'`. The grouped-matmul numbers on this page were measured on 0.0.14, whose grouped-matmul kernels 0.0.15 keeps unchanged.
+
+## MXFP4 experts
+
+GPT OSS and Kimi K3 ship their routed experts in MXFP4: two 4-bit E2M1 codes per byte, and one E8M0 exponent byte per 32 weights, 4.25 bits a weight. `Pretrained.load(source, expert_storage="mxfp4")` keeps those bytes as they are, where the default decodes them to floats on the host:
+
+<!-- not run: downloads openai/gpt-oss-20b, 13 GB -->
+```python
+import jax.numpy as jnp
+
+from dew.interop import Pretrained
+
+loaded = Pretrained.load("openai/gpt-oss-20b", dtype=jnp.bfloat16, param_dtype="auto",
+                         expert_storage="mxfp4")
+experts = loaded.variables["params"]["layers_0"]["mlp"]["experts"]
+print({part: (array.shape, array.dtype) for part, array in experts["gate_up_proj"].items()})
+```
+
+```text
+{'codes': ((32, 5760, 1440), dtype('uint8')), 'exponents': ((32, 5760, 90), dtype('uint8'))}
+```
+
+The model is then built with `Mixture(expert_storage="mxfp4")`. Each expert matrix `[experts, in, out]` is a parameter `{codes, exponents}`, `[experts, out, in / 2]` and `[experts, out, in / 32]`, the layout both GPT OSS's blocks and compressed-tensors' `mxfp4-pack-quantized` pairs share. `moe.expert_kernel` is where `SparseMLP` and GPT OSS's experts read their matrices, and it returns them as a `moe.MXFP4Experts`, which `moe.expert_projection` decodes on the device. `dew.interop.codecs.decode_e2m1_device` builds each weight's bits with integer arithmetic, so it gives the host codec's values exactly, subnormals, infinities and NaN included, even on XLA's CPU backend, which flushes float subnormals. MXFP4 values are exact in bfloat16, so the logits and greedy tokens are those of the same checkpoint loaded with decoded experts, bit for bit (`tests/test_mxfp4_experts.py`, for GPT OSS and Kimi K3).
+
+`KERNELS['mxfp4_grouped_matmul']` picks how the projection decodes. `'pallas'` decodes each `[out, in]` tile inside the Pallas grouped matmul, so a decode step reads only its routed experts' bytes. Everywhere else, and under `implementation='xla'` or `'tokamax'`, the projection decodes every expert first and runs the grouped matmul that `KERNELS['grouped_matmul']` picks on the result. A call that runs XLA where Pallas was measured fastest logs why (`dew.nn.kernels.ran_kernel`).
+
+The experts serve: nothing trains them, and a loss's gradient flows through them to their inputs only. On a mesh, each part is split by its matrix's expert and output axes; the packed input axis stays whole, so a group of 32 weights never leaves its exponent. `save` writes the decoded values back through the source's codec, as a decoded load does. Every MXFP4 weight of the source has to be a routed expert, which holds for GPT OSS and Kimi K3; a checkpoint with other MXFP4 weights loads with the default `expert_storage='float'`.
 
 ## Dispatch and expert parallelism
 

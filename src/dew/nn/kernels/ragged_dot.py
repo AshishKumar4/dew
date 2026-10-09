@@ -176,11 +176,12 @@ def _gpu_ragged_dot_kernel(
       x = _load(x_ref.at[lhs_rows_idx, inner_idx], mask=mask)
       if isinstance(A_ref, tuple):
         # Dew: an MXFP4 tile, each byte of a part covering `per_byte` inputs.
-        A = decode_e2m1_device(*(
+        codes, exponents = (
           _load(part.at[pid.gi, rhs_cols_idx, pl.ds(k * (block.k // per_byte), block.k // per_byte)],
                 mask=rhs_cols_mask[:, None]
                 & ((k * block.k + arange(block.k // per_byte) * per_byte) < size.k)[None, :])
-          for part, per_byte in zip(A_ref, (2, GROUP), strict=True)), compute_dtype)
+          for part, per_byte in zip(A_ref, (2, GROUP), strict=True))
+        A = decode_e2m1_device(codes, exponents, compute_dtype)
       elif not trans_rhs:
         mask = inner_mask[:, None] & rhs_cols_mask[None, :]
         A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)

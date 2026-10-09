@@ -62,6 +62,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import jax.typing
 import ml_dtypes
 import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
@@ -122,7 +123,7 @@ def decode_e2m1(packed: ArrayLike, exponents: ArrayLike) -> np.ndarray:
     return values.reshape(*codes.shape[:-1], 2 * codes.shape[-1])
 
 
-def decode_e2m1_device(codes: jax.Array, exponents: jax.Array, dtype: DTypeLike) -> jax.Array:
+def decode_e2m1_device(codes: jax.Array, exponents: jax.Array, dtype: jax.typing.DTypeLike) -> jax.Array:
     """`decode_e2m1` in jax.numpy: uint8 codes [..., n / 2] under uint8 exponent
     bytes [..., n / 32] to [..., n] in `dtype`, the bits of `decode_e2m1`'s
     float32 cast to `dtype`, NaN (byte 255), infinities and subnormals included.

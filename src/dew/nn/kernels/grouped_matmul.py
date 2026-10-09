@@ -219,7 +219,7 @@ def _projection_bwd(compute, interpret_on_cpu, residuals, cotangent):
         d_inputs = xla_ragged_dot(cotangent.astype(inputs.dtype), transposed, sizes,
                                   preferred_element_type=work)
         return (d_inputs.astype(x_like.dtype),
-                MXFP4Experts(*(np.zeros(part.shape, jax.dtypes.float0) for part in matrix)),
+                jax.tree.map(lambda part: np.zeros(part.shape, jax.dtypes.float0), matrix),
                 np.zeros(sizes.shape, jax.dtypes.float0))
     d_inputs, d_matrix = _backward(inputs, matrix, sizes, cotangent.astype(inputs.dtype), work,
                                    interpret_on_cpu)
