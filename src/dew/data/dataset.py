@@ -337,7 +337,7 @@ class Budgeted(Protocol):
 
 
 class Forwarding:
-    """Forwards a stream wrapper's stop signal, stop budget, close and identity to its source.
+    """Forwards a stream wrapper's stop signal, stop budget, close, identity and endlessness to its source.
 
     Subclasses keep the source at `_source` and override `close` for their own
     cleanup around `super().close()`.
@@ -372,6 +372,10 @@ class Forwarding:
 
     def identity(self) -> str:
         return stream_identity(self._forwarded())
+
+    @property
+    def endless(self) -> bool:
+        return stream_endless(self._forwarded())
 
 
 _QUIET_STOP_SECONDS = 5.0
@@ -801,12 +805,17 @@ class Checkpointable(Protocol):
 
 @runtime_checkable
 class Identified(Protocol):
-    """A training stream that names the records it reads.
+    """A training stream that names the records it reads and says whether it
+    ever runs out.
 
     Each process of a pool opens its own stream, over its own copy of the
     corpus, and `Trainer.fit` refuses a pool whose streams name different
-    records before any process reads one.
+    records before any process reads one. It agrees every read of a stream
+    that may run out, so a process whose stream ran out stops its peers
+    before they step without it; an endless one is agreed at its first read.
     """
+
+    endless: bool
 
     def identity(self) -> str: ...
 
@@ -814,6 +823,12 @@ class Identified(Protocol):
 def stream_identity(stream: Iterator[Batch] | None) -> str:
     """What `stream` reads, as `Identified` names it, or else its type."""
     return stream.identity() if isinstance(stream, Identified) else type(stream).__name__
+
+
+def stream_endless(stream: Iterator[Batch] | None) -> bool:
+    """Whether `stream` says it never runs out (`Identified`), as Dew's
+    global streams do."""
+    return isinstance(stream, Identified) and stream.endless
 
 
 def tokenized(stream: Reader, tokenize: Tokenize | None) -> Reader:
@@ -1333,6 +1348,8 @@ class GlobalStream:
     class and `dew.checkpoints` read.
     """
 
+    endless = True
+
     def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
                  batch: int, order: str, loading: Loading, content: Callable[[], str] | None = None):
         self._open = open_at
@@ -1415,6 +1432,8 @@ class PhasedStream:
     Changing a phase the run has already read, or ending the current phase
     before the records the run already read in it, is refused.
     """
+
+    endless = True
 
     def __init__(self, phases: Sequence[tuple[Callable[[], GlobalStream], int | None]],
                  stop_seconds: float):

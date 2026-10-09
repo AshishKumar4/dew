@@ -45,6 +45,7 @@ from dew.data.dataset import (
     RampedStream,
     Reader,
     rows_of,
+    stream_endless,
     stream_identity,
 )
 from dew.nn.kernels.generation import measured_kernel
@@ -430,6 +431,7 @@ class _FitRun:
     first_step: float | None = None
     preempted: int | None = None
     notice: PreemptionNotice | None = None
+    endless: bool = False
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
@@ -1350,9 +1352,10 @@ class Trainer(Generic[Loss, Effects]):
             with step_scope:
                 with region("input.wait"):
                     # The first read restores the stream's position and opens
-                    # its reader on the prefetch worker, and a process whose
-                    # stream failed there stops its peers before they compile.
-                    batch = run.read() if seen else agreed("first training read", run.read)
+                    # its reader on the prefetch worker, and a stream that may
+                    # run out can on any read: a process whose read failed
+                    # stops its peers before they compile or step without it.
+                    batch = run.read() if seen and run.endless else agreed("training read", run.read)
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
@@ -1475,6 +1478,7 @@ class Trainer(Generic[Loss, Effects]):
                 # corpus, and none reads a record before all agree it is one.
                 agreed_same("training data", lambda: (
                     f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
+            run.endless = stream_endless(run.source)
             run.train = DevicePrefetchIterator(run.source, mesh, source_state=position)
             run.source = None  # Lifetime transferred to the prefetch worker.
 

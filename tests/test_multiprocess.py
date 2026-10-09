@@ -1357,13 +1357,14 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
 @pytest.mark.distributed
 def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_path):
     """Each process opens its own stream over its own copy of the corpus, reads
-    its first batch on its own prefetch thread and lists the checkpoints itself.
+    its batches on its own prefetch thread and lists the checkpoints itself.
     Where one process's corpus holds other records under the same name and
     length, or another count of them, where its first read fails, where its
-    batch lacks a field, or where its listing has not yet seen the newest
-    checkpoint a resume reads, every process refuses with the cause, rather
-    than one raising alone while its peers enter a step or a restore it
-    never joins."""
+    stream (one Dew does not know endless) runs out a step before its peers',
+    where its batch lacks a field, or where its listing has not yet seen the
+    newest checkpoint a resume reads, every process refuses with the cause,
+    rather than one raising alone while its peers enter a step or a restore
+    it never joins."""
     reports = run_pool("pool_refusals", tmp_path / "pool", 2, devices=4, timeout=300,
                        run_dir=str(tmp_path / "runs"))
     for rank, report in enumerate(reports):
@@ -1371,10 +1372,12 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
         assert "training data differs between the processes" in report["content"], report
         assert "64 records" in report["count"] and "96 records" in report["count"], report
         assert "holds no rows" in report["first_read"], report
+        assert "StopIteration" in report["eof"], report
         assert "training batch layout differs" in report["layout"], report
         assert "newest checkpoint differs" in report["stale"], report
         if rank == 0:
-            assert "first training read" in report["first_read"], report
+            assert "training read failed on rank 1" in report["first_read"], report
+            assert "training read failed on rank 1" in report["eof"], report
 
 
 @pytest.mark.distributed
