@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 
@@ -28,6 +29,6 @@ class Delta(Files):
     def arrow(self):
         return self.table.to_pyarrow_dataset()
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> Mapping[str, object]:
         return {"store": "delta", "uri": self.url, "version": self.table.version(),
                 "files": self.table.file_uris(), "columns": self.columns, "filter": str(self.filter)}

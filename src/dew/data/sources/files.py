@@ -105,7 +105,7 @@ class Files:
     def describe(self) -> str:
         return f"files:{self.kind}:{self.url}"
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> Mapping[str, object]:
         files = []
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()

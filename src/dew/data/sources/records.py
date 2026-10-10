@@ -54,10 +54,10 @@ class ArrayRecords:
             raise TypeError("an exported ArrayRecord source must hold records or bytes")
         return value
 
-    def __getstate__(self) -> dict[str, object]:
+    def __getstate__(self) -> Mapping[str, object]:
         return {"urls": self.urls, "storage_options": self.storage_options, "record_codec": self.record_codec}
 
-    def __setstate__(self, state: dict[str, object]) -> None:
+    def __setstate__(self, state: Mapping[str, object]) -> None:
         self.__dict__.update(state)
         self._pins = []
 

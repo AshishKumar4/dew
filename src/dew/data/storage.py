@@ -19,7 +19,7 @@ import urllib.request
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO
+from typing import BinaryIO, TypedDict
 
 import fsspec
 from filelock import FileLock
@@ -29,6 +29,15 @@ from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 
 class PreconditionFailed(FileExistsError):
     """The object changed since the caller read its version."""
+
+
+class ObjectInfo(TypedDict):
+    bytes: int
+    sha256: str
+
+
+class ObjectRef(ObjectInfo):
+    path: str
 
 
 def _secret(value: object, profile: str) -> object:
@@ -50,17 +59,15 @@ def _secret(value: object, profile: str) -> object:
 def _profile(name: str, base: str, options: Mapping[str, object]) -> None:
     implementation = fsspec.get_filesystem_class(base)
 
-    class Profile(implementation):
-        protocol = (name, base)
+    def initialize(self, **kwargs: object):
+        resolved = {key: _secret(value, name) for key, value in {**options, **kwargs}.items()}
+        implementation.__init__(self, **resolved)
 
-        def __init__(self, **kwargs: object):
-            resolved = {key: _secret(value, name) for key, value in {**options, **kwargs}.items()}
-            super().__init__(**resolved)
-
-    Profile.__name__ = f"{name.title()}FileSystem"
-    Profile.__qualname__ = Profile.__name__
-    globals()[Profile.__name__] = Profile
-    fsspec.register_implementation(name, Profile, clobber=True)
+    profile_name = f"{name.title()}FileSystem"
+    profile_type = type(profile_name, (implementation,), {"protocol": (name, base),
+                        "__init__": initialize, "__module__": __name__})
+    globals()[profile_name] = profile_type
+    fsspec.register_implementation(name, profile_type, clobber=True)
 
 
 class DewDataFileSystem(AbstractFileSystem):
@@ -118,7 +125,7 @@ class DewDataFileSystem(AbstractFileSystem):
                 raise PreconditionFailed(path) from error
             raise OSError(f"dew-data {method} {path}: HTTP {error.code}") from error
 
-    def info(self, path: str, **kwargs: object) -> dict[str, object]:
+    def info(self, path: str, **kwargs: object) -> dict[str, str | int]:
         if not self._key(path):
             return {"name": self.bucket, "size": 0, "type": "directory"}
         _, headers = self._request("HEAD", path)
@@ -129,7 +136,7 @@ class DewDataFileSystem(AbstractFileSystem):
     def ls(self, path: str, detail: bool = True, **kwargs: object):
         prefix = self._key(path.rstrip("/"))
         cursor = ""
-        entries: dict[str, dict[str, object]] = {}
+        entries: dict[str, dict[str, str | int]] = {}
         while True:
             query = "?" + urllib.parse.urlencode({"list": prefix, "cursor": cursor})
             body, _ = self._request("GET", self.bucket, query=query)
@@ -320,7 +327,7 @@ class Store:
         fs.makedirs(fs._parent(path), exist_ok=True)
         fs.pipe_file(path, data)
 
-    def verified(self, data: bytes) -> dict[str, object]:
+    def verified(self, data: bytes) -> ObjectInfo:
         self.put_if_absent(data)
         found = self.read()
         digest = hashlib.sha256(data).hexdigest()
@@ -360,8 +367,15 @@ class Store:
             return Versioned(data, next(value for key, value in headers.items() if key.lower() == "etag"))
         info = fs.info(path)
         if scheme == "s3":
-            version = info["ETag"]
-            return Versioned(fs.cat_file(path, IfMatch=version), version)
+            from fsspec.asyn import sync
+
+            async def read_s3() -> Versioned:
+                bucket, key, _ = fs.split_path(path)
+                response = await fs._call_s3("get_object", Bucket=bucket, Key=key)
+                async with response["Body"] as body:
+                    return Versioned(await body.read(), response["ETag"])
+
+            return sync(fs.loop, read_s3)
         if scheme in ("gs", "gcs"):
             version = str(info["generation"])
             return Versioned(fs.cat_file(path, generation=version), version)
