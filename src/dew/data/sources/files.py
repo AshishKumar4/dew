@@ -1,0 +1,384 @@
+"""Indexed files and checkpointable physical-shard readers over filesystem URLs."""
+
+from __future__ import annotations
+
+import bisect
+import csv
+import io
+import json
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from functools import cached_property, lru_cache
+from pathlib import PurePosixPath
+from typing import BinaryIO, Literal
+
+import grain.python as grain
+import numpy as np
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.fs as pafs
+
+from dew.data.dataset import Batch, Records
+from dew.data.storage import Store
+
+from .base import Read, Shard, ShardManifest
+
+type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
+
+
+def _format(url: str) -> Format:
+    suffix = PurePosixPath(url).suffix.lower()
+    formats: dict[str, Format] = {".jsonl": "jsonl", ".txt": "text", ".csv": "csv", ".parquet": "parquet",
+                                  ".arrow": "arrow", ".feather": "arrow", ".array_record": "array_record",
+                                  ".tar": "webdataset"}
+    if suffix not in formats:
+        raise ValueError(f"source {url!r} needs format=; a URL does not declare its record format")
+    return formats[suffix]
+
+
+def _arrow_filesystem(fs) -> pafs.FileSystem:
+    protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+    if "file" in protocols:
+        return pafs.LocalFileSystem()
+    if "s3" in protocols:
+        from urllib.parse import urlsplit
+
+        endpoint = fs.client_kwargs.get("endpoint_url") or fs.endpoint_url
+        parsed = urlsplit(endpoint) if endpoint else None
+        return pafs.S3FileSystem(access_key=fs.key, secret_key=fs.secret, session_token=fs.token,
+                                 anonymous=fs.anon, region=fs.client_kwargs.get("region_name"),
+                                 endpoint_override=parsed.netloc if parsed else None,
+                                 scheme=parsed.scheme if parsed else "https")
+    if "gs" in protocols and fs.token is None:
+        return pafs.GcsFileSystem()
+    return pafs.PyFileSystem(pafs.FSSpecHandler(fs))
+
+
+@dataclass(frozen=True)
+class Files:
+    """Files at URLs, with producer indexes or explicit provisioning for text.
+
+    Parquet partitions are discovered with Arrow's Hive partitioning. A
+    predicate runs within each streamed fragment; indexed predicates need
+    a provisioned accepted-row index and are refused here.
+    """
+
+    url: str | tuple[str, ...]
+    format: Format | None = None
+    index: str | None = None
+    columns: tuple[str, ...] | None = None
+    filter: ds.Expression | None = None
+    partitioning: str | None = "hive"
+    shard_bytes: int = 64 * 2**20
+    storage_options: Mapping[str, object] | None = None
+    spark: bool = False
+
+    @cached_property
+    def kind(self) -> Format:
+        return self.format or _format(self.url if isinstance(self.url, str) else self.url[0])
+
+    @cached_property
+    def paths(self) -> tuple[str, ...]:
+        urls = (self.url,) if isinstance(self.url, str) else self.url
+        found = []
+        for url in urls:
+            fs, path = Store(url, self.storage_options).resolve()
+            if self.spark and not fs.exists(path.rstrip("/") + "/_SUCCESS"):
+                raise ValueError(f"Spark source {url!r} is uncommitted: _SUCCESS is missing")
+            if any(character in path for character in "*?["):
+                names = sorted(fs.glob(path))
+            elif fs.isdir(path):
+                names = sorted(name for name in fs.find(path) if not any(
+                    part.startswith(("_", ".")) for part in PurePosixPath(name[len(path):]).parts))
+                extensions = {"parquet": ".parquet", "arrow": ".arrow", "jsonl": ".jsonl",
+                              "text": ".txt", "csv": ".csv", "array_record": ".array_record",
+                              "webdataset": ".tar"}
+                if self.kind != "files":
+                    names = [name for name in names if name.endswith(extensions[self.kind])]
+            else:
+                names = [path]
+            found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))
+        if not found:
+            raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
+        return tuple(found)
+
+    def describe(self) -> str:
+        return f"files:{self.kind}:{self.url}"
+
+    def snapshot(self) -> dict[str, object]:
+        files = []
+        for url in self.paths:
+            fs, path = Store(url, self.storage_options).resolve()
+            info = fs.info(path)
+            files.append({"uri": url, "bytes": info["size"], "version": info.get(
+                "ETag", info.get("etag", info.get("generation", fs.ukey(path))))})
+        return {"store": self.kind, "files": files, "columns": self.columns,
+                "filter": str(self.filter), "partitioning": self.partitioning}
+
+    def supports(self, read: Read) -> bool:
+        if read != "indexed" or self.kind in ("files", "array_record"):
+            return True
+        if self.filter is not None:
+            return False
+        if self.kind in ("arrow", "parquet"):
+            return True
+        if self.kind == "webdataset":
+            return False
+        indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
+        return all(Store(url, self.storage_options).resolve()[0].exists(
+            Store(url, self.storage_options).resolve()[1]) for url in indexes)
+
+    @staticmethod
+    def _index_url(url: str) -> str:
+        return url.rsplit(".", 1)[0] + ".index.npy"
+
+    def provision(self) -> Files:
+        if self.kind not in ("jsonl", "text", "csv"):
+            raise ValueError(f"{self.describe()} has no provisionable offset index")
+        for url in self.paths:
+            fs, path = Store(url, self.storage_options).resolve()
+            offsets = []
+            with fs.open(path, "rb") as file:
+                if self.kind == "csv":
+                    reader = csv.DictReader(_CsvLines(file))
+                    reader.fieldnames
+                    while True:
+                        start = file.tell()
+                        try:
+                            next(reader)
+                        except StopIteration:
+                            break
+                        offsets.append((0, start, file.tell() - start))
+                else:
+                    while True:
+                        start = file.tell()
+                        line = file.readline()
+                        if not line:
+                            break
+                        if self.kind == "jsonl":
+                            if not line.strip():
+                                continue
+                            json.loads(line)
+                        offsets.append((0, start, len(line)))
+            encoded = io.BytesIO()
+            np.save(encoded, np.array(offsets, dtype=[("shard", "<u4"), ("offset", "<u8"), ("bytes", "<u8")]),
+                    allow_pickle=False)
+            Store(self._index_url(url), self.storage_options).write(encoded.getvalue())
+        self.__dict__.pop("paths", None)
+        return self
+
+    def records(self, read: Read) -> Records:
+        if not self.supports(read):
+            raise FileNotFoundError(f"{self.describe()} cannot read {read}; provision its offset or accepted "
+                                    "index with dew data provision, or choose read='streamed'")
+        if self.kind == "files":
+            return _Paths(self.paths)
+        if self.kind in ("parquet", "arrow"):
+            rows = _ArrowRecords(self)
+        elif self.kind == "array_record":
+            from .records import ArrayRecords
+
+            rows = ArrayRecords(self.paths, self.storage_options)
+        elif read == "memory":
+            return tuple(row for shard in self.manifest().shards for row in self._read_shard(shard))
+        else:
+            rows = _IndexedLines(self)
+        return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
+
+    @cached_property
+    def arrow(self) -> ds.Dataset:
+        fs, _ = Store(self.paths[0], self.storage_options).resolve()
+        paths = [Store(url, self.storage_options).resolve()[1] for url in self.paths]
+        return ds.dataset(paths, filesystem=_arrow_filesystem(fs), format="ipc" if self.kind == "arrow"
+                          else "parquet", partitioning=self.partitioning)
+
+    @cached_property
+    def fragments(self):
+        return tuple(piece for fragment in self.arrow.get_fragments()
+                     for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,)))
+
+    def manifest(self) -> ShardManifest:
+        shards = []
+        if self.kind in ("parquet", "arrow"):
+            for number, fragment in enumerate(self.fragments):
+                rows = None if self.filter is not None else fragment.count_rows()
+                shards.append(Shard(f"{fragment.path}:{number}", fragment.path, number, number + 1, rows))
+        elif self.kind == "array_record":
+            for url in self.paths:
+                shards.append(Shard(url, url))
+        else:
+            for url in self.paths:
+                fs, path = Store(url, self.storage_options).resolve()
+                size = fs.size(path)
+                step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
+                if step < 1:
+                    raise ValueError("file shard_bytes must be positive")
+                for start in range(0, size, step):
+                    shards.append(Shard(f"{url}:{start}", url, start, min(start + step, size)))
+        return ShardManifest(tuple(shards), self._read_shard)
+
+    def _read_shard(self, shard: Shard) -> grain.IterDataset:
+        if self.kind in ("parquet", "arrow"):
+            return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset()
+        if self.kind == "array_record":
+            from .records import ArrayRecords
+
+            return grain.MapDataset.source(ArrayRecords((shard.uri,), self.storage_options)).to_iter_dataset()
+        if self.kind == "webdataset":
+            from .webdataset import TarRows
+
+            return TarRows(shard.uri, self.storage_options)
+        if self.kind == "files":
+            return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
+        return _Lines(self, shard)
+
+    def metadata(self) -> Mapping[str, object]:
+        return {}
+
+    def lengths(self) -> np.ndarray | None:
+        if self.kind in ("parquet", "arrow") and "length" in self.arrow.schema.names:
+            return self.arrow.to_table(columns=["length"])["length"].to_numpy()
+        if self.index:
+            with io.BytesIO(Store(self.index, self.storage_options).read()) as file:
+                index = np.load(file, allow_pickle=False)
+                if index.dtype.names and "length" in index.dtype.names:
+                    return index["length"]
+        return None
+
+
+@dataclass(frozen=True)
+class _Paths:
+    paths: Sequence[str]
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def __getitem__(self, index: int) -> Batch:
+        return {"path": self.paths[index]}
+
+
+@dataclass(frozen=True)
+class _ArrowFragment:
+    source: Files
+    index: int
+
+    @cached_property
+    def table(self) -> pa.Table:
+        return self.source.fragments[self.index].to_table(
+            schema=self.source.arrow.schema, columns=self.source.columns, filter=self.source.filter)
+
+    def __len__(self) -> int:
+        return self.table.num_rows
+
+    def __getitem__(self, index: int) -> Batch:
+        return self.table.slice(index, 1).to_pylist()[0]
+
+
+class _ArrowRecords:
+    def __init__(self, source: Files):
+        self.source = source
+        self.offsets = np.cumsum([0, *(fragment.count_rows() for fragment in source.fragments)])
+
+    @lru_cache(maxsize=1)
+    def _group(self, index: int) -> _ArrowFragment:
+        return _ArrowFragment(self.source, index)
+
+    def __len__(self) -> int:
+        return int(self.offsets[-1])
+
+    def __getitem__(self, index: int) -> Batch:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group = bisect.bisect_right(self.offsets, index) - 1
+        return self._group(group)[index - int(self.offsets[group])]
+
+
+class _IndexedLines:
+    def __init__(self, source: Files):
+        self.source = source
+        self.indexes = (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
+        self.tables = tuple(np.load(io.BytesIO(Store(url, source.storage_options).read()), allow_pickle=False)
+                            for url in self.indexes)
+        self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
+
+    def __len__(self) -> int:
+        return int(self.offsets[-1])
+
+    def __getitem__(self, index: int) -> Batch:
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group = bisect.bisect_right(self.offsets, index) - 1
+        entry = self.tables[group][index - int(self.offsets[group])]
+        shard = int(entry["shard"]) if self.source.index else group
+        fs, path = Store(self.source.paths[shard], self.source.storage_options).resolve()
+        with fs.open(path, "rb") as file:
+            names = next(csv.reader(_CsvLines(file))) if self.source.kind == "csv" else None
+            file.seek(int(entry["offset"]))
+            data = file.read(int(entry["bytes"]))
+        if names is not None:
+            return next(csv.DictReader(io.StringIO(data.decode()), fieldnames=names))
+        return json.loads(data) if self.source.kind == "jsonl" else {"text": data.decode().rstrip("\r\n")}
+
+
+class _CsvLines(Iterator[str]):
+    def __init__(self, file: BinaryIO):
+        self.file = file
+
+    def __next__(self) -> str:
+        line = self.file.readline()
+        if not line:
+            raise StopIteration
+        return line.decode()
+
+
+class _Lines(grain.IterDataset):
+    def __init__(self, source: Files, shard: Shard):
+        super().__init__()
+        self.source = source
+        self.shard = shard
+
+    def __iter__(self) -> grain.DatasetIterator:
+        return _LineIterator(self.source, self.shard)
+
+
+class _LineIterator(grain.DatasetIterator):
+    def __init__(self, source: Files, shard: Shard):
+        super().__init__()
+        self.source, self.shard = source, shard
+        fs, path = Store(shard.uri, source.storage_options).resolve()
+        self.file = fs.open(path, "rb")
+        self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
+        if self.csv is not None:
+            self.csv.fieldnames
+        elif shard.start:
+            self.file.seek(shard.start - 1)
+            if self.file.read(1) != b"\n":
+                self.file.readline()
+
+    def __next__(self) -> Batch:
+        if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
+            raise StopIteration
+        if self.csv is not None:
+            return next(self.csv)
+        while True:
+            line = self.file.readline()
+            if not line:
+                raise StopIteration
+            if self.source.kind == "text":
+                return {"text": line.decode().rstrip("\r\n")}
+            if line.strip():
+                return json.loads(line)
+            if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
+                raise StopIteration
+
+    def get_state(self) -> dict[str, int]:
+        return {"offset": self.file.tell()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        offset = state["offset"]
+        if not isinstance(offset, int) or offset < self.shard.start:
+            raise ValueError(f"invalid file reader position for {self.shard.id}")
+        self.file.seek(offset)
+
+    def close(self) -> None:
+        self.file.close()

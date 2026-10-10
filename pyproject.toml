@@ -173,6 +173,7 @@ tensorboard = ["tensorboard"]
 hpo = ["optuna"]
 # Online URL-streaming loader (HF datasets-backed)
 streaming = ["datasets"]
+delta = ["deltalake>=1.0"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
 # tokenizer puts at the start of an empty-context continuation, and scores it
