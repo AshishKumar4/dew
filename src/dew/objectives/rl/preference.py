@@ -89,8 +89,9 @@ class DPOObjective(LMObjective):
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
                 "a DPO run always freezes one")
         chosen_ids, rejected_ids, chosen_mask, rejected_mask = self._halves(batch)
-        policy_chosen = self.per_token_log_probs(variables, chosen_ids)
-        policy_rejected = self.per_token_log_probs(variables, rejected_ids)
+        policy = self.token_scores(variables, jnp.concatenate((chosen_ids, rejected_ids)),
+                                   qk_stats=self.qk_stats)
+        policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
         ref_chosen = self.per_token_log_probs(step.ema, chosen_ids)
         ref_rejected = self.per_token_log_probs(step.ema, rejected_ids)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
@@ -101,7 +102,7 @@ class DPOObjective(LMObjective):
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,
-        })
+        }, qk_stats=policy.qk)
 
     def evaluate(self, params, batch, step):
         """Return per-token scores of the chosen responses under the policy, for their perplexity.
