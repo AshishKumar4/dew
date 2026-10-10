@@ -23,8 +23,9 @@ leaving each chunk (fla's `chunk_gated_delta_rule_bwd_dhu`),
     dS_i    = dS_i' + exp(g_i,C) dS_i+1 - w_i^T dv_i
 
 where `dv_i'` and `dS_i'` are the cotangents the output sends the corrected
-values and the entered state. Everything else it owes the operands is one
-batched product per chunk, left to XLA. The kernels' products take the
+values and the entered state. The kernel writes only the dS_i+1; everything
+it owes the operands, `dv_i` included, is one batched product per chunk
+from them, left to XLA. The kernels' products take the
 precision XLA's take, the configured default matmul precision (TF32 on a GPU
 at the default, IEEE fp32 at 'highest'), so choosing them changes no
 arithmetic class. tests/test_delta_chunks.py holds both to `xla_chunk_states`
@@ -86,11 +87,12 @@ def _forward_kernel(key_ref, w_ref, gc_ref, u_ref, state_ref, entered_ref, corre
 
 
 def _backward_kernel(key_ref, w_ref, gc_ref, d_entered_ref, d_corrected_ref, d_final_ref,
-                     d_leaving_ref, d_u_ref, d_state_ref):
+                     d_leaving_ref, d_state_ref):
     """`_forward_kernel` read backwards: from the cotangent of the slice
-    leaving the last chunk, each chunk's gradient of the slice leaving it and
-    of its corrected values, then the gradient of the slice entering the
-    first."""
+    leaving the last chunk, each chunk's gradient of the slice leaving it,
+    then the gradient of the slice entering the first. The corrected values'
+    gradient it carries is the recurrence's own; the one returned is
+    recomputed outside (`_states_bwd`)."""
     chunks, size = gc_ref.shape
 
     def chunk(i, d_state):
@@ -99,7 +101,6 @@ def _backward_kernel(key_ref, w_ref, gc_ref, d_entered_ref, d_corrected_ref, d_f
         gc, last = gc_ref[n], gc_ref[n, size - 1]
         written = key_ref[n] * jnp.exp(last - gc)[:, None]
         d_u = d_corrected_ref[n] + written @ d_state
-        d_u_ref[n] = d_u
         return d_entered_ref[n] + d_state * jnp.exp(last) - w_ref[n].T @ d_u
 
     d_state_ref[...] = jax.lax.fori_loop(0, chunks, chunk, d_final_ref[...])
@@ -154,11 +155,20 @@ def _states_fwd(key, w, u, gc, state, interpret: bool):
 def _states_bwd(interpret: bool, residual, cotangent):
     key, w, gc, entered, corrected = residual
     d_entered, d_corrected, d_final = cotangent
-    d_leaving, d_u, d_state = _call(_backward_kernel, "gated_delta_states_backward", (key, w, gc),
-                                    (d_entered, d_corrected, d_final),
-                                    (d_entered, d_corrected, d_final), interpret)
+    d_leaving, d_state = _call(_backward_kernel, "gated_delta_states_backward", (key, w, gc),
+                               (d_entered, d_corrected, d_final), (d_entered, d_final), interpret)
     last = gc[..., -1:]
     leave = jnp.exp(last - gc)                                         # [.., C]
+    # The corrected values' gradient, from the gradients of the slices each
+    # chunk leaves, which the w gradient reads too. Read back from the
+    # kernel, it sat 3.07 times as far from float64 as the scan's at IEEE
+    # products on an A100, and w's 1.25; as one batched product here, 1.01
+    # and 1.00 (c49). Why the kernel's product rounds worse is measured, not
+    # explained: both are IEEE fp32 dots (jax 0.11.2 lowers a HIGHEST fp32
+    # dot to Triton's IEEE input precision) and both exps libdevice's; the
+    # order Triton's dot accumulates in, against cuBLAS's, is an unconfirmed
+    # lead.
+    d_u = d_corrected + (key * leave[..., None]) @ d_leaving
     d_written = corrected @ jnp.swapaxes(d_leaving, -1, -2)            # [.., C, Dk]
     # The written keys' decay `exp(g_C - g_t)`: what reaches its exponent
     # goes to g_C with one sign and to g_t with the other.
