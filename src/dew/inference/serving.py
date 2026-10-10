@@ -750,7 +750,7 @@ class Server:
         """
         base = _seed(key)
         inputs = prepared_inputs(self.processor, prompts, images=None)
-        tickets = [self._enqueued(inputs.take_rows(np.arange(index, index + 1)), max_new_tokens, base, index)
+        tickets = [self._enqueued(inputs.take_rows(jnp.arange(index, index + 1)), max_new_tokens, base, index)
                    for index in range(inputs.tokens.shape[0])]
         self.run()
         return [ticket.result() for ticket in tickets]
