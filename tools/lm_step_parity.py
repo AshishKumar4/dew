@@ -69,7 +69,7 @@ def run(config: dict[str, object], batch: int, seq: int, steps: int,
     step = trainer.compile(state, data)
     record = Record([], [])
     for index in range(steps):
-        state, loss, metrics, finite, _ = step(state, data)
+        state, loss, metrics, finite, _, _ = step(state, data)
         if not bool(finite):
             raise RuntimeError(f"the loss went non-finite at step {index}")
         record.losses.append(float(loss))

@@ -9,14 +9,19 @@ from __future__ import annotations
 
 import dataclasses
 import importlib.metadata
+import logging
 import math
 import platform
+import subprocess
 import traceback
 import typing
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Literal
 
 from dew.records import JSON
+
+_log = logging.getLogger(__name__)
 
 
 def json_value(value: object) -> JSON:
@@ -55,13 +60,43 @@ def packages_installed() -> dict[str, str]:
     return versions
 
 
+def checkout_revision() -> str | None:
+    """The Dew checkout's revision, never the training driver's working directory.
+
+    A wheel is not a checkout and records None. A worktree's .git is a file,
+    so both files and directories are accepted. Git unavailable or unable
+    to read this checkout leaves the revision unknown and reports why.
+    """
+    root = Path(__file__).resolve().parents[3]
+    if not (root / '.git').exists():
+        return None
+    try:
+        revision = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
+                                  capture_output=True, text=True, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        _log.warning("Cannot read Dew's checkout revision: %s", error)
+        return None
+    return revision.stdout.strip()
+
+
 @dataclasses.dataclass(frozen=True)
 class RunRecord:
+    """The complete run config and the software and hardware that trained it.
+
+    `dew_sha` belongs to the installed Dew source checkout. A driver's own
+    revision can be carried separately in W&B's WANDB_TAGS or WANDB_NOTES.
+    Hardware fields are filled by the config's training path; a record made
+    without a training backend leaves them unknown.
+    """
     name: str
     config: JSON
     summary: JSON
     steps: int
     packages: Mapping[str, str]
+    dew_sha: str | None = dataclasses.field(default_factory=checkout_revision)
+    device_kind: str | None = None
+    devices: int | None = None
+    processes: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)

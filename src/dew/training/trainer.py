@@ -80,7 +80,14 @@ from dew.objectives.base import (
 )
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization, peak_flops, step_flops
+from dew.telemetry.instrumentation import (
+    NO_FLOPS,
+    StepFlops,
+    compilation_cache_counts,
+    model_flops_utilization,
+    peak_flops,
+    step_flops,
+)
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     AxisLink,
@@ -112,6 +119,7 @@ from dew.training.memory import (
     fitting_default,
     head_tile_of,
     memory_record,
+    peak_memory_gib,
     recompute_more,
     recompute_record,
     refuse_wide_floats,
@@ -126,7 +134,7 @@ from dew.training.runtime import Preempted, PreemptionNotice
 from dew.training.selection import Best
 from dew.training.state import Accumulation, TrainState
 from dew.training.tracker import Tracker
-from dew.training.transaction import Transaction, compact_qk, with_ema
+from dew.training.transaction import Committed, Transaction, compact_qk, with_ema
 
 _log = logging.getLogger(__name__)
 
@@ -143,10 +151,10 @@ the loss and the objective's report out."""
 
 CompiledStep = Callable[
     [TrainState, Batch],
-    tuple[TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array]]
+    tuple[TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]]
 """A call returns the stepped state, the scalar loss, the objective's whole
 report (`Aux.metrics`), whether that loss was finite, and whether the
-microbatch was accepted."""
+microbatch was accepted, and the transaction's commit telemetry (None for a custom step)."""
 
 Loss = DefaultTypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = DefaultTypeVar("Effects", default=None)
@@ -204,10 +212,11 @@ class ProfileWindow:
     warmup: int = 2
 
 
-Book = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
+Book = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
 """The loop's device-side counters: the interval's summed loss, the current
 streak of non-finite losses, the longest streak since the last check,
-analytical forward FLOPs and real tokens since the last log."""
+analytical forward FLOPs and real tokens since the last log, and the sum of
+committed gradient norms and number of commits since the last log."""
 
 
 def fresh_book(loss: jax.Array) -> Book:
@@ -218,21 +227,24 @@ def fresh_book(loss: jax.Array) -> Book:
     """
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
     zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
-             np.zeros((), dtype), np.zeros((), dtype))
+             np.zeros((), dtype), np.zeros((), dtype), np.zeros((), dtype), np.zeros((), np.int32))
     return jax.device_put(zeros, loss.sharding)
 
 
 @jax.jit
-def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, forward=0.0, tokens=0.0) -> Book:
+def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, forward=0.0,
+             tokens=0.0) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
 
     Five eager ops would cost more: 176 against 37 us a step on a CPU.
     """
-    interval_loss, bad_run, worst_bad_run, interval_flops, interval_tokens = book
+    interval_loss, bad_run, worst_bad_run, interval_flops, interval_tokens, norms, commits = book
     bad_run = jnp.where(finite, 0, bad_run + 1)
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    if committed is not None:
+        norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
     return (interval_loss + loss.astype(dtype), bad_run, jnp.maximum(worst_bad_run, bad_run),
-            interval_flops + forward, interval_tokens + tokens)
+            interval_flops + forward, interval_tokens + tokens, norms, commits)
 
 
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
@@ -483,9 +495,10 @@ class _Interval:
     rollout_seconds: float = 0.0
     waited: float = 0.0
     compiling: float = 0.0
+    compiles: int = 0
 
     def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
-              aux: Mapping[str, jax.Array] | None = None) -> None:
+              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
         """Add one step: its records, its FLOPs and its loss."""
         self.since_log += 1
         self.steps += 1
@@ -497,7 +510,7 @@ class _Interval:
         self.model_counted |= FORWARD_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
-        self.book = bookkeep(self.book, loss, finite,
+        self.book = bookkeep(self.book, loss, finite, committed,
                              aux.get(FORWARD_FLOPS, self.fresh[3]), aux.get(TOKENS, self.fresh[4]))
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
@@ -509,7 +522,7 @@ class _Interval:
         """
         if self.book is None or self.fresh is None:
             return
-        loss, bad_run, worst_bad_run, forward, tokens = self.book
+        loss, bad_run, worst_bad_run, forward, tokens, norms, commits = self.book
         try:
             streak = int(jax.device_get(worst_bad_run))
         except jax.errors.JaxRuntimeError as error:
@@ -523,7 +536,7 @@ class _Interval:
                 f"ending near step {step}, stopping")
         if streak:
             display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
-        self.book = (loss, bad_run, self.fresh[2], forward, tokens)
+        self.book = (loss, bad_run, self.fresh[2], forward, tokens, norms, commits)
 
     def logged(self, now: float) -> None:
         """Start the next logging interval at `now`."""
@@ -1188,14 +1201,19 @@ class Trainer(Generic[Loss, Effects]):
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
                     # return the host-resident ones to pinned host memory.
-                    advanced, loss, aux = body(self._fetched(current, shardings), model_batch(batch))
+                    if self.step is None:
+                        advanced, loss, aux, committed = body(self._fetched(current, shardings),
+                                                              model_batch(batch))
+                    else:
+                        advanced, loss, aux = body(self._fetched(current, shardings), model_batch(batch))
+                        committed = None
                     return (dataclasses.replace(advanced, step=current.step + 1), loss,
                             {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
-                            advanced.microstep > current.microstep)
+                            advanced.microstep > current.microstep, committed)
 
                 jitted = jax.jit(step, in_shardings=(shardings, placement),
                                  out_shardings=(shardings, replicated, replicated, replicated,
-                                                replicated),
+                                                replicated, replicated),
                                  donate_argnums=0)
                 self.program = jitted.lower(prepared, batch)
                 if not consulted:
@@ -1302,13 +1320,13 @@ class Trainer(Generic[Loss, Effects]):
             with self._traced_on(cpu):
                 if current.accumulation is None and self.accumulation > 1:
                     current = self._initialize_accumulation(current, batch, shapes)
-                advanced, loss, aux = body(current, model_batch(batch))
+                advanced, loss, aux, committed = body(current, model_batch(batch))
                 advanced = dataclasses.replace(advanced, step=current.step + 1)
                 # A leaf already where its placement says stays the array it
                 # is: the resident frozen collection crosses no boundary.
                 advanced = transfer(advanced, placement)
                 return (advanced, loss, {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
-                        advanced.microstep > current.microstep)
+                        advanced.microstep > current.microstep, committed)
         return run
 
     # ------------------------------------------------------------------
@@ -1472,6 +1490,7 @@ class Trainer(Generic[Loss, Effects]):
                     agreed("training input declaration", functools.partial(inputs.check, batch))
                 known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops = self._compiled_for(compiled, state, batch)
+                interval.compiles = len(compiled)
                 if not known:
                     # Rebound once the step is compiled, so the first tick
                     # measures steps, not the compile.
@@ -1482,7 +1501,7 @@ class Trainer(Generic[Loss, Effects]):
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted = train_step(state, batch)
+                    state, loss, aux, finite, accepted, committed = train_step(state, batch)
                 if self._unproven:
                     # A step's failure on the devices surfaces at the next
                     # program that reads its outputs, the loss counters, so a
@@ -1496,7 +1515,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.current += 1
                 self._display.step(run.current)
                 seen += 1
-                interval.count(batch, measured_flops, loss, finite, aux)
+                interval.count(batch, measured_flops, loss, finite, committed, aux)
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
@@ -2217,6 +2236,14 @@ class Trainer(Generic[Loss, Effects]):
         Rank zero builds the row; every other rank has nothing to report.
         The report is agreed, so a tracker that failed on rank zero stops its
         peers here rather than at their next collective.
+
+        Loss and objective aux metrics are the latest attempt's values.
+        train/grad_norm is instead the mean over admitted optimizer commits
+        since the last log: bookkeep sums each window's native gradient norm
+        and its commit count on device, independently of the checkpoint loss
+        sum. A tick with no commit omits it. train/compiles counts this fit's
+        StepCompiled records; persistent-cache counts span all jitted programs
+        in this process, as compilation_cache_counts describes.
         """
         def report() -> None:
             if jax.process_index() != 0:
@@ -2229,6 +2256,7 @@ class Trainer(Generic[Loss, Effects]):
             # array is a copy of its own.
             read = jax.device_get({
                 "loss": loss, "aux": aux, "accepted": accepted, "rate": learning_rate(state.opt_state),
+                "committed": None if interval.book is None else interval.book[5:],
                 "scale": None if state.scale is None else state.scale.scale,
                 "model_flops": (interval.book[3] if interval.model_counted and interval.book is not None
                                 else None),
@@ -2241,6 +2269,15 @@ class Trainer(Generic[Loss, Effects]):
                                           compiling=interval.compiling, model_flops=read["model_flops"],
                                           tokens=read["tokens"])}
             scalars["train/accepted"] = float(read["accepted"])
+            if read['committed'] is not None:
+                norms, commits = read['committed']
+                if commits:
+                    scalars['train/grad_norm'] = float(norms / commits)
+            scalars['train/compiles'] = float(interval.compiles)
+            scalars.update(compilation_cache_counts())
+            peak = peak_memory_gib()
+            if peak is not None:
+                scalars['train/peak_memory_gib'] = peak
             if read["rate"] is not None:
                 scalars["train/learning_rate"] = float(read["rate"])
             if read["scale"] is not None:

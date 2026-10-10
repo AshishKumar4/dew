@@ -215,6 +215,18 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
 MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
 
 
+def peak_memory_gib() -> float | None:
+    """The largest local device allocator high-water mark, in GiB.
+
+    The logging tick reads this on process zero. It is the allocator's
+    lifetime peak, not an interval delta or a cross-process maximum. CPU
+    backends and allocators without peak_bytes_in_use report nothing.
+    """
+    peaks = [stats['peak_bytes_in_use'] for device in jax.local_devices()
+             if (stats := device.memory_stats()) is not None and 'peak_bytes_in_use' in stats]
+    return max(peaks) / 1024 ** 3 if peaks else None
+
+
 def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int, *, fits: bool) -> JSON:
     """What the fit check read for a compiled step, as `step_headroom` reads
     it, and its answer `fits`: XLA's memory analysis of the step, `held`, and
