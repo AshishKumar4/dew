@@ -949,7 +949,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             if identity is None:
                 identity, identity_loss = truth, truth_loss
             invariance.append(order_invariance(truth, identity, truth_loss, identity_loss))
-            ref_state, ref_loss, _, _, _ = ref_step(ordered_state(base, order, ref_shardings), ref_data)
+            ref_state, ref_loss, _, _, _, _ = ref_step(ordered_state(base, order, ref_shardings), ref_data)
             ref_gradient = flat(ref_state.opt_state[0]['gradient'], order)
             keys = (*truth, '@loss')
             for path in truth:
