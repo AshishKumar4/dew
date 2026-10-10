@@ -412,8 +412,9 @@ class ConstantVelocity(nn.Module):
 
 def test_heun_takes_the_euler_step_where_sigma_reaches_zero():
     """Karras et al. 2022, Algorithm 2: at sigma_next = 0 there is no
-    derivative to average with, and the step is the Euler one. On the flow
-    path t = 0 is exactly sigma = 0, so the last interval of any grid hits it."""
+    derivative to average with, and the step is the Euler one, with no model
+    call for the corrector. On the flow path t = 0 is exactly sigma = 0, so
+    the last interval of any grid hits it."""
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     model = ConstantVelocity()
     params = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4)), jnp.ones((1,)))
@@ -423,10 +424,20 @@ def test_heun_takes_the_euler_step_where_sigma_reaches_zero():
     zero = jnp.zeros((3,))
     x_0, eps = denoise(x, t)
 
-    heun, _ = Heun().step(x, t, zero, x_0, eps, (), jax.random.PRNGKey(0), process, denoise)
+    calls = []
+
+    def counted(x, t):
+        jax.debug.callback(lambda: calls.append(1))
+        return denoise(x, t)
+
+    heun, _ = jax.jit(lambda x: Heun().step(x, t, zero, x_0, eps, (), jax.random.PRNGKey(0), process,
+                                             counted))(x)
+    jax.effects_barrier()
     euler, _ = Euler().step(x, t, zero, x_0, eps, (), jax.random.PRNGKey(0), process, denoise)
     assert jnp.all(jnp.isfinite(heun))
     assert jnp.allclose(heun, euler, atol=1e-6)
+    # Every row reaches sigma 0, so the corrector's model call is skipped.
+    assert not calls
 
 
 ############################################################################################################

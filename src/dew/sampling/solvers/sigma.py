@@ -131,12 +131,17 @@ class Heun:
         sigma_s = target[1]
         x_euler, dx_0, x_0_coeff, dt = _euler_step(x, denoised, source, target)
 
-        denoised_next, _ = denoise(x_euler, t_next)
-        # When sigma reaches 0 there is no derivative there, so the step is
-        # the Euler one.
-        safe_sigma_s = jnp.where(sigma_s > 0, sigma_s, 1.0)
-        dx_1 = (x_euler - x_0_coeff * denoised_next) / safe_sigma_s
-        return jnp.where(sigma_s > 0, x + 0.5 * (dx_0 + dx_1) * dt, x_euler), state
+        def corrected(operand):
+            denoised_next, _ = denoise(x_euler, t_next)
+            # When sigma reaches 0 there is no derivative there, so a row
+            # there takes the Euler step.
+            safe_sigma_s = jnp.where(sigma_s > 0, sigma_s, 1.0)
+            dx_1 = (x_euler - x_0_coeff * denoised_next) / safe_sigma_s
+            return jnp.where(sigma_s > 0, x + 0.5 * (dx_0 + dx_1) * dt, x_euler)
+
+        # The last step of a trajectory to sigma 0 is the Euler one for every
+        # row, so its corrector's model call is skipped, as KDPM2's is.
+        return lax.cond(jnp.all(sigma_s == 0), lambda _: x_euler, corrected, None), state
 
 
 @dataclass(frozen=True)
