@@ -14,7 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import Digits, serving_task as task
+from model_support import Digits, decoder, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
@@ -27,7 +27,7 @@ from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
-from dew.sampling import Sampling
+from dew.sampling import Sample, Sampling
 from dew.training import Layout, MeshSpec
 
 VOCAB = 13
@@ -632,6 +632,26 @@ def test_a_paged_kernel_reads_one_key_of_each_idle_row(monkeypatch, request, dec
     server.run()
     assert_same_generation(ticket.result(), alone)
     assert reads and all(np.sum(counts > 1) <= 1 for counts in reads), reads
+
+
+def test_a_server_runs_a_model_with_prediction_depths_without_them():
+    """The server only samples, so it allocates and seeds no prediction
+    depth: a paged server takes a model that declares them, its slots hold
+    no prediction cache, and every row is the lone task call's."""
+    from dew.sampling.strategies import Beam, Speculative
+    from dew.sampling.text import drafts
+
+    assert not drafts(Sample()) and not drafts(Beam()) and drafts(Speculative())
+    model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(bound, kv_cache=KVCache(page_size=16, pages=12))
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+    held = jax.tree_util.tree_flatten_with_path(server.cache)[0]
+    assert not [path for path, _ in held if "mtp" in jax.tree_util.keystr(path).lower()]
 
 
 @pytest.mark.mesh(devices=4)

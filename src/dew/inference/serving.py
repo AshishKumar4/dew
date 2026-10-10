@@ -114,7 +114,7 @@ from dew.objectives.base import Variables
 from dew.sampling.decoding import LogitsTransform, Stopping
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
-from dew.sampling.text import Generation, Sampling, check_inputs, prediction_depths, rebuild_position, resolve
+from dew.sampling.text import Generation, Sampling, check_inputs, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
@@ -471,9 +471,6 @@ class Server:
                                  f"which this model cannot take: {self.mixed_refusal}")
             else:
                 _log.info("the admitting step prefills in a forward of its own: %s", self.mixed_refusal)
-            if isinstance(rows, PagedRows) and prediction_depths(model):
-                raise ValueError("a paged server runs no prediction depths; their cache is seeded "
-                                 "over the whole prompt at once")
             formats = resident_formats(
                 model, self.variables, self.pad_id, rows.placement, decode_steps, shapes,
                 state_shardings(self.mesh, shapes), self._admitted, transforms, stopping, grammar)
