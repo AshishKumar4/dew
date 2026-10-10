@@ -137,8 +137,8 @@ def test_checkpointed_passes_preserve_loss_and_gradients(rng, backprop_steps, sc
 def test_checkpointed_passes_reduce_the_backward_storage(rng):
     """CPU's compiled temporary storage compares the same fp32 backward at
     two rows of 64 tokens, width 128 and MLP width 512. Every pass, including
-    the first, also has one checkpoint in the forward jaxpr; this remains
-    the check when an XLA allocation schedule hides the storage saving.
+    the first, also has one checkpoint containing its matrix products in
+    the forward jaxpr. Norm and activation checkpoints contain no products.
     """
     loop = Loop(3, layers=(1, 3), step_norm=False, remat=False)
     plain = tiny(num_layers=4, emb_features=128, mlp_features=512, max_seq_len=64,
@@ -154,13 +154,13 @@ def test_checkpointed_passes_reduce_the_backward_storage(rng):
         executable = jax.jit(jax.value_and_grad(loss)).lower(params).compile()
         sizes.append(executable.memory_analysis().temp_size_in_bytes)
         program = jax.make_jaxpr(loss)(params).jaxpr
-        boundaries.append(sum(equation.primitive.name == "remat2" for equation in program.eqns))
+        boundaries.append(sum(
+            equation.primitive.name == "remat2" and any(
+                body.primitive.name == "dot_general" for body in equation.params['jaxpr'].eqns)
+            for equation in program.eqns))
     print(f"loop temp bytes: plain={sizes[0]}, remat={sizes[1]}; checkpoints={boundaries}")
     assert boundaries == [0, loop.steps]
-    if sizes[1] < sizes[0]:
-        assert sizes[1] < sizes[0]
-    else:
-        print("CPU allocation did not shrink; the jaxpr proves one checkpoint per pass")
+    assert sizes[1] < sizes[0]
 
 
 @pytest.mark.parametrize("scan_layers", [False, True])
@@ -176,9 +176,12 @@ def test_checkpointed_passes_leave_decode_and_its_collections_unchanged(rng, sca
     expected, actual = decoded(plain, params, ids), decoded(checkpointed, params, ids)
     jax.tree.map(np.testing.assert_array_equal, actual, expected)
     assert sorted(actual[1]) == [f'layers_{index}' for index in range(8)]
-    program = jax.make_jaxpr(lambda tree: checkpointed.apply(
-        tree, ids[:, :1], decode=True, mutable=['cache']))(params).jaxpr
-    assert not any(equation.primitive.name == "remat2" for equation in program.eqns)
+    boundaries = []
+    for model in (plain, checkpointed):
+        program = jax.make_jaxpr(lambda tree, model=model: model.apply(
+            tree, ids[:, :1], decode=True, mutable=['cache']))(params).jaxpr
+        boundaries.append(sum(equation.primitive.name == "remat2" for equation in program.eqns))
+    assert boundaries[0] == boundaries[1]
 
 
 def test_with_passes_sets_memory_options_and_keeps_unspecified_ones():

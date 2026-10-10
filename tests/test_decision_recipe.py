@@ -314,7 +314,7 @@ def test_a_decision_run_keeps_its_loop_memory_options_under_lora(tmp_path):
              "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
              "--max-len", "128", "--no-calibrate", "--loop-steps", "3", "--loop-layers", "1", "2",
              "--loop-backprop-steps", "1", "--loop-remat", "--remat", "minimal"]
-    config = DecisionRunConfig.cli(flags)
+    config = DecisionRunConfig.cli(flags, default=_module("clef").run_config())
     assert (config.loop_backprop_steps, config.loop_remat, config.remat) == (1, True, "minimal")
     config.run()
     backbone = Decide.from_run(str(tmp_path / "runs" / "run")).model.backbone
