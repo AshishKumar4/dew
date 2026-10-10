@@ -12,7 +12,7 @@ import numpy as np
 
 from dew.data.compile import compile
 from dew.data.dataset import Batch, Dataset, Loading
-from dew.data.pipeline import HostStep, ObjectiveData, Pipeline, Stage
+from dew.data.pipeline import Artifact, Filter, FlatMap, HostStep, Map, Mixture, ObjectiveData, Pack, Pipeline, RandomMap, Stage, Windows
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.chat import PreferencePair, RenderChat, RenderPrompt
 from dew.data.steps.generic import Formatting
@@ -197,7 +197,7 @@ class Text:
     seq_len: int = 256
     field: str = "text"
     eos: bool = False
-    pack: Literal["first-fit", "best-fit", "concat"] = "concat"
+    pack: Literal["first-fit", "best-fit", "concat"] | None = None
     packing_bins: int = 8
     validation: Validation = None
     split: str = "train"
@@ -205,10 +205,14 @@ class Text:
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         prefix = Pipeline(_source(self.source)).map(Tokenize(self.tokenizer, self.field, self.eos)).stages
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
-        train = train.flat_map(Chunks(self.seq_len + 1)).pack(self.seq_len + 1, bins=self.packing_bins,
-                                                           policy=self.pack)
-        held = None if held is None else held.flat_map(Chunks(self.seq_len + 1)).pack(
-            self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+        if self.pack is None:
+            train = train.windows(self.seq_len)
+            held = None if held is None else held.windows(self.seq_len)
+        else:
+            train = train.flat_map(Chunks(self.seq_len + 1)).pack(self.seq_len + 1, bins=self.packing_bins,
+                                                               policy=self.pack)
+            held = None if held is None else held.flat_map(Chunks(self.seq_len + 1)).pack(
+                self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
         return train, held, ()
 
 
@@ -329,7 +333,7 @@ class Video:
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         train, held = _branches(self.source, self.validation, split=self.split, prefix=())
         audio = Audio(self.audio_model)
-        decoder = DecodeClip(self.frames, self.frame_size, self.audio_padding, audio._processor().sampling_rate)
+        decoder = DecodeClip(self.frames, self.frame_size, self.audio_padding, audio.processor.sampling_rate)
         train = train.random_map(decoder).map(audio)
         held = None if held is None else held.map(FixedClip(decoder), audio)
         return train, held, (EncodeCaptions(),)
@@ -355,9 +359,24 @@ def load(recipe: Recipe | str, *, batch: int, read: Read = "indexed", provision:
     if not isinstance(recipe, Recipe):
         raise TypeError("load expects a typed recipe with pipelines()")
     train, held, shared = recipe.pipelines()
-    train = train.shuffle(seed).repeat().batch(batch)
+    train = _ordered(train, read, seed).batch(batch)
     if isinstance(recipe, Images):
         train = train.map_batch(*recipe.train_batch())
     held = None if held is None else held.batch(batch, drop_remainder=False)
     return compile(train, validation=held, host=(*shared, *host), objective=objective,
                    read=read, provision=provision, loading=loading, seed=seed)
+
+
+def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
+    if isinstance(pipeline.source, Mixture):
+        children = tuple(_ordered(child, read, seed) for child in pipeline.source.pipelines)
+        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+    if read == "memory":
+        at = next((index for index, stage in enumerate(pipeline.stages)
+                   if isinstance(stage, RandomMap)), len(pipeline.stages))
+        order = Pipeline(pipeline.source).shuffle(seed).repeat().stages
+    else:
+        cache = next((index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Artifact)), -1)
+        at = cache + 1
+        order = Pipeline(pipeline.source).shuffle(seed, window=64 if read == "streamed" or cache >= 0 else None).repeat().stages
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *order, *pipeline.stages[at:]))

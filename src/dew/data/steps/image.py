@@ -123,10 +123,10 @@ class DeviceAugment:
     def __call__(self, batch: Batch) -> Batch:
         fields = dict(batch)
         keys = fields.pop("image_augmentation_key")
-        fields["image"] = self._run()(fields["image"], keys)
+        fields["image"] = self._run(fields["image"], keys)
         return fields
 
-    @functools.cache
+    @functools.cached_property
     def _run(self):
         import jax
 
