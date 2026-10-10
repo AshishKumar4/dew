@@ -51,6 +51,7 @@ def join_parts(root: Path, parts: list[str], target: Path, expected: str) -> Non
     digest = hashlib.sha256()
     try:
         with temporary.open("wb") as destination:
+            os.fchmod(destination.fileno(), 0o600)
             for name in parts:
                 if Path(name).name != name:
                     raise ValueError("input part escapes staging")
@@ -231,6 +232,13 @@ class Batch:
             command(["git", "-C", str(self.repo), "update-ref", "refs/colab/" + key, sha], timeout=30)
         for target, source in self.plan["uploads"].items():
             join_parts(self.root, source["parts"], Path(target).expanduser(), source["sha256"])
+        from tools.colab.credentials import environment as private_environment
+        os.environ.update(private_environment(self.plan))
+        if self.plan.get("data_sources"):
+            from tools.colab.data_cache import DataCache
+            for source in self.plan["data_sources"]:
+                cache = DataCache(source["endpoint"], Path("/content/.dew-data.token"))
+                cache.restore(source["prefix"], source["manifest_sha256"], Path(source["target"]))
         if shutil.which("uv") is None:
             command([sys.executable, "-m", "pip", "install", "uv"], timeout=300)
 

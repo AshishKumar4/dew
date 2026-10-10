@@ -1,12 +1,12 @@
-"""Data-cache publication and restore through an in-memory HTTP boundary."""
+"""VM-only data restore against a fake remote builder's published manifest."""
 import hashlib
 import json
-from pathlib import Path
 
 import pytest
 import requests
 
-from tools.colab.common import read, save
+from tools.colab import colab_batch
+from tools.colab.common import save
 from tools.colab.data_cache import DataCache
 
 
@@ -14,17 +14,19 @@ from tools.colab.data_cache import DataCache
 def service(tmp_path, monkeypatch):
     token = tmp_path / "private-token"
     token.write_text("secret")
-    objects = {}
+    payload = b"remote-built rows\n"
+    manifest = {"schema": 1, "name": "decision/mix-v3", "dew": "build-sha", "files": [{
+        "path": "nested/rows.jsonl", "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}]}
+    body = json.dumps(manifest).encode()
+    objects = {"decision/mix-v3/manifest.json": body, "decision/mix-v3/nested/rows.jsonl": payload}
     calls = []
 
     class Response:
         def __init__(self, content=b"", status=200):
-            self.content = content
-            self.status_code = status
-            self.headers = {"Content-Length": str(len(content))}
+            self.content, self.status_code = content, status
 
         def raise_for_status(self):
-            if self.status_code not in (200, 204):
+            if self.status_code != 200:
                 raise requests.HTTPError(str(self.status_code))
 
         def json(self):
@@ -40,100 +42,88 @@ def service(tmp_path, monkeypatch):
         def __exit__(self, *args):
             return False
 
-    def request(method, url, **kwargs):
+    def get(url, **kwargs):
         assert kwargs["headers"]["Authorization"] == "Bearer secret"
         key = url.removeprefix("https://fake.invalid/")
-        calls.append((method, key))
-        if method == "PUT":
-            body = kwargs["data"]
-            if not isinstance(body, bytes):
-                collected = []
-                while block := body.read(32):
-                    collected.append(block)
-                body = b"".join(collected)
-            assert int(kwargs["headers"]["Content-Length"]) == len(body)
-            objects[key] = body
-            return Response(status=204)
+        calls.append(key)
         return Response(objects[key]) if key in objects else Response(status=404)
 
-    monkeypatch.setattr(requests, "request", request)
-    monkeypatch.setattr(requests, "put", lambda url, **kwargs: request("PUT", url, **kwargs))
-    return DataCache("https://fake.invalid", token), objects, calls
+    def reject(*args, **kwargs):
+        raise AssertionError("restore must never publish data")
+
+    monkeypatch.setattr(requests, "get", get)
+    monkeypatch.setattr(requests, "put", reject)
+    return DataCache("https://fake.invalid", token), objects, hashlib.sha256(body).hexdigest(), calls
 
 
-def staged(tmp_path):
-    first, second = b"hello", b"world"
-    chunks = {"first.part": first, "second.part": second}
-    for name, content in chunks.items():
-        (tmp_path / name).write_bytes(content)
-    plan = {"uploads": {"/content/data/rows.jsonl": {"sha256": hashlib.sha256(first + second).hexdigest(),
-                        "parts": list(chunks)}}, "staged_files": {
-                        name: hashlib.sha256(value).hexdigest() for name, value in chunks.items()}}
-    save(tmp_path / "plan.json", plan)
-    return plan
+def test_vm_restores_whole_objects_from_a_pinned_manifest(tmp_path, service):
+    cache, _, identity, calls = service
+    manifest = cache.restore("decision/mix-v3", identity, tmp_path / "vm")
+    assert (tmp_path / "vm/nested/rows.jsonl").read_bytes() == b"remote-built rows\n"
+    assert manifest["dew"] == "build-sha" and len(calls) == 2
 
 
-def test_publish_and_restore_preserve_verified_bytes_without_rebuilding(tmp_path, service):
-    cache, _, calls = service
-    staged(tmp_path)
-    receipt = cache.publish(tmp_path, "/content/data/", name="mix", output=tmp_path / "receipt.json", rate=0)
-    manifest = cache.restore(receipt["manifest_sha256"], tmp_path / "vm")
-    assert (tmp_path / "vm/rows.jsonl").read_bytes() == b"helloworld"
-    assert receipt["bytes"] == 10 and receipt["files"] == 1 and manifest["name"] == "mix"
-    assert "secret" not in (tmp_path / "receipt.json").read_text()
-    assert any(method == "HEAD" for method, _ in calls)
-
-
-def test_second_publication_deduplicates_parts_by_content(tmp_path, service):
-    cache, _, calls = service
-    staged(tmp_path)
-    cache.publish(tmp_path, "/content/data/", name="mix", output=tmp_path / "receipt.json", rate=0)
-    before = len([call for call in calls if call[0] == "PUT" and call[1].startswith("parts/")])
-    receipt = cache.publish(tmp_path, "/content/data/", name="mix", output=tmp_path / "receipt.json", rate=0)
-    assert len([call for call in calls if call[0] == "PUT" and call[1].startswith("parts/")]) == before
-    assert set(receipt["parts"].values()) == {"existing"}
-
-
-def test_changed_staged_part_is_rejected_before_upload(tmp_path, service):
-    cache, objects, _ = service
-    staged(tmp_path)
-    (tmp_path / "first.part").write_bytes(b"tampered")
-    with pytest.raises(ValueError, match="changed"):
-        cache.publish(tmp_path, "/content/data/", name="mix", output=tmp_path / "receipt.json", rate=0)
-    assert objects == {}
-
-
-@pytest.mark.parametrize("manifest_bad", [False, True])
-def test_corruption_never_overwrites_existing_vm_file(tmp_path, service, manifest_bad):
-    cache, objects, _ = service
-    staged(tmp_path)
-    receipt = cache.publish(tmp_path, "/content/data/", name="mix", output=tmp_path / "receipt.json", rate=0)
-    key = receipt["manifest_key"] if manifest_bad else next(key for key in objects if key.startswith("parts/"))
-    objects[key] = b"corrupted"
-    (tmp_path / "vm").mkdir()
-    destination = tmp_path / "vm/rows.jsonl"
+@pytest.mark.parametrize("which", ["manifest.json", "nested/rows.jsonl"])
+def test_corruption_never_overwrites_existing_vm_file(tmp_path, service, which):
+    cache, objects, identity, _ = service
+    objects["decision/mix-v3/" + which] = b"corrupted"
+    destination = tmp_path / "vm/nested/rows.jsonl"
+    destination.parent.mkdir(parents=True)
     destination.write_bytes(b"old")
-    with pytest.raises(ValueError, match="checksum|manifest size"):
-        cache.restore(receipt["manifest_sha256"], tmp_path / "vm")
-    assert destination.read_bytes() == b"old" and list((tmp_path / "vm").glob(".*")) == []
+    with pytest.raises(ValueError, match="checksum"):
+        cache.restore("decision/mix-v3", identity, tmp_path / "vm")
+    assert destination.read_bytes() == b"old" and list(destination.parent.glob(".*")) == []
 
 
-def test_include_selects_index_without_publishing_other_inputs(tmp_path, service):
-    cache, _, _ = service
-    plan = staged(tmp_path)
-    plan["uploads"]["/content/data/private-token"] = plan["uploads"]["/content/data/rows.jsonl"]
-    save(tmp_path / "plan.json", plan)
-    receipt = cache.publish(tmp_path, "/content/data/", name="index", output=tmp_path / "receipt.json",
-                            rate=0, include=("rows.jsonl",))
-    manifest = read(tmp_path / "receipt-manifest.json")
-    assert receipt["files"] == 1 and manifest["files"][0]["path"] == "rows.jsonl"
+def test_oversized_stream_is_rejected_before_promotion(tmp_path, service):
+    cache, objects, identity, _ = service
+    objects["decision/mix-v3/nested/rows.jsonl"] *= 3
+    with pytest.raises(ValueError, match="exceeds"):
+        cache.restore("decision/mix-v3", identity, tmp_path / "vm")
+    assert not (tmp_path / "vm/nested/rows.jsonl").exists()
 
 
-def test_manifest_cannot_escape_vm_target(tmp_path, service):
-    cache, objects, _ = service
-    manifest = json.dumps({"schema": 1, "files": [{"path": "../escape", "parts": [], "sha256": "a" * 64}]}).encode()
-    identity = hashlib.sha256(manifest).hexdigest()
-    objects["manifests/" + identity] = manifest
+@pytest.mark.parametrize("path", ["../escape", "/escape", ""])
+def test_manifest_cannot_escape_vm_target(tmp_path, service, path):
+    cache, objects, _, _ = service
+    manifest = json.loads(objects["decision/mix-v3/manifest.json"])
+    manifest["files"][0]["path"] = path
+    body = json.dumps(manifest).encode()
+    objects["decision/mix-v3/manifest.json"] = body
     with pytest.raises(ValueError, match="escapes"):
-        cache.restore(identity, tmp_path / "vm")
-    assert not (tmp_path / "escape").exists()
+        cache.restore("decision/mix-v3", hashlib.sha256(body).hexdigest(), tmp_path / "vm")
+
+
+def test_symlink_parent_is_rejected(tmp_path, service):
+    cache, _, identity, _ = service
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "vm").mkdir()
+    (tmp_path / "vm/nested").symlink_to(tmp_path / "outside", target_is_directory=True)
+    with pytest.raises(ValueError, match="symlink"):
+        cache.restore("decision/mix-v3", identity, tmp_path / "vm")
+    assert list((tmp_path / "outside").iterdir()) == []
+
+
+def test_staging_sends_only_manifest_identity_and_scoped_credential(tmp_path, service):
+    _, _, identity, _ = service
+    descriptor = tmp_path / "data.json"
+    save(descriptor, {"url": "https://fake.invalid", "token_file": str(tmp_path / "private-token"), "sources": [
+        {"prefix": "decision/mix-v3", "manifest_sha256": identity, "target": "/content/data"}]})
+    job = {**colab_batch.data_inputs({"data_inputs": str(descriptor)}), "index": 1,
+           "entry": {"fields": {"command": "run"}}, "resume_key": "unused", "artifact_policy": "measurements"}
+    plan = {"jobs": [job], "uploads": {}}
+    colab_batch.stage_inputs(plan, tmp_path)
+    assert list(plan["uploads"]) == ["/content/.dew-data.token"]
+    assert plan["data_sources"][0]["manifest_sha256"] == identity
+    assert "secret" not in json.dumps(plan)
+
+
+def test_local_inputs_must_not_shadow_r2_data(tmp_path, service):
+    _, _, identity, _ = service
+    local = tmp_path / "rows.jsonl"
+    local.write_bytes(b"must not stage")
+    job = {"index": 1, "data_sources": [{"target": "/content/data", "manifest_sha256": identity}],
+           "data_token_file": str(tmp_path / "private-token"), "entry": {"fields": {
+           "command": "run", "inputs": f"{local} to /content/data"}}, "artifact_policy": "measurements"}
+    with pytest.raises(ValueError, match="must not also be staged"):
+        colab_batch.stage_inputs({"jobs": [job], "uploads": {}}, tmp_path)
