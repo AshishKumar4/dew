@@ -19,8 +19,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
+
+from process_support import prepare_worker
 
 FIXTURE = Path(__file__).parent / "fixtures/hf/qwen2-tiny"
 
@@ -79,20 +80,7 @@ def main(argv=None) -> None:
     parser.add_argument("--publication", choices=("safetensors", "nccl"), default="safetensors")
     parser.add_argument("--library", default="", help="NCCLPush's library path, never opened")
     args = parser.parse_args(argv)
-    if args.coordinator:
-        os.environ.update({
-            "OMPI_MCA_orte_hnp_uri": f"0.0;tcp://{args.coordinator}",
-            "OMPI_COMM_WORLD_SIZE": str(args.processes),
-            "OMPI_COMM_WORLD_RANK": str(args.process_id),
-            "OMPI_COMM_WORLD_LOCAL_RANK": str(args.process_id),
-            "JAX_COORDINATOR_ADDRESS": args.coordinator,
-        })
-    from dew.training.runtime import prepare_process
-
-    if args.coordinator:
-        prepare_process(multi_host=True)
-    else:
-        prepare_process()
+    prepare_worker(args, multi_host=None)
     report = publish(args)
     if args.out is None:
         print("report", json.dumps(report), flush=True)

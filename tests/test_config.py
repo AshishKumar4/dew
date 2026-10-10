@@ -8,8 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 import jax.numpy as jnp
 import pytest
+from affine_run import TimingRegression as Regression, batches
 from flax import linen as nn
-from test_instrumentation import Regression, batches
 
 import dew.config
 import dew.nn.backbones

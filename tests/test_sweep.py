@@ -10,7 +10,7 @@ caller's tracker.
 import json
 
 import pytest
-from test_instrumentation import Regression, batches
+from affine_run import TimingRegression as Regression, batches
 
 from dew.config import RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch, OptunaSearch, RandomSearch

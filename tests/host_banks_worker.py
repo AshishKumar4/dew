@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
+
+from process_support import prepare_worker
 
 VOCAB = 32
 SEQ_LEN = 8
@@ -182,17 +183,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> None:
     args = parse_args(argv)
-    if args.coordinator:
-        os.environ.update({
-            "OMPI_MCA_orte_hnp_uri": f"0.0;tcp://{args.coordinator}",
-            "OMPI_COMM_WORLD_SIZE": str(args.processes),
-            "OMPI_COMM_WORLD_RANK": str(args.process_id),
-            "OMPI_COMM_WORLD_LOCAL_RANK": str(args.process_id),
-            "JAX_COORDINATOR_ADDRESS": args.coordinator,
-        })
-    from dew.training.runtime import prepare_process
-
-    prepare_process(multi_host=bool(args.coordinator))
+    prepare_worker(args)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(MODES[args.mode](args)))
 

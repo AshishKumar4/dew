@@ -10,8 +10,8 @@ import jax
 import numpy as np
 import optax
 import pytest
+from affine_run import TimingRegression as Regression, batches
 from PIL import Image
-from test_instrumentation import Regression, batches
 
 from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
 from dew.data import Dataset

@@ -13,7 +13,6 @@ calls to a real local HTTP endpoint in order.
 import ctypes
 import json
 import os
-import socket
 import subprocess
 import sys
 import threading
@@ -27,6 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from process_support import run_pool as process_pool, start_process
 
 from dew.inference import NCCLPush, OpenAICompletion, OpenAIRolloutServer, Publication, SafetensorsReload
 from dew.interop import Pretrained
@@ -454,30 +454,13 @@ WORKER = Path(__file__).with_name("weight_publication_worker.py")
 
 def run_pool(directory, engine, processes=2, devices=2):
     """`processes` workers pushing one sharded tree to `engine`, and their reports in process order."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        coordinator = f"127.0.0.1:{probe.getsockname()[1]}"
-    environment = {
-        **os.environ,
-        "JAX_PLATFORMS": "cpu",
-        "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src"),
-        "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}",
-    }
-    outs = [directory / f"process{index}.json" for index in range(processes)]
-    running = [subprocess.Popen([sys.executable, str(WORKER), "--out", str(out), "--coordinator", coordinator,
-                                 "--processes", str(processes), "--process-id", str(index),
-                                 "--directory", str(directory / "served"), "--engine", engine],
-                                env=environment, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                start_new_session=True) for index, out in enumerate(outs)]
-    try:
-        logs = [process.communicate(timeout=600)[0] for process in running]
-    finally:
-        for process in running:
-            if process.poll() is None:
-                process.kill()
-    for index, process in enumerate(running):
-        assert process.returncode == 0, f"process {index} exited {process.returncode}\n{logs[index]}"
-    return [json.loads(out.read_text()) for out in outs]
+    def start(script, out, processes, process_id, coordinator):
+        return start_process(
+            [sys.executable, str(script), "--out", str(out), "--coordinator", coordinator,
+             "--processes", str(processes), "--process-id", str(process_id),
+             "--directory", str(directory / "served"), "--engine", engine], devices)
+
+    return process_pool(WORKER, directory, processes, start=start)
 
 
 @pytest.mark.distributed
