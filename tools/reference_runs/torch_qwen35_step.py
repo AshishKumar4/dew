@@ -182,7 +182,7 @@ def smoke_attribution(path: Path) -> dict:
     events = [{"ph": "X", "cat": "user_annotation", "name": "reference.optimizer",
                "pid": 1, "tid": 1, "ts": 60, "dur": 9}]
     names = ["ampere_bf16_s16816gemm", "chunk_gated_delta_rule_fwd_kernel_h",
-             "flash_fwd_kernel", "_rms_norm_forward_kernel", "reduce_kernel",
+             "flash_fwd_kernel", "_rms_norm_forward_kernel", "triton_red_fused_sum_0",
              "Memcpy DtoD", "vectorized_elementwise_kernel", "unrecognized_kernel"]
     for index, name in enumerate(names):
         launch_time = index * 10
