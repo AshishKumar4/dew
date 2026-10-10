@@ -1027,6 +1027,9 @@ class RunConfig:
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
         """The run a class record (`record`) names, as its class, which must be
         this one or derive from it."""
+        if record.get("rebuildable") is False:
+            raise ValueError("this run was defined in Python, so no record rebuilds it; it loads for "
+                             "inference through dew.pipeline or a task's from_run")
         registry.import_trusted(record, trust)
         named = registry.class_record(record)
         if named is None:

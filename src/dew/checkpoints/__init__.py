@@ -67,6 +67,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position, records
 from dew.coordination import broadcast_from_process_zero, from_every_process
+from dew.files import write_atomically
 from dew.nn import sharding
 from dew.nn.sharding import LogicalAxes
 from dew.objectives.base import Variables
@@ -102,8 +103,18 @@ deleted. The step names it relative to the run directory, so a copied run
 still restores."""
 
 RUN_FILE = "run.json"
-"""The run record `RunConfig.save` writes into the run directory, beside the
-step directories, and `dew.io.publish` ships with a step."""
+"""The one file at the root of every run directory, beside its steps, that
+makes it a run: what `dew.pipeline` looks for, locally and on the Hub, and
+what `dew.io.publish` ships with a step. A run built from a config holds the
+class record `RunConfig.save` writes, which rebuilds it; a run defined in
+Python holds `PYTHON_RUN`, which its first checkpoint writes."""
+
+PYTHON_RUN: dict[str, JSON] = {
+    "rebuildable": False,
+    "defined": "in Python: each checkpoint records the inference declaration it loads by, and no record "
+               "rebuilds the run",
+}
+"""The root record of a run defined in Python (`RUN_FILE`)."""
 
 
 def _is_profiles(node) -> bool:
@@ -879,6 +890,14 @@ class Checkpoints:
             retained.append(dataclasses.replace(checkpoint, rankings=copy.deepcopy(checkpoint.rankings)))
         return retained
 
+    def _identify_run(self) -> None:
+        """Write `PYTHON_RUN` at the run's root unless a run record is already there
+        (`RUN_FILE`), as a config's run writes its own before it trains."""
+        root = epath.Path(self.directory)
+        if jax.process_index() == 0 and not (root / RUN_FILE).exists():
+            root.mkdir(parents=True, exist_ok=True)
+            write_atomically(root / RUN_FILE, json.dumps(PYTHON_RUN, indent=2, sort_keys=True))
+
     def artifact(self, step: int | str | None = None) -> JSON:
         """Return the selected step's inference declaration.
 
@@ -1120,6 +1139,8 @@ class Checkpoints:
         """
         persistent = self._open()
         mapping = isinstance(state, Mapping)
+        if not mapping:
+            self._identify_run()
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
                     or artifact is not None):
