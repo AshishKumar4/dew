@@ -74,6 +74,13 @@ jobs:
     - run: pnpm live:check
     - run: pnpm live:test
     - run: pnpm test  # Chrome, which ubuntu-latest has
+    - run: node scripts/shots.mjs shots  # the landing page at 1440 and 390, dark and light
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: shots
+        path: site/shots
+        retention-days: 14
     - uses: actions/upload-artifact@v4
       if: github.event_name != 'pull_request'
       with:
