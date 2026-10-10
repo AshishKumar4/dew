@@ -23,7 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import multihost_utils
 
-from dew.coordination import PeerFailure, agree_process_phase, agreed
+from dew.coordination import PeerFailure, agree_process_phase, agreed, broadcast_from_process_zero
 from dew.nn.inputs import ModelInputs, local_rows
 from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
@@ -576,10 +576,7 @@ class EpisodeRollout:
             return journal_stack.enter_context(journal.open(cohort, fingerprint, binding))
 
         run = agreed("episode journal open", open_journal)
-        origin = np.frombuffer(bytes.fromhex(run.binding), np.uint8)
-        if processes > 1:
-            origin = multihost_utils.broadcast_one_to_all(origin)
-        bound = origin.tobytes().hex()
+        bound = broadcast_from_process_zero(run.binding)
         agreed("episode journal binding", lambda: run.align(bound))
         return run, bound
 
@@ -630,10 +627,7 @@ class EpisodeRollout:
             multihost_utils.assert_equal(
                 signature, "episode task counts, budgets, sampling and clocks must agree"
             )
-        origin = np.frombuffer(uuid4().bytes, np.uint8) if rank == 0 else np.zeros(16, np.uint8)
-        if processes > 1:
-            origin = multihost_utils.broadcast_one_to_all(origin)
-        binding_id = origin.tobytes().hex()
+        binding_id = broadcast_from_process_zero(uuid4().hex if rank == 0 else None)
         policy_step = int(state.updates)
         slots = self._slots(tasks, state, key, rank)
         error = None

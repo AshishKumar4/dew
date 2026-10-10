@@ -9,9 +9,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from jax.experimental import multihost_utils
 
-from dew.coordination import agreed
+from dew.coordination import agreed, from_every_process
 from dew.inference.tasks import Processor, TextGeneration
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.nn.protocols import HiddenStates
@@ -283,10 +282,8 @@ class PPORollout:
                          self.gamma, self.lam)
         returns = np.asarray(returns)
         raw = returns - baselines
-        moments = np.asarray([np.sum(keep), np.sum(raw * keep), np.sum(raw * raw * keep)], np.float64)
-        if jax.process_count() > 1:
-            moments = np.sum(multihost_utils.process_allgather(moments), axis=0)
-        count, total, squares = moments
+        moments = [float(np.sum(keep)), float(np.sum(raw * keep)), float(np.sum(raw * raw * keep))]
+        count, total, squares = np.sum(np.asarray(from_every_process(moments), np.float64), axis=0)
         mean = total / (count + MEAN_EPS)
         variance = (squares - 2 * mean * total + mean * mean * count) / (count + MEAN_EPS)
         advantages = (raw - mean) / np.sqrt(variance * (count / (count - 1)) + WHITEN_EPS)
@@ -304,9 +301,7 @@ class PPORollout:
         """Collect one cohort of episodes and return its packed rows with critic targets."""
         episodes = self.episodes.collect(state, batch, key)
         projected = agreed("PPO episode projection", lambda: self.episodes.project(episodes))
-        count = np.asarray(min(2, np.count_nonzero(projected[RESPONSE_MASK_KEY])), np.int32)
-        if jax.process_count() > 1:
-            count = np.sum(multihost_utils.process_allgather(count))
+        count = sum(from_every_process(min(2, int(np.count_nonzero(projected[RESPONSE_MASK_KEY])))))
         if int(count) == 0:
             # Every episode was masked (truncated): zero mass, so the step makes no update.
             zeros = np.zeros(projected[IDS_KEY].shape, np.float32)
