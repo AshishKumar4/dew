@@ -424,6 +424,12 @@ def _ruled_jvp(primals, tangents):
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
+    def data(self, tokenizer=None, metadata: Mapping[str, object] | None = None):
+        """Record and host-batch steps for the training and evaluation branches."""
+        from dew.data.pipeline import ObjectiveData
+
+        return ObjectiveData()
+
     _inputs: InputSpec | None = None
     variables: Variables | None = None
     """The tree training starts from (a loaded checkpoint, an adapter's
