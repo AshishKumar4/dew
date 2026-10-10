@@ -206,6 +206,22 @@ def test_a_call_the_kernels_cannot_take_runs_the_scan_and_says_why(monkeypatch, 
     assert len(logged) == 1 and reason in logged[0], logged
 
 
+@pytest.mark.parametrize("generation, depth, refused", [
+    ("sm80", 2, None), ("sm89", 1, "outgrow sm89's 99 KB"), ("sm120", 1, "outgrow sm120's 99 KB")])
+def test_a_small_shared_memory_runs_one_stage_and_refuses_wide_keys(monkeypatch, generation, depth, refused):
+    """A generation with 99 KB of shared memory a block compiles the kernels
+    at one pipeline stage, which holds a 64-token chunk of 128-wide keys,
+    and refuses keys twice as wide; an A100 keeps two stages and takes
+    both."""
+    monkeypatch.setattr(kernels.generation, "device_generation", lambda: generation)
+    assert delta_chunks.stages() == depth
+    key, _, u, _, _ = recurrence_operands((1, 1, 2, 64, 128, 128))
+    assert delta_chunks.refusal(key, u) is None
+    wide, _, u, _, _ = recurrence_operands((1, 1, 2, 64, 256, 128))
+    reason = delta_chunks.refusal(wide, u)
+    assert (reason is None) if refused is None else (refused in reason), reason
+
+
 def test_forward_mode_runs_the_scan():
     """The kernels define only a reverse-mode derivative. Under
     `forward_mode_attention`, which a consistency model's `jax.jvp` runs in,
