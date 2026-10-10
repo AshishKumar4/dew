@@ -162,10 +162,11 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         probe = {inputs.sample.key: jnp.zeros((1, *inputs.sample.shape), jnp.int32)}
         _, _, student, teacher = jax.eval_shape(
             self._predictions, tree, probe, Step(jnp.zeros((), jnp.int32), key, None))
-        projections = {}
+        projections = dict(tree["params"].get(PROJECTIONS, {}))
         for index, (own, other) in enumerate(zip(student.hidden, teacher.hidden, strict=True)):
-            if own.shape[-1] != other.shape[-1]:
-                projections[f"projection_{index}"] = nn.initializers.lecun_normal()(
+            name = f"projection_{index}"
+            if own.shape[-1] != other.shape[-1] and name not in projections:
+                projections[name] = nn.initializers.lecun_normal()(
                     jax.random.fold_in(projection_key, index),
                     (own.shape[-1], other.shape[-1]), jnp.float32)
         if projections:
