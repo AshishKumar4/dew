@@ -248,7 +248,10 @@ class GRPOObjective(LMObjective):
         proximal = OLD_LOG_PROBS_KEY in batch
         old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
         weights = batch.get(SESSION_WEIGHTS_KEY)
-        policy, qk = self._packed_scores(params, batch, qk_stats=self.qk_stats)
+        # `packed_log_probs` is the scoring seam a subclass may replace; the QK
+        # collection MuonClip reads comes from the same live forward when asked for.
+        policy, qk = (self._packed_scores(params, batch, qk_stats=True) if self.qk_stats
+                      else (self.packed_log_probs(params, batch), None))
         return _Terms(policy, old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
