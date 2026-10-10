@@ -290,3 +290,27 @@ def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
     assert Objective.row_weights(last, 4).dtype == jnp.float32
     np.testing.assert_array_equal(Objective.row_weights({"x": last["x"]}, 4), np.ones(4, np.float32))
     assert float(Objective.row_mean(jnp.asarray(last["x"]), last).mean()[0]) == 4.0
+
+
+@pytest.mark.parametrize("rule, message", [
+    ({"right": jnp.full((2,), 3.0), "wrong_key": jnp.full((2,), 7.0)}, r"wrong_key.*which no.*miss.*left"),
+    ({"left": jnp.ones(2), "right": {"nested": jnp.ones(2)}}, "miss"),
+    ({"left": jnp.ones(2), "right": jnp.ones((2, 1))}, r"\['right'\] \(2, 1\) for \(2,\)"),
+])
+def test_a_supplied_gradient_binds_by_path_and_refuses_another_tree(rule, message):
+    """A rule of the parameters' leaf count but other keys, nesting or shapes
+    would bind to other parameters; it is refused, naming the paths."""
+    params = {"left": jnp.zeros(2), "right": jnp.zeros(2)}
+    with pytest.raises(ValueError, match=message):
+        jax.grad(lambda p: Objective.with_gradients(jnp.float32(0), rule, p))(params)
+
+
+def test_a_supplied_gradient_binds_each_rule_to_its_own_parameter_in_any_mapping():
+    """Rules bind by name, a FrozenDict's as a dict's, in a dtype of their own."""
+    from flax.core import freeze
+
+    params = {"left": jnp.zeros(2), "right": jnp.zeros(3)}
+    rule = freeze({"right": jnp.arange(3, dtype=jnp.bfloat16), "left": jnp.asarray([5.0, 6.0])})
+    gradient = jax.grad(lambda p: Objective.with_gradients(jnp.float32(0), rule, p))(params)
+    np.testing.assert_array_equal(gradient["left"], [5.0, 6.0])
+    np.testing.assert_array_equal(gradient["right"], [0.0, 1.0, 2.0])
