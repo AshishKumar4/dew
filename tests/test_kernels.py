@@ -143,6 +143,26 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
     assert attention.resolve_implementation('auto', query, query, **call) == chosen
 
 
+@pytest.mark.parametrize("generation", ["sm80", "sm89"])
+def test_tokamax_takes_the_calls_it_takes_before_flash(monkeypatch, generation, without_deterministic_ops):
+    """With tokamax and dew_flash_attn both installed, a call tokamax's Triton
+    kernel takes (heads up to 64 wide, no window, mask or bias) runs it, as
+    fast as FlashAttention-2 on the A100 and faster on the L4, and a wider one
+    runs FlashAttention-2."""
+    from importlib import util
+
+    from dew.nn import attention
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
+    monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    found = util.find_spec
+    monkeypatch.setattr(util, 'find_spec', lambda name: object() if name in ('tokamax', 'dew_flash_attn')
+                        else found(name))
+    chosen = [attention.resolve_implementation('auto', query, query, causal=True)
+              for query in (jnp.zeros((1, 128, 4, width), jnp.bfloat16) for width in (64, 128))]
+    assert chosen == ['triton', 'flash']
+
+
 @pytest.mark.parametrize("generation, installed, call, chosen, refusal", [
     ("sm80", True, {}, "flash", None),
     ("sm80", True, {"causal": True}, "flash", None),
@@ -154,22 +174,27 @@ def test_auto_sends_a_plain_cudnn_call_to_tokamax_when_it_is_installed(monkeypat
     ("sm80", True, {"softcap": 30.0}, "xla", "the call has a logit softcap"),
     ("sm80", True, {"dtype": jnp.float32}, "xla", "the query is float32"),
     ("sm80", False, {}, "cudnn", "dew_flash_attn is not installed"),
-    ("sm89", True, {}, "cudnn", None),
+    ("sm89", True, {}, "flash", None),
+    ("sm89", True, {"head_dim": 192}, "flash", None),
+    ("sm89", True, {"head_dim": 256}, "xla", "the heads are 256 wide"),
+    ("sm90", True, {}, "cudnn", None),
 ])
 def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, caplog, generation, installed,
                                                                 call, chosen, refusal,
                                                                 without_deterministic_ops):
     """With dew_flash_attn installed, 'auto' takes FlashAttention-2 where it
     was measured faster than cuDNN, for a bf16 call with no window, mask, bias
-    or softcap, heads up to 256 wide and a square causal mask if any. A call
-    it turns down there logs why, once however often it is traced; on a
-    device where it was not measured, nothing is logged."""
+    or softcap, heads up to 256 wide on sm80 and 192 elsewhere, whose backward
+    takes no wider, and a square causal mask if any. A call it turns down
+    there logs why, once however often it is traced; on a device where it was
+    not measured, nothing is logged."""
     from importlib import util
 
     from dew.nn import attention
     monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
     monkeypatch.setattr(attention, 'bf16_dot_runs', lambda: True)
     monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    monkeypatch.setattr(attention, 'device_generation', lambda: generation)
     monkeypatch.setattr(kernels.generation, '_logged', set())
     found = util.find_spec
     monkeypatch.setattr(util, 'find_spec', lambda name: (object() if installed else None)
@@ -178,7 +203,7 @@ def test_auto_sends_a_plain_call_to_flash_where_it_was_measured(monkeypatch, cap
     key = jnp.zeros((1, call.pop("keys", 128), *query.shape[2:]), query.dtype)
     assert [attention.resolve_implementation('auto', query, key, **call) for _ in range(2)] == [chosen] * 2
     logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
-    measured = f"attention runs {chosen!r}, not 'flash', the kernel measured fastest on sm80"
+    measured = f"attention runs {chosen!r}, not 'flash', the kernel measured fastest on {generation}"
     assert logged == ([] if refusal is None else [f"{measured}: {refusal}"])
 
 

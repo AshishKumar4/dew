@@ -69,8 +69,8 @@ the dew_flash_attn wheel (docs/installation.md). 'tpu' is the
 pallas splash kernel, with the older pallas flash kernel behind it for the
 calls splash's mask descriptor cannot carry.
 'auto', every module's default, resolves per trace (`resolve_implementation`):
-flash where `flash_refusal` finds none; triton where cudnn's kernel runs and
-`triton_runs`; cudnn where its kernel runs; tpu where splash's does;
+triton where cudnn's kernel runs and `triton_runs`; flash where
+`flash_refusal` finds none; cudnn where its kernel runs; tpu where splash's does;
 the reference path where the call asks for arithmetic only it honours; and
 xla anywhere else. A call off the kernel `KERNELS` measured fastest on the
 device is logged once a process with the reason (`ran_kernel`).
@@ -799,22 +799,27 @@ def triton_runs(query, sliding_window=None, mask=None, bias=None) -> bool:
 
 
 FLASH_MAX_HEAD_DIM = 256
+# Its backward takes heads up to 192 wide off sm80: "FlashAttention backward for head dim > 192
+# requires A100/A800 or H100/H800", measured on an RTX 4080.
+FLASH_MAX_BACKWARD_HEAD_DIM = 192
 
 
 def flash_refusal(query, key, causal=False, sliding_window=None, mask=None, bias=None, softcap=None,
                   sinks=None) -> str | None:
     """Why 'auto' does not send a call to FlashAttention-2 (`flash_attention`),
     or None where it does: `KERNELS` names it for the GPU, the query is bf16
-    or fp16 with heads a multiple of 8 up to 256 wide, a causal call is
-    square, the call has no window, mask, bias, softcap or sinks, no
-    deterministic ops are asked for, which its backward's atomic sum of the
-    query gradient would not keep, and dew_flash_attn is installed."""
+    or fp16 with heads a multiple of 8 up to 256 wide (192 off sm80, whose
+    backward alone takes wider ones), a causal call is square, the call has
+    no window, mask, bias, softcap or sinks, no deterministic ops are asked
+    for, which its backward's atomic sum of the query gradient would not
+    keep, and dew_flash_attn is installed."""
     head_dim = query.shape[-1]
+    widest = FLASH_MAX_HEAD_DIM if device_generation() == 'sm80' else FLASH_MAX_BACKWARD_HEAD_DIM
     return first_refusal(
         (jax.default_backend() == 'gpu' and measured_kernel('attention', 'cudnn') == 'flash',
          "KERNELS names it for no other device"),
         (query.dtype in CUDNN_DTYPES, f"the query is {query.dtype}"),
-        (head_dim % 8 == 0 and head_dim <= FLASH_MAX_HEAD_DIM, f"the heads are {head_dim} wide"),
+        (head_dim % 8 == 0 and head_dim <= widest, f"the heads are {head_dim} wide"),
         (not causal or query.shape[-3] == key.shape[-3], "a causal call has more keys than queries"),
         (sliding_window is None, "the call has a sliding window"),
         (mask is None, "the call has a mask"),
@@ -1410,11 +1415,11 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
     backend (both 'auto' and 'xla' take the reference path where jax.nn's
     xla kernel would narrow the call, `_xla_kernel_narrows`): the reference
     path when the call asks for arithmetic no fused kernel performs
-    (`reference_only`), else flash where `flash_refusal` has no refusal,
-    cudnn where `cudnn_runs` and the call has no sinks and no bidirectional
-    window (triton in its place where `triton_runs`), the tpu kernel where
-    `tpu_runs`, and xla anywhere else; a call off flash where it was measured
-    fastest is logged (`ran_kernel`). Any other name is returned as it is,
+    (`reference_only`), else triton where `triton_runs` and cudnn's kernel
+    would take the call, flash where `flash_refusal` has no refusal, cudnn
+    where `cudnn_runs` and the call has no sinks and no bidirectional window,
+    the tpu kernel where `tpu_runs`, and xla anywhere else; a call off flash
+    where it was measured fastest is logged (`ran_kernel`). Any other name is returned as it is,
     so an explicit kernel still refuses what it cannot honour by name.
     """
     if implementation not in ('auto', 'reference', 'xla', 'cudnn', 'triton', 'flash', 'tpu'):
@@ -1425,14 +1430,20 @@ def resolve_implementation(implementation, query, key, *, dtype=None, precision=
         return implementation
     if reference_only(query, dtype, precision, force_fp32_for_softmax):
         return 'reference'
-    refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks)
-    if refusal is None:
-        return 'flash'
     # cuDNN keeps a window behind the query only (jax.nn.dot_product_attention
     # refuses a right window without the causal mask), so a bidirectional
     # window goes past it.
-    if sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None):
-        chosen = 'triton' if triton_runs(query, sliding_window, mask, bias) else 'cudnn'
+    fused = sinks is None and cudnn_runs(query, softcap) and (causal or sliding_window is None)
+    # tokamax's Triton kernel, where it is installed and takes the call, ran
+    # SimpleDiT-B's 64-wide heads as fast as FlashAttention-2 on the A100 and
+    # faster on the L4.
+    if fused and triton_runs(query, sliding_window, mask, bias):
+        return 'triton'
+    refusal = flash_refusal(query, key, causal, sliding_window, mask, bias, softcap, sinks)
+    if refusal is None:
+        return 'flash'
+    if fused:
+        chosen = 'cudnn'
     elif tpu_runs(query, key, causal=causal, sliding_window=sliding_window, mask=mask, bias=bias):
         chosen = 'tpu'
     else:
