@@ -23,11 +23,14 @@ from dew.interop.families.gpt_oss import GPT_OSS
 from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
+from dew.interop.families.mamba import MAMBA
 from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA
+from dew.interop.families.mimo import MIMO_V2_FLASH
 from dew.interop.families.modernbert import MODERNBERT
 from dew.interop.families.nemotron_h import NEMOTRON_H
 from dew.interop.families.olmo import OLMO3
 from dew.interop.families.opt import OPT
+from dew.interop.families.ouro import OURO
 from dew.interop.families.phi import PHI
 from dew.interop.families.phi3 import PHI3
 from dew.interop.families.qwen import (
@@ -43,6 +46,7 @@ from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
+    OURO,
     BLOOM,
     GPT_NEO,
     PHI,
@@ -50,6 +54,7 @@ ENTRIES = (
     FALCON,
     PHI3,
     MINIMAX_M2,
+    MIMO_V2_FLASH,
     MODERNBERT,
     NEMOTRON_H,
     STARCODER2,
@@ -90,6 +95,7 @@ ENTRIES = (
     GRANITEMOE,
     MIXTRAL,
     MISTRAL,
+    MAMBA,
     DecoderFamily(
         ("mamba2",),
         mamba2.config_from_hf,

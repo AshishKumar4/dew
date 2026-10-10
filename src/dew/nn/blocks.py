@@ -14,7 +14,7 @@ from jax.typing import DTypeLike
 from .attention import RMSNorm
 from .conv import Conv
 from .precision import at_least_fp32
-from .sharding import constrain
+from .sharding import constrain, explicit_spec, whole_spec
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -29,12 +29,19 @@ def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
     return {} if default is None else {"kernel_init": default}
 
 
-@partial(jax.custom_vjp, nondiff_argnums=(2,))
-def table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
+def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     """`table[ids]` in `dtype`, the table's rows gathered before the cast so
     the gradient accumulates in the table's dtype: casting the table first
-    would scatter-add repeated tokens' cotangents in bf16."""
-    return jnp.take(table, ids, axis=0).astype(dtype)
+    would scatter-add repeated tokens' cotangents in bf16. Under an Explicit
+    axis splitting the ids, the rows are placed as the ids are."""
+    placed = explicit_spec(ids, table.ndim - 1)
+    rows = jnp.take(table, ids, axis=0) if placed is None else table.at[ids].get(out_sharding=placed)
+    return rows.astype(dtype)
+
+
+# `jax.custom_vjp` is generic in its return type, and a `functools.partial`
+# decorator loses that binding, so it is built by hand, as `ssd_chunk_scan` is.
+table_rows = jax.custom_vjp(_table_rows, nondiff_argnums=(2,))
 
 
 def _table_rows_forward(table: jax.Array, ids: jax.Array, dtype: Dtype):
@@ -51,11 +58,24 @@ def _table_rows_backward(dtype: Dtype, residuals: tuple[jax.Array, jax.Array],
     # decided by the rows. Where the rows are the smaller, every device
     # gathers all of them, in the compute dtype, and scatters them itself,
     # into its copy of the table or its shard of the vocabulary, and the
-    # gradient needs no sum.
+    # gradient needs no sum. An Explicit axis splitting the rows is in their
+    # type, which a constraint leaves alone, so they are resharded whole.
     if cotangent.size * cotangent.dtype.itemsize < table.size * table.dtype.itemsize:
-        cotangent = constrain(cotangent, (None,) * cotangent.ndim)
-        ids = constrain(ids, (None,) * ids.ndim)
-    return jnp.zeros_like(table).at[ids].add(cotangent.astype(table.dtype)), None
+        cotangent, ids = _whole(cotangent), _whole(ids)
+    rows = cotangent.astype(table.dtype)
+    placed = explicit_spec(ids)
+    if placed is None:
+        return jnp.zeros_like(table).at[ids].add(rows), None
+    # Each device scatters its own rows and the sums are added across the axis.
+    summed = jax.sharding.NamedSharding(placed.mesh, jax.typeof(table).sharding.spec)
+    return jnp.zeros_like(table).at[ids].add(rows, out_sharding=summed), None
+
+
+def _whole(x: jax.Array) -> jax.Array:
+    """`x` on every device: resharded where an Explicit axis splits it, and
+    constrained over the Auto axes."""
+    placed = whole_spec(x, x.ndim)
+    return constrain(x if placed is None else jax.sharding.reshard(x, placed), (None,) * x.ndim)
 
 
 table_rows.defvjp(_table_rows_forward, _table_rows_backward)

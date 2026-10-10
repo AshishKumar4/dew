@@ -10,8 +10,11 @@ the numpy position table.
 import math
 
 import einops
+import jax
 import jax.numpy as jnp
 import numpy as np
+
+from .sharding import rows_spec
 
 
 def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:
@@ -106,10 +109,14 @@ def patchify(x: jnp.ndarray, patch_size: int) -> jnp.ndarray:
 
 
 def unpatchify(x: jnp.ndarray, patch_size: int, H: int, W: int, C: int) -> jnp.ndarray:
-    """Row-major patches `[B, (H/p) * (W/p), p * p * C]` back to `[B, H, W, C]`."""
+    """Row-major patches `[B, (H/p) * (W/p), p * p * C]` back to `[B, H, W, C]`,
+    as `einops.rearrange(x, 'b (h w) (p1 p2 c) -> b (h p1) (w p2) c')`, the
+    rows placed as `x`'s are (an Explicit axis splitting them is kept)."""
     H_P, W_P = H // patch_size, W // patch_size
-    return einops.rearrange(
-        x, 'b (h w) (p1 p2 c) -> b (h p1) (w p2) c', h=H_P, w=W_P, p1=patch_size, p2=patch_size, c=C)
+    grid = (x.shape[0], H_P, W_P, patch_size, patch_size, C)
+    patches = jax.lax.reshape(x, grid, out_sharding=rows_spec(x, len(grid)))
+    image = jnp.transpose(patches, (0, 1, 3, 2, 4, 5))
+    return jax.lax.reshape(image, (x.shape[0], H, W, C), out_sharding=rows_spec(x, 4))
 
 
 def pixel_unshuffle(x: jnp.ndarray) -> jnp.ndarray:

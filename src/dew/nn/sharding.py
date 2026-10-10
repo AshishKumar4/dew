@@ -489,10 +489,70 @@ def constrain(x: jax.Array, axes: LogicalAxes) -> jax.Array:
     across the fsdp axis, rounded before the sum, instead of gathering the
     weight. With it fsdp gathers weights and splits rows, as fully sharded
     data parallelism is defined. No mesh in context leaves `x` as it is, and
-    under a pipeline's vmap the stage axis takes the vmapped dimension."""
-    if jax.sharding.get_abstract_mesh().empty:
+    under a pipeline's vmap the stage axis takes the vmapped dimension. An
+    Explicit axis stays where `x`'s type places it (`auto_part`)."""
+    mesh = jax.sharding.get_abstract_mesh()
+    if mesh.empty:
         return x
-    return jax.lax.with_sharding_constraint(x, logical_spec(axes, x.shape))
+    return jax.lax.with_sharding_constraint(x, auto_part(logical_spec(axes, x.shape), mesh))
+
+
+def auto_part(spec: jax.sharding.PartitionSpec,
+              mesh: jax.sharding.Mesh | jax.sharding.AbstractMesh) -> jax.sharding.PartitionSpec:
+    """`spec` over `mesh`'s Auto axes alone, which is what a sharding
+    constraint may name: an array's type carries its Explicit axes
+    (`MeshSpec.explicit`), placed by the operations that made it."""
+    explicit = set(mesh.explicit_axes)
+    if not explicit:
+        return spec
+    kept = [tuple(axis for axis in mesh_axes(entry) if axis not in explicit) for entry in spec]
+    return jax.sharding.PartitionSpec(*(axes[0] if len(axes) == 1 else axes or None for axes in kept))
+
+
+def explicit_spec(x: jax.Array, trailing: int = 0) -> jax.sharding.NamedSharding | None:
+    """Where `x`'s type places it, over its dimensions and `trailing` more
+    left whole, when an Explicit axis splits it (`MeshSpec.explicit`); None
+    otherwise. An operation JAX cannot place from its operands' types (a
+    gather, a scatter, a reshape that splits a split dimension, a repeat)
+    takes it as its `out_sharding`; None leaves the operation as it was."""
+    sharding = jax.typeof(x).sharding
+    if not isinstance(sharding, jax.sharding.NamedSharding):
+        return None
+    explicit = set(sharding.mesh.explicit_axes)
+    spec = tuple(sharding.spec)
+    if not any(axis in explicit for entry in spec for axis in mesh_axes(entry)):
+        return None
+    padded = (*spec, *(None,) * (x.ndim - len(spec) + trailing))
+    return jax.sharding.NamedSharding(sharding.mesh, jax.sharding.PartitionSpec(*padded))
+
+
+def rows_spec(like: jax.Array, ndim: int) -> jax.sharding.NamedSharding | None:
+    """A placement for an array of `ndim` dimensions whose rows are `like`'s:
+    the Explicit axis that splits `like`'s first dimension on its first, the
+    rest whole; None where no Explicit axis splits `like`."""
+    placed = explicit_spec(like)
+    if placed is None:
+        return None
+    rows = jax.sharding.PartitionSpec(placed.spec[0], *(None,) * (ndim - 1))
+    return jax.sharding.NamedSharding(placed.mesh, rows)
+
+
+def whole_spec(like: jax.Array, ndim: int) -> jax.sharding.NamedSharding | None:
+    """A whole placement for an array of `ndim` dimensions on `like`'s mesh,
+    where an Explicit axis splits `like`: where a contraction over its split
+    rows lands its sum, which JAX asks to be told, or where its rows are
+    gathered whole; None where no Explicit axis splits `like`."""
+    placed = explicit_spec(like)
+    if placed is None:
+        return None
+    return jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(*(None,) * ndim))
+
+
+def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
+    """`x` with its rows placed as `like`'s are, where an Explicit axis splits
+    them: a whole `x` is cut to each device's rows, without a collective."""
+    placed = rows_spec(like, x.ndim)
+    return x if placed is None else jax.sharding.reshard(x, placed)
 
 
 def _qualified(cls: type) -> str:

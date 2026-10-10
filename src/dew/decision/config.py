@@ -67,6 +67,9 @@ class DecisionRunConfig(RunConfig):
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     pretrained: str = "convaiinnovations/laya"
     """A Laya-style repository, read whole, or a Hugging Face model, read as the backbone."""
+    param_dtype: str = "float32"
+    """The loaded checkpoint's parameter storage dtype; bfloat16 halves a frozen base's memory,
+    leaving fresh LoRA factors and the head in float32."""
     subfolder: str | None = None
     """The checkpoint's folder inside a repository that bundles several, such as `multilingual`."""
     revision: str | None = None
@@ -88,7 +91,8 @@ class DecisionRunConfig(RunConfig):
         """The objective over the backbone `pretrained` names, on the table's
         or the mixture's rows, scored on the held-out ones, which calibrate the
         run after it trains. The checkpoint decides the backbone; the model
-        flags choose only its compute dtype and attention kernel."""
+        flags choose only its compute dtype and attention kernel;
+        `param_dtype` chooses the loaded checkpoint's storage dtype."""
         from dew.interop import Pretrained, sources
 
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
@@ -106,11 +110,12 @@ class DecisionRunConfig(RunConfig):
                 raise ValueError("--lora and --head shape a fresh backbone; a Laya checkpoint trains whole "
                                  "under its own head")
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
-                                           dtype=dtype, attention_impl=attention_impl)
+                                           dtype=dtype, param_dtype=self.param_dtype,
+                                           attention_impl=attention_impl)
             derived["layout"] = dataclasses.replace(start.layout, **budgets)
         else:
             start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
-                                    attention_impl=attention_impl)
+                                    param_dtype=self.param_dtype, attention_impl=attention_impl)
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
             # The tokenizer of the commit the weights come from.
             root = sources.snapshot(self.pretrained, self.revision, weights=False)

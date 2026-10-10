@@ -31,6 +31,7 @@ from dew.data import Corpus, DataPartition, DataPhase, Loading, Ramp, TokenWindo
 from dew.data.dataset import (
     CAPTION,
     Dataset,
+    LengthGroups,
     mixed_records,
     mixed_stream,
     mixture,
@@ -177,6 +178,54 @@ def test_a_mixtures_pass_is_the_records_every_corpus_has_been_read_in():
     assert mixed_records(two_corpora()) == 54
     assert mixed_records(two_corpora(weights=(0.5, 0.5), records=(8, 8))) == 16
     assert mixed_records([Corpus("a", Indexed(1, 10), 3), Corpus("b", Indexed(2, 30), 9)]) == 40
+
+
+def length(record) -> int:
+    """A record's length for `LengthGroups`, read off its id."""
+    return int(record["id"]) % 7
+
+
+def grouped(corpora, batch=4, window=3, cut=None):
+    return mixed_stream(corpora, [], batch=batch, seed=0, loading=READ, groups=LengthGroups(length, window),
+                        cut=cut)
+
+
+def test_length_groups_read_each_window_as_batches_of_like_length():
+    """Every window of three batches holds the records the plain order puts
+    there, sorted into batches whose lengths do not interleave, and the
+    batches come in an order of the window's own."""
+    plain = taken(mixed(two_corpora())(DataPartition()), 6)
+    read = taken(grouped(two_corpora())(DataPartition()), 6)
+    for first in (0, 3):
+        theirs, ours = plain[first:first + 3], read[first:first + 3]
+        assert sorted(itertools.chain(*theirs)) == sorted(itertools.chain(*ours))
+        spans = sorted((min(record % 7 for record in batch), max(record % 7 for record in batch))
+                       for batch in ours)
+        assert all(below[1] <= above[0] for below, above in itertools.pairwise(spans))
+    assert read != plain
+    assert taken(grouped(two_corpora())(DataPartition()), 6) == read
+
+
+def test_a_grouped_stream_resumes_mid_window_and_refuses_another_grouping():
+    stream = grouped(two_corpora())(DataPartition())
+    taken(stream, 2)
+    state = stream.get_state()
+    rest = taken(stream, 4)
+    resumed = grouped(two_corpora())(DataPartition())
+    resumed.set_state(state)
+    assert taken(resumed, 4) == rest
+    with pytest.raises(ValueError, match="grouped by length"):
+        mixed(two_corpora())(DataPartition()).set_state(state)
+
+
+def test_a_cut_stream_maps_every_batch_and_is_read_by_one_process():
+    def halved(batch):
+        return {"id": batch["id"][:2]}
+
+    stream = grouped(two_corpora(), cut=halved)
+    assert [len(batch) for batch in taken(stream(DataPartition()), 3)] == [2, 2, 2]
+    with pytest.raises(ValueError, match="one process"):
+        stream(DataPartition(0, 2))
 
 
 def test_a_validation_pass_over_a_mixture_reads_each_record_at_most_once():

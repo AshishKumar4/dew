@@ -56,7 +56,7 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
-from dew.nn.linear import DepthwiseConv1d, _masked_conv1d, causal_conv1d, document_conv1d, document_starts
+from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, document_starts, held_conv1d
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
@@ -65,6 +65,7 @@ from dew.nn.sharding import (
     logical_axes,
     logical_spec,
     manual_map,
+    rows_like,
     sequence_shards,
 )
 
@@ -205,7 +206,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
     x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
     a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    carried = (jnp.zeros((batch, heads, head_dim, state_size), work) if state is None
+    carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
                else jnp.asarray(state, work))
     platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
     scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
@@ -350,17 +351,6 @@ class Mamba2(nn.Module):
         self.out_proj = dense(self.emb_features, name='out_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
 
-    def _conv(self, mixed, taps, bias, valid, conv_state, segments):
-        """The conv over `[B, D, S]` with the bias before silu, from the
-        held history when decoding, and the history it leaves."""
-        if valid is not None or segments is not None:
-            valid = jnp.ones(mixed.shape[::2], bool) if valid is None else valid
-            return _masked_conv1d(mixed, taps, valid, conv_state, bias=bias, segments=segments)
-        length = mixed.shape[-1]
-        history = mixed if conv_state is None else jnp.concatenate([conv_state, mixed], axis=2)
-        out = causal_conv1d(history, taps, bias=bias)[..., -length:]
-        return out, history[:, :, -(self.conv_kernel - 1):]
-
     @nn.compact
     def __call__(self, x, decode: bool = False, positions=None, segment_ids=None, kv_store=None,
                  attention_metadata: AttentionMetadata | None = None):
@@ -393,7 +383,9 @@ class Mamba2(nn.Module):
                     f"mamba2 under a sequence axis of {shards} runs whole training sequences; "
                     "decoding and rows with padding slots (attention_metadata.valid) hold one "
                     "state per row. Run them on a mesh with sequence=1.")
-            out = self._stateful(mixed, dt, taps, bias, heads, scan, decode, valid, segment_ids)
+            out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
+                            (self.num_heads, self.head_dim, self.state_size),
+                            decode=decode, valid=valid, segments=segment_ids)
             if out is None:
                 # Allocation only, as the delta net: init_cache's dummy token
                 # must not consume a position or leave state behind.
@@ -405,38 +397,42 @@ class Mamba2(nn.Module):
             out = _sequence_mix(mixed, dt, segment_ids, (taps, bias, *heads), scan=scan)
         return self.out_proj(self.norm(out, gate))
 
-    def _stateful(self, mixed, dt, taps, bias, heads, scan, decode: bool, valid, segments):
-        """The scan of a call that holds per-row state: a decode step or
-        prefill advancing the flax cache, or rows with padding slots. None
-        for the allocation-only decode call. Packed `segments` reset the conv
-        and the state at each document's first real token; the held state
-        counts as the call's first document, which it continues."""
-        batch = mixed.shape[0]
-        mixed = jnp.moveaxis(mixed, 2, 1)                   # [B, D, S]
-        ssm = conv_state = None
-        if decode:
-            allocated = self.has_variable('cache', 'ssm_state')
-            conv_state = self.variable('cache', 'conv_state', jnp.zeros,
-                                       (batch, self.conv_features, self.conv_kernel - 1), mixed.dtype)
-            ssm = self.variable('cache', 'ssm_state', jnp.zeros,
-                                (batch, self.num_heads, self.head_dim, self.state_size), mixed.dtype)
-            if not allocated:
-                return None
-        mixed, history = self._conv(mixed, taps, bias, valid,
-                                    None if conv_state is None else conv_state.value, segments)
-        if conv_state is not None:
-            conv_state.value = history
-        starts = None if segments is None else document_starts(segments, valid=valid)
-        out, final = scan(mixed, dt, *heads, starts=starts, valid=valid,
-                          held=None if ssm is None else ssm.value)
-        if ssm is not None:
-            ssm.value = final
-        if valid is not None:
-            out = jnp.where(valid[:, :, None], out, 0)
-        return out
 
 
-def _ssd(convolved, dt, dt_bias, A, D, *, num_heads: int, head_dim: int, n_groups: int,
+def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
+              valid, segments):
+    """The conv and scan of a state-space call that holds per-row state: a
+    decode step or prefill advancing `module`'s flax cache (`conv_state`
+    `[B, D, K-1]`, `ssm_state` `[B, *state_shape]`), or rows with padding
+    slots. `mixed` `[B, S, D]` is the conv's input and `scan(convolved, *,
+    starts, valid, held)` the rest, returning `(output, final state)`. None
+    for the allocation-only decode call. Packed `segments` reset the conv
+    and the state at each document's first real token; the held state
+    counts as the call's first document, which it continues."""
+    batch = mixed.shape[0]
+    mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
+    ssm = conv_state = None
+    if decode:
+        allocated = module.has_variable('cache', 'ssm_state')
+        conv_state = module.variable('cache', 'conv_state', jnp.zeros,
+                                     (batch, mixed.shape[1], taps.shape[1] - 1), mixed.dtype)
+        ssm = module.variable('cache', 'ssm_state', jnp.zeros, (batch, *state_shape), mixed.dtype)
+        if not allocated:
+            return None
+    mixed, history = held_conv1d(mixed, taps, valid, None if conv_state is None else conv_state.value,
+                                 bias=bias, segments=segments)
+    if conv_state is not None:
+        conv_state.value = history
+    starts = None if segments is None else document_starts(segments, valid=valid)
+    out, final = scan(mixed, starts=starts, valid=valid, held=None if ssm is None else ssm.value)
+    if ssm is not None:
+        ssm.value = final
+    if valid is not None:
+        out = jnp.where(valid[:, :, None], out, 0)
+    return out
+
+
+def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
          state_size: int, chunk_size: int, time_step_limit, starts=None, valid=None, held=None,
          axis: str | None = None):
     """The scan after the conv: `convolved` `[B, conv_dim, S]` split into
@@ -448,6 +444,7 @@ def _ssd(convolved, dt, dt_bias, A, D, *, num_heads: int, head_dim: int, n_group
     h` for the state `h` the earlier shards leave, `acs_t` the inclusive sum of
     this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The zero-start
     final state is the shard's write `B_r` (`_entering_state`)."""
+    dt_bias, A, D = heads
     batch, _, length = convolved.shape
     mixed = jnp.moveaxis(convolved, 2, 1)
     intermediate = num_heads * head_dim
@@ -490,7 +487,7 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     width = taps.shape[1] - 1
     mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
     batch, channels, length = mixed.shape
-    history = jnp.zeros((batch, channels, width), mixed.dtype)
+    history = rows_like(jnp.zeros((batch, channels, width), mixed.dtype), mixed)
     forward = None
     if axis is not None:
         if length < width:
@@ -510,7 +507,7 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
             before = jax.lax.ppermute(segments[:, length - width:], axis, forward)
         convolved = document_conv1d(history, mixed, before, segments, taps, bias)
         starts = document_starts(segments, before[:, -1])
-    out, _ = scan(convolved, dt, dt_bias, A, D, starts=starts, axis=axis)
+    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=axis)
     return out
 
 

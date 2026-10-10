@@ -589,7 +589,8 @@ def test_the_loss_scores_each_devices_own_tokens():
 
 
 @pytest.mark.mesh(devices=4)
-def test_the_token_lookups_gradient_sums_no_table_under_data_parallelism():
+@pytest.mark.parametrize("spec", [MeshSpec(), MeshSpec(explicit=("data",))], ids=["auto", "explicit"])
+def test_the_token_lookups_gradient_sums_no_table_under_data_parallelism(spec):
     """Data parallelism has to sum a gradient across devices only where the
     devices' shares of it differ, and a token lookup's gradient is decided
     by the batch's rows: 128 here against a table of 4096. GSPMD scattered
@@ -598,7 +599,9 @@ def test_the_token_lookups_gradient_sums_no_table_under_data_parallelism():
     rows) nineteen times the rows' bytes; the rows travel instead. The head
     is untied, so every other gradient, its own included, is summed once:
     the sums hold every gradient's bytes but the table's. Measured in bytes,
-    since the GPU compiler combines the sums into buffers of its own."""
+    since the GPU compiler combines the sums into buffers of its own. An
+    Explicit data axis places the rows in their type, which the lookup's
+    gradient reshards whole itself."""
     model = models.build(
         "causal_transformer", vocab_size=4096, emb_features=32, num_layers=1,
         num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=SEQ_LEN,
@@ -606,7 +609,7 @@ def test_the_token_lookups_gradient_sums_no_table_under_data_parallelism():
     shapes = jax.eval_shape(LMObjective(model, SEQ_LEN).init, jax.random.key(0))["params"]
     gradients = sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(shapes))
     table = 4096 * 32 * 4
-    summed = collective_bytes(MeshSpec(), model, {"all-reduce"})
+    summed = collective_bytes(spec, model, {"all-reduce"})
 
     assert summed < gradients - table // 2, (summed, gradients, table)
 

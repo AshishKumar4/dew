@@ -102,8 +102,16 @@ class MeshSpec:
     same slice. At 1, `jax.make_mesh` places the devices of a single slice;
     devices on several slices still take the hybrid layout, with each slice
     as one replica when the slice count divides the data axis."""
+    explicit: tuple[str, ...] = ()
+    """The axes whose sharding an array's type carries (JAX's Explicit mode),
+    where every other axis is left to the partitioner (Auto). An Explicit
+    axis is placed where an array is made and follows the operations from
+    there; a model's sharding constraints name only the Auto ones."""
 
     def __post_init__(self):
+        unknown = sorted(set(self.explicit) - set(MESH_AXES))
+        if unknown:
+            raise ValueError(f"explicit names the mesh's axes {list(MESH_AXES)}, got {unknown}")
         if self.stage < 1:
             raise ValueError(f"stage counts pipeline stages, got {self.stage}")
         if self.replicas < 1:
@@ -135,7 +143,8 @@ class MeshSpec:
 
         An axis of size 1 splits nothing, and with every size at 1 the mesh is
         plain data parallelism. So the same code path serves every topology
-        without a flag. The axes are Auto, so GSPMD infers the collectives.
+        without a flag. The axes are Auto, so GSPMD infers the collectives,
+        but for those `explicit` names.
 
         `devices` lists the devices of one slice in the order to use them. The
         mesh takes them row-major over `MESH_AXES`, so neighbouring entries
@@ -174,12 +183,12 @@ class MeshSpec:
         # caller names is the layout itself, filled in its own order. Devices on
         # several slices, every GPU host its own, take the hybrid layout even as
         # one replica.
+        types = tuple(AxisType.Explicit if axis in self.explicit else AxisType.Auto for axis in MESH_AXES)
         if self.replicas == 1 and len({_slice(device) for device in devices}) == 1:
             if named:
-                return Mesh(np.asarray(devices).reshape(shape), MESH_AXES,
-                            axis_types=(AxisType.Auto,) * 6)
-            return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=(AxisType.Auto,) * 6)
-        return Mesh(hybrid_devices(self, shape, devices), MESH_AXES, axis_types=(AxisType.Auto,) * 6)
+                return Mesh(np.asarray(devices).reshape(shape), MESH_AXES, axis_types=types)
+            return jax.make_mesh(shape, MESH_AXES, devices=devices, axis_types=types)
+        return Mesh(hybrid_devices(self, shape, devices), MESH_AXES, axis_types=types)
 
 
 def _rule_table(rules: LogicalAxisRules | Mapping[str, MeshAxes]) -> LogicalAxisRules:
