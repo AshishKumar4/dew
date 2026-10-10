@@ -14,7 +14,7 @@ from itertools import pairwise
 from pathlib import Path
 
 import pyte
-from capture_snippets import DATA, DimScreen, terminal_cells
+from capture_snippets import DATA, DimScreen, cells, terminal_cells
 
 
 def frames_from_cast(cast: str, count: int = 41) -> dict:
@@ -102,6 +102,10 @@ def main() -> None:
     meta = json.loads(options.meta.read_text())
     if any(not meta.get(key) for key in ("where", "jax", "dew", "date")):
         raise ValueError("recording metadata needs where, jax, dew and date")
+    if meta.get("steps") != 1000:
+        raise ValueError("the page's hero cell runs 1000 steps (site/snippets/cells.py); record that many")
+    # The page shows and runs the script without its command line; the build checks both hashes.
+    meta["cell_sha256"] = cells.digest(cells.training_example(options.script.read_text()))
     cast = options.cast.read_text()
     replay = frames_from_cast(cast)
     output = DATA.parents[1] / "public/hero"

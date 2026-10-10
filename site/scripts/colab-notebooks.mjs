@@ -7,7 +7,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { example } from '../src/data/framework-examples.mjs';
 
-export const INSTALL = '%pip install -q "dewml[cuda12]"';
+// streaming for the Hugging Face datasets the cells read, quantization for Qwix.
+export const INSTALL = '%pip install -q "dewml[cuda12,streaming,quantization]"';
 const site = fileURLToPath(new URL('..', import.meta.url));
 
 export const colabUrl = (name) =>

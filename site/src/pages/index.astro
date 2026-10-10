@@ -26,6 +26,11 @@ const code = Object.fromEntries(names.map((name) => [name, example(framework, na
 const records = Object.fromEntries(names.map((name) => [name, cellRecording(name, code[name])]));
 const cell = (name: string) => ({ code: code[name], cell: name, recording: records[name], colab: cells.colab.includes(name) ? colabUrl(name) : undefined });
 checked('hero', heroCode, { script_sha256: capture.meta.script_sha256 });
+// The hero cell is hero.py without its command line, its steps fixed at the recorded run's
+// (framework-examples.mjs); its own hash catches any other change to what Run sends.
+const heroCell = trainingExample(heroCode);
+if (capture.meta.steps !== 1000) throw new Error('hero: the recording ran other than the 1000 steps the cell runs');
+checked('hero cell', heroCell, { script_sha256: capture.meta.cell_sha256 });
 const fullScript = 'https://github.com/AshishKumar4/dew/blob/main/site/snippets/framework.py';
 const terminalReplay = JSON.parse(readPublic('hero', 'train.json'));
 const expanded = [...terminalReplay.frames.at(-1).screen];
@@ -84,7 +89,7 @@ const tutorialNames: Record<string, string> = {
 		<section class="band run" data-reveal>
 			<h2 class="band-title">Training</h2>
 			<p class="band-lede">A small decoder trains on Tiny Shakespeare on {capture.meta.where}, then writes one sample from each of the prompts <code>ROMEO:</code> and <code>JULIET:</code>.</p>
-			<LandingCell code={trainingExample(heroCode)} title="train.py" cell="hero" file="train.py" recording={capture} side playbackSeconds={terminalReplay.duration} />
+			<LandingCell code={heroCell} title="train.py" cell="hero" file="train.py" recording={capture} side playbackSeconds={terminalReplay.duration} />
 			<p class="framework-note"><a href="https://github.com/AshishKumar4/dew/blob/main/site/src/data/hero.py">Full script</a></p>
 		</section>
 
