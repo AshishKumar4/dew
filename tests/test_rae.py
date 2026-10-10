@@ -26,7 +26,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
@@ -53,22 +53,11 @@ def channels_last(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
 
 
-def scaled_gap(actual, expected) -> float:
-    expected = np.asarray(expected, np.float64)
-    difference = np.abs(np.asarray(actual, np.float64) - expected).max()
-    return float(difference / max(1.0, float(np.abs(expected).max())))
-
-
 def test_every_computed_tensor_is_mapped_and_exports_bit_identical(variant):
     directory, (_, params, layouts, _), _ = variant
     tensors = component_tensors(directory, "")
-    read = {name for name in tensors if not name.startswith(UNREAD)}
-    assert {layout.name for layout in layouts} == {f"vae/{name}" for name in read}
-    for layout in layouts:
-        written = layout.export({"autoencoder": params})
-        published = tensors[layout.name.removeprefix("vae/")]
-        assert written.dtype == published.dtype and written.shape == published.shape, layout.name
-        assert written.tobytes() == published.tobytes(), layout.name
+    read = {name: tensor for name, tensor in tensors.items() if not name.startswith(UNREAD)}
+    assert_layout_tensors(layouts, {"autoencoder": params}, read, "vae/")
 
 
 def test_the_latent_matches_the_source(variant):

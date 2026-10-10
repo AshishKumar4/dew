@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from test_instrumentation import Regression, batches
+from affine_run import TimingRegression as Regression, batches
 
 from dew.artifacts import Representations
 from dew.data import DataPartition, Dataset

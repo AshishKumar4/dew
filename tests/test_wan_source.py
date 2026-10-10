@@ -32,7 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
@@ -72,10 +72,7 @@ def load(source, name):
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
     tensors = component_tensors(source / name, "transformer")
-    assert {layout.name for layout in layouts} == {f"transformer/{key}" for key in tensors}
-    for layout in layouts:
-        written = layout.export({"params": params})
-        assert written.tobytes() == tensors[layout.name.removeprefix("transformer/")].tobytes(), layout.name
+    assert_layout_tensors(layouts, {"params": params}, tensors, "transformer/")
 
 
 @pytest.mark.parametrize("name", CASES)

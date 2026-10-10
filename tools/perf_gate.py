@@ -203,6 +203,8 @@ def measure(tree: Path, args: argparse.Namespace, newer: Path) -> dict[str, floa
 
 
 def run(args: argparse.Namespace) -> int:
+    from dew.files import write_atomically
+
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
     rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)]
@@ -212,7 +214,7 @@ def run(args: argparse.Namespace) -> int:
         order = [(base, base_path), (head, head_path)]
         for name, path in order if round_ % 2 == 0 else order[::-1]:
             results["samples"][name].append(measure(path, args, head_path / "tools"))
-            Path(args.out).write_text(json.dumps(results, indent=2))
+            write_atomically(args.out, json.dumps(results, indent=2))
             print(f"round {round_ + 1}: {name} measured", flush=True)
     return 0
 

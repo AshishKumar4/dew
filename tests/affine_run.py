@@ -26,16 +26,33 @@ class Affine(nn.Module):
 class Regression(Objective):
     """Squared error of an affine map against `2 * x[:, :2]`."""
 
-    def __init__(self, ema_decay=0.5):
+    def __init__(self, ema_decay=0.5, *, probe=True):
         self.model = Affine()
         self.ema = EMASpec(decay=optax.constant_schedule(ema_decay))
+        self.probe = probe
 
     def init(self, key, variables=None):
         return self.model.init(key, jnp.zeros((1, FEATURES)))
 
     def loss(self, variables, batch, step):
         prediction = self.model.apply(variables, batch["x"])
-        return jnp.mean((prediction - batch["y"]) ** 2), Aux({"probe": jnp.asarray(1.0)})
+        return jnp.mean((prediction - batch["y"]) ** 2), Aux(
+            {"probe": jnp.asarray(1.0)} if self.probe else {})
+
+
+class TimingRegression(Regression):
+    """Instrumentation's affine step: a slower EMA and no probe metric."""
+
+    def __init__(self):
+        super().__init__(ema_decay=0.9, probe=False)
+
+
+def batches():
+    rng = np.random.default_rng(0)
+    x = rng.normal(size=(BATCH, FEATURES)).astype(np.float32)
+    batch = {"x": x, "y": 2 * x[:, :2]}
+    while True:
+        yield batch
 
 
 class Counting:
