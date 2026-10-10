@@ -177,8 +177,11 @@ def identity(plan: dict) -> dict:
         "hardware": plan["hardware"],
         "jobs": [
             {
+                "artifact_excludes": job.get("artifact_excludes", []),
+                **{
                 key: job[key]
                 for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
+                },
             }
             for job in plan["jobs"]
         ],
@@ -200,6 +203,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             commit=exact_ref(repo, fields["ref"]),
             minutes=int(fields.get("minutes") or 30),
             artifact_policy=fields.get("artifact_policy", "all"),
+            artifact_excludes=fields.get("artifact_excludes", "").split(),
             compile_cache=fields.get("compile_cache", "off"),
             entry=entry,
             economics={
@@ -218,6 +222,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 "command": job["command"],
                 "outputs": job["outputs"],
                 "artifact_policy": job["artifact_policy"],
+                "artifact_excludes": job["artifact_excludes"],
                 "inputs": sorted(inputs),
             },
         )
