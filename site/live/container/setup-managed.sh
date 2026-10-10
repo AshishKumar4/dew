@@ -10,8 +10,9 @@ done
 apt-get update
 apt-get install -y --no-install-recommends python3 python3-venv ca-certificates curl libcap2-bin libseccomp2 bubblewrap
 python3 -m venv /opt/venv
+# streaming for the corpora the cells read, profile for the profile cell's XProf.
 /opt/venv/bin/pip install --no-cache-dir \
-    "dewml[streaming] @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
+    "dewml[streaming,profile] @ https://github.com/AshishKumar4/dew/archive/$commit.tar.gz" \
     -c "https://raw.githubusercontent.com/AshishKumar4/dew/$commit/constraints.txt" \
     ipykernel==7.3.0 jupyter-kernel-gateway==3.0.1 jupyter-client==8.10.0 pillow==12.3.0 websockets==17.1
 id -u model >/dev/null 2>&1 || useradd --uid 5000 --create-home --shell /usr/sbin/nologin model
