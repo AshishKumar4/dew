@@ -151,12 +151,16 @@ fi
 # The environment's Python, made if it does not exist yet.
 if [ -n "$conda_name" ]; then
 	[ -n "$conda" ] || die "conda is not installed"
-	where() { conda run -n "$conda_name" python -c 'import sys; print(sys.executable)' 2>/dev/null; }
-	python=$(where) || {
+	# shellcheck disable=SC2016 # the environment's prefix, as conda run sets it inside
+	prefix() { conda run -n "$conda_name" sh -c 'printf %s "$CONDA_PREFIX"' 2>/dev/null; }
+	where=$(prefix) || {
 		conda create -y -q -n "$conda_name" 'python>=3.12' >/dev/null || die "conda could not create the environment $conda_name"
-		python=$(where) || die "conda made $conda_name but cannot run its Python"
+		where=$(prefix) || die "conda made $conda_name but cannot run in it"
 	}
-	activate="conda activate $(quote "$conda_name")"
+	# The environment's own Python: never one conda run finds on PATH outside it.
+	[ -x "$where/bin/python" ] || conda install -y -q -n "$conda_name" 'python>=3.12' >/dev/null ||
+		die "the conda environment $conda_name has no Python, and conda could not add one"
+	python=$where/bin/python activate="conda activate $(quote "$conda_name")"
 else
 	if [ ! -x "$target/bin/python" ]; then
 		if [ -z "$use_pip" ]; then uv venv -q --python '>=3.12' "$target" || die "uv could not create $target"
@@ -198,6 +202,6 @@ print(m.version("dewml"), "with jax", jax.__version__, "on", jax.default_backend
 installed=$(printf '%s\n' "$report" | tail -n 1)
 printf '\n%s✓ dewml %s%s\n' "$green" "$installed" "$plain"
 printf '  check     %s%s -c "import jax; print(jax.devices())"\n' "$cpu" "$(quote "$python")"
+[ -z "$cpu" ] || activate="$activate; export JAX_PLATFORMS=cpu  # Dew stops when JAX leaves a GPU unused"
 printf '  activate  %s\n' "$activate"
-[ -z "$cpu" ] || printf '  then      export JAX_PLATFORMS=cpu, since Dew stops when JAX would leave the GPU unused\n'
 case $build in cuda*) case $installed in *" on cpu") printf '%sJAX sees no GPU: check that nvidia-smi lists it%s\n' "$red" "$plain" ;; esac ;; esac
