@@ -32,6 +32,12 @@ def _compute_capability() -> str | None:
     return getattr(jax.devices()[0], 'compute_capability', None)
 
 
+SMALL_SHARED = ('sm86', 'sm89', 'sm120')
+"""Generations whose blocks hold 99 KB of shared memory, against 163 KB and
+more on an A100 or an H100: a kernel that buffers more in a block compiles
+fewer pipeline stages there, or refuses (`delta_chunks.stages`)."""
+
+
 def device_generation() -> str:
     """Return the default device's hardware generation.
 
@@ -71,7 +77,9 @@ KERNELS: dict[str, dict[str, str]] = {
     # (delta_prep). At Qwen3.5-9B's widths on an A100, fused prep cut the rule's forward and backward
     # from 9.09 to 8.17 ms and a GatedDeltaNet layer's from 15.15 to 13.70. The output stays XLA;
     # its fused backward lost at every tile. Whole-rule float64 RMS ratios at most 1.324 (c46).
-    'gated_delta_rule': {'sm80': 'pallas'},
+    # On an RTX 4080, the recurrence at one pipeline stage (delta_chunks.stages) and the prep at its
+    # two, which fit there: the rule's 24.62 against 15.73 ms and the layer's 41.35 against 33.80.
+    'gated_delta_rule': {'sm80': 'pallas', 'sm89': 'pallas'},
     # The forward reads bf16 copies of the fp32 weights (dew.training.narrow): Qwen3-0.6B at 1 x 1024
     # runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4 against 125.9 on an A100. A
     # TPU fuses the cast into the matmul.
