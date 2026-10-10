@@ -53,15 +53,62 @@ def _download(repo: str, revision: str, path: str) -> str:
     return hf_hub_download(repo, path, repo_type="dataset", revision=revision)
 
 
-def _rows(repo: str, revision: str, path: str) -> list[dict]:
-    """A pinned parquet or JSON-lines file's rows."""
+def _rows(repo: str, revision: str, path: str, indices: set[int] | None = None) -> Iterator[dict]:
+    """A pinned file's rows, materialising only the selected indices when supplied."""
     local = _download(repo, revision, path)
     if path.endswith(".jsonl"):
         with open(local) as file:
-            return [json.loads(line) for line in file if line.strip()]
+            for index, line in enumerate(file):
+                if line.strip() and (indices is None or index in indices):
+                    yield json.loads(line)
+        return
+    if path.endswith(".csv"):
+        with open(local, newline="") as file:
+            for index, row in enumerate(csv.DictReader(file)):
+                if indices is None or index in indices:
+                    yield row
+        return
     import pyarrow.parquet as pq
 
-    return pq.read_table(local).to_pylist()
+    file = pq.ParquetFile(local)
+    offset = 0
+    for group in range(file.num_row_groups):
+        size = file.metadata.row_group(group).num_rows
+        selected = None if indices is None else {index - offset for index in indices
+                                                 if offset <= index < offset + size}
+        offset += size
+        if selected == set():
+            continue
+        start = 0
+        for batch in file.iter_batches(batch_size=4096, row_groups=[group]):
+            positions = (None if selected is None else
+                         [index - start for index in sorted(selected) if start <= index < start + len(batch)])
+            if positions is None:
+                yield from batch.to_pylist()
+            elif positions:
+                yield from batch.take(positions).to_pylist()
+            start += len(batch)
+
+
+def _count(repo: str, revision: str, path: str) -> int:
+    """The pinned train file's row count, without loading its rows into memory."""
+    local = _download(repo, revision, path)
+    if path.endswith((".jsonl", ".csv")):
+        with open(local, newline="") as file:
+            return sum(1 for _ in (csv.DictReader(file) if path.endswith(".csv") else file))
+    import pyarrow.parquet as pq
+
+    return pq.ParquetFile(local).metadata.num_rows
+
+
+def _held(count: int, held: int | None) -> int:
+    return held if held is not None else min(2000, max(50, count // 50), count // 2)
+
+
+def _draw(count: int, limit: int | None, held: int | None, seed: int) -> set[int] | None:
+    """Choose the capped train and hold-out rows before decoding or converting them."""
+    needed = count if limit is None else min(count, limit + _held(count, held))
+    return None if needed == count else set(random.Random(seed).sample(range(count), needed))
 
 
 def _github(repo: str, revision: str, path: str, *, media: bool = False) -> Path:
@@ -101,22 +148,53 @@ class Source:
     """
 
     weight: float = 0.0
-    limit: int | None = None
+    limit: int | None = 200_000
     held: int | None = None
     seed: int = 0
     natural: ClassVar[bool] = True
+    repo: ClassVar[str] = ""
+    files: ClassVar[tuple[str, ...]] = ()
+    licence: ClassVar[str] = ""
+    licence_url: ClassVar[str] = ""
     """Whether the set is natural text rather than built from templates (`contamination.Overlaps`)."""
 
     def examples(self) -> list[Example]:
-        """Every training example the set gives."""
+        """The seeded, capped training candidates, with room for the held-out split."""
+        return [example for row in self.rows() if (example := self.convert(row)) is not None]
+
+    def convert(self, row: dict) -> Example | None:
+        """One labelled training row as a decision, or None for a row without gold."""
         raise NotImplementedError
+
+    def count(self) -> int:
+        """The pinned source's train rows, before sampling or holding any out."""
+        return sum(_count(self.repo, self.revision, path) for path in self.files)
+
+    def rows(self) -> Iterator[dict]:
+        """Seeded rows from training files only, capped before they become Python objects."""
+        counts = [_count(self.repo, self.revision, path) for path in self.files]
+        selected = _draw(sum(counts), self.limit, self.held, self.seed)
+        offset = 0
+        for path, count in zip(self.files, counts, strict=True):
+            indices = None if selected is None else {index - offset for index in selected
+                                                     if offset <= index < offset + count}
+            yield from _rows(self.repo, self.revision, path, indices)
+            offset += count
+
+    def labels(self, column: str) -> list[str]:
+        """A ClassLabel column's option names in the pinned parquet's metadata order."""
+        import pyarrow.parquet as pq
+
+        schema = pq.ParquetFile(_download(self.repo, self.revision, self.files[0])).schema_arrow
+        feature = json.loads(schema.metadata[b"huggingface"])["info"]["features"][column]
+        return list((feature.get("feature") or feature)["names"])
 
     def split(self) -> tuple[list[Example], list[Example]]:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        count = self.held if self.held is not None else min(2000, max(50, len(examples) // 50),
-                                                             len(examples) // 2)
+        count = _held(self.count() if self.files else len(examples), self.held)
+        count = min(count, len(examples))
         held, train = examples[:count], examples[count:]
         return (train if self.limit is None else train[:self.limit]), held
 
@@ -306,7 +384,7 @@ class Intents(Framed):
     revision: str = "18072d2685ea682290f7b8924d94c62acc19c0b2"
 
     def examples(self) -> list[Example]:
-        rows = _rows("mteb/banking77", self.revision, "data/train-00000-of-00001.parquet")
+        rows = list(_rows("mteb/banking77", self.revision, "data/train-00000-of-00001.parquet"))
         intents = list(dict.fromkeys(row["label_text"] for row in rows))
         return [self.example(row["text"], "Which banking request is this?", intents,
                              intents.index(row["label_text"])) for row in rows]
@@ -412,7 +490,7 @@ class Gsm8k(Framed):
     revision: str = "740312add88f781978c0658806c59bc2815b9866"
 
     def examples(self) -> list[Example]:
-        rows = _rows("openai/gsm8k", self.revision, "main/train-00000-of-00001.parquet")
+        rows = list(_rows("openai/gsm8k", self.revision, "main/train-00000-of-00001.parquet"))
         golds = [row["answer"].rsplit("####", 1)[-1].strip().replace(",", "") for row in rows]
         values = sorted(set(golds), key=float)
         place = {value: index for index, value in enumerate(values)}
