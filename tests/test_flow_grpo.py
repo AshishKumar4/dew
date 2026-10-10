@@ -61,7 +61,7 @@ class AffineVelocity(nn.Module):
         return gain * x + (temb / 1000)[:, None] * 0.1 + offset
 
 
-def test_checkpointed_flow_validation_refuses_implicit_loss_before_placing(tmp_path, monkeypatch):
+def test_checkpointed_flow_validation_refuses_implicit_loss_before_placing(tmp_path):
     from affine_run import Data
 
     from dew.training import Best, Checkpoints
@@ -69,13 +69,12 @@ def test_checkpointed_flow_validation_refuses_implicit_loss_before_placing(tmp_p
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     objective = FlowGRPOObjective(AffineVelocity(), process, InputSpec(Field("image", (2,))),
                                   guidance=None, steps=3)
-    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
-                      checkpoints=Checkpoints(str(tmp_path / "flow")))
+    class Unplaced(Trainer):
+        def place(self, *args, **kwargs):
+            raise AssertionError("training reached placement")
 
-    def placed(*args, **kwargs):
-        raise AssertionError("training reached placement")
-
-    monkeypatch.setattr(trainer, "place", placed)
+    trainer = Unplaced(objective, optax.sgd(.01), key=jax.random.key(0),
+                       checkpoints=Checkpoints(str(tmp_path / "flow")))
     data = Data(val=lambda: iter(({"image": np.zeros((8, 2), np.float32)},)))
     with pytest.raises(ValueError, match=r"Flow-GRPO.*Best.*no validation"):
         trainer.fit(data, steps=1, eval_every=1)

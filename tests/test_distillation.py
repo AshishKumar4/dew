@@ -246,9 +246,8 @@ def test_init_keeps_held_projections_and_draws_only_missing_ones(missing):
         np.testing.assert_array_equal(actual["params"][PROJECTIONS][second],
                                       fresh["params"][PROJECTIONS][second])
         assert second not in held["params"][PROJECTIONS]
-    for name in ("teacher",):
-        for got, want in zip(jax.tree.leaves(actual[name]), jax.tree.leaves(held[name]), strict=True):
-            np.testing.assert_array_equal(got, want)
+    for got, want in zip(jax.tree.leaves(actual[TEACHER]), jax.tree.leaves(held[TEACHER]), strict=True):
+        np.testing.assert_array_equal(got, want)
 
 
 def test_a_layer_the_model_does_not_have_is_named_at_init():

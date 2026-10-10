@@ -751,7 +751,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     peaks = expected["layers_0"]["self_attn"]["max_logits"][0]
     assert np.max(peaks) > threshold
     # The reference must not determine the clip, even when its logits are much larger.
-    reference = None if initial.averaged is None else jax.tree.map(lambda leaf: leaf * 3, initial.averaged)
+    reference = None if initial.ema is None else jax.tree.map(lambda leaf: leaf * 3, initial.averaged)
     _, aux = objective.loss(variables, batch, Step(jnp.array(0), jax.random.key(1), reference))
     observed = aux.qk_stats["policy"] if kind == "ppo" and aux.qk_stats is not None else aux.qk_stats
     assert observed is not None
@@ -762,13 +762,10 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     final, *_ = compiled(initial, batch)
     assert int(final.updates) == 1
     after = part(final.variables, "policy") if kind == "ppo" else final.variables
-    shrunk = []
     for name in ("q_proj", "k_proj"):
         before = start["layers_0"]["self_attn"][name]["kernel"]
         updated = np.asarray(after["params"]["layers_0"]["self_attn"][name]["kernel"])
         assert np.linalg.norm(updated) < np.linalg.norm(before)
-        shrunk.append(not np.array_equal(before, updated))
-    assert all(shrunk)
 
 
 def test_a_parameter_no_group_claims_is_refused():
