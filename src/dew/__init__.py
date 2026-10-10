@@ -14,6 +14,11 @@ keeps a preallocated GPU pool in one piece for a step's temporaries. If you
 set either flag yourself in XLA_FLAGS, your value is kept. If the JAX
 backend has already opened, the flags cannot take effect, and Dew logs a
 warning.
+
+On a machine with an NVIDIA GPU, `import dew` stops with the install that
+fixes it where JAX would run on the CPU: no CUDA build of JAX installed, or
+none this driver runs (docs/installation.md, "Which CUDA build").
+`JAX_PLATFORMS=cpu` asks for the CPU and is not stopped.
 """
 
 from collections.abc import Callable
@@ -23,10 +28,12 @@ from typing import TYPE_CHECKING
 from dew.logging import configure as _configure_logging
 from dew.telemetry.devices import (
     keep_roundings as _keep_roundings,
+    refuse_cpu_only_jax as _refuse_cpu_only_jax,
     unpartition_gpu_pool as _unpartition_gpu_pool,
 )
 
 _configure_logging()
+_refuse_cpu_only_jax()
 _keep_roundings()
 _unpartition_gpu_pool()
 
