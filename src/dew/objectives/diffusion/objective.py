@@ -55,6 +55,7 @@ from dew.objectives.base import (
     Step,
     Variables,
     merge,
+    model_rngs,
     thaw,
     under,
 )
@@ -201,9 +202,9 @@ class FixedBlank:
 
 
 class TunedLatents(NamedTuple):
-    """An end-to-end step's latents: the autoencoder's raw draw, the batch
-    normalized samples the model trains on and the running statistics
-    after them, the autoencoder's regularizer, the discriminator's hinge
+    """An end-to-end step's latents: the autoencoder's raw draw, the
+    normalized samples and the running statistics after the pass,
+    the autoencoder's regularizer, the discriminator's hinge
     loss, and their terms."""
 
     raw: jax.Array
@@ -660,7 +661,7 @@ class DiffusionObjective(Objective[Ratio]):
         t = schedule.sample_t(time_key, count)
         end_to_end = None
         if self.end_to_end is not None:
-            end_to_end = self._end_to_end_latents(variables, images, encode_key, step.step, batch)
+            end_to_end = self._end_to_end_latents(variables, images, encode_key, step, batch)
             samples = end_to_end.samples
         else:
             samples = self.clean_samples(variables, batch, encode_key)
@@ -669,7 +670,7 @@ class DiffusionObjective(Objective[Ratio]):
         # so a float64 run interpolates in float64.
         t = t.astype(jnp.promote_types(samples.dtype, t.dtype))
 
-        call = {**conditions, "train": True, "rngs": {"dropout": dropout_key}}
+        call = {**conditions, "train": step.training, "rngs": model_rngs(dropout_key, training=step.training)}
         losses, aligned = self._denoised(variables, self.model_variables(variables), samples, t, noise, call,
                                          images, batch)
         weighted = losses * expand(self.process.weight(t), losses)
@@ -701,7 +702,8 @@ class DiffusionObjective(Objective[Ratio]):
         metrics.update(end_to_end.terms, autoencoder_alignment=through)
         autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through
         total = total + (autoencoder + end_to_end.hinge) * mass
-        return Ratio(total, mass), Aux(metrics=metrics, variables={LATENT_STATS: end_to_end.statistics})
+        updates = {LATENT_STATS: end_to_end.statistics} if step.training else None
+        return Ratio(total, mass), Aux(metrics=metrics, variables=updates)
 
     def _denoised(self, params, variables, samples, t, noise, call, images, batch: Batch):
         """The per-element denoising loss at `(t, noise)` and, under
@@ -721,7 +723,7 @@ class DiffusionObjective(Objective[Ratio]):
         preds = self.process.prediction.pred_transform(noisy, preds, rates, t)
         return optax.l2_loss(preds, target), aligned
 
-    def _end_to_end_latents(self, params, images, key, step, batch: Batch) -> TunedLatents:
+    def _end_to_end_latents(self, params, images, key, step: Step, batch: Batch) -> TunedLatents:
         """The trained autoencoder's posterior draw of `images` and what the
         step reads of it."""
         assert self.end_to_end is not None and self.autoencoder is not None
@@ -732,10 +734,13 @@ class DiffusionObjective(Objective[Ratio]):
         discriminator = params["params"].get(DISCRIMINATOR)
         regularizer, hinge, terms = self.end_to_end.regularizer(
             images, reconstruction, moments, perceptual=params.get(PERCEPTUAL),
-            discriminator=None if discriminator is None else {"params": discriminator}, step=step,
+            discriminator=None if discriminator is None else {"params": discriminator}, step=step.step,
             batch=batch)
-        samples, statistics = self.end_to_end.batch_normalized(jax.lax.stop_gradient(raw),
-                                                               params[LATENT_STATS], batch)
+        samples, statistics = jax.lax.stop_gradient(raw), params[LATENT_STATS]
+        if step.training:
+            samples, statistics = self.end_to_end.batch_normalized(samples, statistics, batch)
+        else:
+            samples = self.end_to_end.normalized(samples, statistics)
         return TunedLatents(raw, samples, statistics, regularizer, hinge, terms)
 
     def published_autoencoder(self, variables: Variables) -> tuple[AutoEncoder | None, Variables]:

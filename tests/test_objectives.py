@@ -62,6 +62,17 @@ def test_step_and_aux_cross_jit():
     assert jnp.isfinite(aux.metrics["draw"])
 
 
+def test_step_mode_is_static_under_jit():
+    @jax.jit
+    def signed(step):
+        return step.step if step.training else -step.step
+
+    step = Step(step=jnp.asarray(3), key=jax.random.key(0), ema=None)
+    assert signed(step) == 3
+    assert signed(step.replace(training=False)) == -3
+    assert step.training
+
+
 def test_ema_spec_defaults_to_the_whole_tree():
     spec = EMASpec(decay=optax.constant_schedule(0.9))
     assert spec.select is everything
