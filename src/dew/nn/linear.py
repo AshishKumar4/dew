@@ -147,6 +147,40 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None):
             history[:, :, -(kernel.shape[-1] - 1):])
 
 
+def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
+              valid, segments=None, state: str = 'ssm_state', state_dtype=None, conv_dtype=None):
+    """The conv and scan of a mixer that holds per-row state: a decode step or
+    prefill advancing `module`'s flax cache, `conv_state` `[B, D, K-1]` held
+    in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
+    (both `mixed`'s dtype where None), or rows with padding slots. `mixed`
+    `[B, S, D]` is the conv's input, convolved in its own dtype, and
+    `scan(convolved, *, starts, valid, held)` the rest, given the held state
+    as it is stored and returning `(output, final state)`. None for the
+    allocation-only decode call. Packed `segments` reset the conv and the
+    state at each document's first real token; the held state counts as the
+    call's first document, which it continues."""
+    batch = mixed.shape[0]
+    mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
+    held = conv_state = None
+    if decode:
+        allocated = module.has_variable('cache', state)
+        conv_state = module.variable('cache', 'conv_state', jnp.zeros,
+                                     (batch, mixed.shape[1], taps.shape[1] - 1), conv_dtype or mixed.dtype)
+        held = module.variable('cache', state, jnp.zeros, (batch, *state_shape), state_dtype or mixed.dtype)
+        if not allocated:
+            return None
+    mixed, history = held_conv1d(mixed, taps, valid,
+                                 None if conv_state is None else conv_state.value.astype(mixed.dtype),
+                                 bias=bias, segments=segments)
+    if conv_state is not None:
+        conv_state.value = history.astype(conv_state.value.dtype)
+    starts = None if segments is None else document_starts(segments, valid=valid)
+    out, final = scan(mixed, starts=starts, valid=valid, held=None if held is None else held.value)
+    if held is not None:
+        held.value = final.astype(held.value.dtype)
+    return out
+
+
 def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None):
     """Convolve real tokens without advancing a paused row's history.
 
@@ -289,31 +323,42 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, state):
     (k * exp(gc[-1] - gc))^T @ v_new` (modeling_qwen3_next.py:439-446).
 
     Operands are per chunk in the reference's layout, `[B, H, NC, C, ...]`,
-    `gc` `[B, H, NC, C]` being the log decay cumulated within each chunk,
-    and `state` `[B, H, Dk, Dv]` enters the first chunk. Returns the state
-    each chunk entered `[B, H, NC, Dk, Dv]`, each chunk's corrected values
+    `gc` `[B, H, NC, C, D]` being the log decay cumulated within each chunk,
+    D one for a decay per head or Dk for one per key dimension (KDA's, whose
+    rows of S decay apart, modeling_glm5_next.py:529-532), and `state`
+    `[B, H, Dk, Dv]` enters the first chunk. Returns the state each chunk
+    entered `[B, H, NC, Dk, Dv]`, each chunk's corrected values
     `[B, H, NC, C, Dv]` and the state leaving the last chunk.
     """
     def one_chunk(s, step):
         k_i, kd_i, v_i, gc_i = step
         v_corrected = v_i - kd_i @ s
-        last = gc_i[..., -1]
-        written = k_i * jnp.exp(last[..., None] - gc_i)[..., None]
-        return (s * jnp.exp(last)[..., None, None] + jnp.swapaxes(written, -1, -2) @ v_corrected,
+        last = gc_i[..., -1:, :]
+        written = k_i * jnp.exp(last - gc_i)
+        return (s * jnp.swapaxes(jnp.exp(last), -1, -2) + jnp.swapaxes(written, -1, -2) @ v_corrected,
                 (s, v_corrected))
     final, (entered, corrected) = jax.lax.scan(
         one_chunk, state, tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc)))
     return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
 
 
+def _paired(left, right, decay):
+    """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk,
+    `[..., C, C]`: one decay channel scales the product after it, one per key
+    dimension weighs each term of it."""
+    if decay.shape[-1] == 1:
+        return (left @ jnp.swapaxes(right, -1, -2)) * decay[..., 0]
+    return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
+
+
 GATED_DELTA_RULES = ('auto', 'xla', 'pallas')
 """The recurrences `chunk_gated_delta_rule` runs its memory across chunks on."""
 
 
-def chunk_states_kernel(implementation: str, key, out_vals) -> str:
-    """The recurrence a chunked rule over these per-chunk keys and corrected
-    values runs: 'xla' (`xla_chunk_states`) or 'pallas'
-    (`dew.nn.kernels.delta_chunks`).
+def chunk_states_kernel(implementation: str, key, out_vals, gc) -> str:
+    """The recurrence a chunked rule over these per-chunk keys, corrected
+    values and decays runs: 'xla' (`xla_chunk_states`) or 'pallas'
+    (`dew.nn.kernels.delta_chunks`), which decays per head.
 
     'auto' takes the generation's measured one (`KERNELS['gated_delta_rule']`)
     and 'xla' elsewhere. 'pallas' needs a GPU the kernels compile for,
@@ -332,37 +377,34 @@ def chunk_states_kernel(implementation: str, key, out_vals) -> str:
     refusal = first_refusal(
         (placed, "the Pallas kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the kernels lack"),
+        (gc.shape[-1] == 1, "the rule decays per key dimension, and the kernels per head"),
     ) or delta_chunks.refusal(key, out_vals)
     return 'pallas' if refusal is None else ran_kernel('gated_delta_rule', 'xla', refusal)
 
 
-def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
-                           chunk_size: int = CHUNK_SIZE, implementation: str = 'auto'):
-    """The chunked form of the gated delta rule, `torch_chunk_gated_delta_rule`
-    (modeling_qwen3_next.py:374-453) in fp32, over [B, S, H, D] operands;
-    returns `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in the input
-    dtype. The reference's sequential correction is the inverse
+def chunk_delta_rule(query, key, value, g, beta, state=None,
+                     chunk_size: int = CHUNK_SIZE, implementation: str = 'auto'):
+    """The chunked delta rule over [B, S, H, D] operands with the log decay
+    `g` `[B, S, H, D]`, D one for a decay per head (the gated delta rule) or
+    Dk for one per key dimension (Kimi Delta Attention); returns
+    `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in the input dtype,
+    computed in fp32. The references' sequential correction is the inverse
     `strictly_lower_inverse` builds from its diagonal blocks.
 
     Only the memory crosses chunks, so only its recurrence runs chunk after
     chunk, on the recurrence `implementation` names (`chunk_states_kernel`).
-    Each chunk's output, the reference's `attn_inter + attn @ v_new`, reads
+    Each chunk's output, the references' `attn_inter + attn @ v_new`, reads
     the state that chunk entered and its corrected values, so it is computed
-    for every chunk at once after the recurrence. Those are the same sums in
-    the same order, and the scan no longer launches the three products of
-    the output at every chunk.
+    for every chunk at once after the recurrence. The two decays differ only
+    in how a pair of positions is weighed (`_paired`).
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
-    query, key, value, g, beta = (
-        x.astype(work) for x in (query, key, value, g, beta))
+    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
     B, S, H, Dk = key.shape
     Dv = value.shape[-1]
     pad = (chunk_size - S % chunk_size) % chunk_size
-    query = jnp.pad(query, ((0, 0), (0, pad), (0, 0), (0, 0)))
-    key = jnp.pad(key, ((0, 0), (0, pad), (0, 0), (0, 0)))
-    value = jnp.pad(value, ((0, 0), (0, pad), (0, 0), (0, 0)))
+    query, key, value, g = (jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0))) for x in (query, key, value, g))
     beta = jnp.pad(beta, ((0, 0), (0, pad), (0, 0)))
-    g = jnp.pad(g, ((0, 0), (0, pad), (0, 0)))
     T = S + pad
     query = query * (Dk ** -0.5)
 
@@ -370,39 +412,48 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
         moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
         return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
 
-    v_beta = value * beta[..., None]
-    k_beta = key * beta[..., None]
     q_c, k_c = chunks(query), chunks(key)
-    kb_c, vb_c, g_c = chunks(k_beta), chunks(v_beta), chunks(g)
-
-    # Cumulative log decay within each chunk, the reference's
-    # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the reference's
-    # `((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp()).tril()`, one decay
-    # channel per head.
-    gc, decay = chunk_decay(g_c[..., None])
-    gc, decay = gc[..., 0], decay[..., 0]  # [B, H, NC, C], [B, H, NC, C, C]
+    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+    # The log decay cumulated within each chunk, the reference's
+    # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
+    # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
+    # [B, H, NC, C, D], [B, H, NC, C, C, D].
+    gc, decay = chunk_decay(chunks(g))
     # The mask is strictly lower (tril, -1): the reference's masked_fill
     # zeroes the diagonal too.
     strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-    attn = jnp.where(strict, -(kb_c @ jnp.swapaxes(k_c, -1, -2)) * decay, 0.0)
+    attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
     # The reference's `attn + I` operator after its row correction loop.
     inv = strictly_lower_inverse(attn)
     out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
-    k_cumdecay = inv @ (kb_c * jnp.exp(gc)[..., None])
+    k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
-    state = (jnp.zeros((B, H, Dk, Dv), work) if state is None
-             else state.astype(work))
-    if chunk_states_kernel(implementation, k_c, out_vals) == 'pallas':
+    state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
+    # XLA:CPU workaround: under a jitted scan over the layers the chunk
+    # loop's zero initial state came back with other values in most
+    # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
+    # The barrier materializes the zero. Remove it when XLA:CPU no longer
+    # returns an uninitialized scan carry here.
+    state = jax.lax.optimization_barrier(state)
+    if chunk_states_kernel(implementation, k_c, out_vals, gc) == 'pallas':
         entered, v_corrected, state = delta_chunks.chunk_states(
-            k_c, k_cumdecay, out_vals, gc, state, not triton_runs())
+            k_c, k_cumdecay, out_vals, gc[..., 0], state, not triton_runs())
     else:
         entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state)
-    attn = q_c @ jnp.swapaxes(k_c, -1, -2) * decay
-    attn_inter = (q_c * jnp.exp(gc)[..., None]) @ entered
-    core = attn_inter + attn @ v_corrected
+    # decay is zero above the diagonal, so this is the reference's inclusive
+    # lower `masked_fill(triu(1), 0)`.
+    core = (q_c * jnp.exp(gc)) @ entered + _paired(q_c, k_c, decay) @ v_corrected
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
     return core.astype(dtype), state.astype(dtype)
+
+
+def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
+                           chunk_size: int = CHUNK_SIZE, implementation: str = 'auto'):
+    """`torch_chunk_gated_delta_rule` (modeling_qwen3_next.py:374-453): the
+    chunked rule (`chunk_delta_rule`) with one log decay per head, `g`
+    `[B, S, H]`."""
+    return chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size, implementation)
 
 
 def recurrent_delta_rule(query, key, value, g, beta, state=None):
@@ -601,67 +652,44 @@ class GatedDeltaNet(nn.Module):
         # underflow to -inf (modeling_qwen3_next.py:652-653); at least fp32,
         # so a float64 model's stays float64 (`at_least_fp32`).
         wide = at_least_fp32(query.dtype)
-        conv_input = jnp.moveaxis(
-            jnp.concatenate([query, key, value], axis=-1).astype(wide),
-            2, 1)  # [B, D, S], the conv's channel-major layout
-        taps, _ = self.conv1d()
-        recurrent = None
-        if decode:
-            # The first decode-mode call only allocates, the way
-            # open_kv_cache's is: init_cache's dummy token must not consume
-            # a position or leave state behind. The conv state holds the
-            # projections' own values, so it is held in their dtype at no
-            # cost; the recurrent state is held as the docstring says.
-            allocated = self.has_variable('cache', 'recurrent_state')
-            held = (jnp.promote_types(self.dtype, jnp.bfloat16)
-                    if self.dtype is not None and asks_default_precision(self.precision, configured=True)
-                    else wide)
-            conv_state = self.variable(
-                'cache', 'conv_state', jnp.zeros,
-                (B, self.conv_features, self.conv_kernel - 1), jnp.promote_types(query.dtype, held))
-            recurrent = self.variable(
-                'cache', 'recurrent_state', jnp.zeros,
-                (B, self.num_v_heads, self.head_k_dim, self.head_v_dim), held)
-            if not allocated:
-                # Allocation only: the caller's first real forward, not this
-                # call, starts the state.
-                out = jnp.zeros((B, S, self.value_features), self.dtype)
-                return self.out_proj(out)
-            mixed, history = held_conv1d(conv_input, taps, valid, conv_state.value.astype(wide))
-            conv_state.value = history.astype(conv_state.value.dtype)
-        else:
-            mixed, _ = held_conv1d(conv_input, taps, valid)
-        mixed = jnp.moveaxis(mixed, 2, 1)  # back to [B, S, D]
-
-        query, key, value = jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1)
-        query = self._expand_kv(self._split_heads(query, self.head_k_dim))
-        key = self._expand_kv(self._split_heads(key, self.head_k_dim))
-        value = self._split_heads(value, self.head_v_dim)
-
         beta = nn.sigmoid(b.astype(wide))
-        g = -jnp.exp(self.A_log.astype(wide)) * nn.softplus(
-            a.astype(wide) + self.dt_bias.astype(wide))
-
-        query = l2norm(query)
-        key = l2norm(key)
+        g = -jnp.exp(self.A_log.astype(wide)) * nn.softplus(a.astype(wide) + self.dt_bias.astype(wide))
         if valid is not None:
             # exp(0)=1 and beta=0 preserve recurrent memory for invalid input.
             beta = jnp.where(valid[:, :, None], beta, 0.0)
             g = jnp.where(valid[:, :, None], g, 0.0)
 
-        held = None if recurrent is None else recurrent.value
-        state = None if held is None else held.astype(wide)
-        if S == 1 and held is not None and delta_rule.fits(held):
-            out, final = decode_gated_delta_rule(query, key, value, g, beta, held,
-                                                 None if valid is None else valid[:, 0])
-        elif S == 1:
+        def scan(convolved, *, starts, valid, held):
+            del starts
+            query, key, value = jnp.split(jnp.moveaxis(convolved, 2, 1), [key_dim, 2 * key_dim], axis=-1)
+            query = l2norm(self._expand_kv(self._split_heads(query, self.head_k_dim)))
+            key = l2norm(self._expand_kv(self._split_heads(key, self.head_k_dim)))
+            value = self._split_heads(value, self.head_v_dim)
+            state = None if held is None else held.astype(wide)
+            if S == 1 and held is not None and delta_rule.fits(held):
+                return decode_gated_delta_rule(query, key, value, g, beta, held,
+                                               None if valid is None else valid[:, 0])
+            if S > 1:
+                return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size)
             out, final = recurrent_gated_delta_rule(query, key, value, g, beta, state)
             if held is not None and held.dtype == jnp.bfloat16:
                 final = delta_rule.round_to_bf16(final, key[:, 0].astype(wide), value[:, 0].astype(wide))
-        else:
-            out, final = chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size)
-        if recurrent is not None:
-            recurrent.value = final.astype(recurrent.value.dtype)
+            return out, final
+
+        # The conv state holds the projections' own values, so it is held in
+        # their dtype at no cost; the recurrent state is held as the
+        # docstring says. The first decode-mode call only allocates, the way
+        # open_kv_cache's is: init_cache's dummy token must not consume a
+        # position or leave state behind.
+        stored = (jnp.promote_types(self.dtype, jnp.bfloat16)
+                  if self.dtype is not None and asks_default_precision(self.precision, configured=True)
+                  else wide)
+        out = held_scan(self, jnp.concatenate([query, key, value], axis=-1).astype(wide), self.conv1d()[0],
+                        None, scan, (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
+                        valid=valid, state='recurrent_state', state_dtype=stored,
+                        conv_dtype=jnp.promote_types(query.dtype, stored))
+        if out is None:
+            return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
 
         gate = z.reshape(B, S, -1, self.head_v_dim)
         out = self.norm(out, gate)  # the norm scales, then the activation gates

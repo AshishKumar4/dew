@@ -18,8 +18,9 @@ modeling_glm5_next.py:584-733):
 - q and k are l2-normalised inside the rule as `x / sqrt(sum x^2 + eps)`
   (:416-424).
 
-`chunk_kimi_delta_rule` is `chunk_kimi_delta_attention` (:482-578) in fp32,
-and the recurrent form `dew.nn.linear.recurrent_delta_rule` (:428-478).
+`chunk_kimi_delta_rule` is `chunk_kimi_delta_attention` (:482-578) in fp32 on
+the gated delta rule's chunked form, `dew.nn.linear.chunk_delta_rule`, and
+the recurrent form `dew.nn.linear.recurrent_delta_rule` (:428-478).
 tests/test_kda.py holds both to a float64 oracle of the reference.
 """
 
@@ -28,7 +29,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 
-import jax
 import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
@@ -38,11 +38,10 @@ from .linear import (
     CHUNK_SIZE,
     DepthwiseConv1d,
     RMSNormGated,
-    chunk_decay,
-    held_conv1d,
+    chunk_delta_rule,
+    held_scan,
     l2norm,
     recurrent_delta_rule,
-    strictly_lower_inverse,
 )
 from .mixer_base import MixerBase, MixerContext
 from .precision import at_least_fp32
@@ -50,73 +49,11 @@ from .sharding import logical_axes
 
 
 def chunk_kimi_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE):
-    """The chunked KDA rule over `[B, S, H, D]` operands with `g` `[B, S, H, Dk]`
-    and `beta` `[B, S, H]`: `(output [B, S, H, Dv], state [B, H, Dk, Dv])`.
-
-    `chunk_kimi_delta_attention` (modeling_glm5_next.py:482-578) line for
-    line in fp32. The reference's row correction loop inverts `I - A` for a
-    strictly lower triangular `A`, which `dew.nn.linear.strictly_lower_inverse`
-    builds from its diagonal blocks.
-    """
-    dtype, work = query.dtype, at_least_fp32(query.dtype)
-    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
-    B, S, H, Dk = key.shape
-    Dv = value.shape[-1]
-    pad = (chunk_size - S % chunk_size) % chunk_size
-    query, key, value, g = (jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0))) for x in (query, key, value, g))
-    beta = jnp.pad(beta, ((0, 0), (0, pad), (0, 0)))
-    T = S + pad
-    query = query * (Dk ** -0.5)
-
-    def chunks(x):  # [B, T, H, ...] -> [NC, B, H, C, ...] for the scan
-        moved = jnp.moveaxis(x, 2, 1)
-        blocked = moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
-        return jnp.moveaxis(blocked, 2, 0)
-
-    q_c, k_c, g_c = chunks(query), chunks(key), chunks(g)
-    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
-    # Per key dimension: g [NC, B, H, C, Dk] cumulated within the chunk
-    # (modeling_glm5_next.py:530), the decay between positions s >= t of
-    # `exp(gc[s] - gc[t])` per dimension (modeling_glm5_next.py:532), zero
-    # above the diagonal.
-    gc, decay = chunk_decay(g_c)  # [NC, B, H, C, Dk], [NC, B, H, C, C, Dk]
-    # attn[s, t] = -sum_d k_beta[s, d] k[t, d] decay[s, t, d], strictly lower
-    # (the reference's `masked_fill(triu(0), 0)`, modeling_glm5_next.py:533).
-    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-    attn = jnp.where(strict, -jnp.einsum('...sd,...td,...std->...st', kb_c, k_c, decay), 0.0)
-    inv = strictly_lower_inverse(attn)
-    out_vals = inv @ vb_c
-    k_cumdecay = inv @ (kb_c * jnp.exp(gc))
-
-    state = (jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work))
-    # XLA:CPU workaround: under a jitted scan over the layers the chunk
-    # loop's zero initial state came back with other values in most
-    # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
-    # The barrier materializes the zero. Remove it when XLA:CPU no longer
-    # returns an uninitialized scan carry here.
-    state = jax.lax.optimization_barrier(state)
-
-    def one_chunk(s, step):
-        q_i, k_i, v_i, decay_i, kd_i, gc_i = (step[name] for name in ('q', 'k', 'v', 'decay', 'kd', 'gc'))
-        attn_inter = (q_i * jnp.exp(gc_i)) @ s
-        # decay is zero above the diagonal, so this is the reference's
-        # inclusive-lower `masked_fill(triu(1), 0)` (modeling_glm5_next.py:560).
-        attn_intra = jnp.einsum('...sd,...td,...std->...st', q_i, k_i, decay_i)
-        v_corrected = v_i - kd_i @ s
-        out = attn_inter + attn_intra @ v_corrected
-        last = gc_i[..., -1:, :]
-        s = (
-            s * jnp.exp(last)[..., 0, :, None]
-            + jnp.swapaxes(k_i * jnp.exp(last - gc_i), -1, -2) @ v_corrected
-        )
-        return s, out
-
-    state, core = jax.lax.scan(
-        one_chunk, state,
-        {'q': q_c, 'k': k_c, 'v': out_vals, 'decay': decay, 'kd': k_cumdecay, 'gc': gc})
-    core = jnp.moveaxis(core, 0, 2).reshape(B, H, T, Dv)
-    core = jnp.moveaxis(core, 1, 2)[:, :S]
-    return core.astype(dtype), state.astype(dtype)
+    """`chunk_kimi_delta_attention` (modeling_glm5_next.py:482-578): the
+    chunked rule (`dew.nn.linear.chunk_delta_rule`) with `g` `[B, S, H, Dk]`,
+    a log decay per key dimension, on the XLA recurrence, as the Pallas
+    kernels decay per head."""
+    return chunk_delta_rule(query, key, value, g, beta, state, chunk_size, implementation='xla')
 
 
 # q/k/v_proj and o_proj carry the attention mixer's declarations under the
@@ -215,37 +152,29 @@ class KimiDeltaAttention(nn.Module):
             x = jnp.where(valid[:, :, None], x, 0)
         projected = jnp.concatenate([self.q_proj(x), self.k_proj(x), self.v_proj(x)], axis=-1)
         wide = at_least_fp32(projected.dtype)
-        conv_input = jnp.moveaxis(projected.astype(wide), 2, 1)
         taps = jnp.concatenate([conv()[0] for conv in (self.q_conv1d, self.k_conv1d, self.v_conv1d)])
-        recurrent = None
-        if decode:
-            allocated = self.has_variable('cache', 'recurrent_state')
-            conv_state = self.variable('cache', 'conv_state', jnp.zeros,
-                                       (B, 3 * self.qkv_features, self.conv_kernel - 1), wide)
-            recurrent = self.variable('cache', 'recurrent_state', jnp.zeros,
-                                      (B, self.num_heads, self.head_dim, self.head_dim), wide)
-            if not allocated:
-                # Allocation only, as GatedDeltaNet: init_cache's dummy token
-                # must not consume a position or leave state behind.
-                return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
-            mixed, conv_state.value = held_conv1d(conv_input, taps, valid, conv_state.value)
-        else:
-            mixed, _ = held_conv1d(conv_input, taps, valid)
-        mixed = jnp.moveaxis(mixed, 2, 1)
-        query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim)
-                             for part in jnp.split(mixed, 3, axis=-1))
-        query, key = l2norm(query), l2norm(key)
         g = self._decay(x)
         beta = nn.sigmoid(self.b_proj(x).astype(wide))
         if valid is not None:
             # exp(0) = 1 and beta = 0 preserve the memory across a padded slot.
             g = jnp.where(valid[:, :, None, None], g, 0.0)
             beta = jnp.where(valid[:, :, None], beta, 0.0)
-        rule = recurrent_delta_rule if S == 1 else functools.partial(
-            chunk_kimi_delta_rule, chunk_size=self.chunk_size)
-        out, final = rule(query, key, value, g, beta, None if recurrent is None else recurrent.value)
-        if recurrent is not None:
-            recurrent.value = final
+
+        def scan(convolved, *, starts, valid, held):
+            del starts, valid
+            query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim)
+                                 for part in jnp.split(jnp.moveaxis(convolved, 2, 1), 3, axis=-1))
+            rule = recurrent_delta_rule if S == 1 else functools.partial(
+                chunk_kimi_delta_rule, chunk_size=self.chunk_size)
+            return rule(l2norm(query), l2norm(key), value, g, beta, held)
+
+        # The decode state is GatedDeltaNet's pair, here in fp32; the
+        # allocation-only call returns before any state is written.
+        out = held_scan(self, projected.astype(wide), taps, None, scan,
+                        (self.num_heads, self.head_dim, self.head_dim), decode=decode, valid=valid,
+                        state='recurrent_state')
+        if out is None:
+            return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
         gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))
         gate = gate.reshape(B, S, self.num_heads, self.head_dim)
         out = self.o_norm(out, gate).reshape(B, S, self.qkv_features)
