@@ -51,6 +51,21 @@ def assert_same_stored_tensors(written: dict, original: dict) -> None:
                                       value.reshape(-1).view(np.uint8), err_msg=name)
 
 
+def assert_layout_tensors(layouts, variables, tensors, prefix: str) -> None:
+    """Every source tensor has a layout that exports its dtype, shape and bytes."""
+    assert {layout.name for layout in layouts} == {f"{prefix}{name}" for name in tensors}
+    assert_same_stored_tensors(
+        {layout.name.removeprefix(prefix): layout.export(variables) for layout in layouts}, tensors)
+
+
+def scaled_gap(actual, expected) -> float:
+    """Maximum float64 error, scaled by max(1, the reference's magnitude)."""
+    expected = np.asarray(expected, np.float64)
+    difference = np.abs(np.asarray(actual, np.float64) - expected).max()
+    return float(difference / max(1.0, float(np.abs(expected).max())))
+
+
+
 def gemma_features(model_type, config, waveforms):
     """The float32 `input_features` and boolean `input_features_mask` the
     checkpoint's own Transformers extractor makes of 16 kHz `waveforms`,

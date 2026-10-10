@@ -6,7 +6,28 @@ import sys
 from pathlib import Path
 
 import pytest
-from process_support import ProcessGroup, run_pool, start_process
+from process_support import ProcessGroup, prepare_worker, run_pool, start_process
+
+
+def test_worker_bootstrap_keeps_launched_detection_distinct_from_single_host(monkeypatch):
+    from types import SimpleNamespace
+
+    from dew.training import runtime
+
+    joins = []
+    monkeypatch.setattr(runtime, "prepare_process", lambda **kwargs: joins.append(kwargs["multi_host"]))
+    args = SimpleNamespace(coordinator=None, processes=2, process_id=1)
+    prepare_worker(args)
+    prepare_worker(args, multi_host=None)
+    expected = {"OMPI_MCA_orte_hnp_uri": "0.0;tcp://127.0.0.1:1234", "OMPI_COMM_WORLD_SIZE": "2",
+                "OMPI_COMM_WORLD_RANK": "1", "OMPI_COMM_WORLD_LOCAL_RANK": "1",
+                "JAX_COORDINATOR_ADDRESS": "127.0.0.1:1234"}
+    for name in expected:
+        monkeypatch.setenv(name, "previous")
+    args.coordinator = "127.0.0.1:1234"
+    prepare_worker(args)
+    assert joins == [False, None, True]
+    assert {name: os.environ[name] for name in expected} == expected
 
 
 def test_pool_reports_follow_rank_order_and_workers_own_sessions(tmp_path):

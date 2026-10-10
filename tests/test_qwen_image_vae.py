@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
 from safetensors.numpy import save_file
 
 from dew.interop.diffusion import component_tensors
@@ -58,12 +58,6 @@ def channels_last(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
 
 
-def scaled_gap(actual, expected) -> float:
-    expected = np.asarray(expected, np.float64)
-    difference = np.abs(np.asarray(actual, np.float64) - expected).max()
-    return float(difference / max(1.0, float(np.abs(expected).max())))
-
-
 def parameter_gaps(layouts, gradients, reference, walk: str) -> dict[str, float]:
     """Each native parameter gradient, exported to its source tensor's layout,
     against the source's gradient of that tensor."""
@@ -75,14 +69,9 @@ def parameter_gaps(layouts, gradients, reference, walk: str) -> dict[str, float]
 def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, loaded):
     _, params, layouts, _ = loaded
     tensors = component_tensors(source, "vae")
-    assert {layout.name for layout in layouts} == {f"vae/{name}" for name in tensors}
     time_convs = [name for name in tensors if "time_conv" in name]
     assert time_convs, "the fixture must carry the time_conv weights only a second frame reads"
-    for layout in layouts:
-        written = layout.export({"autoencoder": params})
-        published = tensors[layout.name.removeprefix("vae/")]
-        assert written.dtype == published.dtype and written.shape == published.shape, layout.name
-        assert written.tobytes() == published.tobytes(), layout.name
+    assert_layout_tensors(layouts, {"autoencoder": params}, tensors, "vae/")
 
 
 def posterior(model, params, image):

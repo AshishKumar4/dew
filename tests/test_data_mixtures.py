@@ -25,6 +25,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from token_support import write_token_corpus
 
 import dew.data
 from dew.data import Corpus, DataPartition, DataPhase, Loading, Ramp, TokenWindows
@@ -372,15 +373,9 @@ def test_a_mixture_computes_its_own_pass_and_takes_no_record_count(two_splits):
 
 def document_dir(root: Path, documents, eos: int = 0) -> str:
     """A token directory whose stream is `documents`, each closed by eos."""
-    root.mkdir(parents=True, exist_ok=True)
     stream = np.concatenate([np.asarray([*list(document), eos], np.uint16)
                              for document in documents])
-    (root / "train.bin").write_bytes(stream.tobytes())
-    (root / "val.bin").write_bytes(stream.tobytes())
-    (root / "meta.json").write_text(json.dumps(
-        {"tokenizer": "byte", "vocab_size": int(stream.max()) + 1, "dtype": "uint16",
-         "eos_id": eos, "train_tokens": len(stream), "val_tokens": len(stream)}))
-    return str(root)
+    return str(write_token_corpus(root, stream, stream, vocab_size=int(stream.max()) + 1, eos_id=eos))
 
 
 def packed_corpus(root: Path, documents: int = 40, length: int = 3) -> str:

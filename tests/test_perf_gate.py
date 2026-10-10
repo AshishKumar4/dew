@@ -2,12 +2,55 @@
 
 import importlib.util
 import json
+import subprocess
 import sys
+from functools import partial
 from pathlib import Path
 
 import pytest
+from tool_support import load
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("writer", ["perf_gate", "benchmark_step", "config"])
+def test_interrupted_evidence_and_config_saves_keep_the_completed_file(writer, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from dew import files
+    from dew.cli import config
+
+    out = tmp_path / "completed"
+    out.write_text("previous contents")
+
+    def interrupted(source, target):
+        raise OSError("interrupted publication")
+
+    monkeypatch.setattr(files.os, "replace", interrupted)
+    if writer == "config":
+        save = partial(config.save, config.TpuConfig(), out)
+    elif writer == "perf_gate":
+        tool = load(writer)
+        monkeypatch.setattr(tool, "measure", lambda *args: {"fixture": 1.0})
+        args = SimpleNamespace(base="base=/tmp/base", head="head=/tmp/head", rounds=1,
+                               only=["fixture"], out=out)
+        save = partial(tool.run, args)
+    else:
+        tool = load(writer)
+        monkeypatch.setattr(tool, "build_cases", lambda config: [SimpleNamespace(label="fixture")])
+        monkeypatch.setattr(tool, "measure", lambda *args: {"ms_per_step": 1, "samples_per_sec": 1})
+        save = partial(tool.run, tool.BenchmarkConfig(json_out=str(out)))
+    with pytest.raises(OSError, match="interrupted publication"):
+        save()
+    assert out.read_text() == "previous contents"
+    assert list(tmp_path.iterdir()) == [out]
+
+
+def test_report_command_keeps_dew_out_of_its_cold_import():
+    code = ("import runpy, sys\nrunpy.run_path('tools/perf_gate.py', run_name='cold_import')\n"
+            "assert not any(n == 'dew' or n.startswith('dew.') for n in sys.modules)\n")
+    done = subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
 
 
 @pytest.fixture(scope="module")
