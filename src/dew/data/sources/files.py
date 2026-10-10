@@ -75,10 +75,26 @@ class Files:
 
     @cached_property
     def kind(self) -> Format:
+        if self.format is None and self.committed is not None:
+            return _format("data." + str(self.committed["format"]))
         return self.format or _format(self.url if isinstance(self.url, str) else self.url[0])
 
     @cached_property
+    def committed(self) -> Mapping[str, object] | None:
+        if not isinstance(self.url, str):
+            return None
+        store = Store(self.url, self.storage_options).child("_dew_manifest.json")
+        fs, path = store.resolve()
+        return json.loads(fs.cat_file(path)) if fs.exists(path) else None
+
+    @cached_property
     def paths(self) -> tuple[str, ...]:
+        if self.committed is not None:
+            root = Store(str(self.url), self.storage_options)
+            entries = self.committed["files"]
+            if not isinstance(entries, list):
+                raise ValueError(f"export manifest has invalid files at {self.url}")
+            return tuple(root.child(str(entry["path"])).url for entry in entries)
         urls = (self.url,) if isinstance(self.url, str) else self.url
         found = []
         for url in urls:
@@ -178,7 +194,7 @@ class Files:
         elif self.kind == "array_record":
             from .records import ArrayRecords
 
-            rows = ArrayRecords(self.paths, self.storage_options)
+            rows = ArrayRecords(self.paths, self.storage_options, record_codec=self.committed is not None)
         elif read == "memory":
             return tuple(row for shard in self.manifest().shards for row in self._read_shard(shard))
         else:
@@ -194,6 +210,8 @@ class Files:
 
     @cached_property
     def fragments(self):
+        if not self.paths:
+            return ()
         return tuple(piece for fragment in self.arrow.get_fragments()
                      for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,)))
 
@@ -223,7 +241,8 @@ class Files:
         if self.kind == "array_record":
             from .records import ArrayRecords
 
-            return grain.MapDataset.source(ArrayRecords((shard.uri,), self.storage_options)).to_iter_dataset()
+            return grain.MapDataset.source(ArrayRecords(
+                (shard.uri,), self.storage_options, record_codec=self.committed is not None)).to_iter_dataset()
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
@@ -233,7 +252,7 @@ class Files:
         return _Lines(self, shard)
 
     def metadata(self) -> Mapping[str, object]:
-        return {}
+        return self.committed or {}
 
     def lengths(self) -> np.ndarray | None:
         if self.kind in ("parquet", "arrow") and "length" in self.arrow.schema.names:
@@ -382,3 +401,160 @@ class _LineIterator(grain.DatasetIterator):
 
     def close(self) -> None:
         self.file.close()
+
+
+@dataclass(frozen=True)
+class TokenBytes:
+    """A contiguous token store. Local spans use mmap; URL spans use range reads."""
+
+    url: str
+    dtype: str = "uint16"
+    eos_id: int | None = None
+    storage_options: Mapping[str, object] | None = None
+
+    @cached_property
+    def count(self) -> int:
+        fs, path = Store(self.url, self.storage_options).resolve()
+        size = fs.size(path)
+        width = np.dtype(self.dtype).itemsize
+        if size % width:
+            raise ValueError(f"token file {self.url} size {size} is not divisible by dtype {self.dtype}")
+        return size // width
+
+    def __len__(self) -> int:
+        return self.count
+
+    @cached_property
+    def local(self) -> np.memmap | None:
+        fs, path = Store(self.url, self.storage_options).resolve()
+        protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+        return np.memmap(path, dtype=self.dtype, mode="r") if "file" in protocols and self.count else None
+
+    def __getitem__(self, span: slice) -> np.ndarray:
+        start, stop, step = span.indices(self.count)
+        if step != 1:
+            raise ValueError("token stores are read in contiguous spans")
+        if self.local is not None:
+            return np.asarray(self.local[start:stop])
+        if stop <= start:
+            return np.empty(0, dtype=self.dtype)
+        fs, path = Store(self.url, self.storage_options).resolve()
+        width = np.dtype(self.dtype).itemsize
+        return np.frombuffer(fs.cat_file(path, start=start * width, end=stop * width), dtype=self.dtype)
+
+    def __getstate__(self) -> Mapping[str, object]:
+        return {key: value for key, value in self.__dict__.items() if key != "local"}
+
+
+@dataclass(frozen=True)
+class TokenRecords:
+    """ArrayRecord token documents with a producer's authoritative length index."""
+
+    paths: tuple[str, ...]
+    lengths: np.ndarray
+    dtype: str = "int32"
+    field: str | None = None
+    eos_id: int | None = None
+    storage_options: Mapping[str, object] | None = None
+
+    @cached_property
+    def records(self):
+        from .records import ArrayRecords
+
+        return ArrayRecords(self.paths, self.storage_options)
+
+    @cached_property
+    def ends(self) -> np.ndarray:
+        return np.cumsum(self.lengths, dtype=np.int64)
+
+    def piece(self, index: int) -> np.ndarray:
+        from .codec import unpack_dict_of_byte_arrays
+
+        data = self.records[index]
+        if not isinstance(data, bytes):
+            raise TypeError("ArrayRecord token document is not bytes")
+        if self.field is not None:
+            data = unpack_dict_of_byte_arrays(data)[self.field]
+        values = np.frombuffer(data, dtype=self.dtype)
+        if len(values) != int(self.lengths[index]):
+            raise ValueError(f"token document {index} differs from the producer's length index")
+        return values
+
+    def __len__(self) -> int:
+        return int(self.ends[-1]) if len(self.ends) else 0
+
+    def __getitem__(self, span: slice) -> np.ndarray:
+        start, stop, step = span.indices(len(self))
+        if step != 1:
+            raise ValueError("token stores are read in contiguous spans")
+        pieces = []
+        for index in range(int(np.searchsorted(self.ends, start, side="right")), len(self.ends)):
+            begin = 0 if index == 0 else int(self.ends[index - 1])
+            if begin >= stop:
+                break
+            pieces.append(self.piece(index)[max(start - begin, 0):stop - begin])
+        return np.concatenate(pieces) if pieces else np.empty(0, self.dtype)
+
+
+@dataclass(frozen=True)
+class TokenFiles:
+    """A produced train/val token directory, with metadata and document boundaries."""
+
+    url: str
+    split: str = "train"
+    storage_options: Mapping[str, object] | None = None
+    chunk_tokens: int = 65536
+
+    def describe(self) -> str:
+        return f"tokens:{self.url}:{self.split}"
+
+    @cached_property
+    def meta(self) -> Mapping[str, object]:
+        fs, path = Store(self.url, self.storage_options).child("meta.json").resolve()
+        return json.loads(fs.cat_file(path)) if fs.exists(path) else {}
+
+    @cached_property
+    def tokens(self) -> TokenBytes:
+        eos = self.meta.get("eos_id")
+        if eos is not None and not isinstance(eos, int):
+            raise ValueError("token metadata eos_id must be an integer or null")
+        return TokenBytes(self.url.rstrip("/") + f"/{self.split}.bin", str(self.meta.get("dtype", "uint16")),
+                          eos, self.storage_options)
+
+    def metadata(self) -> Mapping[str, object]:
+        return {**self.meta, "tokens": len(self.tokens), "token_store": True}
+
+    def snapshot(self) -> Mapping[str, object]:
+        fs, path = Store(self.tokens.url, self.storage_options).resolve()
+        return {"store": "tokens", "url": self.url, "split": self.split,
+                "metadata": self.meta, "bytes": fs.size(path), "version": fs.ukey(path)}
+
+    def supports(self, read: Read) -> bool:
+        return True
+
+    def records(self, read: Read) -> Records:
+        indexed = _TokenChunks(self.tokens, self.chunk_tokens)
+        return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
+
+    def manifest(self) -> ShardManifest:
+        count = len(self.records("indexed"))
+        return ShardManifest(tuple(Shard(f"{self.tokens.url}:{index}", self.tokens.url, index, index + 1, 1)
+                                   for index in range(count)), self._read_shard)
+
+    def _read_shard(self, shard: Shard) -> grain.IterDataset:
+        return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
+
+    def lengths(self) -> np.ndarray | None:
+        return None
+
+
+@dataclass(frozen=True)
+class _TokenChunks:
+    tokens: TokenBytes
+    size: int
+
+    def __len__(self) -> int:
+        return (len(self.tokens) + self.size - 1) // self.size
+
+    def __getitem__(self, index: int) -> Batch:
+        return {"text": self.tokens[index * self.size:(index + 1) * self.size].astype(np.int32)}

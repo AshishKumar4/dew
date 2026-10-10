@@ -112,12 +112,7 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
     assert manifest["rows"] == 13
     assert Store(root + "/_SUCCESS").read()
     files = Files(root, format=format)
-    if format == "array_record":
-        from dew.data.sources.codec import decode
-
-        actual = [decode(row) for shard in files.manifest().shards for row in files.manifest().reader(shard)]
-    else:
-        actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+    actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
     assert actual == rows
 
 

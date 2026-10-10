@@ -139,13 +139,19 @@ def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
     root = os.environ.get("DEW_DATA_TEST_URL")
     if not root:
         pytest.skip("DEW_DATA_TEST_URL names the writable R2 smoke prefix")
-    store = Store(root.rstrip("/") + "/" + uuid4().hex + "/CURRENT")
-    store.put_if_absent(b'{"generation":"one"}')
+    store = Store(root.rstrip("/") + "/CURRENT")
+    first = ('{"generation":"' + uuid4().hex + '"}').encode()
+    try:
+        previous = store.get_versioned()
+    except FileNotFoundError:
+        store.put_if_absent(first)
+    else:
+        store.put_if_match(first, previous.version)
     with pytest.raises(PreconditionFailed):
         store.put_if_absent(b'{"generation":"two"}')
     cached = Store("dewcache::" + store.url, {"dewcache": {
         "cache_storage": str(tmp_path), "max_bytes": 1024}})
-    assert cached.read() == b'{"generation":"one"}'
+    assert cached.read() == first
     fs, path = store.resolve()
     if "s3" in fs.protocol:
         fs.rm(path)

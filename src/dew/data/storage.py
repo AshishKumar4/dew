@@ -257,6 +257,14 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             cached = self._check_file(path)
             if not cached:
                 self._dew_misses += 1
+                previous = self._metadata.cached_files[-1].get(path)
+                if previous is not None:
+                    with (directory / (previous["fn"] + ".pin")).open("a+b") as pin:
+                        try:
+                            fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return self.fs.open(path, mode=mode, **kwargs)
+                        self.pop_from_cache(path)
                 size = self.fs.size(path)
                 if not self._dew_room(size):
                     return self.fs.open(path, mode=mode, **kwargs)

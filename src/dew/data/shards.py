@@ -10,7 +10,7 @@ from .sources.base import ShardManifest
 
 
 def streamed(manifest: ShardManifest, *, partition: DataPartition, seed: int | None = None,
-             cycle_length: int = 16, loading: Loading) -> grain.IterDataset:
+             cycle_length: int = 16, loading: Loading, epochs: int | None = 1) -> grain.IterDataset:
     if cycle_length < 1:
         raise ValueError("interleave cycle_length must be positive")
     workers = loading.workers if isinstance(loading.workers, int) else 1
@@ -21,6 +21,8 @@ def streamed(manifest: ShardManifest, *, partition: DataPartition, seed: int | N
     root = grain.MapDataset.source(manifest.shards)
     if seed is not None:
         root = root.shuffle(seed=seed)
+    if epochs != 1:
+        root = root.repeat(epochs)
     root = root[partition.index::partition.count].map(manifest.reader)
     return experimental.InterleaveIterDataset(root, cycle_length=cycle_length,
                                                num_make_iter_threads=loading.threads,
