@@ -236,6 +236,7 @@ def supervise(args, client: Colab) -> dict:
             "session": args.session,
             "rate": args.rate,
             "budget_cu": args.budget_cu,
+            "budget_source": args.budget_source,
             "hard_cap_minutes": cap,
             "driver_sha": driver_sha(),
             "started_at": time.time(),
@@ -285,6 +286,7 @@ def main() -> None:
     parser.add_argument("--session")
     parser.add_argument("--rate", type=float)
     parser.add_argument("--budget-cu", type=float)
+    parser.add_argument("--budget-source", default="explicit")
     parser.add_argument("--finalize-only", action="store_true")
     parser.add_argument("--reconcile", action="store_true")
     parser.add_argument("command", nargs=argparse.REMAINDER)
@@ -299,6 +301,8 @@ def main() -> None:
     else:
         if not args.rate or not 0 < args.rate < float("inf"):
             parser.error("rate must be finite and positive")
+        if args.budget_cu is None or not 0 < args.budget_cu < float("inf"):
+            parser.error("a finite positive session budget is required")
         result = supervise(args, client)
         print(result)
         if result["driver_exit"] or result["reason"] or not result["job_results"]:

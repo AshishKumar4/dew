@@ -268,7 +268,14 @@ def main() -> None:
         raise SystemExit("no approved, unheld entries selected")
     plan = colab_batch.plan_jobs(chosen, args.device, args.hardware, args.commit)
     if args.dry_run:
-        print(json.dumps(colab_batch.identity(plan)))
+        print(
+            json.dumps(
+                {
+                    "identity": colab_batch.identity(plan),
+                    "expected_cu": sum(float(job["economics"]["expected_cu"]) for job in plan["jobs"]),
+                }
+            )
+        )
         return
     run_dir = Path(os.environ["DEW_OPS_RUN"])
     work = run_dir / "staging"
