@@ -10,6 +10,10 @@ Python from 3.11:
     pip install dew-flash-attn-cu12   # jax with jax-cuda12-plugin
     pip install dew-flash-attn-cu13   # jax with jax-cuda13-plugin
 
+The wheel ships no CUDA runtime: it needs a CUDA build of JAX of the same major
+in the same environment (`jax[cuda12]` or `jax[cuda13]`), whose libcudart it
+loads.
+
 With it installed, Dew's `attention_impl="auto"` runs FlashAttention-2
 on an A100 (sm80) for calls without a window, mask, bias or softcap and with
 heads up to 256 wide. `attention_impl="flash"` asks for it on any sm8x GPU.
