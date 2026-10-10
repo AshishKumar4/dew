@@ -56,7 +56,8 @@ export default {
     }
     if (request.method === 'HEAD') {
       const object = await env.CACHE.head(key);
-      return new Response(null, object === null ? { status: 404 } : { status: 200, headers: { etag: object.httpEtag } });
+      return new Response(null, object === null ? { status: 404 }
+        : { status: 200, headers: { 'content-length': String(object.size), etag: object.httpEtag } });
     }
     if (request.method === 'PUT') {
       const size = Number(request.headers.get('content-length'));
