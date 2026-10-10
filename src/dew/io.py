@@ -11,7 +11,7 @@ from collections.abc import Sequence
 import jax
 from etils import epath
 
-from dew.checkpoints import RUN_FILE, frozen_entries, is_uri
+from dew.checkpoints import frozen_entries, is_uri
 from dew.training.tracker import WandbTracker
 
 REGISTRY = "wandb-registry-model"
@@ -24,7 +24,8 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     W&B model registry under `name`.
 
     `directory` is one step directory (`Checkpoints.path(step)`). The artifact
-    holds it under its own name, the run's `run.json` and the
+    holds it under its own name, every file at the run's root (its `run.json`,
+    and what the run wrote beside it, a decision run's calibrated task) and the
     `dew.checkpoints.FROZEN_STORE` entries the step records, each at its place
     in the run directory, so a download is a run directory `from_run` and
     `Checkpoints.restore` read. The artifact carries 'latest' and `aliases`;
@@ -46,18 +47,18 @@ def publish(directory: str, name: str, *, tracker: WandbTracker,
     artifact = wandb.Artifact(name=name, type="model")
     path = epath.Path(directory)
     run = path.parent
-    spec = run / RUN_FILE
+    files = sorted((entry for entry in run.iterdir() if entry.is_file()), key=lambda entry: entry.name)
     entries = frozen_entries(directory)
     if is_uri(directory):
         artifact.add_reference(str(path), name=path.name)
-        if spec.exists():
-            artifact.add_reference(str(spec), name=RUN_FILE)
+        for file in files:
+            artifact.add_reference(str(file), name=file.name)
         for entry in entries:
             artifact.add_reference(str(run / entry), name=entry)
     else:
         artifact.add_dir(directory, name=path.name)
-        if spec.exists():
-            artifact.add_file(str(spec), name=RUN_FILE)
+        for file in files:
+            artifact.add_file(str(file), name=file.name)
         for entry in entries:
             artifact.add_dir(str(run / entry), name=entry)
     logged = tracker.run.log_artifact(artifact, aliases=["latest", *aliases])

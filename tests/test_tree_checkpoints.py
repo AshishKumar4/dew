@@ -146,3 +146,24 @@ def test_a_sharded_tree_restores_onto_another_mesh(tmp_path):
     for name in written:
         assert restored[name].sharding == target
         np.testing.assert_array_equal(np.asarray(restored[name]), np.asarray(written[name]))
+
+
+@pytest.mark.mesh
+def test_a_local_placement_names_which_device_holds_which_slice():
+    """Two meshes over the same devices in opposite orders print alike, yet
+    give each device the other's slice; the recorded placement tells them
+    apart, so a local checkpoint refuses the mesh that would misread its shards."""
+    from jax.sharding import Mesh
+
+    from dew.checkpoints import placement
+
+    devices = jax.devices()[:2]
+
+    def leaf(order):
+        sharding = NamedSharding(Mesh(np.array(order), ("fsdp",)), P("fsdp"))
+        return jax.ShapeDtypeStruct((4, 2), jnp.float32, sharding=sharding)
+
+    forward, backward = leaf(devices), leaf(devices[::-1])
+    assert str(forward.sharding) == str(backward.sharding)
+    assert placement({"w": forward}) != placement({"w": backward})
+    assert placement({"w": forward}) == placement({"w": leaf(list(devices))})
