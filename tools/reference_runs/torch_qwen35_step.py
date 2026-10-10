@@ -180,12 +180,12 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
 def smoke_attribution(path: Path) -> dict:
     """Exercise correlation, overlap accounting and unknown retention without CUDA."""
     events = [{"ph": "X", "cat": "user_annotation", "name": "reference.optimizer",
-               "pid": 1, "tid": 1, "ts": 90, "dur": 20}]
+               "pid": 1, "tid": 1, "ts": 60, "dur": 9}]
     names = ["ampere_bf16_s16816gemm", "chunk_gated_delta_rule_fwd_kernel_h",
              "flash_fwd_kernel", "_rms_norm_forward_kernel", "reduce_kernel",
              "Memcpy DtoD", "vectorized_elementwise_kernel", "unrecognized_kernel"]
     for index, name in enumerate(names):
-        launch_time = 100 if index == 6 else index * 10
+        launch_time = index * 10
         events.extend([
             {"ph": "X", "cat": "cpu_op", "name": "aten::mm" if index == 0 else "aten::test",
              "pid": 1, "tid": 2, "ts": launch_time, "dur": 1,
@@ -195,11 +195,15 @@ def smoke_attribution(path: Path) -> dict:
             {"ph": "X", "cat": "kernel", "name": name, "ts": index * 10, "dur": 5,
              "args": {"device": 0, "correlation": index + 1}},
         ])
+    events.append({"ph": "X", "cat": "gpu_memcpy", "name": "Memcpy DtoD", "ts": 1, "dur": 3,
+                   "args": {"device": 0, "correlation": 20}})
     path.write_text(json.dumps({"traceEvents": events}))
     result = attribute(path, 1, 64)
     for kind in KINDS:
-        if abs(result["by_kind_ms"][kind] - 0.005) > 1e-9:
+        if abs(result["by_kind_ms"][kind] - (0.008 if kind == "layout" else 0.005)) > 1e-9:
             raise AssertionError(f"incorrect kernel/launch classification for {kind}")
+    if abs(result["device_ms_per_step"] - 0.040) > 1e-9:
+        raise AssertionError("overlapping copy counted twice in device busy time")
     if abs(result["device_idle_ms_per_step"] - 0.035) > 1e-9:
         raise AssertionError("incorrect interval-union idle accounting")
     if "mlp" not in result["by_part_ms"]:
