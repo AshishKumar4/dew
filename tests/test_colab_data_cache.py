@@ -122,7 +122,7 @@ def test_staging_sends_only_manifest_identity_and_scoped_credential(tmp_path, se
         descriptor,
         {
             "url": "https://fake.invalid",
-            "token_file": str(tmp_path / "private-token"),
+            "read_token_file": str(tmp_path / "private-token"),
             "sources": [
                 {"prefix": "decision/mix-v3", "manifest_sha256": identity, "target": "/content/data"}
             ],
@@ -137,7 +137,7 @@ def test_staging_sends_only_manifest_identity_and_scoped_credential(tmp_path, se
     }
     plan = {"jobs": [job], "uploads": {}}
     colab_batch.stage_inputs(plan, tmp_path)
-    assert list(plan["uploads"]) == ["/content/.dew-data.token"]
+    assert list(plan["uploads"]) == ["/content/.dew-data-read.token"]
     assert plan["data_sources"][0]["manifest_sha256"] == identity
     assert "secret" not in json.dumps(plan)
 
@@ -155,3 +155,10 @@ def test_local_inputs_must_not_shadow_r2_data(tmp_path, service):
     }
     with pytest.raises(ValueError, match="must not also be staged"):
         colab_batch.stage_inputs({"jobs": [job], "uploads": {}}, tmp_path)
+
+
+def test_write_token_only_descriptor_is_refused_before_staging(tmp_path):
+    descriptor = tmp_path / "data.json"
+    save(descriptor, {"url": "https://fake.invalid", "token_file": str(tmp_path / "write-token"), "sources": []})
+    with pytest.raises(ValueError, match="read_token_file"):
+        colab_batch.data_inputs({"data_inputs": str(descriptor)})

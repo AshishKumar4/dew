@@ -161,6 +161,8 @@ def select(device: str, selector: str, hardware: str, order: list[str]) -> list[
             raise ValueError("invalid artifact_policy")
         if fields.get("compile_cache", "off") not in ("on", "off"):
             raise ValueError("compile_cache must be on or off")
+        if fields.get("wandb", "off") not in ("on", "off"):
+            raise ValueError("wandb must be on or off")
     return sorted(
         chosen,
         key=lambda entry: next(
@@ -206,6 +208,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             artifact_policy=fields.get("artifact_policy", "all"),
             artifact_excludes=fields.get("artifact_excludes", "").split(),
             compile_cache=fields.get("compile_cache", "off"),
+            wandb=fields.get("wandb", "off") == "on",
             entry=entry,
             economics={
                 key: fields[key] for key in ("gpu_reason", "expected_cu", "decision", "memory_estimate")
@@ -227,6 +230,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 "artifact_excludes": job["artifact_excludes"],
                 "inputs": sorted(inputs),
                 "data_sources": job["data_sources"],
+                "wandb": job["wandb"],
             },
         )
         jobs.append(job)
@@ -246,7 +250,9 @@ def data_inputs(fields: dict) -> dict:
     if not fields.get("data_inputs"):
         return {"data_sources": []}
     descriptor = read(Path(fields["data_inputs"]).expanduser())
-    result = {"data_sources": [], "data_token_file": descriptor["token_file"]}
+    if not descriptor.get("read_token_file"):
+        raise ValueError("restore-only data inputs require a read_token_file descriptor")
+    result = {"data_sources": [], "data_token_file": descriptor["read_token_file"]}
     for source in descriptor["sources"]:
         if not re.fullmatch(r"[0-9a-f]{64}", source["manifest_sha256"]):
             raise ValueError("cached input descriptor requires an immutable manifest hash")
@@ -276,13 +282,15 @@ def split_file(source: Path, work: Path, prefix: str) -> tuple[list[str], str]:
     return names, digest.hexdigest()
 
 
-def stage(plan: dict, work: Path, repo: Path = REPO, *, netrc_file: Path | None = None) -> None:
+def stage(plan: dict, work: Path, repo: Path = REPO, *, netrc_file: Path | None = None,
+          wandb_config: Path | None = None) -> None:
     work.mkdir(mode=0o700, parents=True, exist_ok=False)
     stage_sources(plan, work, repo)
     stage_inputs(plan, work)
     from tools.colab.credentials import stage_wandb
 
-    stage_wandb(plan, work, netrc_file if netrc_file is not None else Path.home() / ".netrc")
+    stage_wandb(plan, work, netrc_file if netrc_file is not None else Path.home() / ".netrc",
+                wandb_config if wandb_config is not None else Path.home() / ".config/dew/wandb.toml")
     with tarfile.open(work / "runner.tar.gz", "w:gz") as archive:
         for file in HERE.glob("*.py"):
             archive.add(file, arcname="tools/colab/" + file.name)
@@ -365,8 +373,8 @@ def stage_inputs(plan: dict, work: Path) -> None:
         plan["data_sources"].extend(job.get("data_sources", []))
         if job.get("data_sources"):
             source = Path(job["data_token_file"]).expanduser()
-            parts, digest = split_file(source, work, "data-token")
-            target = "/content/.dew-data.token"
+            parts, digest = split_file(source, work, "data-read-token")
+            target = "/content/.dew-data-read.token"
             previous = plan["uploads"].get(target)
             if previous and previous["sha256"] != digest:
                 raise ValueError("packed jobs request different data-cache credentials")
