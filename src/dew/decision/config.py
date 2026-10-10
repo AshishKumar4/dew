@@ -19,6 +19,7 @@ held-out answers and a bucket's 2000, Laya's floors.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -37,6 +38,8 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import LogLoss
 from dew.decision.task import Decide
 from dew.training.state import TrainState
+
+_log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from dew.interop import Pretrained
@@ -155,9 +158,15 @@ class DecisionRunConfig(RunConfig):
             weighted, held_out = self.mixture.read()
             summary["mixture"] = self.mixture.shares()
             summary["made"] = self.mixture.recorded()
-        weighted, held_out, unfit = _fitting(objective, weighted, held_out)
+        fitting, held_out, unfit = _fitting(objective, weighted, held_out)
         if any(unfit.values()):
             summary["unfit"] = unfit
+        left = sorted(set(weighted) - set(fitting))
+        if left:
+            summary["left out"] = left
+            _log.warning("%s left out of the mixture: none of their rows fits a joint row of %d tokens",
+                         ", ".join(left), objective.layout.max_len)
+        weighted = fitting
         examples = weighted if self.mixture is not None else weighted["examples"].examples
         dataset = objective.dataset(examples, batch=self.trainer.batch_size, validation=held_out or None,
                                     seed=self.data.seed, loading=self.data.loading)
@@ -213,6 +222,10 @@ def _fitting(objective: DecisionObjective, weighted: dict[str, Weighted],
     alone pass the layout's `max_len` cannot be laid out at all: it is dropped
     and counted here, rather than stopping the run when a worker reaches it. A
     layout of one row per question lays out every example.
+
+    A set none of whose rows fit has nothing to train on and is left out of
+    the mixture, its rows counted, since grain refuses to mix an empty set;
+    the run's summary names it (`prepare`). A budget no set fits is refused.
     """
     if not objective.layout.joint:
         return weighted, held, {}
@@ -228,7 +241,12 @@ def _fitting(objective: DecisionObjective, weighted: dict[str, Weighted],
     for name, entry in weighted.items():
         examples = [example for example in map(Example.of, entry.examples) if fits(example)]
         unfit[name] = len(entry.examples) - len(examples)
-        kept[name] = Weighted(examples, entry.weight)
+        if examples:
+            kept[name] = Weighted(examples, entry.weight)
+    if not kept:
+        raise ValueError(
+            f"no row of {sorted(weighted)} fits a joint row of {objective.layout.max_len} tokens: each "
+            f"one's questions alone pass it; raise --max-len")
     held_kept = [example for example in held if fits(example)]
     unfit["held out"] = len(held) - len(held_kept)
     return kept, held_kept, unfit

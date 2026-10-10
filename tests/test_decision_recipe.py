@@ -6,13 +6,15 @@ import importlib.util
 import json
 import math
 import sys
+import types
 from pathlib import Path
 
 import pytest
 
 from dew.data.text import HFTokenizer
 from dew.decision import Choice, Decide, DecisionTable, Example, Noul
-from dew.decision.config import DecisionRunConfig
+from dew.decision.config import DecisionRunConfig, _fitting
+from dew.decision.data import Weighted
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
 
@@ -166,6 +168,30 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     for metric in ("log_loss", "accuracy"):
         assert scored["macro"][metric] == pytest.approx(
             sum(value[metric] for value in scored["sources"].values()) / 2)
+
+
+def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
+    """A set none of whose rows a joint row can hold has nothing to train on: the fit check leaves it out
+    of the mixture and counts its rows, rather than handing grain an empty set to mix, which it refuses;
+    a row budget no set fits is refused, naming it."""
+
+    class Layout:
+        joint, max_len = True, 64
+
+        def rows(self, tokenizer, specials, state, questions):
+            if state.startswith("long"):
+                raise ValueError("the questions alone pass max_len")
+            return []
+
+    objective = types.SimpleNamespace(layout=Layout(), tokenizer=None, specials=None)
+    short = [Example.of(row) for row in _requests(4, joint=True)]
+    long = [Example.of({**row, "state": "long " + row["state"]}) for row in _requests(3, joint=True)]
+    sets = {"short": Weighted(short, 1.0), "long": Weighted(long, 2.0)}
+    kept, held, unfit = _fitting(objective, sets, long)
+    assert list(kept) == ["short"] and kept["short"].examples == short and kept["short"].weight == 1.0
+    assert held == [] and unfit == {"short": 0, "long": 3, "held out": 3}
+    with pytest.raises(ValueError, match="64 tokens"):
+        _fitting(objective, {"long": Weighted(long, 1.0)}, [])
 
 
 @pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
