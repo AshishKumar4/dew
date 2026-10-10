@@ -616,7 +616,7 @@ def test_a_paged_kernel_reads_one_key_of_each_idle_row(monkeypatch, request, dec
         scores = jnp.where(jnp.arange(keys.shape[1]) < lengths[:, None, None], scores, -jnp.inf)
         return jnp.einsum("rhk,rkhd->rhd", jax.nn.softmax(scores, axis=-1), values).astype(query.dtype)
 
-    monkeypatch.setattr(KVStore, "kernel", lambda store: True)
+    monkeypatch.setattr(KVStore, "kernel", lambda store, query: True)
     monkeypatch.setattr(KVStore, "decode", recorded)
     monkeypatch.setattr(CausalSelfAttention, "_page_kernel_runs", lambda layer, query: True)
     monkeypatch.setattr(serving_kernel, "_PROGRAMS", {})
