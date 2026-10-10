@@ -269,6 +269,95 @@ class TracedWindow:
         return self.end - self.start - self.excluded
 
 
+class TorchTracedWindow:
+    """The torch loop's synchronized timing window followed by a profiled tail.
+
+    CUDA events measure individual steady steps. The wall clock spans the
+    same steps, synchronized only at its boundaries. The last timing event
+    is recorded before profiler startup, so startup cannot inflate its last
+    sample. CPU timing exists for tiny remote runner checks, never for MFU.
+    """
+
+    def __init__(self, device, total: int, warmup: int, profiled: int):
+        import torch
+
+        self.device = device
+        self.total, self.warmup, self.profile_from = total, warmup, total - profiled
+        if not 0 <= warmup < self.profile_from <= total:
+            raise ValueError("need at least one timed step before the profiled tail")
+        self.timed_steps = self.profile_from - warmup
+        self.events = ([torch.cuda.Event(enable_timing=True) for _ in range(self.timed_steps + 1)]
+                       if device.type == "cuda" else [])
+        self.cpu_times: list[float] = []
+        self.start = self.end = None
+        self.profiler = None
+        self.excluded = 0.0
+        self.excluded_steps: set[int] = set()
+        self.peak_allocated = self.peak_reserved = None
+
+    def synchronize(self) -> None:
+        import torch
+
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+
+    def _boundary(self, step: int) -> None:
+        if self.warmup <= step <= self.profile_from:
+            if self.events:
+                self.events[step - self.warmup].record()
+            else:
+                self.cpu_times.append(time.perf_counter())
+
+    def _end(self) -> None:
+        import torch
+
+        self.synchronize()
+        self.end = time.perf_counter()
+        if self.device.type == "cuda":
+            self.peak_allocated = torch.cuda.max_memory_allocated(self.device)
+            self.peak_reserved = torch.cuda.max_memory_reserved(self.device)
+
+    def before(self, step: int) -> None:
+        import torch
+
+        if step == self.warmup:
+            self.synchronize()
+            if self.device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats(self.device)
+            self.start = time.perf_counter()
+        self._boundary(step)
+        if step == self.profile_from:
+            self._end()
+            activities = [torch.profiler.ProfilerActivity.CPU]
+            if self.device.type == "cuda":
+                activities.append(torch.profiler.ProfilerActivity.CUDA)
+            self.profiler = torch.profiler.profile(activities=activities, record_shapes=True)
+            self.profiler.__enter__()
+
+    def close(self, trace_path: str | Path) -> None:
+        if self.end is None:
+            self._boundary(self.total)
+            self._end()
+        self.synchronize()
+        if self.profiler is not None:
+            self.profiler.__exit__(None, None, None)
+            path = Path(trace_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            self.profiler.export_chrome_trace(str(path))
+
+    @property
+    def seconds(self) -> float:
+        if self.start is None or self.end is None:
+            raise ValueError("the timing window has not closed")
+        return self.end - self.start - self.excluded
+
+    @property
+    def step_seconds(self) -> list[float]:
+        return [(self.events[i].elapsed_time(self.events[i + 1]) / 1e3 if self.events
+                 else self.cpu_times[i + 1] - self.cpu_times[i])
+                for i in range(self.timed_steps) if i + self.warmup not in self.excluded_steps]
+
+
 def attach_xplane_profile(record: dict, trace_dir: str | Path, steps: int,
                           rows: str | Path | None = None) -> None:
     """The traced tail's kernel summary as `record["profile"]`, beside its
