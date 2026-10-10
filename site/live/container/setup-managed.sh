@@ -70,11 +70,10 @@ for path in files("/opt/train"):
 PY
 chmod 0750 /opt/models /opt/hf /opt/xla
 # Training contexts see /opt/train through an overlay of their own (gateway_manager.py), and every
-# write goes to that overlay's upper layer. Overlayfs checks a write against the lower layer's modes,
-# so its directories are open to all: a context creates the datasets' lock files afresh. Its files
-# stay read-only, the weights hardlinked to /opt/models among them.
+# write lands in its upper layer; nothing may write the prepared files themselves. The preparation's
+# locks go: a context opening one would have to copy a root-owned file up, which its user namespace
+# cannot, so it creates its own.
 find /opt/train -name '*.lock' -delete
 chown -R root:root /opt/train
 chmod -R a+rX,go-w /opt/train
-find /opt/train -type d -exec chmod a+w {} +
 rm -rf /var/lib/apt/lists/* /root/.cache /root/prepare-cells.log

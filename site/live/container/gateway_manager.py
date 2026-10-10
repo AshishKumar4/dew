@@ -99,6 +99,15 @@ class LimitedKernelManager(KernelGatewayIOLoopKernelManager):
             for name in ("upper", "work"):
                 (self.overlay / name).mkdir(mode=0o700)
                 os.chown(self.overlay / name, uid, uid)
+            # Copying a root-owned file or directory up fails in the context's user namespace,
+            # which does not map root (EOVERFLOW), so the upper layer starts with /opt/train's
+            # directories as the context's own, and a new lock beside the prepared files needs
+            # no copy-up.
+            for parent, directories, _ in os.walk("/opt/train"):
+                for name in directories:
+                    made = self.overlay / "upper" / Path(parent, name).relative_to("/opt/train")
+                    made.mkdir(mode=0o755)
+                    os.chown(made, uid, uid)
         arguments = ["/kernel.json" if arg == self.connection_file else arg for arg in kernel_cmd[3:]]
         command = [
             "bwrap", "--unshare-user", "--die-with-parent", "--new-session",
