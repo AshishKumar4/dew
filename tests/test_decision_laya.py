@@ -115,7 +115,7 @@ def test_padded_rows_score_as_they_do_alone():
 
 @pytest.mark.network
 @pytest.mark.skipif(not os.environ.get("DEW_NETWORK_TESTS"), reason="downloads the 1.7 GB English checkpoint")
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="XLA:CPU's fp32 dot rounds more than MKL's")
+@pytest.mark.gpu(reason="XLA:CPU's fp32 dot rounds more than MKL's")
 def test_the_released_english_checkpoint_matches_laya():
     """convaiinnovations/laya at the pinned revision against tools/laya_reference.py --real.
 

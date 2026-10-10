@@ -489,6 +489,7 @@ def test_a_pool_publishes_its_sharded_policy_once_and_every_process_hears_a_fail
     assert paths(engine) == ["/pause", "/collective_rpc", "/reset_prefix_cache"]
 
 
+@pytest.mark.gpu(reason="a CPU array reaches its host without a device-to-host transfer")
 @pytest.mark.distributed
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("publication", ["safetensors", "nccl"])
@@ -500,8 +501,6 @@ def test_a_gpu_pool_publication_copies_the_policy_to_process_zeros_host_only(tmp
     each device-to-host copy: process 1 makes none of the served bfloat16
     policy, and process 0 makes its own, which shows the log is on. NCCLPush's
     send is replaced, since no engine joins its group here."""
-    if jax.default_backend() != "gpu":
-        pytest.skip("a CPU array reaches its host without a device-to-host transfer")
     (engine,) = replicas(1)
     library = tmp_path / "libnccl.so.2"
     library.touch()

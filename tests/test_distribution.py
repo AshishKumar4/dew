@@ -514,6 +514,7 @@ def test_a_declared_pool_without_a_coordinator_is_refused():
     assert alone.returncode == 0 and "processes 1" in alone.stdout, alone.stdout + alone.stderr
 
 
+@pytest.mark.gpu(reason="a cluster pins device ids on GPU; the CPU backend takes none")
 @pytest.mark.mesh(devices=2)
 def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
     """`dew launch --processes-per-host 1` gives its one process every local
@@ -524,8 +525,6 @@ def test_a_launched_process_keeps_every_device_inside_a_slurm_step():
     started takes its placement from the launcher."""
     import jax
 
-    if jax.default_backend() != "gpu":
-        pytest.skip("a cluster pins device ids on GPU; the CPU backend takes none")
     env = {**outside_any_cluster(os.environ), **ONE_SLURM_TASK, "PYTHONPATH": str(REPO_ROOT / "src")}
     program = ("from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
@@ -797,6 +796,7 @@ def test_a_pool_whose_program_ends_while_its_failure_watches_read_exits_cleanly(
     assert "terminate called" not in output and "Fatal Python error" not in output, output
 
 
+@pytest.mark.gpu(reason="the execution bound is XLA's GPU watchdog; CPU pools have none")
 @pytest.mark.mesh(devices=2)
 def test_a_rank_that_stalls_between_collectives_ends_the_pool():
     """Rank 1 stops before its fourth step without failing, as a rank blocked
@@ -804,10 +804,6 @@ def test_a_rank_that_stalls_between_collectives_ends_the_pool():
     inside that step's reduction. Every process stays alive and none fails,
     so only a bound on one execution can end the pool: rank 0's runs past
     the pool's execution timeout, shortened here, and the launch ends."""
-    import jax
-
-    if jax.default_backend() != "gpu":
-        pytest.skip("the execution bound is XLA's GPU watchdog; CPU pools have none")
     started = time.monotonic()
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c",
                   stepping_pool("threading.Event().wait()", execution_timeout="20s"),
@@ -1019,6 +1015,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
     assert "Process phase t global array gather plan failed on rank 1" in done.stdout, done.stdout
 
 
+@pytest.mark.gpu(reason="a CPU array reaches its host without a device-to-host transfer")
 @pytest.mark.mesh(devices=2)
 def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
     """With held_by="first" only process 0 holds the gathered tree. Process 1
@@ -1029,10 +1026,6 @@ def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
     Qwen3-0.6B's weight push on each of three RTX 3090s. JAX's transfer guard
     logs every implicit device-to-host copy on a GPU, where the count is
     taken; process 0's copies of the tree show that the log is on."""
-    import jax
-
-    if jax.default_backend() != "gpu":
-        pytest.skip("a CPU array reaches its host without a device-to-host transfer")
     program = (
         "import dew.training.runtime as runtime\n"
         "runtime.prepare_process()\n"

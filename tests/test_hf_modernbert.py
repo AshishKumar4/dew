@@ -55,7 +55,7 @@ def test_modernbert_states_match_the_encoder_through_every_window_path(implement
                                      'ModernBERT packed states')
 
 
-@pytest.mark.skipif(jax.default_backend() != 'gpu', reason='the bf16 kernels it selects are the GPU ones')
+@pytest.mark.gpu(reason='the bf16 kernels it selects are the GPU ones')
 def test_modernbert_states_in_bf16_on_the_gpu_kernels(without_deterministic_ops):
     """'auto' runs the global layers on cuDNN and keeps the local layers'
     two-sided window off it, which cuDNN refuses; the bf16 states are held to

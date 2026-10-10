@@ -564,7 +564,7 @@ def test_the_chunked_rule_holds_with_aligned_keys():
     np.testing.assert_allclose(state, want_state, atol=2e-4)
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
+@pytest.mark.gpu(reason="the kernel runs on CUDA")
 @pytest.mark.parametrize("held", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("rows", [3, 32])
 def test_the_decode_kernel_steps_as_the_recurrence_does(rows, held):
@@ -591,7 +591,7 @@ def test_the_decode_kernel_steps_as_the_recurrence_does(rows, held):
                                atol=2e-6, rtol=2 ** -7 if held == jnp.bfloat16 else 0)
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="the kernel runs on CUDA")
+@pytest.mark.gpu(reason="the kernel runs on CUDA")
 def test_the_decode_kernel_leaves_an_idle_row_alone():
     """A serving step holds every slot, drawing or not. A row the step marks
     idle keeps its state bit for bit, unread and unwritten, and outputs

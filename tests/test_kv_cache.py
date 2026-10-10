@@ -201,8 +201,8 @@ class Decoder(nn.Module):
         return store.decode(query, lengths, None), store.read()
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu" or not bf16_dot_runs(),
-                    reason="the paged BF16 decode kernel needs CUDA sm80+")
+@pytest.mark.gpu(reason="the paged BF16 decode kernel needs CUDA sm80+")
+@pytest.mark.skipif(not bf16_dot_runs(), reason="the paged BF16 decode kernel needs CUDA sm80+")
 def test_native_gpu_paged_value_and_vjp_keep_the_gathered_attention(without_deterministic_ops):
     """Over reordered and shared pages and distinct key counts, the Pallas
     kernel's value is as exact as the gathered cuDNN attention's, measured

@@ -223,8 +223,8 @@ def test_a_kind_reads_a_window_or_a_chunk_not_both():
         model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu" or not bf16_dot_runs(),
-                    reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
+@pytest.mark.gpu(reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
+@pytest.mark.skipif(not bf16_dot_runs(), reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
 def test_packed_windowed_bf16_attention_runs_its_band_on_cudnn(without_deterministic_ops):
     """'auto' hands the band mask of a packed, windowed bf16 call to cuDNN
     as a bias: finite everywhere, padding rows included, and as close to a

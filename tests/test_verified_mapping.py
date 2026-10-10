@@ -33,7 +33,6 @@ import json
 import sys
 import warnings
 
-import jax
 import numpy as np
 import pytest
 import torch
@@ -157,7 +156,7 @@ def test_a_config_without_the_shared_size_names_is_refused_by_name():
     assert TORCHAX in str(refused.value)
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="TF32 matmuls exist on a GPU alone")
+@pytest.mark.gpu(reason="TF32 matmuls exist on a GPU alone")
 def test_the_probe_holds_its_bound_at_a_gpus_default_tf32_precision(tmp_path):
     """The bound was measured at fp32 matmul precision. A GPU's default runs
     fp32 matmuls in TF32, which puts 1e-2 between two correct models, so the
