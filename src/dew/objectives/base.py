@@ -18,7 +18,7 @@ import functools
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -683,7 +683,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return `loss`'s statistics in evaluation mode, unless the objective scores held-out rows
         another way. The objective's own sampling still reads the evaluation key."""
         self._check_validation_loss()
-        return self.loss(variables, batch, step.replace(training=False))
+        return self.loss(variables, batch, replace(step, training=False))
 
     def _check_validation_loss(self) -> None:
         """Refuse a validation loss this objective cannot define, before fit places its state."""

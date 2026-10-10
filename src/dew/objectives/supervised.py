@@ -87,7 +87,7 @@ class Supervised(Objective[Ratio]):
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         sample = jnp.zeros((1, *self.sample.shape), jnp.int32)
         mode = {} if self.mode is None else {self.mode: False}
-        return self.model.init(key, sample, **mode)
+        return self.model.init(key, sample, method="__call__", **mode)
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         # The model's own collections besides its parameters, such as a
@@ -97,7 +97,7 @@ class Supervised(Objective[Ratio]):
         mode = {} if self.mode is None else {self.mode: step.training}
         outputs, updates = self.model.apply(variables, batch[self.sample.key],
                                             rngs=model_rngs(step.key, training=step.training),
-                                            mutable=held, **mode)
+                                            mutable=held, method="__call__", **mode)
         return self._scored(outputs, batch, dict(updates) if held else None)
 
     def _scored(self, outputs: Outputs, batch: Batch, updates: Variables | None) -> tuple[Ratio, Aux]:
