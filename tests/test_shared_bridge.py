@@ -292,12 +292,18 @@ def test_restart_ends_the_running_cell_and_gives_it_a_fresh_context(gateway):
 
 
 def test_tutorials_offer_run_live_only_with_the_modules_the_live_context_stands_in_for():
-    """site/scripts/render-notebooks.mjs gives a notebook Run live when it imports only these."""
-    import re
+    """site/src/data/live-notebooks.mjs gives a notebook Run live when it imports only the Dew
+    modules model_client.install() puts in place."""
+    import subprocess
 
     site = ROOT.parents[1]
-    renderer = (site / "scripts/render-notebooks.mjs").read_text()
-    offered = re.search(r"LIVE_MODULES = new Set\(\[(.*?)\]\)", renderer)
-    served = re.search(r"sys\.modules\.update\(\{(.*?)\}\)", (ROOT / "model_client.py").read_text())
-    assert offered and served
-    assert set(re.findall(r"'(dew[\w.]*)'", offered[1])) == set(re.findall(r'"(dew\.[\w.]+)":', served[1]))
+    offered = subprocess.check_output(
+        ["node", "--input-type=module", "-e",
+         "import { LIVE_MODULES } from './src/data/live-notebooks.mjs';"
+         " console.log(JSON.stringify(LIVE_MODULES))"],
+        cwd=site, text=True)
+    served = subprocess.check_output([sys.executable, "-c", (
+        "import sys, json; sys.path.insert(0, sys.argv[1]); import model_client; model_client.install();"
+        "print(json.dumps(sorted(name for name in sys.modules if name.startswith('dew.'))))"), str(ROOT)],
+        text=True)
+    assert sorted(json.loads(offered)) == json.loads(served)

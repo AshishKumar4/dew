@@ -6,6 +6,7 @@
 import { readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { repository } from '../src/manifest.mjs';
+import { runsLive } from '../src/data/live-notebooks.mjs';
 import { escapeHtml, imageRoot, joined, renderOutputs } from './notebook-outputs.mjs';
 import {
 	blobUrl,
@@ -49,7 +50,6 @@ const files = (await readdir(notebooksDir))
 if (!checkOnly) await rm(imageRoot, { recursive: true, force: true });
 
 const slugOf = (url) => url.replace('https://github.com/', '');
-const LIVE_MODULES = new Set(['dew.interop', 'dew.sampling']);
 const listing = [];
 const notebookOutputs = {};
 for (const file of files) {
@@ -110,10 +110,7 @@ for (const file of files) {
 		`<p class="nb-provenance">Outputs recorded on ${where}, JAX ${escapeHtml(recorded.jax)}, Dew <a href="${repository.url}/commit/${recorded.commit}"><code>${recorded.commit.slice(0, 7)}</code></a>, ${escapeHtml(recorded.date)}.</p>`,
 	);
 
-	// A notebook runs live when it needs no GPU and imports only the Dew modules the live kernel's
-	// Python context stands in for (site/live/container/model_client.py, install()).
-	const imports = liveCells.flatMap(({ code }) => [...code.matchAll(/^\s*(?:from|import)\s+(dew[\w.]*)/gm)].map((match) => match[1]));
-	const live = accelerator === 'CPU' && imports.every((name) => LIVE_MODULES.has(name));
+	const live = runsLive(accelerator, liveCells.map(({ code }) => code));
 	if (live) {
 		parts.push(`<script type="application/json" data-notebook-cells>${JSON.stringify(liveCells).replace(/</g, '\\u003c')}</script>`);
 	}
