@@ -430,6 +430,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
     # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
     # [B, H, NC, C, D], [B, H, NC, C, C, D].
+    lo, decay = None, None
     if output_kernel == 'pallas' or prep_kernel == 'pallas':
         gc, lo = chunk_decay(chunks(g), halves=True)
         if output_kernel != 'pallas' or prep_kernel != 'pallas':
@@ -437,9 +438,11 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     else:
         gc, decay = chunk_decay(chunks(g))
     if prep_kernel == 'pallas':
+        assert lo is not None
         k_cumdecay, out_vals = delta_prep.chunk_prep(k_c, v_c, chunks(beta), gc[..., 0], lo[..., 0],
                                                    not triton_runs())
     else:
+        assert decay is not None
         kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
         # The mask is strictly lower (tril, -1): the reference's masked_fill
         # zeroes the diagonal too.
@@ -465,9 +468,11 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
     if output_kernel == 'pallas':
+        assert lo is not None
         core = delta_output.chunk_output(q_c, k_c, gc[..., 0], lo[..., 0], entered, v_corrected,
                                          not triton_runs())
     else:
+        assert decay is not None
         core = (q_c * jnp.exp(gc)) @ entered + _paired(q_c, k_c, decay) @ v_corrected
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
