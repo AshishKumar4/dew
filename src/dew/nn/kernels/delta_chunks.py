@@ -39,14 +39,23 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
 from ..sharding import seen_whole
+from . import generation
 from .generation import first_refusal
 
 BLOCK = 32
 """Value columns a program carries."""
 WARPS = 4
 STAGES = 2
-"""Triton's software pipeline depth. Each stage buffers a chunk's fp32
-`[C, Dk]` operands in shared memory."""
+"""Triton's software pipeline depth where a block has the shared memory for
+two (`stages`). Each stage buffers a chunk's fp32 `[C, Dk]` operands."""
+
+
+def stages() -> int:
+    """The pipeline depth the kernels compile with on this generation: one
+    where a block holds 99 KB (`generation.SMALL_SHARED`), since two stages
+    of a 64-token chunk of 128-wide keys ask 112 KB (RESOURCE_EXHAUSTED on an
+    RTX 4080), and wider chunks or keys are refused there."""
+    return 1 if generation.device_generation() in generation.SMALL_SHARED else STAGES
 MIN_WIDTH = 16
 """The narrowest side of a product Triton's `dot` takes."""
 
@@ -55,14 +64,17 @@ def refusal(key: jax.Array, out_vals: jax.Array) -> str | None:
     """Why the kernels do not take a rule over these per-chunk operands
     (`[B, H, NC, C, Dk]` keys, `[B, H, NC, C, Dv]` corrected values), or None
     where they do: an fp32 rule, chunks and keys power-of-two wide from
-    `MIN_WIDTH`, values a multiple of `BLOCK` wide, and operands no mesh axis
-    splits (`seen_whole`)."""
+    `MIN_WIDTH`, at most 64 by 128 where shared memory is small (`stages`), values a
+    multiple of `BLOCK` wide, and operands no mesh axis splits
+    (`seen_whole`)."""
     chunk, width = key.shape[-2:]
-    columns = out_vals.shape[-1]
+    columns, device = out_vals.shape[-1], generation.device_generation()
     return first_refusal(
         (key.dtype == jnp.float32, f"the rule runs in {key.dtype}, and the kernels in float32"),
         (all(side >= MIN_WIDTH and side & (side - 1) == 0 for side in (chunk, width)),
          f"chunks of {chunk} and keys {width} wide; Triton multiplies powers of two from {MIN_WIDTH}"),
+        (device not in generation.SMALL_SHARED or chunk * width <= 64 * 128,
+         f"chunks of {chunk} and keys {width} wide outgrow {device}'s 99 KB of shared memory a block"),
         (columns % BLOCK == 0, f"values {columns} wide, not a multiple of the {BLOCK}-column block"),
         (seen_whole(key), "a mesh axis splits the rule's operands, and the kernels see whole arrays"),
     )
@@ -131,7 +143,7 @@ def _call(body, name: str, whole, columned, outputs, interpret: bool):
                   + [spec(array, blocked=True) for array in columned]),
         out_specs=[spec(shape, blocked=True) for shape in outputs],
         out_shape=[jax.ShapeDtypeStruct((rows, *shape.shape[2:]), jnp.float32) for shape in outputs],
-        compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=STAGES),
+        compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=stages()),
         interpret=interpret, name=name,
     )(*map(flat, whole), *map(flat, columned))
     return [out.reshape(shape.shape) for out, shape in zip(blocks, outputs, strict=True)]
