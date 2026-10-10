@@ -71,6 +71,8 @@ def arguments() -> argparse.Namespace:
         parser.error("need at least two warmup steps, one timed step and one profiled step")
     if bool(args.dew_attribution) != bool(args.dew_entry):
         parser.error("pass both Dew attribution and entry for a comparison")
+    if args.dew_attribution and "by_part_kind_ms" not in json.loads(args.dew_attribution.read_text())["time"]:
+        parser.error("Dew comparison requires corrected all-op by_part_kind_ms attribution")
     return args
 
 

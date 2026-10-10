@@ -58,7 +58,8 @@ def register_plain_causal_sdpa() -> str:
     from transformers.masking_utils import AttentionMaskInterface
 
     def mask(*, attention_mask=None, cache_position, kv_length, kv_offset, **kwargs):
-        if attention_mask is not None or kv_offset != 0 or cache_position.shape[0] != kv_length:
+        if (attention_mask is not None or kv_offset != 0 or cache_position.shape[0] != kv_length
+                or not kwargs.get("allow_is_causal_skip", False)):
             raise ValueError("plain causal SDPA requires complete unpadded rows and no cache")
         return None
 
