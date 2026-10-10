@@ -282,7 +282,7 @@ class Mamba2(nn.Module):
     C. `time_step_limit` is the reference's `dt_limit`, by default no clamp.
 
     The decode state is `ssm_state` `[B, H, P, N]` and `conv_state`
-    `[B, conv_dim, K-1]` in the `cache` collection; a one-token call runs the
+    `[B, K-1, conv_dim]` in the `cache` collection; a one-token call runs the
     recurrent step and a longer one the chunked scan from the held state.
     Padded rows (`attention_metadata.valid`) are zeroed before the projection
     (`apply_mask_to_padding_states`) and take a zero step. Packed documents
@@ -415,7 +415,7 @@ class Mamba2(nn.Module):
 def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
          state_size: int, chunk_size: int, time_step_limit, starts=None, valid=None, held=None,
          axis: str | None = None):
-    """The scan after the conv: `convolved` `[B, conv_dim, S]` split into
+    """The scan after the conv: `convolved` `[B, S, conv_dim]` split into
     `x`, `B` and `C`, the step through softplus with its bias and the limit,
     then the recurrent step for one token and the chunked scan otherwise.
     Returns the output `[B, S, H * P]` and the zero-start state leaving it.
@@ -425,10 +425,9 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
     this shard's `A dt` (a `RESET_DECAY` in it zeroes the term). The zero-start
     final state is the shard's write `B_r` (`_entering_state`)."""
     dt_bias, A, D = heads
-    batch, _, length = convolved.shape
-    mixed = jnp.moveaxis(convolved, 2, 1)
+    batch, length, _ = convolved.shape
     intermediate = num_heads * head_dim
-    xs, B, C = jnp.split(mixed, [intermediate, intermediate + n_groups * state_size], axis=-1)
+    xs, B, C = jnp.split(convolved, [intermediate, intermediate + n_groups * state_size], axis=-1)
     xs = xs.reshape(batch, length, num_heads, head_dim)
     B = B.reshape(batch, length, n_groups, state_size)
     C = C.reshape(batch, length, n_groups, state_size)
@@ -465,9 +464,8 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     both wherever it falls."""
     taps, bias, dt_bias, A, D = weights
     width = taps.shape[1] - 1
-    mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
-    batch, channels, length = mixed.shape
-    history = rows_like(jnp.zeros((batch, channels, width), mixed.dtype), mixed)
+    batch, length, channels = mixed.shape
+    history = rows_like(jnp.zeros((batch, width, channels), mixed.dtype), mixed)
     forward = None
     if axis is not None:
         if length < width:
@@ -476,9 +474,9 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
                 f"conv reads behind its first; use fewer sequence shards or longer sequences")
         shards = jax.lax.axis_size(axis)
         forward = [(shard, shard + 1) for shard in range(shards - 1)]
-        history = jax.lax.ppermute(mixed[..., length - width:], axis, forward)
+        history = jax.lax.ppermute(mixed[:, length - width:], axis, forward)
     if segments is None:
-        convolved = causal_conv1d(jnp.concatenate([history, mixed], axis=2), taps, bias=bias)[..., width:]
+        convolved = causal_conv1d(jnp.concatenate([history, mixed], axis=1), taps, bias=bias)[:, width:]
         starts = None
     else:
         if forward is None:
