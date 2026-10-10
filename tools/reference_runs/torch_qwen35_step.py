@@ -100,11 +100,11 @@ def kernel_kind(name: str, launch: str, phase: str) -> tuple[str, str]:
     if re.search(r"rms.?norm|layer.?norm|swiglu|silu|gelu", text):
         return "elementwise", "normalization/activation kernel"
     category = kernel_category(name)
-    if category == "gemm" or re.search(r"aten::(?:mm|bmm|addmm)(?:\b|$)", launch):
+    if category == "gemm" or re.search(r"triton_(?:mm|bmm|addmm)_|aten::(?:mm|bmm|addmm)(?:\b|$)", text):
         return "gemm", "GEMM kernel/launch"
     if category in ("copy", "convert") or re.search(r"aten::(?:copy_|clone|contiguous|to|_to_copy)\b", launch):
         return "layout", "copy/layout/cast kernel/launch"
-    if category in ("reduce", "loss") or re.search(r"aten::(?:sum|mean|norm|amax)\b|cumsum|l2norm", text):
+    if category in ("reduce", "loss") or re.search(r"triton_(?:red|per)_|aten::(?:sum|mean|norm|amax)\b|cumsum|l2norm", text):
         return "reduce", "reduction kernel/launch"
     if category in ("elementwise", "norm"):
         return "elementwise", "elementwise/fused kernel"
@@ -389,7 +389,7 @@ def run(args: argparse.Namespace) -> dict:
     timed = {**rates, "window_tokens_per_s": rates["tokens_per_s"],
              "step_ms": median_ms, "tokens_per_s": batch * seq / (median_ms / 1000),
              "mfu": None if peak is None else flops / (median_ms / 1000) / peak,
-             "source": "unprofiled synchronized window; median CUDA-event step duration",
+             "source": "unprofiled synchronized window; median " + ("CPU clock" if args.smoke else "CUDA-event") + " step duration",
              "step_ms_samples": [value * 1000 for value in window.step_seconds]}
     record = {"schema": "dew.attribution.torch-reference.v1", "framework": "torch", "smoke": args.smoke,
               "commit": git_head(Path(__file__).resolve().parents[2]), "host": host(),
