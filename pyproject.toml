@@ -50,6 +50,10 @@ dependencies = [
     "jinja2",
     "filelock",
     "huggingface_hub",
+    "fsspec>=2026.6.0",
+    "s3fs>=2026.6.0",
+    "pyarrow>=25.0.1",
+    "array-record>=0.8.3",
 ]
 license = "MIT"
 license-files = ["LICENSE"]
@@ -98,6 +102,7 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
+    "moto[server,s3]>=5.1.15",
     # The gate's behavior tests run the same linter and rule set as CI.
     "ruff==0.14.3",
     # The legacy decoder graph test deserializes jax.export; JAX does not
