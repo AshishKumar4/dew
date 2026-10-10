@@ -1,6 +1,8 @@
 """Python training saves the model/task declaration with its own checkpoint."""
 import dataclasses
 import inspect
+import json
+import shutil
 
 import flax.linen
 import grain.python as grain
@@ -288,15 +290,26 @@ def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
                                   np.asarray(objective.model.apply(state.variables, x, t)))
 
 
-def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
+def python_lm_run(directory):
+    """A run defined in Python, an LMObjective fit two steps into `directory`: its objective and state."""
     objective = LMObjective(model(), seq_len=8, ema_decay=None)
     rows = [{'text': np.arange(9, dtype=np.int32)} for _ in range(16)]
     data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
-    checkpoints = Checkpoints(str(tmp_path / 'run'))
+    checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints)
     state = trainer.fit(data, steps=2, log_every=2, checkpoint_every=1)
     checkpoints.wait()
-    assert not (tmp_path / 'run' / 'run.json').exists()
+    return objective, state
+
+
+def test_python_lm_run_saves_its_inference_record_and_marks_itself_a_run(tmp_path):
+    from dew.checkpoints import PYTHON_RUN
+    from dew.config import RunConfig
+
+    objective, state = python_lm_run(tmp_path / 'run')
+    assert json.loads((tmp_path / 'run' / 'run.json').read_text()) == PYTHON_RUN
+    with pytest.raises(ValueError, match='defined in Python'):
+        RunConfig.load(str(tmp_path / 'run'))
     record = Checkpoints(str(tmp_path / 'run')).artifact(2)
     assert record['objective'] == 'dew.objectives.lm.objective:LMObjective'
     assert record['seq_len'] == 8
@@ -315,6 +328,36 @@ def test_python_lm_run_saves_its_inference_record_without_run_json(tmp_path):
     expected = objective.model.apply(state.variables, tokens)
     actual = task.model.apply(task.variables, tokens)
     np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_a_python_run_pushed_to_the_hub_loads_through_the_pipeline_as_it_does_locally(tmp_path, monkeypatch):
+    """The run's own directory, uploaded whole (`HfApi.upload_folder`), is the
+    snapshot the Hub serves: `dew.pipeline` finds its run record there and
+    loads the run, as it loads the directory; steps without the record are
+    refused by name."""
+    import huggingface_hub
+
+    import dew
+    import dew.interop.hub as hub
+
+    objective, state = python_lm_run(tmp_path / 'run')
+    snapshot = tmp_path / 'hub' / ('0' * 40)
+    shutil.copytree(tmp_path / 'run', snapshot)
+
+    def snapshot_download(repo_id=None, revision=None, **_):
+        assert repo_id == 'acme/python-run'
+        return str(snapshot)
+
+    monkeypatch.setattr(huggingface_hub, 'snapshot_download', snapshot_download)
+    monkeypatch.setattr(hub, 'snapshot_download', snapshot_download)
+    tokens = jnp.arange(1, 9)[None, :]
+    expected = np.asarray(objective.model.apply(state.variables, tokens))
+    for source in ('acme/python-run', str(tmp_path / 'run')):
+        task = dew.pipeline(source, ema=False)
+        np.testing.assert_array_equal(np.asarray(task.model.apply(task.variables, tokens)), expected)
+    (snapshot / 'run.json').unlink()
+    with pytest.raises(ValueError, match=r'no run\.json'):
+        dew.pipeline(str(snapshot), ema=False)
 
 
 @pytest.mark.parametrize("kind", ["text", "masked", "block"])

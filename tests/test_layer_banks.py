@@ -169,3 +169,29 @@ def test_an_unscanned_decoder_banks_one_layer_at_a_time():
     identical(scores(unscanned, hosted, tokens, indices, media),
               scores(unscanned, resident, tokens, indices, media))
     assert source.reads == [(site.namespace, (index,)) for index in range(4)]
+
+
+def test_spreading_placed_banks_holds_the_base_once():
+    """Cutting a restored base's banks into their rows releases each bank as
+    its rows exist, so the live bytes never pass the base and one bank."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.inference.banks import placed_rows, spread
+
+    sharding = NamedSharding(jax.make_mesh((1,), ("data",), devices=jax.devices()[:1]), P())
+    banks = {f"layers_{4 * index}_{4 * index + 3}": {"kernel": jax.device_put(jnp.ones((4, 128, 128)),
+                                                                              sharding)}
+             for index in range(4)}
+    one = 4 * 128 * 128 * 4
+    start = sum(array.nbytes for array in jax.live_arrays())
+    peaks = []
+
+    def rows(leaf, count):
+        cut = placed_rows(leaf, count)
+        peaks.append(sum(array.nbytes for array in jax.live_arrays()) - start)
+        return cut
+
+    spread_tree = spread(banks, rows)
+    del banks
+    assert set(spread_tree) == {f"layers_{index}" for index in range(16)}
+    assert max(peaks) <= one, peaks

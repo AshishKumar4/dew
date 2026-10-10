@@ -67,6 +67,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position, records
 from dew.coordination import broadcast_from_process_zero, from_every_process
+from dew.files import write_atomically
 from dew.nn import sharding
 from dew.nn.sharding import LogicalAxes
 from dew.objectives.base import Variables
@@ -102,8 +103,18 @@ deleted. The step names it relative to the run directory, so a copied run
 still restores."""
 
 RUN_FILE = "run.json"
-"""The run record `RunConfig.save` writes into the run directory, beside the
-step directories, and `dew.io.publish` ships with a step."""
+"""The one file at the root of every run directory, beside its steps, that
+makes it a run: what `dew.pipeline` looks for, locally and on the Hub, and
+what `dew.io.publish` ships with a step. A run built from a config holds the
+class record `RunConfig.save` writes, which rebuilds it; a run defined in
+Python holds `PYTHON_RUN`, which its first checkpoint writes."""
+
+PYTHON_RUN: dict[str, JSON] = {
+    "rebuildable": False,
+    "defined": "in Python: each checkpoint records the inference declaration it loads by, and no record "
+               "rebuilds the run",
+}
+"""The root record of a run defined in Python (`RUN_FILE`)."""
 
 
 def _is_profiles(node) -> bool:
@@ -476,11 +487,20 @@ def _written_in_place(tree: Mapping[str, object]) -> bool:
 
 
 def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
-    """Return the sharding of each array leaf of `tree` as a string, keyed by path.
+    """Return the placement of each array leaf of `tree` as a string, keyed by path:
+    its sharding and which slice of it each of this process's devices holds.
 
-    A local checkpoint restores onto this placement and no other."""
+    A local checkpoint restores onto this placement and no other. The sharding's
+    text names its mesh's axes and sizes but not the order of its devices, and two
+    meshes over the same devices in another order give each process other slices."""
+    def owned(leaf) -> str:
+        slices = leaf.sharding.addressable_devices_indices_map(leaf.shape)
+        held = sorted((device.id, tuple((index.start, index.stop) for index in indices))
+                      for device, indices in slices.items())
+        return f"{leaf.sharding} holding {held}"
+
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
-    return {jax.tree_util.keystr(path): str(leaf.sharding)
+    return {jax.tree_util.keystr(path): owned(leaf)
             for path, leaf in leaves
             if isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) and leaf.sharding is not None}
 
@@ -666,7 +686,11 @@ def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> di
         if isinstance(collections, Mapping):
             collections = dict(collections)
             held[tree] = {name: collections.pop(name) for name in names if name in collections}
-            state_tree[tree] = collections
+            # A template asking for stored collections alone leaves no tree for the step to read.
+            if collections:
+                state_tree[tree] = collections
+            else:
+                del state_tree[tree]
     return held
 
 
@@ -878,6 +902,14 @@ class Checkpoints:
             # mutate the committed metadata cached for later queries.
             retained.append(dataclasses.replace(checkpoint, rankings=copy.deepcopy(checkpoint.rankings)))
         return retained
+
+    def _identify_run(self) -> None:
+        """Write `PYTHON_RUN` at the run's root unless a run record is already there
+        (`RUN_FILE`), as a config's run writes its own before it trains."""
+        root = epath.Path(self.directory)
+        if jax.process_index() == 0 and not (root / RUN_FILE).exists():
+            root.mkdir(parents=True, exist_ok=True)
+            write_atomically(root / RUN_FILE, json.dumps(PYTHON_RUN, indent=2, sort_keys=True))
 
     def artifact(self, step: int | str | None = None) -> JSON:
         """Return the selected step's inference declaration.
@@ -1120,6 +1152,8 @@ class Checkpoints:
         """
         persistent = self._open()
         mapping = isinstance(state, Mapping)
+        if not mapping:
+            self._identify_run()
         if mapping:
             if (saved is not None or share is not None or weights_only or rung is not None
                     or artifact is not None):
@@ -1231,9 +1265,9 @@ class Checkpoints:
         back into its tree, onto `held`'s templates (`_held_apart`) or, with
         none, as host arrays."""
         for tree, names in frozen.items():
-            collections = restored.get(tree)
+            templates = None if held is None else held.get(tree, {})
+            collections = restored.get(tree, {} if templates else None)
             if isinstance(collections, Mapping):
-                templates = None if held is None else held.get(tree, {})
                 wanted = names if templates is None else {name: names[name] for name in templates}
                 restored[tree] = {**collections, **self._frozen_values(wanted, templates)}
         return restored
@@ -1267,13 +1301,23 @@ class Checkpoints:
             checkpointer = ocp.PyTreeCheckpointer()
             stored = dict(_item_metadata(checkpointer.metadata(path)))
             template = None if templates is None else templates.get(name)
+            # A template may ask for part of the collection, as a bank reader does
+            # one layer of a frozen base; the part is read through the same partial
+            # restore a step's own leaves take, and only a whole read can check the
+            # content against the digest the step recorded.
+            whole = template is None or (jax.tree.structure(template) == jax.tree.structure(stored))
+            if template is not None and not whole:
+                from dew.inference.banks import narrowed
+                stored, template = narrowed(stored, template), narrowed(template, stored)
             restore_args = (jax.tree.map(read, stored) if template is None
                             else jax.tree.map(read, stored, template))
-            tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(restore_args=restore_args))
-            found = _digest(tree)
-            if found != digest:
-                raise ValueError(f"{path} holds content with digest {found}, not the {digest} the step "
-                                 f"recorded for its {name} collection")
+            tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
+                item=stored, restore_args=restore_args, partial_restore=not whole))
+            if whole:
+                found = _digest(tree)
+                if found != digest:
+                    raise ValueError(f"{path} holds content with digest {found}, not the {digest} the "
+                                     f"step recorded for its {name} collection")
             if template is not None:
                 tree = jax.tree.map(placed, tree, template)
             values[name] = tree
@@ -1448,7 +1492,8 @@ class Checkpoints:
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
         """
-        from dew.objectives.base import merge
+        from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
+        from dew.objectives.base import FROZEN, merge
         from dew.registry import resolve_dtype
         from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
 
@@ -1463,9 +1508,17 @@ class Checkpoints:
             template["ema"] = stored["ema"]
         device_mesh = (DefaultMesh() if mesh is None else mesh).build()
         chosen_layout = DefaultLayout() if layout is None else layout
+        # A CPU-owned run stores its frozen collection banked; the layout places
+        # its layers, and each bank reads onto its first layer's placement.
+        frozen = template["variables"].get(FROZEN)
+        rows = template if frozen is None else {
+            **template, "variables": {**template["variables"], FROZEN: spread(frozen, shape_rows)}}
         with sharding.boxed(self.boxed(step)):
-            placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in template.items()}
-        chosen_layout.check(template["variables"], placement["variables"], device_mesh)
+            placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in rows.items()}
+        chosen_layout.check(rows["variables"], placement["variables"], device_mesh)
+        if frozen is not None:
+            placement["variables"] = {**placement["variables"], FROZEN: banked_placement(
+                frozen, placement["variables"][FROZEN])}
         selected = set()
         if target is not None:
             roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
@@ -1477,7 +1530,9 @@ class Checkpoints:
                 leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
             template, placement)
         values, _ = self.restore(template, step=step)
-        params = values["variables"]
+        params = values.pop("variables")
+        if frozen is not None:
+            params = {**params, FROZEN: spread(params[FROZEN], placed_rows)}
         if averaged:
             params = merge(params, values["ema"])
 
@@ -1615,8 +1670,9 @@ class Checkpoints:
                 _position_leaves(state_tree, restore_args, metadata, from_local=from_local)
             try:
                 # partial_restore: a key the checkpoint holds and the template
-                # does not is skipped instead of refused.
-                restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+                # does not is skipped instead of refused. A template asking for
+                # stored collections alone asks the step for nothing.
+                restored = {} if not state_tree else checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                     item=state_tree, restore_args=restore_args, partial_restore=True))
             except (TypeError, ValueError) as mismatch:
                 if mapping:

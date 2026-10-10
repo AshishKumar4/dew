@@ -166,9 +166,9 @@ class DecisionRunConfig(RunConfig):
                 calibrated.save(directory)
 
         metrics = (Accuracy(), ECE(), AURC(), LogLoss())
+        fitted = calibrate if self.calibrate and held_out else None
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
-                                                      summary=summary),
-                        after=calibrate if self.calibrate and held_out else None)
+                                                      summary=summary, after=fitted))
 
 
 def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None) -> Pretrained:
