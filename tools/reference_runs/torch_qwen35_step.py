@@ -221,16 +221,33 @@ def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
     adjusted = dict(dew["time"]["by_kind_ms"])
     for kind, value in head.items():
         adjusted[kind] = adjusted.get(kind, 0) - value
+    categories = defaultdict(float)
+    kind_map = {"pallas": "gdn", "slicing": "layout", "gather_scatter": "layout"}
+    for part, by_kind in dew["time"]["by_part_kind_ms"].items():
+        if part == "head_loss":
+            continue
+        for kind, ms in by_kind.items():
+            category = ("optimizer" if part == "optimizer" else "elementwise" if part == "norm"
+                        else kind_map.get(kind, kind))
+            categories[category] += ms
+    estimated_ms = timed["steady"]["step_ms"] - head_ms
     return {"caveat": "Qwen3.5-0.8B measured total includes Clef; Qwen3.5-0.8B backbone is a subtraction estimate, while HF uses a negligible hidden-state loss on synthetic unpadded rows.",
             "dew_measured": {"step_ms": timed["steady"]["step_ms"], "tokens_per_s": timed["tokens_per_s"],
                              "mfu": timed["mfu"], "peak_gib": timed["peak_mib"] / 1024,
                              "peak_metric": "Qwen3.5-0.8B XLA/device high-water mark; not torch allocator allocated bytes",
                              "by_kind_ms": dew["time"]["by_kind_ms"]},
-            "dew_backbone_estimate": {"step_ms": timed["steady"]["step_ms"] - head_ms,
+            "dew_backbone_estimate": {"step_ms": estimated_ms,
+                                      "tokens_per_s": E1_TOKENS / (estimated_ms / 1000),
+                                      "mfu": E1_FLOPS_PER_STEP / (estimated_ms / 1000) / 312e12,
                                       "head_profile_ms_subtracted": head_ms, "by_kind_ms": adjusted,
+                                      "categories_ms": dict(categories),
+                                      "profile_idle_ms": dew["time"]["device_idle_ms_per_step"],
+                                      "by_part_kind_ms": {part: value for part, value in dew["time"]["by_part_kind_ms"].items()
+                                                          if part != "head_loss"},
                                       "peak_gib": None, "reason": "no separately measured head-free step or memory peak"},
             "reference": {**reference["steady"], "peak_gib": reference["memory"]["peak_allocated_gib"],
-                          "by_kind_ms": reference["time"].get("by_kind_ms", {})}}
+                          "by_kind_ms": reference["time"].get("by_kind_ms", {}),
+                          "profile_idle_ms": reference["time"].get("device_idle_ms_per_step")}}
 
 
 def run(args: argparse.Namespace) -> dict:
