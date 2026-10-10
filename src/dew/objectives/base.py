@@ -528,7 +528,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
 
         The trainer substitutes them (`substitute`) to rematerialize or
-        quantize, and a compiled validation loss is reused only while they
+        quantize, and compiled evaluation programs are reused only while they
         are the same modules. The default is the `model` the objective
         holds, trained, with no head tile, or nothing for one that holds
         none. One that runs several networks overrides this and names each,
@@ -618,24 +618,33 @@ class Objective(ABC, Generic[Loss, Effects]):
         add: a loss head, a projector, a phase's split. The default adds nothing."""
         return tree
 
-    @property
-    def _validation_loss(self):
-        """Reuse the statistics program only while its model and head stay fixed.
+    def _compiled_program(self, name: str, function: Callable, *, static_argnames: tuple[str, ...] = ()):
+        """Reuse a program only while this objective's modules and head tiles stay fixed.
 
         Fit's ladder replaces the immutable Flax model and may change a
         tiled head. Argument shapes alone cannot identify those programs.
         Keep only the current specialization, not a history of old models.
         """
         programs = tuple((program.module, program.head_tile) for program in self.program_key())
-        cached = vars(self).get('_validation_loss_cache')
+        cached = vars(self).get('_program_cache')
         if cached is None or len(cached[0]) != len(programs) or any(
                 module is not was or tile != had for (module, tile), (was, had) in zip(programs, cached[0],
                                                                                       strict=True)):
-            compiled = jax.jit(
-                lambda variables, batch, step: self._loss(variables, batch, step, validation=True)[0])
-            cached = (programs, compiled)
-            self._validation_loss_cache = cached
-        return cached[1]
+            cached = (programs, {})
+            self._program_cache = cached
+        if name not in cached[1]:
+            # A fresh callable gives JAX a fresh trace even for the same bound method.
+            @functools.wraps(function)
+            def run(*args, **kwargs):
+                return function(*args, **kwargs)
+
+            cached[1][name] = jax.jit(run, static_argnames=static_argnames)
+        return cached[1][name]
+
+    @property
+    def _validation_loss(self):
+        return self._compiled_program(
+            'loss', lambda variables, batch, step: self._loss(variables, batch, step, validation=True)[0])
 
     @functools.cached_property
     def _validation_reduction(self):
@@ -842,7 +851,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         Display sampling and decoding go in `preview`. Each scoring batch has
         its own key, and `step.ema` holds the averaged weights. The default
         returns `_evaluation_scores` over the `evaluation_variables`, compiled
-        once, or None for an objective that scores no tokens.
+        for the current modules, or None for an objective that scores no tokens.
         """
         if self._evaluation_scores is None:
             return None
@@ -853,14 +862,14 @@ class Objective(ABC, Generic[Loss, Effects]):
     weights, the batch and the pass's key, or None when the objective scores
     no tokens."""
 
-    @functools.cached_property
+    @property
     def _compiled_scores(self) -> Callable[..., TokenScores]:
-        """`_evaluation_scores` compiled once per objective. Run op by op, the
+        """`_evaluation_scores` compiled for the current modules. Run op by op, the
         model's forward would dispatch every operation of every validation
         batch from the host, and jax's eager shard_map refuses the chunked
         head's map over the data axis alone."""
         assert self._evaluation_scores is not None
-        return jax.jit(self._evaluation_scores)
+        return self._compiled_program('scores', self._evaluation_scores)
 
     def evaluation_variables(self, variables: Variables, step: Step) -> Variables:
         """Return the weights a validation pass and a preview score: the
