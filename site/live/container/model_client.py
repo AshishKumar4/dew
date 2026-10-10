@@ -25,7 +25,7 @@ SOCKET = "/work/model.sock"
 MAX_RESPONSE = 2_000_000
 MODELS = Path("/opt/live/text-models")
 ELSEWHERE = ("This live kernel runs only the page's models, through the host's shared model process. "
-             "Install Dew to run the rest of it: pip install dewml")
+             "Install Dew to run the rest of it: uv pip install dewml")
 
 
 class StalePage(ValueError):
