@@ -602,6 +602,7 @@ class Trainer(Generic[Loss, Effects]):
         self.objective = objective
         built = isinstance(optimizer, optax.GradientTransformation)
         self._config = None if built else optimizer
+        self._scheduled_rate: optax.Schedule | None = None
         self._optimizer = objective.optimizer(optimizer, accumulation=accumulation) if built else None
         from dew.nn.inputs import request_key
         self.seed = int(key) if isinstance(key, (int, np.integer)) and not isinstance(key, bool) else None
@@ -1390,6 +1391,10 @@ class Trainer(Generic[Loss, Effects]):
         if self._config is not None:
             built = self._config.build(steps // self.accumulation)
             self._optimizer = self.objective.optimizer(built, accumulation=self.accumulation)
+            self._scheduled_rate = None
+            if self._config.schedule is not None and not self._config.param_groups:
+                schedule = self._config.schedule.schedule(steps // self.accumulation)
+                self._scheduled_rate = jax.jit(lambda updates: schedule(jnp.maximum(updates - 1, 0)))
         suites = _suites(dataset, validation, metrics, eval_every)
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
         if metrics and eval_every is None and validation is None:
@@ -2252,6 +2257,12 @@ class Trainer(Generic[Loss, Effects]):
         sum. A tick with no commit omits it. train/compiles counts this fit's
         StepCompiled records; persistent-cache counts span all jitted programs
         in this process, as compilation_cache_counts describes.
+
+        An injected optimizer rate takes precedence. Otherwise an ungrouped
+        OptimConfig supplies its constant rate or its schedule evaluated at
+        max(updates - 1, 0), the last applied update's rate. The scalar program
+        runs only at the logging cadence, and its value joins the same host
+        read; no optimizer or checkpoint state is added for reporting.
         """
         def report() -> None:
             if jax.process_index() != 0:
@@ -2264,6 +2275,8 @@ class Trainer(Generic[Loss, Effects]):
             if (rate is None and self._config is not None and self._config.schedule is None
                     and not self._config.param_groups):
                 rate = self._config.learning_rate
+            if rate is None and self._scheduled_rate is not None:
+                rate = self._scheduled_rate(state.updates)
             # One read for every number, since each float() of a device
             # array is a copy of its own.
             read = jax.device_get({
