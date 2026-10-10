@@ -337,14 +337,14 @@ def text_preview[S](phase: str, setup: Callable[[], S | None],
                      decode: Callable[[list[int]], str] | None) -> TextSamples | None:
     """A text preview, on every process: agree on `setup`, generate the rows
     and the prompt they continue (None for none) from what it returns, gather
-    both to the host, and decode them into `TextSamples` on process zero. The
-    other processes return None, as every process does when `setup` returns
-    None, which draws no preview. Without `decode`, the artifact holds the
-    ids alone."""
+    both to process zero's host (`collective_host`, held by the first), and
+    decode them into `TextSamples` there. The other processes return None,
+    as every process does when `setup` returns None, which draws no preview.
+    Without `decode`, the artifact holds the ids alone."""
     prepared = agreed(f"{phase} setup", setup)
     drawn = agreed(f"{phase} generation", lambda: None if prepared is None else generate(prepared))
-    drawn = collective_host(drawn, phase=phase)
-    if drawn is None or jax.process_index() != 0:
+    drawn = collective_host(drawn, phase=phase, held_by="first")
+    if drawn is None:
         return None
     tokens, prompt = drawn
     if decode is None:

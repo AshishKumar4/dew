@@ -454,7 +454,7 @@ def _previewed(objective: Objective[Loss, Effects], variables: Variables, batch:
     """
     produced = agreed("preview generation/decoding", lambda: objective.preview(
         variables, batch, replace(context, key=preview_key), scored=scored))
-    produced = collective_host(produced, phase="preview artifacts")
+    produced = collective_host(produced, phase="preview artifacts", held_by="first")
     return _artifacts(produced) if root else ()
 
 

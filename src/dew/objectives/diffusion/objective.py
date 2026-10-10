@@ -797,10 +797,11 @@ class DiffusionObjective(Objective[Ratio]):
         the host, and process zero decodes the captions; the other processes return
         None.
         """
-        samples, tokens = self._draw(params, batch, step, VALIDATION_SAMPLES)
-        samples, tokens = collective_host((samples, tokens), phase="diffusion preview")
-        if jax.process_index() != 0:
+        drawn = self._draw(params, batch, step, VALIDATION_SAMPLES)
+        hosted = collective_host(drawn, phase="diffusion preview", held_by="first")
+        if hosted is None:
             return None
+        samples, tokens = hosted
         captions = ()
         for keyword, condition in self.inputs.conditions.items():
             captions = condition.encoder.captions(tokens[keyword])
