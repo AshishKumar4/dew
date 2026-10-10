@@ -231,7 +231,21 @@ def test_throughput_metrics_are_consistent():
 
 
 def test_throughput_metrics_ignore_a_zero_interval():
-    assert make_trainer()._throughput(elapsed=0.0, steps=0, samples=0, flops=0.0) == {}
+    from dew.telemetry.instrumentation import NO_FLOPS
+
+    assert make_trainer()._throughput(elapsed=0.0, steps=0, samples=0, flops=NO_FLOPS) == {}
+
+
+def test_mfu_reads_the_models_flops_and_hfu_the_hardwares(monkeypatch):
+    """train/mfu is over the model's FLOPs, a remat's recomputed forward once,
+    and train/hfu over the hardware's, which run it twice (PaLM's MFU and HFU)."""
+    from dew.telemetry import peaks
+    from dew.telemetry.instrumentation import StepFlops
+
+    monkeypatch.setitem(peaks.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
+    metrics = make_trainer()._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0))
+    assert metrics["train/mfu"] == pytest.approx(0.05)
+    assert metrics["train/hfu"] == pytest.approx(0.075)
 
 
 def test_throughput_metrics_report_compiles_and_waits_apart_from_steps():
@@ -360,6 +374,33 @@ def test_compiled_flops_counts_a_matmul_and_its_gradient():
     analytic = 2 * rows * contracted * columns
     assert compiled_flops(forward) == pytest.approx(analytic, rel=0.01)
     assert compiled_flops(with_gradient) == pytest.approx(2 * analytic, rel=0.01)
+
+
+def test_a_remats_recomputed_forward_counts_once_in_the_models_flops():
+    """A block under `jax.checkpoint` runs its forward again in the backward:
+    the hardware FLOPs count both runs, and the model's count the step as it
+    would run without the remat, matmul for matmul."""
+    from dew.telemetry.instrumentation import step_flops
+
+    def loss(weights, values, block):
+        hidden = values
+        for weight in weights:
+            hidden = block(hidden, weight)
+        return jnp.sum(hidden ** 2)
+
+    def layer(hidden, weight):
+        return jnp.tanh(hidden @ weight)
+
+    weights = [jnp.full((64, 64), 0.01) for _ in range(3)]
+    values = jnp.ones((32, 64))
+    plain = jax.jit(jax.grad(lambda w, x: loss(w, x, layer))).lower(weights, values).compile()
+    rematted = jax.jit(jax.grad(lambda w, x: loss(w, x, jax.checkpoint(layer)))).lower(
+        weights, values).compile()
+
+    once, twice = step_flops(plain), step_flops(rematted)
+    assert once.model == once.hardware
+    assert twice.model == pytest.approx(once.hardware)
+    assert twice.hardware > twice.model
 
 
 def test_compiled_flops_matches_the_transformer_flop_formula():

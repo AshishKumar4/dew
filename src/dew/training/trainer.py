@@ -80,7 +80,7 @@ from dew.objectives.base import (
 )
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import compiled_flops, model_flops_utilization, peak_flops
+from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization, peak_flops, step_flops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     AxisLink,
@@ -254,6 +254,7 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  "step_time_ms": Shown(better="lower", group="throughput"),
                  "samples_per_sec": Shown(better="higher", group="throughput"),
                  "mfu": Shown(better="higher", percent=True, group="throughput"),
+                 "hfu": Shown(better="higher", percent=True, group="throughput"),
                  "rollout_seconds": Shown(better="lower", group="throughput")}
 
 
@@ -469,12 +470,12 @@ class _Interval:
     steps: int = 0
     since_log: int = 0
     samples: int = 0
-    flops: float | None = 0.0
+    flops: StepFlops | None = NO_FLOPS
     rollout_seconds: float = 0.0
     waited: float = 0.0
     compiling: float = 0.0
 
-    def count(self, batch: Batch, flops: float | None, loss: jax.Array, finite: jax.Array) -> None:
+    def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array) -> None:
         """Add one step: its records, its FLOPs and its loss."""
         self.since_log += 1
         self.steps += 1
@@ -512,7 +513,7 @@ class _Interval:
     def logged(self, now: float) -> None:
         """Start the next logging interval at `now`."""
         self.last_log_time, self.since_log, self.samples = now, 0, 0
-        self.flops, self.rollout_seconds, self.waited, self.compiling = 0.0, 0.0, 0.0, 0.0
+        self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
 
     def saved(self, step: int) -> None:
         """Start the next checkpoint interval after the one saved at `step`."""
@@ -587,6 +588,7 @@ class Trainer(Generic[Loss, Effects]):
         # and the executable the step as compiled, whose memory analysis a
         # benchmark reads.
         self.flops_per_step = None
+        self.step_flops: StepFlops | None = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
         # The check that the last compiled step fits (`memory_record`), and
@@ -1210,7 +1212,8 @@ class Trainer(Generic[Loss, Effects]):
             if record_path is not None:
                 keep_rung(record_path, key, self._rung())
             self._shape_rungs[batch_layout(batch)] = self._rung()
-            self.flops_per_step = compiled_flops(self.executable)
+            self.step_flops = step_flops(self.executable)
+            self.flops_per_step = None if self.step_flops is None else self.step_flops.hardware
             self.memory = memory_record(self.executable, self._local_devices(), held, fits=fits)
             self.links = links
         # The program compiled above, not the jit: a call through the jit
@@ -1414,7 +1417,7 @@ class Trainer(Generic[Loss, Effects]):
             run.stop_control = checkpoints.control(checkpoints.latest)
         if self._opened(plan, run, state, position):
             return state, True
-        compiled: dict[Shapes, tuple[CompiledStep, float | None]] = {}
+        compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
         interval = _Interval(time.time(), last_saved=(
             run.current if checkpoints is not None and checkpoints.latest is not None else None))
         seen = 0
@@ -2100,8 +2103,8 @@ class Trainer(Generic[Loss, Effects]):
         batch = shard_batch(self.device_mesh, self.rollout(state, batch, key))
         return batch, time.perf_counter() - began
 
-    def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, float | None]],
-                      state: TrainState, batch: Batch) -> tuple[CompiledStep, float | None]:
+    def _compiled_for(self, compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]],
+                      state: TrainState, batch: Batch) -> tuple[CompiledStep, StepFlops | None]:
         """Return the step compiled for this batch's shapes, compiling on first sight.
 
         A ramped run reads a new shape at every stage, so `compiled` keeps
@@ -2114,7 +2117,7 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                compiled[shapes] = (self.compile(state, batch), self.flops_per_step)
+                compiled[shapes] = (self.compile(state, batch), self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
@@ -2368,12 +2371,14 @@ class Trainer(Generic[Loss, Effects]):
         self._report(ProfileWindowRecord(profile.directory, traced), run.current)
         agreed("profile announcement", announce)
 
-    def _throughput(self, elapsed: float, steps: int, samples: int, flops: float | None, *,
+    def _throughput(self, elapsed: float, steps: int, samples: int, flops: StepFlops | None, *,
                     waited: float = 0.0, compiling: float = 0.0) -> dict[str, float]:
         """Compute the interval's rates from the records it read and its FLOPs.
 
         The FLOPs are the ones the compiler measured for each step's own
         shape; `flops` is None when a shape's measurement was unavailable.
+        train/mfu reads the model's FLOPs, the forward a remat recomputes
+        counted once, and train/hfu the hardware's, which counts it twice.
 
         `compiling` is the seconds the interval spent compiling the step for
         shapes it met for the first time (a bucket length, a ramp's stage).
@@ -2394,7 +2399,9 @@ class Trainer(Generic[Loss, Effects]):
                    "train/data_wait_ms": waited / steps * 1000}
         if compiling > 0:
             scalars["train/compile_s"] = compiling
-        mfu = None if flops is None else model_flops_utilization(flops / steps, step_time)
-        if mfu is not None:
-            scalars["train/mfu"] = mfu
+        for name, counted in (("mfu", None if flops is None else flops.model),
+                              ("hfu", None if flops is None else flops.hardware)):
+            utilization = None if counted is None else model_flops_utilization(counted / steps, step_time)
+            if utilization is not None:
+                scalars[f"train/{name}"] = utilization
         return scalars

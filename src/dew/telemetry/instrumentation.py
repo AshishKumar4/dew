@@ -52,6 +52,10 @@ class _Instruction:
     dims: tuple[int, ...]
     operands: tuple[str, ...]
     attributes: str
+    recomputed: bool = False
+    """Whether it recomputes the forward: JAX's remat names its recomputation
+    `rematted_computation`, and XLA's own rematerialization clones an
+    instruction as `<name>.remat`."""
 
 
 @dataclass
@@ -115,7 +119,9 @@ def _parse(text: str) -> tuple[dict[str, _Computation], str | None]:
         computation.shapes[name] = dims
         element = _ELEMENT.match(match.group('shape'))
         computation.elements[name] = element.group(1) if element else ''
-        computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes)
+        recomputed = '.remat' in name or '.remat' in current or 'rematted_computation' in attributes
+        computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
+                                                      recomputed)
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -417,24 +423,51 @@ def _merged_call_counts(computation: _Computation,
     return merged
 
 
-def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
+@dataclass(frozen=True)
+class StepFlops:
+    """One step's FLOPs: the `model`'s, the forward a remat recomputes counted
+    once, and the `hardware`'s, every matmul the device runs. MFU is read off
+    the first and HFU off the second (PaLM's distinction)."""
+
+    model: float
+    hardware: float
+
+    def __add__(self, other: "StepFlops") -> "StepFlops":
+        return StepFlops(self.model + other.model, self.hardware + other.hardware)
+
+
+NO_FLOPS = StepFlops(0.0, 0.0)
+"""The FLOPs of no step, where an interval's sum starts."""
+
+
+def step_flops(compiled: jax.stages.Compiled) -> StepFlops | None:
     """FLOPs for one call of an executable that is already compiled.
 
     Every matmul and convolution in the optimized module counts once per time
     the module runs it, whether it is a `dot`, a `convolution`, or one of the
     cuBLAS, cuDNN convolution and cuDNN fused-attention custom calls a GPU
-    backend hands them to. Backward passes count because they are in there;
-    remat counts the forward it recomputes twice, because the card runs it
-    twice. None comes back when the module contains a loop whose length
-    neither XLA states nor its counter gives, since the count would then be
-    the body's, not the run's.
+    backend hands them to. Backward passes count because they are in there.
+    The forward a remat recomputes counts once in `model` and twice in
+    `hardware`, because the card runs it twice. None comes back when the
+    module contains a loop whose length neither XLA states nor its counter
+    gives, since the count would then be the body's, not the run's.
     """
     text = compiled.as_text()
-    return None if text is None else hlo_flops(text)
+    if text is None:
+        return None
+    model, hardware = hlo_flops(text, recomputed=False), hlo_flops(text)
+    return None if model is None or hardware is None else StepFlops(model, hardware)
 
 
-def hlo_flops(text: str) -> float | None:
-    """Matmul and convolution FLOPs of one call of an optimized HLO module."""
+def compiled_flops(compiled: jax.stages.Compiled) -> float | None:
+    """The hardware FLOPs of one call of a compiled executable (`step_flops`)."""
+    flops = step_flops(compiled)
+    return None if flops is None else flops.hardware
+
+
+def hlo_flops(text: str, *, recomputed: bool = True) -> float | None:
+    """Matmul and convolution FLOPs of one call of an optimized HLO module;
+    without the forward a remat recomputes where `recomputed` is False."""
     computations, entry = _parse(text)
     if entry is None:
         return None
@@ -442,7 +475,8 @@ def hlo_flops(text: str) -> float | None:
     total = 0.0
     for name, computation in computations.items():
         instructions = sum(_instruction_flops(instruction, computation.shapes)
-                           for instruction in computation.instructions.values())
+                           for instruction in computation.instructions.values()
+                           if recomputed or not instruction.recomputed)
         if not instructions or not weights[name]:
             continue
         total += weights[name] * instructions
