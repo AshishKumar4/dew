@@ -684,6 +684,21 @@ def test_the_sm75_route_applies_on_a_gpu_backend_only(monkeypatch):
     assert resolve_implementation('xla', query, query) == 'xla'
 
 
+@pytest.mark.parametrize("generation, runs", [("sm75", False), ("sm80", True), ("sm120", True)])
+def test_the_decode_kernels_take_a_gpu_their_triton_lowering_compiles_for(monkeypatch, generation, runs):
+    """The decode attention, its paged form and the delta rule's decode
+    step are Triton kernels, which JAX compiles from sm80 on (`triton_runs`):
+    an sm75 T4 takes their portable paths, an fp32 state or query included."""
+    from dew.nn.kernels import decode_attention, delta_rule
+
+    monkeypatch.setattr(jax, 'default_backend', lambda: 'gpu')
+    monkeypatch.setattr(kernels.generation, 'device_generation', lambda: generation)
+    query, key = jnp.zeros((2, 1, 8, 128)), jnp.zeros((2, 64, 8, 128))
+    assert decode_attention.fits(query, key) == runs
+    assert decode_attention.fits_paged(query[:, 0], jnp.zeros((8, 4, 16, 128))) == runs
+    assert delta_rule.fits(jnp.zeros((2, 8, 128, 128))) == runs
+
+
 @pytest.mark.parametrize("dtype, keys, chosen", [
     (jnp.float32, VALUE_BLOCK, "xla"), (jnp.float32, VALUE_BLOCK + 1, "reference"),
     (jnp.float32, 2048, "reference"), (jnp.bfloat16, 2048, "xla")])

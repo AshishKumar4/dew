@@ -173,14 +173,19 @@ def test_only_supported_bfloat16_pools_take_the_paged_kernel(monkeypatch, backen
     fits one of its blocks."""
     monkeypatch.setattr(jax, "default_backend", lambda: backend)
 
-    def kernel(layout, dtype):
-        return KVStore(nn.Module(), layout, 2, 2, 64, jnp.dtype(dtype)).kernel()
+    def kernel(layout, dtype, heads=2):
+        query = jax.ShapeDtypeStruct((2, heads, 64), jnp.dtype(dtype))
+        return KVStore(nn.Module(), layout, 2, 2, 64, jnp.dtype(dtype)).kernel(query)
 
     assert kernel(KVCache(page_size=16), jnp.bfloat16)
     assert kernel(KVCache(page_size=64), jnp.bfloat16) == (backend == "tpu")
     assert not kernel(KVCache(page_size=16), jnp.float32)
     assert not kernel(KVCache(quantized="int8", page_size=16), jnp.bfloat16)
     assert not kernel(KVCache(), jnp.bfloat16)
+    # The query's own heads: 32 over two key heads is 16 a key head, which the
+    # GPU kernel's program holds, and 64 is 32, which it cannot.
+    assert kernel(KVCache(page_size=16), jnp.bfloat16, heads=32)
+    assert kernel(KVCache(page_size=16), jnp.bfloat16, heads=64) == (backend == "tpu")
 
 
 class Decoder(nn.Module):
