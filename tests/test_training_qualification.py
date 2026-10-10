@@ -40,7 +40,8 @@ from transformers import (
 from dew.data import TokenCorpus
 
 ROOT = Path(__file__).resolve().parents[1]
-TOKENIZER = ROOT / "tests" / "fixtures" / "tokenizers" / "tiny-tools"
+FIXTURES = ROOT / "tests" / "fixtures"
+TOKENIZER = FIXTURES / "tokenizers" / "tiny-tools"
 
 
 def spawn(directory: Path, mode: str) -> subprocess.Popen:
@@ -127,7 +128,10 @@ def source_model(kind: str, vocab: int):
 @pytest.fixture(scope="module", params=["dense", "moe"])
 def qualified(tmp_path_factory, request) -> Path:
     directory = tmp_path_factory.mktemp(f"qualification-{request.param}")
-    (directory / "corpus.txt").write_bytes((ROOT / "CONTRIBUTING.md").read_bytes())
+    # A text of its own, CONTRIBUTING.md as of 29288bad9: the MoE source is
+    # checked for near ties in its routing over these tokens, and an edit to
+    # the live file failed that check.
+    (directory / "corpus.txt").write_bytes((FIXTURES / "qualification_corpus.txt").read_bytes())
     TokenCorpus.write(directory / "corpus.txt", directory / "tokens", tokenizer=str(TOKENIZER),
                       val_fraction=0.1)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
