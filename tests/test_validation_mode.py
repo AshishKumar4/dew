@@ -137,6 +137,9 @@ class PixelModel(nn.Module):
 
     @nn.compact
     def __call__(self, x, time, conditioning=None, duration=None, train=False):
+        if not self.is_initializing() and not train:
+            assert not self.has_rng("dropout")
+            assert not self.has_rng("stochastic_rounding")
         h = nn.Dense(8)(x) + time[:, None, None, None] / 1000
         if duration is not None:
             h = h + duration[:, None, None, None] / 1000

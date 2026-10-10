@@ -5,6 +5,7 @@ trains the model and not the autoencoder, and the autoencoder's own loss
 trains it and not the model."""
 
 import tarfile
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -99,6 +100,20 @@ def objective(end_to_end: EndToEnd) -> DiffusionObjective:
 # Eight rows, which the test mesh's eight devices divide.
 BATCH = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (8, 8, 8, 3), 0, 256), np.uint8)}
 STEP = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
+
+
+def test_validation_reads_the_latent_running_statistics_without_updating_them():
+    task = objective(EndToEnd(**L1_KL, align_weight=0, reconstruction_weight=0, kl_weight=0))
+    task.alignment = replace(task.alignment, weight=0)
+    variables = task.init(jax.random.key(0))
+    shifted = {**variables, LATENT_STATS: {**variables[LATENT_STATS],
+                                         "mean": variables[LATENT_STATS]["mean"] + 3}}
+    first, aux = task.validation_loss(variables, BATCH, STEP)
+    second, _ = task.validation_loss(shifted, BATCH, STEP)
+    assert first.mean()[0] != second.mean()[0]
+    assert aux.variables is None
+    np.testing.assert_array_equal(task.scalar_loss(variables, BATCH, STEP)[0],
+                                  task.scalar_loss(shifted, BATCH, STEP)[0])
 
 
 def gradients(end_to_end: EndToEnd):
