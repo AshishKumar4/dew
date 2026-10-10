@@ -137,10 +137,14 @@ def test_the_rule_computes_the_same_values_and_gradients_on_either_recurrence():
         assert relative(have, want) < BOUND, name
 
 
+@jax.default_matmul_precision("highest")
 def test_the_kernels_are_as_exact_as_the_xla_scan():
     """What separates the two at fp32 is rounding, so the kernels sit within
     fp32 rounding of the same recurrence in float64 as the scan does: never
-    more than twice as far from it, on any output or gradient."""
+    more than twice as far from it, on any output or gradient. Both run at
+    IEEE fp32 products: at the default, XLA's GPU products of one shape take
+    TF32 and of another fp32, so the kernels' TF32 would be held to the
+    scan's fp32 (a 3.05 ratio on `u` on an A100, c43)."""
     operands = recurrence_operands((2, 2, 3, 64, 32, 64))
     seeded = cotangents(xla_chunk_states(*operands))
     cpu = jax.devices("cpu")[0]
