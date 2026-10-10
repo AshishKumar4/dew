@@ -82,8 +82,8 @@ class Package:
     groups: list[tuple[str, list[str]]]
     content: str = "site/src/content/docs/api"  # the module pages
     slug: str = "api"  # their URL prefix
-    overview: str = "site/src/content/docs/api.md"  # the page the module list ends; written if absent
-    overview_title: str = "API reference"
+    overview: str = "site/src/content/docs/api.md"  # the page the module list ends
+    overview_title: str = ""  # with a title, the page is written afresh; without, it is extended
     generated: str = "site/src/generated"  # the sidebar and the name index
     usage: list[str] = field(default_factory=list)  # files whose imports must resolve
     usage_skip: tuple[str, ...] = ()
@@ -776,10 +776,11 @@ def main() -> None:
     # The overview page ends with every module, grouped as in the sidebar. Dew's is
     # docs/reference/core-api.md, which sync-docs writes first; a package without one gets a page of its own.
     overview = P.repo / P.overview
-    if not overview.exists():
-        if P is DEW:
-            raise SystemExit("gen_api: run sync-docs first; it writes the overview page the module list extends")
+    if P.overview_title:
+        overview.parent.mkdir(parents=True, exist_ok=True)
         overview.write_text("---\n" + json.dumps({"title": P.overview_title, "editUrl": False}, indent=1) + "\n---\n")
+    elif not overview.exists():
+        raise SystemExit("gen_api: run sync-docs first; it writes the overview page the module list extends")
     index = ["", "## All modules", "",
              "Each module below has a page generated from its docstrings. A name a module re-exports links to "
              "the page of the module that defines it.", ""]
