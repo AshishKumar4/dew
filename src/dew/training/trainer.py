@@ -1147,6 +1147,17 @@ class Trainer(Generic[Loss, Effects]):
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
+    def _step_body(self, shapes, copies):
+        """The objective transaction, or a custom step with no invented commit telemetry."""
+        if self.step is None:
+            return Transaction(self.objective, self.optimizer, self.accumulation, shapes, copies).step()
+        custom = self.step(self.objective, self.optimizer)
+
+        def run(current, batch):
+            advanced, loss, aux = custom(current, batch)
+            return advanced, loss, aux, None
+        return run
+
     def compile(self, state: TrainState, batch: Batch) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
 
@@ -1194,15 +1205,7 @@ class Trainer(Generic[Loss, Effects]):
             refusals: list[RuntimeError] = []
             consulted, record_path, key = False, None, {}
             while True:
-                if self.step is None:
-                    body = Transaction(self.objective, self.optimizer, self.accumulation, shapes,
-                                       copies).step()
-                else:
-                    custom = self.step(self.objective, self.optimizer)
-
-                    def body(current, batch, custom=custom):
-                        advanced, loss, aux = custom(current, batch)
-                        return advanced, loss, aux, None
+                body = self._step_body(shapes, copies)
 
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
