@@ -133,3 +133,5 @@ def test_pinned_headroom_files_have_the_released_train_counts(sources, name):
             locales[row["product_locale"]] += 1
         assert locales == {"us": 419653, "es": 152891, "jp": 209094}
         assert sum(locales.values()) == 781638
+        train, held = sources.Esci().split()
+        assert (len(train), len(held)) == (15_000, 2_000)

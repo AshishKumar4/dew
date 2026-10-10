@@ -452,9 +452,13 @@ class Esci(Source):
     Only `small_version` training rows are read. All three product locales
     are kept because DI 0.2.1 evaluates US, ES and JP, and products join on
     both their id and locale. The option names, descriptions and state are
-    the kit's, without the alternate framing used by other sources.
+    the kit's, without the alternate framing used by other sources. Of the
+    781,638 pairs, `limit` keeps 15,000 drawn with the seed, about what one
+    pass of the `--headroom` mix reads at ESCI's weight, so neither the
+    decontamination nor a run's layout check reads the rest.
     """
 
+    limit: int | None = 15_000
     revision: str = "7916cdf6ab75a462e77f20ab40428a10923998d5"
 
     def rows(self) -> Iterator[dict]:
