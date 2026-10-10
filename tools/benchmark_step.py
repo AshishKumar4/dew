@@ -252,7 +252,7 @@ def parameter_count(params) -> int:
     return int(sum(np.prod(leaf.shape, dtype=np.int64) for leaf in jax.tree.leaves(params)))
 
 
-def device_timeline(directory: str, steps: int) -> dict[str, Any]:
+def device_timeline(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     """What the device did during the traced `steps`, from the newest trace
     under `directory`.
 
@@ -262,8 +262,10 @@ def device_timeline(directory: str, steps: int) -> dict[str, Any]:
     not average utilization across devices. Category timings sum events
     and can overlap; they are not an additional wall-clock measurement.
     """
+    if planes is None:
+        planes = device_events(directory)[0]
     kernels = [(event.name, event.start_ns, event.end_ns)
-               for events in device_events(directory)[0].values() for event in events]
+               for events in planes.values() for event in events]
     if not kernels:
         raise ValueError(
             f"the trace under {directory} holds no device kernels: the profiler "
@@ -309,7 +311,7 @@ def _hlo_collective(event) -> str | None:
     return None
 
 
-def communication(directory: str, steps: int) -> dict[str, Any]:
+def communication(directory: str, steps: int, *, planes=None) -> dict[str, Any]:
     """Each device's traced window split by `trace_window.window_split` into
     compute, every collective, the communication no compute kernel
     overlapped, and idle time ended by a host-to-device copy (input) or by
@@ -321,9 +323,11 @@ def communication(directory: str, steps: int) -> dict[str, Any]:
     `all_to_all_ms_per_step` and `all_to_all_exposed_ms_per_step`, from the
     op each NCCL kernel ran for.
     """
+    if planes is None:
+        planes = device_events(directory)[0]
     devices = [([(event.name, event.start_ns, event.end_ns) for event in kernels],
                 [_hlo_collective(event) for event in kernels])
-               for kernels in device_events(directory)[0].values() if kernels]
+               for kernels in planes.values() if kernels]
     if not devices:
         raise ValueError(f"the trace under {directory} holds no device kernels")
 
@@ -418,8 +422,9 @@ def measure(case: Case, config: BenchmarkConfig) -> Row:
                     if primary is None:
                         raise
                     primary.add_note(f"Profiler stop failed: {error!r}")
-            timeline = {**device_timeline(directory, config.profile_steps),
-                        **communication(directory, config.profile_steps)}
+            planes = device_events(directory)[0]
+            timeline = {**device_timeline(directory, config.profile_steps, planes=planes),
+                        **communication(directory, config.profile_steps, planes=planes)}
         flops = trainer.flops_per_step
         step_time = elapsed / config.steps
         utilization = model_flops_utilization(flops, step_time)

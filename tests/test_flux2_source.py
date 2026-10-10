@@ -23,7 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, translate_flux2_weights
@@ -53,11 +53,6 @@ def arrays(source):
     return fixture_arrays(source / "flux2_transformer.npz")
 
 
-def relative_gap(actual, expected) -> float:
-    actual, expected = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
-    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
-
-
 def load(source, name):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = Flux2Transformer(**flux2_fields(config, dtype="float32", attention_impl="xla"))
@@ -78,10 +73,7 @@ def walk(name, arrays, record):
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
     tensors = component_tensors(source / name, "transformer")
-    assert {layout.name for layout in layouts} == {f"transformer/{key}" for key in tensors}
-    for layout in layouts:
-        written = layout.export({"params": params})
-        assert written.tobytes() == tensors[layout.name.removeprefix("transformer/")].tobytes(), layout.name
+    assert_layout_tensors(layouts, {"params": params}, tensors, "transformer/")
 
 
 @pytest.mark.parametrize("name", CASES)

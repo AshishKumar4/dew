@@ -55,14 +55,22 @@ def test_a_profiled_case_traces_without_the_python_tracer(tmp_path, monkeypatch)
     import jax.profiler
 
     tool = _benchmark_step()
-    monkeypatch.setattr(tool, "device_timeline", lambda directory, steps: {})
-    monkeypatch.setattr(tool, "communication", lambda directory, steps: {})
+    from types import SimpleNamespace
+
+    reads = []
+
+    def device_events(directory):
+        reads.append(directory)
+        return {"/device:GPU:0": [SimpleNamespace(name="dot", start_ns=0, end_ns=100, stats=[])]}, []
+
+    monkeypatch.setattr(tool, "device_events", device_events)
     config = tool.BenchmarkConfig(preset='cpu-smoke', architectures=['causal_transformer'],
                                   warmup=1, steps=1, dtype='float32',
                                   profile_dir=str(tmp_path), profile_steps=1)
     (case,) = tool.build_cases(config)
 
     tool.measure(case, config)
+    assert len(reads) == 1
 
     (trace,) = tmp_path.rglob("*.xplane.pb")
     names = [event.name for plane in jax.profiler.ProfileData.from_file(str(trace)).planes
