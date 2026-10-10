@@ -486,7 +486,7 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
     # rounding, the reference's batch norm being that function in float64.
     statistics = aux.variables[LATENT_STATS]
     tuned = task._end_to_end_latents({**variables, "params": params}, unit_range(batch["image"]),
-                                     jax.random.split(step.key, 5)[0], step.step, batch)
+                                     jax.random.split(step.key, 5)[0], step, batch)
     for name in ("mean", "var"):
         np.testing.assert_array_equal(np.asarray(tuned.statistics[name]), np.asarray(statistics[name]))
     assert_as_exact_as_the_reference(np.asarray(tuned.raw), STEPPED["latents/sample"],

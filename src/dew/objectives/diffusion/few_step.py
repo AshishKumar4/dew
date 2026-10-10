@@ -30,7 +30,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.protocols import IntervalModel
-from dew.objectives.base import Aux, Step, training_rngs
+from dew.objectives.base import Aux, Step, model_rngs
 from dew.sampling.solvers import Euler, Solver
 
 from .objective import DiffusionObjective, _own_loss
@@ -196,7 +196,7 @@ class MeanFlowObjective(DiffusionObjective):
             def average(z, t, r) -> jax.Array:
                 output = self.model.apply(variables, z, schedule.model_time(t), **conditions,
                                           duration=schedule.model_time(t) - schedule.model_time(r),
-                                          train=train, rngs=training_rngs(dropout_key))
+                                          train=train, rngs=model_rngs(dropout_key, training=train))
                 assert isinstance(output, jax.Array)
                 return output
             return average
@@ -221,7 +221,7 @@ class MeanFlowObjective(DiffusionObjective):
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
         guided = jnp.where(expand(dropped, v), v, guided)
-        u, target = mean_flow_target(velocity(conditions, train=True), z, t, r, guided)
+        u, target = mean_flow_target(velocity(conditions, train=step.training), z, t, r, guided)
         losses = adaptive_loss(u, target, self.norm_p, self.norm_eps)
         return self.row_mean(losses, batch), Aux(metrics={})
 
@@ -297,7 +297,7 @@ class ShortcutObjective(DiffusionObjective):
                     **conditions,
                     duration=schedule.model_time(sigma) - schedule.model_time(following),
                     train=train,
-                    rngs=training_rngs(dropout_key),
+                    rngs=model_rngs(dropout_key, training=train),
                 )
                 assert isinstance(output, jax.Array)
                 return output
@@ -308,7 +308,8 @@ class ShortcutObjective(DiffusionObjective):
         bootstrapped = shortcut_target(velocity(teacher, leading, train=False), x[:rows], sigma[:rows],
                                        step_size[:rows])
         target = jnp.concatenate([bootstrapped, v[rows:]])
-        u = velocity(self.model_variables(variables), conditions, train=True)(x, sigma, sigma - step_size)
+        u = velocity(self.model_variables(variables), conditions, train=step.training)(
+            x, sigma, sigma - step_size)
         losses = jnp.square(u - target)
         return self.row_mean(losses, batch), Aux(metrics={})
 

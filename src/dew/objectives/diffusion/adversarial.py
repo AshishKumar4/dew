@@ -300,10 +300,10 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         def score(head_params, spectral, features, *, update=False):
             scores, updated = self.heads.apply(
                 {"params": head_params, SPECTRAL: spectral}, features, condition,
-                update=update, batch=batch, mutable=[SPECTRAL])
-            return scores, updated[SPECTRAL]
+                update=update, batch=batch, mutable=[SPECTRAL] if step.training else [])
+            return scores, updated[SPECTRAL] if step.training else spectral
 
-        real_scores, spectral = score(heads, variables[SPECTRAL], real, update=True)
+        real_scores, spectral = score(heads, variables[SPECTRAL], real, update=step.training)
         held_scores, _ = score(heads, spectral, held)
         fake_scores, _ = score(jax.lax.stop_gradient(heads), spectral, fake)
         discriminator = hinge_discriminator(real_scores, held_scores)
@@ -323,8 +323,8 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
             distillation = self.distillation_weight * schedule.rates(level)[0] * distance
             metrics["distillation"] = jnp.mean(distillation)
             total = total + distillation
-        return (self.row_mean(total, batch),
-                Aux(metrics=metrics, variables={SPECTRAL: jax.lax.stop_gradient(spectral)}))
+        updates = {SPECTRAL: jax.lax.stop_gradient(spectral)} if step.training else None
+        return self.row_mean(total, batch), Aux(metrics=metrics, variables=updates)
 
 
 __all__ = ["AdversarialDistillationObjective"]

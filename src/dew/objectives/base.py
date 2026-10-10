@@ -120,6 +120,8 @@ class Step:
     ema: Variables | None
     """The variables tree with the averaged leaves in place of the live ones,
     or None when the objective keeps no EMA."""
+    training: bool = struct.field(pytree_node=False, default=True)
+    """Whether model calls train; static so compiled losses can branch on the mode."""
 
 
 ROUNDING_STREAM = 0x726F756E
@@ -135,6 +137,11 @@ def training_rngs(key: jax.Array) -> dict[str, jax.Array]:
     A step's key is the same on every process of a pool, and so is every
     rounding draw. An objective passes it as a model apply's `rngs`."""
     return {"dropout": key, "stochastic_rounding": jax.random.fold_in(key, ROUNDING_STREAM)}
+
+
+def model_rngs(key: jax.Array, *, training: bool) -> dict[str, jax.Array] | None:
+    """The model's training streams from `key`, or none during evaluation."""
+    return training_rngs(key) if training else None
 
 
 @struct.dataclass
@@ -673,11 +680,10 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def validation_loss(self, variables: Variables, batch: Batch,
                         step: Step) -> Loss | tuple[Loss, Aux[Effects]]:
-        """Return the statistics a validation pass sums for `batch`: `loss`'s, unless the
-        objective scores held-out rows another way, as a model with a training mode does
-        in its evaluation mode (`Supervised(mode=...)`). What it writes is discarded."""
+        """Return `loss`'s statistics in evaluation mode, unless the objective scores held-out rows
+        another way. The objective's own sampling still reads the evaluation key."""
         self._check_validation_loss()
-        return self.loss(variables, batch, step)
+        return self.loss(variables, batch, step.replace(training=False))
 
     def _check_validation_loss(self) -> None:
         """Refuse a validation loss this objective cannot define, before fit places its state."""
@@ -1091,6 +1097,7 @@ __all__ = [
     "freeze",
     "joined",
     "merge",
+    "model_rngs",
     "part",
     "select",
     "thaw",

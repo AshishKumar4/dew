@@ -189,9 +189,9 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
 
     def _predictions(self, params: Variables, batch: Batch, step: Step
                      ) -> tuple[Ratio, Aux[Effects], Prediction, Prediction]:
-        """Score both sides over the batch: the student training, the teacher not."""
+        """Score the student in the step's mode and the frozen teacher in evaluation mode."""
         statistics, aux, student = self.student.predict(
-            self.student_variables(params), batch, self._student_step(step), train=True,
+            self.student_variables(params), batch, self._student_step(step), train=step.training,
             layers=tuple(student_layer for _, student_layer in self.features))
         _, _, teacher = self.teacher.predict(
             params[TEACHER], batch, replace(step, ema=None), train=False,

@@ -44,9 +44,9 @@ from dew.objectives.base import (
     Step,
     Variables,
     joined,
+    model_rngs,
     part,
     thaw,
-    training_rngs,
     under,
 )
 
@@ -223,7 +223,7 @@ class JepaObjective(Objective[Ratio]):
 
         context = self.encode(
             part(variables, CONTEXT_ENCODER), samples, context_idx,
-            train=True, rngs=training_rngs(dropout_key))
+            train=step.training, rngs=model_rngs(dropout_key, training=step.training))
 
         # Each target block is predicted from the same context. Fold the block
         # axis into the batch so one predictor call covers all M of them
@@ -233,7 +233,7 @@ class JepaObjective(Objective[Ratio]):
             repeated,
             jnp.repeat(context_idx, num_targets, axis=0),
             target_idx.reshape(batch_size * num_targets, -1),
-            train=True, rngs=training_rngs(dropout_key),
+            train=step.training, rngs=model_rngs(dropout_key, training=step.training),
         )
         # `mutable` is unset, so apply returns the output alone, not a pair.
         assert not isinstance(predictions, tuple)

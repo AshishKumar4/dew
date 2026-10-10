@@ -51,8 +51,8 @@ from dew.objectives.base import (
     Step,
     Variables,
     joined,
+    model_rngs,
     part,
-    training_rngs,
 )
 from dew.registry import import_path
 
@@ -396,7 +396,8 @@ class DecisionObjective(Objective[Ratio]):
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
         inputs = laid_out(batch)
-        logits = self.model.logits(variables, inputs, train=True, rngs=training_rngs(step.key))
+        logits = self.model.logits(variables, inputs, train=step.training,
+                                    rngs=model_rngs(step.key, training=step.training))
         options, scored = inputs.options, jnp.asarray(batch["scored"]).astype(jnp.float32)
         # A padding question has no options; it is scored nothing over a
         # finite, even distribution, so no NaN reaches its gradient.
