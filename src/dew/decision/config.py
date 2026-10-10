@@ -97,6 +97,12 @@ class DecisionRunConfig(RunConfig):
     its options are cut to a few tokens each."""
     option_tokens: int | None = None
     """The most tokens one option keeps, in a layout of one row per question."""
+    max_state_tokens: int | None = None
+    """The most tokens a joint row's state keeps, whatever room `max_len` leaves
+    it: a row is its state, cut to this, and its schema, so a large schema
+    (a hundred options, or a document's many hypotheses) fits under a `max_len`
+    set for it without lengthening every other row's state. None lets the
+    state fill the row."""
 
     def prepare(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
@@ -113,7 +119,7 @@ class DecisionRunConfig(RunConfig):
         dtype = str(self.model.fields.get("dtype") or "float32")
         attention_impl = str(self.model.fields.get("attention_impl", "auto"))
         stated = {"max_len": self.max_len, "head_max_len": self.head_max_len,
-                  "option_tokens": self.option_tokens}
+                  "option_tokens": self.option_tokens, "max_state_tokens": self.max_state_tokens}
         budgets = {name: value for name, value in stated.items() if value}
         derived = {}
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
@@ -124,7 +130,7 @@ class DecisionRunConfig(RunConfig):
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                            dtype=dtype, param_dtype=self.param_dtype,
                                            attention_impl=attention_impl)
-            derived["layout"] = dataclasses.replace(start.layout, **budgets)
+            derived["layout"] = _budgeted(start.layout, budgets)
         else:
             start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
                                     param_dtype=self.param_dtype, attention_impl=attention_impl)
@@ -186,9 +192,17 @@ def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None
 
 def _fresh_layout(causal: bool, joint: bool, budgets: dict[str, int]) -> Layout:
     """The layout a fresh head reads: Clef's joint one, or the one a backbone's order asks for."""
-    if joint:
-        return JointLayout() if "max_len" not in budgets else JointLayout(max_len=budgets["max_len"])
-    return dataclasses.replace(StateFirstLayout() if causal else MarkerLayout(), **budgets)
+    return _budgeted(JointLayout() if joint else StateFirstLayout() if causal else MarkerLayout(), budgets)
+
+
+def _budgeted(layout: Layout, budgets: dict[str, int]) -> Layout:
+    """`layout` with the `budgets` it has fields for: a joint row's has no question budget and
+    a row per question's no state budget, which is refused, since the state takes what is left."""
+    fields = {field.name for field in dataclasses.fields(layout)}
+    if "max_state_tokens" in budgets and "max_state_tokens" not in fields:
+        raise ValueError("--max-state-tokens cuts a joint row's state, and this run lays out a row per "
+                         "question, whose state takes what --max-len leaves it")
+    return dataclasses.replace(layout, **{name: value for name, value in budgets.items() if name in fields})
 
 
 def _fitting(objective: DecisionObjective, weighted: dict[str, Weighted],
