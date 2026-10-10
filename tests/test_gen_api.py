@@ -97,4 +97,4 @@ def test_a_module_that_declares_all_needs_its_own_page(gen_api, documented):
     page = "dew.nn.multimodal"
     without = gen_api.undocumented(package, {path: held for path, held in pages.items() if path != page},
                                    {name: path for name, path in home.items() if path != page})
-    assert f"{page} declares __all__ but has no API page; add it to GROUPS" in without
+    assert f"{page} declares __all__ but has no API page; add it to the groups" in without
