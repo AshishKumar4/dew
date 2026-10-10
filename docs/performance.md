@@ -142,10 +142,12 @@ tree's spread across rounds (at least 2%), and the two trees' ranges do not
 overlap. With three rounds each, samples separate by chance 1 time in 20 when
 nothing changed, and the band lowers that further. A row's band is also its
 sensitivity: it cannot see a change smaller than its own noise. A row the base
-cannot run (a tree older than its tool) is not compared. A row the base runs and
-the head does not is broken, and a row neither runs leaves the battery
-incomplete; both fail the gate, as a regression does. `report` writes the table
-and exits 1 on any of them. Every commit
+cannot run in any round (a tree older than its tool) is not compared. A row the
+base runs and the head runs in no round is broken, a row neither runs leaves the
+battery incomplete, and a row either tree measured in only some rounds, or as
+NaN, an infinity or zero, is partial and not judged on the rounds that ran; all
+three fail the gate, as a regression does. `report` writes the table and exits 1
+on any of them. Every commit
 promoted to main that touches `src` passes the gate on a Colab A100 first, and
 its table is kept in `tools/measurements/perf_gate/<head>-vs-<base>.md`:
 
