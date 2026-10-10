@@ -32,6 +32,8 @@ def test_a_gpu_beside_cpu_only_jax_names_the_build_its_driver_runs(gpus, install
 
 @pytest.mark.parametrize("env, gpus, installed", [
     ({"JAX_PLATFORMS": "cpu"}, ("580.82.07", (8, 9)), []),      # the CPU asked for
+    ({"CUDA_VISIBLE_DEVICES": ""}, ("580.82.07", (8, 9)), []),  # every GPU hidden
+    ({"CUDA_VISIBLE_DEVICES": "-1"}, ("580.82.07", (8, 9)), []),
     ({}, None, []),                                             # no NVIDIA GPU answers
     ({}, ("580.82.07", (8, 9)), ["cuda13"]),
     ({}, ("580.82.07", (8, 9)), ["cuda12"]),                    # an older build the driver runs
