@@ -42,7 +42,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			start: () => {
 				output.replaceChildren();
 				if (output.getBoundingClientRect().bottom > innerHeight) output.scrollIntoView({ block: 'center', behavior: 'smooth' });
-				phase.set('Starting');
+				phase.start('Starting');
 			},
 			kernel: (text) => phase.set(text),
 			begin: () => {

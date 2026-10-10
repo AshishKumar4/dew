@@ -83,7 +83,7 @@ const { hero } = recording;
 				showcase.hidden = true;
 				output.replaceChildren();
 				output.hidden = false;
-				phase.set('Starting');
+				phase.start('Starting');
 			},
 			kernel: (text) => phase.set(text),
 			begin: () => {
