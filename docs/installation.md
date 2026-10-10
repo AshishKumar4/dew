@@ -1,18 +1,43 @@
 # Installation
 
-Dew's package name is `dewml` and its import name is `dew`; it is installed from the GitHub repository. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14. The commands below use [uv](https://docs.astral.sh/uv/getting-started/installation/) and a POSIX shell.
+Dew's package name is `dewml` and its import name is `dew`. It needs Python 3.12 or newer; CI tests Python 3.12 and 3.14.
 
-## Installing from GitHub
+## The install script
+
+```bash
+curl -LsSf https://dewml.dev/install.sh | sh
+```
+
+The script shows the hardware it found (an NVIDIA GPU with its driver and the CUDA build that driver runs, a TPU VM, Apple silicon or the CPU) and the Python environment that is active. It asks one question, where to install: the active environment, a new `.venv` in the current directory, a conda environment when conda is installed, or another path. Enter takes the first. It installs [uv](https://docs.astral.sh/uv/) with uv's own installer if uv is missing, prints the install command and runs it, then prints the dewml and JAX versions it installed, a command that lists the devices JAX sees, and how to activate the environment.
+
+With `-y`, or `DEW_YES=1`, or no terminal to ask on, it takes every default. Options choose for it: `--cuda 12` or `--cuda 13`, `--tpu`, `--cpu`, `--venv PATH`, `--conda NAME`, `--version X`, and `--pip` to use pip instead of uv. They follow `sh -s --`:
+
+```bash
+curl -LsSf https://dewml.dev/install.sh | sh -s -- -y --venv ~/envs/dew --cuda 12
+```
+
+## uv or pip
+
+Each command installs the accelerator build of JAX 0.11.2, the version Dew requires:
+
+| Hardware | uv | pip |
+|---|---|---|
+| CPU | `uv pip install dewml` | `pip install dewml` |
+| NVIDIA GPU, CUDA 13 | `uv pip install "dewml[cuda13]"` | `pip install "dewml[cuda13]"` |
+| NVIDIA GPU, CUDA 12 | `uv pip install "dewml[cuda12]"` | `pip install "dewml[cuda12]"` |
+| Google TPU VM | `uv pip install "dewml[tpu]"` | `pip install "dewml[tpu]"` |
+
+[Which CUDA build](#which-cuda-build) explains the choice between the two. With uv, make an environment first:
 
 ```bash
 uv venv --python 3.14
 source .venv/bin/activate
-uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"
+uv pip install dewml
 ```
 
-This installs the current revision of the repository. To reproduce a run later, pin a commit: `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`. Dew installs JAX 0.11.2 and Flax 0.12.10 or a later 0.12 release from PyPI. A process pool across GPUs needs a patched JAX to keep its compilation cache; [Process pools across GPUs](#process-pools-across-gpus) covers it.
+To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew"`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. Dew installs JAX 0.11.2 and Flax 0.12.10 or a later 0.12 release. A process pool across GPUs needs a patched JAX to keep its compilation cache; [Process pools across GPUs](#process-pools-across-gpus) covers it.
 
-The plain install runs JAX on the CPU, which is enough for the [Quickstart](getting-started.md).
+The CPU install is enough for the [Quickstart](getting-started.md).
 
 ## Checking the environment
 
@@ -31,15 +56,7 @@ print("Devices:", jax.devices())
 
 ## GPUs and TPUs
 
-Add the extra that matches the hardware:
-
-| Hardware | Command |
-|---|---|
-| NVIDIA GPU, CUDA 13 driver | `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"` |
-| NVIDIA GPU, CUDA 12 driver | `uv pip install "dewml[cuda12] @ git+https://github.com/AshishKumar4/dew"` |
-| Google TPU VM | `uv pip install "dewml[tpu] @ git+https://github.com/AshishKumar4/dew"` |
-
-Each extra installs the accelerator build of JAX 0.11.2, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
+The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of JAX 0.11.2, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
 ### Which CUDA build
 

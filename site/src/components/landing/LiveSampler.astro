@@ -70,7 +70,7 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 <script>
 	import type { LiveSession, Output } from '../../scripts/live';
 	import { renderOutput } from '../../scripts/live';
-	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
+	import { liveCell } from '../../scripts/landing-kernel';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-sampler]');
 	const run = panel?.querySelector<HTMLButtonElement>('[data-run]');
@@ -88,17 +88,12 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 		const output = q<HTMLElement>('[data-output]');
 		const holder = q<HTMLElement>('[data-turnstile]');
 
-		let session: LiveSession | undefined;
+		// The session the sampler last ran on, and whether it has compiled the sampler yet.
+		let last: LiveSession | undefined;
 		let compiled = false;
-		let running = false;
 		let stopping = false;
 		let failure: string | undefined;
-		let started = 0;
 		let ticker: number | undefined;
-		onKernelClose((message) => {
-			session = undefined;
-			if (!running) show('idle', `${message} Press Run to start a new one.`);
-		});
 
 		/** Enter a stage: its name styles the figure, `text` is the status line, `fraction` fills the bar (none: indeterminate). */
 		const show = (name: string, text: string, fraction?: number) => {
@@ -119,7 +114,6 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			window.clearInterval(ticker);
 			detail.textContent = '';
 		};
-		const seconds = () => ((performance.now() - started) / 1000).toFixed(1);
 		const image = (png: string) => `data:image/png;base64,${png}`;
 
 		const onOutput = (message: Output) => {
@@ -164,59 +158,46 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 			renderOutput(output, message);
 		};
 
-		const execute = async () => {
-			running = true;
-			stopping = false;
-			failure = undefined;
-			run.textContent = 'Stop';
-			output.replaceChildren();
-			log.hidden = true;
-			log.open = false;
-			// On a phone the figure sits below the editor; bring it into view for the run.
-			if (stage.getBoundingClientRect().bottom > window.innerHeight) stage.scrollIntoView({ behavior: 'smooth', block: 'center' });
-			try {
-				if (!session) {
-					show('starting', 'Checking that you are not a bot');
-					tick('Waiting');
-					const opened = await landingKernel(holder, (text) => show('starting', text.replace(/…$/, '')));
-					if (stopping) throw new Error('Stopped.');
-					session = opened;
-					compiled = opened.warm;
+		liveCell(run, editor, holder, 'image', {
+			start: () => {
+				stopping = false;
+				failure = undefined;
+				output.replaceChildren();
+				log.hidden = true;
+				log.open = false;
+				// On a phone the figure sits below the editor; bring it into view for the run.
+				if (stage.getBoundingClientRect().bottom > window.innerHeight) stage.scrollIntoView({ behavior: 'smooth', block: 'center' });
+				// Until the kernel is ready, which another cell may be opening already.
+				show('starting', 'Starting');
+				tick('Waiting');
+			},
+			kernel: (text) => {
+				if (!stopping) show('starting', text.replace(/…$/, ''));
+			},
+			begin: (session) => {
+				if (session !== last) {
+					last = session;
+					compiled = session.warm;
 				}
-				started = performance.now();
 				// A cold kernel compiles the sampler before its first step (about 15 s on the preview's 4 vCPUs);
 				// a warm spare compiled it before it was handed out.
 				show('sampling', compiled ? 'Sampling' : 'Starting the sampler; a new kernel compiles it first');
 				tick('Running');
-				const done = await session.run(editor.value, onOutput, 'image');
+				return onOutput;
+			},
+			end: (outcome) => {
 				untick();
-				if (stopping || done.status === 'aborted') show('idle', 'Stopped.');
-				else if (done.status === 'ok') show('done', `The cell ran in ${seconds()} s on the live kernel.`, 1);
+				if ('failure' in outcome) show('error', outcome.failure);
+				else if (outcome.done.status === 'aborted') show('idle', 'Stopped.');
+				else if (outcome.done.status === 'ok') show('done', `The cell ran in ${outcome.seconds.toFixed(1)} s on the live kernel.`, 1);
 				else show('error', failure ?? 'The cell stopped with an error; the kernel output below says why.');
-			} catch (error) {
-				untick();
-				show(stopping ? 'idle' : 'error', stopping ? 'Stopped.' : error instanceof Error ? error.message : String(error));
-			} finally {
-				running = false;
-				run.textContent = 'Run';
-				run.disabled = false;
-			}
-		};
-
-		// Stopping interrupts the cell; before the kernel is ready it lets the start finish and runs nothing.
-		const stop = () => {
-			stopping = true;
-			run.disabled = true;
-			show(stage.dataset.stage ?? 'idle', 'Stopping');
-			session?.interrupt('image');
-		};
-
-		run.addEventListener('click', () => (running ? stop() : void execute()));
-		editor.addEventListener('keydown', (event) => {
-			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !running) {
-				event.preventDefault();
-				void execute();
-			}
+			},
+			// Stopping interrupts the cell; before the kernel is ready it lets the start finish and runs nothing.
+			stopping: () => {
+				stopping = true;
+				show(stage.dataset.stage ?? 'idle', 'Stopping');
+			},
+			closed: (message) => show('idle', `${message} Press Run to start a new one.`),
 		});
 	}
 </script>

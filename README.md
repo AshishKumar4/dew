@@ -184,7 +184,7 @@ master weights and optimizer state stay in fp32, so updates still accumulate in
 full precision.
 
 For int8 quantization-aware training, install the `quantization` extra
-(`pip install "dewml[quantization]"`, which installs Qwix) and wrap the model before you construct the objective:
+(`uv pip install "dewml[quantization]"`, which installs Qwix) and wrap the model before you construct the objective:
 
 ```python
 from dew.training import Quantization
@@ -1419,13 +1419,20 @@ The [recipe guide](https://github.com/AshishKumar4/dew/blob/main/docs/recipes.md
 
 ## Installation
 
-I recommend Python 3.14. Dew requires Python 3.12 or later, and CI tests both versions. Install the release from PyPI with [uv](https://docs.astral.sh/uv/getting-started/installation/), with the extra for your hardware. Each extra installs the accelerator build of the JAX version Dew requires:
+```bash
+curl -LsSf https://dewml.dev/install.sh | sh
+```
 
-| Hardware | Install |
-|---|---|
-| CPU | `uv pip install dewml` |
-| NVIDIA GPU | `uv pip install "dewml[cuda12]"` (or `cuda13` for CUDA 13 drivers) |
-| Google TPU | `uv pip install "dewml[tpu]"` |
+The script finds the hardware and the build it runs (an NVIDIA GPU and the CUDA version its driver supports, a TPU VM, or the CPU), asks where to install, installs [uv](https://docs.astral.sh/uv/) if it is missing, and installs Dew there. Dew requires Python 3.12 or later; I recommend 3.14, and CI tests both. To install it yourself, choose the extra for your hardware; each installs the accelerator build of the JAX version Dew requires:
+
+| Hardware | uv | pip |
+|---|---|---|
+| CPU | `uv pip install dewml` | `pip install dewml` |
+| NVIDIA GPU, driver 580+ | `uv pip install "dewml[cuda13]"` | `pip install "dewml[cuda13]"` |
+| NVIDIA GPU, driver 525+ | `uv pip install "dewml[cuda12]"` | `pip install "dewml[cuda12]"` |
+| Google TPU VM | `uv pip install "dewml[tpu]"` | `pip install "dewml[tpu]"` |
+
+CUDA 13 also needs a GPU of compute capability 7.5 or later ([which CUDA build](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#which-cuda-build)).
 
 To work on Dew itself, install it from a clone instead:
 
@@ -1437,7 +1444,7 @@ source .venv/bin/activate
 uv pip install -e ".[cuda12]"
 ```
 
-To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#process-pools-across-gpus) explains how to install it. See the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) for driver requirements.
+To install the main branch without cloning it, run `uv pip install "dewml[cuda13] @ git+https://github.com/AshishKumar4/dew"`. The extras install the accelerator build of jax 0.11.2, the version Dew requires. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. A process pool across GPUs keeps its compilation cache only with a patched jax 0.11.2 ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940)); the [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#process-pools-across-gpus) explains how to install it.
 
 The optional extras are `av`, `cuda12`, `cuda13`, `diffusers`, `eval-harness`, `gguf`, `guided`, `hpo`, `inference-clients`, `interop`, `metrics`, `mlflow`, `mutation`, `plots`, `profile`, `quantization`, `serve`, `streaming`, `tensorboard`, `test`, `tfds`, `torch`, `torchax`, `tpu`, `vision`, `wan` and `wandb`. `interop` reads and writes safetensors, `vision` provides the host image processors that the multimodal checkpoints call, and `inference-clients` installs the Ollama and OpenAI SDKs used in the serving section. The sections above name the extra each feature needs. The [installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md) covers development dependencies and dataset preparation.
 

@@ -6,6 +6,7 @@
 import { readdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { repository } from '../src/manifest.mjs';
+import { runsLive } from '../src/data/live-notebooks.mjs';
 import { escapeHtml, imageRoot, joined, renderOutputs } from './notebook-outputs.mjs';
 import {
 	blobUrl,
@@ -90,7 +91,7 @@ for (const file of files) {
 		outputsByCell[cell.id ?? `cell-${index}`] = record;
 		outputs += (cell.outputs ?? []).length;
 		codeIndex += 1;
-		// The live kernel has Dew installed and no network, so it skips the install cells.
+		// The live kernel has no network, so it skips the install cells.
 		if (!install) liveCells.push({ id: codeIndex, code: text });
 		const block = [`<div class="nb-cell" data-cell="${codeIndex}">`, '', fence(text.replace(/\n+$/, ''))];
 		if (rendered) block.push('', rendered);
@@ -109,7 +110,7 @@ for (const file of files) {
 		`<p class="nb-provenance">Outputs recorded on ${where}, JAX ${escapeHtml(recorded.jax)}, Dew <a href="${repository.url}/commit/${recorded.commit}"><code>${recorded.commit.slice(0, 7)}</code></a>, ${escapeHtml(recorded.date)}.</p>`,
 	);
 
-	const live = accelerator === 'CPU';
+	const live = runsLive(accelerator, liveCells.map(({ code }) => code));
 	if (live) {
 		parts.push(`<script type="application/json" data-notebook-cells>${JSON.stringify(liveCells).replace(/</g, '\\u003c')}</script>`);
 	}

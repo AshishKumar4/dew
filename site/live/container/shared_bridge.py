@@ -149,6 +149,25 @@ def largest_guest(proc=Path("/proc")):
     return pids[max(held, key=held.__getitem__)] if held else []
 
 
+class Page:
+    """One page's connection: its socket and contexts, each cell's running task and request, the
+    contexts of its running training cells, and the training cells its Stop ended."""
+
+    def __init__(self, socket, session, cells):
+        self.socket, self.session, self.cells = socket, session, cells
+        self.running, self.requests, self.training, self.stops = {}, {}, {}, set()
+
+    def busy(self):
+        return any(not task.done() for task in self.running.values())
+
+    async def fail(self, identifier, error):
+        await self.socket.send(json.dumps({"id": identifier, "type": "error",
+                                           "ename": type(error).__name__, "evalue": str(error),
+                                           "traceback": []}))
+        await self.socket.send(json.dumps({"id": identifier, "type": "done", "status": "error",
+                                           "count": None}))
+
+
 class Gateway:
     def __init__(self, token, secret, commit):
         self.token, self.secret, self.commit = token, secret, commit
@@ -320,43 +339,7 @@ class Gateway:
         await socket.send(json.dumps({"type": "ready", "uptime": time.monotonic() - self.started,
                                       "setup": next(iter(cells.values())).setup if cells else 0,
                                       "dew": self.commit}))
-        # A running cell's task, a running training cell's context, and the training cells Stop ended.
-        running, training, stops = {}, {}, set()
-
-        async def run(message, cell):
-            context = None
-
-            def send(output):
-                return socket.send(json.dumps({"id": message["id"], **output}))
-            try:
-                if message.get("kernel") == "train":
-                    stops.discard(cell)
-                    result = await self.train(session, message["code"], send, lambda: cell in stops,
-                                              lambda started: training.__setitem__(cell, started))
-                else:
-                    context = await self.context(session, cell)
-                    result = await context.execute(message["code"], send)
-                await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
-            except Exception as error:
-                if isinstance(error, Stopped) and context is not None and cells.get(cell) is context:
-                    # The next run of this cell starts a new context, with its client loaded again.
-                    del cells[cell]
-                    with suppress(OSError):
-                        await self.stop(context)
-                elif context:
-                    with suppress(OSError):
-                        await self.api(f"/api/kernels/{context.identifier}/interrupt", {}, "POST")
-                await socket.send(json.dumps({"id": message["id"], "type": "error",
-                                              "ename": type(error).__name__,
-                                              "evalue": str(error), "traceback": []}))
-                await socket.send(json.dumps({"id": message["id"], "type": "done",
-                                              "status": "error", "count": None}))
-            finally:
-                training.pop(cell, None)
-
-        def busy():
-            return any(not task.done() for task in running.values())
-
+        page = Page(socket, session, cells)
         try:
             deadline = time.monotonic() + self.wall
             while time.monotonic() < deadline:
@@ -364,7 +347,7 @@ class Gateway:
                     raw = await asyncio.wait_for(socket.recv(), timeout=min(15, deadline - time.monotonic()))
                 except TimeoutError:
                     used = max((context.last_used for context in cells.values()), default=0)
-                    if not busy() and time.monotonic() - used > self.idle:
+                    if not page.busy() and time.monotonic() - used > self.idle:
                         break
                     continue
                 message = json.loads(raw)
@@ -374,31 +357,89 @@ class Gateway:
                 for context in cells.values():
                     context.last_used = time.monotonic()
                 if message.get("op") == "interrupt":
-                    if cell in training:
-                        await self.api(f"/api/kernels/{training[cell].identifier}/interrupt", {}, "POST")
-                    elif cell in cells:
-                        await self.api(f"/api/kernels/{cells[cell].identifier}/interrupt", {}, "POST")
-                    if cell in running and not running[cell].done():
-                        stops.add(cell)
-                        async with self.slot:
-                            self.slot.notify_all()
-                elif message.get("op") == "execute":
-                    if cell in running and not running[cell].done():
+                    await self.interrupt(page, cell)
+                elif message.get("op") in ("execute", "restart"):
+                    if message["op"] == "execute" and cell in page.running and not page.running[cell].done():
                         raise ValueError("a cell is already running in this context")
-                    if (not isinstance(message.get("code"), str) or len(message["code"]) > MAX_CODE or
-                            not isinstance(message.get("id"), str) or len(message["id"]) > 128):
+                    if (not isinstance(message.get("id"), str) or len(message["id"]) > 128 or
+                            (message["op"] == "execute" and
+                             (not isinstance(message.get("code"), str) or len(message["code"]) > MAX_CODE))):
                         raise ValueError("invalid or oversized cell")
-                    running[cell] = asyncio.create_task(run(message, cell))
+                    step = self.run if message["op"] == "execute" else self.restart
+                    before = page.running.get(cell), page.requests.get(cell)
+                    page.running[cell] = asyncio.create_task(step(page, message, cell, before))
+                    page.requests[cell] = message["id"]
                 else:
                     raise ValueError("unsupported kernel operation")
         finally:
-            for task in running.values():
+            for task in page.running.values():
                 task.cancel()
-            for task in running.values():
+            for task in page.running.values():
                 with suppress(asyncio.CancelledError):
                     await task
             self.connected.discard(session)
             await self.close(session)
+
+    async def interrupt(self, page, cell):
+        """Interrupt what runs in `cell`, and end a training cell's wait for its turn."""
+        if cell in page.training:
+            await self.api(f"/api/kernels/{page.training[cell].identifier}/interrupt", {}, "POST")
+        elif cell in page.cells:
+            await self.api(f"/api/kernels/{page.cells[cell].identifier}/interrupt", {}, "POST")
+        if cell in page.running and not page.running[cell].done():
+            page.stops.add(cell)
+            async with self.slot:
+                self.slot.notify_all()
+
+    async def run(self, page, message, cell, _before):
+        """Run one cell's code in its context, or a training cell in a fresh one, sending its
+        outputs as they come and then done."""
+        context, socket = None, page.socket
+
+        def send(output):
+            return socket.send(json.dumps({"id": message["id"], **output}))
+        try:
+            if message.get("kernel") == "train":
+                page.stops.discard(cell)
+                result = await self.train(page.session, message["code"], send, lambda: cell in page.stops,
+                                          lambda started: page.training.__setitem__(cell, started))
+            else:
+                context = await self.context(page.session, cell)
+                result = await context.execute(message["code"], send)
+            await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
+        except Exception as error:
+            if isinstance(error, Stopped) and context is not None and page.cells.get(cell) is context:
+                # The next run of this cell starts a new context, with its client loaded again.
+                del page.cells[cell]
+                with suppress(OSError):
+                    await self.stop(context)
+            elif context:
+                with suppress(OSError):
+                    await self.api(f"/api/kernels/{context.identifier}/interrupt", {}, "POST")
+            await page.fail(message["id"], error)
+        finally:
+            page.training.pop(cell, None)
+
+    async def restart(self, page, message, cell, before):
+        """End what runs in `cell`, give it a fresh context, and answer done: the notebook's Restart."""
+        previous, ended = before
+        try:
+            if previous is not None and not previous.done():
+                page.stops.add(cell)
+                previous.cancel()
+                with suppress(asyncio.CancelledError):
+                    await previous
+                await page.socket.send(json.dumps({"id": ended, "type": "done", "status": "aborted",
+                                                   "count": None}))
+            # A cell that never ran has no context of its own yet; its first run starts a fresh one.
+            if cell in page.cells:
+                with suppress(OSError):
+                    await self.stop(page.cells.pop(cell))
+                page.cells[cell] = await self.start(page.session)
+            await page.socket.send(json.dumps({"id": message["id"], "type": "done", "status": "ok",
+                                               "count": None}))
+        except Exception as error:
+            await page.fail(message["id"], error)
 
     async def guard(self):
         """Kill the largest guest while the host's available memory is under RESERVE; the bridge
