@@ -16,6 +16,7 @@ import importlib.metadata
 import json
 import re
 import statistics
+import sys
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -25,11 +26,31 @@ REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
 E1_FLOPS_PER_STEP = 81_029_926_748_160
 E1_TOKENS = 3072 * 8
 BASE_PINS = {
-    "torch": "2.10.0", "transformers": "5.3.0", "numpy": "2.4.0",
+    "annotated-doc": "0.0.5", "anyio": "4.15.1", "certifi": "2026.7.22", "click": "8.5.0",
+    "filelock": "4.1.0", "fsspec": "2026.9.0", "h11": "0.16.0", "hf-xet": "1.7.0",
+    "httpcore": "1.0.9", "httpx": "0.28.1", "huggingface-hub": "1.33.0", "idna": "3.20",
+    "jinja2": "3.1.6", "markdown-it-py": "4.2.0", "markupsafe": "3.0.4", "mdurl": "0.1.2",
+    "mpmath": "1.3.0", "networkx": "3.7", "numpy": "2.5.4", "packaging": "26.3",
+    "pygments": "2.21.0", "pyyaml": "6.0.3", "regex": "2026.9.29", "rich": "15.0.0",
+    "safetensors": "0.8.0", "setuptools": "84.0.0", "shellingham": "1.5.4", "sympy": "1.14.0",
+    "tokenizers": "0.22.2", "torch": "2.10.0", "tqdm": "4.70.1", "transformers": "5.3.0",
+    "typer": "0.27.3", "typing-extensions": "4.16.0",
 }
 CUDA_PINS = {
+    "cuda-bindings": "12.9.4", "cuda-pathfinder": "1.8.3", "einops": "0.8.2", "ninja": "1.13.2",
     "triton": "3.6.0", "flash-linear-attention": "0.5.2", "fla-core": "0.5.2",
     "liger-kernel": "0.8.4", "causal-conv1d": "1.7.0",
+    "nvidia-cublas-cu12": "12.8.4.1", "nvidia-cuda-cupti-cu12": "12.8.90",
+    "nvidia-cuda-nvrtc-cu12": "12.8.93", "nvidia-cuda-runtime-cu12": "12.8.90",
+    "nvidia-cudnn-cu12": "9.10.2.21", "nvidia-cufft-cu12": "11.3.3.83",
+    "nvidia-cufile-cu12": "1.13.1.3", "nvidia-curand-cu12": "10.3.9.90",
+    "nvidia-cusolver-cu12": "11.7.3.90", "nvidia-cusparse-cu12": "12.5.8.93",
+    "nvidia-cusparselt-cu12": "0.7.1", "nvidia-nccl-cu12": "2.27.5",
+    "nvidia-nvjitlink-cu12": "12.8.93", "nvidia-nvshmem-cu12": "3.4.5", "nvidia-nvtx-cu12": "12.8.90",
+}
+WHEELS = {
+    "cpu": "torch @ https://download-r2.pytorch.org/whl/cpu/torch-2.10.0%2Bcpu-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=ee40b8a4b4b2cf0670c6fd4f35a7ef23871af956fecb238fbf5da15a72650b1d",
+    "cuda": "causal-conv1d @ https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.7.0/causal_conv1d-1.7.0%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl",
 }
 KINDS = ("gemm", "attention", "gdn", "elementwise", "reduce", "layout", "optimizer", "unclassified")
 
@@ -54,6 +75,8 @@ def arguments() -> argparse.Namespace:
 
 
 def versions(smoke: bool) -> dict:
+    if sys.version_info[:2] != (3, 12):
+        raise RuntimeError("the reference wheel lock requires Python 3.12")
     installed = {dist.metadata["Name"].lower().replace("_", "-"): dist.version
                  for dist in importlib.metadata.distributions()}
     for package, wanted in (BASE_PINS | ({} if smoke else CUDA_PINS)).items():
@@ -70,7 +93,7 @@ def kernel_kind(name: str, launch: str, phase: str) -> tuple[str, str]:
     text = (name + " " + launch).lower()
     if phase == "optimizer" or "adam" in text:
         return "optimizer", "optimizer launch/range"
-    if re.search(r"gated_delta|chunk_(?:fwd|bwd)|(?:fwd|bwd)_prepare_wy|solve_tril|causal_conv1d", text):
+    if re.search(r"gated_delta|chunk_(?:fwd|bwd)|prepare_wy_repr|recompute_w_u|solve_tril|causal_conv1d", text):
         return "gdn", "FLA chunk/triangular-solve/causal-convolution kernel"
     if re.search(r"flash|fmha|scaled_dot_product|attention", text):
         return "attention", "flash attention kernel/operator"
@@ -94,14 +117,12 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
     from trace_window import window_split
 
     events = json.loads(path.read_text())["traceEvents"]
-    cpu = {str(e.get("args", {}).get("External id")): e for e in events
-           if e.get("ph") == "X" and e.get("cat") == "cpu_op"}
+    cpu = {str(e["args"]["External id"]): e for e in events
+           if e.get("ph") == "X" and e.get("cat") == "cpu_op" and "External id" in e.get("args", {})}
     launches = {str(e.get("args", {}).get("correlation")): e for e in events
-                if e.get("cat") in ("cuda_runtime", "cuda_driver")}
-    scopes = [e for e in events if e.get("ph") == "X" and e.get("name", "").startswith("reference.")]
-    scope_by_thread = defaultdict(list)
-    for scope in scopes:
-        scope_by_thread[scope["tid"]].append(scope)
+                if e.get("cat") in ("cuda_runtime", "cuda_driver") and "correlation" in e.get("args", {})}
+    scopes = [e for e in events if e.get("ph") == "X"
+              and e.get("name") in ("reference.forward", "reference.backward", "reference.optimizer")]
     kinds, parts, rows = defaultdict(float), defaultdict(lambda: defaultdict(float)), {}
     gpu = [e for e in events if e.get("ph") == "X" and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")]
     for event in gpu:
@@ -111,7 +132,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
         if not op:
             op = cpu.get(str(launch.get("args", {}).get("External id")), {})
         host = launch or op
-        containing = [scope for scope in scope_by_thread.get(host.get("tid"), [])
+        containing = [scope for scope in scopes if scope.get("pid") == host.get("pid")
                       if scope["ts"] <= host.get("ts", -1) <= scope["ts"] + scope["dur"]]
         phase = next((scope["name"].removeprefix("reference.") for scope in containing
                       if scope["name"] in ("reference.forward", "reference.backward", "reference.optimizer")), "unknown")
@@ -154,6 +175,37 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
             "part_scope": "MLP GEMMs require observed input shapes; other GEMMs are projections. Unattributed is retained.",
             "common_summary": kernel_summary(kernels, steps),
             "kernel_rows": str(trim_trace(kernels, path.with_suffix(".kernels.json.gz")))}
+
+
+def smoke_attribution(path: Path) -> dict:
+    """Exercise correlation, overlap accounting and unknown retention without CUDA."""
+    events = [{"ph": "X", "cat": "user_annotation", "name": "reference.optimizer",
+               "pid": 1, "tid": 1, "ts": 90, "dur": 20}]
+    names = ["ampere_bf16_s16816gemm", "chunk_gated_delta_rule_fwd_kernel_h",
+             "flash_fwd_kernel", "_rms_norm_forward_kernel", "reduce_kernel",
+             "Memcpy DtoD", "vectorized_elementwise_kernel", "unrecognized_kernel"]
+    for index, name in enumerate(names):
+        launch_time = 100 if index == 6 else index * 10
+        events.extend([
+            {"ph": "X", "cat": "cpu_op", "name": "aten::mm" if index == 0 else "aten::test",
+             "pid": 1, "tid": 2, "ts": launch_time, "dur": 1,
+             "args": {"External id": index + 1, "Input Dims": [[2, 64], [64, 32]] if index == 0 else []}},
+            {"ph": "X", "cat": "cuda_runtime", "name": "cudaLaunchKernel", "pid": 1, "tid": 2,
+             "ts": launch_time, "dur": 1, "args": {"External id": index + 1, "correlation": index + 1}},
+            {"ph": "X", "cat": "kernel", "name": name, "ts": index * 10, "dur": 5,
+             "args": {"device": 0, "correlation": index + 1}},
+        ])
+    path.write_text(json.dumps({"traceEvents": events}))
+    result = attribute(path, 1, 64)
+    for kind in KINDS:
+        if abs(result["by_kind_ms"][kind] - 0.005) > 1e-9:
+            raise AssertionError(f"incorrect kernel/launch classification for {kind}")
+    if abs(result["device_idle_ms_per_step"] - 0.035) > 1e-9:
+        raise AssertionError("incorrect interval-union idle accounting")
+    if "mlp" not in result["by_part_ms"]:
+        raise AssertionError("lost GEMM input-shape attribution")
+    return {"launch_correlation": True, "cross_thread_optimizer_scope": True,
+            "unknown_kernel_retained": True, "interval_union_idle": True, "mlp_shape_attribution": True}
 
 
 def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
@@ -349,6 +401,8 @@ def run(args: argparse.Namespace) -> dict:
                          "optimizer_state_dtypes": state_dtypes, "no_timing_window_compilation": True,
                          "dynamo_counters": {key: dict(value) for key, value in counters.items()}}}
     record["time"].update(model_flops_per_step=flops, peak_gflops=None if peak is None else peak / 1e9)
+    if args.smoke:
+        record["checks"]["attribution_fixture"] = smoke_attribution(Path(args.out).with_suffix(".fixture.json"))
     if args.dew_attribution:
         record["comparison"] = comparison(record, args.dew_attribution, args.dew_entry)
     write_record(args.out, record)
@@ -359,6 +413,7 @@ if __name__ == "__main__":
     cli = arguments()
     if cli.requirements:
         for package, version in (BASE_PINS | (CUDA_PINS if cli.requirements == "cuda" else {})).items():
-            print(f"{package}=={version}")
+            print(WHEELS[cli.requirements] if package == ("torch" if cli.requirements == "cpu" else "causal-conv1d")
+                  else f"{package}=={version}")
     else:
         run(cli)
