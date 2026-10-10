@@ -404,7 +404,7 @@ def test_quantized_gradients_of_a_grouped_convolution_are_refused():
         Quantization(bwd_qtype="int8").apply(conv).apply(variables, x)
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+@pytest.mark.gpu(reason="needs a GPU")
 @pytest.mark.parametrize("dtype", ["int8", "fp8"])
 @pytest.mark.parametrize("group_width", [1, 4])
 @pytest.mark.parametrize("dilation", [1, 2, 3])

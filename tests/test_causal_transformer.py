@@ -1377,7 +1377,7 @@ def test_a_decode_step_reads_each_key_head_once_for_its_group(rng, monkeypatch):
     assert shapes and all(query[:3] == (rows, 2, 2) and key[2] == 2 for query, key in shapes), shapes
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+@pytest.mark.gpu(reason="needs a GPU")
 def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
     """A decode step's keys are the cache's filled slots, a count per row, so
     they reach cuDNN as its padding lengths rather than as a materialized mask:
@@ -1409,7 +1409,7 @@ def test_a_plain_decode_step_attends_through_cudnn_where_it_runs(rng, without_de
     assert fused and not [line for line in fused if "Bias" in line], fused[:1]
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+@pytest.mark.gpu(reason="needs a GPU")
 def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deterministic_ops):
     """A cache prefill of left-padded prompts builds its cursor mask, which
     sends a training call to xla (`kernel_for_materialized_mask`); a prefill

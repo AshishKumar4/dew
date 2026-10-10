@@ -39,8 +39,11 @@ from dew.nn.kernels import bf16_dot_runs
 from dew.telemetry.devices import apply_xla_flags, deterministic_ops_requested, xla_flag
 from dew.training import MeshSpec
 
-on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu' or not bf16_dot_runs(),
-                            reason="needs a cuda device of sm80 or later, cuDNN's bf16 floor")
+
+def on_gpu(test):
+    """Mark `test` for a cuda device of sm80 or later, cuDNN's bf16 floor."""
+    reason = "needs a cuda device of sm80 or later, cuDNN's bf16 floor"
+    return pytest.mark.gpu(reason=reason)(pytest.mark.skipif(not bf16_dot_runs(), reason=reason)(test))
 
 
 def qkv(shape, seed=0):
@@ -482,8 +485,7 @@ def test_an_explicit_cudnn_call_is_refused_under_deterministic_ops(monkeypatch):
         cudnn_shape(*qkv((1, 8, 2, 64)))
 
 
-@pytest.mark.skipif(jax.default_backend() != 'gpu',
-                    reason="jax traces a cudnn call only where cuDNN is installed")
+@pytest.mark.gpu(reason="jax traces a cudnn call only where cuDNN is installed")
 def test_an_explicit_cudnn_call_stands_without_the_flag(without_deterministic_ops):
     """The refusal belongs to the flag, not to the implementation: the same
     call traces to its output shape when the run asked for nothing."""
@@ -796,7 +798,7 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
                                      "folded")
 
 
-@pytest.mark.skipif(jax.default_backend() != 'gpu', reason="the kernel runs on CUDA")
+@pytest.mark.gpu(reason="the kernel runs on CUDA")
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
     """`dew.nn.kernels.decode_attention` reads each row's keys up to its
@@ -827,7 +829,7 @@ def test_the_decode_kernel_reads_each_row_to_its_length(dtype):
                                      "decode kernel")
 
 
-@pytest.mark.skipif(jax.default_backend() != 'gpu', reason="the kernel runs on CUDA")
+@pytest.mark.gpu(reason="the kernel runs on CUDA")
 @pytest.mark.parametrize("page_size", [16, 32])
 def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
     """`decode_attention.attend_paged` reads a row's pages through its table,

@@ -318,8 +318,8 @@ def test_the_exchange_holds_every_automatic_axis_manual():
     assert held == [True]
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu" or jax.device_count() < 2,
-                    reason="cuDNN's fused attention, split over two GPUs")
+@pytest.mark.gpu(reason="cuDNN's fused attention, split over two GPUs")
+@pytest.mark.skipif(jax.device_count() < 2, reason="cuDNN's fused attention, split over two GPUs")
 @pytest.mark.parametrize("exchange", sorted(EXCHANGES))
 @pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
 def test_cudnn_runs_inside_either_exchange(exchange, causal, without_deterministic_ops):

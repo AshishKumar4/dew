@@ -27,8 +27,7 @@ from dew.registry import towers
 
 FIXTURES = Path(__file__).parent / "fixtures" / "audio"
 
-on_gpu = pytest.mark.skipif(jax.default_backend() != 'gpu',
-                            reason="needs a cuda device")
+on_gpu = pytest.mark.gpu(reason="needs a cuda device")
 
 
 def _audio(kind):
