@@ -255,7 +255,7 @@ def test_a_decay_per_key_dimension_runs_the_scan():
     assert chunk_states_kernel("pallas", key, u, jnp.repeat(gc[..., None], 128, axis=-1)) == "xla"
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="the compiled kernels run on CUDA")
+@pytest.mark.gpu(reason="the compiled kernels run on CUDA")
 def test_the_compiled_kernels_are_as_exact_as_xla_at_qwen35_widths():
     """One row of Qwen3.5-9B's gated delta net at the default matmul
     precision, which both paths take (TF32 on the GPU): 1280 tokens, 32

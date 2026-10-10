@@ -80,6 +80,6 @@ These constructions are banned in prose, docstrings, comments and commit message
 
 ## Before a merge
 
-1. The suite passes on CPU (`JAX_PLATFORMS=cpu pytest -m "not network" -q`) and the touched files pass on a GPU.
+1. The suite passes on CPU (`JAX_PLATFORMS=cpu pytest -m "not network" -q`) and the touched files pass on a GPU. A test only a cuda device runs is marked `gpu` (`@pytest.mark.gpu(reason=...)`); every GPU session runs them all (`JAX_PLATFORMS=cuda pytest -m "gpu and not network" -q`), since the CPU suite never does.
 2. Every new number in docs has its reproduction command, and every port has its parity test.
 3. An independent reviewer has read the code itself.

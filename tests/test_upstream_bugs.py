@@ -29,7 +29,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-CUDA = pytest.mark.skipif(jax.default_backend() != "gpu", reason="a CUDA bug, which a cuda lane reproduces")
+CUDA = pytest.mark.gpu(reason="a CUDA bug, which a cuda lane reproduces")
 TPU = pytest.mark.skipif(jax.default_backend() != "tpu", reason="a TPU bug, which a TPU VM reproduces")
 
 

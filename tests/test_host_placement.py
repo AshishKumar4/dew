@@ -518,7 +518,7 @@ def _resident_shared_bytes() -> int:
     return -1
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="pinned host memory is the GPU pool")
+@pytest.mark.gpu(reason="pinned host memory is the GPU pool")
 def test_the_host_memory_limit_is_what_stops_the_bank_pool_from_doubling(monkeypatch):
     """XLA's pinned pool grows by power-of-two regions, capped at the process
     host memory limit. Banks placed one at a time land in a pool that ends

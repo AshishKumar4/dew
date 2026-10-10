@@ -261,6 +261,7 @@ markers = [
     "slow: tests that spawn real grain worker processes or drain long streams",
     "distributed: tests that need real processes with jax.distributed",
     "mesh(devices=8): tests that need that many devices; tests/conftest.py skips them, naming both device counts, on a run with fewer",
+    "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is
 # responsible for are errors. The module field is matched against the module

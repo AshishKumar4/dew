@@ -178,6 +178,7 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
                                rtol=TOLERANCE)
 
 
+@pytest.mark.gpu(reason="needs a GPU the Pallas kernels compile for")
 @pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 @pytest.mark.parametrize('implementation', ['auto', 'pallas'])
 def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(implementation):
