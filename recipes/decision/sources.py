@@ -210,7 +210,9 @@ class Source:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        population = self.count() or len(examples)
+        population = self.count() if self.limit is not None else len(examples)
+        if self.limit is not None and population <= self.limit:
+            population = len(examples)
         count = _held(population, self.held)
         count = min(count, len(examples))
         held, train = examples[:count], examples[count:]

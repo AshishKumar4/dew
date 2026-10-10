@@ -226,6 +226,9 @@ def test_seeded_rows_are_capped_before_conversion(sources, monkeypatch):
     assert seen[0] == seen[1]
     assert {row.questions["answer"].instructions for row in train}.isdisjoint(
         row.questions["answer"].instructions for row in held)
+    monkeypatch.setattr(sources.StrategyQA, "examples", lambda self: [
+        Example(str(index), {"answer": Noul("Ready?")}, {"answer": "true"}) for index in range(3000)])
+    assert [len(part) for part in sources.StrategyQA(limit=50000).split()] == [1000, 2000]
 
 
 def test_open_jev_drops_customer_control_before_grouping(sources, monkeypatch):
