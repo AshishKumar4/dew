@@ -248,3 +248,26 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
         np.testing.assert_allclose(ours, theirs, rtol=1e-4, atol=1e-6)
     with pytest.raises(ValueError, match="record count"):
         run(tmp_path / "changed", 6, "--data.seed", "1")
+
+
+def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
+    """--loop-steps sets the passes of Ouro's tiny looped decoder, leaving its
+    weights as they were; --loop-layers gives the tiny Qwen 3.5, which does not
+    loop, a loop over a block of its own layers; a block with no passes, or
+    passes with no block, on a decoder that does not loop is refused."""
+    from dew.decision.config import looping
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+
+    ouro = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "ouro-tiny", dtype="float32")
+    once = looping(ouro, 1, None)
+    assert once.model.loop == Loop(1, exit_gate=True) and ouro.model.loop == Loop(3, exit_gate=True)
+    assert once.variables is ouro.variables
+    qwen = Pretrained.load(QWEN, dtype="float32")
+    retrofit = looping(qwen, 2, (1, 2))
+    assert retrofit.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2))
+    assert qwen.model.language_model.loop is None
+    assert retrofit.variables is qwen.variables
+    for steps, layers in ((2, None), (None, (1, 2))):
+        with pytest.raises(ValueError, match="has no loop"):
+            looping(qwen, steps, layers)
