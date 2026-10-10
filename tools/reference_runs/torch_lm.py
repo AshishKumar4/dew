@@ -51,6 +51,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from common import (
+    TorchTracedWindow,
     chrome_trace_kernels,
     host,
     kernel_summary,
@@ -364,9 +365,7 @@ def train(args: argparse.Namespace, place: Ranks, run: Run) -> Curves:
     """Every step in the recorded order: timed from `timing_warmup` to the
     profiled tail, which is traced, with the router probes' time taken out."""
     losses, norms, rates, auxes = [], [], [], []
-    events = [torch.cuda.Event(enable_timing=True) for _ in range(run.total + 1)]
-    profile_from = run.total - args.profile_steps if args.profile_steps else run.total
-    profiler = None
+    window = TorchTracedWindow(place.device, run.total, args.timing_warmup, args.profile_steps)
     probe_rows = torch.from_numpy(run.windows[:args.probe_rows].astype(np.int64)).to(place.device)
     probes, probed_steps, probe_seconds = [], set(), 0.0
 
@@ -380,23 +379,13 @@ def train(args: argparse.Namespace, place: Ranks, run: Run) -> Curves:
 
     torch.cuda.reset_peak_memory_stats(place.device)
     torch.cuda.synchronize(place.device)
-    window_start = window_end = None
     for step in range(run.total):
-        if step == profile_from:
-            torch.cuda.synchronize(place.device)
-            window_end = time.perf_counter()
-            profiler = torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                                          torch.profiler.ProfilerActivity.CUDA])
-            profiler.__enter__()
-        if step == args.timing_warmup:
-            torch.cuda.synchronize(place.device)
-            window_start = time.perf_counter()
+        window.before(step)
         if args.probe_every and step % args.probe_every == 0:
             spent = probe(step)
-            if args.timing_warmup <= step < profile_from:
+            if args.timing_warmup <= step < window.profile_from:
                 probe_seconds += spent
-                probed_steps.add(step - 1)
-        events[step].record()
+                probed_steps.add(step)
         lr = warmup_cosine(step, init=args.lr_init, peak=args.lr_peak, warmup=args.warmup,
                            decay_steps=run.schedule_steps, end=args.lr_end)
         for group in run.optimizer.param_groups:
@@ -406,24 +395,14 @@ def train(args: argparse.Namespace, place: Ranks, run: Run) -> Curves:
         norms.append(norm)
         rates.append(lr)
         auxes.append(aux)
-    events[run.total].record()
-    torch.cuda.synchronize(place.device)
-    end = time.perf_counter()
-    if profiler is None:
-        window_end = end
-    else:
-        profiler.__exit__(None, None, None)
-        trace_dir = trace_directory(args)
-        trace_dir.mkdir(parents=True, exist_ok=True)
-        profiler.export_chrome_trace(str(trace_dir / f"rank{place.rank}.json"))
-        if place.distributed:
-            dist.barrier()
+    window.close(trace_directory(args) / f"rank{place.rank}.json")
+    if window.profiler is not None and place.distributed:
+        dist.barrier()
     if args.probe_every:
         probe(run.total)
-    step_seconds = [events[i].elapsed_time(events[i + 1]) / 1e3
-                    for i in range(args.timing_warmup, profile_from) if i not in probed_steps]
-    return Curves(losses, norms, rates, auxes, probes, window_end - window_start - probe_seconds,
-                  profile_from - args.timing_warmup, step_seconds, profiler is not None)
+    window.excluded, window.excluded_steps = probe_seconds, probed_steps
+    return Curves(losses, norms, rates, auxes, probes, window.seconds,
+                  window.timed_steps, window.step_seconds, window.profiler is not None)
 
 
 def record(args: argparse.Namespace, place: Ranks, run: Run, curves: Curves) -> dict | None:
