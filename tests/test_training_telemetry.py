@@ -72,8 +72,7 @@ def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatc
     monkeypatch.chdir(tmp_path)
     config.train(Squared(), targets([1., 3.]), name='telemetry')
     record = run.configuration['run_record']
-    assert record['config']['trainer'] == config.to_dict()['trainer']
-    assert record['config']['optim'] == config.to_dict()['optim']
+    assert record['config'] == config.recorded(Squared()).to_dict()
     assert record['dew_sha'] == expected_sha
     assert record['device_kind'] == jax.devices()[0].device_kind
     assert record['devices'] == jax.device_count()

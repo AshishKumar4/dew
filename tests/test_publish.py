@@ -59,7 +59,14 @@ class Tracker:
 def wandb(monkeypatch):
     """`import wandb` inside publish, without wandb."""
     module = types.ModuleType("wandb")
-    module.Artifact = Artifact
+    module.created = []
+
+    def artifact(*, name, type):
+        created = Artifact(name, type)
+        module.created.append(created)
+        return created
+
+    module.Artifact = artifact
     monkeypatch.setitem(sys.modules, "wandb", module)
     return module
 
@@ -114,6 +121,7 @@ def test_what_a_run_writes_after_training_is_published_only_on_request(tmp_path,
                  after=calibrate)
     assert opened[0]['name'] == config.trainer.name
     assert any('train/loss' in row and 'train/grad_norm' in row for row in run.history)
+    assert len(wandb.created) == int(publish)
     if publish:
         ((artifact, _),) = run.logged
         assert sorted(name for _, name in artifact.files) == ["decide.json", RUN_FILE]
