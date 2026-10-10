@@ -302,7 +302,8 @@ class JointSchemaHead(Head):
                    + self.option_question_projection(questions)[:, :, None])
         # A row's tokens and questions are right-padded, so each attention is told where its keys end
         # (at least one, for a padding row) rather than given a dense mask, which a fused kernel reads
-        # as a bias per head: [B, H, Q*K, T], gigabytes on a batch of long rows with many options.
+        # as a bias per head, [B, H, Q*K, T]: 0.24 GiB of the step's temporaries at B=16 with 2,800
+        # option queries over 3,072 tokens (c47).
         tokens = jnp.maximum(jnp.sum(inputs.valid, axis=1, dtype=jnp.int32), 1)
         asked = jnp.maximum(jnp.sum(inputs.questions, axis=1, dtype=jnp.int32), 1)
         routed = queries.reshape(batch, count * width, self.width)
