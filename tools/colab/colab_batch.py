@@ -181,6 +181,7 @@ def identity(plan: dict) -> dict:
             {
                 "artifact_excludes": job.get("artifact_excludes", []),
                 "data_sources": job.get("data_sources", []),
+                "wandb": job.get("wandb", False),
                 **{
                     key: job[key]
                     for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
@@ -370,7 +371,14 @@ def stage_sources(plan: dict, work: Path, repo: Path) -> None:
 def stage_inputs(plan: dict, work: Path) -> None:
     plan["data_sources"] = []
     for job in plan["jobs"]:
-        plan["data_sources"].extend(job.get("data_sources", []))
+        for source in job.get("data_sources", []):
+            if source in plan["data_sources"]:
+                continue
+            target = Path(source["target"])
+            if any(target.is_relative_to(Path(known["target"]))
+                   or Path(known["target"]).is_relative_to(target) for known in plan["data_sources"]):
+                raise ValueError("different R2 datasets have overlapping VM targets")
+            plan["data_sources"].append(source)
         if job.get("data_sources"):
             source = Path(job["data_token_file"]).expanduser()
             parts, digest = split_file(source, work, "data-read-token")
@@ -388,6 +396,9 @@ def stage_inputs(plan: dict, work: Path) -> None:
             if previous and previous["sha256"] != digest:
                 raise ValueError(f"two inputs target {target} with different bytes")
             plan["uploads"][target] = {"parts": parts, "sha256": digest}
+            if source.stat().st_mode & 0o077 == 0:
+                plan["uploads"][target]["private"] = True
+                plan.setdefault("private_parts", []).extend(parts)
         cache = STATE / "colab-resume" / job["resume_key"]
         if job["artifact_policy"] != "measurements" and (cache / "manifest.json").is_file():
             archive = work / f"resume-{job['index']}.tar.gz"
@@ -398,6 +409,8 @@ def stage_inputs(plan: dict, work: Path) -> None:
 
 def staged(plan: dict, work: Path) -> dict:
     saved = read(work / "plan.json")
+    if any(upload.get("private") for upload in saved.get("uploads", {}).values()):
+        raise ValueError("private credentials require fresh staging at launch; do not reuse their snapshot")
     validate_reuse(saved, plan)
     for filename, expected in saved["staged_files"].items():
         file = work / filename
