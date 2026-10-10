@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import jax
 
@@ -36,6 +37,9 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import LogLoss
 from dew.decision.task import Decide
 from dew.training.state import TrainState
+
+if TYPE_CHECKING:
+    from dew.interop import Pretrained
 
 
 @dataclasses.dataclass(frozen=True)
@@ -73,6 +77,13 @@ class DecisionRunConfig(RunConfig):
     subfolder: str | None = None
     """The checkpoint's folder inside a repository that bundles several, such as `multilingual`."""
     revision: str | None = None
+    loop_steps: int | None = None
+    """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
+    as Ouro's at 1, 2 or 4; None keeps the checkpoint's own."""
+    loop_layers: tuple[int, int] | None = None
+    """The block of layers [first, end) that `loop_steps` repeats: a pretrained
+    decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
+    repeated twice; None keeps a looped checkpoint's block."""
     head: JointShape | None = None
     """Clef's joint schema head over a fresh backbone, which then reads Clef's
     joint layout; None draws Laya's head."""
@@ -106,9 +117,10 @@ class DecisionRunConfig(RunConfig):
         budgets = {name: value for name, value in stated.items() if value}
         derived = {}
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
-            if self.lora is not None or self.head is not None:
-                raise ValueError("--lora and --head shape a fresh backbone; a Laya checkpoint trains whole "
-                                 "under its own head")
+            if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
+                                                    self.loop_layers)):
+                raise ValueError("--lora, --head and the loop shape a fresh backbone; a Laya checkpoint "
+                                 "trains whole under its own head")
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                            dtype=dtype, param_dtype=self.param_dtype,
                                            attention_impl=attention_impl)
@@ -116,6 +128,8 @@ class DecisionRunConfig(RunConfig):
         else:
             start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
                                     param_dtype=self.param_dtype, attention_impl=attention_impl)
+            if self.loop_steps is not None or self.loop_layers is not None:
+                start = looping(start, self.loop_steps, self.loop_layers)
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
             # The tokenizer of the commit the weights come from.
             root = sources.snapshot(self.pretrained, self.revision, weights=False)
@@ -155,6 +169,19 @@ class DecisionRunConfig(RunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary),
                         after=calibrate if self.calibrate and held_out else None)
+
+
+def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None) -> Pretrained:
+    """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
+    which gives a decoder with no loop one over its own layers. Refused where neither names a block,
+    or a new block's passes are not stated."""
+    from dew.nn.protocols import Looping
+
+    looped = start.model.with_passes(steps, layers) if isinstance(start.model, Looping) else None
+    if looped is None:
+        raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
+                         "its layers to repeat and --loop-steps how many times")
+    return dataclasses.replace(start, model=looped)
 
 
 def _fresh_layout(causal: bool, joint: bool, budgets: dict[str, int]) -> Layout:

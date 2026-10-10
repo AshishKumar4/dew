@@ -54,9 +54,9 @@ if TYPE_CHECKING:
     from dew.records import JSON
 
 __all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "DecoderTraining", "DenoisingModel",
-           "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "ModelKwarg",
-           "OutputTable", "ProjectionGroup", "Recomputing", "RequiresText", "Serving", "TimeScaled",
-           "TokenModel", "TritonGemm"]
+           "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
+           "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RequiresText", "Serving",
+           "TimeScaled", "TokenModel", "TritonGemm"]
 
 
 @struct.dataclass
@@ -140,6 +140,15 @@ class CacheCapacity(Protocol):
     the same draws for a request that fits."""
 
     def with_cache_capacity(self, capacity: int) -> Self: ...
+
+
+@runtime_checkable
+class Looping(Protocol):
+    """A model whose layer stack can run a block of it several times over its own output,
+    and the same model at `steps` passes of its block (None keeps its count), or of the block
+    `layers`, [first, end), which gives a model with no loop one; None where they cannot."""
+
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None: ...
 
 
 @runtime_checkable

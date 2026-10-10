@@ -89,28 +89,35 @@ the loop has to carry back out to the scope that asked for them."""
 
 @dataclasses.dataclass(frozen=True)
 class Loop:
-    """A layer stack that runs `steps` times over its own output, the passes
-    sharing its parameters: a looped (universal) transformer, as Ouro
-    (arXiv 2510.25741) runs its whole stack four times.
+    """A block of a layer stack that runs `steps` times over its own output,
+    the passes sharing its parameters: a looped (universal) transformer, as
+    Ouro (arXiv 2510.25741) runs its whole stack four times.
 
-    Every pass reads the same positions and masks. With `step_norm`, the
-    decoder's final norm is applied between passes, as Ouro applies its
-    shared `model.norm` after each one; the last pass's output takes the
-    norm as any decoder's does. `backprop_steps` k trains through the last k
-    passes alone: the passes before them run under `stop_gradient`
-    (truncated backpropagation, as Huginn trains), so neither they nor the
-    embeddings get a gradient. None trains through every pass.
-    `exit_gate` adds Ouro's hazard head, a biased map of each pass's
-    normed states to one logit, which the decoder sows into its `exits`
-    collection; the decoder's output is always the last pass's.
+    `layers` is the block, layers [first, end): the layers before it (the
+    prelude) and after it (the coda) run once, as Huginn's do, and a
+    pretrained decoder gains a loop by repeating a block of its own. None
+    loops the whole stack. Every pass reads the same positions and masks.
+    With `step_norm`, the decoder's final norm is applied between passes, as
+    Ouro applies its shared `model.norm` after each one; the last pass's
+    output takes the norm as any decoder's does. `backprop_steps` k trains
+    through the last k passes alone: the passes before them run under
+    `stop_gradient` (truncated backpropagation, as Huginn trains), so neither
+    they nor the layers before them get a gradient. None trains through
+    every pass. `exit_gate` adds Ouro's hazard head over the whole stack, a
+    biased map of each pass's normed states to one logit, which the decoder
+    sows into its `exits` collection; the decoder's output is always the
+    last pass's.
 
-    A decode cache holds one entry per pass and layer, pass t's layer i at
-    `layers_{t * num_layers + i}`, as Ouro's cache indexes them (`PassView`).
+    A decode cache holds one entry per pass and layer. The first pass keeps
+    its layers' own names; pass t > 0's layer i is `layers_{L + (t - 1) n + i - first}`,
+    L the decoder's layers and n the block's (`PassView`). Over the whole
+    stack that is `layers_{t L + i}`, as Ouro's cache indexes them.
     """
     steps: int
     step_norm: bool = True
     backprop_steps: int | None = None
     exit_gate: bool = False
+    layers: tuple[int, int] | None = None
 
     def __post_init__(self):
         if self.steps < 1:
@@ -118,49 +125,58 @@ class Loop:
         if self.backprop_steps is not None and not 1 <= self.backprop_steps <= self.steps:
             raise ValueError(f"backprop_steps counts passes trained through, 1 to steps={self.steps}, "
                              f"got {self.backprop_steps}")
+        if self.layers is not None:
+            first, end = (int(index) for index in self.layers)
+            object.__setattr__(self, "layers", (first, end))
+            if not 0 <= first < end:
+                raise ValueError(f"a loop's block is layers [first, end), first < end, not {self.layers}")
+            if self.exit_gate:
+                raise ValueError("the exit gate reads the whole stack's output; its loop is the whole stack")
 
 
 @dataclasses.dataclass
 class PassView:
-    """The collections a stack writes (`WRITTEN`), as pass `step` of a `Loop` over
-    `layers` layers sees them.
+    """The collections a stack writes (`WRITTEN`), as one pass of a `Loop`
+    sees them: its `count` layers' entries stored from `layers_{offset}`
+    shown under its layers' own names, from `layers_{first}`.
 
-    `inside` shows the pass its own entries under the names one pass uses,
-    `layers_{step * layers + i}` as `layers_i` (a run's name moves with its
-    first layer), and keeps the tree it was given; `outside` puts the pass's
-    entries back beside the other passes'. A name that is not a layer's is
-    every pass's. Flax calls `inside` before `outside` within one trace
-    (`nn.map_variables`), which is what holding the tree relies on.
+    `inside` shows the pass those entries (a run's name moves with its first
+    layer) and hides every other layer's, and keeps the tree it was given;
+    `outside` puts the pass's entries back beside the others'. A name that
+    is not a layer's is every pass's. Flax calls `inside` before `outside`
+    within one trace (`nn.map_variables`), which is what holding the tree
+    relies on.
     """
-    step: int
-    layers: int
+    offset: int
+    first: int
+    count: int
     held: dict = dataclasses.field(default_factory=dict)
 
-    def _renamed(self, name: str, offset: int) -> str:
+    @staticmethod
+    def _moved(name: str, by: int) -> str:
         run = group_layers(name)
         if run is None:
             return name
-        return f'layers_{run.start + offset}' if len(run) == 1 else group_name(run.start + offset, len(run))
+        return f'layers_{run.start + by}' if len(run) == 1 else group_name(run.start + by, len(run))
 
-    def _theirs(self, name: str) -> bool:
-        """Whether `name` is another pass's layer entry."""
+    def _ours(self, name: str) -> bool:
+        """Whether `name` is a layer entry this pass stores, or a name of no layer."""
         run = group_layers(name)
-        return run is not None and run.start // self.layers != self.step
+        return run is None or self.offset <= run.start < self.offset + self.count
 
     def inside(self, variables: Mapping[str, Mapping]) -> dict:
         self.held = {collection: dict(tree) for collection, tree in variables.items()}
-        offset = -self.step * self.layers
-        return {collection: {self._renamed(name, offset): value for name, value in tree.items()
-                             if not self._theirs(name)}
+        back = self.first - self.offset
+        return {collection: {self._moved(name, back): value for name, value in tree.items()
+                             if self._ours(name)}
                 for collection, tree in self.held.items()}
 
     def outside(self, variables: Mapping[str, Mapping]) -> dict:
-        offset = self.step * self.layers
-        out = {collection: {name: value for name, value in tree.items() if self._theirs(name)}
+        out = {collection: {name: value for name, value in tree.items() if not self._ours(name)}
                for collection, tree in self.held.items()}
         for collection, tree in variables.items():
             out.setdefault(collection, {}).update(
-                {self._renamed(name, offset): value for name, value in tree.items()})
+                {self._moved(name, self.offset - self.first): value for name, value in tree.items()})
         return out
 
 
