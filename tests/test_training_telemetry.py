@@ -59,9 +59,8 @@ def test_rejected_attempts_do_not_contribute_to_grad_norm():
 
 
 def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatch):
-    from test_publish import TrackedRun
-
     import wandb
+    from test_publish import TrackedRun
 
     run = TrackedRun()
     monkeypatch.setattr(wandb, 'init', lambda **_: run)
@@ -91,9 +90,8 @@ def test_checkout_revision_is_none_outside_a_checkout(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize('peaks,expected', [([2 * 1024 ** 3, 5 * 1024 ** 3], 5.), ([None, None], None)])
 def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monkeypatch, peaks, expected):
-    from test_publish import TrackedRun
-
     import wandb
+    from test_publish import TrackedRun
 
     run = TrackedRun()
     monkeypatch.setattr(wandb, 'init', lambda **_: run)
@@ -111,12 +109,12 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
     monkeypatch.setattr(jax, 'devices', lambda: [SimpleNamespace(device_kind='NVIDIA A100-SXM4-80GB')])
     monkeypatch.setattr(jax, 'device_count', lambda: 1)
     interval = _Interval(time.time() - 2, last_saved=None, since_log=2, samples=16,
-                         flops=StepFlops(model=312e12, hardware=624e12), waited=.02, compiling=.1)
+                         flops=StepFlops(model=312e12, hardware=624e12), waited=.02, compiling=.1, compiles=1)
     loss = jnp.asarray(1.)
     jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
-    trainer._log_interval(3, loss, {}, jnp.asarray(True), state, interval)
+    trainer._log_interval(3, loss, {}, jnp.asarray(a=True), state, interval)
     row = run.history[-1]
     names = {'train/loss', 'train/learning_rate', 'train/step_time_ms', 'train/data_wait_ms',
              'train/compile_s', 'train/mfu', 'train/hfu', 'train/compiles', 'train/cache_hits',

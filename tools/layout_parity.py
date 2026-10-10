@@ -478,7 +478,7 @@ def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool
     state, data, step, compiled = compiled_step(case, fields, batch, one_device=one_device, devices=devices)
     losses, gradient = [], {}
     for _ in range(steps):
-        state, loss, _, _, _ = step(state, data)
+        state, loss, _, _, _, _ = step(state, data)
         losses.append(float(loss))
         gradient = gradient or _gradient(state)
     return losses, gradient, compiled
@@ -501,7 +501,7 @@ def pooled(case, batches, pieces: int) -> list[tuple[float, dict[str, NDArray]]]
         step = trainer.compile(state, slices[0]) if step is None else step
         losses = []
         for data in slices:
-            state, loss, _, _, _ = step(state, data)
+            state, loss, _, _, _, _ = step(state, data)
             losses.append(float(loss))
         results.append((float(np.mean(losses)), _gradient(state)))
     return results
@@ -960,7 +960,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
                      'invariance': np.asarray(invariance[-1])}
             for name, (template, data, step, _compiled) in programs.items():
                 shardings = jax.tree.map(lambda leaf: leaf.sharding, template)
-                state, loss, _, _, _ = step(ordered_state(template, order, shardings), data)
+                state, loss, _, _, _, _ = step(ordered_state(template, order, shardings), data)
                 gradient = flat(state.opt_state[0]['gradient'], order)
                 for path in truth:
                     layout_distances[name].setdefault(path, []).append(distance(gradient[path], truth[path]))

@@ -110,7 +110,7 @@ def test_a_non_finite_live_parameter_leaves_the_reference_bit_identical(dynamic_
     before = frozen_bytes(state)
     batch = next(Counting())
     step = trainer.compile(state, batch)
-    new_state, loss, _, finite, _ = step(state, batch)
+    new_state, loss, _, finite, _, _ = step(state, batch)
 
     assert not bool(finite), "the step should have seen the poison"
     assert not bool(jnp.isfinite(loss)), "the loss should have seen the poison"

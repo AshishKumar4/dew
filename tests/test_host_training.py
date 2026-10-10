@@ -143,7 +143,7 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
         # the step consumes the state
         prefix_params = jax.tree.map(np.asarray, prefix.variables)
         prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
-        rejected, _, _, _, accepted = step(prefix, data[1])
+        rejected, _, _, _, accepted, _ = step(prefix, data[1])
         assert not bool(accepted)
         equal(prefix_params, rejected.variables)
         equal(prefix_accumulation, rejected.accumulation)
@@ -229,7 +229,7 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
         start_params, start_ema, start_opt = jax.tree.map(
             np.asarray, (initial.variables, initial.ema, initial.opt_state))
         start_scale, start_fin = float(initial.scale.scale), int(initial.scale.fin_steps)
-        final, _, _, finite, accepted = trainer.compile(initial, data)(initial, data)
+        final, _, _, finite, accepted, _ = trainer.compile(initial, data)(initial, data)
         assert bool(finite) and not bool(accepted)
         equal(start_params, final.variables)
         equal(start_ema, final.ema)

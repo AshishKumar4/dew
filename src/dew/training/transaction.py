@@ -32,6 +32,25 @@ Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 
+@struct.dataclass
+class Committed:
+    """Telemetry from one admitted optimizer commit, not objective metrics or checkpoint state.
+
+    `norm` is optax.global_norm of the native-dtype gradient passed to the
+    optimizer, before its transforms such as clipping. Accumulation takes
+    the pooled gradient at the window's commit, never each microbatch's
+    norm. Rejected attempts and partial windows contribute zero to both
+    `norm` and `count`; the loop sums them on device until its logging tick.
+    """
+    norm: jax.Array
+    count: jax.Array
+
+
+def _chosen(take, taken, kept):
+    """`taken` where `take` holds and `kept` elsewhere, leaf by leaf."""
+    return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
+
+
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
     """The variables tree with the averaged leaves in place of the live ones."""
     return None if ema is None else merge(params, ema)
@@ -307,6 +326,48 @@ class Transaction:
         """Add one replayed microbatch's unscaled gradient into the running sum."""
         return jax.tree.map(lambda a, b: a + _unscale(b, factor), accumulated, contribution)
 
+    def commit(self, current, gradient, effects, qk):
+        """Apply the pooled native gradient and return its finiteness and global norm.
+
+        The norm is reduced beside optimizer.update, in the same compiled
+        transaction, and leaves it with the loss and auxiliary report. No
+        gradient tree crosses to the host or is reconstructed for logging.
+        Admission is decided by finish_attempt after checking the updated
+        parameters and optimizer state as well.
+        """
+        native = jax.tree.map(lambda g, p: g.astype(p.dtype), gradient, current.variables["params"])
+        native_finite = _all_finite(native)
+        norm = optax.global_norm(native)
+        norm = norm.astype(jnp.result_type(norm.dtype, jnp.float32))
+
+        def apply(current):
+            if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
+                update, opt_state = self.optimizer.update(
+                    native, current.opt_state, current.variables["params"], qk_stats=qk)
+            else:
+                update, opt_state = self.optimizer.update(
+                    native, current.opt_state, current.variables["params"])
+            params = {**current.variables, "params": optax.apply_updates(current.variables["params"], update)}
+            if self.aux_shape.effects is not None:
+                params = write_back(params, self.objective.apply_effects(
+                    params, self.effects_tree.unflatten(effects)))
+            averaged = current.ema
+            if self.objective.ema is not None:
+                if averaged is None:
+                    raise ValueError("the objective declares EMA but the state carries none")
+                averaged = _chosen(self.objective.averages(current.updates),
+                                   ema_update(averaged, params, self.objective.ema.decay(current.updates)),
+                                   averaged)
+            compute = None if current.compute is None else narrowed(params, self.copies)
+            return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
+                                       updates=current.updates + 1, compute=compute)
+
+        if current.scale is None:
+            return apply(current), native_finite, norm
+        if self.size == 1:
+            return _chosen(native_finite, apply(current), current), native_finite, norm
+        return jax.lax.cond(native_finite, apply, lambda x: x, current), native_finite, norm
+
     def finish_attempt(self, state, batch, aux, pending, gradient):
         """Commit the window when it is due, then advance the state's clocks.
 
@@ -336,52 +397,18 @@ class Transaction:
         numerical = dataclasses.replace(state, variables=write_back(state.variables, aux.variables),
                                         microstep=state.microstep + 1)
 
-        def chosen(take, taken, kept):
-            """`taken` where `take` holds and `kept` elsewhere, leaf by leaf."""
-            return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
-
         def commit(current):
-            native = jax.tree.map(lambda g, p: g.astype(p.dtype), gradient, current.variables["params"])
-            native_finite = _all_finite(native)
-
-            def apply(current):
-                if isinstance(self.optimizer, optax.GradientTransformationExtraArgs):
-                    update, opt_state = self.optimizer.update(
-                        native, current.opt_state, current.variables["params"], qk_stats=qk)
-                else:
-                    update, opt_state = self.optimizer.update(
-                        native, current.opt_state, current.variables["params"]
-                    )
-                params = {
-                    **current.variables, "params": optax.apply_updates(current.variables["params"], update)}
-                if self.aux_shape.effects is not None:
-                    params = write_back(params, self.objective.apply_effects(
-                        params, self.effects_tree.unflatten(effects)))
-                averaged = current.ema
-                if self.objective.ema is not None:
-                    if averaged is None:
-                        raise ValueError("the objective declares EMA but the state carries none")
-                    averaged = chosen(self.objective.averages(current.updates),
-                                      ema_update(averaged, params, self.objective.ema.decay(current.updates)),
-                                      averaged)
-                compute = None if current.compute is None else narrowed(params, self.copies)
-                return dataclasses.replace(current, variables=params, opt_state=opt_state, ema=averaged,
-                                           updates=current.updates + 1, compute=compute)
-
-            if scale is None:
-                return apply(current), native_finite
-            if self.size == 1:
-                return chosen(native_finite, apply(current), current), native_finite
-            return jax.lax.cond(native_finite, apply, lambda x: x, current), native_finite
+            return self.commit(current, gradient, effects, qk)
 
         due = pending.due & pending.active & accepted
         if self.size == 1:
-            committed, native_finite = commit(numerical)
-            numerical = chosen(due, committed, numerical)
+            committed, native_finite, norm = commit(numerical)
+            numerical = _chosen(due, committed, numerical)
             native_finite = native_finite | ~due
         else:
-            numerical, native_finite = jax.lax.cond(
-                due, commit, lambda x: (x, jnp.asarray(a=True)), numerical)
+            zero = jnp.asarray(0., jnp.result_type(*jax.tree.leaves(state.variables["params"]), jnp.float32))
+            numerical, native_finite, norm = jax.lax.cond(
+                due, commit, lambda x: (x, jnp.asarray(a=True), zero), numerical)
         finite = finite & native_finite
         if scale is not None:
             accepted = finite & _all_finite((numerical.variables, numerical.opt_state, numerical.ema))
@@ -410,10 +437,11 @@ class Transaction:
                     else jnp.zeros_like(x), acc.qk_stats))
             numerical = dataclasses.replace(
                 numerical, accumulation=jax.lax.cond(pending.due, clear, retain, candidate))
-        advanced = chosen(accepted, numerical, state)
+        advanced = _chosen(accepted, numerical, state)
         if scale is not None:
             advanced = dataclasses.replace(advanced, scale=_advance_scale(scale, finite))
-        return advanced, loss, aux
+        counted = due & accepted
+        return advanced, loss, aux, Committed(jnp.where(counted, norm, 0.), counted.astype(jnp.int32))
 
     def step(self, *, realize=None, host=False):
         """Build the function that runs one attempt over the shared phases.
@@ -480,7 +508,8 @@ class Transaction:
                 return finish(state, batch, realized.aux, pending, gradient)
             held = state.variables[FROZEN]
             moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
-            advanced, loss, aux = finish(dataclasses.replace(state, variables=moving), batch,
-                                         realized.aux, pending, gradient)
-            return dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}), loss, aux
+            advanced, loss, aux, committed = finish(dataclasses.replace(state, variables=moving), batch,
+                                                    realized.aux, pending, gradient)
+            return (dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}),
+                    loss, aux, committed)
         return run
