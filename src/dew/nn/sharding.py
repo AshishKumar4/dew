@@ -555,6 +555,17 @@ def rows_like(x: jax.Array, like: jax.Array) -> jax.Array:
     return x if placed is None else jax.sharding.reshard(x, placed)
 
 
+def seen_whole(value: jax.Array) -> bool:
+    """Whether a Pallas kernel, which sees local arrays and carries no
+    manual-axis type, can take `value` where it is traced: no mesh axis
+    outside a `shard_map` splits it, and no `shard_map` that checks varying
+    axes holds it."""
+    mesh = jax.sharding.get_abstract_mesh()
+    split = any(mesh.shape[name] > 1 for name in mesh.axis_names
+                if name not in mesh.manual_axes)
+    return not split and not jax.typeof(value).mat.varying
+
+
 def _qualified(cls: type) -> str:
     return f"{cls.__module__}.{cls.__qualname__}"
 
