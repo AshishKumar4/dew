@@ -94,6 +94,8 @@ def _name(pipeline: Pipeline) -> str:
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
+    if isinstance(stage, Artifact):
+        return StepIdentity(f"dew.data.cache.{type(stage.cache).__name__}", stage.cache.url, True)
     if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch)):
         return StepIdentity.of(stage.step, stage.identity, cache=cache)
     if isinstance(stage, Filter):
@@ -594,7 +596,7 @@ class _Build:
                 rows = streamed(shards, partition=partition, seed=self.seed if self.training else None,
                                 cycle_length=cycle, loading=self.loading)
             else:
-                rows = artifact.cache.mapped(pygrain.MapDataset.source(source.records(self.read)), manifest,
+                rows = artifact.cache.mapped(pygrain.MapDataset.source(source.records(self.read)).seed(self.seed), manifest,
                                              source, transform=transform)
             rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), _CachedOutputs())
             lengths = None
@@ -792,7 +794,7 @@ def compile(train: Pipeline, *, validation: Pipeline | None = None, host: tuple[
                            tuple(_identity(stage) for stage in _steps(original)
                                  if not isinstance(stage, (Workers, Prefetch))))
     plan = Plan("global" if global_order else "per-share", manifest, _order(train),
-                _derived(train, seed), cache=tuple(repr(stage.cache) for stage in _steps(original) if isinstance(stage, Artifact)),
+                _derived(train, seed), cache=tuple(stage.cache.url for stage in _steps(original) if isinstance(stage, Artifact)),
                 volatile=any(isinstance(stage.step, Volatile) and stage.step.volatile
                              for stage in _steps(train) if isinstance(stage, Map)))
     build = _Build(read, loading, seed, batch, budget, global_order, True)

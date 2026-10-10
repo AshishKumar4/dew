@@ -13,6 +13,8 @@ import dataclasses
 import hashlib
 import itertools
 import json
+import shutil
+import subprocess
 import tempfile
 from collections.abc import Callable
 from pathlib import Path
@@ -96,8 +98,12 @@ def fixtures(root: Path):
         HFImages,
         HFOptions,
         HubDataset,
+        LocalVideos,
         PreferencePairs,
         Prompts,
+        PreparedTFDS,
+        TFDSImages,
+        TFDSOptions,
         TokenWindows,
     )
     from dew.data.images import pack_dict_of_byte_arrays
@@ -147,15 +153,32 @@ def fixtures(root: Path):
     writer.close()
     import pyarrow as pa
     import pyarrow.parquet as pq
+    import cv2
     from datasets import Dataset as HFDataset
+    from datasets import Image as HFImage
 
     table = root / "records.parquet"
     pq.write_table(pa.table({"id": list(range(40)), "x": [[index, index + 1] for index in range(40)]}), table)
-    arrow_images = HFDataset.from_list(pixels)
+    arrow_images = HFDataset.from_list([
+        {**row, "image": {"bytes": cv2.imencode(".png", row["image"][..., ::-1])[1].tobytes(), "path": None}}
+        for row in pixels]).cast_column("image", HFImage())
     image_table = root / "image.parquet"
     arrow_images.to_parquet(str(image_table))
+    from imageio_ffmpeg import get_ffmpeg_exe
+    from transformers import Wav2Vec2FeatureExtractor
+
+    clips = root / "clips"
+    clips.mkdir()
+    video = clips / "00.mp4"
+    subprocess.run([get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "testsrc=size=16x16:rate=25", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=16000",
+                    "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)], check=True)
+    for index in range(1, 12):
+        shutil.copyfile(video, clips / f"{index:02}.mp4")
+    audio = root / "audio"
+    Wav2Vec2FeatureExtractor(sampling_rate=16000).save_pretrained(audio)
     backbone = CausalTransformer(vocab_size=256, emb_features=8, num_layers=1, num_heads=2, mlp_features=16)
-    objective = DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=Specials(0, 1, 2, 3),
+    objective = DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=Specials(0, 1, 2, "<mark>", 3),
                                   layout=StateFirstLayout(max_len=128), shuffle_options=True)
     examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
                 for index in range(40)]
@@ -181,6 +204,15 @@ def fixtures(root: Path):
                                                loading=loading).load(batch=4),
         "hub_records": lambda loading: HubDataset(name="parquet", options=HFOptions(data_files={"train": str(table)}),
                                                    seed=7, loading=loading).load(batch=4),
+        "images_tfds": lambda loading: TFDSImages(path="tests/fixtures/tfds/dew_images/1.0.0", image_size=8,
+                                                 augmentation_backend="host", val_batches=1, seed=7,
+                                                 loading=loading).load(batch=4),
+        "tfds_records": lambda loading: PreparedTFDS(name="dew_images", split="train", seed=7, loading=loading,
+                                                    options=TFDSOptions(path="tests/fixtures/tfds/dew_images/1.0.0")
+                                                    ).load(batch=4),
+        "videos_local": lambda loading: LocalVideos(path=str(clips), frames=4, frame_size=16, audio_padding=1,
+                                                    audio_model=str(audio), val_batches=1, caption="clip", seed=7,
+                                                    loading=loading).load(batch=4),
         "decision_table": lambda loading: objective.dataset(examples, validation=examples[:5], batch=4,
                                                              seed=7, loading=loading),
         "decision_mix": lambda loading: objective.dataset({"a": Weighted(examples, 3), "b": Weighted(examples[:8], 1)},

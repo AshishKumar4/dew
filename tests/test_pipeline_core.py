@@ -9,11 +9,13 @@ import numpy as np
 import pytest
 
 from dew.data.compile import compile
+from dew.data.cache import Cache
 from dew.data.dataset import DataPartition, Loading, train_stream
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources.base import ShardManifest
+from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 
@@ -225,3 +227,63 @@ def test_lambda_identity_requires_explicit_non_exact_resume():
     with pytest.raises(ValueError, match="non-exact"):
         plan.check(plan.record())
     assert plan.check(plan.record(), resume="non-exact") == ()
+
+
+def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
+    stored = source(8)
+    cache = Cache(str(tmp_path / "cache"), shard_bytes=2048, spool_bytes=65536)
+    prefix = Pipeline(stored).cache(cache)
+
+    def build(prefix):
+        return compile(prefix.shuffle(5).repeat().random_map(Draw()).batch(4),
+                       read="memory", seed=5, loading=READ)
+
+    cold = build(prefix)
+    reader = cold.train(DataPartition())
+    first_epoch = take(reader, 2)
+    saved = reader.get_state()
+    second_epoch = take(reader, 2)
+    reader.close()
+    by_id = lambda epoch: {identifier: draw for batch in epoch for identifier, draw in
+                          zip(batch["id"], batch["draw"], strict=True)}
+    assert by_id(first_epoch) != by_id(second_epoch)
+    manifest = Manifest.of(stored.snapshot(), ())
+    generation = cache.publish(manifest, stored)
+    resumed = build(prefix).train(DataPartition())
+    resumed.set_state(saved)
+    assert take(resumed, 2) == second_epoch
+    resumed.close()
+    warm = build(Pipeline(stored).cache(generation)).train(DataPartition())
+    warm_first, warm_second = take(warm, 2), take(warm, 2)
+    assert by_id(warm_first) != by_id(warm_second)
+    warm.close()
+
+
+def test_causal_windows_keep_each_boundary_target_and_restore_carry():
+    from dew.data.pipeline import Windows
+    from dew.data.steps.windows import CausalWindows
+
+    rows = grain.MapDataset.source([{"text": np.arange(4, dtype=np.int32)},
+                                    {"text": np.arange(4, 11, dtype=np.int32)}]).to_iter_dataset()
+    windows = CausalWindows(rows, Windows(3))
+    reader = iter(windows)
+    assert next(reader)["text"].tolist() == [0, 1, 2, 3]
+    saved = reader.get_state()
+    rest = take(reader, 10)
+    assert rest == [{"text": [3, 4, 5, 6]}, {"text": [6, 7, 8, 9]}]
+    resumed = iter(windows)
+    resumed.set_state(saved)
+    assert take(resumed, 10) == rest
+    reader.close()
+    resumed.close()
+
+
+def test_validation_takes_accepted_rows_before_the_share_cut():
+    prefix = Pipeline(source(11)).map(Odd()).take(3).batch(4)
+    data = compile(Pipeline(source()).batch(4), validation=prefix, loading=READ)
+    for share in range(2):
+        held = data.val(DataPartition(share, 2))
+        rows = list(held)
+        assert len(rows) == 1
+        assert rows[0]["id"][rows[0][VALID_ROWS]].tolist() == ([1, 5] if share == 0 else [3])
+        held.close()
