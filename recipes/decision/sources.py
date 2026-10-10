@@ -150,7 +150,7 @@ class Source:
     """
 
     weight: float = 0.0
-    limit: int | None = 200_000
+    limit: int | None = None
     held: int | None = None
     seed: int = 0
     revision: str = ""
@@ -206,7 +206,9 @@ class Source:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        population = self.count() if self.files and self.limit is not None and len(examples) >= self.limit else len(examples)
+        population = (self.count() if self.limit is not None and len(examples) >= self.limit
+                      else len(examples))
+        population = population or len(examples)
         count = _held(population, self.held)
         count = min(count, len(examples))
         held, train = examples[:count], examples[count:]
@@ -575,8 +577,10 @@ class Esci(Source):
         selected = _draw(781638, self.limit, self.held, self.seed)
         examples, offset = [], 0
         for batch in pq.ParquetFile(path).iter_batches(batch_size=4096):
-            batch = batch.filter(pc.and_(pc.equal(batch["split"], "train"), pc.equal(batch["small_version"], 1)))
-            positions = [index for index in range(len(batch)) if selected is None or offset + index in selected]
+            batch = batch.filter(pc.and_(pc.equal(batch["split"], "train"),
+                                         pc.equal(batch["small_version"], 1)))
+            positions = [index for index in range(len(batch))
+                         if selected is None or offset + index in selected]
             examples.extend(batch.take(positions).to_pylist())
             offset += len(batch)
         needed = {(row["product_id"], row["product_locale"]) for row in examples}
@@ -610,6 +614,9 @@ class Esci(Source):
 
     def examples(self) -> list[Example]:
         return [self.example(row) for row in self.rows()]
+
+    def count(self) -> int:
+        return 781638
 
 
 @dataclass(frozen=True)
@@ -655,7 +662,8 @@ class Sgd(Source):
     def dialogues(self) -> Iterator[dict]:
         """The 127 pinned training shards, never the dev or test dialogues."""
         for index in range(1, 128):
-            yield from json.loads(_github(self.repo, self.revision, f"train/dialogues_{index:03}.json").read_text())
+            path = _github(self.repo, self.revision, f"train/dialogues_{index:03}.json")
+            yield from json.loads(path.read_text())
 
     @staticmethod
     def frames(dialogue: dict, schemas: dict) -> Iterator[dict]:
@@ -675,7 +683,8 @@ class Sgd(Source):
                           "for this service. Choose NONE when no service intent is active. Do not use future "
                           "turns or hidden labels.", {name: name for name in intents})
         state = {key: row[key] for key in ("history", "service", "schema")}
-        return Example({**state, "task": "SGD current-service intent"}, {"intent": question}, {"intent": row["gold"]})
+        return Example({**state, "task": "SGD current-service intent"}, {"intent": question},
+                       {"intent": row["gold"]})
 
     def count(self) -> int:
         return sum(len(turn["frames"]) for dialogue in self.dialogues() for turn in dialogue["turns"]
@@ -700,7 +709,8 @@ def _evidence_database() -> Path:
     path = cached_assets_path(library_name="dew", namespace="hover", subfolder=digest) / "wiki_wo_links.db"
     if not path.is_file():
         partial = path.with_suffix(".partial")
-        with (urllib.request.urlopen("https://nlp.cs.unc.edu/data/hover/wiki_wo_links.db", timeout=300) as source,
+        url = "https://nlp.cs.unc.edu/data/hover/wiki_wo_links.db"
+        with (urllib.request.urlopen(url, timeout=300) as source,
               partial.open("wb") as target):
             shutil.copyfileobj(source, target)
         with partial.open("rb") as file:
@@ -724,13 +734,15 @@ class Hover(Source):
     licence_url: ClassVar[str] = "https://huggingface.co/datasets/hover-nlp/hover/blob/c0e43052759879b3461642ca6c0dd26658f47691/README.md"
 
     def claims(self) -> list[dict]:
-        return json.loads(_github(self.repo, self.revision, "data/hover/hover_train_release_v1.1.json").read_text())
+        path = _github(self.repo, self.revision, "data/hover/hover_train_release_v1.1.json")
+        return json.loads(path.read_text())
 
     def convert(self, row: dict) -> Example:
         question = Choice("Is the claim supported by the evidence?",
                           {"SUPPORTED": "The evidence supports the claim.",
                            "NOT_SUPPORTED": "The evidence does not support the claim."})
-        return Example({"claim": row["claim"], "evidence": row["evidence"]}, {"q": question}, {"q": row["label"]})
+        return Example({"claim": row["claim"], "evidence": row["evidence"]},
+                       {"q": question}, {"q": row["label"]})
 
     def examples(self) -> list[Example]:
         import sqlite3
@@ -818,7 +830,8 @@ class Fever(Framed):
         evidence = "\n".join(f"{item[0]}: {item[2]}" for item in row["evidence"])
         options = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
         return self.example(f"Claim: {row['claim']}\nEvidence: {evidence}",
-                            "Does the evidence support or refute the claim?", options, options.index(row["label"]))
+                            "Does the evidence support or refute the claim?",
+                            options, options.index(row["label"]))
 
 
 @dataclass(frozen=True)
@@ -847,7 +860,8 @@ class MultiNli(Framed):
     revision: str = "da70db2af9d09693783c3320c4249840212ee221"
     repo: ClassVar[str] = "nyu-mll/multi_nli"
     files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
-    licence: ClassVar[str] = "LicenseRef-OANC AND CC-BY-3.0 AND CC-BY-SA-3.0 AND MIT AND LicenseRef-Public-Domain"
+    licence: ClassVar[str] = ("LicenseRef-OANC AND CC-BY-3.0 AND CC-BY-SA-3.0 "
+                              "AND MIT AND LicenseRef-Public-Domain")
 
     def convert(self, row: dict) -> Example | None:
         if row["label"] == -1:
@@ -895,7 +909,8 @@ class GoEmotions(Source):
     label_column: ClassVar[str] = "labels"
 
     def convert(self, row: dict) -> Example:
-        return _multilabel(row["text"], self.classes, row["labels"], "Which emotion is expressed in the text?")
+        return _multilabel(row["text"], self.classes, row["labels"],
+                           "Which emotion is expressed in the text?")
 
 
 @dataclass(frozen=True)
@@ -920,11 +935,13 @@ class CivilComments(Source):
     weight: float = 1.0
     revision: str = "f2970eb3a55777454c94069077cc8d9b5866312d"
     repo: ClassVar[str] = "google/civil_comments"
-    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet")
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00002.parquet",
+                                      "data/train-00001-of-00002.parquet")
     licence: ClassVar[str] = "CC0-1.0"
 
     def convert(self, row: dict) -> Example:
-        names = ("toxicity", "severe_toxicity", "obscene", "threat", "insult", "identity_attack", "sexual_explicit")
+        names = ("toxicity", "severe_toxicity", "obscene", "threat", "insult",
+                 "identity_attack", "sexual_explicit")
         questions = {name: Noul(f"Does this comment contain {name.replace('_', ' ')}?") for name in names}
         return Example(row["text"], questions, targets={name: (1 - row[name], row[name]) for name in names})
 
@@ -956,11 +973,13 @@ class BiasInBios(Framed):
     licence: ClassVar[str] = "MIT"
 
     def convert(self, row: dict) -> Example:
-        occupations = ("accountant architect attorney chiropractor comedian composer dentist dietitian dj filmmaker "
-                       "interior_designer journalist model nurse painter paralegal pastor personal_trainer "
-                       "photographer physician poet professor psychologist rapper software_engineer surgeon teacher "
-                       "yoga_teacher").split()
-        return self.example(row["hard_text"], "What is this person's occupation?", occupations, row["profession"])
+        occupations = ["accountant", "architect", "attorney", "chiropractor", "comedian", "composer",
+                       "dentist", "dietitian", "dj", "filmmaker", "interior_designer", "journalist", "model",
+                       "nurse", "painter", "paralegal", "pastor", "personal_trainer", "photographer",
+                       "physician", "poet", "professor", "psychologist", "rapper", "software_engineer",
+                       "surgeon", "teacher", "yoga_teacher"]
+        return self.example(row["hard_text"], "What is this person's occupation?",
+                            occupations, row["profession"])
 
 
 @dataclass(frozen=True)
@@ -980,7 +999,8 @@ class MassiveIntent(Framed):
         return [labels[index] for index in sorted(labels)]
 
     def convert(self, row: dict) -> Example:
-        return self.example(row["text"], "Which intent does this request express?", self.classes, row["label"])
+        return self.example(row["text"], "Which intent does this request express?",
+                            self.classes, row["label"])
 
 
 @dataclass(frozen=True)
@@ -1009,7 +1029,8 @@ class UnfairTos(Source):
     label_column: ClassVar[str] = "labels"
 
     def convert(self, row: dict) -> Example:
-        return _multilabel(row["text"], self.classes, row["labels"], "Which unfair clause type applies to this text?")
+        return _multilabel(row["text"], self.classes, row["labels"],
+                           "Which unfair clause type applies to this text?")
 
 
 @dataclass(frozen=True)
@@ -1025,7 +1046,8 @@ class Snips(Framed):
     def convert(self, row: dict) -> Example:
         labels = ["AddToPlaylist", "BookRestaurant", "GetWeather", "PlayMusic", "RateBook",
                   "SearchCreativeWork", "SearchScreeningEvent"]
-        return self.example(row["text"], "Which intent does this request express?", labels, labels.index(row["category"]))
+        return self.example(row["text"], "Which intent does this request express?",
+                            labels, labels.index(row["category"]))
 
 
 @dataclass(frozen=True)
@@ -1117,7 +1139,8 @@ class StrategyQA(Source):
     licence: ClassVar[str] = "MIT"
 
     def convert(self, row: dict) -> Example:
-        return Example("", {"answer": Noul(row["question"])}, {"answer": "true" if row["answer"] else "false"})
+        return Example("", {"answer": Noul(row["question"])},
+                       {"answer": "true" if row["answer"] else "false"})
 
 
 @dataclass(frozen=True)
@@ -1141,7 +1164,7 @@ class SciEntsBank(Source):
 
 @dataclass(frozen=True)
 class HelpSteer2(Source):
-    """HelpSteer2 (nvidia/HelpSteer2, CC-BY-4.0), five human 0–4 ratings in each example."""
+    """HelpSteer2 (nvidia/HelpSteer2, CC-BY-4.0), five human 0-4 ratings in each example."""
 
     weight: float = 1.0
     revision: str = "990b2711a36180dd19d9c94b8627844866f8982a"
@@ -1150,9 +1173,12 @@ class HelpSteer2(Source):
     licence: ClassVar[str] = "CC-BY-4.0"
 
     def convert(self, row: dict) -> Example:
-        levels = {"helpfulness": ["Not helpful", "Slightly helpful", "Somewhat helpful", "Helpful", "Very helpful"],
-                  "correctness": ["Incorrect", "Mostly incorrect", "Partially correct", "Mostly correct", "Correct"],
-                  "coherence": ["Incoherent", "Mostly incoherent", "Somewhat coherent", "Mostly coherent", "Coherent"],
+        levels = {"helpfulness": ["Not helpful", "Slightly helpful", "Somewhat helpful", "Helpful",
+                                  "Very helpful"],
+                  "correctness": ["Incorrect", "Mostly incorrect", "Partially correct", "Mostly correct",
+                                  "Correct"],
+                  "coherence": ["Incoherent", "Mostly incoherent", "Somewhat coherent", "Mostly coherent",
+                                "Coherent"],
                   "complexity": ["Basic", "Simple", "Moderate", "Complex", "Highly complex"],
                   "verbosity": ["Very brief", "Brief", "Moderate length", "Detailed", "Very detailed"]}
         questions = {name: Score(f"Rate the response's {name} on a scale from 0 to 4.", descriptions)
@@ -1199,8 +1225,9 @@ class Lavoir(Source):
     revision: str = "d2c66dc86c782fadccc14748d8fa073ca16a6090"
     repo: ClassVar[str] = "moganai/lavoir-dialogues"
     files: ClassVar[tuple[str, ...]] = tuple(f"data/train/{name}.jsonl" for name in
-                                           ("banking_support", "ecommerce_returns", "hr_requests", "insurance_claims",
-                                            "it_helpdesk", "privacy_requests", "telecom_support", "travel_changes"))
+                                           ("banking_support", "ecommerce_returns", "hr_requests",
+                                            "insurance_claims", "it_helpdesk", "privacy_requests",
+                                            "telecom_support", "travel_changes"))
     licence: ClassVar[str] = "CC-BY-4.0"
     natural: ClassVar[bool] = False
 
@@ -1277,7 +1304,7 @@ def shares(counts: dict[str, int], cap: int = 200_000) -> dict[str, float]:
         raise ValueError("the cap must be positive and training counts non-negative")
     sizes = {name: min(count, cap) for name, count in counts.items()}
     total = sum(sizes.values())
-    result = {name: 0.0 for name in sizes}
+    result = dict.fromkeys(sizes, 0.0)
     free = {name: size ** (1 / 3) for name, size in sizes.items() if size}
     while free:
         room, scale = 1 - sum(result.values()), sum(free.values())
@@ -1292,7 +1319,8 @@ def shares(counts: dict[str, int], cap: int = 200_000) -> dict[str, float]:
     return result
 
 
-def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None, cap: int = 200_000) -> dict[str, Value]:
+def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None,
+          cap: int = 200_000) -> dict[str, Value]:
     """Write `mixture`'s sets under `out`, each decontaminated against `overlaps`, and return what
     `<out>/mixture.json` records."""
     out.mkdir(parents=True, exist_ok=True)
