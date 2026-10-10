@@ -30,6 +30,7 @@ from dew.interop.families.modernbert import MODERNBERT
 from dew.interop.families.nemotron_h import NEMOTRON_H
 from dew.interop.families.olmo import OLMO3
 from dew.interop.families.opt import OPT
+from dew.interop.families.ouro import OURO
 from dew.interop.families.phi import PHI
 from dew.interop.families.phi3 import PHI3
 from dew.interop.families.qwen import (
@@ -45,6 +46,7 @@ from dew.interop.families.starcoder2 import STARCODER2
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 
 ENTRIES = (
+    OURO,
     BLOOM,
     GPT_NEO,
     PHI,
