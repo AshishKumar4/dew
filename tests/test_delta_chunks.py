@@ -25,7 +25,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn import kernels, linear
@@ -109,8 +108,8 @@ def rule_operands(seed: int = 0):
     values, and a held state."""
     keys = jax.random.split(jax.random.key(seed), 6)
     B, S, H = 2, 150, 2
-    return (l2norm(jax.random.normal(keys[0], (B, S, H, 32))), l2norm(jax.random.normal(keys[1], (B, S, H, 32))),
-            jax.random.normal(keys[2], (B, S, H, 64)),
+    query, key = (l2norm(jax.random.normal(drawn, (B, S, H, 32))) for drawn in keys[:2])
+    return (query, key, jax.random.normal(keys[2], (B, S, H, 64)),
             -jnp.exp(jax.random.normal(keys[3], (B, S, H)) - 2.0),
             jax.nn.sigmoid(jax.random.normal(keys[4], (B, S, H))),
             0.1 * jax.random.normal(keys[5], (B, H, 32, 64)))
@@ -234,8 +233,9 @@ def test_the_compiled_kernels_are_as_exact_as_xla_at_qwen35_widths():
     on Blackwell for a Triton race (fla-org/flash-linear-attention#945)."""
     keys = jax.random.split(jax.random.key(3), 6)
     B, S, H, D = 1, 1280, 32, 128
-    operands = (l2norm(jax.random.normal(keys[0], (B, S, H, D))), l2norm(jax.random.normal(keys[1], (B, S, H, D))),
-                jax.random.normal(keys[2], (B, S, H, D)), -jnp.exp(jax.random.normal(keys[3], (B, S, H)) - 3.0),
+    query, key = (l2norm(jax.random.normal(drawn, (B, S, H, D))) for drawn in keys[:2])
+    operands = (query, key, jax.random.normal(keys[2], (B, S, H, D)),
+                -jnp.exp(jax.random.normal(keys[3], (B, S, H)) - 3.0),
                 jax.nn.sigmoid(jax.random.normal(keys[4], (B, S, H))))
     seeded = jax.random.normal(keys[5], (B, S, H, D))
 
