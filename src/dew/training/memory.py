@@ -14,8 +14,6 @@ from typing import Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
-import numpy as np
-from jax.experimental import multihost_utils
 from jax.sharding import Mesh, NamedSharding
 
 from dew.data.dataset import rows_of
@@ -270,13 +268,9 @@ def fits_everywhere(headroom: int | None) -> bool:
     A process reads only its own devices' memory, so the pool takes the minimum;
     a process that reports none does not affect the result.
     """
-    if jax.process_count() == 1:
-        return headroom is None or headroom >= 0
-    # float32 because a pool without x64 gathers no wider type; its sign is
-    # exact, which is all the answer reads.
-    gathered = multihost_utils.process_allgather(
-        np.asarray(np.inf if headroom is None else headroom, np.float32))
-    return bool(np.min(gathered) >= 0)
+    from dew.coordination import from_every_process
+
+    return min((value for value in from_every_process(headroom) if value is not None), default=0) >= 0
 
 
 def step_fits(executable: jax.stages.Compiled | None, mesh: Mesh, held: int = 0) -> bool:

@@ -12,7 +12,6 @@ from typing import Any
 
 import jax
 import numpy as np
-from jax.experimental import multihost_utils
 from jax.sharding import Mesh
 
 from dew.artifacts import Artifact, Artifacts
@@ -22,6 +21,7 @@ from dew.coordination import (
     agreed_same,
     broadcast_from_process_zero,
     collective_host,
+    from_every_process,
 )
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
 from dew.objectives.base import VALID_ROWS, Batch, Effects, Loss, Metric, Objective, Step, Variables
@@ -316,9 +316,8 @@ def _score_split(objective: Objective[Loss, Effects], variables: Variables, batc
                 break
         # Processes on one data share (a replicated stage or sequence axis)
         # read the same rows, so the pool counts each share once.
-        shares = np.asarray(multihost_utils.process_allgather(
-            np.asarray([DataPartition.of(mesh).index, records], np.int64))).reshape(-1, 2)
-        records = sum({int(index): int(count) for index, count in shares}.values())
+        shares = from_every_process([int(DataPartition.of(mesh).index), int(records)])
+        records = sum(dict(shares).values())
         if scored:
             scores = _finalized(metrics, summaries, split=split, root=root)
             loss_value = loss_sums.value(objective)
