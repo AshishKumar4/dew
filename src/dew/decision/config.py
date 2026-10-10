@@ -196,13 +196,13 @@ def _fresh_layout(causal: bool, joint: bool, budgets: dict[str, int]) -> Layout:
 
 
 def _budgeted(layout: Layout, budgets: dict[str, int]) -> Layout:
-    """`layout` with the `budgets` it has fields for: a joint row's has no question budget and
-    a row per question's no state budget, which is refused, since the state takes what is left."""
+    """`layout` with the stated `budgets`, refusing one it has no field for: a joint row has
+    no question budget, and a row per question no state budget, its state taking what is left."""
     fields = {field.name for field in dataclasses.fields(layout)}
-    if "max_state_tokens" in budgets and "max_state_tokens" not in fields:
-        raise ValueError("--max-state-tokens cuts a joint row's state, and this run lays out a row per "
-                         "question, whose state takes what --max-len leaves it")
-    return dataclasses.replace(layout, **{name: value for name, value in budgets.items() if name in fields})
+    unknown = sorted(f"--{name.replace('_', '-')}" for name in budgets if name not in fields)
+    if unknown:
+        raise ValueError(f"{', '.join(unknown)} budget a row that {type(layout).__name__} does not lay out")
+    return dataclasses.replace(layout, **budgets)
 
 
 def _fitting(objective: DecisionObjective, weighted: dict[str, Weighted],
