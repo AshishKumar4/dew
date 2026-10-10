@@ -90,7 +90,7 @@ class DPOObjective(LMObjective):
                 "a DPO run always freezes one")
         chosen_ids, rejected_ids, chosen_mask, rejected_mask = self._halves(batch)
         # The policy and its reference score both halves in one forward each, through the same
-        # program, so a policy equal to its reference earns rewards of exactly zero, not ulps.
+        # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
         pairs = jnp.concatenate((chosen_ids, rejected_ids))
         policy = self.token_scores(variables, pairs, qk_stats=self.qk_stats)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
