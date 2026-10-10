@@ -64,15 +64,40 @@ The synchronous step on 8 containers spends 5 s on one container's 32 rows. Anot
 all-reduce, because XLA:CPU runs a combined all-reduce as one gloo ring for each of its 68 buffers: 17.8 s as that
 tuple, against 5.4 s for the same 57 MB as one buffer ([openxla/xla#50283](https://github.com/openxla/xla/issues/50283)).
 The `fsdp` shape (1.6B parameters) does not fit, because XLA:CPU keeps all 170 gathered weights live at once: 21.4 GB
-of temporaries on 12 GiB containers ([openxla/xla#50284](https://github.com/openxla/xla/issues/50284)). The `moe`
+of temporaries on 12 GiB containers ([openxla/xla#50284](https://github.com/openxla/xla/issues/50284)). Its
+breadth-first scheduler does that: with `--xla_cpu_enable_concurrency_optimized_scheduler=false` the step holds 19.5
+GB, and 17.6 GB with its layers scanned (`--scan-layers`; 18.7 GB under the default scheduler). The rest is mostly the
+gradient, which XLA:CPU all-reduces whole, 6.2 GB, where a GPU reduce-scatters it: the CPU pipeline runs no
+`ReduceScatterCreator`. Neither fits a 12 GiB container, so Dew leaves the scheduler at XLA's default. The `moe`
 and `pipe` layouts are refused across containers: each container is its own slice, and only the data and fsdp axes
 cross slices. On the GPU, `moe` reaches the loss in 13.3 s, and `fsdp` takes 0.99 s a step. A container multiplies
 float32 matrices at 540 GFLOP/s.
 
+Packing the gradient into one buffer does not help from Dew's side: a gradient raveled after the backward pass, or
+the gradient of raveled parameters, still compiles to one all-reduce of every parameter's buffer, since the
+partitioner sums each matmul's partial gradient where it is made. One flat sum needs the data axis's reduction
+written by hand, outside the partitioner.
+
+Where the processes agree on the host (a fit's first read, a log interval, a checkpoint) or share a small host value,
+each takes one round through the coordination service, with no device computation:
+
+| `gang_bench.py`'s `agreements`, median | 8 containers | 32 containers |
+|---|---|---|
+| an agreement (`agree_process_phase`), before: a barrier and a device allgather | 143 ms | 549 ms |
+| an agreement on a value (`agreed_same`), before | 674 ms | 2121 ms |
+| an agreement now, one round | 38 ms | 91 ms |
+| an agreement on a value now | 35 ms | 89 ms |
+
+Before: jobs 20261009034328-7537edca and -6c17c0b3; now: 20261009045908-dfdb460e and -4c0f670e.
+
 Accumulating gradients (`Trainer(accumulation=K)`) does not spare those sums. The accumulated gradient is placed as
 the parameters are, whole on every replica (`Trainer.shardings`), so each of the K microbatches sums its gradient
 across the replicas before it joins the window: K all-reduces where one at the update would do. Deferring the sum
-needs JAX's unreduced shardings, which JAX 0.11.2 accepts only on Explicit mesh axes, and Dew's axes are Auto.
+needs JAX's unreduced shardings. On a mesh whose axes are all Explicit, a window of three microbatches compiles to one
+all-reduce; with only the data axis Explicit, JAX 0.11.2 asserts in a matmul's transpose (fixed after the release in
+[jax-ml/jax@37cd914](https://github.com/jax-ml/jax/commit/37cd914ca1)), and Dew's layers name the data axis in their
+sharding constraints, which JAX takes only on Auto axes. Inside one compiled step XLA folds the window's sums into one;
+Dew dispatches each microbatch on its own, which keeps a partial window checkpointable.
 
 Cost, at list prices on 2026-10-08:
 

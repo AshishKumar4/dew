@@ -819,21 +819,21 @@ def test_a_rank_that_stalls_between_collectives_ends_the_pool():
 @pytest.mark.mesh(devices=2)
 def test_a_failure_stays_published_until_its_diagnostic_reaches_the_pool():
     """A second failure cannot replace the first while its diagnostic is
-    still in flight. Pause at the real diagnostic broadcast, try publishing
-    another failure, then complete the broadcast on both ranks.
+    still in flight. Pause at the agreement's round, which carries the
+    diagnostic, try publishing another failure, then complete the round on
+    both ranks.
     """
     program = ("from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
-               "import jax, numpy as np\n"
-               "from jax.experimental import multihost_utils\n"
+               "import jax\n"
                "from dew import coordination\n"
-               "broadcast = multihost_utils.broadcast_one_to_all\n"
+               "round_ = coordination._round\n"
                "replaced = []\n"
-               "def during_diagnostic(value, *args, **kwargs):\n"
-               "    if value.dtype == np.uint8 and jax.process_index() == 0:\n"
+               "def during_diagnostic(word):\n"
+               "    if jax.process_index() == 0:\n"
                "        replaced.append(coordination.publish_failure(ValueError('second'), 'transfer'))\n"
-               "    return broadcast(value, *args, **kwargs)\n"
-               "multihost_utils.broadcast_one_to_all = during_diagnostic\n"
+               "    return round_(word)\n"
+               "coordination._round = during_diagnostic\n"
                "error = ValueError('original') if jax.process_index() == 0 else None\n"
                "try:\n"
                "    coordination.agree_process_phase(error, phase='diagnostic')\n"
@@ -876,11 +876,11 @@ def test_a_rank_busy_on_its_host_before_an_agreement_leaves_the_pool_running():
 def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
     """A pool brings a tree of 25 small global leaves home. Every group size
     gives the same leaves and dtypes as one leaf a group. With the default
-    size the tree takes one transfer agreement, four in all, where one a leaf
-    took 28 round trips: a weight push of Qwen3-0.6B's 310 leaves spent 4.6 s
-    of its 6.8 s in them on 4x RTX 3090. With `held_by="first"`, process 0
-    holds the tree and process 1, which took part in every agreement, holds
-    none."""
+    size the tree takes one transfer agreement, three rounds in all with the
+    gather plan's and the reconstruction's, where one a leaf took 27: a push
+    of Qwen3-0.6B's 310 leaves once spent 4.6 s of its 6.8 s in them on 4x
+    RTX 3090. With `held_by="first"`, process 0 holds the tree and process 1,
+    which took part in every agreement, holds none."""
     program = (
         "import json\n"
         "import dew.training.runtime as runtime\n"
@@ -903,11 +903,11 @@ def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
         "tree = {name: placed(name, value) for name, value in values.items()}\n"
         "tree['host'] = np.arange(3)\n"
         "agreements = []\n"
-        "agree = coordination.agree_process_phase\n"
-        "def counted(error, *, phase, available=True):\n"
+        "agree = coordination._agree\n"
+        "def counted(phase, error, word):\n"
         "    agreements.append(phase)\n"
-        "    return agree(error, phase=phase, available=available)\n"
-        "coordination.agree_process_phase = counted\n"
+        "    return agree(phase, error, word)\n"
+        "coordination._agree = counted\n"
         "def same(got):\n"
         "    return got is not None and np.array_equal(got['host'], np.arange(3)) and all(\n"
         "        type(got[name]) is np.ndarray and got[name].dtype == value.dtype\n"
@@ -931,10 +931,10 @@ def test_a_pool_gathers_a_tree_in_groups_to_every_host_or_to_process_zero():
     reports = dict(line.split("] gathered ", 1)[1].split(" ", 1)
                    for line in done.stdout.splitlines() if "] gathered " in line)
     assert {rank: json.loads(report) for rank, report in reports.items()} == {
-        "0": {"default every": [True, 4], "default first": [True, 4],
-              "one leaf every": [True, 28], "one leaf first": [True, 28]},
-        "1": {"default every": [True, 4], "default first": [None, 4],
-              "one leaf every": [True, 28], "one leaf first": [None, 28]}}, done.stdout
+        "0": {"default every": [True, 3], "default first": [True, 3],
+              "one leaf every": [True, 27], "one leaf first": [True, 27]},
+        "1": {"default every": [True, 3], "default first": [None, 3],
+              "one leaf every": [True, 27], "one leaf first": [None, 27]}}, done.stdout
 
 
 @pytest.mark.mesh(devices=4)
@@ -1016,7 +1016,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "coordination.collective_host(tree, phase='t')\n")
     done = launch("--processes-per-host", "2", "--", sys.executable, "-c", program, devices=1, timeout=300)
     assert done.returncode != 0, done.stdout + done.stderr
-    assert "Process phase t transfer preflight failed on rank 1" in done.stdout, done.stdout
+    assert "Process phase t global array gather plan failed on rank 1" in done.stdout, done.stdout
 
 
 @pytest.mark.mesh(devices=2)

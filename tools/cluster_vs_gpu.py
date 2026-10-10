@@ -179,6 +179,9 @@ def arguments() -> argparse.Namespace:
                         help="print the step's collectives and memory, and train nothing")
     parser.add_argument("--target", type=float, help="the loss to stop at; the shape's own by default")
     parser.add_argument("--dtype", default=None, help="compute dtype; float32 on CPU, bfloat16 on a GPU")
+    parser.add_argument("--scan-layers", action="store_true",
+                        help="the decoder's layers under one scan, so a step gathers a layer's weights at a "
+                             "time")
     parser.add_argument("--diloco", type=int, metavar="H",
                         help="DiLoCo (Douillard et al. 2023): each host trains its own copy on its own "
                              "share of every global batch, and every H steps the hosts sync (`Outer`)")
@@ -214,7 +217,7 @@ def main() -> None:
     batch_size = shape["batch"] if args.batch is None else args.batch
     data = TokenWindows(path=str(tokens), seq_len=SEQ_LEN).load(batch=batch_size)
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
-                              dtype=getattr(jnp, dtype), attention_impl="auto")
+                              dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
     mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))
     trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=None),
                       optax.adamw(shape["lr"], weight_decay=0.1), key=jax.random.key(0), mesh=mesh,

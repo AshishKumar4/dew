@@ -113,6 +113,8 @@ The head is a value too. Laya's `DecisionHead` scores one question per row at it
 objective = DecisionObjective(Decide.from_pretrained("Cloudflare/clef-flash"), layout=JointLayout(max_len=2048))
 ```
 
+Every row is padded to the layout's `max_len`, which on a mix of short and long requests is most of a step's compute. `bucket=64` batches rows of like length together and cuts each batch just past its longest row, rounded up to a multiple of 64. On Dew's gold mix at `max_len=1280` that takes a step from 2.6 tokens computed per real token to 1.07. Each length compiles its own step, and the stream is read by one process. A recipe takes it as `--objective.bucket 64`.
+
 The loss is a proper scoring rule: its expected value is smallest when the forecast is the true distribution, so it rewards honest probabilities. The rules are `LogLoss`, `Brier`, `Spherical` and `RankedProbability` (for score questions, whose levels are ordered), and they can be added and scaled. `label_smoothing` spreads part of the target over every option. During training a choice's options are reshuffled every time a row is read, so the model cannot learn their positions, and `none_of_the_above=p` adds a "none of the above" option to a share of rows, half of which lose their right answer to it. The same rules, with `Accuracy`, `ECE` and `AURC`, score the validation pass.
 
 Other backbones are one line each:
