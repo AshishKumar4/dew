@@ -16,6 +16,7 @@ import contextlib
 import dataclasses
 import datetime
 import functools
+import json
 import logging
 import math
 import sys
@@ -99,6 +100,7 @@ from dew.training.distributed import (
     batch_divisor,
     batch_shardings,
     link_bandwidth,
+    placed_bytes,
     prefetched_bytes,
     shard_batch,
 )
@@ -109,6 +111,7 @@ from dew.training.memory import (
     device_tokens,
     fitting_default,
     head_tile_of,
+    memory_record,
     recompute_more,
     recompute_record,
     refuse_wide_floats,
@@ -485,7 +488,13 @@ class _Interval:
         if self.book is None or self.fresh is None:
             return
         loss, bad_run, worst_bad_run = self.book
-        streak = int(jax.device_get(worst_bad_run))
+        try:
+            streak = int(jax.device_get(worst_bad_run))
+        except jax.errors.JaxRuntimeError as error:
+            # The counters read every step's loss, so a step that failed on
+            # the devices surfaces here, under the counters' program.
+            raise RuntimeError(f"a training step before step {step} failed on the devices; JAX reports it "
+                               "at the loss counters that read its loss (jit_bookkeep)") from error
         if streak >= BAD_LOSS_STEPS:
             raise RuntimeError(
                 f"Loss has been non-finite for {streak} consecutive steps "
@@ -574,6 +583,10 @@ class Trainer(Generic[Loss, Effects]):
         self.flops_per_step = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
+        # The check that the last compiled step fits (`memory_record`), and
+        # whether a step compiled since has yet to run once.
+        self.memory: JSON = None
+        self._unproven = False
         # The links the last compiled step decided its projections by, which
         # say whether one spread over each axis (`dew.nn.sharding.Link`), and
         # each mesh axis's measured bandwidth.
@@ -1075,9 +1088,15 @@ class Trainer(Generic[Loss, Effects]):
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
             placement = batch_shardings(mesh, batch)
-            held = prefetched_bytes(batch, placement)
             prepared = jax.tree.map(
                 lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), prepared, shardings)
+            # The check reads the state's arguments as already on the devices.
+            # The copies and accumulators `run` builds on the first call are not
+            # yet, so they count with the prefetched batches beside the step.
+            held = prefetched_bytes(batch, placement) + placed_bytes(
+                [field for field, built in ((prepared.compute, state.compute),
+                                            (prepared.accumulation, state.accumulation))
+                 if built is None and field is not None])
             refusals: list[RuntimeError] = []
             consulted, record_path, key = False, None, {}
             while True:
@@ -1130,6 +1149,7 @@ class Trainer(Generic[Loss, Effects]):
             if record_path is not None:
                 keep_rung(record_path, key, self._rung())
             self.flops_per_step = compiled_flops(self.executable)
+            self.memory = memory_record(self.executable, self._local_devices(), held, fits=fits)
             self.links = links
         # The program compiled above, not the jit: a call through the jit
         # traces and compiles its own, without the step's compiler options,
@@ -1371,6 +1391,13 @@ class Trainer(Generic[Loss, Effects]):
                     interval.last_log_time = time.time()
                 with region("train.step"):
                     state, loss, aux, finite, accepted = train_step(state, batch)
+                if self._unproven:
+                    # A step's failure on the devices surfaces at the next
+                    # program that reads its outputs, the loss counters, so a
+                    # newly compiled step's first run is awaited here, where
+                    # its failure can be named.
+                    self._unproven = False
+                    self._await_first_run(loss, run.current)
                 run.loss = loss
                 assert run.train is not None
                 position = run.train.source_state
@@ -1494,6 +1521,25 @@ class Trainer(Generic[Loss, Effects]):
             batch=plan.dataset.batch, precision=precision, shown=shown,
             averaged=self.objective.ema is not None and not self.objective._ema_is_reference))
         return False
+
+    def _local_devices(self) -> list:
+        """This process's devices of the mesh, whose memory the fit check reads."""
+        process = jax.process_index()
+        return [device for device in self.device_mesh.devices.flat if device.process_index == process]
+
+    def _await_first_run(self, loss: jax.Array, step: int) -> None:
+        """Wait for a newly compiled step's first run, and raise its failure
+        on the devices as the step's, with the check that said it fits
+        (`memory_record`) and what the devices hold now."""
+        try:
+            loss.block_until_ready()
+        except jax.errors.JaxRuntimeError as error:
+            now = [{"id": device.id, **{key: value for key, value in (device.memory_stats() or {}).items()
+                                        if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
+                   for device in self._local_devices()]
+            raise RuntimeError(
+                f"the training step compiled for step {step} failed on its first run. It was checked to "
+                f"fit: {json.dumps(self.memory)}; the devices now hold {json.dumps(now)}") from error
 
     def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,
                        shardings: Placement[TrainState], position, loss: jax.Array,
@@ -2003,7 +2049,9 @@ class Trainer(Generic[Loss, Effects]):
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
-            self._report(StepCompiled(seconds, recompute_record(self.objective), links), int(state.step))
+            self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory),
+                         int(state.step))
+            self._unproven = True
         return compiled[shapes]
 
     def _saved_checkpoint(

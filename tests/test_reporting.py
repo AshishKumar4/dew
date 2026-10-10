@@ -129,6 +129,11 @@ def test_fit_records_requests_not_durability_and_leaves_tracker_borrowed(tmp_pat
                                             'FitEnded']
     # The regression model has no remat, and no rung was climbed.
     assert entries[1]['value']['remat'] is None
+    # The fit check's arithmetic is the record's too: XLA's analysis of the
+    # step, and the devices' stats, which a CPU's allocator does not report.
+    memory = entries[1]['value']['memory']
+    assert memory['analysis']['temp'] >= 0 and memory['analysis']['argument'] > 0
+    assert [device['id'] for device in memory['devices']] == [device.id for device in jax.local_devices()]
     assert entries[-1]['value']['status'] == 'completed'
 
 

@@ -664,15 +664,22 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
 PREFETCH_DEPTH = 2
 
 
+def placed_bytes(tree) -> int:
+    """The bytes a device holds of `tree`'s arrays, each laid out as its
+    sharding places it (abstract arrays carry their sharding)."""
+    return sum(math.prod(leaf.sharding.shard_shape(np.shape(leaf))) * np.dtype(leaf.dtype).itemsize
+               for leaf in jax.tree.leaves(tree))
+
+
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
     """Return the bytes a device holds of the batches `fit` places while a step runs.
 
     These are the batches next to the one the step reads: the `PREFETCH_DEPTH` it
     queues and the one it is placing, each laid out as `shardings` places `batch`.
     """
-    shares = jax.tree.map(lambda leaf, sharding: math.prod(sharding.shard_shape(np.shape(leaf)))
-                          * np.dtype(leaf.dtype).itemsize, batch, shardings)
-    return (PREFETCH_DEPTH + 1) * sum(jax.tree.leaves(shares))
+    placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                                      sharding=sharding), batch, shardings)
+    return (PREFETCH_DEPTH + 1) * placed_bytes(placed)
 
 
 class DevicePrefetchIterator:
