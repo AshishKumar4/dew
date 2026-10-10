@@ -29,12 +29,14 @@ BY-SA 4.0. Nothing non-commercial is read.
 
 import csv
 import dataclasses
+import gzip
 import hashlib
 import json
 import random
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, fields
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -56,8 +58,8 @@ def _download(repo: str, revision: str, path: str) -> str:
 def _rows(repo: str, revision: str, path: str, indices: set[int] | None = None) -> Iterator[dict]:
     """A pinned file's rows, materialising only the selected indices when supplied."""
     local = _download(repo, revision, path)
-    if path.endswith(".jsonl"):
-        with open(local) as file:
+    if path.endswith((".jsonl", ".jsonl.gz")):
+        with (gzip.open(local, "rt") if path.endswith(".gz") else open(local)) as file:
             for index, line in enumerate(file):
                 if line.strip() and (indices is None or index in indices):
                     yield json.loads(line)
@@ -93,8 +95,8 @@ def _rows(repo: str, revision: str, path: str, indices: set[int] | None = None) 
 def _count(repo: str, revision: str, path: str) -> int:
     """The pinned train file's row count, without loading its rows into memory."""
     local = _download(repo, revision, path)
-    if path.endswith((".jsonl", ".csv")):
-        with open(local, newline="") as file:
+    if path.endswith((".jsonl", ".jsonl.gz", ".csv")):
+        with (gzip.open(local, "rt") if path.endswith(".gz") else open(local, newline="")) as file:
             return sum(1 for _ in (csv.DictReader(file) if path.endswith(".csv") else file))
     import pyarrow.parquet as pq
 
@@ -151,12 +153,13 @@ class Source:
     limit: int | None = 200_000
     held: int | None = None
     seed: int = 0
+    revision: str = ""
     natural: ClassVar[bool] = True
+    """Whether the set is natural text rather than built from templates (`contamination.Overlaps`)."""
     repo: ClassVar[str] = ""
     files: ClassVar[tuple[str, ...]] = ()
     licence: ClassVar[str] = ""
     licence_url: ClassVar[str] = ""
-    """Whether the set is natural text rather than built from templates (`contamination.Overlaps`)."""
 
     def examples(self) -> list[Example]:
         """The seeded, capped training candidates, with room for the held-out split."""
@@ -601,6 +604,164 @@ class ISarcasm(Source):
         path = _github("iabufarha/iSarcasmEval", self.revision, "train/train.En.csv")
         with path.open(encoding="utf-8-sig", newline="") as file:
             return [self.example(row) for row in csv.DictReader(file)]
+
+
+@dataclass(frozen=True)
+class Sgd(Source):
+    """SGD (google-research-datasets/dstc8-schema-guided-dialogue, CC-BY-SA-4.0), DI user frames."""
+
+    weight: float = 1.0
+    revision: str = "e852981ae34990f4358979625854259302feaa78"
+    repo: ClassVar[str] = "google-research-datasets/dstc8-schema-guided-dialogue"
+    licence: ClassVar[str] = "CC-BY-SA-4.0"
+
+    def dialogues(self) -> Iterator[dict]:
+        """The 127 pinned training shards, never the dev or test dialogues."""
+        for index in range(1, 128):
+            yield from json.loads(_github(self.repo, self.revision, f"train/dialogues_{index:03}.json").read_text())
+
+    @staticmethod
+    def frames(dialogue: dict, schemas: dict) -> Iterator[dict]:
+        """DI's current-user-frame state; later turns and all state labels stay out of it."""
+        history = []
+        for turn in dialogue["turns"]:
+            history.append({"speaker": turn["speaker"], "utterance": turn["utterance"]})
+            if turn["speaker"] == "USER":
+                for frame in turn["frames"]:
+                    schema = schemas[frame["service"]]
+                    yield {"history": list(history), "service": frame["service"], "schema": schema,
+                           "gold": frame["state"].get("active_intent", "NONE")}
+
+    def convert(self, row: dict) -> Example:
+        intents = [item["name"] for item in row["schema"]["intents"]] + ["NONE"]
+        question = Choice("Using the dialogue history and service schema in state, choose the active intent "
+                          "for this service. Choose NONE when no service intent is active. Do not use future "
+                          "turns or hidden labels.", {name: name for name in intents})
+        state = {key: row[key] for key in ("history", "service", "schema")}
+        return Example({**state, "task": "SGD current-service intent"}, {"intent": question}, {"intent": row["gold"]})
+
+    def count(self) -> int:
+        return sum(len(turn["frames"]) for dialogue in self.dialogues() for turn in dialogue["turns"]
+                   if turn["speaker"] == "USER")
+
+    def examples(self) -> list[Example]:
+        schemas = {item["service_name"]: item for item in
+                   json.loads(_github(self.repo, self.revision, "train/schema.json").read_text())}
+        selected = _draw(self.count(), self.limit, self.held, self.seed)
+        rows = (row for dialogue in self.dialogues() for row in self.frames(dialogue, schemas))
+        return [self.convert(row) for index, row in enumerate(rows) if selected is None or index in selected]
+
+
+def _evidence_database() -> Path:
+    """DI's HotpotQA Wikipedia database, accepted only at its pinned SHA-256."""
+    import shutil
+    import urllib.request
+
+    from huggingface_hub import cached_assets_path
+
+    digest = "c37ee397916ec0bffacfe8902db454a5cda88a7a188409217b2e15231fe5ee2f"
+    path = cached_assets_path(library_name="dew", namespace="hover", subfolder=digest) / "wiki_wo_links.db"
+    if not path.is_file():
+        partial = path.with_suffix(".partial")
+        with (urllib.request.urlopen("https://nlp.cs.unc.edu/data/hover/wiki_wo_links.db", timeout=300) as source,
+              partial.open("wb") as target):
+            shutil.copyfileobj(source, target)
+        with partial.open("rb") as file:
+            if hashlib.file_digest(file, "sha256").hexdigest() != digest:
+                raise ValueError("HoVer evidence database does not match DI's pinned SHA-256")
+        partial.replace(path)
+    with path.open("rb") as file:
+        if hashlib.file_digest(file, "sha256").hexdigest() != digest:
+            raise ValueError("HoVer evidence database does not match DI's pinned SHA-256")
+    return path
+
+
+@dataclass(frozen=True)
+class Hover(Source):
+    """HoVer (hover-nlp/hover, MIT; Wikipedia evidence CC-BY-SA-4.0), in DI's evidence-backed shape."""
+
+    weight: float = 1.0
+    revision: str = "39b84697f196308f398a251a7aea9b82ae0f0562"
+    repo: ClassVar[str] = "hover-nlp/hover"
+    licence: ClassVar[str] = "MIT AND CC-BY-SA-4.0"
+
+    def claims(self) -> list[dict]:
+        return json.loads(_github(self.repo, self.revision, "data/hover/hover_train_release_v1.1.json").read_text())
+
+    def convert(self, row: dict) -> Example:
+        question = Choice("Is the claim supported by the evidence?",
+                          {"SUPPORTED": "The evidence supports the claim.",
+                           "NOT_SUPPORTED": "The evidence does not support the claim."})
+        return Example({"claim": row["claim"], "evidence": row["evidence"]}, {"q": question}, {"q": row["label"]})
+
+    def examples(self) -> list[Example]:
+        import sqlite3
+        import unicodedata
+
+        claims = self.claims()
+        selected = _draw(len(claims), self.limit, self.held, self.seed)
+        db = sqlite3.connect(f"file:{_evidence_database()}?mode=ro", uri=True)
+        examples = []
+        try:
+            for index, row in enumerate(claims):
+                if selected is not None and index not in selected:
+                    continue
+                evidence = []
+                for title in dict.fromkeys(title for title, _ in row["supporting_facts"]):
+                    found = db.execute("SELECT text FROM documents WHERE id=?",
+                                       (unicodedata.normalize("NFD", title),)).fetchall()
+                    if len(found) != 1:
+                        raise ValueError(f"HoVer needs exactly one article for {title!r}")
+                    evidence.append({"title": title, "text": found[0][0]})
+                examples.append(self.convert({**row, "evidence": evidence}))
+        finally:
+            db.close()
+        return examples
+
+
+@dataclass(frozen=True)
+class ContractNli(Source):
+    """ContractNLI (stanfordnlp/contract-nli, CC-BY-4.0), DI's 17 hypothesis questions per contract."""
+
+    weight: float = 1.0
+    revision: str = "eced6528dd3c1d14d73f9a87df8f7bdbc03126f9"
+    repo: ClassVar[str] = "stanfordnlp/contract-nli"
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def data(self) -> dict:
+        import zipfile
+
+        with zipfile.ZipFile(_github(self.repo, self.revision, "resources/contract-nli.zip")) as archive:
+            return json.loads(archive.read("contract-nli/train.json"))
+
+    def convert(self, row: dict) -> Example:
+        criteria = {"Entailment": "The contract entails the hypothesis.",
+                    "Contradiction": "The contract contradicts the hypothesis.",
+                    "NotMentioned": "The hypothesis is neither entailed nor contradicted by the contract."}
+        questions = {key: Choice("Classify the relationship between the contract and this hypothesis:\n" +
+                                 label["hypothesis"], criteria) for key, label in row["labels"].items()}
+        answers = {key: value["choice"] for key, value in row["annotation_sets"][0]["annotations"].items()}
+        return Example(row["text"], questions, answers)
+
+    def examples(self) -> list[Example]:
+        data = self.data()
+        return [self.convert({**doc, "labels": data["labels"]}) for doc in data["documents"]]
+
+
+@dataclass(frozen=True)
+class WinoGrande(Source):
+    """WinoGrande XL (allenai/winogrande, Apache-2.0), DI's native A/B blank-filling question."""
+
+    weight: float = 1.0
+    revision: str = "01e74176c63542e6b0bcb004dcdea22d94fb67b5"
+    repo: ClassVar[str] = "allenai/winogrande"
+    files: ClassVar[tuple[str, ...]] = ("winogrande_xl/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+
+    def convert(self, row: dict) -> Example:
+        question = Choice("Which option correctly fills the blank?\n" + row["sentence"],
+                          {"A": row["option1"], "B": row["option2"]})
+        return Example({}, {"q1": question}, {"q1": "AB"[int(row["answer"]) - 1]})
 
 
 @dataclass(frozen=True)
