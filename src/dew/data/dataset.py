@@ -36,7 +36,7 @@ import threading
 import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
 
 import grain.python as pygrain
 import jax
@@ -58,6 +58,8 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from torch.utils.data import Dataset as TorchDataset
+
+    from dew.data.plan import Plan
 
 
 # grain's worker processes read absl flags; a script that never runs absl.app
@@ -1235,9 +1237,11 @@ class _Grouped(pygrain.MapDataset[Batch]):
 
     _MUTATES_ELEMENT_SPEC = False
 
-    def __init__(self, parent: pygrain.MapDataset[Batch], groups: LengthGroups, rows: int, seed: int):
+    def __init__(self, parent: pygrain.MapDataset[Batch], groups: LengthGroups, rows: int, seed: int,
+                 length_at: Callable[[int], int] | None = None):
         super().__init__(parent)
         self._groups, self._rows, self._seed = groups, rows, seed
+        self._length_at = length_at
         self._span = rows * groups.window
         self._orders: dict[int, np.ndarray] = {}
         self._lock = threading.Lock()
@@ -1278,10 +1282,12 @@ class _Grouped(pygrain.MapDataset[Batch]):
 
     def _ordered(self, start: int) -> np.ndarray:
         size = min(self._span, len(self._parent) - start)
-        records = [self._parent[start + offset] for offset in range(size)]
-        # A record the parent filtered out reads as None and is skipped wherever it lands.
-        ranked = np.argsort([0 if record is None else self._groups.length(record) for record in records],
-                            kind="stable")
+        if self._length_at is not None:
+            lengths = [self._length_at(start + offset) for offset in range(size)]
+        else:
+            records = [self._parent[start + offset] for offset in range(size)]
+            lengths = [0 if record is None else self._groups.length(record) for record in records]
+        ranked = np.argsort(lengths, kind="stable")
         batches = [ranked[first:first + self._rows] for first in range(0, size, self._rows)]
         shuffled = np.random.default_rng([self._seed, start]).permutation(len(batches))
         return np.concatenate([batches[index] for index in shuffled])
@@ -1431,7 +1437,8 @@ class GlobalStream:
     endless = True
 
     def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
-                 batch: int, order: str, loading: Loading, content: Callable[[], str] | None = None):
+                 batch: int, order: str, loading: Loading, content: Callable[[], str] | None = None,
+                 *, plan: Plan | None = None, resume: Literal["exact", "non-exact"] = "exact"):
         self._open = open_at
         self._batch = batch
         self._order = order
@@ -1439,6 +1446,8 @@ class GlobalStream:
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
+        self._plan, self._resume = plan, resume
+        self.manifest_changes: tuple[str, ...] = ()
         self.stop_seconds = loading.stop_seconds
 
     def __iter__(self) -> Iterator[Batch]:
@@ -1454,7 +1463,8 @@ class GlobalStream:
         return batch
 
     def get_state(self) -> bytes:
-        return position.encode(position.Global(records=self._records, order=self._order))
+        return position.encode(position.Global(records=self._records, order=self._order,
+                                                plan=None if self._plan is None else self._plan.record()))
 
     @property
     def order(self) -> str:
@@ -1472,6 +1482,8 @@ class GlobalStream:
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
+        if self._plan is not None and saved.plan is not None:
+            self.manifest_changes = self._plan.check(saved.plan, resume=self._resume)
         if saved.completed:
             raise ValueError(
                 f"the saved data position is {saved.records} records into a phased run "
