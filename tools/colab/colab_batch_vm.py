@@ -272,6 +272,7 @@ class Batch:
             colab_sync.restore(packed, tree, job["outputs"])
             packed.unlink()
         from tools.colab.credentials import environment as private_environment
+
         env = {**environment(venv), **compilation_cache(job, tree, venv), **private_environment(job)}
         # One venv per commit, but every job imports its own checked-out tree.
         env["PYTHONPATH"] = str(tree / "src")

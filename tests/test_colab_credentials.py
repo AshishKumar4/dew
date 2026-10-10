@@ -45,7 +45,11 @@ def test_wandb_key_never_appears_in_logs_results_or_manifests(tmp_path, capsys, 
         join_parts(tmp_path, ["vm-part"], tmp_path / "vm-key", hashlib.sha256(key.encode()).hexdigest())
         job["secret_env"]["WANDB_API_KEY"] = str(tmp_path / "vm-key")
         env = credentials.environment(job)
-        assert env == {"WANDB_API_KEY": key, "WANDB_ENTITY": "fixture-team", "WANDB_PROJECT": "fixture-project"}
+        assert env == {
+            "WANDB_API_KEY": key,
+            "WANDB_ENTITY": "fixture-team",
+            "WANDB_PROJECT": "fixture-project",
+        }
         assert credentials.environment(plan["jobs"][1]) == {}
         assert (tmp_path / "vm-key").stat().st_mode & 0o777 == 0o600
     save(tmp_path / "result.json", {"exit": int(failed), "credential_status": "private file"})
@@ -60,8 +64,9 @@ def test_missing_netrc_entry_fails_without_partial_secret_file(tmp_path):
     netrc_file = tmp_path / "netrc"
     netrc_file.write_text("machine unrelated login user password irrelevant\n")
     with pytest.raises(ValueError, match=r"api\.wandb\.ai"):
-        credentials.stage_wandb({"uploads": {}, "jobs": [{"wandb": True}]}, tmp_path,
-                               netrc_file, tmp_path / "missing-config")
+        credentials.stage_wandb(
+            {"uploads": {}, "jobs": [{"wandb": True}]}, tmp_path, netrc_file, tmp_path / "missing-config"
+        )
     assert not (tmp_path / "private-wandb.part").exists()
 
 
@@ -99,8 +104,15 @@ def test_opted_job_requires_entity_and_project_from_local_config(tmp_path):
 
 
 def test_opt_in_change_is_part_of_reuse_identity():
-    job = {"commit": "sha", "command": "run", "outputs": [], "artifact_policy": "all",
-           "ref": "sha", "compile_cache": "off", "wandb": False}
+    job = {
+        "commit": "sha",
+        "command": "run",
+        "outputs": [],
+        "artifact_policy": "all",
+        "ref": "sha",
+        "compile_cache": "off",
+        "wandb": False,
+    }
     first = {"driver_sha": "driver", "base": "sha", "hardware": "gpu:T4", "jobs": [job]}
     second = {**first, "jobs": [{**job, "wandb": True}]}
     with pytest.raises(ValueError, match="identity"):
@@ -119,8 +131,17 @@ def test_owner_only_input_files_get_private_transport(tmp_path):
     source.chmod(0o600)
     work = tmp_path / "work"
     work.mkdir()
-    plan = {"uploads": {}, "jobs": [{"index": 1, "artifact_policy": "measurements", "resume_key": "none",
-             "entry": {"fields": {"inputs": f"{source} to /content/private", "command": "run"}}}]}
+    plan = {
+        "uploads": {},
+        "jobs": [
+            {
+                "index": 1,
+                "artifact_policy": "measurements",
+                "resume_key": "none",
+                "entry": {"fields": {"inputs": f"{source} to /content/private", "command": "run"}},
+            }
+        ],
+    }
     colab_batch.stage_inputs(plan, work)
     assert plan["uploads"]["/content/private/credential"]["private"]
     assert plan["private_parts"] == plan["uploads"]["/content/private/credential"]["parts"]
