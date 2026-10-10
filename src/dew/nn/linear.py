@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.kernels import delta_chunks, delta_output, delta_rule
+from dew.nn.kernels import delta_chunks, delta_output, delta_prep, delta_rule
 from dew.nn.scatter import DROPPED
 
 from .attention import FORWARD_MODE, unweighted_rmsnorm
@@ -422,27 +422,33 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
         moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
         return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
 
-    q_c, k_c = chunks(query), chunks(key)
-    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
-    recurrence = chunk_states_kernel(implementation, k_c, vb_c, chunks(g))
-    output_kernel = chunk_output_kernel(implementation, recurrence, k_c, vb_c)
+    q_c, k_c, v_c = chunks(query), chunks(key), chunks(value)
+    recurrence = chunk_states_kernel(implementation, k_c, v_c, chunks(g))
+    output_kernel = chunk_output_kernel(implementation, recurrence, k_c, v_c)
+    prep_kernel = chunk_prep_kernel(implementation, recurrence, k_c, v_c)
     # The log decay cumulated within each chunk, the reference's
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
     # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
     # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    if output_kernel == 'pallas':
+    if output_kernel == 'pallas' or prep_kernel == 'pallas':
         gc, lo = chunk_decay(chunks(g), halves=True)
-        decay = _chunk_pairwise_decay(gc, lo)
+        if output_kernel != 'pallas' or prep_kernel != 'pallas':
+            decay = _chunk_pairwise_decay(gc, lo)
     else:
         gc, decay = chunk_decay(chunks(g))
-    # The mask is strictly lower (tril, -1): the reference's masked_fill
-    # zeroes the diagonal too.
-    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-    attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
-    # The reference's `attn + I` operator after its row correction loop.
-    inv = strictly_lower_inverse(attn)
-    out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
-    k_cumdecay = inv @ (kb_c * jnp.exp(gc))
+    if prep_kernel == 'pallas':
+        k_cumdecay, out_vals = delta_prep.chunk_prep(k_c, v_c, chunks(beta), gc[..., 0], lo[..., 0],
+                                                   not triton_runs())
+    else:
+        kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+        # The mask is strictly lower (tril, -1): the reference's masked_fill
+        # zeroes the diagonal too.
+        strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
+        attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
+        # The reference's `attn + I` operator after its row correction loop.
+        inv = strictly_lower_inverse(attn)
+        out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
+        k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
     state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
@@ -479,6 +485,18 @@ def chunk_output_kernel(implementation: str, recurrence: str, key, value) -> str
     refusal = first_refusal((recurrence == 'pallas', "the rule's recurrence does not run on Pallas"))
     refusal = refusal or delta_output.refusal(key, value)
     return 'pallas' if refusal is None else ran_kernel('gated_delta_output', 'xla', refusal)
+
+
+def chunk_prep_kernel(implementation: str, recurrence: str, key, value) -> str:
+    """The fused in-chunk correction, explicitly requested until measured.
+    Its shapes inherit the recurrence's bounds; the extra refusals keep the
+    inverse and its products within one program's on-chip storage."""
+    chosen = measured_kernel('gated_delta_prep', 'xla') if implementation == 'auto' else implementation
+    if chosen != 'pallas':
+        return chosen
+    refusal = first_refusal((recurrence == 'pallas', "the rule's recurrence does not run on Pallas"))
+    refusal = refusal or delta_prep.refusal(key, value)
+    return 'pallas' if refusal is None else ran_kernel('gated_delta_prep', 'xla', refusal)
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
