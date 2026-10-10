@@ -32,6 +32,13 @@ die() {
 	printf '%serror:%s %s\n' "$red" "$plain" "$1" >&2
 	exit 1
 }
+# A word as a shell would read it back: as it is when it is plain, else in single quotes.
+quote() {
+	case $1 in
+		'' | *[!A-Za-z0-9_./=:@%+,-]*) printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")" ;;
+		*) printf '%s' "$1" ;;
+	esac
+}
 
 yes=${DEW_YES:-} build='' target='' conda_name='' version='' use_pip=''
 while [ $# -gt 0 ]; do
@@ -74,12 +81,13 @@ if [ -n "$gpus" ]; then
 	[ "$count" -eq 1 ] || gpu="$count × $gpu"
 	driver=$(printf '%s\n' "$gpus" | head -n 1 | cut -d, -f2 | tr -d ' ')
 	sm=$(printf '%s\n' "$gpus" | cut -s -d, -f3 | tr -d ' ' | sort -n | head -n 1)
-	at_least() { awk -v sm="$sm" -v need="$1" 'BEGIN { exit !(sm == "" || sm + 0 >= need) }'; }
+	at_least() { awk -v sm="$sm" -v need="$1" 'BEGIN { exit !(sm + 0 >= need) }'; }
 	major=${driver%%.*}
-	if [ "$major" -ge 580 ] && at_least 7.5; then runs=cuda13
-	elif [ "$major" -ge 525 ] && at_least 5.2; then runs=cuda12
-	elif [ "$major" -ge 525 ]; then runs=cpu why="SM $sm is older than JAX's CUDA builds support"
-	else runs=cpu why="CUDA 12 needs driver 525 or newer; update the driver to use the GPU"
+	if [ "$major" -lt 525 ]; then runs=cpu why="CUDA 12 needs driver 525 or newer; update the driver to use the GPU"
+	elif [ -z "$sm" ]; then runs=cpu why="nvidia-smi did not report its compute capability; choose with --cuda 12 or 13"
+	elif [ "$major" -ge 580 ] && at_least 7.5; then runs=cuda13
+	elif at_least 5.2; then runs=cuda12
+	else runs=cpu why="SM $sm is older than JAX's CUDA builds support"
 	fi
 	if [ "$runs" = cpu ]; then hardware="$gpu, driver $driver: no GPU build, as $why"
 	else hardware="$gpu, driver $driver, runs CUDA ${runs#cuda}"
@@ -98,9 +106,9 @@ fi
 # The Python environment.
 conda=
 command -v conda >/dev/null 2>&1 && conda=1
-if [ -n "${VIRTUAL_ENV:-}" ]; then found="the virtual environment $VIRTUAL_ENV"
-elif [ -n "${CONDA_PREFIX:-}" ] && [ "${CONDA_DEFAULT_ENV:-base}" != base ]; then found="the conda environment $CONDA_DEFAULT_ENV"
-else found=
+if [ -n "${VIRTUAL_ENV:-}" ]; then found="the virtual environment $VIRTUAL_ENV" active=$VIRTUAL_ENV
+elif [ -n "${CONDA_PREFIX:-}" ]; then found="the conda environment ${CONDA_DEFAULT_ENV:-$CONDA_PREFIX}" active=$CONDA_PREFIX
+else found='' active=''
 fi
 
 printf '%sDew installer%s\n' "$bold" "$plain"
@@ -122,7 +130,7 @@ if [ -z "$target" ] && [ -z "$conda_name" ]; then
 	option "another path"; other=$n
 	answer "Choose" 1
 	case $reply in
-		"$here") if [ -n "${VIRTUAL_ENV:-}" ]; then target=$VIRTUAL_ENV; else conda_name=$CONDA_DEFAULT_ENV; fi ;;
+		"$here") target=$active ;;
 		"$venv") target=.venv ;;
 		"$in_conda") answer "Conda environment" dew; conda_name=$reply ;;
 		"$other") answer "Path of the environment" .venv; target=$reply ;;
@@ -134,24 +142,33 @@ fi
 if [ -z "$use_pip" ] && ! command -v uv >/dev/null 2>&1; then
 	curl -LsSf https://astral.sh/uv/install.sh | sh ||
 		die "uv's installer failed; install uv from https://docs.astral.sh/uv, or rerun with --pip"
-	PATH="${XDG_BIN_HOME:-$HOME/.local/bin}:$HOME/.cargo/bin:$PATH"
+	# Where uv's installer puts it (https://docs.astral.sh/uv/reference/storage/#executable-directory).
+	bin=${UV_INSTALL_DIR:-${UV_UNMANAGED_INSTALL:-${XDG_BIN_HOME:-${XDG_DATA_HOME:+$XDG_DATA_HOME/../bin}}}}
+	PATH="${bin:-$HOME/.local/bin}:${bin:+$bin/bin:}$PATH"
 	command -v uv >/dev/null 2>&1 || die "uv is installed but not on PATH; open a new shell and rerun"
 fi
 
 # The environment's Python, made if it does not exist yet.
 if [ -n "$conda_name" ]; then
 	[ -n "$conda" ] || die "conda is not installed"
-	prefix() { conda env list | awk -v name="$conda_name" '$1 == name { print $NF }'; }
-	[ -n "$(prefix)" ] || conda create -y -q -n "$conda_name" 'python>=3.12' >/dev/null ||
-		die "conda could not create the environment $conda_name"
-	python=$(prefix)/bin/python activate="conda activate $conda_name"
+	# shellcheck disable=SC2016 # the environment's prefix, as conda run sets it inside
+	prefix() { conda run -n "$conda_name" sh -c 'printf %s "$CONDA_PREFIX"' 2>/dev/null; }
+	where=$(prefix) || {
+		conda create -y -q -n "$conda_name" 'python>=3.12' >/dev/null || die "conda could not create the environment $conda_name"
+		where=$(prefix) || die "conda made $conda_name but cannot run in it"
+	}
+	# The environment's own Python: never one conda run finds on PATH outside it.
+	[ -x "$where/bin/python" ] || conda install -y -q -n "$conda_name" 'python>=3.12' >/dev/null ||
+		die "the conda environment $conda_name has no Python, and conda could not add one"
+	python=$where/bin/python activate="conda activate $(quote "$conda_name")"
 else
 	if [ ! -x "$target/bin/python" ]; then
 		if [ -z "$use_pip" ]; then uv venv -q --python '>=3.12' "$target" || die "uv could not create $target"
 		else python3 -m venv "$target" || die "python3 could not create $target"
 		fi
 	fi
-	python=$target/bin/python activate=". $target/bin/activate"
+	python=$target/bin/python activate=". $(quote "$target/bin/activate")"
+	if [ "$target" = "${CONDA_PREFIX:-}" ]; then activate="conda activate $(quote "${CONDA_DEFAULT_ENV:-$CONDA_PREFIX}")"; fi
 fi
 "$python" -c 'import sys; sys.exit(sys.version_info < (3, 12))' || die "$python is Python \
 $("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'); Dew needs 3.12 or newer, so choose a new .venv or upgrade it"
@@ -162,20 +179,29 @@ if [ -n "$use_pip" ] && ! "$python" -m pip --version >/dev/null 2>&1; then
 fi
 
 # The install, shown and then run.
-extra=
+extra=''
 [ "$build" = cpu ] || extra="[$build]"
 package="dewml$extra${version:+==$version}"
 if [ -n "$use_pip" ]; then set -- "$python" -m pip install "$package"
 else set -- uv pip install --python "$python" "$package"
 fi
-printf '%s$ %s%s\n' "$dim" "$*" "$plain"
+shown=''
+for word in "$@"; do shown="$shown${shown:+ }$(quote "$word")"; done
+printf '%s$ %s%s\n' "$dim" "$shown" "$plain"
 "$@" || die "the install failed; the lines above say why"
 
-# What is installed, and how to use it.
-installed=$("$python" -c 'import importlib.metadata as m, jax
-print(m.version("dewml"), "with jax", jax.__version__, "on", jax.default_backend())' 2>/dev/null) ||
-	die "dewml is installed but does not import; see why with: $python -c 'import dew'"
+# What is installed, and how to use it. Dew refuses the CPU build beside an NVIDIA GPU unless JAX is told
+# to use the CPU (docs/installation.md, Which CUDA build).
+cpu=''
+if [ "$build" = cpu ] && [ -n "$gpus" ]; then cpu='JAX_PLATFORMS=cpu '; export JAX_PLATFORMS=cpu; fi
+report=$("$python" -c 'import importlib.metadata as m, jax, dew
+print(m.version("dewml"), "with jax", jax.__version__, "on", jax.default_backend())' 2>&1) || {
+	printf '%s\n' "$report" >&2
+	die "dewml is installed, but Dew or JAX's backend failed to start; the error is above"
+}
+installed=$(printf '%s\n' "$report" | tail -n 1)
 printf '\n%s✓ dewml %s%s\n' "$green" "$installed" "$plain"
-printf '  check     %s -c "import jax; print(jax.devices())"\n' "$python"
+printf '  check     %s%s -c "import jax; print(jax.devices())"\n' "$cpu" "$(quote "$python")"
+[ -z "$cpu" ] || activate="$activate; export JAX_PLATFORMS=cpu  # Dew stops when JAX leaves a GPU unused"
 printf '  activate  %s\n' "$activate"
 case $build in cuda*) case $installed in *" on cpu") printf '%sJAX sees no GPU: check that nvidia-smi lists it%s\n' "$red" "$plain" ;; esac ;; esac
