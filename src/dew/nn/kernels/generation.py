@@ -70,7 +70,7 @@ KERNELS: dict[str, dict[str, str]] = {
     # The chunked gated delta rule's memory across chunks (delta_chunks) and in-chunk correction
     # (delta_prep). At Qwen3.5-9B's widths on an A100, fused prep cut the rule's forward and backward
     # from 9.09 to 8.17 ms and a GatedDeltaNet layer's from 15.15 to 13.70. The output stays XLA;
-    # its fused backward lost at every tile. Whole-rule float64 RMS ratios at most 1.32 (c46).
+    # its fused backward lost at every tile. Whole-rule float64 RMS ratios at most 1.324 (c46).
     'gated_delta_rule': {'sm80': 'pallas'},
     # The forward reads bf16 copies of the fp32 weights (dew.training.narrow): Qwen3-0.6B at 1 x 1024
     # runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4 against 125.9 on an A100. A

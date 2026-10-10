@@ -1271,7 +1271,7 @@ for the mixer, so the output kernel was removed. The choice stays the
 single `KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}`: recurrence and
 prep together, every other generation unmeasured. Against float64, the
 whole rule's output and gradients had RMS ratios at most 1.002 at default
-precision and 1.32 at highest, and repeated bit for bit. KDA stays XLA.
+precision and 1.324 at highest, and repeated bit for bit. KDA stays XLA.
 
 This session also tested the recurrence-only `u` discrepancy above.
 Moving its two exp factors to XLA left every output and gradient's RMS
