@@ -93,6 +93,26 @@ def _drain() -> None:
     jax.effects_barrier()
 
 
+COMMAND_BUFFERS = (
+    "no device time is attributed to HLO ops (reports/hlo_stats.json): kernels in a CUDA command "
+    "buffer recorded before the capture started stay under their module. Profile with "
+    "XLA_FLAGS=--xla_gpu_enable_command_buffer= for op-level reports, and time runs without it")
+
+
+def _attributes_ops(reports: Path) -> bool | None:
+    """Whether XProf's hlo_stats names any HLO op, rather than only whole modules
+    (`XlaModule`), as it does for kernels a command buffer recorded before the
+    capture runs; None where it has no hlo_op_name column to tell by."""
+    path = reports / "hlo_stats.json"
+    tables = json.loads(path.read_text()) if path.exists() else []
+    table: dict = (tables[0] if tables else {}) if isinstance(tables, list) else tables
+    columns = [column.get("id") for column in table.get("cols", [])]
+    if "hlo_op_name" not in columns:
+        return None
+    name = columns.index("hlo_op_name")
+    return any(not str(row["c"][name].get("v", "")).startswith("XlaModule") for row in table.get("rows", []))
+
+
 def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) -> None:
     paths = sorted(directory.glob("plugins/profile/*/*.xplane.pb"))
     failures: list[Exception] = []
@@ -154,6 +174,12 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
                 except Exception as error:
                     record.update(status="error", error=str(error))
                     failures.append(error)
+    attributed = _attributes_ops(reports) if metadata.get("backend") == "gpu" else True
+    if attributed is None:
+        metadata["op_attribution"] = "unknown: hlo_stats has no hlo_op_name column"
+    elif not attributed:
+        metadata["op_attribution"] = COMMAND_BUFFERS
+        _logger.warning("Profile %s: %s", directory, COMMAND_BUFFERS)
     written: list[JSON] = [str(path.relative_to(directory))
                            for path in sorted(directory.rglob("*")) if path.is_file()]
     metadata["artifacts"] = written
@@ -182,6 +208,15 @@ class Profiler:
     A long-lived process that has compiled many other programs pays for each
     of them, so there pass `options` with `enable_hlo_proto` off when the
     trace and kernel reports are enough.
+
+    On a GPU the reports also come out empty for work that already ran before
+    the capture: XLA records its kernels into CUDA command buffers on the
+    first run, and a recorded buffer's kernels are attributed to their
+    module, not their ops. The manifest's `op_attribution` then says so and a
+    warning names the fix, profiling with
+    `XLA_FLAGS=--xla_gpu_enable_command_buffer=`; time runs without that
+    flag, since launching kernels one by one costs time. Where hlo_stats has
+    no column naming the ops, `op_attribution` records that it could not tell.
     """
 
     def __init__(self, directory: str | os.PathLike[str] | None = None, *,
