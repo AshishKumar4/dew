@@ -4,12 +4,14 @@
 #
 # A tag flash-attn-v<version> releases them: the build checks that the tag is
 # the version kernels/flash_attn/pyproject.toml carries and that both wheels
-# pass twine's checks, and the publish job uploads those same wheels to PyPI
-# as dew-flash-attn-cu12 and dew-flash-attn-cu13. Trusted publishing: PyPI
-# accepts this workflow's short-lived OIDC token, so the repository holds no
-# PyPI secret. Each of the two PyPI projects names this repository, this
-# workflow file and the `pypi` environment as its publisher. Only the publish
-# job can mint the token, and it runs no code from the repository.
+# pass twine's checks, and one publish job per CUDA major uploads that major's
+# wheel to PyPI, the cu12 one as dew-flash-attn-cu12 and the cu13 one as
+# dew-flash-attn-cu13. Trusted publishing: PyPI accepts this workflow's
+# short-lived OIDC token, so the repository holds no PyPI secret. PyPI takes
+# one pending publisher per (repository, workflow, environment), so each
+# project names this repository, this workflow file and its own environment:
+# `pypi` for cu12 and `pypi-cu13` for cu13. Only the publish jobs can mint the
+# token, and they run no code from the repository.
 
 name: FlashAttention wheels
 
@@ -66,16 +68,30 @@ jobs:
     needs: wheel
     if: startsWith(github.ref, 'refs/tags/flash-attn-v')
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+        - cuda: "12.9.1"
+          environment: pypi
+          project: dew-flash-attn-cu12
+        - cuda: "13.0.0"
+          environment: pypi-cu13
+          project: dew-flash-attn-cu13
     environment:
-      name: pypi
-      url: https://pypi.org/p/dew-flash-attn-cu12
+      name: ${{ matrix.environment }}
+      url: https://pypi.org/p/${{ matrix.project }}
     permissions:
       id-token: write
     steps:
     - uses: actions/download-artifact@v4
       with:
-        pattern: dew-flash-attn-cuda*
-        merge-multiple: true
+        name: dew-flash-attn-cuda${{ matrix.cuda }}
         path: dist/
+    - name: The wheel is this project's
+      # The CUDA major's build names its wheel after its project, which PyPI refuses under another's publisher.
+      run: |
+        ls dist/
+        test "$(ls dist/ | wc -l)" = 1
+        ls dist/ | grep -q "^$(echo '${{ matrix.project }}' | tr - _)-"
     - name: Publish
       uses: pypa/gh-action-pypi-publish@release/v1
