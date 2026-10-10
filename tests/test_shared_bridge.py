@@ -296,7 +296,8 @@ def test_tutorials_offer_run_live_only_with_the_modules_the_live_context_stands_
     import re
 
     site = ROOT.parents[1]
-    offered = re.search(r"LIVE_MODULES = new Set\(\[(.*?)\]\)", (site / "scripts/render-notebooks.mjs").read_text())
+    renderer = (site / "scripts/render-notebooks.mjs").read_text()
+    offered = re.search(r"LIVE_MODULES = new Set\(\[(.*?)\]\)", renderer)
     served = re.search(r"sys\.modules\.update\(\{(.*?)\}\)", (ROOT / "model_client.py").read_text())
     assert offered and served
     assert set(re.findall(r"'(dew[\w.]*)'", offered[1])) == set(re.findall(r'"(dew\.[\w.]+)":', served[1]))
