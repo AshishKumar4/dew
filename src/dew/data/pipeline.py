@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import math
 from collections.abc import Callable, Sequence
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -28,6 +28,7 @@ type RandomStep = pygrain.RandomMapTransform | Callable[[Batch, np.random.Genera
 type HostStep = Callable[[Batch], Batch] | pygrain.MapTransform
 
 
+@runtime_checkable
 class Expansion(Protocol):
     def flat_map(self, element: Batch) -> Sequence[Batch | Rejected]: ...
 
@@ -246,8 +247,8 @@ class Pipeline:
 
 @dataclasses.dataclass(frozen=True)
 class ObjectiveData:
-    train: tuple[RecordStep | RandomStep, ...] = ()
-    evaluate: tuple[RecordStep, ...] = ()
+    train: tuple[RecordStep | RandomStep | Expansion, ...] = ()
+    evaluate: tuple[RecordStep | Expansion, ...] = ()
     group: LengthGroups | None = None
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()

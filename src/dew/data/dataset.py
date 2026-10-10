@@ -31,11 +31,13 @@ import itertools
 import json
 import logging
 import math
+import os
 import sys
 import threading
 import typing
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
 
 import grain.python as pygrain
@@ -421,10 +423,43 @@ class Loading:
     0.1 s and 0.23 GiB with none.
     """
 
-    workers: int = 0
+    workers: int | Literal["auto"] = 0
     threads: int = 64
     read_buffer: int = 128
     worker_buffer: int = 2
+    ram_budget_mb: int | None = None
+    max_workers: int | None = None
+
+    def resolved(self, records: pygrain.IterDataset) -> Loading:
+        """Ask Grain to size workers and buffers within the host's RAM limit."""
+        if self.workers != "auto":
+            return self
+        import grain.experimental as gx
+        import psutil
+
+        available = psutil.virtual_memory().available
+        maximum, current = Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")
+        if maximum.is_file() and current.is_file():
+            limit = maximum.read_text().strip()
+            if limit != "max":
+                available = min(available, max(0, int(limit) - int(current.read_text())))
+        budget = self.ram_budget_mb if self.ram_budget_mb is not None else max(1, available // (2 * 1024**2))
+        try:
+            picked = gx.pick_performance_config(records, ram_budget_mb=budget,
+                                                 max_workers=self.max_workers or os.cpu_count() or 1,
+                                                 max_buffer_size=self.read_buffer)
+        except StopIteration:
+            _log.warning("Grain autotune found no element; using explicit Loading fallback (0 workers)")
+            return dataclasses.replace(self, workers=0)
+        workers = 0 if picked.multiprocessing_options is None else picked.multiprocessing_options.num_workers
+        buffers = self.read_buffer if picked.read_options is None else picked.read_options.prefetch_buffer_size
+        return dataclasses.replace(self, workers=workers, read_buffer=buffers)
+
+    @property
+    def worker_count(self) -> int:
+        if self.workers == "auto":
+            raise ValueError("automatic Loading must be resolved on its Grain pipeline")
+        return self.workers
 
     @property
     def stop_seconds(self) -> float:
@@ -439,7 +474,8 @@ class Loading:
         # Grain's kill timeout is read from Grain (`_grain_kill_seconds`), so an
         # upgrade that changes it moves this budget too. The 5.1 to 7.4 s stop
         # was examples/sft_gemma4.py's four workers.
-        return float(_grain_kill_seconds() * (1 + self.workers))
+        return float(_grain_kill_seconds() * (1 + (self.max_workers or os.cpu_count() or 1)
+                                               if self.workers == "auto" else 1 + self.workers))
 
     @contextlib.contextmanager
     def announced_stop(self) -> Iterator[None]:
@@ -461,7 +497,7 @@ class Loading:
         once `_QUIET_STOP_SECONDS` pass. None with no workers, and None where
         no thread can start (at interpreter shutdown, or at the process's
         thread limit), since the stop must run with or without its line."""
-        if not self.workers:
+        if not self.workers or self.workers == "auto":
             return None
         line = (f"waiting for {self.workers} grain workers to stop, "
                 f"up to {self.workers * _grain_kill_seconds()} s")
@@ -1333,6 +1369,8 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
     share whole batches, and that permutation depends only on the batch and
     worker counts, so neither changes which records a batch holds.
     """
+    if loading.workers == "auto":
+        loading = loading.resolved(records.to_iter_dataset(pygrain.ReadOptions(1, 0)))
     mine = records[offset + partition.index::partition.count]
     # A share a pass's split holds no record for, as process 1's of one record
     # on two, reads one batch of the split's first record with every row a
@@ -1341,7 +1379,7 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
     if empty:
         mine = records[:1]
     if loading.workers:
-        mine = _WorkerBatches(mine, rows, loading.workers, remainder=remainder)
+        mine = _WorkerBatches(mine, rows, loading.worker_count, remainder=remainder)
     stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
     stream = stream.batch(rows, drop_remainder=not remainder)
     if cut is not None:
@@ -1350,7 +1388,7 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
         stream = stream.map(FilledBatch(rows, real=not empty))
     if loading.workers:
         stream = stream.mp_prefetch(pygrain.MultiprocessingOptions(
-            num_workers=loading.workers,
+            num_workers=loading.worker_count,
             per_worker_buffer_size=loading.worker_buffer))
     return iter(stream)
 
