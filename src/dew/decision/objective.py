@@ -16,6 +16,7 @@ from dew.artifacts import Decisions
 from dew.data.dataset import (
     Corpus,
     Dataset,
+    LengthGroups,
     Loading,
     Reader,
     mixed_records,
@@ -160,6 +161,24 @@ def _none_of_the_above(question: Choice, label: int, *, drop: bool) -> tuple[Cho
     return Choice(question.instructions, described), options.index(NONE_OF_THE_ABOVE if drop else right)
 
 
+_ALONG_THE_ROW = ("tokens", "valid", "positions", "slots")
+"""The fields of an encoded row that run along its tokens."""
+
+
+@dataclass(frozen=True)
+class _Cut:
+    """A batch's fields along its rows cut after its longest row, rounded up to
+    a multiple of `bucket` and at most `length`: the padding no row reaches."""
+
+    bucket: int
+    length: int
+
+    def __call__(self, batch: Batch) -> Batch:
+        longest = int(np.max(np.sum(batch["valid"], axis=1)))
+        size = min(self.length, -(-longest // self.bucket) * self.bucket)
+        return {name: value[:, :size] if name in _ALONG_THE_ROW else value for name, value in batch.items()}
+
+
 def _padded(values: Sequence[int | bool], length: int, fill: int | bool = 0) -> np.ndarray:
     dtype = np.bool_ if isinstance(fill, bool) else np.int32
     row = np.full((length,), fill, dtype)
@@ -184,6 +203,24 @@ class _Rows:
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}({self.origin})"
+
+
+class _Tokens:
+    """A record's length as `LengthGroups` ranks it: the tokens of its row laid
+    out without augmentation, counted when the order first reads it and kept,
+    so a later pass does not lay it out twice."""
+
+    def __init__(self, encoding: Encoding, corpora: Sequence[_Rows]):
+        self.encoding, self.corpora = encoding, corpora
+        self.counted: dict[tuple[int, int], int] = {}
+
+    def __call__(self, record: Batch) -> int:
+        key = int(record["corpus"]), int(record["row"])
+        count = self.counted.get(key)
+        if count is None:
+            example, names = self.corpora[key[0]].rows[key[1]]
+            count = self.counted[key] = int(np.sum(self.encoding(example, names, None)["valid"]))
+        return count
 
 
 class _Encode(pygrain.RandomMapTransform):
@@ -249,7 +286,11 @@ class DecisionObjective(Objective[Ratio]):
     The loss is `loss`, a proper scoring rule or a sum of them, computed against
     each row's right option, with `label_smoothing` spread evenly over its
     options. `shuffle_options` and `none_of_the_above` augment the rows as
-    `Encoding` describes, and `dataset` builds them.
+    `Encoding` describes, and `dataset` builds them. With `bucket`, the
+    training stream batches rows of like length (`LengthGroups`) and cuts each
+    batch after its longest row, rounded up to a multiple of `bucket`, so a
+    step pays for little more than its tokens instead of `max_len` per row;
+    each length compiles its own step, and the stream is read on one process.
 
     Evaluation returns the model's `Decisions` on the validation rows, which
     `Accuracy`, `ECE`, `AURC` and the scoring rules read, its probabilities
@@ -267,7 +308,8 @@ class DecisionObjective(Objective[Ratio]):
                  specials: Specials | None = None, layout: Layout | None = None,
                  head: Head | None = None, variables: Variables | None | Omitted = OMITTED,
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
-                 none_of_the_above: float = 0.0, temperatures: Temperatures | None = None):
+                 none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
+                 bucket: int | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -293,6 +335,9 @@ class DecisionObjective(Objective[Ratio]):
             raise ValueError("label_smoothing is a share of the target, in [0, 1)")
         if not 0.0 <= none_of_the_above <= 1.0:
             raise ValueError("none_of_the_above is a probability")
+        if bucket is not None and bucket < 1:
+            raise ValueError(f"bucket is the multiple a batch's length rounds up to, at least 1, "
+                             f"not {bucket}")
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
@@ -311,7 +356,9 @@ class DecisionObjective(Objective[Ratio]):
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
-        self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,)))
+        self.bucket = bucket
+        # A cut batch is as long as its longest row, so only an uncut stream declares its length.
+        self.inputs = None if bucket else InputSpec(sample=Field("tokens", (self.layout.max_len,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The backbone, then the head, both trained."""
@@ -428,11 +475,14 @@ class DecisionObjective(Objective[Ratio]):
         scoring = (None if held is None
                    else _held_pass(held, encoding, batch=batch, seed=seed, loading=loading))
         encode = [_Encode(encoding, corpora, augment=True)]
+        bucketed = {} if self.bucket is None else {"groups": LengthGroups(_Tokens(encoding, corpora)),
+                                                   "cut": _Cut(self.bucket, self.layout.max_len)}
         if len(corpora) == 1:
-            return Dataset(train=train_stream(corpora[0], encode, batch=batch, seed=seed, loading=loading),
+            return Dataset(train=train_stream(corpora[0], encode, batch=batch, seed=seed, loading=loading,
+                                              **bucketed),
                            val=scoring, records=len(corpora[0]), batch=batch)
         mixed = [Corpus(name, rows, weighted[name].weight) for name, rows in zip(names, corpora, strict=True)]
-        return Dataset(train=mixed_stream(mixed, encode, batch=batch, seed=seed, loading=loading),
+        return Dataset(train=mixed_stream(mixed, encode, batch=batch, seed=seed, loading=loading, **bucketed),
                        val=scoring, records=mixed_records(mixed), batch=batch)
 
     def held_out(self, examples: Labelled, *, batch: int, loading: Loading | None = None) -> Reader:

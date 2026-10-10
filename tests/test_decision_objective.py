@@ -1,5 +1,6 @@
 """`DecisionObjective`: proper scoring rules, metrics, row encoding, and training through LoRA."""
 
+import itertools
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -258,6 +259,40 @@ def test_a_mixture_fills_each_step_at_its_weights():
         assert firsts.count("z") == 2
     # A pass reads every set at least once: the large one's 40 rows at three quarters of each step.
     assert data.records == 54
+
+
+def test_a_bucketed_stream_cuts_each_batch_just_past_its_longest_row():
+    """Rows of forty lengths, two to a batch: each batch is cut at the next
+    multiple of eight past its longest row, a window of batches holds the
+    uncut stream's rows, and cutting a batch leaves its loss as it was."""
+    from dew.objectives.base import Step
+
+    rows = [Example("x" * size, {"team": INTENT}, {"team": "sales"}) for size in range(1, 41)]
+
+    def read(**fields):
+        objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+                                      shuffle_options=False, **fields)
+        return objective, list(itertools.islice(objective.dataset(rows, batch=2).train(DataPartition()), 64))
+
+    def held(batches):
+        return sorted(tuple(row[valid]) for batch in batches for row, valid
+                      in zip(np.asarray(batch["tokens"]), np.asarray(batch["valid"]), strict=True))
+
+    plain, whole = read()
+    bucketed, cut = read(bucket=8)
+    assert bucketed.inputs is None
+    for batch in cut:
+        size, longest = batch["tokens"].shape[1], int(np.sum(batch["valid"], axis=1).max())
+        assert size % 8 == 0 and longest <= size < longest + 8
+    assert held(cut) == held(whole)
+    batch = whole[0]
+    size = -(-int(np.sum(batch["valid"], axis=1).max()) // 8) * 8
+    trimmed = {name: value[:, :size] if name in ("tokens", "valid", "positions", "slots") else value
+               for name, value in batch.items()}
+    variables = plain.init(jax.random.key(0))
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
+    np.testing.assert_allclose(plain.scalar_loss(variables, trimmed, step)[0],
+                               plain.scalar_loss(variables, batch, step)[0], rtol=1e-6)
 
 
 def tiny_backbone() -> CausalTransformer:
