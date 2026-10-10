@@ -21,20 +21,23 @@ options under their own names, or under letters (`option_i` past 26) with
 their text as the description. Requests reach a decision model in both
 shapes, so the model learns both.
 
-Licences: Open-Jev's generated rows are CC0; typed-decisions, gliclass and
-BoolQ's card state Apache-2.0, Apache-2.0 and CC BY-SA 3.0; BANKING77 CC BY
-4.0; CLINC150 CC BY 3.0; WANLI CC BY 4.0; HellaSwag and GSM8K MIT; ARC CC
-BY-SA 4.0. Nothing non-commercial is read.
+Only permissive or CC BY-SA sources are read by default; software-copyleft
+data is opt-in. Each source's licence,
+evidence URL and pinned revision are recorded in `mixture.json`. Shares
+are computed from the written training counts with temperature 3, a
+configurable 200,000-row cap and at most ten epochs per mixture pass.
 """
 
 import csv
 import dataclasses
+import gzip
 import hashlib
 import json
 import random
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field, fields
+from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
@@ -53,15 +56,65 @@ def _download(repo: str, revision: str, path: str) -> str:
     return hf_hub_download(repo, path, repo_type="dataset", revision=revision)
 
 
-def _rows(repo: str, revision: str, path: str) -> list[dict]:
-    """A pinned parquet or JSON-lines file's rows."""
+def _rows(repo: str, revision: str, path: str, indices: set[int] | None = None) -> Iterator[dict]:
+    """A pinned file's rows, materialising only the selected indices when supplied."""
     local = _download(repo, revision, path)
-    if path.endswith(".jsonl"):
-        with open(local) as file:
-            return [json.loads(line) for line in file if line.strip()]
+    if path.endswith((".jsonl", ".jsonl.gz")):
+        with (gzip.open(local, "rt") if path.endswith(".gz") else open(local)) as file:
+            for index, line in enumerate(file):
+                if line.strip() and (indices is None or index in indices):
+                    yield json.loads(line)
+        return
+    if path.endswith(".csv"):
+        csv.field_size_limit(2**31 - 1)
+        with open(local, newline="") as file:
+            for index, row in enumerate(csv.DictReader(file)):
+                if indices is None or index in indices:
+                    yield row
+        return
     import pyarrow.parquet as pq
 
-    return pq.read_table(local).to_pylist()
+    file = pq.ParquetFile(local)
+    offset = 0
+    for group in range(file.num_row_groups):
+        size = file.metadata.row_group(group).num_rows
+        selected = None if indices is None else {index - offset for index in indices
+                                                 if offset <= index < offset + size}
+        offset += size
+        if selected == set():
+            continue
+        start = 0
+        for batch in file.iter_batches(batch_size=4096, row_groups=[group]):
+            positions = (None if selected is None else
+                         [index - start for index in sorted(selected) if start <= index < start + len(batch)])
+            if positions is None:
+                yield from batch.to_pylist()
+            elif positions:
+                yield from batch.take(positions).to_pylist()
+            start += len(batch)
+
+
+def _count(repo: str, revision: str, path: str) -> int:
+    """The pinned train file's row count, without loading its rows into memory."""
+    local = _download(repo, revision, path)
+    if path.endswith((".jsonl", ".jsonl.gz", ".csv")):
+        if path.endswith(".csv"):
+            csv.field_size_limit(2**31 - 1)
+        with (gzip.open(local, "rt") if path.endswith(".gz") else open(local, newline="")) as file:
+            return sum(1 for _ in (csv.DictReader(file) if path.endswith(".csv") else file))
+    import pyarrow.parquet as pq
+
+    return pq.ParquetFile(local).metadata.num_rows
+
+
+def _held(count: int, held: int | None) -> int:
+    return held if held is not None else min(2000, max(50, count // 50), count // 2)
+
+
+def _draw(count: int, limit: int | None, held: int | None, seed: int) -> set[int] | None:
+    """Choose the capped train and hold-out rows before decoding or converting them."""
+    needed = count if limit is None else min(count, limit + _held(count, held))
+    return None if needed == count else set(random.Random(seed).sample(range(count), needed))
 
 
 def _github(repo: str, revision: str, path: str, *, media: bool = False) -> Path:
@@ -83,6 +136,26 @@ def _github(repo: str, revision: str, path: str, *, media: bool = False) -> Path
     return cached
 
 
+def _http(url: str, digest: str, namespace: str) -> Path:
+    """Cache a release file only after verifying its pinned SHA-256, including on later reads."""
+    import shutil
+    import urllib.request
+
+    from huggingface_hub import cached_assets_path
+
+    path = cached_assets_path(library_name="dew", namespace=namespace, subfolder=digest) / Path(url).name
+    checked = path if path.is_file() else path.with_suffix(path.suffix + ".partial")
+    if not path.is_file():
+        with urllib.request.urlopen(url, timeout=300) as source, checked.open("wb") as target:
+            shutil.copyfileobj(source, target)
+    with checked.open("rb") as file:
+        if hashlib.file_digest(file, "sha256").hexdigest() != digest:
+            raise ValueError(f"{url} does not match the pinned SHA-256")
+    if checked != path:
+        checked.replace(path)
+    return path
+
+
 def _unit(text: str, salt: str) -> float:
     """A number in [0, 1) that `text` fixes, so a row is framed the same way on every read."""
     digest = hashlib.sha256(f"{salt}:{text}".encode()).digest()
@@ -91,9 +164,10 @@ def _unit(text: str, salt: str) -> float:
 
 @dataclass(frozen=True)
 class Source:
-    """One labelled set a mixture reads, at `weight`, a share of every step; weight 0 leaves it out.
+    """One labelled set: a positive `weight` enables it and weight 0 leaves it out.
 
-    `limit` caps the training examples, drawn with `seed`, and `held` holds that
+    `limit` caps the training examples, drawn with `seed` (None follows the
+    conversion cap), and `held` holds that
     many back for validation and calibration. With no count, hold out 2% of
     the examples (rounded down), at least 50 and at most 2,000, and never
     more than half of them, so a small set still trains. An explicit zero
@@ -104,19 +178,64 @@ class Source:
     limit: int | None = None
     held: int | None = None
     seed: int = 0
+    revision: str = ""
     natural: ClassVar[bool] = True
     """Whether the set is natural text rather than built from templates (`contamination.Overlaps`)."""
+    repo: ClassVar[str] = ""
+    files: ClassVar[tuple[str, ...]] = ()
+    licence: ClassVar[str] = ""
+    licence_url: ClassVar[str] = ""
+    label_column: ClassVar[str] = "label"
 
     def examples(self) -> list[Example]:
-        """Every training example the set gives."""
+        """The seeded, capped training candidates, with room for the held-out split."""
+        return [example for row in self.rows() if (example := self.convert(row)) is not None]
+
+    def convert(self, row: dict) -> Example | None:
+        """One labelled training row as a decision, or None for a row without gold."""
         raise NotImplementedError
+
+    def count(self) -> int:
+        """The pinned source's train rows, before sampling or holding any out."""
+        return sum(_count(self.repo, self.revision, path) for path in self.files)
+
+    def licence_record(self) -> dict[str, str]:
+        """The grant and pinned data revision carried into each training run's summary."""
+        url = self.licence_url or f"https://huggingface.co/datasets/{self.repo}/blob/{self.revision}/README.md"
+        return {"name": self.licence, "url": url, "revision": self.revision}
+
+    def rows(self) -> Iterator[dict]:
+        """Seeded rows from training files only, capped before they become Python objects."""
+        counts = [_count(self.repo, self.revision, path) for path in self.files]
+        selected = _draw(sum(counts), self.limit, self.held, self.seed)
+        offset = 0
+        for path, count in zip(self.files, counts, strict=True):
+            indices = None if selected is None else {index - offset for index in selected
+                                                     if offset <= index < offset + count}
+            yield from _rows(self.repo, self.revision, path, indices)
+            offset += count
+
+    def labels(self, column: str) -> list[str]:
+        """A ClassLabel column's option names in the pinned parquet's metadata order."""
+        import pyarrow.parquet as pq
+
+        schema = pq.ParquetFile(_download(self.repo, self.revision, self.files[0])).schema_arrow
+        feature = json.loads(schema.metadata[b"huggingface"])["info"]["features"][column]
+        return list((feature.get("feature") or feature)["names"])
+
+    @cached_property
+    def classes(self) -> list[str]:
+        return self.labels(self.label_column)
 
     def split(self) -> tuple[list[Example], list[Example]]:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        count = self.held if self.held is not None else min(2000, max(50, len(examples) // 50),
-                                                             len(examples) // 2)
+        population = self.count() if self.limit is not None else len(examples)
+        if self.limit is not None and population <= self.limit:
+            population = len(examples)
+        count = _held(population, self.held)
+        count = min(count, len(examples))
         held, train = examples[:count], examples[count:]
         return (train if self.limit is None else train[:self.limit]), held
 
@@ -176,16 +295,21 @@ class OpenJev(Source):
     """
 
     natural: ClassVar[bool] = False
-    weight: float = 0.30
+    weight: float = 1.0
     calibration: int | None = None
     config: str = "release-v2-redistributable"
     revision: str = "c67699e13d0ae25e35b77165a4b6b079bedc8aba"
     questions: int = 2
 
+    repo: ClassVar[str] = "ZefanCai/Open-Jev"
+    licence: ClassVar[str] = "CC0-1.0"
+
     def read(self, split: str) -> list[Example]:
         rows = _rows("ZefanCai/Open-Jev", self.revision, f"data/{self.config}/{split}-00000-of-00001.parquet")
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for row in rows:
+            if row["group_id"].startswith("customer-control-v1:"):
+                continue
             groups[(row["group_id"], row["state_json"])].append(row)
         examples = []
         for (_, state), members in groups.items():
@@ -235,9 +359,11 @@ class TypedDecisions(Source):
     """
 
     natural: ClassVar[bool] = False
-    weight: float = 0.05
+    weight: float = 1.0
     held: int = 100
     revision: str = "d0e2f0c42fef86cc15d1688d25a19f5ba7c85b18"
+    repo: ClassVar[str] = "LocalLLaMA/typed-decisions"
+    licence: ClassVar[str] = "Apache-2.0"
 
     def examples(self) -> list[Example]:
         examples = []
@@ -268,16 +394,17 @@ class GliClass(Source):
     what it is classified for.
     """
 
-    weight: float = 0.20
-    limit: int | None = 200_000
+    weight: float = 1.0
     most: int = 24
     """A text of more candidates asks its true ones and others drawn up to this many."""
     revision: str = "93d3cdc82257a9e821f4b21d08e3dc81979bb653"
-    shard: str = "data/train-00000-of-00003.parquet"
+    repo: ClassVar[str] = "knowledgator/gliclass-v2.0"
+    files: ClassVar[tuple[str, ...]] = tuple(f"data/train-{index:05}-of-00003.parquet" for index in range(3))
+    licence: ClassVar[str] = "Apache-2.0"
 
     def examples(self) -> list[Example]:
         examples = []
-        for row in _rows("knowledgator/gliclass-v2.0", self.revision, self.shard):
+        for row in self.rows():
             labels, true = list(dict.fromkeys(row["all_labels"])), set(row["true_labels"])
             if len(labels) < 2 or not true <= set(labels):
                 continue
@@ -302,11 +429,13 @@ class Intents(Framed):
     """BANKING77's training requests (mteb/banking77, CC BY 4.0), each asking its intent among all 77."""
 
     most: int | None = 24
-    weight: float = 0.04
+    weight: float = 1.0
     revision: str = "18072d2685ea682290f7b8924d94c62acc19c0b2"
+    repo: ClassVar[str] = "mteb/banking77"
+    licence: ClassVar[str] = "CC-BY-4.0"
 
     def examples(self) -> list[Example]:
-        rows = _rows("mteb/banking77", self.revision, "data/train-00000-of-00001.parquet")
+        rows = list(_rows("mteb/banking77", self.revision, "data/train-00000-of-00001.parquet"))
         intents = list(dict.fromkeys(row["label_text"] for row in rows))
         return [self.example(row["text"], "Which banking request is this?", intents,
                              intents.index(row["label_text"])) for row in rows]
@@ -317,8 +446,10 @@ class Clinc(Framed):
     """CLINC150's training queries (clinc/clinc_oos `plus`, CC BY 3.0): 150 intents and out-of-scope."""
 
     most: int | None = 24
-    weight: float = 0.04
+    weight: float = 1.0
     revision: str = "155b9c710419136e17307b80d0a13e68cd46b4ec"
+    repo: ClassVar[str] = "clinc/clinc_oos"
+    licence: ClassVar[str] = "CC-BY-3.0"
 
     def examples(self) -> list[Example]:
         import pyarrow.parquet as pq
@@ -335,39 +466,29 @@ class Clinc(Framed):
 class Wanli(Framed):
     """WANLI's training pairs (alisawuffles/WANLI, CC BY 4.0): entailment, neutral or contradiction."""
 
-    weight: float = 0.08
-    limit: int | None = 60_000
+    weight: float = 1.0
     revision: str = "61c95318fd71c55b6ba355d76253254615f387ec"
+    repo: ClassVar[str] = "alisawuffles/WANLI"
+    files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
+    licence: ClassVar[str] = "CC-BY-4.0"
 
     def examples(self) -> list[Example]:
         relations = ["entailment", "neutral", "contradiction"]
         return [self.example(f"Premise: {row['premise']}\nHypothesis: {row['hypothesis']}",
                              "How does the hypothesis relate to the premise?", relations,
                              relations.index(row["gold"]))
-                for row in _rows("alisawuffles/WANLI", self.revision, "train.jsonl")
+                for row in self.rows()
                 if row["gold"] in relations]
-
-
-@dataclass(frozen=True)
-class HellaSwag(Framed):
-    """HellaSwag's training contexts (Rowan/hellaswag, MIT), each with four endings."""
-
-    weight: float = 0.05
-    revision: str = "218ec52e09a7e7462a5400043bb9a69a41d06b76"
-
-    def examples(self) -> list[Example]:
-        return [self.example(row["ctx"], "Which continuation is most plausible?", list(row["endings"]),
-                             int(row["label"]))
-                for row in _rows("Rowan/hellaswag", self.revision, "data/train-00000-of-00001.parquet")
-                if str(row["label"]).isdigit()]
 
 
 @dataclass(frozen=True)
 class Arc(Framed):
     """ARC's Easy and Challenge training questions (allenai/ai2_arc, CC BY-SA 4.0)."""
 
-    weight: float = 0.03
+    weight: float = 1.0
     revision: str = "210d026faf9955653af8916fad021475a3f00453"
+    repo: ClassVar[str] = "allenai/ai2_arc"
+    licence: ClassVar[str] = "CC-BY-SA-4.0"
 
     def examples(self) -> list[Example]:
         examples = []
@@ -384,8 +505,10 @@ class Arc(Framed):
 class BoolQ(Source):
     """BoolQ's training questions (google/boolq, CC BY-SA 3.0): a passage and a yes-or-no question."""
 
-    weight: float = 0.05
+    weight: float = 1.0
     revision: str = "35b264d03638db9f4ce671b711558bf7ff0f80d5"
+    repo: ClassVar[str] = "google/boolq"
+    licence: ClassVar[str] = "CC-BY-SA-3.0"
 
     def examples(self) -> list[Example]:
         examples = []
@@ -408,11 +531,13 @@ class Gsm8k(Framed):
     do not give the answer away.
     """
 
-    weight: float = 0.03
+    weight: float = 1.0
     revision: str = "740312add88f781978c0658806c59bc2815b9866"
+    repo: ClassVar[str] = "openai/gsm8k"
+    licence: ClassVar[str] = "MIT"
 
     def examples(self) -> list[Example]:
-        rows = _rows("openai/gsm8k", self.revision, "main/train-00000-of-00001.parquet")
+        rows = list(_rows("openai/gsm8k", self.revision, "main/train-00000-of-00001.parquet"))
         golds = [row["answer"].rsplit("####", 1)[-1].strip().replace(",", "") for row in rows]
         values = sorted(set(golds), key=float)
         place = {value: index for index, value in enumerate(values)}
@@ -439,6 +564,8 @@ class Rows(Source):
     """
 
     path: str | None = None
+    licence: str = "LicenseRef-User-Provided"
+    licence_url: str = ""
 
     def examples(self) -> list[Example]:
         if self.path is None:
@@ -455,29 +582,45 @@ class Esci(Source):
     are kept because DI 0.2.1 evaluates US, ES and JP, and products join on
     both their id and locale. The option names, descriptions and state are
     the kit's, without the alternate framing used by other sources. Of the
-    781,638 pairs, `limit` keeps 15,000 drawn with the seed, about what one
-    pass of the `--headroom` mix reads at ESCI's weight, so neither the
-    decontamination nor a run's layout check reads the rest.
+    781,638 pairs, only the seeded cap plus hold-out are joined to products.
     """
 
-    limit: int | None = 15_000
+    weight: float = 1.0
     revision: str = "7916cdf6ab75a462e77f20ab40428a10923998d5"
+    repo: ClassVar[str] = "amazon-science/esci-data"
+    licence: ClassVar[str] = "Apache-2.0"
+    licence_url: ClassVar[str] = "https://github.com/amazon-science/esci-data/blob/7916cdf6ab75a462e77f20ab40428a10923998d5/LICENSE"
 
     def rows(self) -> Iterator[dict]:
-        """The pinned small training split, joined to its product text in example-id order."""
+        """Seeded small training pairs, joined only to the product texts they actually need."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
         import pyarrow.parquet as pq
 
         root = "shopping_queries_dataset/shopping_queries_dataset_"
-        examples = pq.read_table(_github("amazon-science/esci-data", self.revision,
-                                         root + "examples.parquet", media=True),
-                                  filters=[("split", "=", "train"), ("small_version", "=", 1)])
-        products = pq.read_table(_github("amazon-science/esci-data", self.revision,
-                                         root + "products.parquet", media=True))
-        joined = examples.join(products, keys=["product_id", "product_locale"], join_type="left outer")
-        if joined.num_rows != examples.num_rows or joined["product_title"].null_count:
-            raise ValueError("ESCI needs exactly one product with a title for every training pair")
-        for batch in joined.sort_by([("example_id", "ascending")]).to_batches(max_chunksize=4096):
-            yield from batch.to_pylist()
+        path = _github(self.repo, self.revision, root + "examples.parquet", media=True)
+        selected = _draw(781638, self.limit, self.held, self.seed)
+        examples, offset = [], 0
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=4096):
+            batch = batch.filter(pc.and_(pc.equal(batch["split"], "train"),
+                                         pc.equal(batch["small_version"], 1)))
+            positions = [index for index in range(len(batch))
+                         if selected is None or offset + index in selected]
+            if positions:
+                examples.extend(batch.take(positions).to_pylist())
+            offset += len(batch)
+        needed = {(row["product_id"], row["product_locale"]) for row in examples}
+        ids, products = pa.array(list({key[0] for key in needed})), {}
+        path = _github(self.repo, self.revision, root + "products.parquet", media=True)
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=4096):
+            for row in batch.filter(pc.is_in(batch["product_id"], value_set=ids)).to_pylist():
+                key = row["product_id"], row["product_locale"]
+                if key in needed:
+                    if key in products or row["product_title"] is None:
+                        raise ValueError("ESCI needs exactly one titled product per pair")
+                    products[key] = row
+        for row in examples:
+            yield {**row, **products[(row["product_id"], row["product_locale"])]}
 
     @staticmethod
     def example(row: dict) -> Example:
@@ -498,6 +641,9 @@ class Esci(Source):
     def examples(self) -> list[Example]:
         return [self.example(row) for row in self.rows()]
 
+    def count(self) -> int:
+        return 781638
+
 
 @dataclass(frozen=True)
 class ISarcasm(Source):
@@ -508,7 +654,11 @@ class ISarcasm(Source):
     subtype annotations are not part of the model's input.
     """
 
+    weight: float = 1.0
     revision: str = "dfc708b53bde1bb571abfb5692f63231c2232195"
+    repo: ClassVar[str] = "iabufarha/iSarcasmEval"
+    licence: ClassVar[str] = "MIT"
+    licence_url: ClassVar[str] = "https://github.com/iabufarha/iSarcasmEval/blob/dfc708b53bde1bb571abfb5692f63231c2232195/LICENSE"
 
     @staticmethod
     def example(row: dict) -> Example:
@@ -526,14 +676,672 @@ class ISarcasm(Source):
 
 
 @dataclass(frozen=True)
-class Mixture:
-    """Every source a decision recipe reads, each at its weight; a weight of 0 leaves one out.
+class Sgd(Source):
+    """SGD (google-research-datasets/dstc8-schema-guided-dialogue, CC-BY-SA-4.0), DI user frames."""
 
-    The weights are shares of each step, so they need not sum to one.
-    Laya's application battery and every evaluation split stay out: AG News,
-    DAIR Emotion, Enron spam, the phishing set, toxic-chat, MS MARCO and the
-    customer-support tickets are read by no source here.
+    weight: float = 1.0
+    revision: str = "e852981ae34990f4358979625854259302feaa78"
+    repo: ClassVar[str] = "google-research-datasets/dstc8-schema-guided-dialogue"
+    licence: ClassVar[str] = "CC-BY-SA-4.0"
+    licence_url: ClassVar[str] = "https://github.com/google-research-datasets/dstc8-schema-guided-dialogue/blob/e852981ae34990f4358979625854259302feaa78/README.md"
+
+    def dialogues(self) -> Iterator[dict]:
+        """The 127 pinned training shards, never the dev or test dialogues."""
+        for index in range(1, 128):
+            path = _github(self.repo, self.revision, f"train/dialogues_{index:03}.json")
+            yield from json.loads(path.read_text())
+
+    @staticmethod
+    def frames(dialogue: dict, schemas: dict) -> Iterator[dict]:
+        """DI's current-user-frame state; later turns and all state labels stay out of it."""
+        history = []
+        for turn in dialogue["turns"]:
+            history.append({"speaker": turn["speaker"], "utterance": turn["utterance"]})
+            if turn["speaker"] == "USER":
+                for frame in turn["frames"]:
+                    schema = schemas[frame["service"]]
+                    yield {"history": list(history), "service": frame["service"], "schema": schema,
+                           "gold": frame["state"].get("active_intent", "NONE")}
+
+    def convert(self, row: dict) -> Example:
+        intents = [item["name"] for item in row["schema"]["intents"]] + ["NONE"]
+        question = Choice("Using the dialogue history and service schema in state, choose the active intent "
+                          "for this service. Choose NONE when no service intent is active. Do not use future "
+                          "turns or hidden labels.", {name: name for name in intents})
+        state = {key: row[key] for key in ("history", "service", "schema")}
+        return Example({**state, "task": "SGD current-service intent"}, {"intent": question},
+                       {"intent": row["gold"]})
+
+    def count(self) -> int:
+        return sum(len(turn["frames"]) for dialogue in self.dialogues() for turn in dialogue["turns"]
+                   if turn["speaker"] == "USER")
+
+    def examples(self) -> list[Example]:
+        schemas = {item["service_name"]: item for item in
+                   json.loads(_github(self.repo, self.revision, "train/schema.json").read_text())}
+        selected = _draw(self.count(), self.limit, self.held, self.seed)
+        rows = (row for dialogue in self.dialogues() for row in self.frames(dialogue, schemas))
+        return [self.convert(row) for index, row in enumerate(rows) if selected is None or index in selected]
+
+
+def _evidence_database() -> Path:
+    """DI's HotpotQA Wikipedia database, accepted only at its pinned SHA-256."""
+    return _http("https://nlp.cs.unc.edu/data/hover/wiki_wo_links.db",
+                 "c37ee397916ec0bffacfe8902db454a5cda88a7a188409217b2e15231fe5ee2f", "hover")
+
+
+@dataclass(frozen=True)
+class Hover(Source):
+    """HoVer (hover-nlp/hover, MIT; Wikipedia evidence CC-BY-SA-4.0), in DI's evidence-backed shape."""
+
+    weight: float = 1.0
+    revision: str = "39b84697f196308f398a251a7aea9b82ae0f0562"
+    repo: ClassVar[str] = "hover-nlp/hover"
+    licence: ClassVar[str] = "MIT AND CC-BY-SA-4.0"
+    licence_url: ClassVar[str] = "https://huggingface.co/datasets/hover-nlp/hover/blob/c0e43052759879b3461642ca6c0dd26658f47691/README.md"
+
+    def claims(self) -> list[dict]:
+        path = _github(self.repo, self.revision, "data/hover/hover_train_release_v1.1.json")
+        return json.loads(path.read_text())
+
+    def convert(self, row: dict) -> Example:
+        question = Choice("Is the claim supported by the evidence?",
+                          {"SUPPORTED": "The evidence supports the claim.",
+                           "NOT_SUPPORTED": "The evidence does not support the claim."})
+        return Example({"claim": row["claim"], "evidence": row["evidence"]},
+                       {"q": question}, {"q": row["label"]})
+
+    def examples(self) -> list[Example]:
+        import sqlite3
+        import unicodedata
+
+        claims = self.claims()
+        selected = _draw(len(claims), self.limit, self.held, self.seed)
+        db = sqlite3.connect(f"file:{_evidence_database()}?mode=ro", uri=True)
+        examples = []
+        try:
+            for index, row in enumerate(claims):
+                if selected is not None and index not in selected:
+                    continue
+                evidence = []
+                for title in dict.fromkeys(title for title, _ in row["supporting_facts"]):
+                    found = db.execute("SELECT text FROM documents WHERE id=?",
+                                       (unicodedata.normalize("NFD", title),)).fetchall()
+                    if len(found) != 1:
+                        raise ValueError(f"HoVer needs exactly one article for {title!r}")
+                    evidence.append({"title": title, "text": found[0][0]})
+                examples.append(self.convert({**row, "evidence": evidence}))
+        finally:
+            db.close()
+        return examples
+
+
+@dataclass(frozen=True)
+class ContractNli(Source):
+    """ContractNLI (stanfordnlp/contract-nli, CC-BY-4.0), DI's 17 hypothesis questions per contract."""
+
+    weight: float = 1.0
+    revision: str = "eced6528dd3c1d14d73f9a87df8f7bdbc03126f9"
+    repo: ClassVar[str] = "stanfordnlp/contract-nli"
+    licence: ClassVar[str] = "CC-BY-4.0"
+    licence_url: ClassVar[str] = "https://github.com/stanfordnlp/contract-nli/blob/eced6528dd3c1d14d73f9a87df8f7bdbc03126f9/LICENSE"
+
+    def data(self) -> dict:
+        import zipfile
+
+        with zipfile.ZipFile(_github(self.repo, self.revision, "resources/contract-nli.zip")) as archive:
+            return json.loads(archive.read("contract-nli/train.json"))
+
+    def convert(self, row: dict) -> Example:
+        criteria = {"Entailment": "The contract entails the hypothesis.",
+                    "Contradiction": "The contract contradicts the hypothesis.",
+                    "NotMentioned": "The hypothesis is neither entailed nor contradicted by the contract."}
+        questions = {key: Choice("Classify the relationship between the contract and this hypothesis:\n" +
+                                 label["hypothesis"], criteria) for key, label in row["labels"].items()}
+        answers = {key: value["choice"] for key, value in row["annotation_sets"][0]["annotations"].items()}
+        return Example(row["text"], questions, answers)
+
+    def examples(self) -> list[Example]:
+        data = self.data()
+        return [self.convert({**doc, "labels": data["labels"]}) for doc in data["documents"]]
+
+
+@dataclass(frozen=True)
+class WinoGrande(Source):
+    """WinoGrande XL (allenai/winogrande, Apache-2.0), DI's native A/B blank-filling question."""
+
+    weight: float = 1.0
+    revision: str = "01e74176c63542e6b0bcb004dcdea22d94fb67b5"
+    repo: ClassVar[str] = "allenai/winogrande"
+    files: ClassVar[tuple[str, ...]] = ("winogrande_xl/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+    licence_url: ClassVar[str] = "https://github.com/allenai/winogrande/blob/727e837f77521ef38bcc56df3b275c8da43f45af/LICENSE"
+
+    def convert(self, row: dict) -> Example:
+        question = Choice("Which option correctly fills the blank?\n" + row["sentence"],
+                          {"A": row["option1"], "B": row["option2"]})
+        return Example({}, {"q1": question}, {"q1": "AB"[int(row["answer"]) - 1]})
+
+
+@dataclass(frozen=True)
+class Fever(Framed):
+    """Original FEVER (fever.ai, CC-BY-SA-3.0), SUPPORTS/REFUTES claims with gold Wikipedia sentences.
+
+    Both the training claims and June 2017 Wikipedia archive are SHA-256 pinned.
+    NOT ENOUGH INFO has no gold evidence in this release and is not a training example.
     """
+
+    weight: float = 1.0
+    revision: str = "eba7e8f87076753f8494718b9a857827af7bf73e76c9e4b75420207d26e588b6"
+    wiki_revision: str = "4b06d95da6adf7fe02d2796176c670dacccb21348da89cba4c50676ab99665f2"
+    repo: ClassVar[str] = "fever.ai"
+    licence: ClassVar[str] = "CC-BY-SA-3.0"
+    licence_url: ClassVar[str] = "https://fever.ai/dataset/fever.html"
+
+    def licence_record(self) -> dict[str, str]:
+        return {**super().licence_record(), "wiki_revision": self.wiki_revision}
+
+    def claims(self) -> Iterator[dict]:
+        """Only the original pinned training release, never development or test claims."""
+        path = _http("https://fever.ai/download/fever/train.jsonl", self.revision, "fever")
+        with path.open() as file:
+            for line in file:
+                yield json.loads(line)
+
+    @cached_property
+    def label_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for row in self.claims():
+            counts[row["label"]] += 1
+        return dict(counts)
+
+    def count(self) -> int:
+        return sum(self.label_counts[label] for label in ("SUPPORTS", "REFUTES"))
+
+    def rows(self) -> Iterator[dict]:
+        selected = _draw(self.count(), self.limit, self.held, self.seed)
+        labelled = (row for row in self.claims() if row["label"] in ("SUPPORTS", "REFUTES"))
+        for index, row in enumerate(labelled):
+            if selected is None or index in selected:
+                yield row
+
+    def sentences(self, needed: dict[str, set[int]]) -> dict[tuple[str, int], str]:
+        """Stream the archive, retaining only the sampled claims' requested gold sentence texts."""
+        import unicodedata
+        import zipfile
+
+        path = _http("https://fever.ai/download/fever/wiki-pages.zip", self.wiki_revision, "fever")
+        # FEVER's own DocDB normalizes both stored page IDs and queries to NFD.
+        wanted: dict[str, set[int]] = defaultdict(set)
+        for title, indices in needed.items():
+            wanted[unicodedata.normalize("NFD", title)].update(indices)
+        found, pending = {}, set(wanted)
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if not pending:
+                    break
+                if not name.endswith(".jsonl") or name.startswith("__MACOSX/"):
+                    continue
+                with archive.open(name) as file:
+                    for line in file:
+                        page = json.loads(line)
+                        title = unicodedata.normalize("NFD", page["id"])
+                        if title not in pending:
+                            continue
+                        for sentence in page["lines"].splitlines():
+                            index, _, text = sentence.partition("\t")
+                            if index.isdigit() and int(index) in wanted[title]:
+                                found[title, int(index)] = text.partition("\t")[0]
+                        if all((title, index) in found for index in wanted[title]):
+                            pending.remove(title)
+                        if not pending:
+                            break
+        if pending:
+            raise ValueError(f"FEVER has missing gold evidence sentences on {len(pending)} pages")
+        return {(title, index): found[unicodedata.normalize("NFD", title), index]
+                for title, indices in needed.items() for index in indices}
+
+    def convert(self, row: dict) -> Example | None:
+        if row["label"] not in ("SUPPORTS", "REFUTES"):
+            return None
+        evidence = "\n".join(f"{item['page']}: {item['text']}" for item in row["evidence"])
+        options = ["SUPPORTS", "REFUTES"]
+        return self.example(f"Claim: {row['claim']}\nEvidence: {evidence}",
+                            "Does the evidence support or refute the claim?",
+                            options, options.index(row["label"]))
+
+    def examples(self) -> list[Example]:
+        claims = list(self.rows())
+        needed: dict[str, set[int]] = defaultdict(set)
+        facts = []
+        for row in claims:
+            pairs = list(dict.fromkeys((item[2], item[3]) for group in row["evidence"] for item in group
+                                       if item[2] is not None and item[3] is not None and item[3] >= 0))
+            if not pairs:
+                raise ValueError(f"FEVER labelled claim {row['id']} has no gold evidence")
+            facts.append(pairs)
+            for page, index in pairs:
+                needed[page].add(index)
+        sentences = self.sentences(dict(needed)) if needed else {}
+        return [self.convert({**row, "evidence": [{"page": page, "text": sentences[page, index]}
+                                                 for page, index in pairs]})
+                for row, pairs in zip(claims, facts, strict=True)]
+
+
+@dataclass(frozen=True)
+class Snli(Framed):
+    """SNLI training pairs (stanfordnlp/snli, CC-BY-SA-4.0), excluding unlabelled pairs."""
+
+    weight: float = 1.0
+    revision: str = "cdb5c3d5eed6ead6e5a341c8e56e669bb666725b"
+    repo: ClassVar[str] = "stanfordnlp/snli"
+    files: ClassVar[tuple[str, ...]] = ("plain_text/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-SA-4.0"
+
+    def convert(self, row: dict) -> Example | None:
+        if row["label"] == -1:
+            return None
+        return self.example(f"Premise: {row['premise']}\nHypothesis: {row['hypothesis']}",
+                            "How does the hypothesis relate to the premise?",
+                            ["entailment", "neutral", "contradiction"], row["label"])
+
+
+@dataclass(frozen=True)
+class MultiNli(Framed):
+    """MultiNLI (nyu-mll/multi_nli, OANC, CC-BY-3.0, CC-BY-SA-3.0, MIT and public-domain text)."""
+
+    weight: float = 1.0
+    revision: str = "da70db2af9d09693783c3320c4249840212ee221"
+    repo: ClassVar[str] = "nyu-mll/multi_nli"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = ("LicenseRef-OANC AND CC-BY-3.0 AND CC-BY-SA-3.0 "
+                              "AND MIT AND LicenseRef-Public-Domain")
+
+    def convert(self, row: dict) -> Example | None:
+        if row["label"] == -1:
+            return None
+        return self.example(f"Premise: {row['premise']}\nHypothesis: {row['hypothesis']}",
+                            "How does the hypothesis relate to the premise?",
+                            ["entailment", "neutral", "contradiction"], row["label"])
+
+
+@dataclass(frozen=True)
+class Paws(Source):
+    """PAWS labeled_final (google-research-datasets/paws, Google's free-use grant), gold paraphrases."""
+
+    weight: float = 1.0
+    revision: str = "161ece9501cf0a11f3e48bd356eaa82de46d6a09"
+    repo: ClassVar[str] = "google-research-datasets/paws"
+    files: ClassVar[tuple[str, ...]] = ("labeled_final/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "LicenseRef-Google-PAWS"
+
+    def convert(self, row: dict) -> Example:
+        state = {key: row[key] for key in ("sentence1", "sentence2")}
+        return Example(state, {"paraphrase": Noul("Do these sentences express the same meaning?")},
+                       {"paraphrase": "true" if row["label"] == 1 else "false"})
+
+
+def _multilabel(text: str, labels: Sequence[str], true: Sequence[int], instructions: str) -> Example:
+    """One true label is a Choice; otherwise every candidate gets its own independent Noul."""
+    if len(true) == 1:
+        return Example(text, {"label": Choice(instructions, labels)}, {"label": labels[true[0]]})
+    questions = {f"label_{index}": Noul(f"{instructions} Does this label apply? {label}")
+                 for index, label in enumerate(labels)}
+    answers = {f"label_{index}": "true" if index in true else "false" for index in range(len(labels))}
+    return Example(text, questions, answers)
+
+
+@dataclass(frozen=True)
+class GoEmotions(Source):
+    """GoEmotions simplified (google-research-datasets/go_emotions, Apache-2.0), all 28 emotions."""
+
+    weight: float = 1.0
+    revision: str = "add492243ff905527e67aeb8b80c082af02207c3"
+    repo: ClassVar[str] = "google-research-datasets/go_emotions"
+    files: ClassVar[tuple[str, ...]] = ("simplified/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+    label_column: ClassVar[str] = "labels"
+
+    def convert(self, row: dict) -> Example:
+        return _multilabel(row["text"], self.classes, row["labels"],
+                           "Which emotion is expressed in the text?")
+
+
+@dataclass(frozen=True)
+class DBpedia(Framed):
+    """DBpedia-14 (fancyzhx/dbpedia_14, CC-BY-SA-3.0), fourteen ontology classes."""
+
+    weight: float = 1.0
+    revision: str = "9abd46cf7fc8b4c64290f26993c540b92aa145ac"
+    repo: ClassVar[str] = "fancyzhx/dbpedia_14"
+    files: ClassVar[tuple[str, ...]] = ("dbpedia_14/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-SA-3.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(f"{row['title']}\n{row['content']}", "Which category describes this entity?",
+                            self.classes, row["label"])
+
+
+@dataclass(frozen=True)
+class CivilComments(Source):
+    """Civil Comments (google/civil_comments, CC0-1.0), annotator fractions for toxicity and subtypes."""
+
+    weight: float = 1.0
+    revision: str = "f2970eb3a55777454c94069077cc8d9b5866312d"
+    repo: ClassVar[str] = "google/civil_comments"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00002.parquet",
+                                      "data/train-00001-of-00002.parquet")
+    licence: ClassVar[str] = "CC0-1.0"
+
+    def convert(self, row: dict) -> Example:
+        names = ("toxicity", "severe_toxicity", "obscene", "threat", "insult",
+                 "identity_attack", "sexual_explicit")
+        questions = {name: Noul(f"Does this comment contain {name.replace('_', ' ')}?") for name in names}
+        return Example(row["text"], questions, targets={name: (1 - row[name], row[name]) for name in names})
+
+
+@dataclass(frozen=True)
+class SmsSpam(Source):
+    """SMS Spam Collection (ucirvine/sms_spam, CC-BY-4.0 from UCI), ham versus spam."""
+
+    weight: float = 1.0
+    revision: str = "cae486f927c250fe1d4a5b55f11357964ed1646c"
+    repo: ClassVar[str] = "ucirvine/sms_spam"
+    files: ClassVar[tuple[str, ...]] = ("plain_text/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+    licence_url: ClassVar[str] = "https://archive.ics.uci.edu/dataset/228/sms+spam+collection"
+
+    def convert(self, row: dict) -> Example:
+        return Example(row["sms"], {"spam": Noul("Is this message spam?")},
+                       {"spam": "true" if row["label"] == 1 else "false"})
+
+
+@dataclass(frozen=True)
+class BiasInBios(Framed):
+    """Bias in Bios (LabHC/bias_in_bios, MIT), occupations without the protected attribute as input."""
+
+    weight: float = 1.0
+    revision: str = "052f01de644dba841176e0449528b41f27d94a61"
+    repo: ClassVar[str] = "LabHC/bias_in_bios"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001-0ab65b32c47407e8.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        occupations = ["accountant", "architect", "attorney", "chiropractor", "comedian", "composer",
+                       "dentist", "dietitian", "dj", "filmmaker", "interior_designer", "journalist", "model",
+                       "nurse", "painter", "paralegal", "pastor", "personal_trainer", "photographer",
+                       "physician", "poet", "professor", "psychologist", "rapper", "software_engineer",
+                       "surgeon", "teacher", "yoga_teacher"]
+        return self.example(row["hard_text"], "What is this person's occupation?",
+                            occupations, row["profession"])
+
+
+@dataclass(frozen=True)
+class MassiveIntent(Framed):
+    """MASSIVE English intents (SetFit/amazon_massive_intent_en-US, CC-BY-4.0), sixty user intents."""
+
+    weight: float = 1.0
+    revision: str = "f7672a018e8ceb37fc0184dcfbb7e665155ffea6"
+    repo: ClassVar[str] = "SetFit/amazon_massive_intent_en-US"
+    files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+    licence_url: ClassVar[str] = "https://huggingface.co/datasets/AmazonScience/massive/blob/ff6bd8e4b27c3543e4f8fe2108f32bb95a6f8740/README.md"
+
+    @cached_property
+    def classes(self) -> list[str]:
+        labels = {row["label"]: row["label_text"] for row in _rows(self.repo, self.revision, self.files[0])}
+        return [labels[index] for index in sorted(labels)]
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["text"], "Which intent does this request express?",
+                            self.classes, row["label"])
+
+
+@dataclass(frozen=True)
+class Ledgar(Framed):
+    """LEDGAR (coastalcph/lex_glue, CC-BY-4.0), one of a hundred contract clause types."""
+
+    weight: float = 1.0
+    revision: str = "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"
+    repo: ClassVar[str] = "coastalcph/lex_glue"
+    files: ClassVar[tuple[str, ...]] = ("ledgar/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["text"], "Which type of contract clause is this?", self.classes, row["label"])
+
+
+@dataclass(frozen=True)
+class UnfairTos(Source):
+    """Unfair-ToS (coastalcph/lex_glue, CC-BY-4.0), all applicable unfair clause types."""
+
+    weight: float = 1.0
+    revision: str = "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"
+    repo: ClassVar[str] = "coastalcph/lex_glue"
+    files: ClassVar[tuple[str, ...]] = ("unfair_tos/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+    label_column: ClassVar[str] = "labels"
+
+    def convert(self, row: dict) -> Example:
+        return _multilabel(row["text"], self.classes, row["labels"],
+                           "Which unfair clause type applies to this text?")
+
+
+@dataclass(frozen=True)
+class Snips(Framed):
+    """SNIPS (benayas/snips, Apache-2.0), seven labelled personal-assistant intents."""
+
+    weight: float = 1.0
+    revision: str = "16915b895754dd4028068abe52b6851a904977d7"
+    repo: ClassVar[str] = "benayas/snips"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+
+    def convert(self, row: dict) -> Example:
+        labels = ["AddToPlaylist", "BookRestaurant", "GetWeather", "PlayMusic", "RateBook",
+                  "SearchCreativeWork", "SearchScreeningEvent"]
+        return self.example(row["text"], "Which intent does this request express?",
+                            labels, labels.index(row["category"]))
+
+
+@dataclass(frozen=True)
+class PhishingEmail(Source):
+    """Phishing Email Detection (zefang-liu/phishing-email-dataset, LGPL-3.0-only), opt-in labelled emails.
+
+    Software copyleft applied to data is outside the default permissive/CC BY-SA policy.
+    Enable it with a positive weight only when accepting those terms.
+    """
+
+    weight: float = 0.0
+    revision: str = "34085a032c123ca237f314a01a67909cdea35e34"
+    repo: ClassVar[str] = "zefang-liu/phishing-email-dataset"
+    files: ClassVar[tuple[str, ...]] = ("Phishing_Email.csv",)
+    licence: ClassVar[str] = "LGPL-3.0-only"
+
+    def convert(self, row: dict) -> Example | None:
+        if not row["Email Text"].strip():
+            return None
+        return Example(row["Email Text"], {"phishing": Noul("Is this email a phishing attempt?")},
+                       {"phishing": "true" if row["Email Type"] == "Phishing Email" else "false"})
+
+
+@dataclass(frozen=True)
+class PubMedQA(Framed):
+    """PubMedQA's human-labelled subset (qiaojin/PubMedQA, MIT), yes/no/maybe over abstract context."""
+
+    weight: float = 1.0
+    revision: str = "9001f2853fb87cab8d220904e0de81ac6973b318"
+    repo: ClassVar[str] = "qiaojin/PubMedQA"
+    files: ClassVar[tuple[str, ...]] = ("pqa_labeled/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        options = ["yes", "no", "maybe"]
+        return self.example("\n".join(row["context"]["contexts"]), row["question"],
+                            options, options.index(row["final_decision"]))
+
+
+@dataclass(frozen=True)
+class MedMCQA(Framed):
+    """MedMCQA (openlifescienceai/medmcqa, Apache-2.0), four medical answers with the provided gold."""
+
+    weight: float = 1.0
+    revision: str = "91c6572c454088bf71b679ad90aa8dffcd0d5868"
+    repo: ClassVar[str] = "openlifescienceai/medmcqa"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["question"], "Which answer is correct?",
+                            [row[key] for key in ("opa", "opb", "opc", "opd")], row["cop"])
+
+
+@dataclass(frozen=True)
+class Qasc(Framed):
+    """QASC (allenai/qasc, CC-BY-4.0), eight answers without exposing the gold supporting facts."""
+
+    weight: float = 1.0
+    revision: str = "a34ba204eb9a33b919c10cc08f4f1c8dae5ec070"
+    repo: ClassVar[str] = "allenai/qasc"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["question"], "Which answer is correct?", row["choices"]["text"],
+                            row["choices"]["label"].index(row["answerKey"]))
+
+
+@dataclass(frozen=True)
+class CommonsenseQA(Framed):
+    """CommonsenseQA (tau/commonsense_qa, MIT), five alternatives with human-authored gold answers."""
+
+    weight: float = 1.0
+    revision: str = "94630fe30dad47192a8546eb75f094926d47e155"
+    repo: ClassVar[str] = "tau/commonsense_qa"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["question"], "Which answer is correct?", row["choices"]["text"],
+                            row["choices"]["label"].index(row["answerKey"]))
+
+
+@dataclass(frozen=True)
+class StrategyQA(Source):
+    """StrategyQA (ChilleD/StrategyQA, MIT), binary questions without gold reasoning in the state."""
+
+    weight: float = 1.0
+    revision: str = "705562638fe1d8ca6bb98c66fc8f94d45fda8c83"
+    repo: ClassVar[str] = "ChilleD/StrategyQA"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001-506370352f622815.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        return Example("", {"answer": Noul(row["question"])},
+                       {"answer": "true" if row["answer"] else "false"})
+
+
+@dataclass(frozen=True)
+class SciEntsBank(Source):
+    """SciEntsBank (nkazi/SciEntsBank, CC-BY-4.0), its five categorical student-answer grades."""
+
+    weight: float = 1.0
+    revision: str = "abaadf77345c5d68b73b630131a8ae164a45f3ab"
+    repo: ClassVar[str] = "nkazi/SciEntsBank"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        criteria = {"correct": "Correct", "contradictory": "Contradicts the reference answer",
+                    "partially_correct_incomplete": "Partially correct but incomplete",
+                    "irrelevant": "Irrelevant", "non_domain": "Not in the question's domain"}
+        question = Choice("How should the student's answer be graded against the reference answer?", criteria)
+        return Example({key: row[key] for key in ("question", "reference_answer", "student_answer")},
+                       {"grade": question}, {"grade": question.options[row["label"]]})
+
+
+@dataclass(frozen=True)
+class HelpSteer2(Source):
+    """HelpSteer2 (nvidia/HelpSteer2, CC-BY-4.0), five human 0-4 ratings in each example."""
+
+    weight: float = 1.0
+    revision: str = "990b2711a36180dd19d9c94b8627844866f8982a"
+    repo: ClassVar[str] = "nvidia/HelpSteer2"
+    files: ClassVar[tuple[str, ...]] = ("train.jsonl.gz",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        levels = {"helpfulness": ["Not helpful", "Slightly helpful", "Somewhat helpful", "Helpful",
+                                  "Very helpful"],
+                  "correctness": ["Incorrect", "Mostly incorrect", "Partially correct", "Mostly correct",
+                                  "Correct"],
+                  "coherence": ["Incoherent", "Mostly incoherent", "Somewhat coherent", "Mostly coherent",
+                                "Coherent"],
+                  "complexity": ["Basic", "Simple", "Moderate", "Complex", "Highly complex"],
+                  "verbosity": ["Very brief", "Brief", "Moderate length", "Detailed", "Very detailed"]}
+        questions = {name: Score(f"Rate the response's {name} on a scale from 0 to 4.", descriptions)
+                     for name, descriptions in levels.items()}
+        return Example({"prompt": row["prompt"], "response": row["response"]}, questions,
+                       {name: int(row[name]) for name in levels})
+
+
+@dataclass(frozen=True)
+class HateSpeech(Source):
+    """Measuring Hate Speech (ucberkeley-dlab/measuring-hate-speech, CC-BY-4.0), human ordinal votes."""
+
+    weight: float = 1.0
+    revision: str = "5468f6e118396646b02a2f691e771f6b6d9502ea"
+    repo: ClassVar[str] = "ucberkeley-dlab/measuring-hate-speech"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def count(self) -> int:
+        """Comments, not annotations: all votes for a comment belong in the same split."""
+        return len({row["comment_id"] for row in _rows(self.repo, self.revision, self.files[0])})
+
+    def convert(self, row: dict) -> Example:
+        # Sachdeva et al. 2022, Appendix A; codes increase in hatefulness (section 3.5).
+        question = Score("Does this comment contain hate speech, defined as bias-motivated, hostile and "
+                         "malicious language targeted at a person/group because of their actual or perceived "
+                         "innate characteristics, especially when the group is unnecessarily labeled?",
+                         ["No", "Unclear", "Yes"])
+        votes = row["votes"]
+        return Example(row["text"], {"hatespeech": question},
+                       targets={"hatespeech": tuple(vote / sum(votes) for vote in votes)})
+
+    def examples(self) -> list[Example]:
+        grouped = {}
+        for row in _rows(self.repo, self.revision, self.files[0]):
+            group = grouped.setdefault(row["comment_id"], {"text": row["text"], "votes": [0, 0, 0]})
+            group["votes"][int(row["hatespeech"])] += 1
+        selected = _draw(len(grouped), self.limit, self.held, self.seed)
+        return [self.convert(row) for index, row in enumerate(grouped.values())
+                if selected is None or index in selected]
+
+
+@dataclass(frozen=True)
+class Lavoir(Source):
+    """Lavoir dialogues (moganai/lavoir-dialogues, CC-BY-4.0), exact rule-derived routing posteriors."""
+
+    weight: float = 1.0
+    revision: str = "d2c66dc86c782fadccc14748d8fa073ca16a6090"
+    repo: ClassVar[str] = "moganai/lavoir-dialogues"
+    files: ClassVar[tuple[str, ...]] = tuple(f"data/train/{name}.jsonl" for name in
+                                           ("banking_support", "ecommerce_returns", "hr_requests",
+                                            "insurance_claims", "it_helpdesk", "privacy_requests",
+                                            "telecom_support", "travel_changes"))
+    licence: ClassVar[str] = "CC-BY-4.0"
+    natural: ClassVar[bool] = False
+
+    def convert(self, row: dict) -> Example:
+        question = Question.from_wire(row["question"])
+        return Example(row["state"], {"route": question},
+                       targets={"route": tuple(row["target"][name] for name in question.options)})
+
+
+@dataclass(frozen=True)
+class Mixture:
+    """The licensed sources; positive weights enable sources, and `write` computes their shares."""
 
     open_jev: OpenJev = field(default_factory=OpenJev)
     typed_decisions: TypedDecisions = field(default_factory=TypedDecisions)
@@ -541,12 +1349,38 @@ class Mixture:
     banking77: Intents = field(default_factory=Intents)
     clinc150: Clinc = field(default_factory=Clinc)
     wanli: Wanli = field(default_factory=Wanli)
-    hellaswag: HellaSwag = field(default_factory=HellaSwag)
     arc: Arc = field(default_factory=Arc)
     boolq: BoolQ = field(default_factory=BoolQ)
     gsm8k: Gsm8k = field(default_factory=Gsm8k)
     esci: Esci = field(default_factory=Esci)
     isarcasm: ISarcasm = field(default_factory=ISarcasm)
+    sgd: Sgd = field(default_factory=Sgd)
+    hover: Hover = field(default_factory=Hover)
+    contract_nli: ContractNli = field(default_factory=ContractNli)
+    winogrande: WinoGrande = field(default_factory=WinoGrande)
+    go_emotions: GoEmotions = field(default_factory=GoEmotions)
+    dbpedia: DBpedia = field(default_factory=DBpedia)
+    civil_comments: CivilComments = field(default_factory=CivilComments)
+    sms_spam: SmsSpam = field(default_factory=SmsSpam)
+    paws: Paws = field(default_factory=Paws)
+    fever: Fever = field(default_factory=Fever)
+    snli: Snli = field(default_factory=Snli)
+    mnli: MultiNli = field(default_factory=MultiNli)
+    pubmedqa: PubMedQA = field(default_factory=PubMedQA)
+    medmcqa: MedMCQA = field(default_factory=MedMCQA)
+    qasc: Qasc = field(default_factory=Qasc)
+    bias_in_bios: BiasInBios = field(default_factory=BiasInBios)
+    massive_intent: MassiveIntent = field(default_factory=MassiveIntent)
+    helpsteer2: HelpSteer2 = field(default_factory=HelpSteer2)
+    hate_speech_scales: HateSpeech = field(default_factory=HateSpeech)
+    commonsense_qa: CommonsenseQA = field(default_factory=CommonsenseQA)
+    sci_ents_bank: SciEntsBank = field(default_factory=SciEntsBank)
+    ledgar: Ledgar = field(default_factory=Ledgar)
+    unfair_tos: UnfairTos = field(default_factory=UnfairTos)
+    strategyqa: StrategyQA = field(default_factory=StrategyQA)
+    snips: Snips = field(default_factory=Snips)
+    phishing_email: PhishingEmail = field(default_factory=PhishingEmail)
+    lavoir_dialogues: Lavoir = field(default_factory=Lavoir)
     rows: Rows = field(default_factory=Rows)
 
     def sources(self) -> Iterator[tuple[str, Source]]:
@@ -566,26 +1400,59 @@ def row(example: Example) -> dict[str, Value]:
             "targets": {name: list(target) for name, target in example.targets.items()}}
 
 
-def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None) -> dict[str, Value]:
+def shares(counts: dict[str, int], cap: int = 200_000) -> dict[str, float]:
+    """T=3 temperature shares of capped train counts, redistributing excess above ten epochs per pass."""
+    if cap <= 0 or any(count < 0 for count in counts.values()):
+        raise ValueError("the cap must be positive and training counts non-negative")
+    sizes = {name: min(count, cap) for name, count in counts.items()}
+    total = sum(sizes.values())
+    result = dict.fromkeys(sizes, 0.0)
+    free = {name: size ** (1 / 3) for name, size in sizes.items() if size}
+    while free:
+        room, scale = 1 - sum(result.values()), sum(free.values())
+        proposed = {name: room * weight / scale for name, weight in free.items()}
+        limited = {name for name, share in proposed.items() if share * total > 10 * sizes[name]}
+        if not limited:
+            result.update(proposed)
+            break
+        for name in limited:
+            result[name] = 10 * sizes[name] / total
+            del free[name]
+    return result
+
+
+def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None,
+          cap: int = 200_000) -> dict[str, Value]:
     """Write `mixture`'s sets under `out`, each decontaminated against `overlaps`, and return what
     `<out>/mixture.json` records."""
     out.mkdir(parents=True, exist_ok=True)
+    if cap <= 0:
+        raise ValueError("cap must be positive")
     counts: dict[str, Value] = {}
+    sizes = {}
     for name, source in mixture.sources():
+        source = dataclasses.replace(source, limit=cap if source.limit is None else min(source.limit, cap))
         train, held = source.split()
         if overlaps is not None:
             train = overlaps.keep(name, train, source.natural)
             held = overlaps.keep(f"{name} (held out)", held, source.natural)
         for suffix, examples in ((".jsonl", train), (".held.jsonl", held)):
             if examples:
-                lines = (json.dumps(row(example), ensure_ascii=False) + "\n" for example in examples)
-                (out / f"{name}{suffix}").write_text("".join(lines))
+                with (out / f"{name}{suffix}").open("w") as file:
+                    for example in examples:
+                        file.write(json.dumps(row(example), ensure_ascii=False) + "\n")
         counts[name] = {"train": len(train), "held": len(held)}
+        sizes[name] = len(train)
     made: dict[str, Value] = {
-        "weights": {name: source.weight for name, source in mixture.sources()},
+        "temperature": 3,
+        "cap": cap,
+        "max_epochs": 10,
+        "weights": shares(sizes, cap),
         "rows": counts,
         "sources": {name: {"class": type(source).__name__, **dataclasses.asdict(source)}
                     for name, source in mixture.sources()},
+        "licences": {entry.name: source.licence_record() for entry in fields(mixture)
+                     if (source := getattr(mixture, entry.name)).repo or source.weight > 0},
         "decontamination": None if overlaps is None else dict(overlaps.report),
     }
     (out / "mixture.json").write_text(json.dumps(made, indent=1) + "\n")
@@ -598,16 +1465,8 @@ class Conversion:
 
     out: str = "data/mixture"
     decontaminate: str | None = None
-    headroom: bool = False
-    """Add ESCI and iSarcasmEval at weights 0.02 and 0.01; the default mixture does not read either."""
+    cap: int = 200_000
     mixture: Mixture = field(default_factory=Mixture)
-
-    def selected(self) -> Mixture:
-        """The mixture, with the two permissively licensed headroom sources when requested."""
-        if not self.headroom:
-            return self.mixture
-        return dataclasses.replace(self.mixture, esci=dataclasses.replace(self.mixture.esci, weight=0.02),
-                                   isarcasm=dataclasses.replace(self.mixture.isarcasm, weight=0.01))
 
 
 if __name__ == "__main__":
@@ -616,4 +1475,4 @@ if __name__ == "__main__":
 
     conversion = tyro.cli(Conversion)
     overlaps = None if conversion.decontaminate is None else Overlaps.load(conversion.decontaminate)
-    print(json.dumps(write(conversion.selected(), Path(conversion.out), overlaps)["rows"]))
+    print(json.dumps(write(conversion.mixture, Path(conversion.out), overlaps, conversion.cap)["rows"]))
