@@ -177,13 +177,23 @@ class PPOObjective(Objective[Ratio, Variables]):
         A critic that does not return one value per input position raises
         `ValueError`.
         """
+        return self._critic_scores(variables, batch)[0]
+
+    def _critic_scores(self, variables: Variables, batch: Mapping[str, object], *, qk_stats: bool = False
+                       ) -> tuple[jax.Array, Variables | None]:
+        """The critic's values and, when requested, the QK collection from that same forward."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         values = self.critic.apply(part(variables, "critic"), ids[:, :-1], segment_ids=segments[:, :-1],
-                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1])
+                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32)[:, :-1],
+                                   mutable=["qk"] if qk_stats else False)
+        qk = None
+        if qk_stats:
+            values, gathered = values
+            qk = gathered.get("qk")
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
-        return onto_ids(batch, values.astype(jnp.float32))
+        return onto_ids(batch, values.astype(jnp.float32)), qk
 
     def loss(self, variables: Variables, batch, step: Step) -> tuple[Ratio, Aux[Variables]]:
         """Return the actor's policy loss plus the weighted, clipped value error, over the same mass.
@@ -197,11 +207,19 @@ class PPOObjective(Objective[Ratio, Variables]):
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
         pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        terms = clipped_value_loss_terms(self.values(variables, batch), jnp.asarray(batch[RETURNS_KEY]),
+        values, critic_qk = self._critic_scores(variables, batch, qk_stats=self.actor.qk_stats)
+        terms = clipped_value_loss_terms(values, jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), pg.mass)
         metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
-        return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics)
+        qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
+        if critic_qk is not None:
+            qk = {**(qk or {}), "critic": critic_qk}
+        return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics, qk_stats=qk)
+
+    def validation_loss(self, variables: Variables, batch, step: Step):
+        """Score source prompts under the live actor, without rollout targets or the critic."""
+        return self.actor.validation_loss(part(variables, "policy"), batch, replace(step, ema=None))
 
     def evaluate(self, params: Variables, batch, step: Step):
         return self.actor.evaluate(part(params, "policy"), batch, replace(step, ema=None))
