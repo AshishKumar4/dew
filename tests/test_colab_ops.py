@@ -1014,8 +1014,14 @@ def test_launcher_always_sets_a_finite_session_budget(tmp_path, monkeypatch, exp
 
 
 def test_artifact_exclusions_match_incremental_and_final_without_losing_nested_logs(tmp_path):
-    paths = ("out/e1/train.log", "out/result.jsonl", "out/e1/mix/train.jsonl",
-             "out/mix-long/train.jsonl", "out/mix-long-3072/rows.jsonl", "out/autotune/cache.bin")
+    paths = (
+        "out/e1/train.log",
+        "out/result.jsonl",
+        "out/e1/mix/train.jsonl",
+        "out/mix-long/train.jsonl",
+        "out/mix-long-3072/rows.jsonl",
+        "out/autotune/cache.bin",
+    )
     for name in paths:
         write(tmp_path / name)
     excludes = ["*/mix/*", "*/mix-long*/*", "*/autotune/*"]

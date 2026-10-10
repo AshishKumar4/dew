@@ -275,8 +275,13 @@ class Batch:
         )
         status.update(exit=code, seconds=round(time.time() - began), command_finished_at=time.time())
         self.save_job(job, status)
-        colab_sync.pack_outputs(tree, job["outputs"], home / "outputs.tar.gz", job["artifact_policy"],
-                                job.get("artifact_excludes", []))
+        colab_sync.pack_outputs(
+            tree,
+            job["outputs"],
+            home / "outputs.tar.gz",
+            job["artifact_policy"],
+            job.get("artifact_excludes", []),
+        )
         status.update(
             stage_seconds=round(time.time() - started), artifact_manifest="outputs.tar.gz.manifest.json"
         )
