@@ -176,6 +176,21 @@ def test_the_layer_matches_mamba2_mixer(reference, geometry):
     assert largest(out, reference["layer.output"]) < BOUND
 
 
+def test_a_call_shorter_than_the_conv_reads_the_first_tokens_as_a_longer_one(reference, geometry):
+    """Two tokens, fewer than the conv kernel's three of history: the zeros
+    ahead of them still span the whole history, so their outputs are the
+    first two of the 70-token call's."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])
+    assert hidden.shape[1] > 2 and geometry["conv_kernel"] - 1 > 2
+
+    out = module.apply(variables, hidden[:, :2])
+
+    assert out.shape == (hidden.shape[0], 2, geometry["hidden_size"])
+    assert largest(out, reference["layer.output"][:, :2]) < BOUND
+
+
 def test_the_layer_in_bfloat16_matches_the_reference_in_bfloat16(reference, geometry):
     """Compute in bfloat16 with fp32 parameters, against the reference run
     in bfloat16 end to end; the scan itself is fp32 in both. Largest

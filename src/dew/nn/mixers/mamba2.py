@@ -65,6 +65,7 @@ from dew.nn.sharding import (
     logical_axes,
     logical_spec,
     manual_map,
+    rows_like,
     sequence_shards,
 )
 
@@ -205,7 +206,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
 
     x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
     a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    carried = (jnp.zeros((batch, heads, head_dim, state_size), work) if state is None
+    carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
                else jnp.asarray(state, work))
     platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
     scanned, final = (xla_chunk_scan(x_c, B_c, C_c, a_c, carried) if platform is None else
@@ -486,7 +487,7 @@ def _sequence_mix(mixed, dt, segments, weights, *, scan, axis: str | None = None
     width = taps.shape[1] - 1
     mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
     batch, channels, length = mixed.shape
-    history = jnp.zeros((batch, channels, width), mixed.dtype)
+    history = rows_like(jnp.zeros((batch, channels, width), mixed.dtype), mixed)
     forward = None
     if axis is not None:
         if length < width:

@@ -43,7 +43,7 @@ from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
-from .sharding import SEQUENCE_AXIS, STAGE_AXIS, logical_spec, mesh_axes
+from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
 # from either leaves the same convolution chain open to the faulty rewrite.
@@ -62,10 +62,10 @@ def _barrier(x: jax.Array) -> jax.Array:
 
 def _automatic_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
     """The mesh axes above size one that GSPMD places: neither a
-    `shard_map`'s manual axes nor the stage axis, which a pipeline's stage
-    vmap holds."""
-    return [axis for axis in mesh.axis_names if mesh.shape[axis] > 1
-            and axis not in mesh.manual_axes and axis != STAGE_AXIS]
+    `shard_map`'s manual axes, an Explicit axis, which an array's type
+    places, nor the stage axis, which a pipeline's stage vmap holds."""
+    return [axis for axis in mesh.axis_names if mesh.shape[axis] > 1 and axis not in mesh.manual_axes
+            and axis not in mesh.explicit_axes and axis != STAGE_AXIS]
 
 
 def _promoted_whole(*arrays: jax.Array | None, dtype: DTypeLike | None = None,
@@ -93,7 +93,7 @@ def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
     if not automatic:
         return x
     batched = x.ndim > spatial + 1
-    rows = logical_spec(("activation_batch",), x.shape[:1]) if batched else P()
+    rows = auto_part(logical_spec(("activation_batch",), x.shape[:1]), mesh) if batched else P()
     entries: list[list[str]] = [list(mesh_axes(rows[0])) if rows else []]
     entries += [[] for _ in x.shape[1:]]
     for axis in sorted(automatic, key=lambda axis: axis != SEQUENCE_AXIS):
