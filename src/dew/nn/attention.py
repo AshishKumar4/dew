@@ -316,8 +316,12 @@ def layer_normalized(x, scale, bias, epsilon: float, dtype):
 
 def l2_normalized(x, eps: float = 1e-12):
     """torch's `F.normalize`: `x` over its L2 norm on the last axis, the norm
-    held at `eps` at least."""
-    return x / jnp.maximum(jnp.linalg.norm(x, axis=-1, keepdims=True), eps)
+    held at `eps` at least.
+
+    The norm is the root of the squared norm held at `eps`², the same value,
+    so a zero vector's gradient is zero: the root of a sum that is zero has
+    an infinite slope, which the floor's zero gradient would turn into NaN."""
+    return x / jnp.sqrt(jnp.maximum(jnp.sum(jnp.square(x), axis=-1, keepdims=True), eps * eps))
 
 
 def unweighted_rmsnorm(x, eps: float):
