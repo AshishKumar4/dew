@@ -319,6 +319,45 @@ def test_empty_native_tool_discovery_is_an_export_failure(tmp_path, native_repor
     assert active_profile() is None
 
 
+@pytest.mark.parametrize("column, names, recorded", [
+    ("hlo_op_name", ["XlaModule/loop_add_fusion", "XlaModule/gemm_fusion_dot_3"], "command buffers"),
+    ("hlo_op_name", ["XlaModule/DelayKernel", "loop_add_fusion"], None),
+    ("op", ["loop_add_fusion"], "unknown"),
+], ids=["module only", "an op named", "no op column"])
+def test_a_gpu_capture_that_names_no_op_says_why(tmp_path, monkeypatch, caplog, column, names, recorded):
+    """Kernels a CUDA command buffer recorded before the capture are reported
+    under their module, so hlo_stats names no HLO op. The manifest records it
+    and a warning names the flag that profiles op by op; a capture that names
+    any op records nothing; and a table without the column that names ops is
+    recorded as unknown, without the warning, so a change in XProf's schema
+    shows."""
+    module = importlib.import_module("dew.telemetry.profile")
+    table = {"cols": [{"id": "rank"}, {"id": column}],
+             "rows": [{"c": [{"v": rank}, {"v": name}]} for rank, name in enumerate(names)]}
+
+    class Converter:
+        def xspace_to_tool_names(self, paths):
+            return ["hlo_stats"]
+
+        def xspace_to_tool_data(self, paths, tool, params):
+            return json.dumps([table]), "application/json"
+
+    (tmp_path / "plugins/profile/session").mkdir(parents=True)
+    (tmp_path / "plugins/profile/session/host.xplane.pb").write_bytes(b"")
+    metadata = {"backend": "gpu"}
+    module._reports(tmp_path, Converter(), metadata)
+
+    record = manifest(tmp_path)
+    warned = [entry.getMessage() for entry in caplog.records if entry.name == module.__name__]
+    if recorded is None:
+        assert "op_attribution" not in record and not warned
+    elif recorded == "unknown":
+        assert record["op_attribution"].startswith("unknown") and not warned
+    else:
+        assert record["op_attribution"] == module.COMMAND_BUFFERS
+        assert any("--xla_gpu_enable_command_buffer=" in message for message in warned)
+
+
 @pytest.mark.parametrize("phase", ["start", "stop"])
 @pytest.mark.parametrize("drain_fails", [False, True])
 def test_blocked_lifecycle_drain_refuses_conflicts_without_holding_mutex(
