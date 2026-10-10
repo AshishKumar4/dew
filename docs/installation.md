@@ -41,7 +41,18 @@ Add the extra that matches the hardware:
 
 Each extra installs the accelerator build of JAX 0.11.2, the version Dew requires; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
-The [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) lists the driver each build needs. `JAX_PLATFORMS` selects the backend before JAX is imported; `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
+### Which CUDA build
+
+The driver and the GPU decide the build, newest first:
+
+| Build | NVIDIA driver | GPU (SM) |
+|---|---|---|
+| `cuda13` | 580 or later | 7.5 or later |
+| `cuda12` | 525 or later | 5.2 or later |
+
+`nvidia-smi --query-gpu=driver_version,compute_cap --format=csv,noheader` prints both; with several GPUs the oldest SM counts. These are the minimums in the [JAX installation guide](https://docs.jax.dev/en/latest/installation.html) and in Table 3 of NVIDIA's [CUDA release notes](https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html). Neither build runs on an older driver or GPU. The [dewml.dev install script](https://dewml.dev/install.sh) applies the same rule.
+
+`import dew` applies it too: on a machine with an NVIDIA GPU, it stops when JAX would run on the CPU, because no CUDA build is installed or the installed one can't run on this driver, and it prints the install that fixes it. `JAX_PLATFORMS` selects the backend before JAX is imported. `JAX_PLATFORMS=cpu python train.py` runs on the CPU on a GPU machine, and the check leaves it alone. On Colab the tutorials install `dewml[cuda13]`. [Cloud TPUs](tpu.md) covers TPU provisioning.
 
 ### Process pools across GPUs
 
