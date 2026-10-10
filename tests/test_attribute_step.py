@@ -12,6 +12,8 @@ import json
 import pytest
 from tool_support import load
 
+from dew.telemetry.instrumentation import custom_call_kind, hlo_instructions
+
 attribute = load("attribute_step")
 
 MODULE = """HloModule jit_step
@@ -102,7 +104,18 @@ ROWS = {
 def test_an_op_is_kinded_by_what_it_runs_not_by_its_operands_names(case):
     """With the module, a custom call is kinded by its target and a fusion by the ops it runs."""
     found, kind = ROWS[case]
-    assert attribute.kind_of(found, attribute.instructions(MODULE)) == kind
+    assert attribute.kind_of(found, hlo_instructions(MODULE)) == kind
+
+
+@pytest.mark.parametrize("target, kind", [
+    ("__cublas$lt$matmul", "gemm"), ("__cublas$gemm", "gemm"), ("__cudnn$convBackwardInput", "convolution"),
+    ("__cudnn$fmhaSoftmaxBackward", "attention"), ("dew_flash_mha_fwd", "attention"),
+    ("__gpu$xla.gpu.triton", "triton"), ("xla.gpu.ext.custom", None),
+])
+def test_a_custom_calls_kind_is_one_table_the_flop_count_and_the_attribution_share(target, kind):
+    """cuBLAS, cuDNN's convolutions and fused attention, Dew's FlashAttention-2 and Pallas's
+    Triton calls are told apart by target; anything else is no known kind."""
+    assert custom_call_kind(target) == kind
 
 
 @pytest.mark.parametrize("case, kind", [
