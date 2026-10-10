@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap
 from safetensors.numpy import load_file, save_file
 
 from dew.nn.autoencoders.dc_ae import dc_ae_fields, dc_ae_path, load_dc_ae
@@ -48,12 +48,6 @@ def channels_last(array):
     return np.asarray(array).transpose(0, 2, 3, 1)
 
 
-def scaled_gap(actual, expected) -> float:
-    expected = np.asarray(expected, np.float64)
-    difference = np.abs(np.asarray(actual, np.float64) - expected).max()
-    return float(difference / max(1.0, float(np.abs(expected).max())))
-
-
 def parameter_gaps(layouts, gradients, reference, walk: str) -> dict[str, float]:
     """Each native gradient of a source parameter, exported to its tensor's
     layout, against the source's gradient of that tensor. The batch norms'
@@ -66,13 +60,8 @@ def parameter_gaps(layouts, gradients, reference, walk: str) -> dict[str, float]
 def test_every_published_tensor_is_mapped_and_exports_bit_identical(variant):
     directory, (_, params, layouts, _), _ = variant
     tensors = load_file(directory / "diffusion_pytorch_model.safetensors")
-    counted = {name for name in tensors if not name.endswith("num_batches_tracked")}
-    assert {layout.name for layout in layouts} == {f"vae/{name}" for name in counted}
-    for layout in layouts:
-        written = layout.export({"autoencoder": params})
-        published = tensors[layout.name.removeprefix("vae/")]
-        assert written.dtype == published.dtype and written.shape == published.shape, layout.name
-        assert written.tobytes() == published.tobytes(), layout.name
+    counted = {name: tensor for name, tensor in tensors.items() if not name.endswith("num_batches_tracked")}
+    assert_layout_tensors(layouts, {"autoencoder": params}, counted, "vae/")
 
 
 def test_the_latent_matches_the_source(variant):

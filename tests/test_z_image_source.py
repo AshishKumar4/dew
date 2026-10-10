@@ -22,7 +22,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import extract_fixture, fixture_arrays
+from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays, scaled_gap as relative_gap
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, translate_z_image_weights, z_image_fields
@@ -49,11 +49,6 @@ def record(source):
 @pytest.fixture(scope="module")
 def arrays(source):
     return fixture_arrays(source / "z_image.npz")
-
-
-def relative_gap(actual, expected) -> float:
-    actual, expected = np.asarray(actual, np.float64), np.asarray(expected, np.float64)
-    return float(np.abs(actual - expected).max() / max(1.0, float(np.abs(expected).max())))
 
 
 def nhwc(latents):
@@ -85,10 +80,7 @@ def inputs(name, arrays, record):
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
     tensors = component_tensors(source / name, "transformer")
-    assert {layout.name for layout in layouts} == {f"transformer/{key}" for key in tensors}
-    for layout in layouts:
-        written = layout.export({"params": params})
-        assert written.tobytes() == tensors[layout.name.removeprefix("transformer/")].tobytes(), layout.name
+    assert_layout_tensors(layouts, {"params": params}, tensors, "transformer/")
 
 
 @pytest.mark.parametrize("name", CASES)
