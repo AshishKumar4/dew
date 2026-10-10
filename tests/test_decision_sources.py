@@ -458,6 +458,7 @@ def test_hate_speech_groups_annotator_votes_by_comment(sources, monkeypatch):
     rows.append({"comment_id": 2, "text": "Second", "hatespeech": 0.})
     monkeypatch.setattr(sources, "_rows", lambda *args: iter(rows))
     examples = sources.HateSpeech().examples()
+    assert sources.HateSpeech().count() == 2
     assert len(examples) == 2
     assert [row.state for row in examples] == ["First", "Second"]
     assert examples[0].targets == {"hatespeech": (.25, .25, .5)}
@@ -586,7 +587,11 @@ TRAIN_COUNTS = {
 @pytest.mark.parametrize(("name", "count"), TRAIN_COUNTS.items())
 def test_new_pinned_train_row_counts(sources, name, count):
     source = getattr(sources.Mixture(), name)
-    assert source.count() == count
+    if name == "hate_speech_scales":
+        assert sources.Source.count(source) == count
+        assert source.count() == 39565
+    else:
+        assert source.count() == count
     sample = dataclasses.replace(source, limit=3, held=0).examples()
     assert 1 <= len(sample) <= 3
     assert all(row.answers or row.targets for row in sample)

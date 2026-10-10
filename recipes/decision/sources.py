@@ -210,9 +210,7 @@ class Source:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        population = (self.count() if self.limit is not None and len(examples) >= self.limit
-                      else len(examples))
-        population = population or len(examples)
+        population = self.count() or len(examples)
         count = _held(population, self.held)
         count = min(count, len(examples))
         held, train = examples[:count], examples[count:]
@@ -1200,6 +1198,10 @@ class HateSpeech(Source):
     repo: ClassVar[str] = "ucberkeley-dlab/measuring-hate-speech"
     files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
     licence: ClassVar[str] = "CC-BY-4.0"
+
+    def count(self) -> int:
+        """Comments, not annotations: all votes for a comment belong in the same split."""
+        return len({row["comment_id"] for row in _rows(self.repo, self.revision, self.files[0])})
 
     def convert(self, row: dict) -> Example:
         # Sachdeva et al. 2022, Appendix A; codes increase in hatefulness (section 3.5).
