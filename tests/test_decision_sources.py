@@ -137,7 +137,8 @@ def test_pinned_esci_and_isarcasm_have_the_released_train_counts(sources, name):
 
         source = sources.Esci(limit=15_000)
         path = sources._github(source.repo, source.revision,
-                               "shopping_queries_dataset/shopping_queries_dataset_examples.parquet", media=True)
+                               "shopping_queries_dataset/shopping_queries_dataset_examples.parquet",
+                               media=True)
         table = pq.read_table(path, columns=["product_locale"],
                               filters=[("split", "=", "train"), ("small_version", "=", 1)])
         locales = Counter(table["product_locale"].to_pylist())
@@ -270,7 +271,8 @@ def test_fever_includes_evidence_and_three_gold_labels(sources, monkeypatch):
 ])
 def test_binary_text_converters(sources, name, text_key, label_key, question, answer_key, yes, no):
     for label, gold in ((yes, "true"), (no, "false")):
-        example = getattr(sources, name)().convert({text_key: "A message.\nWith two lines.", label_key: label})
+        row = {text_key: "A message.\nWith two lines.", label_key: label}
+        example = getattr(sources, name)().convert(row)
         assert example.state == "A message.\nWith two lines."
         assert example.questions[answer_key].wire() == {"type": "noul", "instructions": question}
         assert example.answers == {answer_key: gold}
@@ -278,7 +280,8 @@ def test_binary_text_converters(sources, name, text_key, label_key, question, an
 
 def test_paws_uses_both_sentences_and_binary_gold(sources):
     for label, gold in ((1, "true"), (0, "false")):
-        example = sources.Paws().convert({"sentence1": "A follows B.", "sentence2": "B follows A.", "label": label})
+        example = sources.Paws().convert({"sentence1": "A follows B.", "sentence2": "B follows A.",
+                                         "label": label})
         assert example.state == {"sentence1": "A follows B.", "sentence2": "B follows A."}
         assert example.questions["paraphrase"].wire() == {
             "type": "noul", "instructions": "Do these sentences express the same meaning?"}
@@ -326,10 +329,12 @@ def test_civil_comments_preserves_every_annotator_fraction(sources):
     ("Ledgar", {"text": "The parties agree.", "label": 1}, "The parties agree.",
      "Which type of contract clause is this?", ["Adjustments", "Agreements", "Amendments"], "Agreements"),
     ("MassiveIntent", {"text": "Wake me.", "label": 2}, "Wake me.",
-     "Which intent does this request express?", ["datetime_query", "iot_hue_lightchange", "alarm_set"], "alarm_set"),
+     "Which intent does this request express?", ["datetime_query", "iot_hue_lightchange", "alarm_set"],
+     "alarm_set"),
     ("Snips", {"text": "Play jazz.", "category": "PlayMusic"}, "Play jazz.",
      "Which intent does this request express?", ["AddToPlaylist", "BookRestaurant", "GetWeather", "PlayMusic",
-                                                "RateBook", "SearchCreativeWork", "SearchScreeningEvent"], "PlayMusic"),
+                                                "RateBook", "SearchCreativeWork", "SearchScreeningEvent"],
+     "PlayMusic"),
     ("BiasInBios", {"hard_text": "He writes software.", "profession": 24, "gender": 1}, "He writes software.",
      "What is this person's occupation?", ["accountant", "architect", "attorney", "chiropractor", "comedian",
          "composer", "dentist", "dietitian", "dj", "filmmaker", "interior_designer", "journalist", "model",
@@ -376,17 +381,20 @@ def test_medmcqa_uses_zero_based_gold_without_explanation(sources, monkeypatch):
 def test_pubmedqa_uses_labeled_context_not_long_answer(sources, monkeypatch):
     monkeypatch.setattr(sources, "_unit", lambda text, salt: 1. if salt == "keys" else 0.)
     for label in ("yes", "no", "maybe"):
-        example = sources.PubMedQA().convert({"question": "Does it work?", "context": {"contexts": ["A", "B"]},
+        example = sources.PubMedQA().convert({"question": "Does it work?",
+                                              "context": {"contexts": ["A", "B"]},
                                               "long_answer": "Hidden answer", "final_decision": label})
         assert example.state == "A\nB"
         assert example.questions["answer"].wire() == {
-            "type": "choice", "instructions": "Does it work?", "criteria": dict.fromkeys(["yes", "no", "maybe"])}
+            "type": "choice", "instructions": "Does it work?",
+            "criteria": dict.fromkeys(["yes", "no", "maybe"])}
         assert example.answers == {"answer": label}
 
 
 def test_strategyqa_omits_gold_facts(sources):
     for label in (False, True):
-        example = sources.StrategyQA().convert({"question": "Is it older?", "answer": label, "facts": "Secret"})
+        example = sources.StrategyQA().convert({"question": "Is it older?", "answer": label,
+                                                "facts": "Secret"})
         assert example.state == ""
         assert example.questions["answer"].wire() == {"type": "noul", "instructions": "Is it older?"}
         assert example.answers == {"answer": str(label).lower()}
@@ -395,13 +403,16 @@ def test_strategyqa_omits_gold_facts(sources):
 def test_scientsbank_keeps_the_five_categorical_grades(sources):
     labels = ["correct", "contradictory", "partially_correct_incomplete", "irrelevant", "non_domain"]
     for index, label in enumerate(labels):
-        example = sources.SciEntsBank().convert({"question": "Why?", "reference_answer": "A", "student_answer": "B",
+        example = sources.SciEntsBank().convert({"question": "Why?", "reference_answer": "A",
+                                                 "student_answer": "B",
                                                  "label": index})
         assert example.state == {"question": "Why?", "reference_answer": "A", "student_answer": "B"}
         question = example.questions["grade"]
         assert isinstance(question, Choice) and question.options == tuple(labels)
-        assert question.instructions == "How should the student's answer be graded against the reference answer?"
-        assert question.descriptions == ("Correct", "Contradicts the reference answer", "Partially correct but incomplete",
+        assert question.instructions == (
+            "How should the student's answer be graded against the reference answer?")
+        assert question.descriptions == ("Correct", "Contradicts the reference answer",
+                                          "Partially correct but incomplete",
                                           "Irrelevant", "Not in the question's domain")
         assert example.answers == {"grade": label}
 
@@ -454,7 +465,8 @@ def test_winogrande_reproduces_the_kits_empty_state_and_letter_options(sources):
                                                 "answer": answer})
         assert example.state == {}
         assert example.questions["q1"].wire() == {"type": "choice",
-            "instructions": "Which option correctly fills the blank?\n_ is taller.", "criteria": {"A": "Ava", "B": "Bo"}}
+            "instructions": "Which option correctly fills the blank?\n_ is taller.",
+            "criteria": {"A": "Ava", "B": "Bo"}}
         assert example.answers == {"q1": expected}
 
 
@@ -497,24 +509,28 @@ def test_contractnli_reads_only_train_and_groups_hypotheses(sources, monkeypatch
     assert example.answers == {"nda": "Entailment", "sale": "NotMentioned"}
     for name, label in labels.items():
         assert example.questions[name].wire() == {"type": "choice",
-            "instructions": "Classify the relationship between the contract and this hypothesis:\n" + label["hypothesis"],
+            "instructions": ("Classify the relationship between the contract and this hypothesis:\n" +
+                             label["hypothesis"]),
             "criteria": {"Entailment": "The contract entails the hypothesis.",
                          "Contradiction": "The contract contradicts the hypothesis.",
-                         "NotMentioned": "The hypothesis is neither entailed nor contradicted by the contract."}}
+                         "NotMentioned": ("The hypothesis is neither entailed nor contradicted "
+                                          "by the contract.")}}
 
 
 def test_hover_joins_complete_articles_in_nfd_without_duplicate_titles(sources, monkeypatch, tmp_path):
     path = tmp_path / "wiki.db"
     with sqlite3.connect(path) as db:
         db.execute("CREATE TABLE documents (id TEXT, text TEXT)")
-        db.execute("INSERT INTO documents VALUES (?, ?)", (unicodedata.normalize("NFD", "Café"), "Full article."))
+        db.execute("INSERT INTO documents VALUES (?, ?)",
+                   (unicodedata.normalize("NFD", "Café"), "Full article."))
     claims = [{"claim": "There is a cafe.", "label": label, "supporting_facts": [["Café", 0], ["Café", 1]]}
               for label in ("SUPPORTED", "NOT_SUPPORTED")]
     monkeypatch.setattr(sources, "_evidence_database", lambda: path)
     monkeypatch.setattr(sources.Hover, "claims", lambda self: claims)
     examples = sources.Hover().examples()
     for example, claim in zip(examples, claims, strict=True):
-        assert example.state == {"claim": "There is a cafe.", "evidence": [{"title": "Café", "text": "Full article."}]}
+        assert example.state == {"claim": "There is a cafe.",
+                                  "evidence": [{"title": "Café", "text": "Full article."}]}
         assert example.questions["q"].wire() == {"type": "choice",
             "instructions": "Is the claim supported by the evidence?",
             "criteria": {"SUPPORTED": "The evidence supports the claim.",
