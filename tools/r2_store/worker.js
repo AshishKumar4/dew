@@ -1,8 +1,9 @@
-// Dew CI's shared XLA compilation cache (tests/remote_cache.py): GET, HEAD
-// and PUT of /<key> in the dew-xla-cache bucket, and GET /?list=<prefix>
-// for the keys under a prefix, a page at a time, for a bearer of the
-// CACHE_TOKEN secret, which armada-dew2 holds as DEW_XLA_CACHE_TOKEN. A miss
-// is a 404. The bucket expires an entry 14 days after it is written.
+// One of Dew's R2 object stores, each its own Worker over its own bucket
+// (dew-xla-cache.jsonc, dew-data.jsonc; provision.sh): GET, HEAD and PUT of
+// /<key> in the bucket bound as CACHE, and GET /?list=<prefix> for the keys
+// under a prefix, a page at a time, for a bearer of the store's CACHE_TOKEN
+// secret. A miss is a 404. How long an object lives is its bucket's
+// lifecycle, which provision.sh sets.
 const MAX_BYTES = 256 * 1024 * 1024;
 const KEY = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 
