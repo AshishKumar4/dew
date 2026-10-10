@@ -868,6 +868,21 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table(page_size):
 
 
 @pytest.mark.parametrize("implementation", ["reference", "xla"])
+def test_normal_attention_ends_each_rows_keys_at_its_length_as_a_prefix_mask_does(implementation):
+    """Key lengths keep each row's first keys, as the prefix mask of those lengths
+    does, bitwise: a right-padded context's padding reads as nothing either way."""
+    module = NormalAttention(16, heads=2, dim_head=8, attention_impl=implementation)
+    rng = np.random.default_rng(1)
+    queries = jnp.asarray(rng.normal(size=(3, 5, 16)), jnp.float32)
+    context = jnp.asarray(rng.normal(size=(3, 7, 16)), jnp.float32)
+    params = module.init(jax.random.key(0), queries, context)
+    lengths = jnp.asarray([7, 4, 1])
+    prefix = (jnp.arange(7)[None, :] < lengths[:, None])[:, None, None, :]
+    np.testing.assert_array_equal(module.apply(params, queries, context, key_value_seq_lengths=lengths),
+                                  module.apply(params, queries, context, mask=prefix))
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla"])
 def test_normal_attention_reads_only_the_keys_its_mask_keeps(implementation):
     """A key the mask drops leaves the output bitwise unchanged when its value
     moves, which the unmasked call does not. An all-True mask computes the
