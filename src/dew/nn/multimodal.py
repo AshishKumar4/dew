@@ -14,6 +14,7 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.protocols import OutputTable, ProjectionGroup
+from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 
 if TYPE_CHECKING:
@@ -170,7 +171,8 @@ class AudioConditioner(nn.Module):
 
 def _place(embeddings: jax.Array, table: jax.Array, indices: jax.Array) -> jax.Array:
     """Replace the marked slots of embeddings with the indexed table rows."""
-    picked = table[jnp.arange(embeddings.shape[0])[:, None], jnp.maximum(indices, 0)]
+    rows = (jnp.arange(embeddings.shape[0])[:, None], jnp.maximum(indices, 0))
+    picked = table.at[rows].get(out_sharding=explicit_spec(indices, table.ndim - 2))
     return jnp.where((indices >= 0)[..., None], picked.astype(embeddings.dtype), embeddings)
 
 

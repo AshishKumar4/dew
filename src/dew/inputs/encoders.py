@@ -23,6 +23,7 @@ import numpy as np
 from flax.typing import Dtype
 from typing_extensions import TypeVar
 
+from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
 from dew.nn.text_encoders import (
     DEFAULT_MODEL,
@@ -310,9 +311,9 @@ class CharTable(ConditionEncoder[str, TextContext]):
         return {"input_ids": ids, "attention_mask": mask}
 
     def encode(self, params, tokens) -> TextContext:
-        hidden = params["table"][jnp.asarray(tokens["input_ids"])]
-        if self.dtype is not None:
-            hidden = hidden.astype(self.dtype)
+        table = params["table"]
+        dtype = table.dtype if self.dtype is None else self.dtype
+        hidden = table_rows(table, jnp.asarray(tokens["input_ids"]), dtype)
         return TextContext(hidden=hidden, mask=jnp.asarray(tokens["attention_mask"]))
 
     def captions(self, tokens) -> tuple[str, ...]:

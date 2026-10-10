@@ -33,7 +33,7 @@ from ..attention import LayerNorm
 from ..dit import ROPE_THETA, ModulatedBlock, _JepaStackOptions, build_block_pattern, scan_ordered_pos_embed
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
-from ..sharding import constrain, down_projection
+from ..sharding import constrain, down_projection, rows_like
 from .dit import gather_tokens
 
 
@@ -206,7 +206,7 @@ class JepaPredictor(_JepaStackOptions):
             targets = jnp.broadcast_to(
                 targets, (*context.shape[:-2], num_target_tokens, self.predictor_features))
 
-        tokens = jnp.concatenate([context, targets], axis=-2)
+        tokens = jnp.concatenate([context, rows_like(targets, context)], axis=-2)
         tokens = self.stack(tokens, train=train)
         return _projected(self.proj_out, self.norm(tokens[..., -num_target_tokens:, :]))
 

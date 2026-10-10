@@ -48,6 +48,7 @@ from .sharding import (
     manual_map,
     mesh_axes,
     row_axes,
+    rows_spec,
     sequence_shards,
     split_positions,
 )
@@ -1690,7 +1691,8 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segmen
                      folded(_banded(_blocks(value, span, blocks), preceding(1)), 2 * span),
                      implementation=masked,
                      mask=keep.reshape(batch * blocks, 1, span, 2 * span))
-    return out.reshape(batch, blocks * span, *out.shape[2:])[:, :length]
+    unfolded = (batch, blocks * span, *out.shape[2:])
+    return jax.lax.reshape(out, unfolded, out_sharding=rows_spec(out, len(unfolded)))[:, :length]
 
 
 # Splash's tile size. At 1024 the forward kernel holds 4 MiB of fp32 logits

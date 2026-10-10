@@ -28,15 +28,18 @@ def test_benchmark_cases_can_be_read_without_either_framework():
 
 
 def test_case_labels_keep_the_mesh_fields_in_the_trainers_order(monkeypatch):
-    """The standalone case names mesh axes in the order the trainer lays them out."""
+    """The standalone case names mesh axes in the order the trainer lays them
+    out, then the axes it makes Explicit, so an Explicit layout's case is
+    told from its Auto twin's."""
     from dew.training import MeshSpec
 
     monkeypatch.syspath_prepend(str(TOOLS))
     cases = importlib.import_module("benchmark_cases")
-    names = [field.name for field in dataclasses.fields(MeshSpec)]
+    names = [field.name for field in dataclasses.fields(MeshSpec) if field.name != "explicit"]
     mesh = dict.fromkeys(reversed(names), 2)
     assert cases.mesh_label(mesh) == "-".join(f"{name}2" for name in names)
     assert cases.mesh_label(dict.fromkeys(names, 1)) == "data"
+    assert cases.mesh_label({"fsdp": 2, "explicit": ("data",)}) == "fsdp2-explicit_data"
 
 
 @pytest.mark.parametrize("changed", ["benchmark_cases", "benchmark_models"])
