@@ -565,11 +565,24 @@ class StreamedBank:
                                sharding=self.device, ordered=True)
 
 
-def spread(tree: Mapping, row=lambda leaf, offset: leaf[offset]) -> dict:
+def bank_sharding(row: NamedSharding, *, memory_kind: str | None) -> NamedSharding:
+    """A bank's sharding from one of its rows': the layer axis in front and
+    unsharded, the row's own axes after it, in `memory_kind`."""
+    return NamedSharding(row.mesh, P(None, *row.spec), memory_kind=memory_kind)
+
+
+def row_sharding(bank: NamedSharding) -> NamedSharding:
+    """One row's sharding out of a bank's (`bank_sharding`), in the bank's memory."""
+    return NamedSharding(bank.mesh, P(*bank.spec[1:]), memory_kind=bank.memory_kind)
+
+
+def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in range(count)]) -> dict:
     """`tree` with every run's bank spread back over its layers: a mapping under
-    a run's name, `layers_3_7`, as `layers_3` through `layers_7`, each leaf the
-    bank's row `row(leaf, offset)` gives (an array's, or a shape's with
-    `row` dropping the axis), beside the leaves a layer holds on its own.
+    a run's name, `layers_3_7`, as `layers_3` through `layers_7`, each leaf's
+    rows the `count` that `rows(leaf, count)` cuts it into (an array's slices,
+    a shape's with its layer axis dropped), beside the leaves a layer holds
+    on its own. Each leaf is cut once, so `rows` may release the bank as it
+    goes and the base is held twice for one leaf at most.
 
     A CPU-owned training run stores its frozen collection banked
     (`dew.training.execution.banked`); this is the layer view every reader
@@ -579,33 +592,42 @@ def spread(tree: Mapping, row=lambda leaf, offset: leaf[offset]) -> dict:
     for name, value in tree.items():
         layers = group_layers(name) if isinstance(value, Mapping) else None
         if layers is None or len(layers) == 1:
-            held = spread(value, row) if isinstance(value, Mapping) and layers is None else value
+            held = spread(value, rows) if isinstance(value, Mapping) and layers is None else value
             spread_tree[name] = merge(spread_tree.get(name, {}), held) if isinstance(held, Mapping) else held
             continue
+        count = len(layers)
+        cut = jax.tree.map(lambda leaf, count=count: tuple(rows(leaf, count)), value)
         for offset, index in enumerate(layers):
-            rows = jax.tree.map(lambda leaf, offset=offset: row(leaf, offset), value)
-            spread_tree[f"layers_{index}"] = merge(spread_tree.get(f"layers_{index}", {}), rows)
+            row = jax.tree.map(lambda held, offset=offset: held[offset], cut,
+                               is_leaf=lambda node: isinstance(node, tuple))
+            spread_tree[f"layers_{index}"] = merge(spread_tree.get(f"layers_{index}", {}), row)
     return spread_tree
 
 
-def shape_row(leaf: jax.ShapeDtypeStruct, offset: int) -> jax.ShapeDtypeStruct:
-    """One row of a bank's shape (`spread`): the layer axis dropped."""
-    return jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype)
+def shape_rows(leaf: jax.ShapeDtypeStruct, count: int) -> list[jax.ShapeDtypeStruct]:
+    """A bank's shape cut into its rows' (`spread`): the layer axis dropped."""
+    return [jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype)] * count
+
+
+def placed_rows(bank: jax.Array, count: int) -> tuple[jax.Array, ...]:
+    """A restored bank cut into its rows (`spread`), each where the bank's row
+    sharding places it, in the bank's memory, and the bank deleted after."""
+    cut = jax.jit(lambda held: tuple(held[offset] for offset in range(count)),
+                  out_shardings=(row_sharding(bank.sharding),) * count)(bank)
+    bank.delete()
+    return cut
 
 
 def banked_placement(tree: Mapping, rows: Mapping) -> dict:
     """The placement of `tree`, which may hold banks, from `rows`, the placement of
-    its `spread` view: a bank's leaf is its first layer's, the layer axis in front
-    and unsharded."""
+    its `spread` view: a bank's leaf is its first layer's (`bank_sharding`)."""
     placed = {}
     for name, value in tree.items():
         layers = group_layers(name) if isinstance(value, Mapping) else None
         if layers is not None and len(layers) > 1:
-            first = rows[f"layers_{layers[0]}"]
+            first = narrowed(rows[f"layers_{layers[0]}"], value)
             placed[name] = jax.tree.map(
-                lambda _, sharding: NamedSharding(sharding.mesh, P(None, *sharding.spec),
-                                                  memory_kind=sharding.memory_kind),
-                value, narrowed(first, value))
+                lambda _, sharding: bank_sharding(sharding, memory_kind=sharding.memory_kind), value, first)
         elif isinstance(value, Mapping):
             placed[name] = banked_placement(value, rows[name])
         else:
@@ -655,7 +677,7 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
         return placement
 
     def place(sharding, shape):
-        bank = NamedSharding(sharding.mesh, P(None, *sharding.spec), memory_kind=sharding.memory_kind)
+        bank = bank_sharding(sharding, memory_kind=sharding.memory_kind)
         if bank.memory_kind == "pinned_host" and next(iter(bank.device_set)).platform == "tpu":
             # A minor layer axis can change TPU tile shape when sliced,
             # making the host-to-device copy halt even before its squeeze.
