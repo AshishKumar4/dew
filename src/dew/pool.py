@@ -65,21 +65,28 @@ def runs_on_gpu(env: Mapping[str, str]) -> bool:
     return not platforms or any(name in platforms for name in ("cuda", "gpu"))
 
 
-def listed_gpus(argv: Sequence[str]) -> int | None:
-    """GPUs in the `nvidia-smi -L` output of `argv`, whose MIG lines are
-    indented; None when they could not be counted: nvidia-smi missing, or
-    failing, or not answering within a minute, as over ssh a host whose
-    non-interactive PATH lacks it, or that cannot be reached, gives. None is
-    not zero GPUs, and every check that reads a count skips on it."""
+def answered(argv: Sequence[str], timeout: float = 60) -> str | None:
+    """What `argv` (an nvidia-smi query, or one over ssh) printed, or None
+    where it did not answer: missing, failing, or not done within `timeout`
+    seconds, as over ssh a host whose non-interactive PATH lacks it, or that
+    cannot be reached, gives. Each failure is logged at debug level."""
     try:
-        found = subprocess.run(argv, capture_output=True, text=True, timeout=60)
+        found = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as failure:
-        _log.debug("%s could not list GPUs: %s", " ".join(argv), failure)
+        _log.debug("%s did not answer: %s", " ".join(argv), failure)
         return None
     if found.returncode != 0:
         _log.debug("%s exited %d: %s", " ".join(argv), found.returncode, found.stderr.strip()[-300:])
         return None
-    return sum(line.startswith("GPU ") for line in found.stdout.splitlines())
+    return found.stdout
+
+
+def listed_gpus(argv: Sequence[str]) -> int | None:
+    """GPUs in the `nvidia-smi -L` output of `argv`, whose MIG lines are
+    indented; None when they could not be counted (`answered`). None is not
+    zero GPUs, and every check that reads a count skips on it."""
+    listed = answered(argv)
+    return None if listed is None else sum(line.startswith("GPU ") for line in listed.splitlines())
 
 
 def visible_gpus(visible: str) -> int:
