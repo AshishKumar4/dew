@@ -299,3 +299,66 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
     for steps, layers in ((2, None), (None, (1, 2))):
         with pytest.raises(ValueError, match="has no loop"):
             looping(qwen, steps, layers)
+
+
+def test_a_decision_run_keeps_its_loop_memory_options_under_lora(tmp_path):
+    """The CLI selects layer recomputation before the loop and adapter are
+    built. A trained and reloaded tiny multimodal Qwen keeps all three
+    choices, and the trainer's next rung starts above the selected one.
+    """
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+
+    mixture = _mixture(tmp_path, _requests(16, joint=True), [], held=4)
+    flags = [*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
+             "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
+             "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
+             "--max-len", "128", "--no-calibrate", "--loop-steps", "3", "--loop-layers", "1", "2",
+             "--loop-backprop-steps", "1", "--loop-remat", "--remat", "minimal"]
+    config = DecisionRunConfig.cli(flags)
+    assert (config.loop_backprop_steps, config.loop_remat, config.remat) == (1, True, "minimal")
+    config.run()
+    backbone = Decide.from_run(str(tmp_path / "runs" / "run")).model.backbone
+    assert backbone.language_model.loop.backprop_steps == 1
+    assert backbone.language_model.loop.remat is True
+    assert backbone.language_model.remat == REMAT_POLICIES["minimal"]
+    assert backbone.recompute_more().language_model.remat == REMAT_POLICIES["full"]
+
+
+@pytest.mark.parametrize("fields,checkpoint,message", [
+    ({"loop_backprop_steps": 1}, QWEN, "has no loop"),
+    ({"loop_remat": True}, QWEN, "has no loop"),
+    ({"loop_backprop_steps": 1}, TINY, "Laya checkpoint"),
+    ({"loop_remat": True}, TINY, "Laya checkpoint"),
+    ({"remat": "full"}, TINY, "Laya checkpoint"),
+    ({"remat": "unknown"}, QWEN, "remat names one of"),
+])
+def test_a_decision_run_refuses_memory_options_without_their_backbone(fields, checkpoint, message):
+    with pytest.raises(ValueError, match=message):
+        DecisionRunConfig(pretrained=str(checkpoint), **fields).prepare()
+
+
+@pytest.mark.parametrize("policy", ["minimal", "save_qkv_proj", "full"])
+def test_a_loaded_backbone_selects_remat_without_changing_its_weights(policy):
+    """Text, multimodal and DiffusionGemma decoders select any named policy;
+    policies outside the fitting ladder stay there. An existing Ouro loop
+    also accepts memory options without changing its passes or its gate.
+    """
+    from dew.decision.config import looping
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_block import REMAT_POLICIES
+    from dew.nn.diffusion_gemma import DiffusionGemma
+    from dew.nn.protocols import RematChoosing
+
+    ouro = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "ouro-tiny", dtype="float32")
+    changed = looping(ouro, None, None, backprop_steps=1, remat=True)
+    assert changed.model.loop == dataclasses.replace(ouro.model.loop, backprop_steps=1, remat=True)
+    assert changed.variables is ouro.variables
+    qwen = Pretrained.load(QWEN, dtype="float32")
+    for model in (ouro.model, qwen.model, DiffusionGemma(text=ouro.model, canvas_length=4)):
+        assert isinstance(model, RematChoosing)
+        selected = model.with_remat(REMAT_POLICIES[policy])
+        assert selected.recompute_record() == policy
+        assert selected.with_remat(None).recompute_record() is None
+        assert model.recompute_record() is None
+        if policy == "save_qkv_proj":
+            assert selected.recompute_more() is None
