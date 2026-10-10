@@ -978,11 +978,7 @@ def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, m
     staging = tmp_path / "staging"
     netrc_file = write(tmp_path / "netrc", b"machine api.wandb.ai login test password test-key\n")
     batch.stage(plan, staging, repo, netrc_file=netrc_file)
-    secret = plan["uploads"].pop("/content/.dew-wandb.key")
-    target = str(tmp_path / "vm-wandb.key")
-    plan["uploads"][target] = secret
-    plan["secret_env"]["WANDB_API_KEY"] = target
-    save(staging / "plan.json", plan)
+
     worker = vm.Batch(staging)
     worker.prepare()
     for expected in (sha, plan["jobs"][0]["commit"]):
