@@ -27,7 +27,7 @@ from dew.nn.backbones.decoder_block import GatedMLP, Mixture
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.sharding import BATCH_AXES
-from dew.sampling import Sample, Sampling
+from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec
 
 VOCAB = 13
@@ -641,9 +641,6 @@ def test_a_server_runs_a_model_with_prediction_depths_without_them(options):
     depth: a model that declares them admits in the one mixed forward, over
     a dense or a paged cache, its slots hold no prediction cache, and every
     row is the lone task call's."""
-    from dew.sampling.strategies import Beam, Speculative
-
-    assert not Sample.drafts and not Beam.drafts and Speculative.drafts
     model = decoder().clone(max_seq_len=128, num_nextn_predict_layers=1)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))

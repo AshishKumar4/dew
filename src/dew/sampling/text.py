@@ -57,7 +57,7 @@ from dew.sampling.decoding import (
     TopP,
     Typical,
 )
-from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Strategy
+from dew.sampling.strategies import DecodeOps, DecoderState, Draws, Sample, Speculative, Strategy
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 
@@ -529,8 +529,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
 
     `depths` is the prediction depths a drafting strategy runs, beside the
     model's block drafter where it has one; None, for a strategy that does
-    not draft (`Strategy.drafts`), runs neither, so the prefill allocates and
-    seeds no drafting cache.
+    not draft (any but `Speculative`), runs neither, so the prefill
+    allocates and seeds no drafting cache.
 
     Parameters stay unmapped: every operation reads the same tree, and only
     the cache moves with the rows. A model with a block drafter hands its
@@ -683,7 +683,8 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
-    ops = decode_ops(model, params, pad_id, prediction_depths(model) if strategy.drafts else None)
+    drafting = isinstance(strategy, Speculative)
+    ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafting else None)
     state, real = prefill_state(model, params, inputs, ops)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
