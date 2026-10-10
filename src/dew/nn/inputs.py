@@ -333,6 +333,16 @@ VALIDITY_FIELD = "attention_mask"
 """The token field that marks real slots. Absent means every slot is real."""
 
 
+def valid_order(valid: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each row's real slots first, in order, then its padding slots: the
+    physical slot behind each compact column `[rows, slots]`, and how many
+    slots of each row are real `[rows]`. A stable sort of the validity, so a
+    row's tokens keep their order; a caller says what its columns past the
+    count hold (decoding's -1 history tokens, a convolution's zero column)."""
+    valid = jnp.asarray(valid, bool)
+    return jnp.argsort(~valid, axis=-1, stable=True), jnp.sum(valid, axis=-1, dtype=jnp.int32)
+
+
 def _last_real(value: jax.Array, valid: jax.Array) -> jax.Array:
     """Each row's value at its last real slot, or at slot 0 in a row with none."""
     last = jnp.max(jnp.where(valid, jnp.arange(valid.shape[1])[None, :], 0), axis=1)

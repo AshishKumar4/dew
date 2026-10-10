@@ -32,11 +32,10 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.kernels import delta_chunks, delta_rule
-from dew.nn.scatter import DROPPED
 
 from .attention import FORWARD_MODE, unweighted_rmsnorm
 from .blocks import normal_kernel
-from .inputs import AttentionMetadata
+from .inputs import AttentionMetadata, valid_order
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32
 from .sharding import logical_axes, rows_like
@@ -124,13 +123,10 @@ def _stream_order(valid):
     row's real tokens holds `length`, the zero column `_masked_conv1d` appends,
     so it gathers a zero and its cotangent lands there, never on a real slot;
     every real token writes its own column, so no two writers meet."""
-    batch, length = valid.shape
-    valid = jnp.asarray(valid, bool)
-    rank = jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1
-    source = jnp.full((batch, length), length, jnp.int32).at[
-        jnp.arange(batch)[:, None], jnp.where(valid, rank, DROPPED)].set(
-            jnp.broadcast_to(jnp.arange(length, dtype=jnp.int32), (batch, length)), mode='drop')
-    return rank, source
+    length = valid.shape[1]
+    order, counts = valid_order(valid)
+    rank = jnp.cumsum(jnp.asarray(valid, bool), axis=1, dtype=jnp.int32) - 1
+    return rank, jnp.where(jnp.arange(length)[None, :] < counts[:, None], order, length).astype(jnp.int32)
 
 
 def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None):
