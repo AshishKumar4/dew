@@ -236,7 +236,8 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
              tokens=0.0) -> Book:
     """Advance the loop's counters for one step in a single dispatch.
 
-    Five eager ops would cost more: 176 against 37 us a step on a CPU.
+    Loss counters and commit telemetry advance together, without reading
+    either on the host between logging ticks.
     """
     interval_loss, bad_run, worst_bad_run, interval_flops, interval_tokens, norms, commits = book
     bad_run = jnp.where(finite, 0, bad_run + 1)
@@ -468,9 +469,10 @@ class _FitRun:
 class _Interval:
     """What `fit` sums between logs and between checkpoints.
 
-    `book` is the loss summed since the last checkpoint and both bad-loss
-    counters, on device, so the loop never blocks on a result, and they move
-    together in one dispatch; the host reads them at the logging cadence.
+    `book` is the loss summed since the last checkpoint, both bad-loss
+    counters, and the gradient-norm sum and commit count since the last log.
+    They stay on device and move together in one dispatch; the host reads
+    them at the logging cadence, never blocking the step loop on a result.
     The first step places them where its loss is, and `fresh` keeps them at
     zero there, for a counter's restart to reuse rather than build again.
     `steps` counts since the last checkpoint, the rest since the last log.
@@ -480,7 +482,8 @@ class _Interval:
     train/rollout_seconds when a rollout is set. `waited` is the time the
     loop spent waiting on its next batch and `compiling` the time it spent
     compiling the step for a shape it had not met, both in seconds, since
-    the last log."""
+    the last log. `compiles` counts StepCompiled records over the whole fit,
+    so logging and checkpointing never reset it."""
 
     last_log_time: float
     last_saved: int | None
