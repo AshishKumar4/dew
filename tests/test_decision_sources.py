@@ -238,6 +238,23 @@ def test_open_jev_drops_customer_control_before_grouping(sources, monkeypatch):
     assert len(sources.OpenJev().read("calibration")) == 1
 
 
+def test_phishing_csv_reads_long_fields_and_embedded_newlines(sources, monkeypatch, tmp_path):
+    path = tmp_path / "emails.csv"
+    message = 'A long "quoted" email\n' + "body " * 30000
+    with path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=["Email Text", "Email Type"])
+        writer.writeheader()
+        writer.writerows([{"Email Text": message, "Email Type": "Phishing Email"},
+                          {"Email Text": "Plain", "Email Type": "Safe Email"}])
+    monkeypatch.setattr(sources, "_download", lambda *args: str(path))
+    csv.field_size_limit(131072)
+    assert sources.PhishingEmail().count() == 2
+    csv.field_size_limit(131072)
+    examples = sources.PhishingEmail().examples()
+    assert [row.state for row in examples] == [message, "Plain"]
+    assert [row.answers for row in examples] == [{"phishing": "true"}, {"phishing": "false"}]
+
+
 @pytest.mark.parametrize("name", ["Snli", "MultiNli"])
 def test_inference_converters_keep_the_gold_relation(sources, monkeypatch, name):
     monkeypatch.setattr(sources, "_unit", lambda text, salt: 1. if salt == "keys" else 0.)

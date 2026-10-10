@@ -65,6 +65,7 @@ def _rows(repo: str, revision: str, path: str, indices: set[int] | None = None) 
                     yield json.loads(line)
         return
     if path.endswith(".csv"):
+        csv.field_size_limit(2**31 - 1)
         with open(local, newline="") as file:
             for index, row in enumerate(csv.DictReader(file)):
                 if indices is None or index in indices:
@@ -96,6 +97,8 @@ def _count(repo: str, revision: str, path: str) -> int:
     """The pinned train file's row count, without loading its rows into memory."""
     local = _download(repo, revision, path)
     if path.endswith((".jsonl", ".jsonl.gz", ".csv")):
+        if path.endswith(".csv"):
+            csv.field_size_limit(2**31 - 1)
         with (gzip.open(local, "rt") if path.endswith(".gz") else open(local, newline="")) as file:
             return sum(1 for _ in (csv.DictReader(file) if path.endswith(".csv") else file))
     import pyarrow.parquet as pq
