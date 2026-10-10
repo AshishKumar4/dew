@@ -87,6 +87,12 @@ class Package:
     generated: str = "site/src/generated"  # the sidebar and the name index
     usage: list[str] = field(default_factory=list)  # files whose imports must resolve
     usage_skip: tuple[str, ...] = ()
+    special: tuple[str, ...] = ()  # private-looking methods a class documents, such as "__call__"
+    fence_indented: bool = False  # an indented block after a blank line in a docstring is Python
+
+    def method(self, name: str) -> bool:
+        """Whether a class's method `name` is documented."""
+        return not name.startswith("_") or name in self.special
 
     @property
     def pages(self) -> list[str]:
@@ -98,7 +104,8 @@ class Package:
         fields = json.loads(path.read_text())
         repo = (path.parent / fields.pop("repo", ".")).resolve()
         groups = [(label, list(modules)) for label, modules in fields.pop("groups")]
-        return cls(repo=repo, groups=groups, usage_skip=tuple(fields.pop("usage_skip", ())), **fields)
+        return cls(repo=repo, groups=groups, usage_skip=tuple(fields.pop("usage_skip", ())),
+                   special=tuple(fields.pop("special", ())), **fields)
 
 
 DEW = Package("dew", Path(__file__).resolve().parents[2], "https://github.com/AshishKumar4/dew/blob/main/",
@@ -281,8 +288,43 @@ class Linker:
 CODE_SPAN = re.compile(r"(`+)(.+?)\1", re.S)
 
 
+def fenced(text: str) -> list[tuple[bool, str]]:
+    """`text` in runs of prose and code: with `P.fence_indented`, an indented block after a blank
+    line is code, unindented; otherwise all of it is prose."""
+    if not P.fence_indented:
+        return [(False, text)]
+    runs: list[tuple[bool, list[str]]] = []
+    lines = text.split("\n")
+    for k, line in enumerate(lines):
+        indented = line.startswith("    ")
+        starts = indented and line.strip() and (k == 0 or not lines[k - 1].strip())
+        code = bool(runs) and runs[-1][0] and (indented or not line.strip())
+        if starts or code:
+            if not (runs and runs[-1][0]):
+                runs.append((True, []))
+            runs[-1][1].append(line[4:])
+        else:
+            if not runs or runs[-1][0]:
+                runs.append((False, []))
+            runs[-1][1].append(line)
+    out = []
+    for is_code, chunk in runs:
+        while is_code and chunk and not chunk[-1].strip():
+            chunk.pop()
+        out.append((is_code, "\n".join(chunk)))
+    return out
+
+
 def prose(text: str, linker: Linker, context: str, own: str) -> str:
-    """A docstring as Markdown: code spans kept, angle brackets escaped, references linked."""
+    """A docstring as Markdown: code spans kept, angle brackets escaped, references linked, and
+    indented examples fenced as Python where the package asks for it (`fenced`)."""
+    parts = []
+    for is_code, chunk in fenced(text):
+        parts.append(f"```python\n{chunk}\n```\n" if is_code else spans(chunk, linker, context, own))
+    return "".join(parts)
+
+
+def spans(text: str, linker: Linker, context: str, own: str) -> str:
     text = text.replace("``", "`")
     out, last = [], 0
     for match in CODE_SPAN.finditer(text):
@@ -359,7 +401,7 @@ def render_object(entry: Entry, linker: Linker, context: str) -> str:
                 lines.append(f"<dd>\n\n{prose(attribute.docstring.value, linker, context, own)}\n\n</dd>")
             lines += ["</dl>", ""]
         for name, member in obj.members.items():
-            if name.startswith("_") or member.is_alias or not member.is_function:
+            if not P.method(name) or member.is_alias or not member.is_function:
                 continue
             lines += [f"### {entry.name}.{name}", "", "```python", function_signature(member), "```", ""]
             if member.docstring:
@@ -689,7 +731,7 @@ def linked(pages: dict[str, Page], home: dict[str, str]) -> Linker:
                 linker.add(f"{path}.{entry.name}", url)
                 if entry.obj.is_class:
                     for name, member in entry.obj.members.items():
-                        if not name.startswith("_") and not member.is_alias and member.is_function:
+                        if P.method(name) and not member.is_alias and member.is_function:
                             method = f"/{page_slug(path)}/#{anchor(f'{entry.name}.{name}')}"
                             linker.add(f"{entry.canonical}.{name}", method, f"{entry.name}.{name}")
                             linker.add(f"{path}.{entry.name}.{name}", method)

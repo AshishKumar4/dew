@@ -52,9 +52,11 @@ export async function shoot({ chromium, launch = {}, base, pages, out, top = fal
 					}, scrolls);
 					await page.waitForTimeout(settle);
 					await page.screenshot({ path: path.join(out, `${name}.png`), fullPage: true });
-					const problems = [...errors];
-					if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) problems.push('wider than the screen');
-					if (checks) problems.push(...(await checks(page)));
+					const found = [];
+					if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) found.push('wider than the screen');
+					if (checks) found.push(...(await checks(page)));
+					// After every check, so an error raised while they ran counts too.
+					const problems = [...errors, ...found];
 					failed += problems.length ? 1 : 0;
 					const said = [...notes, ...(console_.length ? [`console: ${console_.join(' | ')}`] : [])];
 					console.log(`${name}${said.length ? `  ${said.join('  ')}` : ''}${problems.length ? `  FAILED: ${problems.join(' | ')}` : ''}`);
