@@ -21,7 +21,7 @@ const cell = (name) => ({
 	output: '[data-cell-output]',
 	finished: (root) => {
 		const text = root.querySelector('[data-cell-status]').textContent;
-		return /^Ran in /.test(text) ? 'ok' : /stopped|^Stopped|Press Run to start a new one|error/i.test(text) ? text : '';
+		return /^Ran in /.test(text) ? 'ok' : /stopped|^Stopped|Press Run to start a new one|error|timed out|Try again/i.test(text) ? text : '';
 	},
 });
 const examples = [
@@ -33,7 +33,7 @@ const examples = [
 		output: '[data-text-output]',
 		finished: (root) => {
 			const text = root.querySelector('[data-text-status]').textContent;
-			return /^Generated in /.test(text) ? 'ok' : /stopped|^Stopped|Press Run to start a new one|error/i.test(text) ? text : '';
+			return /^Generated in /.test(text) ? 'ok' : /stopped|^Stopped|Press Run to start a new one|error|timed out|Try again/i.test(text) ? text : '';
 		},
 	},
 	{
@@ -44,7 +44,7 @@ const examples = [
 		finished: (root) => {
 			const stage = root.querySelector('.sampler-stage').dataset.stage;
 			const text = root.querySelector('[data-status]').textContent;
-			return stage === 'done' ? 'ok' : stage === 'error' || /Press Run to start a new one/.test(text) ? text : '';
+			return stage === 'done' ? 'ok' : stage === 'error' || /Press Run to start a new one|timed out|Try again/.test(text) ? text : '';
 		},
 	},
 ];
