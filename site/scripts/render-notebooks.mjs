@@ -49,6 +49,7 @@ const files = (await readdir(notebooksDir))
 if (!checkOnly) await rm(imageRoot, { recursive: true, force: true });
 
 const slugOf = (url) => url.replace('https://github.com/', '');
+const LIVE_MODULES = new Set(['dew.interop', 'dew.sampling']);
 const listing = [];
 const notebookOutputs = {};
 for (const file of files) {
@@ -90,7 +91,7 @@ for (const file of files) {
 		outputsByCell[cell.id ?? `cell-${index}`] = record;
 		outputs += (cell.outputs ?? []).length;
 		codeIndex += 1;
-		// The live kernel has Dew installed and no network, so it skips the install cells.
+		// The live kernel has no network, so it skips the install cells.
 		if (!install) liveCells.push({ id: codeIndex, code: text });
 		const block = [`<div class="nb-cell" data-cell="${codeIndex}">`, '', fence(text.replace(/\n+$/, ''))];
 		if (rendered) block.push('', rendered);
@@ -109,7 +110,10 @@ for (const file of files) {
 		`<p class="nb-provenance">Outputs recorded on ${where}, JAX ${escapeHtml(recorded.jax)}, Dew <a href="${repository.url}/commit/${recorded.commit}"><code>${recorded.commit.slice(0, 7)}</code></a>, ${escapeHtml(recorded.date)}.</p>`,
 	);
 
-	const live = accelerator === 'CPU';
+	// A notebook runs live when it needs no GPU and imports only the Dew modules the live kernel's
+	// Python context stands in for (site/live/container/model_client.py, install()).
+	const imports = liveCells.flatMap(({ code }) => [...code.matchAll(/^\s*(?:from|import)\s+(dew[\w.]*)/gm)].map((match) => match[1]));
+	const live = accelerator === 'CPU' && imports.every((name) => LIVE_MODULES.has(name));
 	if (live) {
 		parts.push(`<script type="application/json" data-notebook-cells>${JSON.stringify(liveCells).replace(/</g, '\\u003c')}</script>`);
 	}
