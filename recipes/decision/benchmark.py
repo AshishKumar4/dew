@@ -8,7 +8,9 @@
 Both talk to the model through its wire format, as their published rows were
 scored, so any `/v1/systemone` server can be measured the same way.
 Decision Index has its own kit and engine (`python -m decision_index pipeline
---engine http`), which the same server answers.
+--engine http`), which the same server answers. `di-proxy` selects a weighted
+whole-group subset and uses that kit's scorers, from either a server or a
+full run's results; `held` scores a trained run on each mixture source.
 
 typed-decisions (LocalLLaMA/typed-decisions, test split, 400 cases): each
 case is one request with its five questions, as the dataset's card scores
@@ -200,23 +202,85 @@ def battery(engine: Engine, laya: Path) -> dict:
     return scores
 
 
+def held(run: Path, mixture: Path) -> dict:
+    """Score every source's held-out rows with a trained `Decide` run, including its calibration.
+
+    Log loss is natural-log cross entropy per labelled question, against
+    either a one-hot answer or its soft target. Accuracy uses the target's
+    most likely option. Unlabelled questions are not scored. The macro means
+    give each source with scored questions equal weight, whatever its size;
+    a source without any reports null scores and is left out of that mean.
+    """
+    from dew.decision import Decide, Example
+
+    decide = Decide.from_run(str(run))
+    recorded = json.loads((mixture / "mixture.json").read_text())
+    scores = {}
+    for source, count in recorded["rows"].items():
+        path = mixture / f"{source}.held.jsonl"
+        examples = ([Example.of(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
+                    if count["held"] else [])
+        if len(examples) != count["held"]:
+            raise ValueError(f"{path} has {len(examples)} rows, but mixture.json records {count['held']}")
+        losses, correct = [], []
+        for example in examples:
+            answers = decide(example.state, example.questions)
+            for name, label in example.labels().items():
+                truth = example.distribution(name)
+                found = answers[name].probabilities
+                positive = truth > 0
+                losses.append(float(-np.sum(truth[positive] * np.log(found[positive]))))
+                correct.append(int(np.argmax(found)) == label)
+        scores[source] = {"rows": len(examples), "questions": len(losses),
+                          "log_loss": float(np.mean(losses)) if losses else None,
+                          "accuracy": float(np.mean(correct)) if correct else None}
+    scored = [value for value in scores.values() if value["questions"]]
+    macro = {metric: float(np.mean([value[metric] for value in scored])) if scored else None
+             for metric in ("log_loss", "accuracy")}
+    return {"sources": scores, "macro": macro}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    suites = ("typed-decisions", "battery", "open-jev-test", "open-jev-ood", "uniform")
+    suites = ("typed-decisions", "battery", "open-jev-test", "open-jev-ood", "uniform", "held", "di-proxy")
     parser.add_argument("suite", choices=suites)
-    parser.add_argument("--url", default="http://127.0.0.1:8000")
+    engine = parser.add_mutually_exclusive_group()
+    engine.add_argument("--url", help="the model server; defaults to http://127.0.0.1:8000 for other suites")
+    engine.add_argument("--results", type=Path, help="a full DI run's results.jsonl in place of a server")
     parser.add_argument("--laya", type=Path, help="a checkout of NandhaKishorM/laya at LAYA_COMMIT")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--limit", type=int, help="ask only the first this many Open-Jev examples")
+    parser.add_argument("--run", type=Path, help="a trained Decide run for the held-out scorer")
+    parser.add_argument("--mixture", type=Path, help="the mixture directory holding per-source held-out rows")
+    parser.add_argument("--kit", type=Path, help="the Decision Index checkout at 9eb2dbe")
+    parser.add_argument("--suite-dir", type=Path, help="a built Decision Index 0.2.1 suite")
+    parser.add_argument("--requests", type=int, default=2500,
+                        help="the proxy's request budget (whole groups)")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--bootstrap", type=int, default=1000,
+                        help="group bootstrap draws for an 80%% interval")
     options = parser.parse_args()
-    if options.suite == "uniform":
+    if options.suite == "di-proxy":
+        if (options.kit is None or options.suite_dir is None
+                or (options.url is None) == (options.results is None)):
+            parser.error("di-proxy needs --kit, --suite-dir, and exactly one of --url and --results")
+        from di_kit import run
+
+        scores = run(options.kit, options.suite_dir, options.out, url=options.url, results=options.results,
+                     requests=options.requests, seed=options.seed, bootstrap=options.bootstrap)
+    elif options.suite == "held":
+        if options.run is None or options.mixture is None:
+            parser.error("held needs --run and --mixture")
+        scores = held(options.run, options.mixture)
+    elif options.suite == "uniform":
         scores = typed_decisions(uniform)
     elif options.suite == "typed-decisions":
-        scores = typed_decisions(http(options.url))
+        scores = typed_decisions(http(options.url or "http://127.0.0.1:8000"))
     elif options.suite.startswith("open-jev"):
-        scores = open_jev(http(options.url), options.suite.removeprefix("open-jev-"), options.limit)
+        scores = open_jev(http(options.url or "http://127.0.0.1:8000"),
+                          options.suite.removeprefix("open-jev-"), options.limit)
     else:
-        scores = battery(http(options.url), options.laya)
+        scores = battery(http(options.url or "http://127.0.0.1:8000"), options.laya)
     options.out.write_text(json.dumps(scores, indent=1) + "\n")
     print(json.dumps(scores))
 

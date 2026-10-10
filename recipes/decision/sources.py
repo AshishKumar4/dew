@@ -27,6 +27,7 @@ BoolQ's card state Apache-2.0, Apache-2.0 and CC BY-SA 3.0; BANKING77 CC BY
 BY-SA 4.0. Nothing non-commercial is read.
 """
 
+import csv
 import dataclasses
 import hashlib
 import json
@@ -63,6 +64,25 @@ def _rows(repo: str, revision: str, path: str) -> list[dict]:
     return pq.read_table(local).to_pylist()
 
 
+def _github(repo: str, revision: str, path: str, *, media: bool = False) -> Path:
+    """Cache a pinned GitHub file, reading LFS bytes from the media host when requested."""
+    import shutil
+    import urllib.request
+
+    from huggingface_hub import cached_assets_path
+
+    cached = cached_assets_path(library_name="dew", namespace=repo, subfolder=revision) / path
+    if not cached.is_file():
+        cached.parent.mkdir(parents=True, exist_ok=True)
+        host = "media.githubusercontent.com/media" if media else "raw.githubusercontent.com"
+        partial = cached.with_suffix(cached.suffix + ".partial")
+        with (urllib.request.urlopen(f"https://{host}/{repo}/{revision}/{path}", timeout=300) as response,
+              partial.open("wb") as target):
+            shutil.copyfileobj(response, target)
+        partial.replace(cached)
+    return cached
+
+
 def _unit(text: str, salt: str) -> float:
     """A number in [0, 1) that `text` fixes, so a row is framed the same way on every read."""
     digest = hashlib.sha256(f"{salt}:{text}".encode()).digest()
@@ -74,12 +94,14 @@ class Source:
     """One labelled set a mixture reads, at `weight`, a share of every step; weight 0 leaves it out.
 
     `limit` caps the training examples, drawn with `seed`, and `held` holds that
-    many back for validation and calibration.
+    many back for validation and calibration. With no count, hold out 2% of
+    the examples (rounded down), at least 50 and at most 2,000, or all the
+    examples of a smaller set. An explicit zero keeps every example in train.
     """
 
     weight: float = 0.0
     limit: int | None = None
-    held: int = 0
+    held: int | None = None
     seed: int = 0
     natural: ClassVar[bool] = True
     """Whether the set is natural text rather than built from templates (`contamination.Overlaps`)."""
@@ -92,7 +114,8 @@ class Source:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        held, train = examples[:self.held], examples[self.held:]
+        count = min(2000, max(50, len(examples) // 50)) if self.held is None else self.held
+        held, train = examples[:count], examples[count:]
         return (train if self.limit is None else train[:self.limit]), held
 
 
@@ -423,6 +446,84 @@ class Rows(Source):
 
 
 @dataclass(frozen=True)
+class Esci(Source):
+    """Amazon's ESCI training pairs (Apache-2.0), asking Decision Index's native four-way relevance choice.
+
+    Only `small_version` training rows are read. All three product locales
+    are kept because DI 0.2.1 evaluates US, ES and JP, and products join on
+    both their id and locale. The option names, descriptions and state are
+    the kit's, without the alternate framing used by other sources. Of the
+    781,638 pairs, `limit` keeps 15,000 drawn with the seed, about what one
+    pass of the `--headroom` mix reads at ESCI's weight, so neither the
+    decontamination nor a run's layout check reads the rest.
+    """
+
+    limit: int | None = 15_000
+    revision: str = "7916cdf6ab75a462e77f20ab40428a10923998d5"
+
+    def rows(self) -> Iterator[dict]:
+        """The pinned small training split, joined to its product text in example-id order."""
+        import pyarrow.parquet as pq
+
+        root = "shopping_queries_dataset/shopping_queries_dataset_"
+        examples = pq.read_table(_github("amazon-science/esci-data", self.revision,
+                                         root + "examples.parquet", media=True),
+                                  filters=[("split", "=", "train"), ("small_version", "=", 1)])
+        products = pq.read_table(_github("amazon-science/esci-data", self.revision,
+                                         root + "products.parquet", media=True))
+        joined = examples.join(products, keys=["product_id", "product_locale"], join_type="left outer")
+        if joined.num_rows != examples.num_rows or joined["product_title"].null_count:
+            raise ValueError("ESCI needs exactly one product with a title for every training pair")
+        for batch in joined.sort_by([("example_id", "ascending")]).to_batches(max_chunksize=4096):
+            yield from batch.to_pylist()
+
+    @staticmethod
+    def example(row: dict) -> Example:
+        """A joined query-product pair in the kit's ESCI request shape."""
+        criteria = {"E": "Exact: the product satisfies the search query.",
+                    "S": "Substitute: a product that could substitute for the requested product.",
+                    "C": "Complement: a product that complements the requested product.",
+                    "I": "Irrelevant: the product does not address the requested product need."}
+        product = {key.removeprefix("product_"): row[key] for key in
+                   ("product_title", "product_description", "product_bullet_point",
+                    "product_brand", "product_color")
+                   if row.get(key) is not None}
+        question = Choice("Classify the relevance of this product to the search query "
+                          "using the ESCI categories.", criteria)
+        return Example({"search_query": row["query"], "product": product}, {"answer": question},
+                       {"answer": row["esci_label"]})
+
+    def examples(self) -> list[Example]:
+        return [self.example(row) for row in self.rows()]
+
+
+@dataclass(frozen=True)
+class ISarcasm(Source):
+    """iSarcasmEval's English training tweets (MIT), in DI's task-A request shape.
+
+    The binary gold is `sarcastic`, not the `sarcasm` subtype. A CSV reader
+    preserves commas, quotes and newlines inside tweets; rephrases and
+    subtype annotations are not part of the model's input.
+    """
+
+    revision: str = "dfc708b53bde1bb571abfb5692f63231c2232195"
+
+    @staticmethod
+    def example(row: dict) -> Example:
+        """One training tweet asked the kit's binary sarcasm question."""
+        if row["sarcastic"] not in ("0", "1"):
+            raise ValueError(f"sarcastic must be 0 or 1, got {row['sarcastic']!r}")
+        question = Choice("Is this text intended to be sarcastic?", {"no": "No", "yes": "Yes"})
+        return Example(row["tweet"], {"sarcastic": question},
+                       {"sarcastic": "yes" if row["sarcastic"] == "1" else "no"})
+
+    def examples(self) -> list[Example]:
+        path = _github("iabufarha/iSarcasmEval", self.revision, "train/train.En.csv")
+        with path.open(encoding="utf-8-sig", newline="") as file:
+            return [self.example(row) for row in csv.DictReader(file)]
+
+
+@dataclass(frozen=True)
 class Mixture:
     """Every source a decision recipe reads, each at its weight; a weight of 0 leaves one out.
 
@@ -442,6 +543,8 @@ class Mixture:
     arc: Arc = field(default_factory=Arc)
     boolq: BoolQ = field(default_factory=BoolQ)
     gsm8k: Gsm8k = field(default_factory=Gsm8k)
+    esci: Esci = field(default_factory=Esci)
+    isarcasm: ISarcasm = field(default_factory=ISarcasm)
     rows: Rows = field(default_factory=Rows)
 
     def sources(self) -> Iterator[tuple[str, Source]]:
@@ -493,7 +596,16 @@ class Conversion:
 
     out: str = "data/mixture"
     decontaminate: str | None = None
+    headroom: bool = False
+    """Add ESCI and iSarcasmEval at weights 0.02 and 0.01; the default mixture does not read either."""
     mixture: Mixture = field(default_factory=Mixture)
+
+    def selected(self) -> Mixture:
+        """The mixture, with the two permissively licensed headroom sources when requested."""
+        if not self.headroom:
+            return self.mixture
+        return dataclasses.replace(self.mixture, esci=dataclasses.replace(self.mixture.esci, weight=0.02),
+                                   isarcasm=dataclasses.replace(self.mixture.isarcasm, weight=0.01))
 
 
 if __name__ == "__main__":
@@ -502,4 +614,4 @@ if __name__ == "__main__":
 
     conversion = tyro.cli(Conversion)
     overlaps = None if conversion.decontaminate is None else Overlaps.load(conversion.decontaminate)
-    print(json.dumps(write(conversion.mixture, Path(conversion.out), overlaps)["rows"]))
+    print(json.dumps(write(conversion.selected(), Path(conversion.out), overlaps)["rows"]))
