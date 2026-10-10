@@ -39,7 +39,7 @@ BASE_PINS = {
 CUDA_PINS = {
     "cuda-bindings": "12.9.4", "cuda-pathfinder": "1.8.3", "einops": "0.8.2", "ninja": "1.13.2",
     "triton": "3.6.0", "flash-linear-attention": "0.5.2", "fla-core": "0.5.2",
-    "liger-kernel": "0.8.4", "causal-conv1d": "1.7.0",
+    "liger-kernel": "0.8.0", "causal-conv1d": "1.7.0",
     "nvidia-cublas-cu12": "12.8.4.1", "nvidia-cuda-cupti-cu12": "12.8.90",
     "nvidia-cuda-nvrtc-cu12": "12.8.93", "nvidia-cuda-runtime-cu12": "12.8.90",
     "nvidia-cudnn-cu12": "9.10.2.21", "nvidia-cufft-cu12": "11.3.3.83",
@@ -257,12 +257,14 @@ def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
 def run(args: argparse.Namespace) -> dict:
     import numpy as np
     import torch
-    from common import TorchTracedWindow, git_head, host, peak_flops, throughput, warmup_cosine, write_record
+    from common import (TorchTracedWindow, git_head, host, peak_flops, register_plain_causal_sdpa,
+                        throughput, warmup_cosine, write_record)
     from transformers import Qwen3_5TextConfig
     from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
 
     package_versions = versions(args.smoke)
     torch.manual_seed(args.seed)
+    attention_implementation = register_plain_causal_sdpa()
     if args.smoke:
         torch.set_num_threads(2)
         device, batch, seq = torch.device("cpu"), 2, 16
@@ -274,7 +276,7 @@ def run(args: argparse.Namespace) -> dict:
             layer_types=["linear_attention", "full_attention"], use_cache=False,
             rope_parameters={"rope_type": "default", "rope_theta": 1e6, "partial_rotary_factor": 0.5,
                              "mrope_interleaved": True, "mrope_section": [2, 1, 1]})
-        config._attn_implementation = "eager"
+        config._attn_implementation = attention_implementation
         backbone = qwen.Qwen3_5TextModel(config)
     else:
         if not torch.cuda.is_available():
@@ -291,7 +293,7 @@ def run(args: argparse.Namespace) -> dict:
                                      cross_entropy=False, fused_linear_cross_entropy=False)
         raw_config = json.loads(Path(hf_hub_download(MODEL, "config.json", revision=REVISION)).read_text())
         config = Qwen3_5TextConfig(**raw_config["text_config"])
-        config.dtype, config.use_cache, config._attn_implementation = torch.float32, False, "sdpa"
+        config.dtype, config.use_cache, config._attn_implementation = torch.float32, False, attention_implementation
         if not qwen.is_fast_path_available:
             raise RuntimeError("HF's FLA/causal-conv1d fast path is unavailable")
         backbone = qwen.Qwen3_5TextModel(config).to(device=device, dtype=torch.float32)
@@ -319,15 +321,30 @@ def run(args: argparse.Namespace) -> dict:
             self.backbone = backbone
             self.register_buffer("projection", torch.linspace(-1, 1, config.hidden_size, device=device)
                                  .reshape(1, -1) / config.hidden_size ** 0.5)
+            # Three explicit identical mRoPE axes denote plain text. The
+            # fourth HF axis is reserved for potentially packed-row positions.
+            self.register_buffer("position_ids", torch.arange(seq, device=device).reshape(1, 1, -1)
+                                 .expand(3, batch, -1))
 
         def forward(self, tokens):
-            hidden = self.backbone(input_ids=tokens, use_cache=False).last_hidden_state
+            hidden = self.backbone(input_ids=tokens, attention_mask=None, position_ids=self.position_ids,
+                                   use_cache=False).last_hidden_state
             return torch.nn.functional.linear(hidden, self.projection).float().square().mean()
 
     model = BackboneLoss().train()
     if any(parameter.dtype != torch.float32 for parameter in model.parameters()):
         raise RuntimeError("all master parameters must be fp32")
-    network = torch.compile(model, backend="eager" if args.smoke else "inductor", dynamic=False)
+    observed_sdpa = []
+
+    def inspect_cpu_graph(graph, example_inputs):
+        for node in graph.graph.nodes:
+            if node.op == "call_function" and node.target is torch.nn.functional.scaled_dot_product_attention:
+                if node.kwargs.get("attn_mask") is not None or node.kwargs.get("is_causal") is not True:
+                    raise AssertionError(f"compiled attention violated the causal no-mask contract: {node.kwargs}")
+                observed_sdpa.append({"attn_mask": None, "is_causal": True})
+        return graph.forward
+
+    network = torch.compile(model, backend=inspect_cpu_graph if args.smoke else "inductor", dynamic=False)
     decay, no_decay = [], []
     for name, parameter in model.named_parameters():
         (decay if parameter.ndim >= 2 and name.rsplit(".", 1)[-1] != "bias" else no_decay).append(parameter)
@@ -377,6 +394,8 @@ def run(args: argparse.Namespace) -> dict:
         raise RuntimeError("non-finite training loss")
     if args.smoke and torch.equal(before, next(model.parameters()).detach()):
         raise RuntimeError("tiny proof failed to update the backbone")
+    if args.smoke and not observed_sdpa:
+        raise AssertionError("CPU proof did not inspect a compiled SDPA call")
     state_dtypes = sorted({str(value.dtype) for state in optimizer.state.values() for value in state.values()
                            if isinstance(value, torch.Tensor)})
     if state_dtypes != ["torch.float32"]:
@@ -404,8 +423,8 @@ def run(args: argparse.Namespace) -> dict:
                          "schedule": "common.warmup_cosine(init=0,peak=2.5e-5,warmup=10,decay_steps=220,end=0)",
                          "gradient_clipping": None,
                          "gradient_checkpointing": False, "gradient_accumulation": 1,
-                         "compile_backend": "eager" if args.smoke else "inductor", "warmup": args.warmup,
-                         "attention": "eager CPU" if args.smoke else "SDPA flash only",
+                         "compile_backend": "inspected FX eager" if args.smoke else "inductor", "warmup": args.warmup,
+                         "attention": "plain causal SDPA, attn_mask=None, is_causal=True; flash-only on CUDA",
                          "gdn": "HF CPU" if args.smoke else "FLA chunk + causal-conv1d + FLA gated RMSNorm",
                          "liger": [] if args.smoke else ["RMSNorm (offset=1)", "SwiGLU"],
                          "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
@@ -425,6 +444,7 @@ def run(args: argparse.Namespace) -> dict:
     record["time"].update(model_flops_per_step=flops, peak_gflops=None if peak is None else peak / 1e9)
     if args.smoke:
         record["checks"]["attribution_fixture"] = smoke_attribution(Path(args.out).with_suffix(".fixture.json"))
+        record["checks"]["compiled_sdpa_calls"] = observed_sdpa
     if args.dew_attribution:
         record["comparison"] = comparison(record, args.dew_attribution, args.dew_entry)
     write_record(args.out, record)

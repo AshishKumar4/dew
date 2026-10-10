@@ -45,6 +45,35 @@ def _peaks():
 peak_flops = _peaks().peak_flops
 
 
+def register_plain_causal_sdpa() -> str:
+    """HF's SDPA for complete, unpadded, uncached causal training rows.
+
+    HF 5.3's default mask builder materializes a dense mask during Dynamo
+    tracing, even with attention_mask=None. Flash SDPA rejects that mask.
+    Register the row contract through HF's public attention interfaces so
+    every backbone can use the same no-mask path, with explicit guards.
+    """
+    from transformers import AttentionInterface
+    from transformers.integrations.sdpa_attention import sdpa_attention_forward
+    from transformers.masking_utils import AttentionMaskInterface
+
+    def mask(*, attention_mask=None, cache_position, kv_length, kv_offset, **kwargs):
+        if attention_mask is not None or kv_offset != 0 or cache_position.shape[0] != kv_length:
+            raise ValueError("plain causal SDPA requires complete unpadded rows and no cache")
+        return None
+
+    def attention(module, query, key, value, attention_mask, **kwargs):
+        if attention_mask is not None or query.shape[-2] != key.shape[-2] or query.shape[-2] <= 1:
+            raise ValueError("plain causal SDPA requires no mask and equal training query/key lengths > 1")
+        kwargs["is_causal"] = True
+        return sdpa_attention_forward(module, query, key, value, None, **kwargs)
+
+    name = "plain_causal_sdpa"
+    AttentionInterface.register(name, attention)
+    AttentionMaskInterface.register(name, mask)
+    return name
+
+
 def warmup_cosine(step: int, *, init: float, peak: float, warmup: int, decay_steps: int,
                   end: float) -> float:
     """`optax.warmup_cosine_decay_schedule` at `step`, the count of updates
