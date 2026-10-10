@@ -1,0 +1,159 @@
+"""tools/attribute_step.py: where a profiled step's device time goes, by part and kind.
+
+The rows here are the Qwen3.5-0.8B step's own (c50, a decision step on an A100): XProf's hlo_stats
+rows and the optimized HLO they ran, cut to the instructions each case reads. A kind is read
+from the op, never from its operands' names, which its expression also holds: FlashAttention's
+backward takes an operand called `%input_concatenate_fusion.8` and is attention, not a layout
+move, and a weight-gradient GEMM traced at `up_proj/transpose` is a GEMM.
+"""
+
+import json
+
+import pytest
+from tool_support import load
+
+attribute = load("attribute_step")
+
+MODULE = """HloModule jit_step
+
+%fused_multiply_transpose.8 (param_0: f32[8,16,3072], param_1: f32[8,16,48,64]) -> f32[8,16,3072] {
+  %param_1 = f32[8,16,48,64]{3,2,1,0} parameter(1)
+  %exp.178 = f32[8,16,48,64]{3,2,1,0} exponential(%param_1)
+  %transpose.12 = f32[8,48,64,16]{3,2,1,0} transpose(%exp.178), dimensions={0,2,3,1}
+  %param_0 = f32[8,16,3072]{2,1,0} parameter(0)
+  ROOT %multiply.3 = f32[8,16,3072]{2,1,0} multiply(%param_0, %param_0)
+}
+
+%fused_convert.83 (param_0.1: f32[8,3072,8,256]) -> bf16[8,3072,8,256] {
+  %param_0.1 = f32[8,3072,8,256]{3,2,1,0} parameter(0)
+  ROOT %convert.4 = bf16[8,3072,8,256]{3,2,1,0} convert(%param_0.1)
+}
+
+%fused_reduce.89 (param_0.2: f32[8,16,3072]) -> f32[8,16] {
+  %param_0.2 = f32[8,16,3072]{2,1,0} parameter(0)
+  %constant.1 = f32[] constant(0)
+  ROOT %reduce.7 = f32[8,16]{1,0} reduce(%param_0.2, %constant.1), dimensions={2}, to_apply=%add
+}
+"""
+ENTRY = [
+    "  %p0 = bf16[8,3072,8,256]{3,2,1,0} parameter(0)",
+    "  %ffi_call.114 = (bf16[8,3072,8,256]{3,2,1,0}, bf16[8,3072,8,256]{3,2,1,0}) custom-call("
+    "%loop_convert_fusion.83, %input_concatenate_fusion.8), custom_call_target=\"dew_flash_mha_bwd\", "
+    "api_version=API_VERSION_TYPED_FFI",
+    "  %dot_product_attention_bwd.144 = (bf16[8,16,2800,64]{3,1,2,0}, u8[0]{0}) custom-call("
+    "%bitcast.13109.0, %bitcast.13113.0), custom_call_target=\"__cudnn$fmhaSoftmaxBackward\"",
+    "  %pallas_call.525 = (f32[6144,64,128]{2,1,0}) custom-call(%bitcast.478.0), "
+    "custom_call_target=\"__gpu$xla.gpu.triton\"",
+    "  %custom-call.1589 = (bf16[1024,3584]{1,0}, s8[4194304]{0}) custom-call(%bitcast.remat.237, "
+    "%bitcast.2097.0), custom_call_target=\"__cublas$lt$matmul\"",
+    "  %input_multiply_transpose_fusion.8 = f32[8,16,3072]{2,1,0} fusion(%a, %b), kind=kInput, "
+    "calls=%fused_multiply_transpose.8",
+    "  %loop_convert_fusion.83 = bf16[8,3072,8,256]{3,2,1,0} fusion(%p0), kind=kLoop, "
+    "calls=%fused_convert.83",
+    "  %input_reduce_fusion.89 = f32[8,16]{1,0} fusion(%c), kind=kInput, calls=%fused_reduce.89",
+    "  ROOT %copy.5 = bf16[8,3072,8,256]{2,3,1,0} copy(%p0)",
+]
+MODULE += "ENTRY %main.1 (p0: bf16[8,3072,8,256]) -> bf16[8,3072,8,256] {\n" + "\n".join(ENTRY) + "\n}\n"
+
+LAYER = ("jit(step)/transpose(jvp(MultimodalTransformer.hidden_states))/language_model.hidden_states/"
+         "language_model.stack/layers_11/layers_11._forward/layers_11._mix/self_attn/")
+
+
+def row(name, expression, framework, category="custom-call"):
+    """An hlo_stats row as XProf writes it, its expression cut where XProf cuts it."""
+    return {"hlo_op_name": name, "hlo_op_expression": expression[:400], "tf_op_name": framework,
+            "category": category}
+
+
+ROWS = {
+    "flash backward": (row("ffi_call.114", "%ffi_call.114 = (bf16[8,3072,8,256]{3,2,1,0}, bf16[8,3072,8,256]"
+                           "{3,2,1,0}) custom-call(bf16[8,3072,8,256]{3,2,1,0} %loop_convert_fusion.83, bf16"
+                           "[8,3072,8,256]{3,2,1,0} %input_concatenate_fusion.8, bf16[8,3072,2,2",
+                           LAYER + "self_attn._attended/ffi_call:"), "attention"),
+    "cuDNN attention backward": (row("dot_product_attention_bwd.144", "%dot_product_attention_bwd.144 = "
+                                     "(bf16[8,16,2800,64]{3,1,2,0}, u8[0]{0}) custom-call(bf16[8,2800,16,64]"
+                                     "{3,2,1,0} %bitcast.13109.0",
+                                     "jit(step)/transpose(jvp(JointSchemaHead))/evidence_layers_1/attention/"
+                                     "dot_product_attention_bwd:"), "attention"),
+    "Pallas recurrence": (row("pallas_call.525", "%pallas_call.525 = (f32[6144,64,128]{2,1,0}) custom-call("
+                              "f32[6144,64,128]{2,1,0} %bitcast.478.0",
+                              LAYER + "gated_delta_prep_backward/pallas_call:"), "pallas"),
+    "weight-gradient GEMM": (row("custom-call.1589", "%custom-call.1589 = (bf16[1024,3584]{1,0}, "
+                                 "s8[4194304]{0}) custom-call(bf16[24576,1024]{1,0} %bitcast.remat.237",
+                                 LAYER.replace("_mix/self_attn/", "mlp/up_proj/") + "transpose:"), "gemm"),
+    "transposing fusion": (row("input_multiply_transpose_fusion.8", "%input_multiply_transpose_fusion.8 = "
+                               "f32[8,16,3072]{2,1,0} fusion(f32[8,16,3072]{2,1,0} "
+                               "%input_transpose_fusion.225",
+                               LAYER + "jit(softplus)/mul:", "input fusion"), "layout"),
+    "dtype cast": (row("loop_convert_fusion.83", "%loop_convert_fusion.83 = bf16[8,3072,8,256]{3,2,1,0} "
+                       "fusion("
+                       "f32[8,3072,8,256]{3,2,1,0} %p0", LAYER + "convert_element_type:", "loop fusion"),
+                   "elementwise"),
+    "reduction": (row("input_reduce_fusion.89", "%input_reduce_fusion.89 = f32[8,16]{1,0} fusion("
+                      "f32[8,16,3072]"
+                      "{2,1,0} %c", LAYER + "reduce_sum:", "input fusion"), "reduce"),
+    "layout copy": (row("copy.5", "%copy.5 = bf16[8,3072,8,256]{2,3,1,0} copy(bf16[8,3072,8,256]{3,2,1,0} "
+                        "%p0)",
+                        LAYER + "copy:", "data formatting"), "layout"),
+}
+
+
+@pytest.mark.parametrize("case", list(ROWS))
+def test_an_op_is_kinded_by_what_it_runs_not_by_its_operands_names(case):
+    """With the module, a custom call is kinded by its target and a fusion by the ops it runs."""
+    found, kind = ROWS[case]
+    assert attribute.kind_of(found, attribute.instructions(MODULE)) == kind
+
+
+@pytest.mark.parametrize("case, kind", [
+    ("flash backward", "custom-call"),
+    ("Pallas recurrence", "pallas"),
+    ("transposing fusion", "layout"),
+    ("dtype cast", "elementwise"),
+    ("reduction", "reduce"),
+    ("layout copy", "layout"),
+])
+def test_without_the_module_an_op_is_kinded_from_its_own_name_and_opcode(case, kind):
+    """A custom call whose target the expression does not show is only a custom call, never the
+    kind of an operand its expression names."""
+    assert attribute.kind_of(ROWS[case][0]) == kind
+
+
+@pytest.mark.parametrize("framework, source, part", [
+    (LAYER + "gated_delta_prep_backward/pallas_call:", "dew/nn/linear.py:450:31", "gdn"),
+    (LAYER + "jit(softplus)/mul:", "dew/nn/linear.py:689:48", "gdn"),
+    (LAYER + "self_attn._attended/ffi_call:", "dew/nn/attention.py:854:15", "attention"),
+    ("jit(step)/transpose(jvp(JointSchemaHead))/evidence_layers_1/attention/dot_product_attention_bwd:",
+     "dew/nn/attention.py:511:10", "head_loss"),
+    (LAYER.replace("_mix/self_attn/", "input_layernorm/") + "mul:", "dew/nn/attention.py:292:12", "norm"),
+    (LAYER.replace("_mix/self_attn/", "mlp/up_proj/") + "transpose:", "dew/nn/moe.py:549:20", "mlp"),
+])
+def test_a_part_is_read_from_the_source_that_traced_it_before_the_module_path(framework, source, part):
+    """Qwen3.5 names every mixer `self_attn`, so a delta net's ops are its by their file; the
+    decision head's attention is the head's, and a decoder norm traced in attention.py is a norm."""
+    assert attribute.part_of(f"{framework} {source}") == part
+
+
+def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
+    """Through the command: the step's time by kind and by part and kind, each op once."""
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info"]
+    times = {"flash backward": 6000.0, "Pallas recurrence": 2000.0, "transposing fusion": 1000.0,
+             "weight-gradient GEMM": 500.0}
+    cells = [("15", found["category"], found["hlo_op_name"], found["hlo_op_expression"], found["tf_op_name"],
+              "1", time, "") for case, time in times.items() for found in [ROWS[case][0]]]
+    rows = [{"c": [{"v": value} for value in values]} for values in cells]
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": rows}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 311869.0}}))
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    (dump / "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt").write_text(MODULE)
+    out = tmp_path / "attribution.json"
+    assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
+    time = json.loads(out.read_text())["time"]
+    assert time["by_kind_ms"] == {"attention": 6.0, "pallas": 2.0, "layout": 1.0, "gemm": 0.5}
+    assert time["by_part_kind_ms"]["attention"] == {"attention": 6.0}
+    assert time["by_part_kind_ms"]["mlp"] == {"gemm": 0.5}
