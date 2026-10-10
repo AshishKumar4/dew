@@ -9,12 +9,12 @@ import ctypes
 import importlib.util
 import logging
 import os
+import re
 import shutil
-import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 
-from dew.pool import runs_on_gpu
+from dew.pool import answered, runs_on_gpu
 
 _log = logging.getLogger(__name__)
 _late_policy_warned = False
@@ -132,22 +132,17 @@ def runs_on(build: str, driver: str, sm: tuple[int, int]) -> bool:
 
 def nvidia_gpus() -> tuple[str, tuple[int, int]] | None:
     """The driver version and the least SM of the GPUs nvidia-smi lists, or
-    None where none answers: no nvidia-smi, no GPU, or a driver too old to
-    report an SM."""
+    None where none answers (`dew.pool.answered`): no nvidia-smi, no GPU, or
+    a driver too old to report an SM, which prints `[N/A]`."""
     if shutil.which("nvidia-smi") is None:
         return None
-    query = ["nvidia-smi", "--query-gpu=driver_version,compute_cap", "--format=csv,noheader"]
-    try:
-        found = subprocess.run(query, capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
+    listed = answered(("nvidia-smi", "--query-gpu=driver_version,compute_cap", "--format=csv,noheader"), 10)
+    lines = (listed or "").splitlines()
+    rows = [[field.strip() for field in line.split(",")] for line in lines if line.strip()]
+    if not rows or not all(len(row) == 2 and re.fullmatch(r"\d+\.\d+", row[1]) for row in rows):
         return None
-    rows = [line.split(",") for line in found.stdout.splitlines() if line.strip()]
-    if found.returncode != 0 or not rows:
-        return None
-    try:
-        return rows[0][0].strip(), min(tuple(map(int, sm.strip().split("."))) for _, sm in rows)
-    except ValueError:
-        return None
+    sms = [(int(major), int(minor)) for major, minor in (row[1].split(".") for row in rows)]
+    return rows[0][0], min(sms)
 
 
 def cpu_only_refusal(env: Mapping[str, str], gpus: tuple[str, tuple[int, int]] | None,
