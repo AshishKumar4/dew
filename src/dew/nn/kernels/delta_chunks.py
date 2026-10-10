@@ -67,40 +67,40 @@ def refusal(key: jax.Array, out_vals: jax.Array) -> str | None:
     )
 
 
-def _forward_kernel(key_ref, w_ref, gc_ref, u_ref, state_ref, entered_ref, corrected_ref, final_ref):
+def _forward_kernel(key_ref, w_ref, leave_ref, forget_ref, u_ref, state_ref,
+                    entered_ref, corrected_ref, final_ref):
     """One program's chunks in order. Refs are its row-head's `[NC, C, Dk]`
-    keys and `w`, `[NC, C]` cumulated decays, `[NC, C, BLOCK]` values and its
-    `[Dk, BLOCK]` slice of the memory; it writes the slice each chunk enters,
-    the corrected values and the slice leaving the last chunk."""
-    chunks, size = gc_ref.shape
+    keys and `w`, `[NC, C]` write decays, `[NC]` memory decays,
+    `[NC, C, BLOCK]` values and its `[Dk, BLOCK]` slice of the memory;
+    it writes the slice each chunk enters, the corrected values and the
+    slice leaving the last chunk."""
+    chunks = leave_ref.shape[0]
 
     def chunk(n, state):
         entered_ref[n] = state
-        gc, last = gc_ref[n], gc_ref[n, size - 1]
         corrected = u_ref[n] - w_ref[n] @ state
         corrected_ref[n] = corrected
-        written = key_ref[n] * jnp.exp(last - gc)[:, None]
-        return state * jnp.exp(last) + written.T @ corrected
+        written = key_ref[n] * leave_ref[n][:, None]
+        return state * forget_ref[n] + written.T @ corrected
 
     final_ref[...] = jax.lax.fori_loop(0, chunks, chunk, state_ref[...])
 
 
-def _backward_kernel(key_ref, w_ref, gc_ref, d_entered_ref, d_corrected_ref, d_final_ref,
+def _backward_kernel(key_ref, w_ref, leave_ref, forget_ref, d_entered_ref, d_corrected_ref, d_final_ref,
                      d_leaving_ref, d_u_ref, d_state_ref):
     """`_forward_kernel` read backwards: from the cotangent of the slice
     leaving the last chunk, each chunk's gradient of the slice leaving it and
     of its corrected values, then the gradient of the slice entering the
     first."""
-    chunks, size = gc_ref.shape
+    chunks = leave_ref.shape[0]
 
     def chunk(i, d_state):
         n = chunks - 1 - i
         d_leaving_ref[n] = d_state
-        gc, last = gc_ref[n], gc_ref[n, size - 1]
-        written = key_ref[n] * jnp.exp(last - gc)[:, None]
+        written = key_ref[n] * leave_ref[n][:, None]
         d_u = d_corrected_ref[n] + written @ d_state
         d_u_ref[n] = d_u
-        return d_entered_ref[n] + d_state * jnp.exp(last) - w_ref[n].T @ d_u
+        return d_entered_ref[n] + d_state * forget_ref[n] - w_ref[n].T @ d_u
 
     d_state_ref[...] = jax.lax.fori_loop(0, chunks, chunk, d_final_ref[...])
 
@@ -136,34 +136,45 @@ def _call(body, name: str, whole, columned, outputs, interpret: bool):
     return [out.reshape(shape.shape) for out, shape in zip(blocks, outputs, strict=True)]
 
 
-def _states(key, w, u, gc, state, interpret: bool):
+def _states_with_decays(key, w, u, leave, forget, state, interpret: bool):
     """`xla_chunk_states` on the kernels: operands in its layout, fp32, and
     the same `(entered, corrected, final)` back."""
     batch, heads, chunks = key.shape[:3]
     entered = jax.ShapeDtypeStruct((batch, heads, chunks, *state.shape[2:]), jnp.float32)
-    entered, corrected, final = _call(_forward_kernel, "gated_delta_states", (key, w, gc), (u, state),
-                                      (entered, u, state), interpret)
+    entered, corrected, final = _call(_forward_kernel, "gated_delta_states", (key, w, leave, forget),
+                                      (u, state), (entered, u, state), interpret)
     return entered, corrected, final
 
 
+def _decay_factors(gc):
+    """The write and memory decays in XLA, shared by both recurrence kernels.
+    Keeping exp here gives the same factors as xla_chunk_states, including
+    at 'highest', which controls dot precision but not Triton's exp."""
+    return jnp.exp(gc[..., -1:] - gc), jnp.exp(gc[..., -1])
+
+
+def _states(key, w, u, gc, state, interpret: bool):
+    leave, forget = _decay_factors(gc)
+    return _states_with_decays(key, w, u, leave, forget, state, interpret)
+
+
 def _states_fwd(key, w, u, gc, state, interpret: bool):
-    entered, corrected, final = _states(key, w, u, gc, state, interpret)
-    return (entered, corrected, final), (key, w, gc, entered, corrected)
+    leave, forget = _decay_factors(gc)
+    entered, corrected, final = _states_with_decays(key, w, u, leave, forget, state, interpret)
+    return (entered, corrected, final), (key, w, leave, forget, entered, corrected)
 
 
 def _states_bwd(interpret: bool, residual, cotangent):
-    key, w, gc, entered, corrected = residual
+    key, w, leave, forget, entered, corrected = residual
     d_entered, d_corrected, d_final = cotangent
-    d_leaving, d_u, d_state = _call(_backward_kernel, "gated_delta_states_backward", (key, w, gc),
+    d_leaving, d_u, d_state = _call(_backward_kernel, "gated_delta_states_backward", (key, w, leave, forget),
                                     (d_entered, d_corrected, d_final),
                                     (d_entered, d_corrected, d_final), interpret)
-    last = gc[..., -1:]
-    leave = jnp.exp(last - gc)                                         # [.., C]
     d_written = corrected @ jnp.swapaxes(d_leaving, -1, -2)            # [.., C, Dk]
     # The written keys' decay `exp(g_C - g_t)`: what reaches its exponent
     # goes to g_C with one sign and to g_t with the other.
     d_exponent = jnp.sum(d_written * key, axis=-1) * leave
-    d_last = (jnp.exp(last[..., 0]) * jnp.sum(entered * d_leaving, axis=(-2, -1))
+    d_last = (forget * jnp.sum(entered * d_leaving, axis=(-2, -1))
               + jnp.sum(d_exponent, axis=-1))
     d_gc = (-d_exponent).at[..., -1].add(d_last)
     return (d_written * leave[..., None], -(d_u @ jnp.swapaxes(entered, -1, -2)), d_u, d_gc, d_state)
