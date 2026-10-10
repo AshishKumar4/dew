@@ -5,11 +5,10 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import sharp from 'sharp';
+import { terminalText } from '../src/data/terminal-text.mjs';
 import { checkOnly, siteRoot } from './lib.mjs';
 
 export const imageRoot = path.join(siteRoot, 'public/tutorials');
-
-const ANSI = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
 
 export const escapeHtml = (text) =>
 	text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -18,15 +17,6 @@ export const escapeHtml = (text) =>
 const oneLine = (html) => html.replace(/\r?\n/g, '&#10;');
 
 export const joined = (value) => (Array.isArray(value) ? value.join('') : (value ?? ''));
-
-/** Apply carriage returns the way a terminal does, so progress bars show their last state. */
-function terminal(text) {
-	return text
-		.replace(ANSI, '')
-		.split('\n')
-		.map((line) => line.split('\r').filter((part) => part !== '').at(-1) ?? '')
-		.join('\n');
-}
 
 async function writeImage(buffer, stem, name) {
 	const dir = path.join(imageRoot, stem);
@@ -51,8 +41,8 @@ export async function renderOutputs(cell, stem, index, allowErrors, images, reco
 	const install = /^\s*[%!]pip\s/.test(joined(cell.source));
 	const flush = () => {
 		if (!stream) return;
-		const text = terminal(stream.text).replace(/\n+$/, '');
-		const stdout = terminal(stream.stdout).replace(/\n+$/, '');
+		const text = terminalText(stream.text).replace(/\n+$/, '');
+		const stdout = terminalText(stream.stdout).replace(/\n+$/, '');
 		if (stdout) record.stdout = (record.stdout ? `${record.stdout}\n` : '') + stdout;
 		if (text) {
 			const body = `<pre class="nb-stream">${escapeHtml(text)}</pre>`;
@@ -77,7 +67,7 @@ export async function renderOutputs(cell, stem, index, allowErrors, images, reco
 		flush();
 		if (output.output_type === 'error') {
 			if (!allowErrors) throw new Error(`${stem}: cell ${index} recorded ${output.ename}: ${output.evalue}`);
-			const trace = terminal(joined(output.traceback));
+			const trace = terminalText(joined(output.traceback));
 			html.push(`<div class="nb-output nb-error"><pre>${escapeHtml(trace)}</pre></div>`);
 			continue;
 		}
@@ -97,7 +87,7 @@ export async function renderOutputs(cell, stem, index, allowErrors, images, reco
 			const markup = joined(data['text/html']).replace(/<script[\s\S]*?<\/script>/gi, '');
 			html.push(`<div class="nb-output nb-html">${markup}</div>`);
 		} else if (data['text/plain']) {
-			html.push(`<div class="nb-output nb-result"><pre>${escapeHtml(terminal(joined(data['text/plain'])))}</pre></div>`);
+			html.push(`<div class="nb-output nb-result"><pre>${escapeHtml(terminalText(joined(data['text/plain'])))}</pre></div>`);
 		}
 	}
 	flush();

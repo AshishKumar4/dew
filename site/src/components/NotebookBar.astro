@@ -159,9 +159,11 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 			}
 		});
 		bar.querySelector('[data-live-interrupt]')!.addEventListener('click', () => session?.interrupt());
-		bar.querySelector('[data-live-restart]')!.addEventListener('click', () => {
-			session?.restart();
-			say('Restarted the kernel. Run the cells again from the top.');
+		bar.querySelector('[data-live-restart]')!.addEventListener('click', async () => {
+			if (!session) return;
+			say('Restarting the kernel…');
+			const done = await session.restart();
+			say(done.status === 'ok' ? 'Restarted the kernel. Run the cells again from the top.' : 'The kernel did not restart. Reload the page for a new one.');
 		});
 		addEventListener('pagehide', () => session?.close());
 	}

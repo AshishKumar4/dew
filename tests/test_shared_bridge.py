@@ -261,3 +261,42 @@ def test_the_load_report_names_the_busiest_processes_and_the_stalls(bridge, tmp_
     assert report["loadavg"].startswith("3.90")
     assert report["stalls"] == {"cpu": "some avg10=61.00 avg60=20.00 avg300=5.00 total=1"}
     assert report["cpu_ticks"] == [(600, "7", "python model_service.py"), (10, "8", "sh")]
+
+
+def test_restart_ends_the_running_cell_and_gives_it_a_fresh_context(gateway):
+    """The notebook's Restart: the running cell ends as aborted, its context is replaced, the
+    restart is answered done, and the next run is in the fresh context."""
+    async def scenario():
+        session = str(uuid.uuid4())
+        await gateway.create(session)
+        socket = Socket(session)
+        handler = asyncio.create_task(gateway.websocket(socket))
+        await socket.incoming.put({"op": "execute", "id": "1", "code": "wait"})
+        await until(lambda: any(m.get("type") == "stream" for m in socket.sent), handler)
+        await socket.incoming.put({"op": "restart", "id": "2"})
+        await until(lambda: socket.done("2"), handler)
+        done = {m["id"]: m["status"] for m in socket.sent if m.get("type") == "done"}
+        assert done == {"1": "aborted", "2": "ok"}
+        await socket.incoming.put({"op": "execute", "id": "3", "code": "now"})
+        await until(lambda: socket.done("3"), handler)
+        outputs = [m["text"] for m in socket.sent if m.get("type") == "stream"]
+        assert outputs == ["kernel-0", "kernel-1"]
+        await socket.incoming.put({"op": "restart", "id": "4", "cell": "never-ran"})
+        await until(lambda: socket.done("4"), handler)
+        assert len(gateway.kernels) == 2
+        await socket.incoming.put(None)
+        with pytest.raises(Closed):
+            await handler
+
+    asyncio.run(asyncio.wait_for(scenario(), 10))
+
+
+def test_tutorials_offer_run_live_only_with_the_modules_the_live_context_stands_in_for():
+    """site/scripts/render-notebooks.mjs gives a notebook Run live when it imports only these."""
+    import re
+
+    site = ROOT.parents[1]
+    offered = re.search(r"LIVE_MODULES = new Set\(\[(.*?)\]\)", (site / "scripts/render-notebooks.mjs").read_text())
+    served = re.search(r"sys\.modules\.update\(\{(.*?)\}\)", (ROOT / "model_client.py").read_text())
+    assert offered and served
+    assert set(re.findall(r"'(dew[\w.]*)'", offered[1])) == set(re.findall(r'"(dew\.[\w.]+)":', served[1]))
