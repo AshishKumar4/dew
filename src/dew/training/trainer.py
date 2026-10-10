@@ -2252,10 +2252,14 @@ class Trainer(Generic[Loss, Effects]):
             # where the loop waits on the device.
             loss.block_until_ready()
             now = time.time()
+            rate = learning_rate(state.opt_state)
+            if (rate is None and self._config is not None and self._config.schedule is None
+                    and not self._config.param_groups):
+                rate = self._config.learning_rate
             # One read for every number, since each float() of a device
             # array is a copy of its own.
             read = jax.device_get({
-                "loss": loss, "aux": aux, "accepted": accepted, "rate": learning_rate(state.opt_state),
+                "loss": loss, "aux": aux, "accepted": accepted, "rate": rate,
                 "committed": None if interval.book is None else interval.book[5:],
                 "scale": None if state.scale is None else state.scale.scale,
                 "model_flops": (interval.book[3] if interval.model_counted and interval.book is not None

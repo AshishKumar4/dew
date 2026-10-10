@@ -100,6 +100,7 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
     trainer.fit(targets([1., 3.]), steps=2, log_every=1)
     first = [row for row in run.history if 'train/loss' in row]
     assert all(row['train/compiles'] == 1 for row in first)
+    assert all(row['train/learning_rate'] == pytest.approx(.1) for row in first)
     assert first[1]['train/cache_hits'] >= first[0]['train/cache_hits']
     assert first[1]['train/cache_misses'] >= first[0]['train/cache_misses']
     state = trainer.initial_state()
