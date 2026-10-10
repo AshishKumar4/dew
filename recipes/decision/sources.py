@@ -21,7 +21,8 @@ options under their own names, or under letters (`option_i` past 26) with
 their text as the description. Requests reach a decision model in both
 shapes, so the model learns both.
 
-Only permissive or share-alike sources are read. Each source's licence,
+Only permissive or CC BY-SA sources are read by default; software-copyleft
+data is opt-in. Each source's licence,
 evidence URL and pinned revision are recorded in `mixture.json`. Shares
 are computed from the written training counts with temperature 3, a
 configurable 200,000-row cap and at most ten epochs per mixture pass.
@@ -585,7 +586,8 @@ class Esci(Source):
                                          pc.equal(batch["small_version"], 1)))
             positions = [index for index in range(len(batch))
                          if selected is None or offset + index in selected]
-            examples.extend(batch.take(positions).to_pylist())
+            if positions:
+                examples.extend(batch.take(positions).to_pylist())
             offset += len(batch)
         needed = {(row["product_id"], row["product_locale"]) for row in examples}
         ids, products = pa.array(list({key[0] for key in needed})), {}
@@ -1056,9 +1058,13 @@ class Snips(Framed):
 
 @dataclass(frozen=True)
 class PhishingEmail(Source):
-    """Phishing Email Detection (zefang-liu/phishing-email-dataset, LGPL-3.0-only), labelled emails."""
+    """Phishing Email Detection (zefang-liu/phishing-email-dataset, LGPL-3.0-only), opt-in labelled emails.
 
-    weight: float = 1.0
+    Software copyleft applied to data is outside the default permissive/CC BY-SA policy.
+    Enable it with a positive weight only when accepting those terms.
+    """
+
+    weight: float = 0.0
     revision: str = "34085a032c123ca237f314a01a67909cdea35e34"
     repo: ClassVar[str] = "zefang-liu/phishing-email-dataset"
     files: ClassVar[tuple[str, ...]] = ("Phishing_Email.csv",)
@@ -1357,7 +1363,8 @@ def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None,
         "rows": counts,
         "sources": {name: {"class": type(source).__name__, **dataclasses.asdict(source)}
                     for name, source in mixture.sources()},
-        "licences": {name: source.licence_record() for name, source in mixture.sources()},
+        "licences": {entry.name: source.licence_record() for entry in fields(mixture)
+                     if (source := getattr(mixture, entry.name)).repo or source.weight > 0},
         "decontamination": None if overlaps is None else dict(overlaps.report),
     }
     (out / "mixture.json").write_text(json.dumps(made, indent=1) + "\n")

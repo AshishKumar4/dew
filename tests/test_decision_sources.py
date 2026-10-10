@@ -84,6 +84,25 @@ def test_esci_rows_reproduce_the_kits_request(sources, label):
     assert example.answers == {"answer": label}
 
 
+def test_esci_small_cap_skips_batches_with_no_selected_pairs(sources, monkeypatch, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    examples_path, products_path = tmp_path / "examples.parquet", tmp_path / "products.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"product_id": str(index), "product_locale": "us", "split": "train", "small_version": 1,
+         "query": f"query {index}", "esci_label": "E"} for index in range(8200)]), examples_path)
+    pq.write_table(pa.Table.from_pylist([
+        {"product_id": "8199", "product_locale": "us", "product_title": "Last product"}]), products_path)
+    monkeypatch.setattr(sources, "_github", lambda repo, rev, path, **kwargs:
+                        examples_path if path.endswith("examples.parquet") else products_path)
+    monkeypatch.setattr(sources, "_draw", lambda count, limit, held, seed: {8199})
+    examples = sources.Esci(limit=1, held=0).examples()
+    assert len(examples) == 1
+    assert examples[0].state == {"search_query": "query 8199", "product": {"title": "Last product"}}
+    assert examples[0].answers == {"answer": "E"}
+
+
 def test_isarcasm_reads_csv_and_uses_the_binary_target(sources, monkeypatch, tmp_path):
     path = tmp_path / "train.En.csv"
     tweets = ['Wonderful, another "perfect" day.\nReally.', "An ordinary afternoon."]
@@ -203,6 +222,15 @@ def test_written_weights_use_post_split_post_decontamination_counts_and_licences
         "name": "CC-BY-4.0", "url": "https://archive.ics.uci.edu/dataset/228/sms+spam+collection",
         "revision": "cae486f927c250fe1d4a5b55f11357964ed1646c"}
     assert json.loads((tmp_path / "mixture.json").read_text()) == made
+    assert default.phishing_email.weight == 0
+    assert "phishing_email" not in dict(default.sources())
+    assert made["licences"]["phishing_email"] == {
+        "name": "LGPL-3.0-only",
+        "url": ("https://huggingface.co/datasets/zefang-liu/phishing-email-dataset/blob/"
+                "34085a032c123ca237f314a01a67909cdea35e34/README.md"),
+        "revision": "34085a032c123ca237f314a01a67909cdea35e34"}
+    enabled = dataclasses.replace(default, phishing_email=sources.PhishingEmail(weight=1))
+    assert "phishing_email" in dict(enabled.sources())
     for _, source in default.sources():
         licence = source.licence_record()
         assert licence["name"] and licence["url"].startswith("https://")
