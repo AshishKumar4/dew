@@ -3,6 +3,7 @@
 // Opening a session renders a Turnstile check, asks the Worker for a session,
 // and connects its WebSocket; the protocol is described in site/live/container/shared_bridge.py.
 
+import { terminalText } from '../data/terminal-text.mjs';
 import { live } from '../live.mjs';
 
 const { endpoint: ENDPOINT, turnstileSitekey: SITEKEY } = location.hostname === live.preview.hostname ? live.preview : live;
@@ -159,8 +160,17 @@ export class LiveSession {
 		this.socket.send(JSON.stringify({ op: 'interrupt', cell }));
 	}
 
-	restart(): void {
-		this.socket.send(JSON.stringify({ op: 'restart' }));
+	/** End what runs in `cell` and give it a fresh Python context; resolves once the new one is ready. */
+	restart(cell?: string): Promise<Done> {
+		const { promise, resolve } = Promise.withResolvers<Done>();
+		if (this.socket.readyState !== WebSocket.OPEN) {
+			resolve({ status: 'aborted', count: null });
+			return promise;
+		}
+		const id = String(this.next++);
+		this.pending.set(id, { onOutput: () => {}, resolve });
+		this.socket.send(JSON.stringify({ op: 'restart', id, cell }));
+		return promise;
 	}
 
 	close(): void {
@@ -170,17 +180,6 @@ export class LiveSession {
 
 // Rendering outputs, shared by the landing page and the tutorial pages.
 
-// eslint-disable-next-line no-control-regex
-const ANSI = /\u001b\[[0-9;]*[A-Za-z]/g;
-
-/** Text as a terminal would show it: ANSI colors removed, and a carriage return rewriting its line. */
-export function terminalText(text: string): string {
-	return text
-		.replace(ANSI, '')
-		.split('\n')
-		.map((line) => line.slice(line.lastIndexOf('\r') + 1))
-		.join('\n');
-}
 
 /** Append one output to `into`, the way the tutorial pages show recorded outputs. */
 export function renderOutput(into: HTMLElement, output: Output): void {

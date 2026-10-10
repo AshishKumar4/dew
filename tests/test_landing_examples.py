@@ -13,24 +13,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_each_native_landing_cell_defines_its_imports_and_data():
-    script = """
-        import {readFileSync} from 'node:fs';
-        import {example, trainingExample} from './site/src/data/framework-examples.mjs';
-        const source = readFileSync('site/snippets/framework.py', 'utf8');
-        const where = JSON.parse(readFileSync('site/snippets/cells.json', 'utf8'));
-        const names = [...where.pool, ...where.colab];
-        const cells = Object.fromEntries(names.map(name => [name, example(source, name)]));
-        cells.hero = trainingExample(readFileSync('site/src/data/hero.py', 'utf8'));
-        process.stdout.write(JSON.stringify(cells));
-    """
-    cells = json.loads(subprocess.check_output(["node", "--input-type=module", "-e", script], cwd=ROOT))
-    assert len(cells) == 13
-    # The page and the recorder (site/snippets/cells.py) read the same code out of framework.py.
+    # The page reads its programs from programs.json, which site/snippets/cells.py writes.
     sys.path.insert(0, str(ROOT / "site/snippets"))
     import cells as page
-    assert {name: page.cell(name) for name in cells if name != "hero"} == {
-        name: code for name, code in cells.items() if name != "hero"}
-    assert page.training_example((ROOT / "site/src/data/hero.py").read_text()) == cells["hero"]
+    cells = json.loads((ROOT / "site/src/data/programs.json").read_text())
+    assert cells == page.programs(), "programs.json is stale: run python site/snippets/cells.py"
+    assert len(cells) == 13
     for name, code in cells.items():
         compile(code, f"{name}.py", "exec")
         imports = [node for node in ast.parse(code).body if isinstance(node, (ast.Import, ast.ImportFrom))]

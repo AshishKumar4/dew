@@ -27,48 +27,30 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 </div>
 
 <script>
-	import type { LiveSession } from '../../scripts/live';
 	import { renderOutput } from '../../scripts/live';
-	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
+	import { liveCell, phases } from '../../scripts/landing-kernel';
 
 	const panel = document.querySelector<HTMLElement>('[data-live-text]');
-	if (panel?.querySelector('[data-text-run]')) {
+	const run = panel?.querySelector<HTMLButtonElement>('[data-text-run]');
+	if (panel && run) {
 		const editor = panel.querySelector<HTMLTextAreaElement>('textarea[data-text-cell]')!;
-		const run = panel.querySelector<HTMLButtonElement>('[data-text-run]')!;
 		const output = panel.querySelector<HTMLElement>('[data-text-output]')!;
 		const status = panel.querySelector<HTMLElement>('[data-text-status]')!;
-		const holder = panel.querySelector<HTMLElement>('[data-text-turnstile]')!;
-		let session: LiveSession | undefined;
-		let running = false;
-		let stopping = false;
-		onKernelClose((message) => {
-			session = undefined;
-			if (!running) status.textContent = `${message} Press Run to start a new one.`;
-		});
-		const execute = async () => {
-			running = true;
-			stopping = false;
-			run.textContent = 'Stop';
-			output.replaceChildren();
-			if (output.getBoundingClientRect().bottom > innerHeight) output.scrollIntoView({ block: 'center', behavior: 'smooth' });
-			let timer: number | undefined;
-			let phase = 'Starting';
-			let since = performance.now();
-			const setPhase = (text: string) => {
-				phase = text;
-				since = performance.now();
-				status.textContent = text;
-			};
-			try {
-				timer = window.setInterval(() => { if (!stopping) status.textContent = `${phase} · ${Math.round((performance.now() - since) / 1000)} s`; }, 1000);
-				session = await landingKernel(holder, setPhase);
-				if (stopping) throw new Error('Stopped.');
-				const started = performance.now();
-				setPhase('Generating');
+		const phase = phases(status);
+		let first: number | undefined;
+		liveCell(run, editor, panel.querySelector<HTMLElement>('[data-text-turnstile]')!, 'text', {
+			start: () => {
+				output.replaceChildren();
+				if (output.getBoundingClientRect().bottom > innerHeight) output.scrollIntoView({ block: 'center', behavior: 'smooth' });
+				phase.start('Starting');
+			},
+			kernel: (text) => phase.set(text),
+			begin: () => {
+				phase.set('Generating');
 				// The server streams the text so far; the cell then prints all of it, which is already shown.
 				const streamed = document.createElement('pre');
-				let first: number | undefined;
-				const result = await session.run(editor.value, (message) => {
+				first = undefined;
+				return (message) => {
 					if (message.type === 'display' && message.text?.startsWith('{"dew-text"')) {
 						const packet = JSON.parse(message.text);
 						first ??= packet.first_token_seconds;
@@ -78,31 +60,22 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 					}
 					if (message.type === 'stream' && message.text.trimEnd() === streamed.textContent?.trimEnd()) return;
 					renderOutput(output, message);
-				}, 'text');
-				window.clearInterval(timer);
-				const seconds = ((performance.now() - started) / 1000).toFixed(1);
-				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
-					: result.status !== 'ok' ? 'The cell stopped with an error.'
+				};
+			},
+			end: (outcome) => {
+				phase.stop();
+				const seconds = 'done' in outcome ? outcome.seconds.toFixed(1) : '';
+				status.textContent = 'failure' in outcome ? outcome.failure
+					: outcome.done.status === 'aborted' ? 'Stopped.'
+					: outcome.done.status !== 'ok' ? 'The cell stopped with an error.'
 					: first === undefined ? `Generated in ${seconds} s.`
 					: `Generated in ${seconds} s; the first token came ${first.toFixed(2)} s after the request.`;
-			} catch (error) {
-				status.textContent = error instanceof Error ? error.message : String(error);
-			} finally {
-				window.clearInterval(timer);
-				running = false;
-				run.textContent = 'Run';
-				run.disabled = false;
-			}
-		};
-		run.addEventListener('click', () => {
-			if (!running) void execute();
-			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt('text'); }
-		});
-		editor.addEventListener('keydown', (event) => {
-			if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !running) {
-				event.preventDefault();
-				void execute();
-			}
+			},
+			stopping: () => {
+				phase.stop();
+				status.textContent = 'Stopping';
+			},
+			closed: (message) => (status.textContent = `${message} Press Run to start a new one.`),
 		});
 	}
 </script>

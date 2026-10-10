@@ -80,6 +80,8 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 		const label = start.querySelector<HTMLElement>('[data-label]')!;
 		let session: Session | undefined;
 		let queue: Promise<unknown> = Promise.resolve();
+		// Each Restart starts a new epoch; runs queued before it are dropped.
+		let epoch = 0;
 
 		const say = (text: string) => (status.textContent = text);
 
@@ -109,8 +111,8 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 			return done.status === 'ok';
 		}
 
-		function enqueue(id: number): Promise<boolean> {
-			const run = queue.then(() => runCell(id));
+		function enqueue(id: number, mine = epoch): Promise<boolean> {
+			const run = queue.then(() => (mine === epoch ? runCell(id) : false));
 			queue = run.catch(() => false);
 			return run;
 		}
@@ -154,14 +156,22 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 		});
 
 		bar.querySelector('[data-live-all]')!.addEventListener('click', async () => {
+			// One epoch for the whole run, so a Restart during it ends it.
+			const mine = epoch;
 			for (const cell of cells) {
-				if (!(await enqueue(cell.id))) break;
+				if (!(await enqueue(cell.id, mine))) break;
 			}
 		});
 		bar.querySelector('[data-live-interrupt]')!.addEventListener('click', () => session?.interrupt());
-		bar.querySelector('[data-live-restart]')!.addEventListener('click', () => {
-			session?.restart();
-			say('Restarted the kernel. Run the cells again from the top.');
+		bar.querySelector('[data-live-restart]')!.addEventListener('click', async () => {
+			if (!session) return;
+			epoch += 1;
+			say('Restarting the kernel…');
+			// Runs asked for from now on wait for the fresh context.
+			const restarted = session.restart();
+			queue = restarted;
+			const done = await restarted;
+			say(done.status === 'ok' ? 'Restarted the kernel. Run the cells again from the top.' : 'The kernel did not restart. Reload the page for a new one.');
 		});
 		addEventListener('pagehide', () => session?.close());
 	}
