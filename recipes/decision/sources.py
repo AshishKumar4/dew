@@ -136,6 +136,26 @@ def _github(repo: str, revision: str, path: str, *, media: bool = False) -> Path
     return cached
 
 
+def _http(url: str, digest: str, namespace: str) -> Path:
+    """Cache a release file only after verifying its pinned SHA-256, including on later reads."""
+    import shutil
+    import urllib.request
+
+    from huggingface_hub import cached_assets_path
+
+    path = cached_assets_path(library_name="dew", namespace=namespace, subfolder=digest) / Path(url).name
+    checked = path if path.is_file() else path.with_suffix(path.suffix + ".partial")
+    if not path.is_file():
+        with urllib.request.urlopen(url, timeout=300) as source, checked.open("wb") as target:
+            shutil.copyfileobj(source, target)
+    with checked.open("rb") as file:
+        if hashlib.file_digest(file, "sha256").hexdigest() != digest:
+            raise ValueError(f"{url} does not match the pinned SHA-256")
+    if checked != path:
+        checked.replace(path)
+    return path
+
+
 def _unit(text: str, salt: str) -> float:
     """A number in [0, 1) that `text` fixes, so a row is framed the same way on every read."""
     digest = hashlib.sha256(f"{salt}:{text}".encode()).digest()
@@ -706,27 +726,8 @@ class Sgd(Source):
 
 def _evidence_database() -> Path:
     """DI's HotpotQA Wikipedia database, accepted only at its pinned SHA-256."""
-    import shutil
-    import urllib.request
-
-    from huggingface_hub import cached_assets_path
-
-    digest = "c37ee397916ec0bffacfe8902db454a5cda88a7a188409217b2e15231fe5ee2f"
-    path = cached_assets_path(library_name="dew", namespace="hover", subfolder=digest) / "wiki_wo_links.db"
-    if not path.is_file():
-        partial = path.with_suffix(".partial")
-        url = "https://nlp.cs.unc.edu/data/hover/wiki_wo_links.db"
-        with (urllib.request.urlopen(url, timeout=300) as source,
-              partial.open("wb") as target):
-            shutil.copyfileobj(source, target)
-        with partial.open("rb") as file:
-            if hashlib.file_digest(file, "sha256").hexdigest() != digest:
-                raise ValueError("HoVer evidence database does not match DI's pinned SHA-256")
-        partial.replace(path)
-    with path.open("rb") as file:
-        if hashlib.file_digest(file, "sha256").hexdigest() != digest:
-            raise ValueError("HoVer evidence database does not match DI's pinned SHA-256")
-    return path
+    return _http("https://nlp.cs.unc.edu/data/hover/wiki_wo_links.db",
+                 "c37ee397916ec0bffacfe8902db454a5cda88a7a188409217b2e15231fe5ee2f", "hover")
 
 
 @dataclass(frozen=True)
@@ -824,20 +825,98 @@ class WinoGrande(Source):
 
 @dataclass(frozen=True)
 class Fever(Framed):
-    """FEVER gold evidence (copenlu/fever_gold_evidence, CC-BY-SA-3.0 AND GPL-3.0-only)."""
+    """Original FEVER (fever.ai, CC-BY-SA-3.0), SUPPORTS/REFUTES claims with gold Wikipedia sentences.
+
+    Both the training claims and June 2017 Wikipedia archive are SHA-256 pinned.
+    NOT ENOUGH INFO has no gold evidence in this release and is not a training example.
+    """
 
     weight: float = 1.0
-    revision: str = "a6b8d891d393e97a4efac791afffb2d7de5e57c6"
-    repo: ClassVar[str] = "copenlu/fever_gold_evidence"
-    files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
-    licence: ClassVar[str] = "CC-BY-SA-3.0 AND GPL-3.0-only"
+    revision: str = "eba7e8f87076753f8494718b9a857827af7bf73e76c9e4b75420207d26e588b6"
+    wiki_revision: str = "4b06d95da6adf7fe02d2796176c670dacccb21348da89cba4c50676ab99665f2"
+    repo: ClassVar[str] = "fever.ai"
+    licence: ClassVar[str] = "CC-BY-SA-3.0"
+    licence_url: ClassVar[str] = "https://fever.ai/dataset/fever.html"
 
-    def convert(self, row: dict) -> Example:
-        evidence = "\n".join(f"{item[0]}: {item[2]}" for item in row["evidence"])
-        options = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
+    def licence_record(self) -> dict[str, str]:
+        return {**super().licence_record(), "wiki_revision": self.wiki_revision}
+
+    def claims(self) -> Iterator[dict]:
+        """Only the original pinned training release, never development or test claims."""
+        path = _http("https://fever.ai/download/fever/train.jsonl", self.revision, "fever")
+        with path.open() as file:
+            for line in file:
+                yield json.loads(line)
+
+    @cached_property
+    def label_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = defaultdict(int)
+        for row in self.claims():
+            counts[row["label"]] += 1
+        return dict(counts)
+
+    def count(self) -> int:
+        return sum(self.label_counts[label] for label in ("SUPPORTS", "REFUTES"))
+
+    def rows(self) -> Iterator[dict]:
+        selected = _draw(self.count(), self.limit, self.held, self.seed)
+        labelled = (row for row in self.claims() if row["label"] in ("SUPPORTS", "REFUTES"))
+        for index, row in enumerate(labelled):
+            if selected is None or index in selected:
+                yield row
+
+    def sentences(self, needed: dict[str, set[int]]) -> dict[tuple[str, int], str]:
+        """Stream the archive, retaining only the sampled claims' requested gold sentence texts."""
+        import zipfile
+
+        path = _http("https://fever.ai/download/fever/wiki-pages.zip", self.wiki_revision, "fever")
+        found, pending = {}, set(needed)
+        with zipfile.ZipFile(path) as archive:
+            for name in archive.namelist():
+                if not name.endswith(".jsonl") or name.startswith("__MACOSX/"):
+                    continue
+                with archive.open(name) as file:
+                    for line in file:
+                        page = json.loads(line)
+                        if page["id"] not in pending:
+                            continue
+                        for sentence in page["lines"].splitlines():
+                            index, _, text = sentence.partition("\t")
+                            if index.isdigit() and int(index) in needed[page["id"]]:
+                                found[page["id"], int(index)] = text.partition("\t")[0]
+                        if all((page["id"], index) in found for index in needed[page["id"]]):
+                            pending.remove(page["id"])
+                        if not pending:
+                            return found
+        if pending:
+            raise ValueError(f"FEVER has missing gold evidence sentences on {len(pending)} pages")
+        return found
+
+    def convert(self, row: dict) -> Example | None:
+        if row["label"] not in ("SUPPORTS", "REFUTES"):
+            return None
+        evidence = "\n".join(f"{item['page']}: {item['text']}" for item in row["evidence"])
+        options = ["SUPPORTS", "REFUTES"]
         return self.example(f"Claim: {row['claim']}\nEvidence: {evidence}",
                             "Does the evidence support or refute the claim?",
                             options, options.index(row["label"]))
+
+    def examples(self) -> list[Example]:
+        claims = list(self.rows())
+        needed: dict[str, set[int]] = defaultdict(set)
+        facts = []
+        for row in claims:
+            pairs = list(dict.fromkeys((item[2], item[3]) for group in row["evidence"] for item in group
+                                       if item[2] is not None and item[3] is not None and item[3] >= 0))
+            if not pairs:
+                raise ValueError(f"FEVER labelled claim {row['id']} has no gold evidence")
+            facts.append(pairs)
+            for page, index in pairs:
+                needed[page].add(index)
+        sentences = self.sentences(dict(needed)) if needed else {}
+        return [self.convert({**row, "evidence": [{"page": page, "text": sentences[page, index]}
+                                                 for page, index in pairs]})
+                for row, pairs in zip(claims, facts, strict=True)]
 
 
 @dataclass(frozen=True)
