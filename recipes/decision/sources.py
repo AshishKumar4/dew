@@ -867,30 +867,39 @@ class Fever(Framed):
 
     def sentences(self, needed: dict[str, set[int]]) -> dict[tuple[str, int], str]:
         """Stream the archive, retaining only the sampled claims' requested gold sentence texts."""
+        import unicodedata
         import zipfile
 
         path = _http("https://fever.ai/download/fever/wiki-pages.zip", self.wiki_revision, "fever")
-        found, pending = {}, set(needed)
+        # FEVER's own DocDB normalizes both stored page IDs and queries to NFD.
+        wanted: dict[str, set[int]] = defaultdict(set)
+        for title, indices in needed.items():
+            wanted[unicodedata.normalize("NFD", title)].update(indices)
+        found, pending = {}, set(wanted)
         with zipfile.ZipFile(path) as archive:
             for name in archive.namelist():
+                if not pending:
+                    break
                 if not name.endswith(".jsonl") or name.startswith("__MACOSX/"):
                     continue
                 with archive.open(name) as file:
                     for line in file:
                         page = json.loads(line)
-                        if page["id"] not in pending:
+                        title = unicodedata.normalize("NFD", page["id"])
+                        if title not in pending:
                             continue
                         for sentence in page["lines"].splitlines():
                             index, _, text = sentence.partition("\t")
-                            if index.isdigit() and int(index) in needed[page["id"]]:
-                                found[page["id"], int(index)] = text.partition("\t")[0]
-                        if all((page["id"], index) in found for index in needed[page["id"]]):
-                            pending.remove(page["id"])
+                            if index.isdigit() and int(index) in wanted[title]:
+                                found[title, int(index)] = text.partition("\t")[0]
+                        if all((title, index) in found for index in wanted[title]):
+                            pending.remove(title)
                         if not pending:
-                            return found
+                            break
         if pending:
             raise ValueError(f"FEVER has missing gold evidence sentences on {len(pending)} pages")
-        return found
+        return {(title, index): found[unicodedata.normalize("NFD", title), index]
+                for title, indices in needed.items() for index in indices}
 
     def convert(self, row: dict) -> Example | None:
         if row["label"] not in ("SUPPORTS", "REFUTES"):

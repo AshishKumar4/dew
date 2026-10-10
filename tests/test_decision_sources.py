@@ -327,12 +327,12 @@ def test_original_fever_samples_labelled_claims_and_joins_only_gold_sentences(
          "evidence": [[[1, 2, "A", 0], [1, 3, "B", 2]], [[4, 5, "A", 0]]]},
         {"id": 2, "label": "NOT ENOUGH INFO", "claim": "No evidence", "evidence": [[[None] * 4]]},
         {"id": 3, "label": "REFUTES", "claim": "Second claim", "evidence": [[[5, 6, "B", 1]]]},
-        {"id": 4, "label": "SUPPORTS", "claim": "Third claim", "evidence": [[[7, 8, "C", 0]]]},
+        {"id": 4, "label": "SUPPORTS", "claim": "Third claim", "evidence": [[[7, 8, "Café", 0]]]},
     ]
     claims_path.write_text("".join(json.dumps(row) + "\n" for row in claims))
     pages = [{"id": "A", "lines": "0\tA zero\tignored link\n1\tA unused"},
              {"id": "B", "lines": "2\tB two\n0\tB unused\n1\tB one\tignored link"},
-             {"id": "C", "lines": "0\tC zero"},
+             {"id": unicodedata.normalize("NFD", "Café"), "lines": "0\tC zero"},
              {"id": "Unused", "lines": "0\tDo not retain this page"}]
     with zipfile.ZipFile(wiki_path, "w") as archive:
         archive.writestr("license.html", "Not a JSONL member")
@@ -348,6 +348,7 @@ def test_original_fever_samples_labelled_claims_and_joins_only_gold_sentences(
     full = source.examples()
     assert len(full) == 3
     assert full[0].state == "Claim: First claim\nEvidence: A: A zero\nB: B two"
+    assert full[2].state == "Claim: Third claim\nEvidence: Café: C zero"
     assert [row.answers for row in full] == [
         {"answer": "SUPPORTS"}, {"answer": "REFUTES"}, {"answer": "SUPPORTS"}]
     monkeypatch.setattr(sources, "_draw", lambda count, limit, held, seed: {1})
