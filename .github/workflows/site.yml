@@ -20,12 +20,17 @@ on:
     branches: [ "main" ]
     paths: [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
   workflow_dispatch:
+    inputs:
+      run_cells:
+        description: "A deployed landing page whose live cells to run, such as https://preview.dewml.dev"
+        required: false
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
-  group: site-${{ github.ref }}
+  group: site-${{ github.ref }}${{ inputs.run_cells && '-cells' || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' || startsWith(github.ref, 'refs/heads/ci/') }}
 
 jobs:
@@ -50,7 +55,7 @@ jobs:
 
   build:
     needs: proven
-    if: needs.proven.outputs.run == ''
+    if: needs.proven.outputs.run == '' && !inputs.run_cells
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -136,3 +141,33 @@ jobs:
       env:
         CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       run: node live/deploy.mjs "$GITHUB_SHA"
+
+  # Run on a deployed page: every landing cell that runs on the live pool, pressed as a visitor
+  # would, each screenshotted once it finishes (scripts/run-cells.mjs).
+  cells:
+    if: ${{ inputs.run_cells }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        working-directory: site
+    steps:
+    - uses: actions/checkout@v4
+    - uses: pnpm/action-setup@v4
+      with:
+        package_json_file: site/package.json
+    - uses: actions/setup-node@v4
+      with:
+        node-version: 22
+        cache: pnpm
+        cache-dependency-path: site/pnpm-lock.yaml
+    - run: pnpm install --frozen-lockfile
+    - run: node scripts/run-cells.mjs "$URL" cells
+      env:
+        URL: ${{ inputs.run_cells }}
+    - uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: cells
+        path: site/cells
+        retention-days: 14
