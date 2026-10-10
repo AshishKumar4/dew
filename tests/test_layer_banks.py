@@ -193,5 +193,5 @@ def test_spreading_placed_banks_holds_the_base_once():
 
     spread_tree = spread(banks, rows)
     del banks
-    assert sorted(spread_tree) == [f"layers_{index}" for index in range(16)]
+    assert set(spread_tree) == {f"layers_{index}" for index in range(16)}
     assert max(peaks) <= one, peaks
