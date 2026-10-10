@@ -95,11 +95,13 @@ class AxisLink:
 class StepCompiled:
     """A training step compiled for a new batch shape, the remat it compiled
     under, which is the model's own or a stronger rung the trainer moved to
-    because the step did not fit, and the links of the tensor and sequence
-    axes the mesh splits, by axis name."""
+    because the step did not fit, the links of the tensor and sequence axes
+    the mesh splits, by axis name, and the arithmetic of the check that it
+    fits this process's devices (`dew.training.memory.memory_record`)."""
     seconds: float
     remat: JSON
     links: Mapping[str, AxisLink]
+    memory: JSON = None
 
 
 @dataclasses.dataclass(frozen=True)

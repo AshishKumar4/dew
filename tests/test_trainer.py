@@ -1859,7 +1859,7 @@ def device_memory(limit, in_use, largest=0, pool=None, platform="gpu"):
     stats = {"bytes_limit": int(limit), "bytes_in_use": int(in_use), "largest_free_block_bytes": int(largest)}
     if pool is not None:
         stats["pool_bytes"] = int(pool)
-    return SimpleNamespace(platform=platform, local_hardware_id=0, memory_stats=lambda: stats)
+    return SimpleNamespace(platform=platform, id=0, local_hardware_id=0, memory_stats=lambda: stats)
 
 
 def test_a_step_fits_where_one_free_block_holds_its_temporaries(monkeypatch):
@@ -1881,6 +1881,49 @@ def test_a_step_fits_where_one_free_block_holds_its_temporaries(monkeypatch):
     split = device_memory(limit, 13.3 * GiB, largest=10.4 * GiB, pool=limit)
     assert step_headroom(planned_step(11.68 * GiB), [split]) < 0
     assert step_headroom(planned_step(10 * GiB), [split]) > 0
+
+
+def test_the_fit_checks_arithmetic_is_recorded(monkeypatch):
+    """`memory_record` keeps what the check read, the step's analysis, the
+    bytes held beside it and each device's allocator, with its answer, so a
+    step the check passed and the devices refused can be read from its
+    StepCompiled record."""
+    from dew.training import memory as module
+
+    monkeypatch.setenv("XLA_FLAGS", "--xla_gpu_enable_allocator_spatial_partitioning=false")
+    monkeypatch.setattr(module, "gpu_free_bytes", lambda ordinal: None)
+    device = device_memory(60 * GiB, 31 * GiB, largest=26 * GiB, pool=58 * GiB)
+    step = planned_step(28.08 * GiB, outputs=GiB)
+    record = module.memory_record(step, [device], 2 * GiB, fits=False)
+    assert record["fits"] is False
+    assert record["analysis"]["temp"] == int(28.08 * GiB) and record["held"] == 2 * GiB
+    assert record["devices"][0]["largest_free_block_bytes"] == 26 * GiB
+    assert record["devices"][0]["pool_bytes"] == 58 * GiB and record["devices"][0]["strands"] is False
+
+
+def test_a_new_steps_failure_on_the_devices_is_raised_as_the_steps(monkeypatch):
+    """A step's failure surfaces at the next program that reads its outputs:
+    on an A100 an out-of-memory step was reported under the loss counters
+    (`executable_name='jit_bookkeep'`). The first run of a newly compiled
+    step is awaited, and its failure named with the check that said it fits;
+    a later one is named where the counters meet it."""
+    from types import SimpleNamespace
+
+    trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0))
+    trainer.memory = {"held": 123}
+
+    def refused():
+        raise jax.errors.JaxRuntimeError("RESOURCE_EXHAUSTED: Out of memory while trying to allocate "
+                                         "28.08GiB [executable_name='jit_bookkeep']")
+
+    with pytest.raises(RuntimeError, match=r"compiled for step 1 failed on its first run.*\"held\": 123"):
+        trainer._await_first_run(SimpleNamespace(block_until_ready=refused), 1)
+
+    interval = trainer_module._Interval(last_log_time=0.0, last_saved=None)
+    interval.book = interval.fresh = (0.0, 0, SimpleNamespace())
+    monkeypatch.setattr(jax, "device_get", lambda value: refused())
+    with pytest.raises(RuntimeError, match="a training step before step 7 failed on the devices"):
+        interval.check_finite(7, trainer._display)
 
 
 def test_a_partitioned_pool_needs_room_for_the_temporaries_twice(monkeypatch):

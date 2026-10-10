@@ -212,6 +212,30 @@ def step_headroom(executable: jax.stages.Compiled, devices: Sequence, held: int 
                for d, m in zip(devices, memory, strict=True))
 
 
+MEMORY_STATS = ('bytes_limit', 'bytes_in_use', 'pool_bytes', 'largest_free_block_bytes', 'peak_bytes_in_use')
+
+
+def memory_record(executable: jax.stages.Compiled, devices: Sequence, held: int, *, fits: bool) -> JSON:
+    """What the fit check read for a compiled step, as `step_headroom` reads
+    it, and its answer `fits`: XLA's memory analysis of the step, `held`, and
+    each of `devices`' allocator stats and free GPU bytes, in bytes. A step
+    the check passed and the devices then refused is read from it."""
+    stats = executable.memory_analysis()
+    analysis: JSON = None if stats is None else {
+        name: int(getattr(stats, f"{name}_size_in_bytes", 0) or 0)
+        for name in ("argument", "output", "alias", "temp", "generated_code")}
+    devices_stats: list[JSON] = []
+    for device in devices:
+        memory = device.memory_stats() or {}
+        reported: dict[str, JSON] = {key: int(memory[key]) for key in MEMORY_STATS if key in memory}
+        devices_stats.append({"id": int(device.id), **reported,
+                              "unclaimed": None if not memory else unclaimed(device, memory),
+                              "strands": bool(memory) and strands_temporaries(device.platform, memory)})
+    record: dict[str, JSON] = {"analysis": analysis, "held": int(held), "devices": devices_stats,
+                               "fits": fits}
+    return record
+
+
 def unclaimed(device, memory: Mapping[str, int]) -> int | None:
     """Return the bytes free on a GPU whose pool grows (`gpu_free_bytes`), or None for any other device.
 
