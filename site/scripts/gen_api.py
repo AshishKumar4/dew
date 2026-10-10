@@ -501,7 +501,8 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
                         bound[name] = module_at(package, target)
                     except KeyError:
                         continue
-        elif isinstance(node, ast.ImportFrom) and node.module and (node.module + ".").startswith(P.package + "."):
+        elif (isinstance(node, ast.ImportFrom) and node.module
+              and (node.module + ".").startswith(P.package + ".")):
             try:
                 module = module_at(package, node.module)
                 for alias in node.names:
@@ -820,7 +821,8 @@ def main() -> None:
     overview = P.repo / P.overview
     if P.overview_title:
         overview.parent.mkdir(parents=True, exist_ok=True)
-        overview.write_text("---\n" + json.dumps({"title": P.overview_title, "editUrl": False}, indent=1) + "\n---\n")
+        front = json.dumps({"title": P.overview_title, "editUrl": False}, indent=1)
+        overview.write_text(f"---\n{front}\n---\n")
     elif not overview.exists():
         raise SystemExit("gen_api: run sync-docs first; it writes the overview page the module list extends")
     index = ["", "## All modules", "",
