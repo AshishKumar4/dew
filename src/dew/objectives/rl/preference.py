@@ -89,11 +89,12 @@ class DPOObjective(LMObjective):
                 "the DPO reference reads step.ema, but the objective keeps no EMA; "
                 "a DPO run always freezes one")
         chosen_ids, rejected_ids, chosen_mask, rejected_mask = self._halves(batch)
-        policy = self.token_scores(variables, jnp.concatenate((chosen_ids, rejected_ids)),
-                                   qk_stats=self.qk_stats)
+        # The policy and its reference score both halves in one forward each, through the same
+        # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
+        pairs = jnp.concatenate((chosen_ids, rejected_ids))
+        policy = self.token_scores(variables, pairs, qk_stats=self.qk_stats)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
-        ref_chosen = self.per_token_log_probs(step.ema, chosen_ids)
-        ref_rejected = self.per_token_log_probs(step.ema, rejected_ids)
+        ref_chosen, ref_rejected = jnp.split(-self.token_scores(step.ema, pairs).losses, 2)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
