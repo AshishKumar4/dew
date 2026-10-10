@@ -12,6 +12,7 @@ from flax import linen as nn
 from test_instrumentation import Regression, batches
 
 import dew.config
+import dew.io
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.data import Dataset
@@ -339,6 +340,30 @@ def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path, capsys):
     output = capsys.readouterr().out
     assert "Experiment_Name: batch" in output
     assert f"Local tracking: {tmp_path / 'runs' / 'batch' / 'tracking'}" in output
+
+
+def test_what_a_run_writes_after_training_is_published_with_its_checkpoint(tmp_path, monkeypatch):
+    """`after` runs before the final checkpoint is published, so a file it
+    writes into the run, as a decision run's calibrated task, is there to
+    publish beside the step."""
+    from dew.config import Wandb
+    from dew.training.tracker import LocalTracker
+
+    published = []
+    monkeypatch.setattr(dew.config, "WandbTracker", lambda *_, **__: LocalTracker(str(tmp_path / "wandb")))
+    monkeypatch.setattr(dew.io, "publish", lambda directory, *_, **__: published.append(
+        sorted(entry.name for entry in os.scandir(os.path.dirname(directory)) if entry.is_file())))
+    run = RunConfig(trainer=TrainerConfig(
+        name="after", checkpoint_dir=str(tmp_path / "runs"), steps=1, batch_size=8, eval_every=None,
+        checkpoint_every=1, wandb=Wandb(project="dew")))
+
+    def calibrate(state, directory):
+        with open(os.path.join(directory, "decide.json"), "w") as file:
+            file.write("{}")
+
+    data = Dataset(lambda partition: batches(), None, None, 8)
+    run.train(Regression(), data, name="after", after=calibrate)
+    assert published == [["decide.json", "run.json"]]
 
 
 def test_train_scores_every_named_validation_split(tmp_path):

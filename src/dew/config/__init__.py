@@ -780,13 +780,10 @@ class Prepared:
     `run` is the run as it records itself, with what building resolved (a
     pinned source, the model's fields as built). `train` trains it under a
     name: `run.train` over the objective and the data the class built.
-    `after` runs on the state training ends on and the run's directory, as a
-    decision run fits its calibration on its held-out rows and saves it there.
     """
 
     run: "RunConfig"
     train: Callable[[str], TrainState]
-    after: Callable[[TrainState, str], None] | None = None
 
 
 def _within(node: dict[str, JSON], key: str) -> dict[str, JSON]:
@@ -1064,10 +1061,7 @@ class RunConfig:
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
                                 f"{datasets.label(registry.import_path(type(prepared.run.data)))}/"
                                 f"date-{run_timestamp()}")
-        state = prepared.train(name)
-        if prepared.after is not None:
-            prepared.after(state, os.path.join(trainer.checkpoint_dir, name))
-        return state
+        return prepared.train(name)
 
     def recorded(self, objective: Objective[Loss, Effects]) -> Self:
         """Return this config as the record of the run that trains `objective`.
@@ -1098,7 +1092,8 @@ class RunConfig:
     def train(self, objective: Objective[Loss, Effects], dataset: Dataset, *, name: str,
               metrics: Sequence[Metric] = (), rollout: Rollout | None = None,
               summary: Mapping[str, object] | None = None,
-              validation: Mapping[str, Reader] | None = None) -> TrainState:
+              validation: Mapping[str, Reader] | None = None,
+              after: Callable[[TrainState, str], None] | None = None) -> TrainState:
         """Train `objective` on `data` as this config describes; every recipe calls this after building both.
 
         The run lives under `name` in `trainer.checkpoint_dir`, and process zero writes
@@ -1123,7 +1118,9 @@ class RunConfig:
         scores in place of `dataset.val`, as `Trainer.fit` takes them: a held-out
         split and a test set are logged as `val/...` and `test/...`. With no
         `trainer.best`, the first split's loss ranks the checkpoints; a `Best`
-        over a metric names its split.
+        over a metric names its split. `after` runs on the state training ends
+        on and the run's directory before the checkpoint is published, as a
+        decision run fits its calibration there, so what it writes is published.
         """
         if dataset.batch != self.trainer.batch_size:
             raise ValueError(
@@ -1177,6 +1174,8 @@ class RunConfig:
                 metrics=metrics, preview=trainer.wandb is not None,
                 best=trainer.best_policies(), validation=validation,
             )
+            if after is not None:
+                after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
                 if wandb_tracker is not None:

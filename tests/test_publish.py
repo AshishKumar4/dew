@@ -70,13 +70,15 @@ def test_a_local_checkpoint_is_uploaded_with_its_run_spec(tmp_path, wandb):
     step.mkdir(parents=True)
     (step / "params").write_text("weights")
     (run / RUN_FILE).write_text("{}")
+    (run / "decide.json").write_text("{}")
     tracker = Tracker()
 
     logged = dew.io.publish(str(step), "flowers", tracker=tracker, aliases=("v1",))
 
     assert logged is not None
     assert logged.dirs == [(str(step), "step_6")] and logged.references == []
-    assert logged.files == [(str(run / RUN_FILE), RUN_FILE)], "the run spec rides with the weights"
+    assert logged.files == [(str(run / "decide.json"), "decide.json"), (str(run / RUN_FILE), RUN_FILE)], \
+        "the run's own files, its spec and what it wrote beside it, ride with the weights"
     assert tracker.run.logged[0][1] == ("latest", "v1")
     assert tracker.run.linked[0][1] == f"{dew.io.REGISTRY}/flowers"
 
@@ -86,8 +88,8 @@ def test_a_bucket_checkpoint_is_referenced_rather_than_uploaded(monkeypatch, tmp
     gs:// path is False, so the spec is found through the path's own parent
     and the reference carries it with no local read."""
     class Uri:
-        """The three things publish asks a path: its parent, a child, and
-        whether it is there. A real gs:// path would need credentials."""
+        """What publish asks a path: its parent, a child, its listing, and
+        whether it is a file. A real gs:// path would need credentials."""
 
         def __init__(self, uri):
             self.uri = str(uri)
@@ -105,6 +107,12 @@ def test_a_bucket_checkpoint_is_referenced_rather_than_uploaded(monkeypatch, tmp
 
         def exists(self):
             return True
+
+        def is_file(self):
+            return self.name == RUN_FILE
+
+        def iterdir(self):
+            return [self / "step_6", self / RUN_FILE]
 
         def read_text(self):
             """The step's Orbax metadata, recording one stored collection."""
@@ -158,6 +166,12 @@ class FileUri:
 
     def exists(self):
         return self.local.exists()
+
+    def is_file(self):
+        return self.local.is_file()
+
+    def iterdir(self):
+        return [FileUri(f"file://{entry}") for entry in self.local.iterdir()]
 
     def read_text(self):
         return self.local.read_text()
