@@ -3,6 +3,7 @@
 Data is built remotely into R2. The PC carries manifest identities and the
 scoped credential only; it never publishes or proxies dataset bytes.
 """
+
 import hashlib
 import os
 import re
@@ -29,14 +30,15 @@ class DataCache:
             raise ValueError("invalid data-cache key")
         for attempt in range(4):
             try:
-                response = requests.get(self.endpoint + "/" + key, headers=self.headers,
-                                        timeout=(20, 120), stream=stream)
+                response = requests.get(
+                    self.endpoint + "/" + key, headers=self.headers, timeout=(20, 120), stream=stream
+                )
                 response.raise_for_status()
                 return response
             except requests.RequestException:
                 if attempt == 3:
                     raise
-                time.sleep(2 ** attempt)
+                time.sleep(2**attempt)
         raise AssertionError("request retries exhausted")
 
     def restore(self, prefix: str, identity: str, target: Path) -> dict:

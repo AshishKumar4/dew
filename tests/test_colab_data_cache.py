@@ -1,4 +1,5 @@
 """VM-only data restore against a fake remote builder's published manifest."""
+
 import hashlib
 import json
 
@@ -15,8 +16,18 @@ def service(tmp_path, monkeypatch):
     token = tmp_path / "private-token"
     token.write_text("secret")
     payload = b"remote-built rows\n"
-    manifest = {"schema": 1, "name": "decision/mix-v3", "dew": "build-sha", "files": [{
-        "path": "nested/rows.jsonl", "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload)}]}
+    manifest = {
+        "schema": 1,
+        "name": "decision/mix-v3",
+        "dew": "build-sha",
+        "files": [
+            {
+                "path": "nested/rows.jsonl",
+                "sha256": hashlib.sha256(payload).hexdigest(),
+                "bytes": len(payload),
+            }
+        ],
+    }
     body = json.dumps(manifest).encode()
     objects = {"decision/mix-v3/manifest.json": body, "decision/mix-v3/nested/rows.jsonl": payload}
     calls = []
@@ -34,7 +45,7 @@ def service(tmp_path, monkeypatch):
 
         def iter_content(self, size):
             for offset in range(0, len(self.content), size):
-                yield self.content[offset:offset + size]
+                yield self.content[offset : offset + size]
 
         def __enter__(self):
             return self
@@ -107,10 +118,23 @@ def test_symlink_parent_is_rejected(tmp_path, service):
 def test_staging_sends_only_manifest_identity_and_scoped_credential(tmp_path, service):
     _, _, identity, _ = service
     descriptor = tmp_path / "data.json"
-    save(descriptor, {"url": "https://fake.invalid", "token_file": str(tmp_path / "private-token"), "sources": [
-        {"prefix": "decision/mix-v3", "manifest_sha256": identity, "target": "/content/data"}]})
-    job = {**colab_batch.data_inputs({"data_inputs": str(descriptor)}), "index": 1,
-           "entry": {"fields": {"command": "run"}}, "resume_key": "unused", "artifact_policy": "measurements"}
+    save(
+        descriptor,
+        {
+            "url": "https://fake.invalid",
+            "token_file": str(tmp_path / "private-token"),
+            "sources": [
+                {"prefix": "decision/mix-v3", "manifest_sha256": identity, "target": "/content/data"}
+            ],
+        },
+    )
+    job = {
+        **colab_batch.data_inputs({"data_inputs": str(descriptor)}),
+        "index": 1,
+        "entry": {"fields": {"command": "run"}},
+        "resume_key": "unused",
+        "artifact_policy": "measurements",
+    }
     plan = {"jobs": [job], "uploads": {}}
     colab_batch.stage_inputs(plan, tmp_path)
     assert list(plan["uploads"]) == ["/content/.dew-data.token"]
@@ -122,8 +146,12 @@ def test_local_inputs_must_not_shadow_r2_data(tmp_path, service):
     _, _, identity, _ = service
     local = tmp_path / "rows.jsonl"
     local.write_bytes(b"must not stage")
-    job = {"index": 1, "data_sources": [{"target": "/content/data", "manifest_sha256": identity}],
-           "data_token_file": str(tmp_path / "private-token"), "entry": {"fields": {
-           "command": "run", "inputs": f"{local} to /content/data"}}, "artifact_policy": "measurements"}
+    job = {
+        "index": 1,
+        "data_sources": [{"target": "/content/data", "manifest_sha256": identity}],
+        "data_token_file": str(tmp_path / "private-token"),
+        "entry": {"fields": {"command": "run", "inputs": f"{local} to /content/data"}},
+        "artifact_policy": "measurements",
+    }
     with pytest.raises(ValueError, match="must not also be staged"):
         colab_batch.stage_inputs({"jobs": [job], "uploads": {}}, tmp_path)
