@@ -30,13 +30,22 @@ def gate():
     ("ms", ["not run: no such tool"], [100.0, 101.0], "not compared"),  # an older base without the tool
     ("ms", [100.0, 101.0], ["not run: it broke"] * 2, "broken"),
     ("ms", ["not run: no data"] * 2, ["not run: no data"] * 2, "incomplete"),
+    ("ms", [100.0] * 3, [100.0, "not run: OOM", "not run: timeout"], "partial"),  # one round of three ran
+    ("ms", [100.0] * 3, [100.0, None, None], "partial"),                         # rounds that wrote no row
+    ("ms", [100.0] * 3, [100.0, float("nan"), 101.0], "partial"),
+    ("ms", [100.0] * 3, [100.0, 0.0, 101.0], "partial"),
+    ("items/s", [1000.0] * 3, [float("inf"), 1000.0, 1000.0], "partial"),
+    ("ms", [100.0, "not run: OOM", 101.0], [100.0] * 3, "partial"),              # the base's rounds too
+    ("ms", [100.0] * 3, [float("nan")] * 3, "broken"),                           # no head round measured
 ])
 def test_a_row_moves_only_past_its_own_noise(gate, unit, base, head, state):
     """A row regresses, or is faster, when the head's median moves past
     either tree's spread across rounds (at least 2%) and the two trees'
-    samples do not overlap. A row the base could not run is not compared,
-    one the head could not run is broken, and one neither ran leaves the
-    battery incomplete."""
+    samples do not overlap. A row the base could not run in any round is
+    not compared, one the head could not run in any round is broken, and
+    one neither ran leaves the battery incomplete. A row either tree
+    measured in only some rounds, or as NaN, an infinity or zero, is
+    partial, and is not judged on the rounds that ran."""
     assert gate.verdict(gate.Row("row", unit, ""), base, head)[0] == state
 
 
@@ -66,3 +75,20 @@ def test_the_report_fails_on_a_broken_row_and_not_on_an_ungated_one(gate, tmp_pa
     (tmp_path / "gate.json").write_text(json.dumps(results))
     monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json")])
     assert gate.main() == code
+
+
+@pytest.mark.parametrize("head, rounds, shown", [
+    ([{"row": 10.0}, {}, {"row": 10.1}], 3, "partial (head 1 of 3 rounds unmeasured)"),
+    ([{"row": 10.0}, {"row": float("nan")}, {"row": 10.1}], 3, "partial (head 1 of 3 rounds unmeasured)"),
+    ([{"row": 10.0}], 3, "partial (head 2 of 3 rounds unmeasured)"),
+], ids=["a missing row key", "nan", "an interrupted run"])
+def test_the_report_fails_on_a_partial_row(gate, tmp_path, monkeypatch, head, rounds, shown):
+    """A head that measured a row in only some of its rounds fails the gate
+    and says how many rounds it lacks, rather than passing on the rest."""
+    results = {"base": "main", "head": "head", "rounds": rounds, "rows": [gate.Row("row", "ms", "").__dict__],
+               "samples": {"main": [{"row": 10.0}, {"row": 10.1}, {"row": 10.05}], "head": head}}
+    (tmp_path / "gate.json").write_text(json.dumps(results))
+    monkeypatch.setattr(sys, "argv", ["perf_gate.py", "report", str(tmp_path / "gate.json"),
+                                      "--table", str(tmp_path / "gate.md")])
+    assert gate.main() == 1
+    assert f"| row | ms | - | - | - | - | {shown} |" in (tmp_path / "gate.md").read_text()
