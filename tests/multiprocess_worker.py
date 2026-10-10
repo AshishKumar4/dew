@@ -1181,6 +1181,46 @@ def mode_evaluation_replicas(args) -> dict:
     return {"measured": measured, "no_consumer": unconsumed}
 
 
+def _preview_objective(kind):
+    """A preview-failure case's objective and a batch for it. A diffusion or masked
+    objective's compiled sampler is a program of its own, which a case replaces
+    (`replaced`) or takes away with AttributeError."""
+    from dew.diffusion import presets
+    from dew.diffusion.discrete import MDLM
+    from dew.inputs import Field, InputSpec
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.objectives.lm import LMObjective, Samples
+    from dew.sampling import Euler
+
+    def sampled(base):
+        class Sampled(base):
+            replaced = None
+
+            @property
+            def _sample(self):
+                if self.replaced is AttributeError:
+                    raise AttributeError("_sample")
+                return super()._sample if self.replaced is None else self.replaced
+
+        return Sampled
+
+    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, causal=kind != "masked", dtype="float32", attention_impl="xla")
+    if kind == "lm":
+        return (LMObjective(model, seq_len=4, samples=Samples(prompt=[1, 2], max_new_tokens=1)),
+                {"text": np.ones((3, 5), np.int32)})
+    if kind == "masked":
+        return (sampled(MaskedDiffusionObjective)(model, MDLM(mask_id=7)(), seq_len=4, samples=1, steps=2),
+                {"text": np.ones((3, 4), np.int32)})
+    return (sampled(DiffusionObjective)(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
+                                        presets.EDM(regime="pixel"), InputSpec(Field("image", (RES, RES, 3))),
+                                        steps=2, solver=Euler(), guidance=None),
+            {"image": np.zeros((3, RES, RES, 3), np.uint8)})
+
+
 def _builtin_sampler_failure(kind, phase, source, rank, fault):
     """A sampler failure at its public invocation or artifact preflight seam."""
     import jax
@@ -1213,44 +1253,18 @@ def mode_builtin_preview_failures(args) -> dict:
     import optax
 
     from dew.data import Dataset
-    from dew.diffusion import presets
-    from dew.diffusion.discrete import MDLM
     from dew.inference import TextGeneration
-    from dew.inputs import Field, InputSpec
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.diffusion import DiffusionObjective
-    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-    from dew.objectives.lm import LMObjective, Samples
-    from dew.sampling import Euler
     from dew.training import Trainer
 
     rank = jax.process_index()
     reports = {}
     for kind in ("lm", "diffusion", "masked"):
-        model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
-                                  num_heads=2, mlp_features=16, max_seq_len=8,
-                                  causal=kind != "masked", dtype="float32", attention_impl="xla")
-        if kind == "lm":
-            objective = LMObjective(model, seq_len=4,
-                                    samples=Samples(prompt=[1, 2], max_new_tokens=1))
-            batch = {"text": np.ones((3, 5), np.int32)}
-        elif kind == "masked":
-            objective = MaskedDiffusionObjective(model, MDLM(mask_id=7)(), seq_len=4,
-                                                samples=1, steps=2)
-            batch = {"text": np.ones((3, 4), np.int32)}
-        else:
-            objective = DiffusionObjective(
-                SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
-                presets.EDM(regime="pixel"), InputSpec(Field("image", (RES, RES, 3))),
-                steps=2, solver=Euler(), guidance=None)
-            batch = {"image": np.zeros((3, RES, RES, 3), np.uint8)}
+        objective, batch = _preview_objective(kind)
         tracker = ScoreRecorder()
         trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
                           tracker=tracker if rank == 0 else None)
         state, _, _ = trainer.place()
-        field = "_prompt" if kind == "lm" else "_sample"
-        original = getattr(objective, field)
+        original = objective._prompt if kind == "lm" else None
         original_generate = TextGeneration.__call__
         closed = []
 
@@ -1271,12 +1285,14 @@ def mode_builtin_preview_failures(args) -> dict:
                 sample_failure = _builtin_sampler_failure(kind, phase, source, rank, fault)
 
                 if phase == "setup":
-                    if rank == source:
-                        delattr(objective, field)
+                    if rank == source and kind == "lm":
+                        delattr(objective, "_prompt")
+                    elif rank == source:
+                        objective.replaced = AttributeError
                 elif kind == "lm":
                     TextGeneration.__call__ = sample_failure
                 else:
-                    objective._sample = sample_failure
+                    objective.replaced = sample_failure
                 try:
                     result = Evaluation.run(objective, state.variables, data.val, key=state.key,
                           preview=trainer.tracker is not None, mesh=trainer.device_mesh)
@@ -1288,7 +1304,10 @@ def mode_builtin_preview_failures(args) -> dict:
                 else:
                     reports[case] = {"error": None}
                 finally:
-                    setattr(objective, field, original)
+                    if kind == "lm":
+                        objective._prompt = original
+                    else:
+                        objective.replaced = None
                     TextGeneration.__call__ = original_generate
                 # Files keep the successful escapee alive without accidentally
                 # matching the stranded rank's next JAX phase agreement.
