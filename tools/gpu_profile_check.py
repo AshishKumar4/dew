@@ -66,8 +66,11 @@ def capture(out: Path) -> dict:
     with dew.Profiler(out) as profiler:
         for _ in range(STEPS):
             jax.block_until_ready(step(weights, x))
-    directory = Path(profiler.directory)
-    manifest = json.loads(next(directory.rglob("manifest.json")).read_text())
+    # The profiler's directory holds a directory per capture, and the
+    # capture's reports sit beside its manifest.
+    path = next(Path(profiler.directory).rglob("manifest.json"))
+    directory = path.parent
+    manifest = json.loads(path.read_text())
     planes, _ = device_events(directory)
     events = [event for name, found in planes.items() if name.startswith("/device:GPU") for event in found]
     busy = length(union([(event.start_ns, event.start_ns + event.duration_ns) for event in events]))
