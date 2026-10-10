@@ -84,14 +84,13 @@ class Supervised(Objective[Ratio]):
         self.sample = inputs.sample
         self.inputs = inputs
         self.mode = mode
-
-    def _called(self, *, training: bool) -> dict[str, Any]:
-        """The mode keyword the model is called with, none without a `mode`."""
-        return {} if self.mode is None else {self.mode: training}
+        # The keyword that puts the model in or out of training mode, none without a mode.
+        self._training: dict[str, Any] = {} if mode is None else {mode: True}
+        self._evaluating: dict[str, Any] = {} if mode is None else {mode: False}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         sample = jnp.zeros((1, *self.sample.shape), jnp.int32)
-        return self.model.init(key, sample, **self._called(training=False))
+        return self.model.init(key, sample, **self._evaluating)
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         # The model's own collections besides its parameters, such as a
@@ -99,14 +98,14 @@ class Supervised(Objective[Ratio]):
         # keeps the updates (`Aux.variables`).
         held = [name for name in variables if name not in ("params", FROZEN)]
         outputs, updates = self.model.apply(variables, batch[self.sample.key], rngs=training_rngs(step.key),
-                                            mutable=held, **self._called(training=True))
+                                            mutable=held, **self._training)
         return self._scored(outputs, batch, dict(updates) if held else None)
 
     def validation_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         """With a `mode`, the model in its evaluation mode, writing nothing; otherwise `loss`."""
         if self.mode is None:
             return self.loss(variables, batch, step)
-        outputs = self.model.apply(variables, batch[self.sample.key], **self._called(training=False))
+        outputs = self.model.apply(variables, batch[self.sample.key], **self._evaluating)
         return self._scored(outputs, batch, None)
 
     def _scored(self, outputs: Outputs, batch: Batch, updates: Variables | None) -> tuple[Ratio, Aux]:
