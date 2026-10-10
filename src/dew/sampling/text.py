@@ -35,7 +35,7 @@ from typing_extensions import TypeVar
 
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.dspark import DSpark
-from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of
+from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, valid_order
 from dew.nn.kv_cache import Layered, gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import BlockDenoiser, Serving
 from dew.objectives.base import Variables
@@ -472,8 +472,8 @@ def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,
     the next, at that token's own coordinate, which is the history a
     checkpoint's predictor was trained behind.
     """
-    order = jnp.argsort(~real, axis=1, stable=True)[..., None]
-    lengths = jnp.sum(real, axis=1, dtype=jnp.int32)
+    order, lengths = valid_order(real)
+    order = order[..., None]
     # Without supplied coordinates a token's position is its rank among
     # the row's real tokens, which is what the cache assigns; the physical
     # slot a padded prompt put it in is not a coordinate.

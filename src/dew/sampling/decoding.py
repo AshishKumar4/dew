@@ -33,6 +33,7 @@ import numpy as np
 from flax import struct
 from jax import lax
 
+from dew.nn.inputs import valid_order
 from dew.nn.scatter import DROPPED
 from dew.sampling.vocabulary import (
     Referencing,
@@ -116,8 +117,7 @@ class StepState:
 
 
 def _compact(tokens: jax.Array, valid: jax.Array) -> tuple[jax.Array, jax.Array]:
-    order = jnp.argsort(~valid, axis=-1, stable=True)
-    lengths = jnp.sum(valid, axis=-1, dtype=jnp.int32)
+    order, lengths = valid_order(valid)
     kept = jnp.arange(tokens.shape[1])[None, :] < lengths[:, None]
     return jnp.where(kept, jnp.take_along_axis(tokens, order, axis=-1), -1), lengths
 
