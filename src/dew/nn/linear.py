@@ -261,17 +261,23 @@ def chunk_decay(g, *, halves: bool = False):
     47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
     against 16.5).
     """
-    chunk_size = g.shape[-2]
     hi, lo = jax.lax.associative_scan(_compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
     if halves:
         return hi, lo
+    return hi, _chunk_pairwise_decay(hi, lo)
+
+
+def _chunk_pairwise_decay(hi, lo):
+    """The decay between two compensated sums; kernels read the halves
+    instead, while the XLA products still need the full pairwise tensor."""
+    chunk_size = hi.shape[-2]
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
     diff = jnp.where(inclusive, diff, 0.0)
-    return hi, jnp.where(inclusive, jnp.exp(diff), 0.0)
+    return jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
 def strictly_lower_inverse(a):
@@ -418,11 +424,17 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
 
     q_c, k_c = chunks(query), chunks(key)
     kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+    recurrence = chunk_states_kernel(implementation, k_c, vb_c, chunks(g))
+    output_kernel = chunk_output_kernel(implementation, recurrence, k_c, vb_c)
     # The log decay cumulated within each chunk, the reference's
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
     # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
     # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    gc, decay = chunk_decay(chunks(g))
+    if output_kernel == 'pallas':
+        gc, lo = chunk_decay(chunks(g), halves=True)
+        decay = _chunk_pairwise_decay(gc, lo)
+    else:
+        gc, decay = chunk_decay(chunks(g))
     # The mask is strictly lower (tril, -1): the reference's masked_fill
     # zeroes the diagonal too.
     strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
@@ -439,7 +451,6 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    recurrence = chunk_states_kernel(implementation, k_c, out_vals, gc)
     if recurrence == 'pallas':
         entered, v_corrected, state = delta_chunks.chunk_states(
             k_c, k_cumdecay, out_vals, gc[..., 0], state, not triton_runs())
@@ -447,9 +458,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
         entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state)
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
-    if chunk_output_kernel(implementation, recurrence, k_c, v_corrected) == 'pallas':
-        hi, lo = chunk_decay(chunks(g), halves=True)
-        core = delta_output.chunk_output(q_c, k_c, hi[..., 0], lo[..., 0], entered, v_corrected,
+    if output_kernel == 'pallas':
+        core = delta_output.chunk_output(q_c, k_c, gc[..., 0], lo[..., 0], entered, v_corrected,
                                          not triton_runs())
     else:
         core = (q_c * jnp.exp(gc)) @ entered + _paired(q_c, k_c, decay) @ v_corrected
