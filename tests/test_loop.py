@@ -130,7 +130,8 @@ def test_checkpointed_passes_preserve_loss_and_gradients(rng, backprop_steps, sc
 
     expected, actual = result(plain), result(checkpointed)
     gradient_error = max(float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
-                         for a, b in zip(jax.tree.leaves(actual[1]), jax.tree.leaves(expected[1]), strict=True))
+                         for a, b in zip(jax.tree.leaves(actual[1]), jax.tree.leaves(expected[1]),
+                                         strict=True))
     print(f"loop fp32: scan={scan_layers}, backprop_steps={backprop_steps}, "
           f"loss_error={float(jnp.abs(actual[0] - expected[0]))}, gradient_error={gradient_error}")
     jax.tree.map(lambda a, b: np.testing.assert_allclose(a, b, rtol=2e-5, atol=2e-6), actual, expected)
