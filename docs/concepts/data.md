@@ -350,6 +350,8 @@ scores canvas cross entropy on test. Then it reloads the run as a
 `BlockGeneration` task, captions every test image, and records in
 `result.json` how many captions name the right flower. It trains a small
 model from scratch and does not fine-tune the released 26B DiffusionGemma.
+On an A100 40 GB the default 6000 steps train in 13 minutes, and 33.3% of
+the 6149 test captions name the right flower (14.1% after 3000 steps).
 
 Both scripts accept `--smoke`, which writes a few local records, shrinks the
 model and runs four CPU steps without the network. It shows that the

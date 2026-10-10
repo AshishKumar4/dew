@@ -100,7 +100,13 @@ def caption(name: str) -> str:
 
 
 def caption_batch(batch, config: Config, labels):
-    """One padded prompt/image block followed by the caption canvas, no packing."""
+    """One padded prompt/image block followed by the caption canvas, no packing.
+
+    The canvas is whole: EOS fills it after the caption, and every position
+    is attended and scored. The sampler denoises a whole canvas and stops at
+    its first EOS, so the model has to learn where a caption ends. A canvas
+    cut at the caption's end would never teach it that, and would give the
+    class away by the caption's length."""
     tokenizer = ByteTokenizer()
     rows = len(batch["image"])
     image_tokens = (config.image_size // (2 * config.patch_size)) ** 2
@@ -117,12 +123,13 @@ def caption_batch(batch, config: Config, labels):
     start = 1 + image_tokens
     tokens[:, start:start+len(prompt)] = prompt
     valid[:, :start+len(prompt)] = True
+    tokens[:, config.prompt_tokens:] = EOS
+    valid[:, config.prompt_tokens:] = True
     for row, label in enumerate(batch["label"]):
-        response = [*tokenizer.encode(caption(labels[int(label)])), EOS]
-        if len(response) > config.canvas_length:
+        response = tokenizer.encode(caption(labels[int(label)]))
+        if len(response) >= config.canvas_length:
             raise ValueError("canvas_length must hold a whole Flowers caption plus EOS")
         tokens[row, config.prompt_tokens:config.prompt_tokens+len(response)] = response
-        valid[row, config.prompt_tokens:config.prompt_tokens+len(response)] = True
     pixels = np.asarray(batch["image"], np.float32).transpose(0, 3, 1, 2)[:, None] / 127.5 - 1
     positions = np.cumsum(valid, axis=-1, dtype=np.int32) - 1
     prepared = ModelInputs(tokens, {"image_indices": indices, "attention_mask": valid,

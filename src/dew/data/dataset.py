@@ -1210,6 +1210,83 @@ class _WorkerBatches[Record](pygrain.MapDataset[Record]):
         return None if which >= self._whole or record >= len(self._parent) else self._parent[record]
 
 
+@dataclasses.dataclass(frozen=True)
+class LengthGroups:
+    """Global batches of records of like length, for a stream whose batches are
+    cut to their longest record.
+
+    The order is read `window` global batches at a time: each window's
+    records are sorted by `length`, cut into batches again, and those batches
+    are put back in a random order of the window's own (`_Grouped`). Every
+    record is still read once a pass and a position is still one record
+    count. A batch's corpus shares now hold over its window rather than over
+    the batch. `length` reads a record as the order holds it, before any
+    operation runs, and only ranks: an estimate is enough.
+    """
+    length: Callable[[Batch], int]
+    window: int = 64
+
+
+class _Grouped(pygrain.MapDataset[Batch]):
+    """`parent` with each window of `rows * window` records sorted by length
+    and cut into batches of `rows`, the batches shuffled within the window
+    from `seed`. A window's order is computed once, by the first reading thread
+    to need it while the others wait, and the last few windows' orders are kept."""
+
+    _MUTATES_ELEMENT_SPEC = False
+
+    def __init__(self, parent: pygrain.MapDataset[Batch], groups: LengthGroups, rows: int, seed: int):
+        super().__init__(parent)
+        self._groups, self._rows, self._seed = groups, rows, seed
+        self._span = rows * groups.window
+        self._orders: dict[int, np.ndarray] = {}
+        self._lock = threading.Lock()
+
+    def __getstate__(self) -> dict:
+        state = dict(self.__dict__)
+        del state["_lock"]
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.Lock()
+
+    def __len__(self) -> int:
+        return len(self._parent)
+
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
+    @overload
+    def __getitem__(self, index: int) -> Batch | None: ...
+
+    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch] | None:
+        if isinstance(index, slice):
+            return self.slice(index)
+        start = index - index % self._span
+        return self._parent[start + int(self._order(start)[index - start])]
+
+    def _order(self, start: int) -> np.ndarray:
+        order = self._orders.get(start)
+        if order is None:
+            with self._lock:
+                order = self._orders.get(start)
+                if order is None:
+                    order = self._ordered(start)
+                    # A new dict, so a thread reading the old one never sees it change.
+                    self._orders = {**dict(list(self._orders.items())[-3:]), start: order}
+        return order
+
+    def _ordered(self, start: int) -> np.ndarray:
+        size = min(self._span, len(self._parent) - start)
+        records = [self._parent[start + offset] for offset in range(size)]
+        # A record the parent filtered out reads as None and is skipped wherever it lands.
+        ranked = np.argsort([0 if record is None else self._groups.length(record) for record in records],
+                            kind="stable")
+        batches = [ranked[first:first + self._rows] for first in range(0, size, self._rows)]
+        shuffled = np.random.default_rng([self._seed, start]).permutation(len(batches))
+        return np.concatenate([batches[index] for index in shuffled])
+
+
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
     own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
@@ -1230,12 +1307,13 @@ class FilledBatch(pygrain.MapTransform):
 
 def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
                      partition: DataPartition, loading: Loading, offset: int = 0,
-                     remainder: bool = False) -> pygrain.DatasetIterator[Batch]:
+                     remainder: bool = False,
+                     cut: Callable[[Batch], Batch] | None = None) -> pygrain.DatasetIterator[Batch]:
     """The partition's share of `records`, in batches of `rows` records.
 
     A training stream is endless and takes whole batches. An evaluation pass
     (`remainder`) takes every record: its last batch is filled out to `rows`
-    (`FilledBatch`).
+    (`FilledBatch`). `cut` maps each batch once it is stacked.
 
     The slice is `offset + index :: count`. Global batch k is then the same
     records at every count, and an offset is a slice bound rather than a
@@ -1260,6 +1338,8 @@ def _batches[Record](records: pygrain.MapDataset[Record], *, rows: int,
         mine = _WorkerBatches(mine, rows, loading.workers, remainder=remainder)
     stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
     stream = stream.batch(rows, drop_remainder=not remainder)
+    if cut is not None:
+        stream = stream.map(cut)
     if remainder:
         stream = stream.map(FilledBatch(rows, real=not empty))
     if loading.workers:
@@ -1662,8 +1742,9 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
 
 
 def train_stream(source: Records, operations: Sequence[pygrain.Transformation], *,
-                 batch: int, seed: int, loading: Loading,
-                 offset: int = 0) -> Callable[[DataPartition], GlobalStream]:
+                 batch: int, seed: int, loading: Loading, offset: int = 0,
+                 groups: LengthGroups | None = None,
+                 cut: Callable[[Batch], Batch] | None = None) -> Callable[[DataPartition], GlobalStream]:
     """Return an endless shuffled stream over `source`, `batch` records a global step.
 
     The order is the corpus reshuffled from `seed` every epoch, endlessly, and
@@ -1676,20 +1757,25 @@ def train_stream(source: Records, operations: Sequence[pygrain.Transformation], 
     and what a record turns into depends on neither the share count nor the worker
     count.
 
-    `offset` starts the order past the records earlier phases read.
+    `offset` starts the order past the records earlier phases read. `groups`
+    reads the order a window of batches at a time with each batch's records
+    of like length (`LengthGroups`), and `cut` maps every batch once it is
+    stacked, as a stream that pads each batch only to its longest record
+    does; a cut batch's shape is its own, so one reader reads the stream.
     """
     start = f", from record {offset}" if offset else ""
-    order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}{start}"
+    order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}{start}{_grouping(groups)}"
 
     def records() -> pygrain.MapDataset[Batch]:
-        return _endless(source, seed, offset).apply(list(operations))
+        return _ordered(_endless(source, seed, offset), groups, batch, seed).apply(list(operations))
 
     return _global_stream(records, order, batch=batch, loading=loading,
-                          content=functools.partial(sampled, source))
+                          content=functools.partial(sampled, source), cut=cut)
 
 
 def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transformation], *,
-                 batch: int, seed: int, loading: Loading) -> Callable[[DataPartition], GlobalStream]:
+                 batch: int, seed: int, loading: Loading, groups: LengthGroups | None = None,
+                 cut: Callable[[Batch], Batch] | None = None) -> Callable[[DataPartition], GlobalStream]:
     """An endless stream over `corpora` at their weights, `batch` records a global step.
 
     The order is `mixture(corpora, seed)` and everything after it is
@@ -1698,24 +1784,36 @@ def mixed_stream(corpora: Sequence[Corpus], operations: Sequence[pygrain.Transfo
     therefore one record count and resumes on any partition. The
     `operations` sit above the mixture, so a record's rng is keyed by its
     place in the mixed stream rather than in the corpus it came from.
+    `groups` and `cut` are `train_stream`'s.
     """
     shares = _shares(corpora)
-    order = "mixture reshuffled from seed {} of [{}]".format(seed, ", ".join(
+    order = "mixture reshuffled from seed {} of [{}]{}".format(seed, ", ".join(
         f"{corpus.name} at {share:.6g}: {_described(corpus)}"
-        for corpus, share in zip(corpora, shares, strict=True)))
+        for corpus, share in zip(corpora, shares, strict=True)), _grouping(groups))
 
     def records() -> pygrain.MapDataset[Batch]:
-        return mixture(corpora, seed).seed(seed).apply(list(operations))
+        return _ordered(mixture(corpora, seed).seed(seed), groups, batch, seed).apply(list(operations))
 
     def content() -> str:
         return ", ".join(sampled(corpus.source) for corpus in corpora)
 
-    return _global_stream(records, order, batch=batch, loading=loading, content=content)
+    return _global_stream(records, order, batch=batch, loading=loading, content=content, cut=cut)
+
+
+def _ordered(records: pygrain.MapDataset[Batch], groups: LengthGroups | None, batch: int,
+             seed: int) -> pygrain.MapDataset[Batch]:
+    return records if groups is None else _Grouped(records, groups, batch, seed)
+
+
+def _grouping(groups: LengthGroups | None) -> str:
+    """What `groups` adds to an order's description: a position saved under
+    one grouping is refused under another."""
+    return "" if groups is None else f", grouped by length {groups.window} batches at a time"
 
 
 def _global_stream(records: Callable[[], pygrain.MapDataset[Batch]], order: str, *,
-                   batch: int, loading: Loading,
-                   content: Callable[[], str]) -> Callable[[DataPartition], GlobalStream]:
+                   batch: int, loading: Loading, content: Callable[[], str],
+                   cut: Callable[[Batch], Batch] | None = None) -> Callable[[DataPartition], GlobalStream]:
     """A `GlobalStream` factory over the endless order `records` builds.
 
     Each reader gets its own pipeline over its share, opened at whatever
@@ -1724,10 +1822,14 @@ def _global_stream(records: Callable[[], pygrain.MapDataset[Batch]], order: str,
     """
     def stream(partition: DataPartition) -> GlobalStream:
         rows = partition.rows(batch)
+        if cut is not None and partition.count > 1:
+            raise ValueError(
+                f"a cut batch takes a shape of its own, and {partition.count} readers would each cut "
+                "their share to a different one; read a cut stream on one process")
 
         def open_at(offset: int) -> pygrain.DatasetIterator[Batch]:
             return _batches(records(), rows=rows, partition=partition, loading=loading,
-                            offset=offset)
+                            offset=offset, cut=cut)
 
         return GlobalStream(open_at, batch, order, loading, content)
 
@@ -1773,6 +1875,7 @@ __all__ = [
     "Forwarding",
     "GlobalStream",
     "Identified",
+    "LengthGroups",
     "Loading",
     "PhasedStream",
     "Ramp",

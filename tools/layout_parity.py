@@ -135,8 +135,11 @@ LAYOUTS: dict[str, dict[str, int]] = {
     "tensor2_sequence2": {"tensor": 2, "sequence": 2},
     "stage2_sequence2": {"stage": 2, "sequence": 2, "microbatches": 4},
     "stage2_fsdp2": {"fsdp": 2, "stage": 2, "microbatches": 4},
+    "data4_explicit": {"explicit": ("data",)},
+    "fsdp2_explicit": {"fsdp": 2, "explicit": ("data",)},
 }
-"""Four-device layouts: every axis alone and the combinations worth running."""
+"""Four-device layouts: every axis alone and the combinations worth running,
+and the data axis Explicit (`MeshSpec.explicit`) alone and beside fsdp."""
 
 
 def _fixture(name: str) -> dict[str, Any]:
@@ -190,9 +193,9 @@ def zoo() -> dict[str, Any]:
     released configs' routing and layer kinds. The layers a sequence axis
     splits differently come too: latent attention (MLA), a window (12 rows:
     a sequence split two ways reads it from one neighbour, four ways through
-    the exchange), Mamba-2 alone, and packed rows of three documents whose
-    boundaries fall inside the shards, in the dense decoder and in Rigel's
-    three Mamba-2 layers to one windowed layer.
+    the exchange), Mamba-2 alone, Mamba-1 alone, and packed rows of three
+    documents whose boundaries fall inside the shards, in the dense decoder,
+    in Mamba-1 and in Rigel's three Mamba-2 layers to one windowed layer.
 
     The dense, MoE, hybrid and MLA decoders also train every other objective
     a decoder takes: SFT over the assistant's turns (`_sft`), DPO over pairs
@@ -233,6 +236,9 @@ def zoo() -> dict[str, Any]:
     mla = {**dense, "mixer": {"class": "mla", "fields": {"q_lora_rank": 48, "kv_lora_rank": 32, "qk_nope_head_dim": 16,
                               "qk_rope_head_dim": 8, "v_head_dim": 8}}}
     mamba2 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": mamba}}
+    mamba1 = {**dense, "layer_types": ("mamba",) * 4, "kinds": {"mamba": {"mixer": {
+        "class": "mamba", "fields": {"intermediate_size": 128, "state_size": 8, "time_step_rank": 4,
+                                     "chunk_size": 8}}}}}
     rigel = {**dense, "layer_types": ("mamba",) * 3 + ("sliding",),
              "kinds": {"mamba": mamba, "sliding": {"window": 12}}}
     dit: dict[str, object] = {"patch_size": 2, "emb_features": 64, "num_layers": 4, "num_heads": 4, "mlp_ratio": 2,
@@ -266,6 +272,8 @@ def zoo() -> dict[str, Any]:
         "mamba2": Case("causal_transformer", mamba2, **lm),
         "dense_packed": Case("causal_transformer", dense, packed_documents=3, **lm),
         "rigel_packed": Case("causal_transformer", rigel, packed_documents=3, **lm),
+        "mamba1": Case("causal_transformer", mamba1, **lm),
+        "mamba1_packed": Case("causal_transformer", mamba1, packed_documents=3, **lm),
         "dit": Case("simple_dit", dit, batch_size=8, image_size=32, channels=4,
                     fsdp_min_param_size=256),
         "dgemma": Case("diffusion_gemma", dgemma, canvas={"prompt_length": 16, "canvas_size": 8},

@@ -48,6 +48,7 @@ from .sharding import (
     manual_map,
     mesh_axes,
     row_axes,
+    rows_spec,
     sequence_shards,
     split_positions,
 )
@@ -417,7 +418,8 @@ def cached_validity(module: nn.Module, length: int) -> jax.Array:
 _DEFAULT_CACHE = KVCache()
 
 
-def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE):
+def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KVCache = _DEFAULT_CACHE,
+                  value_dim: int | None = None):
     """Fixed-size K/V with a cursor and cached validity for each batch row.
 
     Returns [B, S] compact slot positions and a writer. Invalid tokens have
@@ -425,7 +427,8 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     every row empty. The writer returns full cache arrays, including unused
     slots which the caller excludes with `cached_validity`. `layout` chooses the
     storage behind the slots, dense or paged, full or quantized
-    (`dew.nn.kv_cache`); the slots and the cursor are the same for all.
+    (`dew.nn.kv_cache`); the slots and the cursor are the same for all. Values
+    are `value_dim` wide, None for the keys' width.
     """
     shards = sequence_shards()
     if shards > 1:
@@ -437,7 +440,7 @@ def open_kv_cache(module: nn.Module, key, max_seq_len, *, valid=None, layout: KV
     batch, length, heads, head_dim = key.shape
     if valid is None and length > max_seq_len:
         raise ValueError(f"{length} tokens do not fit a KV cache of {max_seq_len}.")
-    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype)
+    store = KVStore.open(module, layout, batch, max_seq_len, heads, head_dim, key.dtype, value_dim=value_dim)
     positions, allocated = cache_positions(module, batch, length, valid)
     return positions, Append(store, positions, allocated)
 
@@ -1688,7 +1691,8 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, positions, segmen
                      folded(_banded(_blocks(value, span, blocks), preceding(1)), 2 * span),
                      implementation=masked,
                      mask=keep.reshape(batch * blocks, 1, span, 2 * span))
-    return out.reshape(batch, blocks * span, *out.shape[2:])[:, :length]
+    unfolded = (batch, blocks * span, *out.shape[2:])
+    return jax.lax.reshape(out, unfolded, out_sharding=rows_spec(out, len(unfolded)))[:, :length]
 
 
 # Splash's tile size. At 1024 the forward kernel holds 4 MiB of fp32 logits

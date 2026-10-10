@@ -81,7 +81,7 @@ def onto_ids(batch, scores: jax.Array) -> jax.Array:
     where `response_mask` is, every chain start and all padding included.
     """
     wide = at_least_fp32(scores.dtype)
-    shifted = jnp.concatenate([jnp.zeros((scores.shape[0], 1), wide), scores.astype(wide)], axis=1)
+    shifted = jnp.concatenate([jnp.zeros_like(scores[:, :1], wide), scores.astype(wide)], axis=1)
     return jnp.where(jnp.asarray(batch[RESPONSE_MASK_KEY]) != 0, shifted, 0.0)
 
 
