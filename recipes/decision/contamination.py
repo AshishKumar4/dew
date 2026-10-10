@@ -180,11 +180,36 @@ class Overlaps:
 
     @classmethod
     def load(cls, path: str | Path) -> "Overlaps":
-        with np.load(path) as saved:
+        import io
+
+        from dew.data.storage import Store
+
+        if not str(path).endswith(".npz"):
+            root = Store(str(path))
+            manifest = json.loads(root.child("manifest.json").read())
+            parts = []
+            for entry in manifest["files"]:
+                data = root.child(entry["path"]).read()
+                if len(data) != entry["bytes"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                    raise ValueError(f"evaluation index shard differs: {entry['path']}")
+                parts.append(data)
+            data = b"".join(parts)
+            if hashlib.sha256(data).hexdigest() != manifest["sha256"]:
+                raise ValueError("evaluation index concatenated checksum differs")
+            with np.load(io.BytesIO(data)) as saved:
+                return cls(saved["wholes"], saved["grams"], saved["decisions"])
+        fs, location = Store(str(path)).resolve()
+        with fs.open(location, "rb") as file, np.load(file) as saved:
             return cls(saved["wholes"], saved["grams"], saved["decisions"])
 
     def save(self, path: str | Path) -> None:
-        np.savez_compressed(path, wholes=self.wholes, grams=self.grams, decisions=self.decisions)
+        import io
+
+        from dew.data.storage import Store
+
+        buffer = io.BytesIO()
+        np.savez_compressed(buffer, wholes=self.wholes, grams=self.grams, decisions=self.decisions)
+        Store(str(path)).write(buffer.getvalue())
 
     def hits(self, example: Example, *, natural: bool = True) -> bool:
         """Whether one of `example`'s decisions is an evaluation decision, or its content
@@ -263,7 +288,7 @@ def _decoded(value: Value) -> Value:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", required=True)
     parser.add_argument("--jsonl", nargs="*", default=[], help="request files with state and questions")
     parser.add_argument("--hub", nargs="*", default=[],
                         help="repo@revision:path=column,column files and the columns that hold their content")

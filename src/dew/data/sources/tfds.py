@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
+from functools import cached_property
 from typing import TYPE_CHECKING, Annotated
 
 from etils import epath
@@ -30,6 +31,7 @@ from filelock import FileLock
 from dew.cache import dew_cache_dir
 
 from ..dataset import Batch, Records, json_argument
+from .base import Read, Shard, ShardManifest
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
@@ -279,3 +281,74 @@ PreparedOptions = Annotated[TFDSOptions, json_argument(TFDSOptions)]
 """`TFDSOptions` as a dataset spec declares it: one JSON object on the
 command line, because a decoder tree is a tree of TFDS objects with no
 command-line spelling."""
+
+
+@dataclasses.dataclass(frozen=True)
+class TFDS:
+    """A prepared TFDS split, read with TFDS's native ArrayRecord data source."""
+
+    name: str
+    split: str = "train"
+    path: str | None = None
+    config: str | None = None
+    version: str | None = None
+    decoders: DecoderTree | None = None
+
+    @cached_property
+    def builder(self):
+        return read_only_builder(self.path or os.path.join(dew_cache_dir(), "tfds"), name=self.name,
+                                  config=self.config, version=self.version)
+
+    def describe(self) -> str:
+        return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
+
+    def snapshot(self) -> Mapping[str, object]:
+        import hashlib
+
+        from dew.data.storage import Store
+
+        directory = str(self.builder.data_path)
+        metadata = Store(directory.rstrip("/") + "/dataset_info.json").read()
+        return {"store": "tfds", "name": self.name, "split": self.split, "directory": directory,
+                "metadata_sha256": hashlib.sha256(metadata).hexdigest()}
+
+    def supports(self, read: Read) -> bool:
+        try:
+            self.builder
+        except FileNotFoundError:
+            return False
+        return True
+
+    def provision(self) -> TFDS:
+        if self.path is not None:
+            raise ValueError(f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
+                             "with TFDS or omit path to use Dew's preparation directory")
+        prepared(self.name, config=self.config, version=self.version)
+        return self
+
+    def records(self, read: Read) -> Records:
+        if not self.supports(read):
+            raise FileNotFoundError(f"{self.describe()} has no prepared ArrayRecord data; "
+                                    "run dew data provision or set provision=True")
+        rows = self.builder.as_data_source(self.split, decoders=self.decoders)
+        if not isinstance(rows, Records):
+            raise TypeError(f"TFDS split {self.split!r} did not return random-access records")
+        return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
+
+    def manifest(self) -> ShardManifest:
+        rows = self.records("indexed")
+        shards = tuple(Shard(f"{self.describe()}:{start}", str(self.builder.data_path), start,
+                             min(start + 1024, len(rows)), min(1024, len(rows) - start))
+                       for start in range(0, len(rows), 1024))
+        return ShardManifest(shards, self._read_shard)
+
+    def _read_shard(self, shard: Shard):
+        import grain.python as grain
+
+        return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
+
+    def metadata(self) -> Mapping[str, object]:
+        return {"name": self.builder.info.name, "version": str(self.builder.info.version)}
+
+    def lengths(self):
+        return None
