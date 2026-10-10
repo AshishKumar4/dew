@@ -87,7 +87,7 @@ def close(left, right, bound=STREAMED_BOUND):
 
 def unbanked(tree):
     """A frozen collection with every run's bank spread back over its layers, as host arrays."""
-    return spread(tree, lambda leaf, offset: np.asarray(leaf)[offset])
+    return spread(tree, lambda leaf, count: list(np.asarray(leaf)))
 
 
 class Coupled(Objective):
@@ -482,6 +482,24 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
     expected = objective.model.apply(trained, jnp.asarray(prompt))
     np.testing.assert_allclose(np.asarray(loaded["logits"]), np.asarray(expected), atol=1e-5)
     assert np.asarray(loaded["tokens"]).shape[-1] >= 2
+
+    # Each bank is cut into rows where the layout places its layers, in the
+    # bank's memory, and released: the read leaves nothing behind but the rows.
+    from dew.inference.banks import shape_rows
+    from dew.training import MeshSpec
+
+    def live_bytes():
+        return sum(array.nbytes for array in jax.live_arrays())
+
+    stored = Checkpoints(str(tmp_path / "run")).stored()["variables"][FROZEN]
+    before = live_bytes()
+    variables = Checkpoints(str(tmp_path / "run")).variables(ema=False)
+    assert live_bytes() - before <= sum(leaf.nbytes for leaf in jax.tree.leaves(variables))
+    placed = Layout().shardings(MeshSpec().build(), spread(stored, shape_rows))
+    for path, leaf in jax.tree_util.tree_leaves_with_path(variables[FROZEN]):
+        wanted = dict(jax.tree_util.tree_leaves_with_path(placed))[path]
+        assert leaf.sharding.is_equivalent_to(wanted, leaf.ndim), jax.tree_util.keystr(path)
+        assert leaf.sharding.memory_kind == wanted.memory_kind, jax.tree_util.keystr(path)
 
 
 def multimodal(**overrides):

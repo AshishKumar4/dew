@@ -1492,7 +1492,7 @@ class Checkpoints:
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
         """
-        from dew.inference.banks import banked_placement, shape_row, spread
+        from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
         from dew.objectives.base import FROZEN, merge
         from dew.registry import resolve_dtype
         from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
@@ -1512,7 +1512,7 @@ class Checkpoints:
         # its layers, and each bank reads onto its first layer's placement.
         frozen = template["variables"].get(FROZEN)
         rows = template if frozen is None else {
-            **template, "variables": {**template["variables"], FROZEN: spread(frozen, shape_row)}}
+            **template, "variables": {**template["variables"], FROZEN: spread(frozen, shape_rows)}}
         with sharding.boxed(self.boxed(step)):
             placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in rows.items()}
         chosen_layout.check(rows["variables"], placement["variables"], device_mesh)
@@ -1530,9 +1530,9 @@ class Checkpoints:
                 leaf.shape, target if path[1:] in selected else leaf.dtype, sharding=sharding),
             template, placement)
         values, _ = self.restore(template, step=step)
-        params = values["variables"]
+        params = values.pop("variables")
         if frozen is not None:
-            params = {**params, FROZEN: spread(params[FROZEN])}
+            params = {**params, FROZEN: spread(params[FROZEN], placed_rows)}
         if averaged:
             params = merge(params, values["ema"])
 
