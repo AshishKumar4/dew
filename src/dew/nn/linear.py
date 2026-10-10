@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.kernels import delta_chunks, delta_rule
+from dew.nn.kernels import delta_chunks, delta_prep, delta_rule
 
 from .attention import FORWARD_MODE, unweighted_rmsnorm
 from .blocks import normal_kernel
@@ -231,13 +231,15 @@ def _compensated_add(left, right):
     return total, dropped + left_lo + right_lo
 
 
-def chunk_decay(g):
+def chunk_decay(g, *, halves: bool = False):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
     Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
     `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
-    the diagonal, `[..., C, C, F]`.
+    the diagonal, `[..., C, C, F]`. With `halves=True`, return the two halves
+    of the compensated sum instead; kernels form their own pairwise decay
+    on chip, and autodiff of the compensated sum remains in XLA.
 
     The references subtract two fp32 cumulative sums, so every exponent
     carries the rounding of the chunk's whole accumulated magnitude, which
@@ -255,15 +257,23 @@ def chunk_decay(g):
     47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
     against 16.5).
     """
-    chunk_size = g.shape[-2]
     hi, lo = jax.lax.associative_scan(_compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
+    if halves:
+        return hi, lo
+    return hi, _chunk_pairwise_decay(hi, lo)
+
+
+def _chunk_pairwise_decay(hi, lo):
+    """The decay between two compensated sums; kernels read the halves
+    instead, while the XLA products still need the full pairwise tensor."""
+    chunk_size = hi.shape[-2]
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
     diff = jnp.where(inclusive, diff, 0.0)
-    return hi, jnp.where(inclusive, jnp.exp(diff), 0.0)
+    return jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
 def strictly_lower_inverse(a):
@@ -352,9 +362,9 @@ GATED_DELTA_RULES = ('auto', 'xla', 'pallas')
 
 
 def chunk_states_kernel(implementation: str, key, out_vals, gc) -> str:
-    """The recurrence a chunked rule over these per-chunk keys, corrected
-    values and decays runs: 'xla' (`xla_chunk_states`) or 'pallas'
-    (`dew.nn.kernels.delta_chunks`), which decays per head.
+    """The recurrence and prep a chunked rule over these per-chunk keys,
+    values and decays runs: 'xla' or 'pallas' (`delta_chunks`, `delta_prep`),
+    whose fused in-chunk correction and memory recurrence decay per head.
 
     'auto' takes the generation's measured one (`KERNELS['gated_delta_rule']`)
     and 'xla' elsewhere. 'pallas' needs a GPU the kernels compile for,
@@ -374,7 +384,7 @@ def chunk_states_kernel(implementation: str, key, out_vals, gc) -> str:
         (placed, "the Pallas kernels need a GPU of sm80 or later"),
         (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the kernels lack"),
         (gc.shape[-1] == 1, "the rule decays per key dimension, and the kernels per head"),
-    ) or delta_chunks.refusal(key, out_vals)
+    ) or delta_chunks.refusal(key, out_vals) or delta_prep.refusal(key, out_vals)
     return 'pallas' if refusal is None else ran_kernel('gated_delta_rule', 'xla', refusal)
 
 
@@ -392,7 +402,9 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     Each chunk's output, the references' `attn_inter + attn @ v_new`, reads
     the state that chunk entered and its corrected values, so it is computed
     for every chunk at once after the recurrence. The two decays differ only
-    in how a pair of positions is weighed (`_paired`).
+    in how a pair of positions is weighed (`_paired`). Pallas also prepares
+    each chunk's correction on chip; the output stays in XLA, which was
+    measured faster than the fused output at every tested tile (c45, c46).
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
@@ -408,21 +420,28 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
         moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
         return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
 
-    q_c, k_c = chunks(query), chunks(key)
-    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+    q_c, k_c, v_c = chunks(query), chunks(key), chunks(value)
+    recurrence = chunk_states_kernel(implementation, k_c, v_c, chunks(g))
     # The log decay cumulated within each chunk, the reference's
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
     # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
     # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    gc, decay = chunk_decay(chunks(g))
-    # The mask is strictly lower (tril, -1): the reference's masked_fill
-    # zeroes the diagonal too.
-    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-    attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
-    # The reference's `attn + I` operator after its row correction loop.
-    inv = strictly_lower_inverse(attn)
-    out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
-    k_cumdecay = inv @ (kb_c * jnp.exp(gc))
+    if recurrence == 'pallas':
+        gc, lo = chunk_decay(chunks(g), halves=True)
+        decay = _chunk_pairwise_decay(gc, lo)
+        k_cumdecay, out_vals = delta_prep.chunk_prep(k_c, v_c, chunks(beta), gc[..., 0], lo[..., 0],
+                                                   not triton_runs())
+    else:
+        kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+        gc, decay = chunk_decay(chunks(g))
+        # The mask is strictly lower (tril, -1): the reference's masked_fill
+        # zeroes the diagonal too.
+        strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
+        attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
+        # The reference's `attn + I` operator after its row correction loop.
+        inv = strictly_lower_inverse(attn)
+        out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
+        k_cumdecay = inv @ (kb_c * jnp.exp(gc))
 
     state = jnp.zeros((B, H, Dk, Dv), work) if state is None else state.astype(work)
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
@@ -431,7 +450,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    if chunk_states_kernel(implementation, k_c, out_vals, gc) == 'pallas':
+    if recurrence == 'pallas':
         entered, v_corrected, state = delta_chunks.chunk_states(
             k_c, k_cumdecay, out_vals, gc[..., 0], state, not triton_runs())
     else:

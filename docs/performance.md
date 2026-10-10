@@ -1223,6 +1223,32 @@ output and five gradients), and two calls agree bit for bit. Value blocks of
 memory); the block stays 32 until the G4, whose sm120 holds less shared
 memory a block, is measured. `KERNELS` takes the kernels on sm80 only.
 
+A fused output lost at all nine tested tiles (c45), its forward and backward
+taking 24.02 ms against the preceding path's 9.33 at the default tile.
+The output stays in XLA.
+
+Fused prep did improve training (c46). `dew.nn.kernels.delta_prep` keeps the
+key products and strictly lower solve on chip and saves one fp32 inverse
+for the backward (40 MiB here). Its 16-wide diagonal blocks use masked row
+reductions, then 16-to-32-to-64 merges use `X2 A21 X1`, the XLA inverse's
+bounded block doubling. Same-session medians of 20 calls on the A100:
+
+| call | recurrence only, ms / kernels | fused prep, ms / kernels |
+|---|---:|---:|
+| rule, forward | 3.34 / 37 | 3.21 / 19 |
+| rule, forward + backward | 9.09 / 103 | 8.17 / 46 |
+| GatedDeltaNet, forward | 6.13 / 50 | 6.14 / 30 |
+| GatedDeltaNet, forward + input gradient | 15.15 / 127 | 13.70 / 69 |
+
+The rule's training time fell 10.1%, the mixer's 9.6%; fla's rule took
+1.36/3.61 ms. Temporary memory fell from 1254.8 to 1051.8 MiB for the rule
+and 1659.0 to 1387.7 for the mixer. Eighteen prep tiles did not beat the
+default 32-column, 4-warp, 2-stage tile (lowest repeat 8.25 ms). The single
+`KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}` takes recurrence and prep
+together; other generations remain unmeasured, and KDA stays XLA. The
+whole rule's float64 RMS ratios were at most 1.002 at default precision
+and 1.324 at highest, with bitwise repeats.
+
 With canonical metadata the call is exactly the plain call. Its outputs are
 bitwise equal to the no-metadata forward, and its parameter gradients are
 within 2.4e-06 of it. The opaque all-true mask stays on the xla kernel at
