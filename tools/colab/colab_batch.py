@@ -71,7 +71,7 @@ def first_sentence(text: str) -> str:
 
 def input_paths(fields: dict) -> list[tuple[Path, str]]:
     sources, _, destinations = first_sentence(fields.get("inputs", "")).partition(" to ")
-    pattern = r"(?<![\w.])~?/[\w./-]+"
+    pattern = r"(?<![\w.])~?/[\w./+-]+"
     remote = re.findall(pattern, destinations)
     pairs = []
     for value in re.findall(pattern, sources):
@@ -84,7 +84,7 @@ def input_paths(fields: dict) -> list[tuple[Path, str]]:
             if file.is_file():
                 suffix = file.relative_to(source) if source.is_dir() else file.name
                 pairs.append((file, remote[0].rstrip("/.") + "/" + str(suffix)))
-    for value in re.findall(r"~/[\w./-]+", fields["command"]):
+    for value in re.findall(r"~/[\w./+-]+", fields["command"]):
         path = Path(value).expanduser()
         if path.is_file():
             pairs.append((path, value))
