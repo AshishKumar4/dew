@@ -528,9 +528,10 @@ class TextGeneration:
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
             policy, chain, criteria = self._controls(sampling, logits, stopping)
-            generated = generate(cache_sized(self.model, capacity), self.variables, shaped, trips,
+            generated = generate(cache_sized(self.model, capacity), self.variables, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
-                                 stopping=criteria, strategy=self.strategy if strategy is None else strategy)
+                                 stopping=criteria, strategy=self.strategy if strategy is None else strategy,
+                                 trips=trips)
             decoder = None if self.processor is None else functools.partial(decoded_rows, self.processor)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return replace(_requested(generated, budget, padding), decoder=decoder)

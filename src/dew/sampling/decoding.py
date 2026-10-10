@@ -56,7 +56,10 @@ class StepState:
     hold a real token. A row's history is therefore its own, whatever padding
     the prompt batch needed. `step` counts the tokens the row has committed,
     `active` marks the rows still generating, and `keys` holds one PRNG key
-    per row.
+    per row. `budget` is the tokens each row's request may draw, `[rows]`,
+    which can be fewer than the draw slots: a task scans a bucket of trips
+    past it so budgets share one compiled loop, and a server's slots hold
+    its whole capacity. None leaves it the draw slots.
     """
 
     tokens: jax.Array
@@ -65,6 +68,7 @@ class StepState:
     active: jax.Array
     keys: jax.Array
     prompt_width: int = struct.field(pytree_node=False, default=0)
+    budget: jax.Array | None = None
 
     @property
     def width(self) -> int:
@@ -74,6 +78,12 @@ class StepState:
     @property
     def rows(self) -> int:
         return self.tokens.shape[0]
+
+    def budgets(self) -> jax.Array:
+        """Return the tokens each row's request may draw (`budget`), `[rows]`."""
+        if self.budget is not None:
+            return self.budget
+        return jnp.full(self.rows, self.width - self.prompt_width, jnp.int32)
 
     def total(self) -> jax.Array:
         """Return the number of real tokens each row holds, prompt and generated together."""
@@ -652,17 +662,16 @@ class ForcedEOS:
     `eos` may name several ids, all of which the forced step allows, as the
     reference allows every id its tensor holds. `max_length` counts prompt and
     generated tokens together. Left as None, the end is the request's own
-    (the prompt width plus the token budget), so a caller that changes the
-    budget per call forces EOS at the new end rather than at a length the task
-    was built with.
+    token budget (`StepState.budgets`), so a caller that changes the budget
+    per call forces EOS at the new end rather than at a length the task was
+    built with, and a loop that scans past the budget forces it inside it.
     """
 
     eos: jax.Array = struct.field(default_factory=lambda: jnp.zeros((0,), jnp.int32))
     max_length: int | None = struct.field(pytree_node=False, default=None)
 
     def __call__(self, state: StepState, logits: jax.Array) -> jax.Array:
-        budget = state.width - state.prompt_width
-        rows = (state.step == budget - 1 if self.max_length is None
+        rows = (state.step == state.budgets() - 1 if self.max_length is None
                 else state.total() == self.max_length - 1)
         only = jnp.where(_membership(self.eos, logits.shape[-1])[None, :], 0.0, FILTER)
         return jnp.where(rows[:, None], only, logits)

@@ -745,15 +745,13 @@ class Server:
         """Submit a batch, run it through, and return its generations in order.
 
         Row `i` draws with the request key folded by `i`, as the same batch
-        through `TextGeneration` would.
+        through `TextGeneration` would. Each row is validated as `submit`
+        validates one.
         """
         base = _seed(key)
         inputs = prepared_inputs(self.processor, prompts, images=None)
-        valid = inputs.token_fields.get("attention_mask")
-        rows = np.asarray(inputs.tokens)
-        mask = np.ones(rows.shape, bool) if valid is None else np.asarray(valid).astype(bool)
-        tickets = [self._enqueued(rows[index][mask[index]], max_new_tokens, base, index)
-                   for index in range(rows.shape[0])]
+        tickets = [self._enqueued(inputs.take_rows(np.arange(index, index + 1)), max_new_tokens, base, index)
+                   for index in range(inputs.tokens.shape[0])]
         self.run()
         return [ticket.result() for ticket in tickets]
 

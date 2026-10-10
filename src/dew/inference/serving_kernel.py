@@ -269,7 +269,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         decoder = dataclasses.replace(decoder, logits=jnp.where(fed[:, None], decoder.logits,
                                                                 state.decoder.logits))
     view = StepState(state.tokens, state.valid, state.step, state.active,
-                     jax.random.wrap_key_data(state.keys), prompt_width=capacity)
+                     jax.random.wrap_key_data(state.keys), prompt_width=capacity, budget=state.budget)
     chain = decoding.chain(transforms)
     token, behavior, raw = draw(view, decoder.logits,
                                 chain if grammar is None else grammar.guiding(chain, state.automaton))

@@ -622,12 +622,13 @@ class CausalSelfAttention(nn.Module):
         It rounds elsewhere, so the prefill is not bitwise xla's: its RMS
         distance from an fp32 forward is 1.04 times xla's on Qwen3-0.6B and
         1.00 on 1.7B (tests/reference_error.py allows 2), and greedy rows part
-        only at bf16 near-ties (docs/performance.md)."""
+        only at bf16 near-ties (docs/performance.md). cuDNN cannot honor
+        attention sinks, so a sink layer keeps xla, which takes them."""
         masked = kernel_for_materialized_mask(
             self.attention_impl, query, dtype=self.dtype, precision=self.precision,
             force_fp32_for_softmax=self.force_fp32_for_softmax)
         if (decode and query.shape[1] > 1 and masked == 'xla' and self.attention_impl in ('auto', 'cudnn')
-                and cudnn_runs(query, self.attn_logit_softcap)):
+                and not self.attention_sinks and cudnn_runs(query, self.attn_logit_softcap)):
             return 'cudnn'
         return masked
 
@@ -772,7 +773,8 @@ class CausalSelfAttention(nn.Module):
         # A chunk, window or metadata mask replaces `cursor` and keeps the gather.
         plain_step = (append is not None and mask is cursor and S == 1 and sinks is None
                       and bias is None and not sowing)
-        if append is not None and plain_step and self._page_kernel_runs(query) and append.store.kernel():
+        if (append is not None and plain_step and self._page_kernel_runs(query)
+                and append.store.kernel(query[:, 0])):
             attention = self._paged(append, query)
         elif plain_step:
             attention = self._decode_attention(query, key, value, jnp.asarray(positions).reshape(B, S)[:, 0])
@@ -839,7 +841,7 @@ class CausalSelfAttention(nn.Module):
         prompt = positions[rows:].reshape(pieces, width)
         index.value = (index.value + (positions[:rows] >= 0)).at[admitted.slots].set(
             admitted.cursors + jnp.sum(prompt >= 0, axis=1, dtype=jnp.int32), mode="drop")
-        if self._page_kernel_runs(query) and store.kernel():
+        if self._page_kernel_runs(query) and store.kernel(query[0, :rows]):
             decoded = store.decode(query[0, :rows], index.value, self.attn_logit_softcap)
             decoded = checkpoint_name(decoded[:, None], 'context')
         else:
