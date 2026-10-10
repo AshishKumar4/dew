@@ -21,7 +21,6 @@ import dataclasses
 import inspect
 import types
 from collections.abc import Callable, Mapping, Sequence
-from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -29,7 +28,7 @@ import optax
 from flax import linen as nn
 
 from dew.inputs import InputSpec
-from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables, training_rngs
+from dew.objectives.base import FROZEN, Aux, Batch, Objective, Ratio, Source, Step, Variables, model_rngs
 
 type Outputs = jax.Array | tuple[Outputs, ...] | list[Outputs] | Mapping[str, Outputs]
 """What a model returns: an array, or a tree of them."""
@@ -84,29 +83,22 @@ class Supervised(Objective[Ratio]):
         self.sample = inputs.sample
         self.inputs = inputs
         self.mode = mode
-        # The keyword that puts the model in or out of training mode, none without a mode.
-        self._training: dict[str, Any] = {} if mode is None else {mode: True}
-        self._evaluating: dict[str, Any] = {} if mode is None else {mode: False}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         sample = jnp.zeros((1, *self.sample.shape), jnp.int32)
-        return self.model.init(key, sample, **self._evaluating)
+        mode = {} if self.mode is None else {self.mode: False}
+        return self.model.init(key, sample, method="__call__", **mode)
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         # The model's own collections besides its parameters, such as a
         # BatchNorm's running statistics, update as it runs, and the trainer
         # keeps the updates (`Aux.variables`).
-        held = [name for name in variables if name not in ("params", FROZEN)]
-        outputs, updates = self.model.apply(variables, batch[self.sample.key], rngs=training_rngs(step.key),
-                                            mutable=held, **self._training)
+        held = [name for name in variables if name not in ("params", FROZEN)] if step.training else []
+        mode = {} if self.mode is None else {self.mode: step.training}
+        outputs, updates = self.model.apply(variables, batch[self.sample.key],
+                                            rngs=model_rngs(step.key, training=step.training),
+                                            mutable=held, method="__call__", **mode)
         return self._scored(outputs, batch, dict(updates) if held else None)
-
-    def validation_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
-        """With a `mode`, the model in its evaluation mode, writing nothing; otherwise `loss`."""
-        if self.mode is None:
-            return self.loss(variables, batch, step)
-        outputs = self.model.apply(variables, batch[self.sample.key], **self._evaluating)
-        return self._scored(outputs, batch, None)
 
     def _scored(self, outputs: Outputs, batch: Batch, updates: Variables | None) -> tuple[Ratio, Aux]:
         losses = self.criterion(outputs, batch)

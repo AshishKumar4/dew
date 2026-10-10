@@ -46,8 +46,8 @@ from dew.objectives.base import (
     Source,
     Step,
     Variables,
+    model_rngs,
     thaw,
-    training_rngs,
 )
 from dew.objectives.lm.chunked import head_cross_entropy, logits_cross_entropy, reads_states
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
@@ -151,7 +151,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
     def loss(self, variables, batch, step: Step):
         tokens, losses, weights, counted, predicted, real = self._token_losses(
-            variables, batch, step.key, train=True)
+            variables, batch, step.key, train=step.training)
         nelbo = Ratio(self.row_mean(losses * weights, batch).total,
                       self.row_mean(real.astype(jnp.float32), batch).total)
         correct = (predicted == tokens).astype(losses.dtype)
@@ -213,7 +213,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         masked = jnp.where(is_masked, masked, tokens)
 
         over_states = reads_states(self.model)
-        read = self.model.apply(params, masked, train=train, rngs=training_rngs(dropout_key),
+        read = self.model.apply(params, masked, train=train, rngs=model_rngs(dropout_key, training=train),
                                 method="hidden_states" if over_states else "logits", mutable=False,
                                 capture_intermediates=False, **prepared.kwargs())
         # MDLM's SUBS parameterization gives the mask token no mass: it is

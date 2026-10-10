@@ -41,6 +41,7 @@ from dew.objectives.base import (
     Source,
     Step,
     Variables,
+    model_rngs,
     thaw,
 )
 from dew.objectives.lm.chunked import head_cross_entropy, model_logits
@@ -271,7 +272,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, _ = self._token_losses(
-            variables, batch, step.key, train=True)
+            variables, batch, step.key, train=step.training)
         canvas_stats, encoder_stats = (
             _row_losses(canvas_losses, target_mask, batch),
             _row_losses(encoder_losses, encoder_target_mask, batch),
@@ -395,13 +396,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             full_valid, selected, self.prompt_length, self.canvas_size,
             fields.get("positions"), fields.get("image_groups"))
         model = self.training_model
+        rngs = model_rngs(key, training=train)
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         encoder_kwargs = prepared.kwargs()
         encoder_kwargs.update(positions=positions, attention_mask=full_valid)
         encoder_states, mutated = model.apply(
             {**params, "cache": cache}, tokens, **encoder_kwargs,
             attention_pairwise_mask=encoder_mask, attention_key_positions=encoder_keys,
-            method=model.encode, train=train, states=True, mutable=["cache"], rngs=None,
+            method=model.encode, train=train, states=True, mutable=["cache"], rngs=rngs,
             capture_intermediates=False)
         cache = mutated["cache"]
         if self.stop_gradient_from_denoiser_to_encoder:
@@ -409,7 +411,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         def denoise(sc_logits):
             return model.apply(
                 {**params, "cache": cache}, noisy, self_conditioning_logits=sc_logits,
-                train=train, positions=positions[:, self.prompt_length:],
+                train=train, rngs=rngs, positions=positions[:, self.prompt_length:],
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
                 states=True)
 

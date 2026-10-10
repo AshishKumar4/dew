@@ -188,6 +188,19 @@ def runs(tmp_path_factory):
     return student, batch
 
 
+def test_validation_does_not_advance_the_spectral_statistics(runs):
+    config, batch = runs
+    task = config.build()
+    variables = task.init(jax.random.key(1))
+    step = Step(jnp.asarray(0), jax.random.key(2), None)
+    validation, aux = task.validation_loss(variables, batch, step)
+    training, trained = task.loss(variables, batch, step)
+    assert validation.mean()[0] != training.mean()[0]
+    assert aux.variables is None
+    assert any(not np.array_equal(before, after) for before, after in zip(
+        jax.tree.leaves(variables[SPECTRAL]), jax.tree.leaves(trained.variables[SPECTRAL]), strict=True))
+
+
 def test_each_side_trains_on_its_own_loss(runs):
     """The heads' gradient is the discriminator loss's alone and the
     student's the generator and distillation losses' alone; the teacher is
