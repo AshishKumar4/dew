@@ -38,6 +38,14 @@ def refusal(key, value) -> str | None:
     )
 
 
+def _join(first, second, axis):
+    """Join two register tiles with Triton's two-way stack and reshape.
+    Its Pallas lowering does not concatenate tiles wider than one entry."""
+    shape = list(first.shape)
+    shape[axis] *= 2
+    return jnp.moveaxis(jnp.stack((first, second), axis=-1), -1, axis).reshape(shape)
+
+
 def _inverse(a):
     """Diagonal blocks, then their pairwise merges: never powers of A.
     Masked row reductions keep the 16-wide solve below Triton's dot bound."""
@@ -51,11 +59,12 @@ def _inverse(a):
             return jnp.where(index[:, None] == i, corrected, inverse)
 
         return jax.lax.fori_loop(2, size, row, a) + jnp.eye(size, dtype=jnp.float32)
-    half = size // 2
-    first, second = _inverse(a[:half, :half]), _inverse(a[half:, half:])
-    below = (second @ a[half:, :half]) @ first
-    top = jnp.concatenate((first, jnp.zeros_like(first)), axis=1)
-    return jnp.concatenate((top, jnp.concatenate((below, second), axis=1)), axis=0)
+    top, bottom = jnp.split(a, 2, axis=0)
+    a11, _ = jnp.split(top, 2, axis=1)
+    a21, a22 = jnp.split(bottom, 2, axis=1)
+    first, second = _inverse(a11), _inverse(a22)
+    below = (second @ a21) @ first
+    return _join(_join(first, jnp.zeros_like(first), 1), _join(below, second, 1), 0)
 
 
 def _forward_kernel(k_ref, v_ref, beta_ref, hi_ref, lo_ref, w_ref, u_ref, inverse_ref):
