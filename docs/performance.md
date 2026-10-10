@@ -1247,6 +1247,40 @@ failed for the `u` gradient (1.504e-7 versus XLA's 4.926e-8 RMS, ratio
 3.05); changing dot precision alone had not fixed that narrower case.
 No automatic fused-output dispatch was enabled from this measurement.
 
+The fused prep did improve training in the follow-up A100 session (c46).
+`dew.nn.kernels.delta_prep` keeps the key products and the strictly lower
+solve on chip, then prepares `w` and `u`. It saves one fp32 inverse for the
+backward (40 MiB at this shape), not the attention or decay matrices. Its
+16-wide diagonal blocks use masked row reductions, then the 16-to-32-to-64
+merges use `X2 A21 X1`, the same bounded block-doubling structure as the
+XLA inverse. Output remains XLA. Same-session medians of 20 calls:
+
+| call | recurrence only, ms / kernels | fused prep, ms / kernels |
+|---|---:|---:|
+| rule, forward | 3.34 / 37 | 3.21 / 19 |
+| rule, forward + backward | 9.09 / 103 | 8.17 / 46 |
+| GatedDeltaNet, forward | 6.13 / 50 | 6.14 / 30 |
+| GatedDeltaNet, forward + input gradient | 15.15 / 127 | 13.70 / 69 |
+
+The rule's training time fell 10.1%, the mixer's 9.6%. Temporary memory
+fell from 1254.8 to 1051.8 MiB for the rule and 1659.0 to 1387.7 MiB for
+the mixer. Eighteen prep tiles (16/32/64 columns, 2/4/8 warps, 1/2 stages)
+did not improve on the default 32-column, 4-warp, 2-stage tile: the lowest
+repeat was 8.25 ms. Prep plus output took 9.81 ms for the rule and 16.19
+for the mixer, so the output kernel was removed. The choice stays the
+single `KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}`: recurrence and
+prep together, every other generation unmeasured. Against float64, the
+whole rule's output and gradients had RMS ratios at most 1.002 at default
+precision and 1.32 at highest, and repeated bit for bit. KDA stays XLA.
+
+This session also tested the recurrence-only `u` discrepancy above.
+Moving its two exp factors to XLA left every output and gradient's RMS
+error bitwise unchanged. Both kernel traces used IEEE dots at highest
+precision, so neither an approximate exp nor an ignored dot-precision
+context explained it. That experiment was reverted; the narrower `u`
+gradient failure remains a separate issue in the preceding recurrence,
+not a claimed passing gate for this prep change.
+
 With canonical metadata the call is exactly the plain call. Its outputs are
 bitwise equal to the no-metadata forward, and its parameter gradients are
 within 2.4e-06 of it. The opaque all-true mask stays on the xla kernel at

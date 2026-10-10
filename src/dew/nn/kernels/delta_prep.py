@@ -21,7 +21,6 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from .delta_output import _decay
 from .generation import first_refusal
 
 BLOCK = 32
@@ -36,6 +35,15 @@ def refusal(key, value) -> str | None:
         (key.shape[-1] <= 128, f"prep keys {key.shape[-1]} wide, wider than 128"),
         (value.shape[-1] <= 256, f"prep values {value.shape[-1]} wide, wider than 256"),
     )
+
+
+def _decay(hi, lo):
+    """The compensated pairwise decay, masked before exp so unused positive
+    differences cannot overflow (dew.nn.linear.chunk_decay)."""
+    index = jnp.arange(hi.shape[0])
+    lower = index[:, None] >= index[None, :]
+    diff = (hi[:, None] - hi[None, :]) + (lo[:, None] - lo[None, :])
+    return jnp.where(lower, jnp.exp(jnp.where(lower, diff, 0.0)), 0.0)
 
 
 def _join(first, second, axis):
