@@ -94,15 +94,15 @@ def _drain() -> None:
 
 
 COMMAND_BUFFERS = (
-    "no device time is attributed to HLO ops (reports/hlo_stats.json): kernels in a CUDA command "
-    "buffer recorded before the capture started stay under their module. Profile with "
+    "no device time is attributed to HLO ops (reports/hlo_stats.json): the kernels XLA ran as CUDA "
+    "command buffers stay under their module. Profile with "
     "XLA_FLAGS=--xla_gpu_enable_command_buffer= for op-level reports, and time runs without it")
 
 
-def _attributes_ops(reports: Path) -> bool | None:
-    """Whether XProf's hlo_stats names any HLO op, rather than only whole modules
-    (`XlaModule`), as it does for kernels a command buffer recorded before the
-    capture runs; None where it has no hlo_op_name column to tell by."""
+def attributed_ops(reports: Path) -> int | None:
+    """How many HLO ops XProf's hlo_stats in `reports` attributes device time
+    to, not counting whole modules (`XlaModule`), as it reports kernels run as
+    a command buffer; None where it has no hlo_op_name column to tell by."""
     path = reports / "hlo_stats.json"
     tables = json.loads(path.read_text()) if path.exists() else []
     table: dict = (tables[0] if tables else {}) if isinstance(tables, list) else tables
@@ -110,7 +110,7 @@ def _attributes_ops(reports: Path) -> bool | None:
     if "hlo_op_name" not in columns:
         return None
     name = columns.index("hlo_op_name")
-    return any(not str(row["c"][name].get("v", "")).startswith("XlaModule") for row in table.get("rows", []))
+    return sum(not str(row["c"][name].get("v", "")).startswith("XlaModule") for row in table.get("rows", []))
 
 
 def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) -> None:
@@ -174,10 +174,10 @@ def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) 
                 except Exception as error:
                     record.update(status="error", error=str(error))
                     failures.append(error)
-    attributed = _attributes_ops(reports) if metadata.get("backend") == "gpu" else True
+    attributed = attributed_ops(reports) if metadata.get("backend") == "gpu" else 1
     if attributed is None:
         metadata["op_attribution"] = "unknown: hlo_stats has no hlo_op_name column"
-    elif not attributed:
+    elif attributed == 0:
         metadata["op_attribution"] = COMMAND_BUFFERS
         _logger.warning("Profile %s: %s", directory, COMMAND_BUFFERS)
     written: list[JSON] = [str(path.relative_to(directory))
@@ -210,10 +210,15 @@ class Profiler:
     trace and kernel reports are enough.
 
     On a GPU the reports also come out empty for work that already ran before
-    the capture: XLA records its kernels into CUDA command buffers on the
-    first run, and a recorded buffer's kernels are attributed to their
-    module, not their ops. The manifest's `op_attribution` then says so and a
-    warning names the fix, profiling with
+    the capture, as a Trainer's profile window does: XLA runs a step's
+    kernels as CUDA command buffers, and their device time is attributed to
+    their module, not their ops (on JAX 0.11.2 an RTX 4080's warmed step
+    named no op; 63 when its first run fell inside the capture; 166 with
+    command buffers off). XLA means to run command buffers op by op while a
+    profiling session is active (command_buffer_thunk.cc, ExecuteOnStream),
+    and here does not; why is open, and tools/gpu_profile_check.py records
+    whether it does on every GPU session. The manifest's `op_attribution`
+    then says so and a warning names the fix, profiling with
     `XLA_FLAGS=--xla_gpu_enable_command_buffer=`; time runs without that
     flag, since launching kernels one by one costs time. Where hlo_stats has
     no column naming the ops, `op_attribution` records that it could not tell.
