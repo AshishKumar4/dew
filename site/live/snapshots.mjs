@@ -25,7 +25,8 @@ const sha256 = (value) => createHash('sha256').update(value).digest('hex');
 export function login() {
 	const config = readFileSync(path.join(here, 'wrangler.jsonc'), 'utf8');
 	const account = /"account_id":\s*"([0-9a-f]{32})"/.exec(config)[1];
-	const { token } = JSON.parse(execFileSync('pnpm', ['exec', 'wrangler', 'auth', 'token', '--json'],
+	// Wrangler itself, not through pnpm, which may print its own lines before the JSON.
+	const { token } = JSON.parse(execFileSync(path.join(here, '..', 'node_modules', '.bin', 'wrangler'), ['auth', 'token', '--json'],
 		{ encoding: 'utf8', cwd: path.join(here, '..') }));
 	return { account, token };
 }
