@@ -1,4 +1,5 @@
 """Job-opted private credentials; account settings remain local configuration."""
+
 import hashlib
 import netrc
 import os
@@ -28,7 +29,11 @@ def stage_wandb(plan: dict, work: Path, netrc_file: Path, config_file: Path) -> 
     with os.fdopen(descriptor, "wb") as output:
         output.write(payload)
     target = "/content/.dew-wandb.key"
-    plan["uploads"][target] = {"parts": [filename], "sha256": hashlib.sha256(payload).hexdigest(), "private": True}
+    plan["uploads"][target] = {
+        "parts": [filename],
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "private": True,
+    }
     plan.setdefault("private_parts", []).append(filename)
     for job in requested:
         job["secret_env"] = {"WANDB_API_KEY": target}

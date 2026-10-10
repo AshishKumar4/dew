@@ -159,7 +159,10 @@ def test_local_inputs_must_not_shadow_r2_data(tmp_path, service):
 
 def test_write_token_only_descriptor_is_refused_before_staging(tmp_path):
     descriptor = tmp_path / "data.json"
-    save(descriptor, {"url": "https://fake.invalid", "token_file": str(tmp_path / "write-token"), "sources": []})
+    save(
+        descriptor,
+        {"url": "https://fake.invalid", "token_file": str(tmp_path / "write-token"), "sources": []},
+    )
     with pytest.raises(ValueError, match="read_token_file"):
         colab_batch.data_inputs({"data_inputs": str(descriptor)})
 
@@ -185,8 +188,13 @@ def test_duplicate_destination_aliases_are_rejected_before_data_fetch(tmp_path, 
 
 def test_packed_jobs_cannot_restore_different_datasets_over_one_target(tmp_path, service):
     _, _, identity, _ = service
-    common = {"index": 1, "entry": {"fields": {"command": "run"}}, "resume_key": "none",
-              "data_token_file": str(tmp_path / "private-token"), "artifact_policy": "measurements"}
+    common = {
+        "index": 1,
+        "entry": {"fields": {"command": "run"}},
+        "resume_key": "none",
+        "data_token_file": str(tmp_path / "private-token"),
+        "artifact_policy": "measurements",
+    }
     first = {**common, "data_sources": [{"target": "/content/data", "manifest_sha256": identity}]}
     second = {**common, "data_sources": [{"target": "/content/data/sub", "manifest_sha256": "a" * 64}]}
     with pytest.raises(ValueError, match="overlapping"):

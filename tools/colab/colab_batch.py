@@ -283,15 +283,25 @@ def split_file(source: Path, work: Path, prefix: str) -> tuple[list[str], str]:
     return names, digest.hexdigest()
 
 
-def stage(plan: dict, work: Path, repo: Path = REPO, *, netrc_file: Path | None = None,
-          wandb_config: Path | None = None) -> None:
+def stage(
+    plan: dict,
+    work: Path,
+    repo: Path = REPO,
+    *,
+    netrc_file: Path | None = None,
+    wandb_config: Path | None = None,
+) -> None:
     work.mkdir(mode=0o700, parents=True, exist_ok=False)
     stage_sources(plan, work, repo)
     stage_inputs(plan, work)
     from tools.colab.credentials import stage_wandb
 
-    stage_wandb(plan, work, netrc_file if netrc_file is not None else Path.home() / ".netrc",
-                wandb_config if wandb_config is not None else Path.home() / ".config/dew/wandb.toml")
+    stage_wandb(
+        plan,
+        work,
+        netrc_file if netrc_file is not None else Path.home() / ".netrc",
+        wandb_config if wandb_config is not None else Path.home() / ".config/dew/wandb.toml",
+    )
     with tarfile.open(work / "runner.tar.gz", "w:gz") as archive:
         for file in HERE.glob("*.py"):
             archive.add(file, arcname="tools/colab/" + file.name)
@@ -375,8 +385,10 @@ def stage_inputs(plan: dict, work: Path) -> None:
             if source in plan["data_sources"]:
                 continue
             target = Path(source["target"])
-            if any(target.is_relative_to(Path(known["target"]))
-                   or Path(known["target"]).is_relative_to(target) for known in plan["data_sources"]):
+            if any(
+                target.is_relative_to(Path(known["target"])) or Path(known["target"]).is_relative_to(target)
+                for known in plan["data_sources"]
+            ):
                 raise ValueError("different R2 datasets have overlapping VM targets")
             plan["data_sources"].append(source)
         if job.get("data_sources"):
