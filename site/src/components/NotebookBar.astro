@@ -111,8 +111,7 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 			return done.status === 'ok';
 		}
 
-		function enqueue(id: number): Promise<boolean> {
-			const mine = epoch;
+		function enqueue(id: number, mine = epoch): Promise<boolean> {
 			const run = queue.then(() => (mine === epoch ? runCell(id) : false));
 			queue = run.catch(() => false);
 			return run;
@@ -157,8 +156,10 @@ const runtime = notebook.accelerator === 'GPU' ? 'Needs one NVIDIA GPU' : 'Runs 
 		});
 
 		bar.querySelector('[data-live-all]')!.addEventListener('click', async () => {
+			// One epoch for the whole run, so a Restart during it ends it.
+			const mine = epoch;
 			for (const cell of cells) {
-				if (!(await enqueue(cell.id))) break;
+				if (!(await enqueue(cell.id, mine))) break;
 			}
 		});
 		bar.querySelector('[data-live-interrupt]')!.addEventListener('click', () => session?.interrupt());
