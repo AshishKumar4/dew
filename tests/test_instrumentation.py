@@ -4,14 +4,16 @@ None of the performance work is evaluable without these numbers, so they get
 the same treatment as the training maths.
 """
 
+import itertools
 import os
+import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, TimingRegression as Regression, batches as batches
+from affine_run import BATCH, FEATURES, TimingRegression as Regression, batches as batches
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
@@ -230,6 +232,19 @@ def test_throughput_metrics_are_consistent():
 
 def test_throughput_metrics_ignore_a_zero_interval():
     assert make_trainer()._throughput(elapsed=0.0, steps=0, samples=0, flops=0.0) == {}
+
+
+def test_throughput_metrics_report_compiles_and_waits_apart_from_steps():
+    """An interval's rates are over its steps alone: a second spent compiling
+    a new shape is reported as train/compile_s, and the wait on input as
+    train/data_wait_ms a step."""
+    metrics = make_trainer()._throughput(elapsed=3.0, steps=10, samples=640, flops=None, waited=0.5,
+                                         compiling=1.0)
+    assert metrics["train/step_time_ms"] == pytest.approx(200.0)
+    assert metrics["train/samples_per_sec"] == pytest.approx(320.0)
+    assert metrics["train/data_wait_ms"] == pytest.approx(50.0)
+    assert metrics["train/compile_s"] == pytest.approx(1.0)
+    assert "train/compile_s" not in make_trainer()._throughput(elapsed=2.0, steps=10, samples=640, flops=None)
 
 
 def test_mfu_is_skipped_on_unknown_hardware():
@@ -490,6 +505,29 @@ def test_fit_reports_throughput_to_the_tracker():
     assert len(ticks) == 3, "no throughput was logged"
     assert all(p["train/step_time_ms"] > 0 for p in ticks)
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
+
+
+def test_fit_reports_the_wait_on_input_and_a_later_compile():
+    """A slow input shows as train/data_wait_ms on every tick, and a batch
+    of a shape the loop has not met compiles inside its tick, which reports
+    the compile as train/compile_s; the ticks that compiled nothing report
+    none."""
+    tracker = RecordingTracker()
+
+    def slow():
+        rng = np.random.default_rng(0)
+        for rows in itertools.chain([BATCH] * 2, itertools.repeat(2 * BATCH)):
+            time.sleep(0.05)
+            x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
+            yield {"x": x, "y": 2 * x[:, :2]}
+
+    make_trainer(tracker=tracker).fit(Data(slow), steps=4, log_every=1)
+
+    ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
+    assert len(ticks) == 4
+    assert all(p["train/data_wait_ms"] >= 40 for p in ticks), [p["train/data_wait_ms"] for p in ticks]
+    assert [("train/compile_s" in p) for p in ticks] == [False, False, True, False]
+    assert ticks[2]["train/compile_s"] > 0
 
 
 def test_compilation_cache_directory_is_configured(tmp_path):
