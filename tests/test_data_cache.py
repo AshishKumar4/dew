@@ -59,14 +59,15 @@ def test_missing_input_completion_refuses_publication():
 
 
 def test_unsealed_writer_cannot_certify_coverage():
-    source = Memory([{"id": 0}])
+    source = Memory([{"id": 0}, {"id": 1}])
     cache, key = _cache(shard_bytes=1), Manifest()
     rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
     rows[0]
     with pytest.raises(ValueError, match="missing"):
         cache.publish(key, source)
+    rows[1]
     rows.close()
-    assert len(cache.publish(key, source)) == 1
+    assert len(cache.publish(key, source)) == 2
 
 
 def test_conflicting_duplicate_writers_refuse_publication():

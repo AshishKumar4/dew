@@ -5,16 +5,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import sqlite3
 import tempfile
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import Path
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 from array_record.python.array_record_module import ArrayRecordWriter
@@ -73,7 +75,18 @@ def _outputs_digest(outputs: Sequence[object]) -> str:
 
 
 def _accepted(outputs: Sequence[object]) -> tuple[object, ...]:
-    return tuple(value for value in outputs if not hasattr(value, "reason"))
+    return tuple(value for value in outputs if not isinstance(value, _Rejection))
+
+
+@runtime_checkable
+class _Rejection(Protocol):
+    reason: str
+    permanent: bool
+
+
+@runtime_checkable
+class _Volatile(Protocol):
+    volatile: bool
 
 
 @dataclass(frozen=True)
@@ -165,7 +178,9 @@ class Cache:
                     candidate = {**entry, "shard": record["shard"]["path"]}
                     existing = completions.get(entry["id"])
                     if existing is not None and existing["payload_sha256"] != entry["payload_sha256"]:
-                        raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
+                        if not record["volatile"]:
+                            raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
+                        _log.warning("volatile cache conflict for row %s; keeping the first sealed copy", entry["id"])
                     completions.setdefault(entry["id"], candidate)
                     collected.append(entry["id"])
                 rows.close()
@@ -238,7 +253,8 @@ def _source_ids(source: Source, *, streamed: bool = False) -> Iterator[RowId]:
 
 
 class _Writer:
-    def __init__(self, cache: Cache, key: DependencyManifest):
+    def __init__(self, cache: Cache, key: DependencyManifest, *, volatile: bool = False,
+                 expected: int | None = None):
         self.cache, self.root = cache, cache._root(key)
         self.writer = uuid.uuid4().hex
         self.directory = tempfile.TemporaryDirectory(prefix="dew-spool-")
@@ -246,32 +262,68 @@ class _Writer:
         self.lock = threading.Condition(threading.RLock())
         self.futures: list[Future] = []
         self.segments: list[dict] = []
-        self.completed: dict[str, tuple[object, ...]] = {}
-        self.pending: list[tuple[str, tuple[object, ...], bytes]] = []
+        self.index = sqlite3.connect(Path(self.directory.name) / "inputs.sqlite", check_same_thread=False)
+        self.index.execute("CREATE TABLE inputs (id TEXT PRIMARY KEY, shard INTEGER, offset INTEGER, digest TEXT)")
+        self.pending: dict[str, bytes] = {}
         self.pending_bytes = 0
         self.spool_bytes = 0
         self.admitting = True
         self.closed = False
+        self.volatile = volatile
+        self.expected = expected
+        self.seal_future: Future | None = None
+
+    @lru_cache(maxsize=2)
+    def _records(self, shard: int) -> ArrayRecords:
+        return ArrayRecords((self.root.child(f"shards/{self.writer}/{shard:06d}.array_record").url,),
+                            self.cache.storage_options)
 
     def process(self, row_id: RowId, ordinal: int, value: object, transform: Transform | None):
         row_key = _row_key(row_id)
         with self.lock:
-            existing = self.completed.get(row_key)
+            existing = self.pending.get(row_key)
+            completed = self.index.execute("SELECT shard, offset, digest FROM inputs WHERE id=?",
+                                           (row_key,)).fetchone()
         if existing is not None:
-            return existing if transform is not None else existing[0]
+            values = decode(existing)
+            if not isinstance(values, tuple):
+                raise ValueError(f"cache pending row {row_key} is not an input completion")
+            return values if transform is not None else values[0]
+        if completed is not None and self.futures[completed[0]].done():
+            uploaded = self.futures[completed[0]]
+            if uploaded.exception() is None:
+                data = self._records(completed[0])[completed[1]]
+                if not isinstance(data, bytes) or _hash(data) != completed[2]:
+                    raise ValueError(f"cache writer record is corrupt for row {row_key}")
+                values = decode(data)
+                if not isinstance(values, tuple):
+                    raise ValueError(f"cache writer record is not a completion for row {row_key}")
+                return values if transform is not None else values[0]
         outputs = (value,) if transform is None else transform(ordinal, value)
         if not isinstance(outputs, tuple):
             raise TypeError("cache input transform must return a tuple of outputs")
         data = encode(outputs)
-        transient = any(getattr(output, "permanent", True) is False
-                        or getattr(output, "reason", None) == "transient" for output in outputs)
+        transient = any(isinstance(output, _Rejection) and not output.permanent for output in outputs)
         with self.lock:
-            existing = self.completed.get(row_key)
+            existing = self.pending.get(row_key)
             if existing is not None:
-                if _outputs_digest(existing) != _outputs_digest(outputs):
+                if existing != data:
                     raise ValueError(f"conflicting cache duplicate for row {row_key}")
-                return existing if transform is not None else existing[0]
+                return outputs if transform is not None else outputs[0]
+            completed = self.index.execute("SELECT shard, offset, digest FROM inputs WHERE id=?",
+                                           (row_key,)).fetchone()
+            if completed is not None:
+                if _hash(data) != completed[2]:
+                    if not self.volatile:
+                        raise ValueError(f"conflicting cache duplicate for row {row_key}")
+                    _log.warning("volatile cache conflict for row %s; keeping the first copy", row_key)
+                return outputs if transform is not None else outputs[0]
             if not transient and self.admitting:
+                pages = self.index.execute("PRAGMA page_count").fetchone()[0]
+                page_size = self.index.execute("PRAGMA page_size").fetchone()[0]
+                if (pages + 2) * page_size > self.cache.keep_local_bytes:
+                    self.admitting = False
+                    _log.warning("cache %s stopped admission at its local index budget", self.root.url)
                 if len(data) > self.cache.spool_bytes:
                     if self.cache.on_full == "block":
                         raise ValueError(f"cache row {row_key} exceeds spool_bytes={self.cache.spool_bytes}")
@@ -286,12 +338,14 @@ class _Writer:
                         if future.done():
                             future.result()
                 if self.admitting:
-                    self.completed[row_key] = outputs
-                    self.pending.append((row_key, outputs, data))
+                    self.pending[row_key] = data
                     self.pending_bytes += len(data)
                     self.spool_bytes += len(data)
                     if self.pending_bytes >= self.cache.shard_bytes:
                         self._flush()
+                    if self.expected is not None and self.index.total_changes + len(self.pending) == self.expected:
+                        self._flush()
+                        self.seal_future = self.pool.submit(self.seal)
         return outputs if transform is not None else outputs[0]
 
     def _flush(self) -> None:
@@ -302,15 +356,19 @@ class _Writer:
         writer = ArrayRecordWriter(str(path), "group_size:1")
         entries = []
         used = self.pending_bytes
-        for offset, (row_id, outputs, data) in enumerate(self.pending):
+        for offset, (row_id, data) in enumerate(self.pending.items()):
+            outputs = decode(data)
+            if not isinstance(outputs, tuple):
+                raise ValueError(f"cache pending row {row_id} is not an input completion")
             writer.write(data)
             accepted = _accepted(outputs)
             entries.append({"id": row_id, "fanout": len(accepted), "record": offset,
                             "outputs": [[row_id, index] for index in range(len(accepted))],
                             "sha256": _outputs_digest(accepted), "payload_sha256": _outputs_digest(outputs),
-                            "rejections": [getattr(value, "reason") for value in outputs
-                                           if hasattr(value, "reason")]})
+                            "rejections": [value.reason for value in outputs if isinstance(value, _Rejection)]})
+            self.index.execute("INSERT INTO inputs VALUES (?, ?, ?, ?)", (row_id, number, offset, _hash(data)))
         writer.close()
+        self.index.commit()
         self.pending.clear()
         self.pending_bytes = 0
         self.futures.append(self.pool.submit(self._upload, number, path, entries, used))
@@ -330,7 +388,8 @@ class _Writer:
                     if existing != data:
                         raise ValueError(f"cache retry found conflicting shard {shard}")
                     verified = {"bytes": len(data), "sha256": _hash(data)}
-                encoded = _json({"schema": 1, "shard": {"path": shard, **verified}, "completions": entries})
+                encoded = _json({"schema": 1, "shard": {"path": shard, **verified},
+                                 "completions": entries, "volatile": self.volatile})
                 try:
                     self.root.child(segment).verified(encoded)
                 except PreconditionFailed:
@@ -370,8 +429,11 @@ class _Writer:
         if self.closed:
             return
         self.seal()
+        if self.seal_future is not None:
+            self.seal_future.result()
         self.closed = True
         self.pool.shutdown(wait=True, cancel_futures=True)
+        self.index.close()
         self.directory.cleanup()
 
 
@@ -383,7 +445,11 @@ class _CachedMap(grain.MapDataset):
 
     @cached_property
     def writer(self) -> _Writer:
-        return _Writer(self.cache, self.key)
+        writer = _Writer(self.cache, self.key,
+                         volatile=isinstance(self.transform, _Volatile) and self.transform.volatile,
+                         expected=len(self))
+        weakref.finalize(self, writer.close)
+        return writer
 
     def __len__(self) -> int:
         return len(self._parent)
@@ -427,7 +493,7 @@ class _CachedIterator(grain.DatasetIterator):
                  shard: Shard, transform: Transform | None):
         super().__init__(parent)
         self.parent, self.shard, self.transform = parent, shard, transform
-        self.writer = _Writer(cache, key)
+        self.writer = _Writer(cache, key, volatile=isinstance(transform, _Volatile) and transform.volatile)
         self.ordinal = 0
 
     def __next__(self):
