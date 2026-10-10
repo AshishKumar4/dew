@@ -162,3 +162,22 @@ def test_write_token_only_descriptor_is_refused_before_staging(tmp_path):
     save(descriptor, {"url": "https://fake.invalid", "token_file": str(tmp_path / "write-token"), "sources": []})
     with pytest.raises(ValueError, match="read_token_file"):
         colab_batch.data_inputs({"data_inputs": str(descriptor)})
+
+
+def test_repeated_restore_reuses_verified_files_without_refetching_data(tmp_path, service):
+    cache, _, identity, calls = service
+    cache.restore("decision/mix-v3", identity, tmp_path / "vm")
+    cache.restore("decision/mix-v3", identity, tmp_path / "vm")
+    assert calls.count("decision/mix-v3/nested/rows.jsonl") == 1
+    assert calls.count("decision/mix-v3/manifest.json") == 2
+
+
+def test_duplicate_destination_aliases_are_rejected_before_data_fetch(tmp_path, service):
+    cache, objects, _, calls = service
+    manifest = json.loads(objects["decision/mix-v3/manifest.json"])
+    manifest["files"].append({**manifest["files"][0], "path": "nested//rows.jsonl"})
+    body = json.dumps(manifest).encode()
+    objects["decision/mix-v3/manifest.json"] = body
+    with pytest.raises(ValueError, match="duplicate"):
+        cache.restore("decision/mix-v3", hashlib.sha256(body).hexdigest(), tmp_path / "vm")
+    assert calls == ["decision/mix-v3/manifest.json"]

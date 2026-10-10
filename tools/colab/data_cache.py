@@ -7,6 +7,7 @@ scoped credential only; it never publishes or proxies dataset bytes.
 import hashlib
 import os
 import re
+import shutil
 import tempfile
 import time
 from pathlib import Path
@@ -44,6 +45,8 @@ class DataCache:
     def restore(self, prefix: str, identity: str, target: Path) -> dict:
         if not SHA.fullmatch(identity):
             raise ValueError("invalid manifest identity")
+        if target == Path(target.anchor):
+            raise ValueError("dataset target cannot be a filesystem root")
         prefix = prefix.strip("/")
         with self.get(prefix + "/manifest.json") as response:
             if hashlib.sha256(response.content).hexdigest() != identity:
@@ -51,7 +54,7 @@ class DataCache:
             manifest = response.json()
         if manifest["schema"] != 1:
             raise ValueError("unsupported dataset manifest")
-        names = [record["path"] for record in manifest["files"]]
+        names = [Path(record["path"]).as_posix() for record in manifest["files"]]
         if len(set(names)) != len(names):
             raise ValueError("duplicate dataset destination")
         for record in manifest["files"]:
@@ -62,12 +65,20 @@ class DataCache:
         relative = Path(record["path"])
         if not relative.parts or relative.is_absolute() or ".." in relative.parts:
             raise ValueError("dataset member escapes target")
+        if relative.as_posix() != record["path"]:
+            raise ValueError("dataset member path is not canonical")
         if not SHA.fullmatch(record["sha256"]) or not isinstance(record["bytes"], int) or record["bytes"] < 0:
             raise ValueError("invalid dataset file metadata")
         file = target / relative
         if any(parent.is_symlink() for parent in file.parents):
             raise ValueError("dataset destination uses a symlink")
         file.parent.mkdir(parents=True, exist_ok=True)
+        if file.is_file() and not file.is_symlink() and file.stat().st_size == record["bytes"]:
+            with file.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() == record["sha256"]:
+                    return
+        if shutil.disk_usage(file.parent).free < record["bytes"] + 64 * 1024 * 1024:
+            raise ValueError("insufficient space for atomic dataset restore")
         descriptor, filename = tempfile.mkstemp(prefix="." + file.name, dir=file.parent)
         temporary = Path(filename)
         digest = hashlib.sha256()
