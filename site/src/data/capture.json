@@ -10,6 +10,7 @@
 		"date": "2026-10-09",
 		"wall_seconds": 109.6,
 		"script_sha256": "12530d343929a61cd3f4cd5f20ca88ec084e35bd8dfaadfa5f4229f109257e31",
+		"cell_sha256": "70f3e3b07b9fb8997d5e7ac544927e934fc1d910cb407cd676bbd4ed9dbb0ff6",
 		"steps": 1000,
 		"device": "NVIDIA A100-SXM4-40GB",
 		"description": "Tiny Shakespeare from winglian/tiny-shakespeare, the first 1% of its tokens held out, freshly initialized weights, real recorded training",

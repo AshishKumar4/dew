@@ -96,14 +96,22 @@ except OSError:
 else:
     raise AssertionError("a training context reached the network")
 # The prepared cache is an overlay of the context's own (gateway_manager.py); training() checks
-# from outside that this write stayed in it, and the overlay holds no more than 64 MiB.
+# from outside that this write stayed in it. The overlay holds no more than 64 MiB: files of
+# 20 MiB, under the 32 MiB a file may be (guest_limits.py), fill it until a write finds no space.
+import errno
 Path("/opt/train/escape").write_text("x")
+written = 0
 try:
-    Path("/opt/train/escape").write_bytes(bytes(65 * 1024 * 1024))
-except OSError:
-    pass
+    for k in range(5):
+        Path(f"/opt/train/fill{k}").write_bytes(bytes(20 * 1024 * 1024))
+        written += 20
+except OSError as error:
+    assert error.errno == errno.ENOSPC, f"filling the overlay failed otherwise than for space: {error}"
 else:
-    raise AssertionError("a training context wrote more than its overlay holds")
+    raise AssertionError("a training context wrote 100 MiB into its 64 MiB overlay")
+assert 40 <= written <= 64, f"the overlay took {written} MiB"
+for k in range(5):
+    Path(f"/opt/train/fill{k}").unlink(missing_ok=True)
 for path in ("/opt/live/escape", "/work/../escape"):
     try:
         Path(path).write_text("x")
