@@ -160,6 +160,7 @@ class Source:
     files: ClassVar[tuple[str, ...]] = ()
     licence: ClassVar[str] = ""
     licence_url: ClassVar[str] = ""
+    label_column: ClassVar[str] = "label"
 
     def examples(self) -> list[Example]:
         """The seeded, capped training candidates, with room for the held-out split."""
@@ -191,6 +192,10 @@ class Source:
         schema = pq.ParquetFile(_download(self.repo, self.revision, self.files[0])).schema_arrow
         feature = json.loads(schema.metadata[b"huggingface"])["info"]["features"][column]
         return list((feature.get("feature") or feature)["names"])
+
+    @cached_property
+    def classes(self) -> list[str]:
+        return self.labels(self.label_column)
 
     def split(self) -> tuple[list[Example], list[Example]]:
         """The training examples and the held-out ones."""
@@ -762,6 +767,75 @@ class WinoGrande(Source):
         question = Choice("Which option correctly fills the blank?\n" + row["sentence"],
                           {"A": row["option1"], "B": row["option2"]})
         return Example({}, {"q1": question}, {"q1": "AB"[int(row["answer"]) - 1]})
+
+
+@dataclass(frozen=True)
+class Fever(Framed):
+    """FEVER gold evidence (copenlu/fever_gold_evidence, CC-BY-SA-3.0 AND GPL-3.0-only)."""
+
+    weight: float = 1.0
+    revision: str = "a6b8d891d393e97a4efac791afffb2d7de5e57c6"
+    repo: ClassVar[str] = "copenlu/fever_gold_evidence"
+    files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
+    licence: ClassVar[str] = "CC-BY-SA-3.0 AND GPL-3.0-only"
+
+    def convert(self, row: dict) -> Example:
+        evidence = "\n".join(f"{item[0]}: {item[2]}" for item in row["evidence"])
+        options = ["SUPPORTS", "REFUTES", "NOT ENOUGH INFO"]
+        return self.example(f"Claim: {row['claim']}\nEvidence: {evidence}",
+                            "Does the evidence support or refute the claim?", options, options.index(row["label"]))
+
+
+@dataclass(frozen=True)
+class Snli(Framed):
+    """SNLI training pairs (stanfordnlp/snli, CC-BY-SA-4.0), excluding unlabelled pairs."""
+
+    weight: float = 1.0
+    revision: str = "cdb5c3d5eed6ead6e5a341c8e56e669bb666725b"
+    repo: ClassVar[str] = "stanfordnlp/snli"
+    files: ClassVar[tuple[str, ...]] = ("plain_text/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-SA-4.0"
+
+    def convert(self, row: dict) -> Example | None:
+        if row["label"] == -1:
+            return None
+        return self.example(f"Premise: {row['premise']}\nHypothesis: {row['hypothesis']}",
+                            "How does the hypothesis relate to the premise?",
+                            ["entailment", "neutral", "contradiction"], row["label"])
+
+
+@dataclass(frozen=True)
+class MultiNli(Framed):
+    """MultiNLI (nyu-mll/multi_nli, OANC, CC-BY-3.0, CC-BY-SA-3.0, MIT and public-domain text)."""
+
+    weight: float = 1.0
+    revision: str = "da70db2af9d09693783c3320c4249840212ee221"
+    repo: ClassVar[str] = "nyu-mll/multi_nli"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "LicenseRef-OANC AND CC-BY-3.0 AND CC-BY-SA-3.0 AND MIT AND LicenseRef-Public-Domain"
+
+    def convert(self, row: dict) -> Example | None:
+        if row["label"] == -1:
+            return None
+        return self.example(f"Premise: {row['premise']}\nHypothesis: {row['hypothesis']}",
+                            "How does the hypothesis relate to the premise?",
+                            ["entailment", "neutral", "contradiction"], row["label"])
+
+
+@dataclass(frozen=True)
+class Paws(Source):
+    """PAWS labeled_final (google-research-datasets/paws, Google's free-use grant), gold paraphrases."""
+
+    weight: float = 1.0
+    revision: str = "161ece9501cf0a11f3e48bd356eaa82de46d6a09"
+    repo: ClassVar[str] = "google-research-datasets/paws"
+    files: ClassVar[tuple[str, ...]] = ("labeled_final/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "LicenseRef-Google-PAWS"
+
+    def convert(self, row: dict) -> Example:
+        state = {key: row[key] for key in ("sentence1", "sentence2")}
+        return Example(state, {"paraphrase": Noul("Do these sentences express the same meaning?")},
+                       {"paraphrase": "true" if row["label"] == 1 else "false"})
 
 
 @dataclass(frozen=True)
