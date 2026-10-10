@@ -2006,10 +2006,6 @@ class CausalTransformer(nn.Module):
         if position is not None:
             return (f'LongRoPE crossing position {position} requires separate admission so each '
                     'request keeps its own table and rebuild history')
-        if self.num_nextn_predict_layers:
-            return "it runs prediction depths"
-        if self.dspark is not None:
-            return "its block drafter keeps a cache of its own, which a mixed step does not run"
         if self.position_embedding == "learned" or self.engram is not None or self.hash_layers:
             return "a learned position embedding, n-gram or hash routing reads beyond the token"
         default = self.mixer if self.mixer is not None else AttentionMixer()
