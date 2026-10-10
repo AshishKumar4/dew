@@ -207,7 +207,9 @@ def held(run: Path, mixture: Path) -> dict:
 
     Log loss is natural-log cross entropy per labelled question, against
     either a one-hot answer or its soft target. Accuracy uses the target's
-    most likely option. Unlabelled questions are not scored. The macro means
+    most likely option. Unlabelled questions are not scored. A question whose
+    gold option the model gives no probability at all scores an infinite
+    loss, which stays in the mean, and `infinite` counts them. The macro means
     give each source with scored questions equal weight, whatever its size;
     a source without any reports null scores and is left out of that mean.
     """
@@ -233,6 +235,7 @@ def held(run: Path, mixture: Path) -> dict:
                 correct.append(int(np.argmax(found)) == label)
         scores[source] = {"rows": len(examples), "questions": len(losses),
                           "log_loss": float(np.mean(losses)) if losses else None,
+                          "infinite": int(np.sum(np.isinf(losses))),
                           "accuracy": float(np.mean(correct)) if correct else None}
     scored = [value for value in scores.values() if value["questions"]]
     macro = {metric: float(np.mean([value[metric] for value in scored])) if scored else None

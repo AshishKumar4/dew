@@ -151,7 +151,7 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     assert scored["sources"]["rows"]["rows"] == made["rows"]["rows"]["held"]
     assert scored["sources"]["hard"]["rows"] == 2
     for source, metrics in scored["sources"].items():
-        assert set(metrics) == {"rows", "questions", "log_loss", "accuracy"}
+        assert set(metrics) == {"rows", "questions", "log_loss", "infinite", "accuracy"}
         expected = []
         for line in (mixture / f"{source}.held.jsonl").read_text().splitlines():
             example = Example.of(json.loads(line))
@@ -159,7 +159,8 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
             target = example.distribution("team")
             expected.append(-sum(t * math.log(p) for t, p in zip(target, probabilities, strict=True)))
         assert metrics["log_loss"] == pytest.approx(sum(expected) / len(expected))
-        assert math.isfinite(metrics["log_loss"]) and 0 <= metrics["accuracy"] <= 1
+        assert math.isfinite(metrics["log_loss"]) and metrics["infinite"] == 0
+        assert 0 <= metrics["accuracy"] <= 1
     for metric in ("log_loss", "accuracy"):
         assert scored["macro"][metric] == pytest.approx(
             sum(value[metric] for value in scored["sources"].values()) / 2)

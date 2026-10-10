@@ -51,6 +51,8 @@ def test_sources_hold_out_a_seeded_two_percent_with_bounds(sources, monkeypatch,
         assert written == [sources.row(row) for row in held]
     monkeypatch.setattr(sources.Rows, "examples", lambda self: [Example("x", {"q": question})] * 110_000)
     assert len(sources.Rows().split()[1]) == 2000
+    monkeypatch.setattr(sources.Rows, "examples", lambda self: [Example("x", {"q": question})] * 30)
+    assert [len(part) for part in sources.Rows().split()] == [15, 15]
     assert len(sources.Rows(held=0, limit=3).split()[0]) == 3
     assert sources.Rows(held=0).split()[1] == []
     monkeypatch.setattr(sources.TypedDecisions, "examples", lambda self: examples(sources.Intents()))

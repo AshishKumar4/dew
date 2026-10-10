@@ -95,8 +95,9 @@ class Source:
 
     `limit` caps the training examples, drawn with `seed`, and `held` holds that
     many back for validation and calibration. With no count, hold out 2% of
-    the examples (rounded down), at least 50 and at most 2,000, or all the
-    examples of a smaller set. An explicit zero keeps every example in train.
+    the examples (rounded down), at least 50 and at most 2,000, and never
+    more than half of them, so a small set still trains. An explicit zero
+    keeps every example in train.
     """
 
     weight: float = 0.0
@@ -114,7 +115,8 @@ class Source:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        count = min(2000, max(50, len(examples) // 50)) if self.held is None else self.held
+        count = self.held if self.held is not None else min(2000, max(50, len(examples) // 50),
+                                                             len(examples) // 2)
         held, train = examples[:count], examples[count:]
         return (train if self.limit is None else train[:self.limit]), held
 
