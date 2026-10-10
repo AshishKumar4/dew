@@ -1194,19 +1194,21 @@ class Trainer(Generic[Loss, Effects]):
             refusals: list[RuntimeError] = []
             consulted, record_path, key = False, None, {}
             while True:
-                body = (self.step(self.objective, self.optimizer) if self.step is not None else
-                        Transaction(self.objective, self.optimizer, self.accumulation, shapes,
-                                    copies).step())
+                if self.step is None:
+                    body = Transaction(self.objective, self.optimizer, self.accumulation, shapes,
+                                       copies).step()
+                else:
+                    custom = self.step(self.objective, self.optimizer)
+
+                    def body(current, batch, custom=custom):
+                        advanced, loss, aux = custom(current, batch)
+                        return advanced, loss, aux, None
 
                 def step(current, batch, body=body):
                     # The body sees every field on the device; the out shardings
                     # return the host-resident ones to pinned host memory.
-                    if self.step is None:
-                        advanced, loss, aux, committed = body(self._fetched(current, shardings),
-                                                              model_batch(batch))
-                    else:
-                        advanced, loss, aux = body(self._fetched(current, shardings), model_batch(batch))
-                        committed = None
+                    advanced, loss, aux, committed = body(self._fetched(current, shardings),
+                                                          model_batch(batch))
                     return (dataclasses.replace(advanced, step=current.step + 1), loss,
                             {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
                             advanced.microstep > current.microstep, committed)
