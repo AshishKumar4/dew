@@ -7,7 +7,9 @@
 // (`If-None-Match: *` writes a key only if it is absent) and answers 412
 // where the condition fails; every answer about an object carries its ETag.
 // How long an object lives is its bucket's lifecycle, which provision.sh sets.
-const MAX_BYTES = 256 * 1024 * 1024;
+// The largest request body Cloudflare's edge hands a Worker on this account's
+// plan (100 MB); a larger PUT would fail there before the Worker answers.
+const MAX_BYTES = 100 * 1000 * 1000;
 const KEY = /^[A-Za-z0-9._-]+(\/[A-Za-z0-9._-]+)*$/;
 
 async function authorized(request, token) {
@@ -31,7 +33,15 @@ export default {
     if (key.length > 512 || !KEY.test(key) || key.split('/').includes('..')) return new Response(null, { status: 400 });
     if (request.method === 'GET') {
       const ranged = request.headers.has('range');
-      const object = await env.CACHE.get(key, ranged ? { range: request.headers } : {});
+      let object;
+      try {
+        object = await env.CACHE.get(key, ranged ? { range: request.headers } : {});
+      } catch {
+        // R2 throws on a range the object cannot satisfy, as one past its end.
+        const head = await env.CACHE.head(key);
+        return head === null ? new Response(null, { status: 404 })
+          : new Response(null, { status: 416, headers: { 'content-range': `bytes */${head.size}` } });
+      }
       if (object === null) return new Response(null, { status: 404 });
       if (!ranged || object.range === undefined) {
         return new Response(object.body, { headers: { 'content-length': String(object.size), etag: object.httpEtag } });
