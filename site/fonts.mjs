@@ -23,16 +23,10 @@ function latinFace(pkg, file) {
 const sans = ['ui-sans-serif', 'system-ui', 'sans-serif'];
 const mono = ['ui-monospace', 'monospace'];
 
-// Geist, Inter (with its optical sizes, so headlines get the Display cut) and
-// Hanken Grotesk are the candidates the preview compares; html[data-font]
-// switches between them (src/styles/theme.css). Geist Mono pairs with Geist,
-// JetBrains Mono with the others.
+// Geist for text and titles, Geist Mono for code.
 export const fonts = [
 	['Geist Variable', '--font-geist', '@fontsource-variable/geist', 'wght.css', sans],
 	['Geist Mono Variable', '--font-geist-mono', '@fontsource-variable/geist-mono', 'wght.css', mono],
-	['Inter Variable', '--font-inter', '@fontsource-variable/inter', 'opsz.css', sans],
-	['Hanken Grotesk Variable', '--font-hanken', '@fontsource-variable/hanken-grotesk', 'wght.css', sans],
-	['JetBrains Mono Variable', '--font-mono', '@fontsource-variable/jetbrains-mono', 'wght.css', mono],
 ].map(([name, cssVariable, pkg, file, fallbacks]) => ({
 	provider: fontProviders.local(),
 	name,
