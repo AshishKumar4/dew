@@ -18,6 +18,7 @@ from dew.data import Dataset
 from dew.objectives import Aux, Objective
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.training import Trainer, WandbTracker
+from dew.training.optim import Cosine
 from dew.training.trainer import _Interval
 
 
@@ -148,6 +149,26 @@ def test_wandb_counts_each_new_step_shape_once(monkeypatch):
     assert [row['train/compiles'] for row in rows] == [1, 2, 2, 2]
     assert rows[1]['train/compile_s'] > 0
     assert sum(row.get('reporting/type') == 'StepCompiled' for row in run.history) == 2
+
+
+@pytest.mark.parametrize('every', [1, 2])
+def test_configured_cosine_rate_is_the_last_applied_update(every, monkeypatch):
+    import wandb
+    from test_publish import TrackedRun
+
+    run = TrackedRun()
+    monkeypatch.setattr(wandb, 'init', lambda **_: run)
+    schedule = Cosine(peak=.1, init=.01, end=.005, warmup_steps=1, every=every)
+    with WandbTracker('dew', 'scheduled', offline=True) as sink:
+        trainer = Trainer(Squared(), OptimConfig(schedule=schedule), key=0, tracker=sink, accumulation=2)
+        trainer.fit(targets([1.] * 16), steps=16, log_every=1)
+    oracle = optax.warmup_cosine_decay_schedule(
+        init_value=.01, peak_value=.1, warmup_steps=1, decay_steps=8 // every, end_value=.005)
+    rows = [row for row in run.history if 'train/loss' in row]
+    assert len(rows) == 16
+    for row in rows:
+        update = max(row['train/step'] // 2 - 1, 0)
+        assert row['train/learning_rate'] == pytest.approx(float(oracle(update // every)))
 
 
 def test_cache_listener_is_registered_once_across_trainers():
