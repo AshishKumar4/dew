@@ -36,7 +36,7 @@ class Keep(grain.MapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class Formatting(grain.MapTransform):
-    def map(self, element: object) -> Batch:
+    def map(self, element: Batch) -> Batch:
         fields = record(element, "dataset row")
         held: Batch = {}
         for name, value in fields.items():

@@ -29,6 +29,16 @@ type HostStep = Callable[[Batch], Batch] | pygrain.MapTransform
 
 
 @runtime_checkable
+class Rejecting(Protocol):
+    rejects: bool
+
+
+@runtime_checkable
+class Volatile(Protocol):
+    volatile: bool
+
+
+@runtime_checkable
 class Expansion(Protocol):
     def flat_map(self, element: Batch) -> Sequence[Batch | Rejected]: ...
 
@@ -171,7 +181,8 @@ class Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
 
     def map(self, *steps: RecordStep, identity: str | None = None, rejects: bool = False) -> Pipeline:
-        return self.then(*(Map(step, identity, rejects or bool(getattr(step, "rejects", False))) for step in steps))
+        return self.then(*(Map(step, identity, rejects or isinstance(step, Rejecting) and step.rejects)
+                           for step in steps))
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         return self.then(*(RandomMap(step, identity) for step in steps))
