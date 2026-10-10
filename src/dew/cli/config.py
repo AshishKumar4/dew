@@ -94,7 +94,7 @@ def save(cfg: TpuConfig, path: Path | None = None) -> Path:
     """Write the config and return where it landed."""
     path = path or config_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(dumps(cfg))
+    write_atomically(path, dumps(cfg))
     return path
 
 

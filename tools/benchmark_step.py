@@ -56,12 +56,13 @@ import jax
 import numpy as np
 import tyro
 
+from dew.files import write_atomically
 from dew.registry import models
 from dew.telemetry.instrumentation import model_flops_utilization
 from dew.telemetry.profile import capture_options
 from dew.training.distributed import DevicePrefetchIterator
-from dew.training.runtime import prepare_process
 from dew.training.memory import recompute_record
+from dew.training.runtime import prepare_process
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import (
@@ -546,13 +547,8 @@ def run(config: BenchmarkConfig) -> list[Row]:
             # A GPU sweep is minutes of compilation per case; rewriting the
             # file as each case lands means an interrupted sweep still keeps
             # the cases it did measure.
-            write_json(rows, config.json_out)
+            write_atomically(config.json_out, json.dumps(rows, indent=2))
     return rows
-
-
-def write_json(rows: list[Row], path: str) -> None:
-    with open(path, "w") as handle:
-        json.dump(rows, handle, indent=2)
 
 
 def main(config: BenchmarkConfig) -> list[Row]:
