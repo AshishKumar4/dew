@@ -2,7 +2,9 @@
 
 import csv
 import dataclasses
+import hashlib
 import importlib.util
+import io
 import json
 import sqlite3
 import sys
@@ -82,6 +84,25 @@ def test_esci_rows_reproduce_the_kits_request(sources, label):
                      "C": "Complement: a product that complements the requested product.",
                      "I": "Irrelevant: the product does not address the requested product need."}}
     assert example.answers == {"answer": label}
+
+
+def test_esci_small_cap_skips_batches_with_no_selected_pairs(sources, monkeypatch, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    examples_path, products_path = tmp_path / "examples.parquet", tmp_path / "products.parquet"
+    pq.write_table(pa.Table.from_pylist([
+        {"product_id": str(index), "product_locale": "us", "split": "train", "small_version": 1,
+         "query": f"query {index}", "esci_label": "E"} for index in range(8200)]), examples_path)
+    pq.write_table(pa.Table.from_pylist([
+        {"product_id": "8199", "product_locale": "us", "product_title": "Last product"}]), products_path)
+    monkeypatch.setattr(sources, "_github", lambda repo, rev, path, **kwargs:
+                        examples_path if path.endswith("examples.parquet") else products_path)
+    monkeypatch.setattr(sources, "_draw", lambda count, limit, held, seed: {8199})
+    examples = sources.Esci(limit=1, held=0).examples()
+    assert len(examples) == 1
+    assert examples[0].state == {"search_query": "query 8199", "product": {"title": "Last product"}}
+    assert examples[0].answers == {"answer": "E"}
 
 
 def test_isarcasm_reads_csv_and_uses_the_binary_target(sources, monkeypatch, tmp_path):
@@ -203,10 +224,23 @@ def test_written_weights_use_post_split_post_decontamination_counts_and_licences
         "name": "CC-BY-4.0", "url": "https://archive.ics.uci.edu/dataset/228/sms+spam+collection",
         "revision": "cae486f927c250fe1d4a5b55f11357964ed1646c"}
     assert json.loads((tmp_path / "mixture.json").read_text()) == made
+    assert default.phishing_email.weight == 0
+    assert "phishing_email" not in dict(default.sources())
+    assert made["licences"]["phishing_email"] == {
+        "name": "LGPL-3.0-only",
+        "url": ("https://huggingface.co/datasets/zefang-liu/phishing-email-dataset/blob/"
+                "34085a032c123ca237f314a01a67909cdea35e34/README.md"),
+        "revision": "34085a032c123ca237f314a01a67909cdea35e34"}
+    enabled = dataclasses.replace(default, phishing_email=sources.PhishingEmail(weight=1))
+    assert "phishing_email" in dict(enabled.sources())
     for _, source in default.sources():
         licence = source.licence_record()
         assert licence["name"] and licence["url"].startswith("https://")
-        assert len(licence["revision"]) == 40
+        assert len(licence["revision"]) == (64 if isinstance(source, sources.Fever) else 40)
+    assert made["licences"]["fever"] == {
+        "name": "CC-BY-SA-3.0", "url": "https://fever.ai/dataset/fever.html",
+        "revision": "eba7e8f87076753f8494718b9a857827af7bf73e76c9e4b75420207d26e588b6",
+        "wiki_revision": "4b06d95da6adf7fe02d2796176c670dacccb21348da89cba4c50676ab99665f2"}
 
 
 def test_seeded_rows_are_capped_before_conversion(sources, monkeypatch):
@@ -272,16 +306,103 @@ def test_inference_converters_keep_the_gold_relation(sources, monkeypatch, name)
     assert source.convert({"label": -1}) is None
 
 
-def test_fever_includes_evidence_and_three_gold_labels(sources, monkeypatch):
+def test_fever_includes_evidence_and_binary_gold_labels(sources, monkeypatch):
     monkeypatch.setattr(sources, "_unit", lambda text, salt: 1. if salt == "keys" else 0.)
-    for label in ("SUPPORTS", "REFUTES", "NOT ENOUGH INFO"):
+    for label in ("SUPPORTS", "REFUTES"):
         example = sources.Fever().convert({"claim": "The city is old.", "label": label,
-                                           "evidence": [["City", "0", "Founded in 1200."]]})
+                                           "evidence": [{"page": "City", "text": "Founded in 1200."}]})
         assert example.state == "Claim: The city is old.\nEvidence: City: Founded in 1200."
         assert example.questions["answer"].wire() == {
             "type": "choice", "instructions": "Does the evidence support or refute the claim?",
-            "criteria": {"SUPPORTS": None, "REFUTES": None, "NOT ENOUGH INFO": None}}
+            "criteria": {"SUPPORTS": None, "REFUTES": None}}
         assert example.answers == {"answer": label}
+    assert sources.Fever().convert({"label": "NOT ENOUGH INFO"}) is None
+
+
+def test_original_fever_samples_labelled_claims_and_joins_only_gold_sentences(
+        sources, monkeypatch, tmp_path):
+    claims_path, wiki_path = tmp_path / "train.jsonl", tmp_path / "wiki-pages.zip"
+    claims = [
+        {"id": 1, "label": "SUPPORTS", "claim": "First claim",
+         "evidence": [[[1, 2, "A", 0], [1, 3, "B", 2]], [[4, 5, "A", 0]]]},
+        {"id": 2, "label": "NOT ENOUGH INFO", "claim": "No evidence", "evidence": [[[None] * 4]]},
+        {"id": 3, "label": "REFUTES", "claim": "Second claim", "evidence": [[[5, 6, "B", 1]]]},
+        {"id": 4, "label": "SUPPORTS", "claim": "Third claim", "evidence": [[[7, 8, "Café", 0]]]},
+    ]
+    claims_path.write_text("".join(json.dumps(row) + "\n" for row in claims))
+    pages = [{"id": "A", "lines": "0\tA zero\tignored link\n1\tA unused"},
+             {"id": "B", "lines": "2\tB two\n0\tB unused\n1\tB one\tignored link"},
+             {"id": unicodedata.normalize("NFD", "Café"), "lines": "0\tC zero"},
+             {"id": "Unused", "lines": "0\tDo not retain this page"}]
+    with zipfile.ZipFile(wiki_path, "w") as archive:
+        archive.writestr("license.html", "Not a JSONL member")
+        archive.writestr("__MACOSX/._wiki-001.jsonl", "Not a JSONL member")
+        archive.writestr("wiki-pages/wiki-001.jsonl", "".join(json.dumps(page) + "\n" for page in pages))
+
+    def whole_member(*args, **kwargs):
+        raise AssertionError("Wiki JSONL members must be streamed, not read whole")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", whole_member)
+    monkeypatch.setattr(sources, "_http", lambda url, digest, namespace:
+                        wiki_path if url.endswith(".zip") else claims_path)
+    monkeypatch.setattr(sources, "_unit", lambda text, salt: 1. if salt == "keys" else 0.)
+    source = sources.Fever()
+    assert source.label_counts == {"SUPPORTS": 2, "REFUTES": 1, "NOT ENOUGH INFO": 1}
+    assert source.count() == 3
+    assert source.sentences({"B": {1}}) == {("B", 1): "B one"}
+    full = source.examples()
+    assert len(full) == 3
+    assert full[0].state == "Claim: First claim\nEvidence: A: A zero\nB: B two"
+    assert full[2].state == "Claim: Third claim\nEvidence: Café: C zero"
+    assert [row.answers for row in full] == [
+        {"answer": "SUPPORTS"}, {"answer": "REFUTES"}, {"answer": "SUPPORTS"}]
+    monkeypatch.setattr(sources, "_draw", lambda count, limit, held, seed: {1})
+    sampled = sources.Fever(limit=1, held=0).examples()
+    assert len(sampled) == 1
+    assert sampled[0].state == "Claim: Second claim\nEvidence: B: B one"
+    assert sampled[0].answers == {"answer": "REFUTES"}
+    with pytest.raises(ValueError, match="missing gold evidence"):
+        source.sentences({"B": {9}})
+
+
+def test_fever_rejects_modified_cached_training_and_wiki_files(sources, monkeypatch, tmp_path):
+    import huggingface_hub
+
+    monkeypatch.setattr(huggingface_hub, "cached_assets_path", lambda **kwargs: tmp_path)
+    (tmp_path / "train.jsonl").write_bytes(b"modified training claims")
+    (tmp_path / "wiki-pages.zip").write_bytes(b"modified Wikipedia archive")
+    with pytest.raises(ValueError, match="pinned SHA-256"):
+        list(sources.Fever().claims())
+    with pytest.raises(ValueError, match="pinned SHA-256"):
+        sources.Fever().sentences({"Page": {0}})
+
+
+def test_release_download_verifies_bytes_before_caching(sources, monkeypatch, tmp_path):
+    import urllib.request
+
+    import huggingface_hub
+
+    content = b"a pinned release"
+    monkeypatch.setattr(huggingface_hub, "cached_assets_path", lambda **kwargs: tmp_path)
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: io.BytesIO(content))
+    digest = hashlib.sha256(content).hexdigest()
+    path = sources._http("https://example.com/release.zip", digest, "release")
+    assert path.read_bytes() == content
+    assert not (tmp_path / "release.zip.partial").exists()
+    with pytest.raises(ValueError, match="pinned SHA-256"):
+        sources._http("https://example.com/changed.zip", "0" * 64, "release")
+    assert not (tmp_path / "changed.zip").exists()
+
+
+def test_sparse_parquet_rows_skip_batches_without_selected_indices(sources, monkeypatch, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "rows.parquet"
+    pq.write_table(pa.table({"id": list(range(8200))}), path)
+    monkeypatch.setattr(sources, "_download", lambda *args: str(path))
+    assert list(sources._rows("repo", "revision", "rows.parquet", {8199})) == [{"id": 8199}]
+    assert list(sources._rows("repo", "revision", "rows.parquet", set())) == []
 
 
 @pytest.mark.parametrize(("name", "text_key", "label_key", "question", "answer_key", "yes", "no"), [
@@ -578,7 +699,7 @@ def test_hover_rejects_a_database_with_a_wrong_hash(sources, monkeypatch, tmp_pa
 
 TRAIN_COUNTS = {
     "winogrande": 40398, "go_emotions": 43410, "dbpedia": 560000, "civil_comments": 1804874,
-    "sms_spam": 5574, "paws": 49401, "fever": 228277, "snli": 550152, "mnli": 392702,
+    "sms_spam": 5574, "paws": 49401, "snli": 550152, "mnli": 392702,
     "pubmedqa": 1000, "medmcqa": 182822, "qasc": 8134, "bias_in_bios": 257478,
     "massive_intent": 11514, "helpsteer2": 20324, "hate_speech_scales": 135556,
     "commonsense_qa": 9741, "sci_ents_bank": 4969, "ledgar": 60000, "unfair_tos": 5532,
@@ -618,3 +739,16 @@ def test_hover_pinned_train_claim_count_and_evidence(sources):
     examples = sources.Hover(limit=2, held=0).examples()
     assert len(examples) == 2
     assert all(row.state["evidence"] for row in examples)
+
+
+@pytest.mark.network
+def test_original_fever_pinned_training_and_support_refute_counts(sources):
+    source = sources.Fever(limit=3, held=0)
+    assert source.label_counts == {"SUPPORTS": 80035, "REFUTES": 29775, "NOT ENOUGH INFO": 35639}
+    assert sum(source.label_counts.values()) == 145449
+    assert source.count() == 109810
+    examples = source.examples()
+    assert len(examples) == 3
+    assert all("Evidence:" in (row.state or row.questions["answer"].instructions) for row in examples)
+    assert all(set(row.questions["answer"].options) <= {"SUPPORTS", "REFUTES", "A", "B"}
+               for row in examples)
