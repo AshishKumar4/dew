@@ -122,7 +122,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.decode = decode
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len,)))
         self.ema = EMASpec.constant(ema_decay)
-        self._sample = jax.jit(self._sample_impl, static_argnames=("count",))
+
+    @property
+    def _sample(self):
+        return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
 
     def task_record(self) -> Mapping[str, JSON]:
         """The row length, tokenizer, process, solver and sampling steps."""

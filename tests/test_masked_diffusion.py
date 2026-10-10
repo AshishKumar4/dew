@@ -106,6 +106,34 @@ def loaded(name: str):
     return model, variables
 
 
+def test_compiled_samples_follow_the_substituted_masked_model():
+    class FixedToken(nn.Module):
+        token: int
+        causal = False
+        mask_token_id = None
+
+        @nn.compact
+        def logits(self, tokens, train=False):
+            scale = self.param("scale", nn.initializers.ones, ())
+            return jnp.broadcast_to(jax.nn.one_hot(self.token, 4) * 100 * scale, (*tokens.shape, 4))
+
+        def __call__(self, tokens, train=False):
+            return self.logits(tokens, train=train)
+
+    process = MDLM(mask_id=3)()
+    objective = MaskedDiffusionObjective(FixedToken(0), process, seq_len=4, steps=3, samples=2)
+    variables = objective.init(jax.random.key(0))
+    step = Step(jnp.array(0), jax.random.key(1), None)
+    before = objective.preview(variables, {}, step).tokens
+    compiled = objective._sample
+    objective.substitute([FixedToken(1)])
+    after = objective.preview(variables, {}, step).tokens
+    np.testing.assert_array_equal(before, 0)
+    np.testing.assert_array_equal(after, 1)
+    assert objective._sample is not compiled
+    assert objective._sample is objective._sample
+
+
 def test_unmask_sampler_runs_on_a_loaded_model_end_to_end():
     """Evaluation on llada-tiny unmasks the fully masked rows into vocabulary
     ids: [4, 12] int32 with no mask id left. A sampler returning its input

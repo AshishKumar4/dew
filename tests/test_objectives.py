@@ -120,6 +120,29 @@ def lm_objective(variables=None, **options):
     return LMObjective(model, seq_len=4, variables=variables, **options)
 
 
+def test_compiled_scores_follow_substituted_modules_and_head_tiles():
+    objective = lm_objective(ema_decay=None)
+    variables = objective.init(jax.random.key(0))
+    batch = {"text": jnp.array([[1, 2, 3, 4, 5]], jnp.int32)}
+    step = Step(jnp.array(0), jax.random.key(1), None)
+    before = objective.evaluate(variables, batch, step)
+    compiled = objective._compiled_scores
+    assert objective._compiled_scores is compiled
+    replacement = objective.model.clone(final_logit_softcap=.1)
+    objective.substitute([replacement])
+    after = objective.evaluate(variables, batch, step)
+    fresh = lm_objective(ema_decay=None)
+    fresh.substitute([replacement])
+    expected = fresh.evaluate(variables, batch, step)
+    assert not np.allclose(before.losses, expected.losses)
+    np.testing.assert_array_equal(after.losses, expected.losses)
+    assert objective._compiled_scores is not compiled
+    compiled = objective._compiled_scores
+    objective.head_tile = (2, 8)
+    assert objective._compiled_scores is not compiled
+    assert objective._compiled_scores is objective._compiled_scores
+
+
 def model_constants(objective) -> int:
     """What the model's own initialization compiles in: its static tables
     (the rotary inverse frequencies, built on the host), a few hundred bytes."""

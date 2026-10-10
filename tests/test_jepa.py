@@ -238,6 +238,25 @@ def test_the_predictor_predicts_each_target_by_its_position(mask, rng, factorize
 
 # --- the objective ---------------------------------------------------------
 
+def test_compiled_embeddings_follow_the_substituted_encoder(mask):
+    objective = make_objective(mask)
+    variables = objective.init(jax.random.key(0))
+    batch = {"image": images(batch=2), "label": jnp.array([0, 1])}
+    step = step_with(variables)
+    before = objective.evaluate(variables, batch, step).features
+    compiled = objective._embed
+    replacement = objective.encoder.clone(norm_epsilon=1.)
+    objective.substitute([replacement, objective.predictor])
+    after = objective.evaluate(variables, batch, step).features
+    fresh = make_objective(mask)
+    fresh.substitute([replacement, objective.predictor])
+    expected = fresh.evaluate(variables, batch, step).features
+    assert not np.allclose(before, expected)
+    np.testing.assert_array_equal(after, expected)
+    assert objective._embed is not compiled
+    assert objective._embed is objective._embed
+
+
 def test_fresh_loss_is_non_trivial_and_training_reduces_it(mask, rng):
     objective = make_objective(mask)
     params = objective.init(rng)
