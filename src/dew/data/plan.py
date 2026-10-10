@@ -12,7 +12,7 @@ import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -21,12 +21,12 @@ from dew.records import JSON, json_value, record
 _log = logging.getLogger(__name__)
 
 
-def _canonical(value: object) -> bytes:
+def _canonical(value: JSON | Mapping[str, object]) -> bytes:
     return json.dumps(json_value(value, "data plan"), sort_keys=True,
                       separators=(",", ":"), allow_nan=False).encode()
 
 
-def fingerprint(value: object) -> str:
+def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     """Hash order metadata, including an array's shape and dtype."""
     if isinstance(value, np.ndarray):
         digest = hashlib.sha256(_canonical([value.dtype.str, list(value.shape)]))
@@ -52,9 +52,7 @@ class StepIdentity:
         module = kind.__module__
         name = f"{module}.{kind.__qualname__}"
         frozen = dataclasses.is_dataclass(step) and not isinstance(step, type)
-        declared = identity or getattr(step, "identity", None)
-        if declared is not None and not isinstance(declared, str):
-            declared = None
+        declared = identity or (step.identity if isinstance(step, _DeclaredIdentity) else None)
         unstable = "<lambda>" in name or "<locals>" in name
         exact = bool(declared) or frozen or not unstable
         external = not module.startswith("dew.")
@@ -65,6 +63,11 @@ class StepIdentity:
         module_hash = (hashlib.sha256(Path(path).read_bytes()).hexdigest()
                        if external and path is not None and Path(path).is_file() else None)
         return cls(name, repr(step) if frozen else declared or name, exact, module_hash, declared)
+
+
+@runtime_checkable
+class _DeclaredIdentity(Protocol):
+    identity: str
 
 
 @dataclasses.dataclass(frozen=True)

@@ -36,7 +36,7 @@ class CorpusCounts:
                 **{f"data/rejected/{self.name}/{reason}": float(count)
                    for reason, count in self.rejected.items()}}
 
-    def state(self) -> dict[str, object]:
+    def state(self) -> Mapping[str, object]:
         return {"attempted": self.attempted, "accepted": self.accepted,
                 "truncated": self.truncated, "chunks": self.chunks,
                 "rejected": dict(self.rejected)}

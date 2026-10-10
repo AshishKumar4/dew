@@ -25,6 +25,7 @@ from dew.data.dataset import (
     validation_pass,
 )
 from dew.data.text import HFTokenizer, Tokenizer
+from dew.data.pipeline import ObjectiveData, Rejected
 from dew.decision.calibration import Temperatures
 from dew.decision.data import DecisionTable, Example, Weighted
 from dew.decision.head import DecisionHead, Head
@@ -55,6 +56,7 @@ from dew.objectives.base import (
     part,
 )
 from dew.registry import import_path
+from dew.records import integer, record
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -270,6 +272,75 @@ def _laid_rows(examples: Iterable[Example | Mapping[str, object]], *,
     return [(example, (name,)) for example in held for name in example.labels()]
 
 
+@dataclass(frozen=True)
+class FittedRow:
+    example: Example
+    names: tuple[str, ...]
+    length: int
+    truncated: bool
+
+
+@dataclass(frozen=True)
+class Fit(pygrain.MapTransform):
+    layout: Layout
+    tokenizer: Tokenizer
+    specials: Specials
+    rejects = True
+
+    def map(self, element: Batch) -> Batch | Rejected:
+        example = Example.of(element.get("example", element))
+        labels = example.labels()
+        if not labels:
+            return Rejected("unlabelled")
+        asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
+        try:
+            laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked)
+        except ValueError as error:
+            if self.layout.joint and "schema needs" in str(error):
+                return Rejected("unfit")
+            raise
+        fitted = tuple(FittedRow(example, tuple(question.name for question in row.questions),
+                                 len(row.tokens), row.state_kept < row.state_tokens) for row in laid)
+        return {"decision": fitted[0]} if self.layout.joint else {"decision_rows": fitted}
+
+
+@dataclass(frozen=True)
+class QuestionRows:
+    def flat_map(self, element: Batch) -> Sequence[Batch]:
+        return tuple({"decision": row} for row in element["decision_rows"])
+
+
+def _fitted(element: Batch) -> FittedRow:
+    fitted = element["decision"]
+    if not isinstance(fitted, FittedRow):
+        raise ValueError("decision encoding needs the fitted decision row")
+    return fitted
+
+
+@dataclass(frozen=True)
+class LayoutRows(pygrain.RandomMapTransform):
+    encoding: Encoding
+
+    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
+        fitted = _fitted(element)
+        return self.encoding(fitted.example, fitted.names, rng)
+
+
+@dataclass(frozen=True)
+class EvaluateRows(pygrain.MapTransform):
+    encoding: Encoding
+
+    def map(self, element: Batch) -> Batch:
+        fitted = _fitted(element)
+        return self.encoding(fitted.example, fitted.names, None)
+
+
+@dataclass(frozen=True)
+class StoredLength:
+    def __call__(self, element: Batch) -> int:
+        return _fitted(element).length if "decision" in element else int(np.sum(element["valid"]))
+
+
 class DecisionObjective(Objective[Ratio]):
     """Trains a decision model on questions with known answers.
 
@@ -431,6 +502,26 @@ class DecisionObjective(Objective[Ratio]):
     @functools.cached_property
     def _logits(self):
         return jax.jit(lambda variables, inputs: self.model.logits(variables, inputs))
+
+    def data(self, tokenizer: Tokenizer | None = None,
+             metadata: Mapping[str, object] | None = None) -> ObjectiveData:
+        """Fit rows before mixing, augment training layouts, and cut training batches."""
+        if metadata is None or "slots" not in metadata:
+            raise ValueError("decision data needs source metadata slots (questions and options)")
+        slots = record(metadata["slots"], "decision slots")
+        width = integer(slots.get("options"), "slots.options") + int(self.none_of_the_above > 0)
+        questions = integer(slots.get("questions"), "slots.questions") if self.layout.joint else 1
+        if min(width, questions) < 1:
+            raise ValueError("decision source slot maxima must be positive")
+        vocabulary = self.tokenizer if tokenizer is None else tokenizer
+        encoding = Encoding(self.layout, vocabulary, self.specials, width, questions,
+                            self.shuffle_options, self.none_of_the_above)
+        fit = Fit(self.layout, vocabulary, self.specials)
+        expand = () if self.layout.joint else (QuestionRows(),)
+        return ObjectiveData(train=(fit, *expand, LayoutRows(encoding)),
+                             evaluate=(fit, *expand, EvaluateRows(encoding)),
+                             group=None if self.bucket is None else LengthGroups(StoredLength()),
+                             train_batch=() if self.bucket is None else (_Cut(self.bucket, self.layout.max_len),))
 
     def dataset(self, examples: Labelled | DecisionTable | Mapping[str, Weighted], *, batch: int,
                 validation: Labelled | None = None, seed: int = 0, loading: Loading | None = None) -> Dataset:
