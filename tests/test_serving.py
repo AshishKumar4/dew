@@ -634,10 +634,13 @@ def test_a_paged_kernel_reads_one_key_of_each_idle_row(monkeypatch, request, dec
     assert reads and all(np.sum(counts > 1) <= 1 for counts in reads), reads
 
 
-def test_a_server_runs_a_model_with_prediction_depths_without_them():
+@pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
+                         ids=["dense", "paged"])
+def test_a_server_runs_a_model_with_prediction_depths_without_them(options):
     """The server only samples, so it allocates and seeds no prediction
-    depth: a paged server takes a model that declares them, its slots hold
-    no prediction cache, and every row is the lone task call's."""
+    depth: a model that declares them admits in the one mixed forward, over
+    a dense or a paged cache, its slots hold no prediction cache, and every
+    row is the lone task call's."""
     from dew.sampling.strategies import Beam, Speculative
     from dew.sampling.text import drafts
 
@@ -647,7 +650,8 @@ def test_a_server_runs_a_model_with_prediction_depths_without_them():
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    server, tickets = served_alongside(bound, kv_cache=KVCache(page_size=16, pages=12))
+    server, tickets = served_alongside(bound, **options)
+    assert server.mixed_refusal is None
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
     held = jax.tree_util.tree_flatten_with_path(server.cache)[0]
