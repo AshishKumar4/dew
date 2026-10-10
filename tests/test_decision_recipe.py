@@ -206,3 +206,27 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     answers = decide("charged twice", {"team": team, "urgent": Noul("Is it urgent?")})
     assert answers["team"].choice in team.options and 0 <= answers["urgent"].noul <= 1
     assert math.isfinite(-sum(math.log(value) for value in answers["team"].probabilities))
+
+
+
+def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
+    """--loop-steps sets the passes of Ouro's tiny looped decoder, leaving its
+    weights as they were; --loop-layers gives the tiny Qwen 3.5, which does not
+    loop, a loop over a block of its own layers; a block with no passes, or
+    passes with no block, on a decoder that does not loop is refused."""
+    from dew.decision.config import looping
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+
+    ouro = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "ouro-tiny", dtype="float32")
+    once = looping(ouro, 1, None)
+    assert once.model.loop == Loop(1, exit_gate=True) and ouro.model.loop == Loop(3, exit_gate=True)
+    assert once.variables is ouro.variables
+    qwen = Pretrained.load(QWEN, dtype="float32")
+    retrofit = looping(qwen, 2, (1, 2))
+    assert retrofit.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2))
+    assert qwen.model.language_model.loop is None
+    assert retrofit.variables is qwen.variables
+    for steps, layers in ((2, None), (None, (1, 2))):
+        with pytest.raises(ValueError, match="has no loop"):
+            looping(qwen, steps, layers)
