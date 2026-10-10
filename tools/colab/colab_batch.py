@@ -253,8 +253,14 @@ def data_inputs(fields: dict) -> dict:
         destination = Path(source["target"])
         if not destination.is_absolute() or ".." in destination.parts:
             raise ValueError("cached dataset requires an absolute VM target")
-        result["data_sources"].append({"endpoint": descriptor["url"], "target": str(destination),
-                                      "prefix": source["prefix"], "manifest_sha256": source["manifest_sha256"]})
+        result["data_sources"].append(
+            {
+                "endpoint": descriptor["url"],
+                "target": str(destination),
+                "prefix": source["prefix"],
+                "manifest_sha256": source["manifest_sha256"],
+            }
+        )
     return result
 
 
@@ -275,6 +281,7 @@ def stage(plan: dict, work: Path, repo: Path = REPO, *, netrc_file: Path | None 
     stage_sources(plan, work, repo)
     stage_inputs(plan, work)
     from tools.colab.credentials import stage_wandb
+
     stage_wandb(plan, work, netrc_file if netrc_file is not None else Path.home() / ".netrc")
     with tarfile.open(work / "runner.tar.gz", "w:gz") as archive:
         for file in HERE.glob("*.py"):

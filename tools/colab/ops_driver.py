@@ -78,8 +78,12 @@ class Driver:
                     raise
         for file in sorted(work.iterdir()):
             if file.suffix == ".part" or file.name in ("runner.tar.gz", "plan.json"):
-                self.upload(plan["device"], file, remote + "/" + file.name,
-                            private=file.name in plan.get("private_parts", []))
+                self.upload(
+                    plan["device"],
+                    file,
+                    remote + "/" + file.name,
+                    private=file.name in plan.get("private_parts", []),
+                )
 
     def start(self, session: Session, plan: dict, remote: str) -> None:
         ready = threading.Event()

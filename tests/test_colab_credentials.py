@@ -1,4 +1,5 @@
 """Launch credentials cross the fake CLI through private files, never receipts."""
+
 import hashlib
 import json
 import sys
@@ -22,9 +23,11 @@ def test_wandb_key_never_appears_in_logs_results_or_manifests(tmp_path, capsys, 
     credentials.stage_wandb(plan, work, netrc_file)
     save(work / "plan.json", plan)
     fake_cli = tmp_path / "colab"
-    fake_cli.write_text(f"#!{sys.executable}\nimport pathlib,sys,shutil\n"
-                        "payload=pathlib.Path(sys.argv[4]).read_bytes();print(payload.decode())\n"
-                        + ("sys.exit(1)\n" if failed else "shutil.copyfile(sys.argv[4],sys.argv[5])\n"))
+    fake_cli.write_text(
+        f"#!{sys.executable}\nimport pathlib,sys,shutil\n"
+        "payload=pathlib.Path(sys.argv[4]).read_bytes();print(payload.decode())\n"
+        + ("sys.exit(1)\n" if failed else "shutil.copyfile(sys.argv[4],sys.argv[5])\n")
+    )
     fake_cli.chmod(0o700)
     driver = Driver(tmp_path / "attempt", None, str(fake_cli))
     upload = plan["uploads"]["/content/.dew-wandb.key"]
@@ -52,7 +55,7 @@ def test_wandb_key_never_appears_in_logs_results_or_manifests(tmp_path, capsys, 
 def test_missing_netrc_entry_fails_without_partial_secret_file(tmp_path):
     netrc_file = tmp_path / "netrc"
     netrc_file.write_text("machine unrelated login user password irrelevant\n")
-    with pytest.raises(ValueError, match="api.wandb.ai"):
+    with pytest.raises(ValueError, match=r"api\.wandb\.ai"):
         credentials.stage_wandb({"uploads": {}}, tmp_path, netrc_file)
     assert not (tmp_path / "private-wandb.part").exists()
 

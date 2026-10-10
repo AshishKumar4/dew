@@ -233,9 +233,11 @@ class Batch:
         for target, source in self.plan["uploads"].items():
             join_parts(self.root, source["parts"], Path(target).expanduser(), source["sha256"])
         from tools.colab.credentials import environment as private_environment
+
         os.environ.update(private_environment(self.plan))
         if self.plan.get("data_sources"):
             from tools.colab.data_cache import DataCache
+
             for source in self.plan["data_sources"]:
                 cache = DataCache(source["endpoint"], Path("/content/.dew-data.token"))
                 cache.restore(source["prefix"], source["manifest_sha256"], Path(source["target"]))
