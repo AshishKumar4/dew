@@ -48,6 +48,7 @@ from dew.nn.inputs import ModelKwarg
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
+    from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.dit import TextContext
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
@@ -55,8 +56,8 @@ if TYPE_CHECKING:
 
 __all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "DecoderTraining", "DenoisingModel",
            "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
-           "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RequiresText", "Serving",
-           "TimeScaled", "TokenModel", "TritonGemm"]
+           "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
+           "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
 
 
 @struct.dataclass
@@ -146,9 +147,26 @@ class CacheCapacity(Protocol):
 class Looping(Protocol):
     """A model whose layer stack can run a block of it several times over its own output,
     and the same model at `steps` passes of its block (None keeps its count), or of the block
-    `layers`, [first, end), which gives a model with no loop one; None where they cannot."""
+    `layers`, [first, end), which gives a model with no loop one; None where they cannot.
+    `backprop_steps` trains through the final passes and `remat` checkpoints each pass;
+    None keeps an existing loop's value, or a fresh loop's default."""
 
-    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None: ...
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
+                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None: ...
+
+
+@runtime_checkable
+class RematChoosing(Protocol):
+    """A decoder whose layers start at a chosen `RematPolicy`, or None for no remat.
+
+    CausalTransformer and the multimodal and DiffusionGemma models that wrap
+    it answer this capability. Image diffusion models choose a `RematChoice`
+    instead of named decoder residuals, so they do not. A policy outside
+    `DECODER_REMAT` is valid, but `Recomputing.recompute_more` cannot climb
+    from it.
+    """
+
+    def with_remat(self, policy: RematPolicy | None) -> Self: ...
 
 
 @runtime_checkable
