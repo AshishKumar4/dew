@@ -1447,15 +1447,14 @@ class Trainer(Generic[Loss, Effects]):
                 if not compiled and self.rollout is None and inputs is not None:
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     agreed("training input declaration", functools.partial(inputs.check, batch))
-                first_compile = not compiled
-                began = time.perf_counter()
+                known, began = len(compiled), time.perf_counter()
                 train_step, measured_flops = self._compiled_for(compiled, state, batch)
-                if first_compile:
+                if not known:
                     # Rebound once the step is compiled, so the first tick
                     # measures steps, not the compile.
                     interval.last_log_time = time.time()
                     interval.waited = 0.0
-                else:
+                elif len(compiled) > known:
                     # A shape met later compiles inside the interval, which
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
