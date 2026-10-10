@@ -40,9 +40,8 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import normal_kernel
 from dew.nn.inputs import AttentionMetadata
-from dew.nn.linear import DepthwiseConv1d
+from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.mixers.mamba2 import held_scan
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
 
@@ -179,6 +178,8 @@ class Mamba(nn.Module):
             # Allocation only: init_cache's dummy token must not consume a
             # position or leave state behind.
             return self.out_proj(jnp.zeros((batch, length, self.intermediate_size), self.dtype))
+        if valid is not None:
+            out = jnp.where(valid[:, :, None], out, 0)
         gated = out * nn.silu(gate.astype(wide))
         return self.out_proj(gated.astype(gate.dtype))
 
