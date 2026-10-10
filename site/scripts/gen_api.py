@@ -298,24 +298,7 @@ def kind_label(obj: griffe.Object) -> str:
     return "attribute"
 
 
-def registrations() -> dict[str, list[tuple[str, str]]]:
-    """Names registered with `@<registry>("name")`, read from the source."""
-    found: dict[str, list[tuple[str, str]]] = {}
-    for path in sorted((REPO / "src/dew").rglob("*.py")):
-        tree = ast.parse(path.read_text())
-        module = ".".join(path.relative_to(REPO / "src").with_suffix("").parts).removesuffix(".__init__")
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.ClassDef, ast.FunctionDef)):
-                continue
-            for decorator in node.decorator_list:
-                if (isinstance(decorator, ast.Call) and isinstance(decorator.func, ast.Name)
-                        and decorator.args and isinstance(decorator.args[0], ast.Constant)
-                        and isinstance(decorator.args[0].value, str)):
-                    found.setdefault(decorator.func.id, []).append((decorator.args[0].value, f"{module}.{node.name}"))
-    return found
-
-
-def render_object(entry: Entry, linker: Linker, context: str, registered: dict[str, list[tuple[str, str]]]) -> str:
+def render_object(entry: Entry, linker: Linker, context: str) -> str:
     obj = entry.obj
     own = linker.by_path.get(entry.canonical, "")
     lines = [f"## {entry.name}", ""]
@@ -333,15 +316,6 @@ def render_object(entry: Entry, linker: Linker, context: str, registered: dict[s
         lines += ["```python", f"{entry.name}{annotation}{value}", "```", ""]
     if obj.docstring:
         lines += [prose(obj.docstring.value, linker, context, own), ""]
-    if obj.is_attribute and str(obj.annotation or "").startswith("Registry"):
-        members = registered.get(entry.name.split(".")[-1], [])
-        if members:
-            lines += ["| Registered name | Object |", "|---|---|"]
-            for name, path in sorted(members):
-                url = linker.by_path.get(path)
-                target = f"[`{path.rsplit('.', 1)[-1]}`]({url})" if url else f"`{path}`"
-                lines.append(f"| `{name}` | {target} |")
-            lines.append("")
     if obj.is_class:
         documented_fields = [attribute for attribute in fields(obj) if attribute.docstring]
         properties = [member for name, member in obj.members.items()
@@ -730,7 +704,6 @@ def main() -> None:
         print(f"gen_api: {len(PAGES)} pages cover the public API")
         return
 
-    registered = registrations()
     CONTENT.mkdir(parents=True, exist_ok=True)
     for path in PAGES:
         page = pages[path]
@@ -749,7 +722,7 @@ def main() -> None:
             body += ["| Name | Summary |", "|---|---|", *rows, ""]
         for entry in page.entries:
             if home[entry.canonical] == path:
-                body.append(render_object(entry, linker, path, registered))
+                body.append(render_object(entry, linker, path))
         frontmatter = {
             "title": path,
             "description": summary,
@@ -781,10 +754,6 @@ def main() -> None:
                for label, modules in GROUPS]
     (GENERATED / "api.json").write_text(json.dumps(sidebar, indent=1) + "\n")
     (GENERATED / "api-index.json").write_text(json.dumps(linker.by_path, indent=1, sort_keys=True) + "\n")
-    # What each registry holds, for pages that count or list registered components.
-    (GENERATED / "registries.json").write_text(json.dumps(
-        {name: [{"name": key, "object": path} for key, path in sorted(entries)] for name, entries in sorted(registered.items())},
-        indent=1) + "\n")
     count = sum(1 for path in PAGES for entry in pages[path].entries if home[entry.canonical] == path)
     print(f"gen_api: {len(PAGES)} pages, {count} objects documented")
 
