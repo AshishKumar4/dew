@@ -1625,6 +1625,21 @@ at most 0.54, while vLLM's median token gap is shorter: by 0.3-0.7 ms
 against either cache at 32 slots and the dense one at 128, and by 4.2 ms
 against the paged cache at 128.
 
+Most of that 4.2 ms was idle rows, 2026-10-10. A freed row keeps its last
+request's slot count on the device until the next request is admitted, and the
+paged kernel read every key under it: tracing 150 steady-state steps of the
+128-slot open loop at 32 requests a second (c40), the paged kernel took 758 ms
+against cuDNN's 295 over the dense cache, with 40 to 50 of the 128 rows
+decoding. A row whose query is padding now reads one key, as the dense path's
+count does. On a Colab A100 40GB, base and head alternating for two rounds (c42):
+
+| 128 slots, Qwen3-0.6B | paged, before | paged, now | dense |
+|---|---:|---:|---:|
+| open loop at 32 req/s: gap p50 / p99 (ms) | 8.04-7.98 / 13.38-13.56 | 5.14-5.18 / 8.99-10.09 | 4.17-4.20 / 9.11-10.08 |
+| closed loop, tokens a second | 12374, 12368 | 12704, 12710 | |
+
+The paged kernel's own step is what remains: 5.1 against 4.1 ms a decode-only step.
+
 ### The remaining gap, 2026-10-03
 
 At 64 slots Dew serves 7146 and 7197 tokens a second (medians of five runs,
