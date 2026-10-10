@@ -701,6 +701,76 @@ def test_muonclip_moves_a_real_step():
     assert largest_update_difference(params, muon_params) > 1e-6
 
 
+@pytest.mark.parametrize("kind", ["grpo", "grpo-kl", "dpo", "ppo"])
+def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
+    from flax import linen as nn
+
+    from dew.objectives.base import Step, part
+    from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective
+    from dew.training import Trainer
+    from dew.training.transaction import compact_qk
+
+    class Critic(nn.Module):
+        @nn.compact
+        def __call__(self, tokens, **packing):
+            return nn.Embed(32, 1)(tokens)[..., 0]
+
+    model = tiny_decoder(num_layers=1)
+    if kind == "dpo":
+        objective = DPOObjective(model, 5, qk_stats=True)
+    elif kind == "ppo":
+        objective = PPOObjective(model, 5, critic=Critic(), qk_stats=True, beta=.01)
+    else:
+        objective = GRPOObjective(model, 5, qk_stats=True, beta=.01 if kind == "grpo-kl" else 0.)
+    rows = jax.device_count()
+    ids = jnp.asarray(np.random.default_rng(7).integers(0, 32, (rows, 6)), jnp.int32)
+    if kind == "dpo":
+        paired = jnp.stack((ids, (ids + 3) % 32), axis=1)
+        batch = {"input_ids": paired, "completion_mask": jnp.ones_like(paired)}
+        scoring_ids = jnp.concatenate((paired[:, 0], paired[:, 1]))
+        packing = {}
+    else:
+        mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
+        batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
+                 "text_positions": jnp.broadcast_to(jnp.arange(6), ids.shape),
+                 "response_mask": mask, "advantages": mask,
+                 "behavior_log_probs": jnp.full(ids.shape, -3.),
+                 "old_values": jnp.zeros_like(mask), "returns": mask}
+        scoring_ids = ids
+        packing = {"segment_ids": batch["text_segment_ids"][:, :-1],
+                   "positions": batch["text_positions"][:, :-1]}
+    threshold = .01
+    optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
+                            optimizer_opts={"qk_clip_threshold": threshold}).build(1)
+    trainer = Trainer(objective, optimizer, key=jax.random.key(0))
+    initial = trainer.initial_state()
+    variables = initial.variables
+    policy = part(variables, "policy") if kind == "ppo" else variables
+    _, sown = model.apply(policy, scoring_ids[:, :-1], method="hidden_states", mutable=["qk"], **packing)
+    expected = compact_qk(sown["qk"])
+    peaks = expected["layers_0"]["self_attn"]["max_logits"][0]
+    assert np.max(peaks) > threshold
+    # The reference must not determine the clip, even when its logits are much larger.
+    reference = None if initial.averaged is None else jax.tree.map(lambda leaf: leaf * 3, initial.averaged)
+    _, aux = objective.loss(variables, batch, Step(jnp.array(0), jax.random.key(1), reference))
+    observed = aux.qk_stats["policy"] if kind == "ppo" and aux.qk_stats is not None else aux.qk_stats
+    assert observed is not None
+    for got, want in zip(jax.tree.leaves(compact_qk(observed)), jax.tree.leaves(expected), strict=True):
+        np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-6)
+    start = jax.tree.map(np.asarray, policy["params"])
+    compiled = trainer.compile(initial, batch)
+    final, *_ = compiled(initial, batch)
+    assert int(final.updates) == 1
+    after = part(final.variables, "policy") if kind == "ppo" else final.variables
+    shrunk = []
+    for name in ("q_proj", "k_proj"):
+        before = start["layers_0"]["self_attn"][name]["kernel"]
+        updated = np.asarray(after["params"]["layers_0"]["self_attn"][name]["kernel"])
+        assert np.linalg.norm(updated) < np.linalg.norm(before)
+        shrunk.append(not np.array_equal(before, updated))
+    assert all(shrunk)
+
+
 def test_a_parameter_no_group_claims_is_refused():
     from dew.training.optim import ParamGroup
     config = OptimConfig(optimizer="adamw", param_groups=(ParamGroup("norms", ("*/scale",)),))

@@ -227,6 +227,30 @@ def test_a_validation_pass_scores_with_the_teacher_the_trainer_substituted():
     assert after == scored(built)
 
 
+@pytest.mark.parametrize("missing", [False, True])
+def test_init_keeps_held_projections_and_draws_only_missing_ones(missing):
+    objective, held = fixture_objective(fixture())
+    projections = dict(held["params"][PROJECTIONS])
+    assert len(projections) >= 2
+    first, second = tuple(projections)[:2]
+    projections[first] = jnp.full_like(projections[first], 7.)
+    if missing:
+        projections.pop(second)
+    held = {**held, "params": {**held["params"], PROJECTIONS: projections}}
+    key = jax.random.key(91)
+    actual = objective.init(key, held)
+    for name, value in projections.items():
+        np.testing.assert_array_equal(actual["params"][PROJECTIONS][name], value)
+    if missing:
+        fresh = objective.init(key)
+        np.testing.assert_array_equal(actual["params"][PROJECTIONS][second],
+                                      fresh["params"][PROJECTIONS][second])
+        assert second not in held["params"][PROJECTIONS]
+    for name in ("teacher",):
+        for got, want in zip(jax.tree.leaves(actual[name]), jax.tree.leaves(held[name]), strict=True):
+            np.testing.assert_array_equal(got, want)
+
+
 def test_a_layer_the_model_does_not_have_is_named_at_init():
     student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None)
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
