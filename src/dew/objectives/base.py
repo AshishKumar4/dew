@@ -676,7 +676,11 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the statistics a validation pass sums for `batch`: `loss`'s, unless the
         objective scores held-out rows another way, as a model with a training mode does
         in its evaluation mode (`Supervised(mode=...)`). What it writes is discarded."""
+        self._check_validation_loss()
         return self.loss(variables, batch, step)
+
+    def _check_validation_loss(self) -> None:
+        """Refuse a validation loss this objective cannot define, before fit places its state."""
 
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
