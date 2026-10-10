@@ -1,4 +1,6 @@
-"""Generate the API reference from Dew's source with griffe.
+"""Generate the API reference from Dew's source with griffe, or another package's: sparx's site runs
+this file, at the Dew commit sparx pins, with `--config` naming its own package, pages and paths
+(`Package`).
 
 griffe reads `src/dew` statically, so the build imports neither JAX nor Dew.
 Every object is documented in full on one page, its home: the page whose
@@ -12,7 +14,7 @@ it list it with a link. The build fails when
   through a dotted name (`dew.pipeline`, `TextToImage.from_run`) that the
   module or class it starts from does not have,
 
-so a new public module has to be placed in GROUPS below before it ships.
+so a new public module has to be placed in DEW_GROUPS below before it ships.
 """
 
 from __future__ import annotations
@@ -28,13 +30,7 @@ from pathlib import Path
 
 import griffe
 
-REPO = Path(__file__).resolve().parents[2]
-SITE = REPO / "site"
-CONTENT = SITE / "src/content/docs/api"
-GENERATED = SITE / "src/generated"
-SOURCE = "https://github.com/AshishKumar4/dew/blob/main/"
-
-GROUPS: list[tuple[str, list[str]]] = [
+DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew"]),
     ("Training", ["dew.training", "dew.training.state", "dew.training.optim", "dew.training.quantization",
                   "dew.training.runtime", "dew.training.distributed", "dew.training.posthoc"]),
@@ -67,13 +63,47 @@ GROUPS: list[tuple[str, list[str]]] = [
     ("Configuration", ["dew.config", "dew.config.sweep"]),
     ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.telemetry.profile"]),
 ]
-PAGES = [module for _, modules in GROUPS for module in modules]
-
 # Places that show users Dew code; every Dew name they use must resolve to the
 # documented API. A landing snippet file shows only its marked regions.
-USAGE = ["docs/**/*.md", "README.md", "CONTRIBUTING.md", "examples/*.py", "recipes/**/*.py",
+DEW_USAGE = ["docs/**/*.md", "README.md", "CONTRIBUTING.md", "examples/*.py", "recipes/**/*.py",
          "tutorials/*.ipynb", "site/snippets/*.py", "site/src/data/*.py"]
-USAGE_SKIP = ("docs/research/", "docs/design/")
+DEW_USAGE_SKIP = ("docs/research/", "docs/design/")
+
+
+
+
+@dataclass(frozen=True)
+class Package:
+    """What the reference documents and where it goes. Paths are relative to `repo`."""
+
+    package: str
+    repo: Path
+    source: str  # the source's blob URL, ending in /
+    groups: list[tuple[str, list[str]]]
+    content: str = "site/src/content/docs/api"  # the module pages
+    slug: str = "api"  # their URL prefix
+    overview: str = "site/src/content/docs/api.md"  # the page the module list ends; written if absent
+    overview_title: str = "API reference"
+    generated: str = "site/src/generated"  # the sidebar and the name index
+    usage: list[str] = field(default_factory=list)  # files whose imports must resolve
+    usage_skip: tuple[str, ...] = ()
+
+    @property
+    def pages(self) -> list[str]:
+        return [module for _, modules in self.groups for module in modules]
+
+    @classmethod
+    def read(cls, path: Path) -> Package:
+        """A package from a JSON file of these fields, `repo` relative to the file."""
+        fields = json.loads(path.read_text())
+        repo = (path.parent / fields.pop("repo", ".")).resolve()
+        groups = [(label, list(modules)) for label, modules in fields.pop("groups")]
+        return cls(repo=repo, groups=groups, usage_skip=tuple(fields.pop("usage_skip", ())), **fields)
+
+
+DEW = Package("dew", Path(__file__).resolve().parents[2], "https://github.com/AshishKumar4/dew/blob/main/",
+              DEW_GROUPS, usage=DEW_USAGE, usage_skip=DEW_USAGE_SKIP)
+P = DEW
 
 
 class Unresolved(Exception):
@@ -108,7 +138,7 @@ class Slugger:
 
 
 def page_slug(module: str) -> str:
-    return f"api/{module}"
+    return f"{P.slug}/{module}"
 
 
 @dataclass
@@ -281,7 +311,7 @@ def first_sentence(obj: griffe.Object) -> str:
 def source_link(obj: griffe.Object) -> str:
     relative = obj.relative_package_filepath if hasattr(obj, "relative_package_filepath") else None
     path = Path("src") / (relative or obj.relative_filepath)
-    return f"{SOURCE}{path.as_posix()}#L{obj.lineno}"
+    return f"{P.source}{path.as_posix()}#L{obj.lineno}"
 
 
 def kind_label(obj: griffe.Object) -> str:
@@ -339,7 +369,7 @@ def render_object(entry: Entry, linker: Linker, context: str) -> str:
 
 def usage_imports() -> Iterator[tuple[str, str, str]]:
     """(file, module, name) for every `from dew... import name` users are shown."""
-    pattern = re.compile(r"from\s+(dew(?:\.\w+)*)\s+import\s+(\([^)]*\)|[^\n#]+)")
+    pattern = re.compile(rf"from\s+({P.package}(?:\.\w+)*)\s+import\s+(\([^)]*\)|[^\n#]+)")
     for relative, path in usage_files():
         if path.suffix == ".ipynb":
             text = "\n".join(code for code, _ in usage_code(relative, path))
@@ -359,10 +389,10 @@ def usage_imports() -> Iterator[tuple[str, str, str]]:
 
 
 def usage_files() -> Iterator[tuple[str, Path]]:
-    for glob in USAGE:
-        for path in sorted(REPO.glob(glob)):
-            relative = path.relative_to(REPO).as_posix()
-            if not relative.startswith(USAGE_SKIP):
+    for glob in P.usage:
+        for path in sorted(P.repo.glob(glob)):
+            relative = path.relative_to(P.repo).as_posix()
+            if not relative.startswith(P.usage_skip):
                 yield relative, path
 
 
@@ -422,16 +452,16 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                if alias.name == "dew" or alias.name.startswith("dew."):
-                    name = alias.asname or "dew"
-                    target = alias.name if alias.asname else "dew"
+                if alias.name == P.package or alias.name.startswith(P.package + "."):
+                    name = alias.asname or P.package
+                    target = alias.name if alias.asname else P.package
                     try:
-                        bound[name] = package if target == "dew" else package[target.removeprefix("dew.")]
+                        bound[name] = module_at(package, target)
                     except KeyError:
                         continue
-        elif isinstance(node, ast.ImportFrom) and node.module and (node.module + ".").startswith("dew."):
+        elif isinstance(node, ast.ImportFrom) and node.module and (node.module + ".").startswith(P.package + "."):
             try:
-                module = package if node.module == "dew" else package[node.module.removeprefix("dew.")]
+                module = module_at(package, node.module)
                 for alias in node.names:
                     member = module.members.get(alias.name)
                     if member is not None:
@@ -571,11 +601,11 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
 
 
 def load() -> griffe.Module:
-    """Load `dew` with its namespace subpackages, which griffe's finder skips."""
-    root = REPO / "src"
+    """Load the package with its namespace subpackages, which griffe's finder skips."""
+    root = P.repo / "src"
     loader = griffe.GriffeLoader(search_paths=[str(root)])
-    package = loader.load("dew")
-    for directory in sorted((root / "dew").rglob("*")):
+    package = loader.load(P.package)
+    for directory in sorted((root / P.package).rglob("*")):
         if not directory.is_dir() or (directory / "__init__.py").exists() or not any(directory.glob("*.py")):
             continue
         parts = directory.relative_to(root).parts
@@ -595,10 +625,15 @@ def load() -> griffe.Module:
     return package
 
 
+def module_at(package: griffe.Module, path: str) -> griffe.Object | griffe.Alias:
+    """The member at dotted `path`, which starts with the package's own name."""
+    return package if path == P.package else package[path.removeprefix(P.package + ".")]
+
+
 def module_of(package: griffe.Module, path: str) -> griffe.Module:
-    obj = package if path == "dew" else package[path.removeprefix("dew.")]
+    obj = module_at(package, path)
     if not obj.is_module:
-        raise SystemExit(f"GROUPS lists {path}, which is not a module")
+        raise SystemExit(f"the groups list {path}, which is not a module")
     return obj
 
 
@@ -606,11 +641,11 @@ def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]
     """Each page, and each documented object's home: the page with the longest
     module prefix of its path, else the first page that exports it."""
     pages = {path: Page(module_of(package, path), list(public_entries(module_of(package, path))))
-             for path in PAGES}
+             for path in P.pages}
     home: dict[str, str] = {}
-    for path in PAGES:
+    for path in P.pages:
         for entry in pages[path].entries:
-            prefixes = [page for page in PAGES if entry.canonical.startswith(page + ".")
+            prefixes = [page for page in P.pages if entry.canonical.startswith(page + ".")
                         and any(e.canonical == entry.canonical for e in pages[page].entries)]
             home.setdefault(entry.canonical, max(prefixes, key=len) if prefixes else path)
     return pages, home
@@ -632,7 +667,7 @@ def undocumented(package: griffe.Module, pages: dict[str, Page], home: dict[str,
         if module.exports is None:
             continue
         if module.path not in pages:
-            problems.append(f"{module.path} declares __all__ but has no API page; add it to GROUPS")
+            problems.append(f"{module.path} declares __all__ but has no API page; add it to the groups")
         for entry in public_entries(module):
             if entry.canonical not in home:
                 problems.append(f"{module.path}.__all__ exports {entry.name} ({entry.canonical}), which no API page documents")
@@ -642,7 +677,7 @@ def undocumented(package: griffe.Module, pages: dict[str, Page], home: dict[str,
 def linked(pages: dict[str, Page], home: dict[str, str]) -> Linker:
     """Every documented name's URL: its page and the anchor of its heading there."""
     linker = Linker()
-    for path in PAGES:
+    for path in P.pages:
         linker.add(path, f"/{page_slug(path)}/")
         # The headings render_object writes, in page order, so the anchors match
         # even when two names differ only in case, like `Sample` and `sample`.
@@ -662,9 +697,14 @@ def linked(pages: dict[str, Page], home: dict[str, str]) -> Linker:
 
 
 def main() -> None:
+    global P
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Check public API coverage without writing generated files.")
+    parser.add_argument("--config", type=Path, help="A JSON file of another package's `Package` fields.")
     args = parser.parse_args()
+    if args.config:
+        P = Package.read(args.config)
+    content, generated = P.repo / P.content, P.repo / P.generated
     package = load()
     pages, home = documented(package)
 
@@ -675,8 +715,8 @@ def main() -> None:
     problems = undocumented(package, pages, home)
     for file, module_path, name in usage_imports():
         try:
-            module = (module_of(package, module_path) if module_path == "dew"
-                      else package[module_path.removeprefix("dew.")])
+            module = (module_of(package, module_path) if module_path == P.package
+                      else module_at(package, module_path))
             member = module.members.get(name)
             if member is None:
                 problems.append(f"{file}: `from {module_path} import {name}`: {module_path} has no {name}")
@@ -701,11 +741,11 @@ def main() -> None:
         raise SystemExit(1)
 
     if args.check:
-        print(f"gen_api: {len(PAGES)} pages cover the public API")
+        print(f"gen_api: {len(P.pages)} pages cover the public API")
         return
 
-    CONTENT.mkdir(parents=True, exist_ok=True)
-    for path in PAGES:
+    content.mkdir(parents=True, exist_ok=True)
+    for path in P.pages:
         page = pages[path]
         module = page.module
         summary = first_sentence(module) or f"The `{path}` module."
@@ -731,31 +771,33 @@ def main() -> None:
             "tableOfContents": {"minHeadingLevel": 2, "maxHeadingLevel": 2},
         }
         text = "---\n" + json.dumps(frontmatter, indent=1) + "\n---\n\n" + "\n".join(body).rstrip() + "\n"
-        (CONTENT / f"{path}.md").write_text(text)
+        (content / f"{path}.md").write_text(text)
 
-    # The overview page is docs/reference/core-api.md, which sync-docs wrote;
-    # it ends with every module, grouped as in the sidebar.
-    overview = SITE / "src/content/docs/api.md"
+    # The overview page ends with every module, grouped as in the sidebar. Dew's is
+    # docs/reference/core-api.md, which sync-docs writes first; a package without one gets a page of its own.
+    overview = P.repo / P.overview
     if not overview.exists():
-        raise SystemExit("gen_api: run sync-docs first; it writes the overview page the module list extends")
+        if P is DEW:
+            raise SystemExit("gen_api: run sync-docs first; it writes the overview page the module list extends")
+        overview.write_text("---\n" + json.dumps({"title": P.overview_title, "editUrl": False}, indent=1) + "\n---\n")
     index = ["", "## All modules", "",
              "Each module below has a page generated from its docstrings. A name a module re-exports links to "
              "the page of the module that defines it.", ""]
-    for label, modules in GROUPS:
+    for label, modules in P.groups:
         index += [f"### {label}", "", "| Module | Summary |", "|---|---|"]
         index += [f"| [`{module}`](/{page_slug(module)}/) | {escape(first_sentence(pages[module].module))} |"
                   for module in modules]
         index.append("")
     overview.write_text(overview.read_text().rstrip() + "\n" + "\n".join(index).rstrip() + "\n")
 
-    GENERATED.mkdir(parents=True, exist_ok=True)
+    generated.mkdir(parents=True, exist_ok=True)
     sidebar = [{"label": label, "collapsed": True,
                 "items": [{"label": module, "slug": page_slug(module)} for module in modules]}
-               for label, modules in GROUPS]
-    (GENERATED / "api.json").write_text(json.dumps(sidebar, indent=1) + "\n")
-    (GENERATED / "api-index.json").write_text(json.dumps(linker.by_path, indent=1, sort_keys=True) + "\n")
-    count = sum(1 for path in PAGES for entry in pages[path].entries if home[entry.canonical] == path)
-    print(f"gen_api: {len(PAGES)} pages, {count} objects documented")
+               for label, modules in P.groups]
+    (generated / "api.json").write_text(json.dumps(sidebar, indent=1) + "\n")
+    (generated / "api-index.json").write_text(json.dumps(linker.by_path, indent=1, sort_keys=True) + "\n")
+    count = sum(1 for path in P.pages for entry in pages[path].entries if home[entry.canonical] == path)
+    print(f"gen_api: {len(P.pages)} pages, {count} objects documented")
 
 
 def iter_modules(module: griffe.Module) -> Iterator[griffe.Module]:
