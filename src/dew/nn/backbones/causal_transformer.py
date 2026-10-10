@@ -1583,15 +1583,24 @@ class CausalTransformer(nn.Module):
         its block once, the block `steps` times, each pass after the first
         reading the last one's output, normed under `step_norm`, and the layers
         after it once; the passes before the last `backprop_steps` pass no
-        gradient back."""
+        gradient back. `remat` checkpoints each block pass outside decode,
+        leaving its span and the train/decode choices static in the closure;
+        the per-pass collection view stays outside that checkpoint."""
         loop = self.loop
         if loop is None:
             return self.stack(x, **stack)
         first, end = loop.layers or (0, self.num_layers)
         block = None if loop.layers is None else (first, end)
+        train, decode = stack['train'], stack['decode']
+        dynamic = {name: value for name, value in stack.items() if name not in ('train', 'decode')}
+
+        def pass_block(module, x, **inputs):
+            return module.stack(x, span=block, train=train, decode=decode, **inputs)
+
+        run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
         if first:
             x = self.stack(x, span=(0, first), **stack)
-        x = self.stack(x, span=block, **stack)
+        x = run_block(self, x, **dynamic)
         for step in range(1, loop.steps):
             normed = self.norm(x)
             self._gate_exit(normed)
@@ -1599,9 +1608,9 @@ class CausalTransformer(nn.Module):
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
             view = PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
-            run = nn.map_variables(type(self).stack, mapped_collections=WRITTEN, trans_in_fn=view.inside,
+            run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                    trans_out_fn=view.outside, mutable=True)
-            x = run(self, x, span=block, **stack)
+            x = run(self, x, **dynamic)
         if end < self.num_layers:
             x = self.stack(x, span=(end, self.num_layers), **stack)
         return x
@@ -1957,9 +1966,12 @@ class CausalTransformer(nn.Module):
         return self.clone(max_seq_len=capacity)
 
     @nn.nowrap
-    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None:
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
+                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None:
         """This model with its loop run `steps` times (None keeps its count), over the
-        block `layers` where given (None keeps its block).
+        block `layers` where given (None keeps its block). `backprop_steps`
+        sets how many final passes train through, and `remat` checkpoints
+        each pass; None keeps the loop's own value for either.
 
         A model with no loop gains one over `layers`, with no norm between its
         passes, so one pass computes the model as it was; None when it has no
@@ -1967,9 +1979,23 @@ class CausalTransformer(nn.Module):
         if self.loop is None:
             if steps is None or layers is None:
                 return None
-            return self.clone(loop=Loop(steps, step_norm=False, layers=layers))
+            return self.clone(loop=Loop(steps, step_norm=False, layers=layers,
+                                        backprop_steps=backprop_steps, remat=remat or False))
         return self.clone(loop=dataclasses.replace(self.loop, steps=steps or self.loop.steps,
-                                                   layers=layers or self.loop.layers))
+                                                   layers=layers or self.loop.layers,
+                                                   backprop_steps=(self.loop.backprop_steps
+                                                                   if backprop_steps is None
+                                                                   else backprop_steps),
+                                                   remat=self.loop.remat if remat is None else remat))
+
+    @nn.nowrap
+    def with_remat(self, policy: RematPolicy | None) -> Self:
+        """Start at `policy`, including policies outside `DECODER_REMAT`.
+
+        `recompute_more` stays at a policy off that ladder, so the trainer
+        cannot climb from it; None keeps every layer's residuals.
+        """
+        return self.clone(remat=policy)
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
