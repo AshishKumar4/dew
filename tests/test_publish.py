@@ -88,7 +88,7 @@ def test_what_a_run_writes_after_training_is_published_with_its_checkpoint(tmp_p
     from test_instrumentation import Regression, batches
 
     from dew.config import RunConfig, TrainerConfig, Wandb
-    from dew.data import Dataset
+    from dew.data import Dataset, Loading
 
     run = TrackedRun()
     wandb.init = lambda **_: run
@@ -99,7 +99,9 @@ def test_what_a_run_writes_after_training_is_published_with_its_checkpoint(tmp_p
     def calibrate(state, directory):
         (Path(directory) / "decide.json").write_text("{}")
 
-    config.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="after",
+    batch = next(batches())
+    rows = [{"x": x, "y": y} for x, y in zip(batch["x"], batch["y"], strict=True)]
+    config.train(Regression(), Dataset.from_records(rows, batch=8, loading=Loading(workers=0)), name="after",
                  after=calibrate)
     ((artifact, _),) = run.logged
     assert sorted(name for _, name in artifact.files) == ["decide.json", RUN_FILE]

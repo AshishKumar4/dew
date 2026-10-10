@@ -487,11 +487,20 @@ def _written_in_place(tree: Mapping[str, object]) -> bool:
 
 
 def placement(tree: Mapping[str, StateLeaf]) -> dict[str, str]:
-    """Return the sharding of each array leaf of `tree` as a string, keyed by path.
+    """Return the placement of each array leaf of `tree` as a string, keyed by path:
+    its sharding and which slice of it each of this process's devices holds.
 
-    A local checkpoint restores onto this placement and no other."""
+    A local checkpoint restores onto this placement and no other. The sharding's
+    text names its mesh's axes and sizes but not the order of its devices, and two
+    meshes over the same devices in another order give each process other slices."""
+    def owned(leaf) -> str:
+        slices = leaf.sharding.addressable_devices_indices_map(leaf.shape)
+        held = sorted((device.id, tuple((index.start, index.stop) for index in indices))
+                      for device, indices in slices.items())
+        return f"{leaf.sharding} holding {held}"
+
     leaves, _ = jax.tree_util.tree_flatten_with_path(tree)
-    return {jax.tree_util.keystr(path): str(leaf.sharding)
+    return {jax.tree_util.keystr(path): owned(leaf)
             for path, leaf in leaves
             if isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) and leaf.sharding is not None}
 
@@ -1661,8 +1670,9 @@ class Checkpoints:
                 _position_leaves(state_tree, restore_args, metadata, from_local=from_local)
             try:
                 # partial_restore: a key the checkpoint holds and the template
-                # does not is skipped instead of refused.
-                restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+                # does not is skipped instead of refused. A template asking for
+                # stored collections alone asks the step for nothing.
+                restored = {} if not state_tree else checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                     item=state_tree, restore_args=restore_args, partial_restore=True))
             except (TypeError, ValueError) as mismatch:
                 if mapping:
