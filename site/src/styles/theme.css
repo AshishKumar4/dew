@@ -2,7 +2,7 @@
 
 :root {
 	/* One family for display and UI, and a mono for code. Weight and optical size
-	   set the hierarchy. The preview compares three families (fonts.mjs). */
+	   set the hierarchy. */
 	--dew-font: var(--font-geist);
 	--dew-font-mono: var(--font-geist-mono);
 	--dew-font-display: var(--dew-font);
@@ -81,27 +81,12 @@
 	--dew-glow: rgba(18, 163, 148, 0.1);
 }
 
-:root[data-font='inter'] {
-	--dew-font: var(--font-inter);
-	--dew-font-mono: var(--font-mono);
-}
-
-:root[data-font='hanken'] {
-	--dew-font: var(--font-hanken);
-	--dew-font-mono: var(--font-mono);
-}
-
 /* Type: one sans family; titles are the same family, heavier and tighter. */
 
 body {
 	-webkit-font-smoothing: antialiased;
 	-moz-osx-font-smoothing: grayscale;
 	text-rendering: optimizeLegibility;
-}
-
-:root[data-font='inter'] body {
-	/* Inter's single-storey a, open digits and round quotes. */
-	font-feature-settings: 'cv11', 'ss01', 'ss03';
 }
 
 h1#_top,

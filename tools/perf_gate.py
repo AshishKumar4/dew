@@ -27,6 +27,7 @@ takes a commit.
 import argparse
 import contextlib
 import json
+import math
 import os
 import statistics
 import subprocess
@@ -205,7 +206,7 @@ def run(args: argparse.Namespace) -> int:
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
     rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)]
-    results = {"base": base, "head": head, "rows": [row.__dict__ for row in rows],
+    results = {"base": base, "head": head, "rounds": args.rounds, "rows": [row.__dict__ for row in rows],
                "samples": {base: [], head: []}}
     for round_ in range(args.rounds):
         order = [(base, base_path), (head, head_path)]
@@ -216,6 +217,12 @@ def run(args: argparse.Namespace) -> int:
     return 0
 
 
+def measured(sample: object) -> bool:
+    """Whether a round's sample of a row is a measurement: a finite positive number. A row a
+    round could not run holds why (`not run: ...`), and a round that wrote no sample holds None."""
+    return isinstance(sample, float) and math.isfinite(sample) and sample > 0
+
+
 def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
     """Whether `row` regressed from the `base` samples to the `head` ones, and the numbers that say so.
 
@@ -223,15 +230,20 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
     least FLOOR) and the two trees' samples do not overlap at all. With three rounds each, the
     samples separate by chance 1 time in 20 when nothing changed (1 / C(6, 3)), and the band
     lowers that further; it is also the smallest change the row can see. A row the base cannot
-    run (a tree older than its tool) is not compared; one the base runs and the head does not is
-    broken; one neither runs leaves the battery incomplete."""
-    base, head = [x for x in base if isinstance(x, float)], [x for x in head if isinstance(x, float)]
-    if not base and not head:
+    run in any round (a tree older than its tool) is not compared; one the base runs and the head
+    runs in no round is broken; one neither runs leaves the battery incomplete. A row either tree
+    measured in some rounds and not in others, or measured as NaN, an infinity or zero, is
+    partial: the rounds that ran would be judged as if they were all, so it is not judged."""
+    if not any(measured(x) for x in base) and not any(measured(x) for x in head):
         return "incomplete", {}
-    if not base:
+    if not any(measured(x) for x in base):
         return "not compared", {}
-    if not head:
+    if not any(measured(x) for x in head):
         return "broken", {}
+    missing = {name: sum(not measured(x) for x in samples)
+               for name, samples in (("base", base), ("head", head)) if not all(map(measured, samples))}
+    if missing:
+        return "partial", {"unmeasured rounds": missing}
     worse = 1.0 if row.unit == "ms" else -1.0
 
     def spread(xs):
@@ -248,18 +260,24 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
 def report(args: argparse.Namespace) -> int:
     results = json.loads(Path(args.results).read_text())
     base, head = results["base"], results["head"]
+    # A round a run never reached counts as unmeasured, so an interrupted run is partial.
+    rounds = results.get("rounds", max(map(len, results["samples"].values())))
+    samples = {name: [*taken, *[{}] * (rounds - len(taken))] for name, taken in results["samples"].items()}
     lines = [f"| row | unit | {base} | {head} | change | band | verdict |",
              "|---|---|---:|---:|---:|---:|---|"]
     failed = []
     for spec in results["rows"]:
         row = Row(**spec)
-        state, numbers = verdict(row, [s.get(row.name) for s in results["samples"][base]],
-                                 [s.get(row.name) for s in results["samples"][head]])
-        if state in ("broken", "incomplete") or (state == "regressed" and row.gated):
+        state, numbers = verdict(row, [s.get(row.name) for s in samples[base]],
+                                 [s.get(row.name) for s in samples[head]])
+        if state in ("broken", "incomplete", "partial") or (state == "regressed" and row.gated):
             failed.append(f"{row.name} ({state})")
         if not row.gated:
             state = f"{state}, not gated"
-        cells = (["-"] * 4 if not numbers else
+        if state.startswith("partial"):
+            state += " (" + ", ".join(f"{tree} {count} of {rounds} rounds unmeasured"
+                                      for tree, count in numbers["unmeasured rounds"].items()) + ")"
+        cells = (["-"] * 4 if "base" not in numbers else
                  [f"{numbers['base']:.2f}", f"{numbers['head']:.2f}", f"{numbers['change']:+.1%}",
                   f"{numbers['band']:.1%}"])
         lines.append(f"| {row.name} | {row.unit} | " + " | ".join(cells) + f" | {state} |")

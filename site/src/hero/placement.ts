@@ -1,4 +1,4 @@
-// Where both heroes draw the word, measured from the page's own layout so the
+// Where the hero draws the word, measured from the page's own layout so the
 // word keeps its balance against the headline at every viewport: the copy sits
 // at the bottom of the hero (src/styles/landing.css), and its height against the
 // viewport's decides how much room is left above it.
