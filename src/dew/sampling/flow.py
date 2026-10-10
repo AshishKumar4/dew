@@ -22,7 +22,7 @@ from flax import struct
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
-from dew.diffusion.schedules import FlowMatchingScheduler, expand
+from dew.diffusion.schedules import RectifiedFlow, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform
 
 from .guidance import Guidance, Walk
@@ -137,12 +137,9 @@ class FlowSDE:
     noise_level: float = 0.7
 
     def validate(self, process: Process) -> None:
-        schedule = process.sampler_schedule
-        if not isinstance(schedule, FlowMatchingScheduler) or not isinstance(
+        if not isinstance(process.sampler_schedule, RectifiedFlow) or not isinstance(
                 process.prediction, FlowMatchPredictionTransform):
             raise ValueError("FlowSDE requires a rectified-flow schedule and velocity prediction")
-        if not math.isfinite(schedule.shift) or schedule.shift <= 0:
-            raise ValueError("a rectified-flow timestep shift must be finite and positive")
 
     def init(self, x: jax.Array, times: jax.Array, process: Process, *,
              key: jax.Array) -> tuple[jax.Array, jax.Array]:

@@ -3,12 +3,12 @@
 from .common import ContinuousNoiseScheduler, GeneralizedNoiseScheduler, NoiseScheduler, expand
 from .cosine import CosineNoiseScheduler, cosine_beta_schedule
 from .discrete import DiscreteNoiseScheduler
-from .flow import FlowMatchingScheduler
+from .flow import FlowMatchingScheduler, RectifiedFlow
 from .karras import EDMNoiseScheduler, KarrasVENoiseScheduler
 from .linear import LinearNoiseScheduler, linear_beta_schedule
 from .sqrt import SqrtContinuousNoiseScheduler
 
 __all__ = ["ContinuousNoiseScheduler", "CosineNoiseScheduler", "DiscreteNoiseScheduler",
            "EDMNoiseScheduler", "FlowMatchingScheduler", "GeneralizedNoiseScheduler",
-           "KarrasVENoiseScheduler", "LinearNoiseScheduler", "NoiseScheduler",
+           "KarrasVENoiseScheduler", "LinearNoiseScheduler", "NoiseScheduler", "RectifiedFlow",
            "SqrtContinuousNoiseScheduler", "cosine_beta_schedule", "expand", "linear_beta_schedule"]

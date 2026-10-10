@@ -520,3 +520,23 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     assert logged["evaluation/records"] == count * 2
     previews = [value for _, value in tracker.artifacts if not isinstance(value, RECORD_TYPES)]
     assert previews[0].images.shape == (min(4, count), 4, 4, 1)
+
+
+def test_flow_sde_takes_any_rectified_flow_schedule():
+    """FlowSDE's step holds on the rectified-flow path, which a published
+    source's flow grid walks as Dew's own schedule does, so either is taken
+    and a VP schedule is refused; a timestep shift that is not finite and
+    positive is refused where the schedule is built."""
+    from dew.diffusion.schedules import CosineNoiseScheduler
+    from dew.diffusion.schedules.source_grids import FlowGrid
+
+    velocity = FlowMatchPredictionTransform()
+    grid = FlowGrid(np.linspace(1.0, 0.0, 9), np.linspace(1000.0, 0.0, 9), 1.0)
+    for schedule in (FlowMatchingScheduler(shift=3.0), grid):
+        FlowSDE().validate(Process(schedule, velocity))
+    with pytest.raises(ValueError, match="rectified-flow schedule"):
+        FlowSDE().validate(Process(CosineNoiseScheduler(1000), velocity))
+    for shift in (0.0, float("inf")):
+        with pytest.raises(ValueError, match="finite and positive"):
+            FlowMatchingScheduler(shift=shift)
+
