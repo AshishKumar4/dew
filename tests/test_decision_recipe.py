@@ -312,7 +312,8 @@ def test_a_decision_run_keeps_its_loop_memory_options_under_lora(tmp_path):
     flags = [*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
              "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
              "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
-             "--max-len", "128", "--no-calibrate", "--loop-steps", "3", "--loop-layers", "1", "2",
+             "--max-len", "1024", "--objective.bucket", "64", "--no-calibrate",
+             "--loop-steps", "3", "--loop-layers", "1", "2",
              "--loop-backprop-steps", "1", "--loop-remat", "--remat", "minimal"]
     config = DecisionRunConfig.cli(flags, default=_module("clef").run_config())
     assert (config.loop_backprop_steps, config.loop_remat, config.remat) == (1, True, "minimal")
