@@ -1,13 +1,16 @@
 """Colab contracts exercised against files, child processes and a fake service."""
 
 import base64
+import contextlib
 import hashlib
 import io
 import json
 import os
+import random
 import subprocess
 import sys
 import tarfile
+import time
 import types
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -22,6 +25,7 @@ from tools.colab import (
     colab_new as allocation,
     colab_sync as sync,
     metadata_capture,
+    ops_driver,
     ops_supervisor,
 )
 from tools.colab.common import lock, read, save
@@ -204,48 +208,31 @@ def test_restore_rejects_undeclared_member_and_symlink_parent(tmp_path):
 
 
 @pytest.mark.parametrize("large", [False, True])
-def test_owned_download_is_atomic_and_consumed_spool_is_reconciled(tmp_path, fake_vm, monkeypatch, large):
+def test_owned_download_is_atomic_without_a_backing_spool(tmp_path, fake_vm, monkeypatch, large):
     remote, calls, session = fake_vm
     body = b"payload" * 30
     write(remote / "content/result.json", body)
     if large:
         monkeypatch.setattr(transfer, "SMALL_LIMIT", 10)
-    target, spool = tmp_path / "target", tmp_path / "spool"
-    transfer.download(session, "/content/result.json", target, (spool,))
+    target = tmp_path / "target"
+    transfer.download(session, "/content/result.json", target)
     assert target.read_bytes() == body
     assert any("/files/" in url for url, _ in calls) == large
     assert all("private" not in url for url, _ in calls)
-    registry = next(spool.glob("*.json"))
-    value = read(registry)
-    value["process_start"] = "dead"
-    save(registry, value)
-    transfer.reconcile_transfers((spool,))
-    assert target.read_bytes() == body
-    target.unlink()
-    transfer.reconcile_transfers((spool,))
-    assert list(spool.iterdir()) == []
+    transfer.reconcile_transfers((tmp_path,))
+    assert target.read_bytes() == body and not target.is_symlink()
+    assert list(tmp_path.glob(".*.part")) == []
 
 
 def test_dead_partial_cleanup_preserves_unowned_files(tmp_path):
-    spool = tmp_path / "spool"
-    partial = write(spool / "transfer-owned.part")
+    partial = write(tmp_path / f".target.colab-{os.getpid()}-0-dead.part")
+    live = write(tmp_path / f".target.colab-{os.getpid()}-{transfer.process_start(os.getpid())}-live.part")
     unrelated = write(tmp_path / "unowned")
-    target = tmp_path / "result"
-    promotion = tmp_path / "result.promote-transfer-owned"
-    promotion.symlink_to(partial)
-    save(
-        partial.with_suffix(".json"),
-        {
-            "file": str(partial),
-            "target": str(target),
-            "promotion": str(promotion),
-            "pid": os.getpid(),
-            "process_start": "different",
-        },
-    )
-    save(spool / "transfer-forged.json", {"file": str(unrelated), "target": str(target)})
-    transfer.reconcile_transfers((spool,))
-    assert not partial.exists() and not promotion.is_symlink() and unrelated.read_bytes() == b"sample"
+    forged = tmp_path / ".target.colab-0-0-forged.part"
+    forged.symlink_to(unrelated)
+    transfer.reconcile_transfers((tmp_path,))
+    assert not partial.exists() and live.exists() and forged.is_symlink()
+    assert unrelated.read_bytes() == b"sample"
 
 
 def test_failed_download_keeps_old_target(tmp_path, fake_vm, monkeypatch):
@@ -262,8 +249,8 @@ def test_failed_download_keeps_old_target(tmp_path, fake_vm, monkeypatch):
 
     monkeypatch.setattr(requests, "get", truncated)
     with pytest.raises(ValueError, match="changed"):
-        transfer.download(session, "/result", target, (tmp_path / "spool",))
-    assert target.read_bytes() == b"old" and list((tmp_path / "spool").iterdir()) == []
+        transfer.download(session, "/result", target)
+    assert target.read_bytes() == b"old" and list(tmp_path.glob(".*.part")) == []
 
 
 def test_exact_branch_ref_is_not_replaced_by_later_base(tmp_path):
@@ -512,7 +499,7 @@ def test_session_budget_uses_provisioning_time_and_no_inferred_estimate():
     assert ops_supervisor.remaining_budget({"rate": 6}, {"requested_at": 100}, 800) == float("inf")
 
 
-def test_finalizer_reports_failed_release_as_provisional_and_retries(tmp_path, fake_colab):
+def test_finalizer_reports_failed_release_as_provisional_and_retries(tmp_path, fake_colab, monkeypatch):
     client, held, _, released, service = fake_colab
     save(tmp_path / "run.json", {"session": "test", "driver_sha": "driver", "rate": 6, "started_at": 0})
     save(tmp_path / "driver.json", {"endpoint": "owned", "progress": {"phase": "done"}})
@@ -526,6 +513,8 @@ def test_finalizer_reports_failed_release_as_provisional_and_retries(tmp_path, f
     result = ops_supervisor.finalize(tmp_path, client, "controller died", 1)
     assert result["cu_provisional"] and result["release"].startswith("failed")
     service.unassign = lambda endpoint: released.append(endpoint)
+    due = result["release_retry_at"] + 1
+    monkeypatch.setattr(time, "time", lambda: due)
     result = ops_supervisor.finalize(tmp_path, client, "retry", 1)
     assert result["release"] == "released" and not result["cu_provisional"] and released == ["owned"]
     assert ops_supervisor.finalize(tmp_path, client) == result and released == ["owned"]
@@ -650,3 +639,343 @@ def test_fake_vm_runs_pinned_jobs_after_one_nonblocking_preamble(tmp_path):
         assert read(home / "collected/out/result.json") == {"step": 3}
     assert worker.progress["profile_preamble"]["broken"]
     assert (tmp_path / "out/_preamble/profile-check/calls").read_text() == "capture\n"
+
+
+def test_emergency_capture_deadline_interrupts_a_slow_service(tmp_path, monkeypatch):
+    def slow(*args, **kwargs):
+        time.sleep(30)
+        raise AssertionError("request should have been interrupted")
+
+    monkeypatch.setattr(requests, "get", slow)
+    began = time.monotonic()
+    receipt = metadata_capture.capture(
+        tmp_path,
+        {"driver_sha": "driver", "jobs": []},
+        allocation.Session("owned", "https://fake.invalid/", "secret"),
+        "/content/batch",
+        seconds=0.1,
+    )
+    assert receipt["timed_out"] and receipt["capture_exit"] != 0
+    assert time.monotonic() - began < 3
+
+
+def test_review_transient_progress_and_collection_failures_preserve_running_batch(
+    tmp_path, fake_vm, monkeypatch
+):
+    remote, _, session = fake_vm
+    status = {
+        "exit": 0,
+        "seconds": 1,
+        "stage_seconds": 1,
+        "artifact_manifest": "outputs.tar.gz.manifest.json",
+    }
+    save(remote / "content/batch/progress.json", {"phase": "done", "jobs": {"1": status}})
+    save(remote / "content/batch/job-1/status.json", status)
+    write(remote / "content/batch/job-1/run.log", b"completed")
+    write(remote / "content/batch/job-1/dew/out/result.json", b'{"step":3}')
+    queue = tmp_path / "queue.md"
+    queue.write_text(
+        "## Pending\n- lane: test job\n  device: gpu\n  ref: ref\n"
+        "  command: run\n  outputs: out/\n\n## Done\n"
+    )
+    monkeypatch.setattr(batch, "QUEUE", queue)
+    monkeypatch.setattr(ops_driver, "STATE", tmp_path / "state")
+    monkeypatch.setattr(batch, "STATE", tmp_path / "state")
+    failures = {"progress": 0, "collection": 0, "kernel": 0}
+    original = requests.get
+
+    def intermittent(url, **kwargs):
+        kind = (
+            "progress"
+            if url.endswith("progress.json")
+            else "collection"
+            if url.endswith("sync.tar.gz")
+            else None
+        )
+        if kind and failures[kind] < 2:
+            failures[kind] += 1
+            raise requests.ConnectionError("temporary connection loss")
+        return original(url, **kwargs)
+
+    class Kernel:
+        def execute_code(self, script, **kwargs):
+            if failures["kernel"] < 1:
+                failures["kernel"] += 1
+                raise RuntimeError("WebSocket channel closed")
+            with contextlib.redirect_stdout(io.StringIO()) as output:
+                exec(script.replace("/content", str(remote / "content")), {})
+            return [{"output_type": "stream", "text": output.getvalue()}]
+
+        def stop(self, **kwargs):
+            return None
+
+    client = types.SimpleNamespace(session=lambda endpoint: session, kernel=lambda *args, **kwargs: Kernel())
+    pauses = []
+    monkeypatch.setattr(requests, "get", intermittent)
+    monkeypatch.setattr(time, "sleep", pauses.append)
+    job = {
+        "index": 1,
+        "lane": "test",
+        "resume_key": "key",
+        "outputs": ["out/"],
+        "artifact_policy": "measurements",
+        "commit": "sha",
+        "entry": batch.entries(batch.sections()[1])[0],
+    }
+    driver = Driver(tmp_path / "run", client, "unused")
+    driver.poll(
+        "owned", "/content/batch", {"base": "base", "device": "gpu", "driver_sha": "driver", "jobs": [job]}
+    )
+    assert failures == {"progress": 2, "collection": 2, "kernel": 1}
+    assert driver.state["results"][0]["observed_exit"] == 0
+    artifact = Path(driver.state["results"][0]["results"]) / "outputs/out/result.json"
+    assert read(artifact) == {"step": 3} and len(pauses) >= 5
+
+
+def fixture_repository(tmp_path, *, large=False):
+    repo, origin = tmp_path / "repo", tmp_path / "origin.git"
+    repo.mkdir()
+    subprocess.run(["git", "init", "--bare", "-q", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"], check=True)
+    if large:
+        write(repo / "history.bin", random.Random(1).randbytes(200000))
+    else:
+        write(repo / "base", b"base")
+    subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "base",
+        ],
+        check=True,
+    )
+    subprocess.run(["git", "-C", str(repo), "remote", "add", "origin", str(origin)], check=True)
+    subprocess.run(["git", "-C", str(repo), "push", "-q", "origin", "HEAD:main"], check=True)
+    sha = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    return repo, origin, sha
+
+
+def request(ref="HEAD", command="run", policy="all"):
+    fields = {
+        "lane": "test",
+        "command": command,
+        "outputs": ["out/"],
+        "ref": ref,
+        "gpu_reason": "test",
+        "expected_cu": "0.1",
+        "decision": "test",
+        "memory_estimate": "1GiB",
+        "artifact_policy": policy,
+    }
+    return {"text": "- lane: test job\n", "fields": fields}
+
+
+def test_review_resume_identity_changes_with_commit_and_command(tmp_path):
+    repo, _, sha = fixture_repository(tmp_path)
+    first = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)["jobs"][0]["resume_key"]
+    other_job = batch.plan_jobs([request(command="other")], "gpu", "gpu:T4", sha, repo)["jobs"][0][
+        "resume_key"
+    ]
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-qm",
+            "new",
+        ],
+        check=True,
+    )
+    moved = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)["jobs"][0]["resume_key"]
+    assert len({first, other_job, moved}) == 3
+
+
+def test_review_measurements_never_restore_old_outputs(tmp_path, monkeypatch):
+    monkeypatch.setattr(batch, "STATE", tmp_path / "state")
+    cache = tmp_path / "state/colab-resume/key"
+    write(cache / "outputs/out/result.json", b"old result")
+    save(cache / "manifest.json", digests({"out/result.json": b"old result"}))
+    staging = tmp_path / "staging"
+    staging.mkdir()
+    job = {
+        "index": 1,
+        "entry": request(policy="measurements"),
+        "resume_key": "key",
+        "artifact_policy": "measurements",
+    }
+    batch.stage_inputs({"uploads": {}, "jobs": [job]}, staging)
+    assert not job.get("resume_parts") and list(staging.iterdir()) == []
+
+
+def test_review_reconciler_preserves_first_failure_and_bounds_release_retries(
+    tmp_path, fake_colab, monkeypatch
+):
+    client, held, _, _, service = fake_colab
+    clock = [1000.0]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    save(tmp_path / "run.json", {"session": "test", "driver_sha": "driver", "rate": 1, "started_at": 0})
+    save(tmp_path / "driver.json", {"endpoint": "owned", "progress": {"phase": "done"}})
+    save(tmp_path / "allocation.json", {"endpoint": "owned", "requested_at": 100, "assigned_at": 110})
+    held.append(types.SimpleNamespace(endpoint="owned"))
+    attempts = []
+
+    def unavailable(endpoint):
+        attempts.append(endpoint)
+        raise requests.ConnectionError("temporary failure")
+
+    service.unassign = unavailable
+    ops_supervisor.finalize(tmp_path, client, "original failure", 17)
+    for _ in range(8):
+        clock[0] += 3600
+        receipt = ops_supervisor.finalize(tmp_path, client, "reconciler", None)
+    assert receipt["reason"] == "original failure" and receipt["driver_exit"] == 17
+    assert len(attempts) <= 4 and "attention" in receipt["release"]
+    assert receipt["cleanup_history"] and receipt["cu_provisional"]
+
+
+def test_review_published_sources_do_not_upload_a_bundle(tmp_path, monkeypatch):
+    repo, _, sha = fixture_repository(tmp_path)
+    monkeypatch.setattr(batch, "STATE", tmp_path / "state")
+    plan = batch.plan_jobs([request(sha)], "gpu", "gpu:T4", sha, repo)
+    batch.stage(plan, tmp_path / "staging", repo)
+    assert not list((tmp_path / "staging").glob("bundle*"))
+    assert plan["fetch_commits"] == [sha]
+
+
+def test_review_unpushed_bundle_contains_only_the_new_range(tmp_path, monkeypatch):
+    repo, _, sha = fixture_repository(tmp_path, large=True)
+    write(repo / "new", b"small delta")
+    subprocess.run(["git", "-C", str(repo), "add", "new"], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "-qm",
+            "unpublished",
+        ],
+        check=True,
+    )
+    monkeypatch.setattr(batch, "STATE", tmp_path / "state")
+    plan = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)
+    batch.stage(plan, tmp_path / "staging", repo)
+    assert sum(file.stat().st_size for file in (tmp_path / "staging").glob("bundle*")) < 10000
+    assert sha in plan["fetch_commits"]
+
+
+def test_review_completed_download_is_a_regular_file(tmp_path, fake_vm):
+    remote, _, session = fake_vm
+    write(remote / "result", b"result")
+    target = tmp_path / "result"
+    transfer.download(session, "/result", target)
+    assert target.read_bytes() == b"result" and not target.is_symlink()
+
+
+def test_review_cuda_selection_respects_the_gpu_sm_floor(tmp_path, monkeypatch):
+    tree, venv, binaries = tmp_path / "tree", tmp_path / "venv", tmp_path / "bin"
+    tree.mkdir()
+    binaries.mkdir()
+    write(tree / "pyproject.toml", b"[project.optional-dependencies]\ncuda12=[]\ncuda13=[]\n")
+    gpu = binaries / "nvidia-smi"
+    gpu.write_text(
+        f"#!{sys.executable}\nimport sys\n"
+        "print('580.1, 7.0' if 'compute_cap' in str(sys.argv) else '580.1')\n"
+    )
+    gpu.chmod(0o700)
+    uv = binaries / "uv"
+    log = tmp_path / "uv.log"
+    uv.write_text(
+        f"#!{sys.executable}\nimport pathlib,sys\n"
+        f"with pathlib.Path({str(log)!r}).open('a') as f:f.write(str(sys.argv)+'\\n')\n"
+        "if sys.argv[1]=='venv':\n p=pathlib.Path(sys.argv[-1])/'bin';p.mkdir(parents=True)\n"
+        " (p/'python').write_text('#!/bin/sh\\nexit 0\\n');(p/'python').chmod(0o700)\n"
+    )
+    uv.chmod(0o700)
+    monkeypatch.setenv("PATH", str(binaries) + ":" + os.environ["PATH"])
+    vm.install(venv, tree, tmp_path / "setup.log")
+    assert "cuda12" in log.read_text() and "cuda13" not in log.read_text()
+
+
+def test_network_outage_is_not_proof_that_the_workload_died(tmp_path, monkeypatch):
+    clock = [1000.0]
+    polls = []
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    def poll():
+        polls.append(1)
+        clock[0] += 360
+        save(tmp_path / "driver.json", {"endpoint": "owned", "heartbeat": clock[0]})
+        return 0 if len(polls) > 2 else None
+
+    def unavailable():
+        raise requests.ConnectionError("control API unavailable")
+
+    reason = ops_supervisor.watch(
+        types.SimpleNamespace(poll=poll),
+        tmp_path,
+        {"started_at": 1000},
+        types.SimpleNamespace(assignments=unavailable),
+    )
+    assert reason is None and read(tmp_path / "watchdog-attention.json")["notify"] == "Main"
+
+
+def test_publish_retained_excludes_stale_files_outside_the_acknowledged_manifest(tmp_path):
+    cache = tmp_path / "cache"
+    write(cache / "outputs/out/old-result.json", b"old")
+    write(cache / "outputs/out/current.log", b"current")
+    save(cache / "manifest.json", digests({"out/current.log": b"current"}))
+    sync.publish_retained(cache, tmp_path / "receipt")
+    assert (tmp_path / "receipt/out/current.log").read_bytes() == b"current"
+    assert not (tmp_path / "receipt/out/old-result.json").exists()
+
+
+@pytest.mark.parametrize("unpublished", [False, True])
+def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, monkeypatch, unpublished):
+    repo, _, sha = fixture_repository(tmp_path)
+    if unpublished:
+        write(repo / "unpublished", b"new")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(repo),
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "unpushed",
+            ],
+            check=True,
+        )
+    monkeypatch.setattr(batch, "STATE", tmp_path / "state")
+    plan = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)
+    staging = tmp_path / "staging"
+    batch.stage(plan, staging, repo)
+    worker = vm.Batch(staging)
+    worker.prepare()
+    for expected in (sha, plan["jobs"][0]["commit"]):
+        subprocess.run(["git", "-C", str(worker.repo), "cat-file", "-e", expected + "^{commit}"], check=True)
+    assert (worker.repo / ".git/shallow").is_file()

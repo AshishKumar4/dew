@@ -3,8 +3,10 @@
 import hashlib
 import os
 import re
+import subprocess
 import tarfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 from tools.colab import colab_sync
 from tools.colab.common import HERE, PART, REPO, STATE, driver_sha, git, lock, name, read, save
@@ -109,6 +111,16 @@ def exact_ref(repo: Path, ref: str) -> str:
     return git(repo, "rev-parse", f"{ref}^{{commit}}")
 
 
+def artifact_path(plan: dict, attempt: str, job: dict) -> Path:
+    return (
+        STATE
+        / "integration"
+        / plan["base"]
+        / name(job["lane"])
+        / f"{name(plan['device'])}-{name(attempt)}-job-{job['index']}"
+    )
+
+
 def hold_unreported(plan: dict, completed: set[int], reason: str) -> None:
     with queue_lock():
         head, pending, done = sections()
@@ -190,9 +202,23 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             artifact_policy=fields.get("artifact_policy", "all"),
             compile_cache=fields.get("compile_cache", "off"),
             entry=entry,
-            resume_key=colab_sync.retained_key(device, fields["ref"], fields["lane"], fields["outputs"]),
             economics={
                 key: fields[key] for key in ("gpu_reason", "expected_cu", "decision", "memory_estimate")
+            },
+        )
+        inputs = []
+        for source, target in input_paths(fields):
+            with source.open("rb") as stream:
+                inputs.append((target, hashlib.file_digest(stream, "sha256").hexdigest()))
+        job["resume_key"] = colab_sync.retained_key(
+            job["commit"],
+            {
+                "device": device,
+                "lane": job["lane"],
+                "command": job["command"],
+                "outputs": job["outputs"],
+                "artifact_policy": job["artifact_policy"],
+                "inputs": sorted(inputs),
             },
         )
         jobs.append(job)
@@ -221,21 +247,7 @@ def split_file(source: Path, work: Path, prefix: str) -> tuple[list[str], str]:
 
 def stage(plan: dict, work: Path, repo: Path = REPO) -> None:
     work.mkdir(parents=True, exist_ok=False)
-    refs = {"base": plan["base"], **{f"job-{job['index']}": job["commit"] for job in plan["jobs"]}}
-    for job in plan["jobs"]:
-        for ref in job["entry"]["fields"].get("refs", "").split():
-            refs[f"extra-{len(refs)}"] = exact_ref(repo, ref)
-    private = f"refs/colab/{plan['device']}/{name(work.name)}/"
-    try:
-        for key, sha in refs.items():
-            git(repo, "update-ref", private + key, sha)
-        git(repo, "bundle", "create", str(work / "dew.bundle"), *[private + key for key in refs])
-    finally:
-        for key in refs:
-            git(repo, "update-ref", "-d", private + key)
-    plan["refs"] = private
-    plan["bundle_parts"], plan["bundle_sha256"] = split_file(work / "dew.bundle", work, "bundle")
-    (work / "dew.bundle").unlink()
+    stage_sources(plan, work, repo)
     stage_inputs(plan, work)
     with tarfile.open(work / "runner.tar.gz", "w:gz") as archive:
         for file in HERE.glob("*.py"):
@@ -249,6 +261,70 @@ def stage(plan: dict, work: Path, repo: Path = REPO) -> None:
     save(work / "plan.json", plan)
 
 
+def stage_sources(plan: dict, work: Path, repo: Path) -> None:
+    refs = {"base": plan["base"], **{f"job-{job['index']}": job["commit"] for job in plan["jobs"]}}
+    for job in plan["jobs"]:
+        for ref in job["entry"]["fields"].get("refs", "").split():
+            refs[f"extra-{len(refs)}"] = exact_ref(repo, ref)
+    origin = git(repo, "remote", "get-url", "origin")
+    if origin.startswith("git@github.com:"):
+        origin = "https://github.com/" + origin.split(":", 1)[1]
+    if urlparse(origin).username or urlparse(origin).password:
+        raise ValueError("origin URL must not embed credentials")
+    remote = [line.split() for line in git(repo, "ls-remote", "--refs", "origin").splitlines()]
+    remote.sort(key=lambda pair: pair[1] != "refs/heads/main")
+    known = [
+        sha
+        for sha, _ in remote
+        if subprocess.run(
+            ["git", "-C", str(repo), "cat-file", "-e", sha], capture_output=True, check=False
+        ).returncode
+        == 0
+    ]
+    if not known:
+        raise ValueError("no known published base; fetch origin before staging")
+
+    def published(sha):
+        return any(
+            sha == head
+            or subprocess.run(
+                ["git", "-C", str(repo), "merge-base", "--is-ancestor", sha, head],
+                capture_output=True,
+                check=False,
+            ).returncode
+            == 0
+            for head in known
+        )
+
+    pending = {key: sha for key, sha in refs.items() if not published(sha)}
+    prerequisites = sorted({git(repo, "merge-base", sha, known[0]) for sha in pending.values()})
+    plan.update(
+        origin=origin,
+        source_refs=refs,
+        fetch_commits=sorted(set(refs.values()) - set(pending.values()) | set(prerequisites)),
+    )
+    if not pending:
+        return
+    private = f"refs/colab/{plan['device']}/{name(work.name)}/"
+    try:
+        for key, sha in pending.items():
+            git(repo, "update-ref", private + key, sha)
+        git(
+            repo,
+            "bundle",
+            "create",
+            str(work / "dew.bundle"),
+            *[private + key for key in pending],
+            *["^" + sha for sha in prerequisites],
+        )
+    finally:
+        for key in pending:
+            git(repo, "update-ref", "-d", private + key)
+    plan["refs"] = private
+    plan["bundle_parts"], plan["bundle_sha256"] = split_file(work / "dew.bundle", work, "bundle")
+    (work / "dew.bundle").unlink()
+
+
 def stage_inputs(plan: dict, work: Path) -> None:
     for job in plan["jobs"]:
         for source, target in input_paths(job["entry"]["fields"]):
@@ -258,7 +334,7 @@ def stage_inputs(plan: dict, work: Path) -> None:
                 raise ValueError(f"two inputs target {target} with different bytes")
             plan["uploads"][target] = {"parts": parts, "sha256": digest}
         cache = STATE / "colab-resume" / job["resume_key"]
-        if (cache / "manifest.json").is_file():
+        if job["artifact_policy"] != "measurements" and (cache / "manifest.json").is_file():
             archive = work / f"resume-{job['index']}.tar.gz"
             colab_sync.pack_retained(cache, archive)
             job["resume_parts"], job["resume_sha256"] = split_file(archive, work, f"resume-{job['index']}")

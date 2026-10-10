@@ -3,18 +3,16 @@
 import base64
 import hashlib
 import os
+import re
 import shutil
 import tempfile
-import time
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
 import requests
 
 from tools.colab.colab_new import Session
-from tools.colab.common import STATE, read, save
 
-SPOOLS = (STATE / "colab-transfer-spool",)
 SMALL_LIMIT = 16 * 1024 * 1024
 MARGIN = 64 * 1024 * 1024
 
@@ -77,74 +75,37 @@ def transfer(session: Session, remote: str, partial: Path, size: int) -> tuple[i
     return written, digest.hexdigest()
 
 
-def download(session: Session, remote: str, target: Path, spools: tuple[Path, ...] = SPOOLS) -> None:
+def download(session: Session, remote: str, target: Path) -> None:
     target = target.absolute()
     target.parent.mkdir(parents=True, exist_ok=True)
     metadata = contents(session, remote)
     size = metadata.get("size")
     if metadata.get("type") != "file" or not isinstance(size, int) or size < 0:
         raise ValueError("download requires a regular file with a known size")
-    for directory in spools:
-        directory.mkdir(parents=True, exist_ok=True)
-    spool = max(spools, key=lambda directory: shutil.disk_usage(directory).free)
-    if shutil.disk_usage(spool).free < size + MARGIN:
-        raise RuntimeError("not enough transfer-spool space")
-    descriptor, filename = tempfile.mkstemp(prefix="transfer-", suffix=".part", dir=spool)
+    reconcile_transfers((target.parent,))
+    if shutil.disk_usage(target.parent).free < size + MARGIN:
+        raise RuntimeError("not enough artifact filesystem space")
+    prefix = f".{target.name}.colab-{os.getpid()}-{process_start(os.getpid())}-"
+    descriptor, filename = tempfile.mkstemp(prefix=prefix, suffix=".part", dir=target.parent)
     os.close(descriptor)
     partial = Path(filename)
-    registry = partial.with_suffix(".json")
-    link = target.with_name(target.name + ".promote-" + partial.stem)
-    record = {
-        "state": "downloading",
-        "pid": os.getpid(),
-        "process_start": process_start(os.getpid()),
-        "created_at": time.time(),
-        "endpoint": session.endpoint,
-        "remote": remote,
-        "file": str(partial),
-        "target": str(target),
-        "promotion": str(link),
-        "expected_bytes": size,
-    }
-    save(registry, record)
     try:
-        written, digest = transfer(session, remote, partial, size)
-        link.symlink_to(partial)
-        os.replace(link, target)
-        record.update(state="complete", bytes=written, sha256=digest, finished_at=time.time())
-        save(registry, record)
+        transfer(session, remote, partial, size)
+        os.replace(partial, target)
     finally:
-        # A crash after promotion but before the completed journal still owns
-        # recoverable bytes. Never delete a target's backing file on that path.
-        if not (target.is_symlink() and target.resolve(strict=False) == partial):
-            link.unlink(missing_ok=True)
-            partial.unlink(missing_ok=True)
-            registry.unlink(missing_ok=True)
+        partial.unlink(missing_ok=True)
 
 
-def reconcile_transfers(spools: tuple[Path, ...] = SPOOLS) -> None:
-    for directory in spools:
-        for registry in directory.glob("transfer-*.json"):
-            record = read(registry)
-            partial = Path(record["file"])
-            target = Path(record["target"])
-            if partial.parent != directory or partial.with_suffix(".json") != registry:
-                continue
-            if target.is_symlink() and target.resolve(strict=False) == partial:
+def reconcile_transfers(directories: tuple[Path, ...]) -> None:
+    """Remove dead writers' temporary files only in declared artifact directories."""
+    for directory in directories:
+        for partial in directory.glob(".*.colab-*.part"):
+            match = re.fullmatch(r"\..+\.colab-(\d+)-(\d+)-[A-Za-z0-9_]+\.part", partial.name)
+            if not match or partial.is_symlink():
                 continue
             try:
-                alive = process_start(record["pid"]) == record["process_start"]
+                alive = process_start(int(match[1])) == match[2]
             except (OSError, IndexError):
                 alive = False
-            if alive:
-                continue
-            promotion = Path(record["promotion"])
-            if (
-                promotion.parent == target.parent
-                and promotion.name == target.name + ".promote-" + partial.stem
-                and promotion.is_symlink()
-                and promotion.resolve(strict=False) == partial
-            ):
-                promotion.unlink()
-            partial.unlink(missing_ok=True)
-            registry.unlink()
+            if not alive:
+                partial.unlink(missing_ok=True)

@@ -16,6 +16,7 @@ from tools.colab.colab_new import Colab
 from tools.colab.common import REPO, STATE, driver_sha, lock, name, read, save
 
 RELEASED = {"released", "already absent", "no assignment acquired"}
+RELEASE_BACKOFF = (60, 180, 600)
 
 
 def accounting(run: dict, allocation: dict, driver: dict, released_at: float | None, now: float) -> dict:
@@ -49,12 +50,12 @@ def remaining_budget(run: dict, allocation: dict, now: float) -> float:
 
 def finalize(run_dir: Path, client: Colab, reason: str | None = None, code: int | None = None) -> dict:
     previous = read(run_dir / "result.json")
-    if previous.get("release") in RELEASED:
+    if previous.get("release") in RELEASED or previous.get("needs_attention"):
         return previous
     run = read(run_dir / "run.json")
     driver = read(run_dir / "driver.json")
     allocation = read(run_dir / "allocation.json")
-    result = {
+    result = previous or {
         "session": run["session"],
         "driver_sha": run["driver_sha"],
         "driver_exit": code,
@@ -66,6 +67,10 @@ def finalize(run_dir: Path, client: Colab, reason: str | None = None, code: int 
         "finished_at": time.time(),
     }
     save(run_dir / "result.json", result)
+    if time.time() < result.get("release_retry_at", 0):
+        result.update(accounting(run, allocation, driver, None, time.time()))
+        save(run_dir / "result.json", result)
+        return result
     released_at = None
     try:
         endpoint = driver.get("endpoint") or client.recover_endpoint(run_dir / "allocation.json")
@@ -86,10 +91,43 @@ def finalize(run_dir: Path, client: Colab, reason: str | None = None, code: int 
             released_at = time.time()
     except Exception as error:
         result["release"] = "failed: " + type(error).__name__
+    history = result.setdefault("cleanup_history", [])
+    history.append({"at": time.time(), "release": result["release"], "trigger": reason})
+    if result["release"] not in RELEASED:
+        attempt = len(history) - 1
+        if attempt >= len(RELEASE_BACKOFF):
+            result.update(
+                release="release failed: needs attention",
+                needs_attention=True,
+                notify="Main",
+                release_retry_at=None,
+            )
+            save(
+                run_dir / "attention.json",
+                {
+                    "notify": "Main",
+                    "endpoint": driver.get("endpoint"),
+                    "reason": "bounded release attempts exhausted",
+                },
+            )
+            print(f"NOTIFY Main: release needs attention; {run_dir / 'result.json'}", flush=True)
+        else:
+            result["release_retry_at"] = time.time() + RELEASE_BACKOFF[attempt]
+    else:
+        result["release_retry_at"] = None
     result.update(accounting(run, allocation, driver, released_at, time.time()))
     save(run_dir / "result.json", result)
     plan = read(run_dir / "staging/plan.json")
     if plan:
+        directories = [run_dir / "out/_preamble/profile-check"]
+        for job in plan["jobs"]:
+            directories.extend(
+                [
+                    STATE / "colab-resume" / job["resume_key"],
+                    colab_batch.artifact_path(plan, run_dir.name, job),
+                ]
+            )
+        colab_io.reconcile_transfers(tuple(directories))
         colab_batch.hold_unreported(
             plan, {job["index"] for job in driver.get("results", [])}, reason or "unobserved completion"
         )
@@ -112,7 +150,6 @@ def emergency(run_dir: Path, run: dict, allocation: dict, client: Colab, endpoin
 
 
 def reconcile(root: Path, client: Colab) -> None:
-    colab_io.reconcile_transfers()
     for journal in root.glob("*/run.json"):
         run = read(journal)
         try:
@@ -122,6 +159,9 @@ def reconcile(root: Path, client: Colab) -> None:
         if not alive:
             with lock(journal.parent / "finalize.lock"):
                 finalize(journal.parent, client, "orphaned controller; no inferred job exit")
+    pending = [read(path.parent / "result.json") for path in root.glob("*/run.json")]
+    if not any(item.get("release") not in RELEASED and not item.get("needs_attention") for item in pending):
+        subprocess.run(["systemctl", "--user", "stop", "dew-colab-ops-reconcile.timer"], check=True)
 
 
 def watch(child: subprocess.Popen, run_dir: Path, run: dict, client: Colab) -> str | None:
@@ -169,7 +209,14 @@ def watch(child: subprocess.Popen, run_dir: Path, run: dict, client: Colab) -> s
         except Exception as error:
             save(run_dir / "watchdog.json", {"error": type(error).__name__, "at": now})
             if now - last_seen > 300:
-                return "assignment checks unavailable for five minutes"
+                save(
+                    run_dir / "watchdog-attention.json",
+                    {
+                        "notify": "Main",
+                        "at": now,
+                        "reason": "assignment checks unavailable; workload not confirmed dead",
+                    },
+                )
     return None
 
 
