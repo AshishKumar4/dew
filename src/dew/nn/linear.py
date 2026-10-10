@@ -31,12 +31,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.kernels import delta_rule
+from dew.nn.kernels import delta_chunks, delta_rule
 from dew.nn.scatter import DROPPED
 
-from .attention import unweighted_rmsnorm
+from .attention import FORWARD_MODE, unweighted_rmsnorm
 from .blocks import normal_kernel
 from .inputs import AttentionMetadata
+from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32
 from .sharding import logical_axes, rows_like
 
@@ -281,13 +282,75 @@ def strictly_lower_inverse(a):
     return inverse.reshape(*lead, width, width)
 
 
+def xla_chunk_states(key, k_cumdecay, out_vals, gc, state):
+    """The memory crossing chunks, the one sequential part of the chunked
+    rule, as a `lax.scan`: per chunk the reference's corrected values
+    `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
+    (k * exp(gc[-1] - gc))^T @ v_new` (modeling_qwen3_next.py:439-446).
+
+    Operands are per chunk in the reference's layout, `[B, H, NC, C, ...]`,
+    `gc` `[B, H, NC, C]` being the log decay cumulated within each chunk,
+    and `state` `[B, H, Dk, Dv]` enters the first chunk. Returns the state
+    each chunk entered `[B, H, NC, Dk, Dv]`, each chunk's corrected values
+    `[B, H, NC, C, Dv]` and the state leaving the last chunk.
+    """
+    def one_chunk(s, step):
+        k_i, kd_i, v_i, gc_i = step
+        v_corrected = v_i - kd_i @ s
+        last = gc_i[..., -1]
+        written = k_i * jnp.exp(last[..., None] - gc_i)[..., None]
+        return (s * jnp.exp(last)[..., None, None] + jnp.swapaxes(written, -1, -2) @ v_corrected,
+                (s, v_corrected))
+    final, (entered, corrected) = jax.lax.scan(
+        one_chunk, state, tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc)))
+    return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
+
+
+GATED_DELTA_RULES = ('auto', 'xla', 'pallas')
+"""The recurrences `chunk_gated_delta_rule` runs its memory across chunks on."""
+
+
+def chunk_states_kernel(implementation: str, key, out_vals) -> str:
+    """The recurrence a chunked rule over these per-chunk keys and corrected
+    values runs: 'xla' (`xla_chunk_states`) or 'pallas'
+    (`dew.nn.kernels.delta_chunks`).
+
+    'auto' takes the generation's measured one (`KERNELS['gated_delta_rule']`)
+    and 'xla' elsewhere. 'pallas' needs a GPU the kernels compile for,
+    operands they take (`delta_chunks.refusal`) and reverse mode, since under
+    `forward_mode_attention`, which traces for `jax.jvp`, the XLA scan gives
+    the tangent. A call it turns down runs 'xla', which `ran_kernel` logs
+    where 'pallas' was measured fastest. An explicit 'pallas' on a host
+    without a GPU interprets the kernels, as the CPU suite runs them.
+    """
+    if implementation not in GATED_DELTA_RULES:
+        raise ValueError(f"implementation must be one of {list(GATED_DELTA_RULES)}, got {implementation!r}")
+    chosen = measured_kernel('gated_delta_rule', 'xla') if implementation == 'auto' else implementation
+    if chosen != 'pallas':
+        return chosen
+    placed = triton_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
+    refusal = first_refusal(
+        (placed, "the Pallas kernels need a GPU of sm80 or later"),
+        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the kernels lack"),
+    ) or delta_chunks.refusal(key, out_vals)
+    return 'pallas' if refusal is None else ran_kernel('gated_delta_rule', 'xla', refusal)
+
+
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
-                           chunk_size: int = CHUNK_SIZE):
+                           chunk_size: int = CHUNK_SIZE, implementation: str = 'auto'):
     """The chunked form of the gated delta rule, `torch_chunk_gated_delta_rule`
-    (modeling_qwen3_next.py:374-453) line for line in fp32, over [B, S, H, D]
-    operands; returns `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in
-    the input dtype. The reference's sequential correction is the inverse
+    (modeling_qwen3_next.py:374-453) in fp32, over [B, S, H, D] operands;
+    returns `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])` in the input
+    dtype. The reference's sequential correction is the inverse
     `strictly_lower_inverse` builds from its diagonal blocks.
+
+    Only the memory crosses chunks, so only its recurrence runs chunk after
+    chunk, on the recurrence `implementation` names (`chunk_states_kernel`).
+    Each chunk's output, the reference's `attn_inter + attn @ v_new`, reads
+    the state that chunk entered and its corrected values, so it is computed
+    for every chunk at once after the recurrence. Those are the same sums in
+    the same order, and the scan no longer launches the three products of
+    the output at every chunk.
     """
     dtype, work = query.dtype, at_least_fp32(query.dtype)
     query, key, value, g, beta = (
@@ -303,10 +366,9 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     T = S + pad
     query = query * (Dk ** -0.5)
 
-    def chunks(x):  # [B, S, H, ...] -> [NC, B, H, C, ...] for the scan
+    def chunks(x):  # [B, S, H, ...] -> [B, H, NC, C, ...], the reference's layout
         moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
-        blocked = moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
-        return jnp.moveaxis(blocked, 2, 0)  # [NC, B, H, C, ...]
+        return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
 
     v_beta = value * beta[..., None]
     k_beta = key * beta[..., None]
@@ -318,7 +380,7 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
     # `((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp()).tril()`, one decay
     # channel per head.
     gc, decay = chunk_decay(g_c[..., None])
-    gc, decay = gc[..., 0], decay[..., 0]  # [NC, B, H, C], [NC, B, H, C, C]
+    gc, decay = gc[..., 0], decay[..., 0]  # [B, H, NC, C], [B, H, NC, C, C]
     # The mask is strictly lower (tril, -1): the reference's masked_fill
     # zeroes the diagonal too.
     strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
@@ -330,31 +392,16 @@ def chunk_gated_delta_rule(query, key, value, g, beta, state=None,
 
     state = (jnp.zeros((B, H, Dk, Dv), work) if state is None
              else state.astype(work))
-
-    def one_chunk(carry, step):
-        s = carry
-        q_i, k_i, v_i = step['q'], step['k'], step['v']
-        decay_i, kd_i, gc_i = step['decay'], step['kd'], step['gc']
-        attn_i = q_i @ jnp.swapaxes(k_i, -1, -2) * decay_i
-        v_prime = kd_i @ s
-        v_corrected = v_i - v_prime
-        attn_inter = (q_i * jnp.exp(gc_i)[..., None]) @ s
-        out = attn_inter + attn_i @ v_corrected
-        # The chunk's write into the memory, the reference's
-        # `s * exp(gc[-1]) + (k * exp(gc[-1] - gc))^T @ v_new`
-        # (modeling_qwen3_next.py:443-446).
-        s = (s * jnp.exp(gc_i[..., -1])[..., None, None]
-             + jnp.swapaxes(
-                 k_i * jnp.exp(gc_i[..., -1][..., None] - gc_i)[..., None],
-                 -1, -2) @ v_corrected)
-        return s, out
-    state, core = jax.lax.scan(
-        one_chunk, state,
-        {'q': q_c, 'k': k_c, 'v': out_vals, 'decay': decay,
-         'kd': k_cumdecay, 'gc': gc})
-    # core: [NC, B, H, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
-    core = jnp.moveaxis(core, 0, 2).reshape(B, H, T, Dv)
-    core = jnp.moveaxis(core, 1, 2)[:, :S]
+    if chunk_states_kernel(implementation, k_c, out_vals) == 'pallas':
+        entered, v_corrected, state = delta_chunks.chunk_states(
+            k_c, k_cumdecay, out_vals, gc, state, not triton_runs())
+    else:
+        entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state)
+    attn = q_c @ jnp.swapaxes(k_c, -1, -2) * decay
+    attn_inter = (q_c * jnp.exp(gc)[..., None]) @ entered
+    core = attn_inter + attn @ v_corrected
+    # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
+    core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
     return core.astype(dtype), state.astype(dtype)
 
 

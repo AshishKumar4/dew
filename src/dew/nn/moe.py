@@ -48,6 +48,7 @@ from .sharding import (
     logical_axes,
     logical_spec,
     mesh_axes,
+    seen_whole,
 )
 
 # 'softmax' normalizes a token's affinities over the experts (Mixtral,
@@ -385,17 +386,6 @@ def grouped_matmul(tokens: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                           preferred_element_type=preferred_element_type)
 
 
-def _local(value: jax.Array) -> bool:
-    """Whether the kernels, which see local arrays and carry no manual-axis
-    type, can take `value` where it is traced: no mesh axis outside a
-    `shard_map` splits it, and no `shard_map` that checks varying axes
-    holds it."""
-    mesh = jax.sharding.get_abstract_mesh()
-    split = any(mesh.shape[name] > 1 for name in mesh.axis_names
-                if name not in mesh.manual_axes)
-    return not split and not jax.typeof(value).mat.varying
-
-
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
     """Expert-major biases in compute dtype, with master-precision cotangent sums.
 
@@ -423,12 +413,12 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     'xla' and 'tokamax' hold it in every differentiation mode (tangents on
     `jax.lax.ragged_dot`); 'pallas' in first-order reverse mode
     (`dew.nn.kernels.grouped_matmul`), and a trace the kernels cannot take
-    (`_local`) runs 'xla'. tests/test_moe_precision.py measures it against
+    (`seen_whole`) runs 'xla'. tests/test_moe_precision.py measures it against
     float64 sums and three Adam steps on every expert/fsdp layout.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), precision)
-    if chosen == 'pallas' and _local(x) and _local(kernel):
+    if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
     return _projection(x, kernel, group_sizes, dtype,
                        'xla' if chosen == 'pallas' else chosen, precision)
