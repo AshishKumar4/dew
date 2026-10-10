@@ -8,13 +8,14 @@ import tempfile
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import pyarrow as pa
 import pyarrow.dataset as ds
 from array_record.python.array_record_module import ArrayRecordWriter
 
+from dew.data.dataset import Batch
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
@@ -24,7 +25,12 @@ if TYPE_CHECKING:
     from dew.data.pipeline import Pipeline
 
 
-def _chunks(values: Iterable[object], rows: int) -> Iterator[list[object]]:
+@runtime_checkable
+class _Closeable(Protocol):
+    def close(self) -> None: ...
+
+
+def _chunks(values: Iterable[Batch | bytes | None], rows: int) -> Iterator[list[Batch | bytes | None]]:
     batch = []
     for value in values:
         batch.append(value)
@@ -35,7 +41,7 @@ def _chunks(values: Iterable[object], rows: int) -> Iterator[list[object]]:
         yield batch
 
 
-def export(values: Source | grain.IterDataset | Iterable[object] | Pipeline, url: str, *,
+def export(values: Source | grain.IterDataset | Iterable[Batch | bytes | None] | Pipeline, url: str, *,
            format: Literal["parquet", "array_record"] = "parquet", rows_per_shard: int = 100_000,
            partitioning: tuple[str, ...] | None = None,
            storage_options: Mapping[str, object] | None = None) -> Mapping[str, object]:
@@ -93,9 +99,9 @@ def export(values: Source | grain.IterDataset | Iterable[object] | Pipeline, url
         if format == "parquet":
             fs, directory = target.resolve()
             for path in sorted(fs.find(directory)) if fs.exists(directory) else []:
-                data = fs.cat_file(path)
+                payload = fs.cat_file(path)
                 relative = f"shards/{writer}/" + path[len(directory):].lstrip("/")
-                files.append({"path": relative, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()})
+                files.append({"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()})
         manifest = {"schema": 1, "format": format, "codec": 1 if format == "array_record" else None,
                     "rows": count, "partitioning": partitioning, "files": files}
         encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
@@ -103,6 +109,5 @@ def export(values: Source | grain.IterDataset | Iterable[object] | Pipeline, url
         root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
         return manifest
     finally:
-        close = getattr(rows, "close", None)
-        if close is not None:
-            close()
+        if isinstance(rows, _Closeable):
+            rows.close()

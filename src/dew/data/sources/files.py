@@ -125,9 +125,9 @@ class Files:
         files = []
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()
-            info = fs.info(path)
-            files.append({"uri": url, "bytes": info["size"], "version": info.get(
-                "ETag", info.get("etag", info.get("generation", fs.ukey(path))))})
+            metadata = fs.info(path)
+            files.append({"uri": url, "bytes": metadata["size"], "version": metadata.get(
+                "ETag", metadata.get("etag", metadata.get("generation", fs.ukey(path))))})
         return {"store": self.kind, "files": files, "columns": self.columns,
                 "filter": str(self.filter), "partitioning": self.partitioning}
 
@@ -157,7 +157,7 @@ class Files:
             with fs.open(path, "rb") as file:
                 if self.kind == "csv":
                     reader = csv.DictReader(_CsvLines(file))
-                    reader.fieldnames
+                    _ = reader.fieldnames
                     while True:
                         start = file.tell()
                         try:
@@ -222,17 +222,16 @@ class Files:
                 rows = None if self.filter is not None else fragment.count_rows()
                 shards.append(Shard(f"{fragment.path}:{number}", fragment.path, number, number + 1, rows))
         elif self.kind == "array_record":
-            for url in self.paths:
-                shards.append(Shard(url, url))
+            shards.extend(Shard(url, url) for url in self.paths)
         else:
             for url in self.paths:
                 fs, path = Store(url, self.storage_options).resolve()
-                size = fs.size(path)
+                size = Store(url, self.storage_options).size()
                 step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
                 if step < 1:
                     raise ValueError("file shard_bytes must be positive")
-                for start in range(0, size, step):
-                    shards.append(Shard(f"{url}:{start}", url, start, min(start + step, size)))
+                shards.extend(Shard(f"{url}:{start}", url, start, min(start + step, size))
+                              for start in range(0, size, step))
         return ShardManifest(tuple(shards), self._read_shard)
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
@@ -284,7 +283,9 @@ class _ArrowFragment:
     @cached_property
     def table(self) -> pa.Table:
         return self.source.fragments[self.index].to_table(
-            schema=self.source.arrow.schema, columns=self.source.columns, filter=self.source.filter)
+            schema=self.source.arrow.schema,
+            columns=list(self.source.columns) if self.source.columns is not None else None,
+            filter=self.source.filter)
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -298,9 +299,15 @@ class _ArrowRecords:
         self.source = source
         self.offsets = np.cumsum([0, *(fragment.count_rows() for fragment in source.fragments)])
 
-    @lru_cache(maxsize=1)
-    def _group(self, index: int) -> _ArrowFragment:
-        return _ArrowFragment(self.source, index)
+    @cached_property
+    def _group(self):
+        @lru_cache(maxsize=1)
+        def opened(index: int) -> _ArrowFragment:
+            return _ArrowFragment(self.source, index)
+        return opened
+
+    def __getstate__(self) -> Mapping[str, object]:
+        return {key: value for key, value in self.__dict__.items() if key != "_group"}
 
     def __len__(self) -> int:
         return int(self.offsets[-1])
@@ -333,10 +340,10 @@ class _IndexedLines:
         with fs.open(path, "rb") as file:
             names = next(csv.reader(_CsvLines(file))) if self.source.kind == "csv" else None
             file.seek(int(entry["offset"]))
-            data = file.read(int(entry["bytes"]))
+            payload = file.read(int(entry["bytes"]))
         if names is not None:
-            return next(csv.DictReader(io.StringIO(data.decode()), fieldnames=names))
-        return json.loads(data) if self.source.kind == "jsonl" else {"text": data.decode().rstrip("\r\n")}
+            return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
+        return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode().rstrip("\r\n")}
 
 
 class _CsvLines(Iterator[str]):
@@ -368,7 +375,7 @@ class _LineIterator(grain.DatasetIterator):
         self.file = fs.open(path, "rb")
         self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
         if self.csv is not None:
-            self.csv.fieldnames
+            _ = self.csv.fieldnames
         elif shard.start:
             self.file.seek(shard.start - 1)
             if self.file.read(1) != b"\n":
@@ -415,7 +422,7 @@ class TokenBytes:
     @cached_property
     def count(self) -> int:
         fs, path = Store(self.url, self.storage_options).resolve()
-        size = fs.size(path)
+        size = Store(self.url, self.storage_options).size()
         width = np.dtype(self.dtype).itemsize
         if size % width:
             raise ValueError(f"token file {self.url} size {size} is not divisible by dtype {self.dtype}")
@@ -470,12 +477,12 @@ class TokenRecords:
     def piece(self, index: int) -> np.ndarray:
         from .codec import unpack_dict_of_byte_arrays
 
-        data = self.records[index]
-        if not isinstance(data, bytes):
+        payload = self.records[index]
+        if not isinstance(payload, bytes):
             raise TypeError("ArrayRecord token document is not bytes")
         if self.field is not None:
-            data = unpack_dict_of_byte_arrays(data)[self.field]
-        values = np.frombuffer(data, dtype=self.dtype)
+            payload = unpack_dict_of_byte_arrays(payload)[self.field]
+        values = np.frombuffer(payload, dtype=self.dtype)
         if len(values) != int(self.lengths[index]):
             raise ValueError(f"token document {index} differs from the producer's length index")
         return values

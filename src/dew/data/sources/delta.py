@@ -6,7 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 
-from .files import Files
+from .files import Files, Format
 
 
 @dataclass(frozen=True)
@@ -19,10 +19,12 @@ class Delta(Files):
             from deltalake import DeltaTable
         except ImportError as error:
             raise ImportError("reading Delta tables needs pip install 'dewml[delta]'") from error
+        if not isinstance(self.url, str):
+            raise ValueError("Delta takes one table URL")
         return DeltaTable(self.url, version=self.version, storage_options=self.storage_options)
 
     @cached_property
-    def kind(self):
+    def kind(self) -> Format:
         return "parquet"
 
     @cached_property

@@ -146,3 +146,45 @@ def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
     generation = cache.publish(key, source)
     for shard in manifest.shards:
         assert generation.outputs((shard.id, 0)) == ({"id": shard.start},)
+
+
+@dataclass(frozen=True)
+class Draw(grain.RandomMapTransform):
+    def random_map(self, element, rng):
+        return {**element, "draw": int(rng.integers(0, 2**31))}
+
+
+def test_cold_warm_and_resumed_caches_keep_per_epoch_randomness():
+    source = Memory([{"id": index} for index in range(8)])
+    cache, key = _cache(), Manifest()
+    parent = grain.MapDataset.source(source.records("indexed"))
+    cold = cache.mapped(parent, key, source)
+
+    def epochs(rows):
+        return rows.repeat(2).seed(31).random_map(Draw()).to_iter_dataset()
+
+    reader = iter(epochs(cold))
+    first = [next(reader) for _ in range(5)]
+    state = reader.get_state()
+    rest = list(reader)
+    reader.close()
+    cold.close()
+    expected = first + rest
+    assert [row["id"] for row in expected[:8]] == [row["id"] for row in expected[8:]]
+    assert [row["draw"] for row in expected[:8]] != [row["draw"] for row in expected[8:]]
+    generation = cache.publish(key, source)
+    warm = generation.mapped(parent, key, source)
+    assert list(epochs(warm)) == expected
+    resumed = iter(epochs(warm))
+    resumed.set_state(state)
+    assert list(resumed) == rest
+    resumed.close()
+
+
+def test_cache_refuses_stochastic_prefix_by_step_name():
+    from dew.data.compile import compile
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(8)])
+    with pytest.raises(ValueError, match=r"cache prefix.*Draw"):
+        compile(Pipeline(source).random_map(Draw()).cache(_cache()).batch(2))
