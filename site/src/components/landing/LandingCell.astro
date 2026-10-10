@@ -58,9 +58,8 @@ const { hero } = recording;
 </div>
 
 <script>
-	import type { LiveSession } from '../../scripts/live';
 	import { renderOutput } from '../../scripts/live';
-	import { landingKernel, onKernelClose } from '../../scripts/landing-kernel';
+	import { liveCell, phases } from '../../scripts/landing-kernel';
 
 	for (const panel of document.querySelectorAll<HTMLElement>('[data-landing-cell]')) {
 		const cell = panel.dataset.landingCell!;
@@ -77,61 +76,41 @@ const { hero } = recording;
 			setTimeout(() => { copy.textContent = 'Copy'; }, 1500);
 		});
 		if (!run || !status) continue;
-		let session: LiveSession | undefined;
-		let running = false;
-		let stopping = false;
-		onKernelClose((message) => {
-			session = undefined;
-			if (!running) status.textContent = `${message} Press Run to start a new one.`;
-		});
-		const execute = async () => {
-			running = true;
-			stopping = false;
-			run.textContent = 'Stop';
-			// The live run replaces the recording.
-			showcase.hidden = true;
-			output.replaceChildren();
-			output.hidden = false;
-			let phase = 'Starting';
-			let since = performance.now();
-			const setPhase = (text: string) => {
-				phase = text;
-				since = performance.now();
-				status.textContent = text;
-			};
-			const timer = window.setInterval(() => {
-				if (!stopping) status.textContent = `${phase} · ${Math.round((performance.now() - since) / 1000)} s`;
-			}, 1000);
-			try {
-				session = await landingKernel(holder, setPhase);
-				if (stopping) throw new Error('Stopped.');
-				const started = performance.now();
-				setPhase('Running');
-				const result = await session.run(editor.value, (message) => {
+		const phase = phases(status);
+		liveCell(run, editor, holder, cell, {
+			start: () => {
+				// The live run replaces the recording.
+				showcase.hidden = true;
+				output.replaceChildren();
+				output.hidden = false;
+				phase.set('Starting');
+			},
+			kernel: (text) => phase.set(text),
+			begin: () => {
+				phase.set('Running');
+				return (message) => {
 					if (message.type === 'display' && message.text?.startsWith('{"dew-wait"')) {
 						const { ahead } = JSON.parse(message.text)['dew-wait'];
-						setPhase(`This host runs one cell at a time; ${ahead} ${ahead === 1 ? 'run is' : 'runs are'} ahead of yours`);
+						phase.set(`This host runs one cell at a time; ${ahead} ${ahead === 1 ? 'run is' : 'runs are'} ahead of yours`);
 						return;
 					}
-					if (phase !== 'Running') setPhase('Running');
+					if (phase.phase !== 'Running') phase.set('Running');
 					renderOutput(output, message);
-				}, cell, 'train');
-				status.textContent = stopping || result.status === 'aborted' ? 'Stopped.'
-					: result.status === 'ok' ? `Ran in ${((performance.now() - started) / 1000).toFixed(0)} s on a shared 4-vCPU host.`
+				};
+			},
+			end: (outcome) => {
+				phase.stop();
+				status.textContent = 'failure' in outcome ? outcome.failure
+					: outcome.done.status === 'aborted' ? 'Stopped.'
+					: outcome.done.status === 'ok' ? `Ran in ${outcome.seconds.toFixed(0)} s on a shared 4-vCPU host.`
 					: 'The cell stopped with an error.';
-			} catch (error) {
-				status.textContent = error instanceof Error ? error.message : String(error);
-			} finally {
-				window.clearInterval(timer);
-				running = false;
-				run.textContent = 'Run';
-				run.disabled = false;
-			}
-		};
-		run.addEventListener('click', () => {
-			if (!running) void execute();
-			else { stopping = true; run.disabled = true; status.textContent = 'Stopping'; session?.interrupt(cell); }
-		});
+			},
+			stopping: () => {
+				phase.stop();
+				status.textContent = 'Stopping';
+			},
+			closed: (message) => (status.textContent = `${message} Press Run to start a new one.`),
+		}, 'train');
 	}
 </script>
 
