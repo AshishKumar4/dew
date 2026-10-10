@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from tools.colab import credentials
+from tools.colab import colab_batch, credentials
 from tools.colab.colab_batch_vm import environment as vm_environment, join_parts
 from tools.colab.common import read, save
 from tools.colab.ops_driver import Driver
@@ -96,3 +96,31 @@ def test_opted_job_requires_entity_and_project_from_local_config(tmp_path):
     with pytest.raises(ValueError, match="entity and project"):
         credentials.stage_wandb({"uploads": {}, "jobs": [{"wandb": True}]}, tmp_path, netrc_file, config)
     assert not (tmp_path / "private-wandb.part").exists()
+
+
+def test_opt_in_change_is_part_of_reuse_identity():
+    job = {"commit": "sha", "command": "run", "outputs": [], "artifact_policy": "all",
+           "ref": "sha", "compile_cache": "off", "wandb": False}
+    first = {"driver_sha": "driver", "base": "sha", "hardware": "gpu:T4", "jobs": [job]}
+    second = {**first, "jobs": [{**job, "wandb": True}]}
+    with pytest.raises(ValueError, match="identity"):
+        colab_batch.validate_reuse(first, second)
+
+
+def test_private_snapshots_cannot_reuse_rotated_credentials(tmp_path):
+    save(tmp_path / "plan.json", {"uploads": {"private": {"private": True}}})
+    with pytest.raises(ValueError, match="fresh staging"):
+        colab_batch.staged({}, tmp_path)
+
+
+def test_owner_only_input_files_get_private_transport(tmp_path):
+    source = tmp_path / "credential"
+    source.write_text("fixture-input-key")
+    source.chmod(0o600)
+    work = tmp_path / "work"
+    work.mkdir()
+    plan = {"uploads": {}, "jobs": [{"index": 1, "artifact_policy": "measurements", "resume_key": "none",
+             "entry": {"fields": {"inputs": f"{source} to /content/private", "command": "run"}}}]}
+    colab_batch.stage_inputs(plan, work)
+    assert plan["uploads"]["/content/private/credential"]["private"]
+    assert plan["private_parts"] == plan["uploads"]["/content/private/credential"]["parts"]

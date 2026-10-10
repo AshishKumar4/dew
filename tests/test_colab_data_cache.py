@@ -181,3 +181,13 @@ def test_duplicate_destination_aliases_are_rejected_before_data_fetch(tmp_path, 
     with pytest.raises(ValueError, match="duplicate"):
         cache.restore("decision/mix-v3", hashlib.sha256(body).hexdigest(), tmp_path / "vm")
     assert calls == ["decision/mix-v3/manifest.json"]
+
+
+def test_packed_jobs_cannot_restore_different_datasets_over_one_target(tmp_path, service):
+    _, _, identity, _ = service
+    common = {"index": 1, "entry": {"fields": {"command": "run"}}, "resume_key": "none",
+              "data_token_file": str(tmp_path / "private-token"), "artifact_policy": "measurements"}
+    first = {**common, "data_sources": [{"target": "/content/data", "manifest_sha256": identity}]}
+    second = {**common, "data_sources": [{"target": "/content/data/sub", "manifest_sha256": "a" * 64}]}
+    with pytest.raises(ValueError, match="overlapping"):
+        colab_batch.stage_inputs({"jobs": [first, second], "uploads": {}}, tmp_path)
