@@ -658,10 +658,12 @@ def _block_drafting(model: nn.Module, params: Variables):
 
 
 def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
-              max_new_tokens: int, pad_id: int, n: int,
+              trips: int, budget: jax.Array, pad_id: int, n: int,
               transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
               strategy: Strategy) -> Generation:
-    """One fixed compiled loop; finished rows do not mutate their cache state.
+    """One fixed compiled loop of `trips` draws; finished rows do not mutate
+    their cache state. `budget` is the tokens the request may draw, at most
+    `trips`, which the steps read (`StepState.budget`).
 
     The continuations share one prefill. Parameters remain unmapped, and the
     strategy owns whatever loop the request asked for. Results leave in prompt
@@ -670,19 +672,20 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
     batch, width = inputs.tokens.shape
     prompt = inputs.tokens if n == 1 else jnp.repeat(inputs.tokens, n, axis=0)
     valid = inputs.token_fields.get("attention_mask")
-    if max_new_tokens == 0:
+    if trips == 0:
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
     ops = decode_ops(model, params, pad_id, prediction_depths(model))
     state, real = prefill_state(model, params, inputs, ops)
     start = StepState(
-        tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, max_new_tokens), jnp.int32)], axis=1),
+        tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),
         valid=jnp.concatenate([jnp.ones((batch, width), bool) if valid is None else valid.astype(bool),
-                               jnp.zeros((batch, max_new_tokens), bool)], axis=1),
-        step=jnp.zeros(batch, jnp.int32), active=real, keys=keys, prompt_width=width)
+                               jnp.zeros((batch, trips), bool)], axis=1),
+        step=jnp.zeros(batch, jnp.int32), active=real, keys=keys, prompt_width=width,
+        budget=jnp.full(batch, budget, jnp.int32))
     drawn: Draws = strategy(state, start, ops, decoding.chain(transforms),
-                            decoding.criterion(stopping), max_new_tokens, n)
+                            decoding.criterion(stopping), trips, n)
     return Generation(
         jnp.concatenate([prompt, jnp.where(drawn.valid, drawn.tokens, pad_id)], axis=1),
         jnp.sum(drawn.valid, axis=1, dtype=jnp.int32), drawn.terminated,
@@ -844,7 +847,7 @@ def _digest(components: Components) -> tuple[Identity, str]:
     return (_stable(components), payload.hexdigest())
 
 
-def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tokens: int,
+def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tokens: int, trips: int,
            sampling: Sampling, n: int, logits: Transforms | None, stopping: Criteria | None,
            strategy: Strategy | None, pooled: bool) -> tuple[ModelInputs, tuple, Components]:
     """This process's validated request, the controls a pool compares, and
@@ -861,14 +864,16 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
     _refuse_exchange(model)
-    prepared = _validated(model, ids, fields, conditioning, max_new_tokens, sampling, n)
+    if trips < max_new_tokens:
+        raise ValueError(f"trips must cover the budget of {max_new_tokens} tokens, got {trips}")
+    prepared = _validated(model, ids, fields, conditioning, trips, sampling, n)
     components = resolve(sampling, logits, stopping, strategy)
-    controls = (max_new_tokens, n, sampling.pad) + ((_digest(components),) if pooled else ())
+    controls = (max_new_tokens, trips, n, sampling.pad) + ((_digest(components),) if pooled else ())
     return prepared, controls, components
 
 
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
-             max_new_tokens: int, pad_id: int, n: int,
+             budget: jax.Array, trips: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
              strategy: Strategy) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
@@ -879,18 +884,18 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     and throwing it costs nothing.
     """
 
-    def run(params, inputs, keys, transforms, stopping, strategy):
-        return _generate(model, params, inputs, keys, max_new_tokens, pad_id, n,
+    def run(params, inputs, keys, budget, transforms, stopping, strategy):
+        return _generate(model, params, inputs, keys, trips, budget, pad_id, n,
                          transforms, stopping, strategy)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
-        params, inputs, keys, transforms, stopping, strategy)
+        params, inputs, keys, budget, transforms, stopping, strategy)
 
 
 @functools.cache
 def _compiled(rows: jax.sharding.NamedSharding | None):
-    return jax.jit(_checked, static_argnames=("model", "max_new_tokens", "pad_id", "n"),
-                   in_shardings=(None, rows, rows, None, None, None),
+    return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n"),
+                   in_shardings=(None, rows, rows, None, None, None, None),
                    out_shardings=(None, rows))
 
 
@@ -901,7 +906,8 @@ def generate(model: nn.Module, params: Variables,
              inputs: ModelInputs | ArrayLike | Sequence[Sequence[int]], max_new_tokens: int,
              *, key: int | jax.Array | None = None,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
-             stopping: Criteria | None = None, strategy: Strategy | None = None) -> Generation:
+             stopping: Criteria | None = None, strategy: Strategy | None = None,
+             trips: int | None = None) -> Generation:
     """Generate continuations from model inputs, or from token ids for a text-only prompt.
 
     ``params`` is the full variables dict, ``{'params': ...}``.
@@ -931,14 +937,21 @@ def generate(model: nn.Module, params: Variables,
     replaces it. ``strategy`` replaces the per-row draw loop; ``None`` uses
     ``Sample``. A policy with ``stop`` strings raises ``ValueError``,
     because ``generate`` has no tokenizer to compile them against.
+
+    ``trips``, at least ``max_new_tokens``, scans that many draws, so calls
+    of several budgets share one compiled loop (``TextGeneration`` buckets
+    them); the budget still bounds what the request draws as far as a
+    transform or a search reads it (``ForcedEOS``, ``Beam``), and the
+    columns past it come back for the caller to cut.
     """
     if sampling.stop:
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
                          "have; generate through a TextGeneration with a processor, or pass "
                          "stopping=(decoding.stop_strings(tokenizer, strings, vocab_size),)")
+    scanned = max_new_tokens if trips is None else trips
     request, components = Request.prepare(
         inputs, key, mesh_of(params),
-        lambda canonical, pooled: _check(model, params, canonical, max_new_tokens, sampling, n,
+        lambda canonical, pooled: _check(model, params, canonical, max_new_tokens, scanned, sampling, n,
                                          logits, stopping, strategy, pooled),
         phase="generation")
     plan = request.plan
@@ -946,8 +959,8 @@ def generate(model: nn.Module, params: Variables,
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     failure, output = _compiled(plan.sharding)(model, params, plan.place(request.padded()),
-                                               plan.keys(request.key), max_new_tokens, sampling.pad, n,
-                                               *components)
+                                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned,
+                                               sampling.pad, n, *components)
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

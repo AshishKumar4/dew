@@ -33,6 +33,8 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from .generation import triton_runs
+
 BLOCK = 32
 """Keys a step of the loop reads."""
 QUERIES = 16
@@ -42,10 +44,11 @@ WARPS = 4
 
 def fits(query: jax.Array, key: jax.Array) -> bool:
     """Whether the kernel takes this `[B, T, N, D]` query over `[B, S, N, D]`
-    keys: CUDA, at most `QUERIES` positions, a power-of-two width up to 256,
-    and a capacity of whole blocks."""
+    keys: a GPU Dew's Triton kernels run on (`triton_runs`), at most
+    `QUERIES` positions, a power-of-two width up to 256, and a capacity of
+    whole blocks."""
     positions, width = query.shape[1], query.shape[-1]
-    return (jax.default_backend() == "gpu" and positions <= QUERIES and width & (width - 1) == 0
+    return (triton_runs() and positions <= QUERIES and width & (width - 1) == 0
             and 16 <= width <= 256 and key.shape[1] % BLOCK == 0 and query.dtype == key.dtype)
 
 
@@ -120,12 +123,12 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
 
 def fits_paged(query: jax.Array | jax.ShapeDtypeStruct, key_pages: jax.Array | jax.ShapeDtypeStruct) -> bool:
     """Whether `attend_paged` takes this `[rows, heads, D]` query over
-    `[kv_heads, pages, page_size, D]` pools: CUDA, at most `QUERIES` query
-    heads a key head, a power-of-two width up to 256, and a power-of-two page
-    of at most `BLOCK` keys."""
+    `[kv_heads, pages, page_size, D]` pools: a GPU Dew's Triton kernels run on
+    (`triton_runs`), at most `QUERIES` query heads a key head, a power-of-two
+    width up to 256, and a power-of-two page of at most `BLOCK` keys."""
     heads, width = query.shape[-2:]
     kv_heads, page_size = key_pages.shape[0], key_pages.shape[2]
-    return (jax.default_backend() == "gpu" and heads % kv_heads == 0 and heads // kv_heads <= QUERIES
+    return (triton_runs() and heads % kv_heads == 0 and heads // kv_heads <= QUERIES
             and width & (width - 1) == 0 and 16 <= width <= 256 and page_size & (page_size - 1) == 0
             and page_size <= BLOCK and query.dtype == key_pages.dtype)
 

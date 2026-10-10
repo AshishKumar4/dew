@@ -25,18 +25,20 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
+from .generation import triton_runs
+
 BLOCK = 32
 """Value columns a program: 16 to 64 measured within 3% on an RTX 4080."""
 WARPS = 8
 
 
 def fits(state: jax.Array) -> bool:
-    """Whether the kernel takes this `[rows, heads, Dk, Dv]` state: CUDA, held
-    in fp32 or bf16, and power-of-two widths with Dv a multiple of `BLOCK`
-    (Triton's blocks)."""
+    """Whether the kernel takes this `[rows, heads, Dk, Dv]` state: a GPU Dew's
+    Triton kernels run on (`triton_runs`), held in fp32 or bf16, and
+    power-of-two widths with Dv a multiple of `BLOCK` (Triton's blocks)."""
     dk, dv = state.shape[-2:]
     power = dk > 0 and dk & (dk - 1) == 0
-    return (jax.default_backend() == "gpu" and state.dtype in (jnp.float32, jnp.bfloat16) and power
+    return (triton_runs() and state.dtype in (jnp.float32, jnp.bfloat16) and power
             and dv % BLOCK == 0 and (dv // BLOCK) & (dv // BLOCK - 1) == 0)
 
 
