@@ -365,7 +365,8 @@ def run(args: argparse.Namespace) -> dict:
     device_name = "CPU smoke (no MFU)" if args.smoke else torch.cuda.get_device_name(device)
     peak = None if args.smoke else peak_flops(device_name)
     flops = None if args.smoke else E1_FLOPS_PER_STEP
-    timed = {**rates, "step_ms": median_ms, "tokens_per_s": batch * seq / (median_ms / 1000),
+    timed = {**rates, "window_tokens_per_s": rates["tokens_per_s"],
+             "step_ms": median_ms, "tokens_per_s": batch * seq / (median_ms / 1000),
              "mfu": None if peak is None else flops / (median_ms / 1000) / peak,
              "source": "unprofiled synchronized window; median CUDA-event step duration",
              "step_ms_samples": [value * 1000 for value in window.step_seconds]}
@@ -406,6 +407,15 @@ def run(args: argparse.Namespace) -> dict:
     if args.dew_attribution:
         record["comparison"] = comparison(record, args.dew_attribution, args.dew_entry)
     write_record(args.out, record)
+    write_record(Path(args.out).with_suffix(".summary.json"), {
+        "commit": record["commit"], "smoke": args.smoke, "config": record["config"],
+        "steady": {key: value for key, value in timed.items() if key != "step_ms_samples"},
+        "memory": record["memory"], "checks": {key: value for key, value in record["checks"].items()
+                                              if key != "dynamo_counters"},
+        "time": {key: value for key, value in record["time"].items()
+                 if key not in ("top_ops", "common_summary")},
+        "comparison": record.get("comparison"),
+    })
     return record
 
 
