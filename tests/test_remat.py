@@ -203,6 +203,7 @@ def test_fused_attention_forward_is_named_as_the_policy_matches_it():
     assert not saved_through_remat(jax.lax.tanh_p)
 
 
+@pytest.mark.gpu(reason='needs the fused cudnn kernel, which this backend will not run')
 @pytest.mark.skipif(not cudnn_runs(jnp.zeros((1, 8, 2, 64), jnp.bfloat16)),
                     reason='needs the fused cudnn kernel, which this backend will not run')
 def test_fused_attention_runs_once_per_layer_under_remat():
@@ -301,7 +302,7 @@ def test_a_distillation_recomputes_more_in_its_student_alone_and_resumes_there()
     assert [entry.module.remat for entry in resumed.program_key()] == [REMAT_POLICIES['full'], None]
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs GPU allocator memory statistics")
+@pytest.mark.gpu(reason="needs GPU allocator memory statistics")
 def test_compilation_counts_memory_kept_alive_outside_its_state():
     """A fresh 2 GiB allocator isolates the accounting regression from
     fragmentation left by earlier GPU tests. Its real held buffers force

@@ -573,7 +573,7 @@ def test_a_resumed_run_that_cannot_fit_its_checkpoints_rung_climbs_and_says_so(t
     assert "the rung its checkpoint trained on" in caplog.text
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="CUDA embedding-gradient reductions")
+@pytest.mark.gpu(reason="CUDA embedding-gradient reductions")
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_path, dtype):
     """Repeated token IDs share embedding-gradient updates. CUDA's default
@@ -646,7 +646,7 @@ np.savez(sys.argv[1], *[np.asarray(leaf) for leaf in leaves])
 """
 
 
-@pytest.mark.skipif(jax.default_backend() != "gpu", reason="cuDNN convolution autotuning")
+@pytest.mark.gpu(reason="cuDNN convolution autotuning")
 def test_two_processes_train_a_conv_model_to_the_bit_under_the_repeatable_flags(tmp_path):
     """Autotuning picks a convolution's cuDNN algorithm per process, so only
     a second process shows whether it agrees. Two fresh processes, without a
