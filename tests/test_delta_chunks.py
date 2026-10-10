@@ -68,6 +68,11 @@ def kernel_states(*operands):
     return delta_chunks.chunk_states(*operands, INTERPRETED)
 
 
+def xla_states(key, w, u, gc, state):
+    """`xla_chunk_states` with the kernels' one decay per head."""
+    return xla_chunk_states(key, w, u, gc[..., None], state)
+
+
 # Three chunks of the narrowest product Triton takes, two blocks of value
 # columns; and one row-head at Qwen3.5's widths, four blocks.
 SHAPES = [pytest.param((2, 2, 3, 16, 32, 64), id="narrow"),
@@ -79,7 +84,7 @@ def test_the_kernels_compute_the_xla_recurrence(shape):
     """The state every chunk entered, the corrected values and the state
     leaving the last chunk."""
     operands = recurrence_operands(shape)
-    expected = xla_chunk_states(*operands)
+    expected = xla_states(*operands)
 
     got = kernel_states(*operands)
 
@@ -93,8 +98,8 @@ def test_the_kernels_compute_the_xla_gradients(shape):
     """The reverse recurrence and the products after it against autodiff of
     the scan, for the keys, `w`, the values, the decays and the held state."""
     operands = recurrence_operands(shape)
-    seeded = cotangents(xla_chunk_states(*operands))
-    expected = jax.vjp(xla_chunk_states, *operands)[1](seeded)
+    seeded = cotangents(xla_states(*operands))
+    expected = jax.vjp(xla_states, *operands)[1](seeded)
 
     gradients = jax.vjp(kernel_states, *operands)[1](seeded)
 
@@ -146,17 +151,17 @@ def test_the_kernels_are_as_exact_as_the_xla_scan():
     TF32 and of another fp32, so the kernels' TF32 would be held to the
     scan's fp32 (a 3.05 ratio on `u` on an A100, c43)."""
     operands = recurrence_operands((2, 2, 3, 64, 32, 64))
-    seeded = cotangents(xla_chunk_states(*operands))
+    seeded = cotangents(xla_states(*operands))
     cpu = jax.devices("cpu")[0]
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
         exact = [jax.device_put(np.asarray(t, np.float64), cpu) for t in operands]
-        truth = xla_chunk_states(*exact)
-        truth_gradients = jax.vjp(xla_chunk_states, *exact)[1](
+        truth = xla_states(*exact)
+        truth_gradients = jax.vjp(xla_states, *exact)[1](
             tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded))
 
-    scanned = xla_chunk_states(*operands)
+    scanned = xla_states(*operands)
     states = kernel_states(*operands)
-    scan_gradients = jax.vjp(xla_chunk_states, *operands)[1](seeded)
+    scan_gradients = jax.vjp(xla_states, *operands)[1](seeded)
     kernel_gradients = jax.vjp(kernel_states, *operands)[1](seeded)
 
     names = ("entered", "corrected", "final", "key", "w", "u", "gc", "state")
@@ -173,8 +178,8 @@ def test_auto_takes_the_kernels_where_they_were_measured(monkeypatch, generation
     monkeypatch.setitem(kernels.KERNELS, "gated_delta_rule", {"sm80": "pallas"})
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: generation)
     monkeypatch.setattr(linear, "triton_runs", lambda: gpu)
-    key, _, u, _, _ = recurrence_operands((1, 1, 2, 64, 128, 128))
-    assert chunk_states_kernel("auto", key, u) == chosen
+    key, _, u, gc, _ = recurrence_operands((1, 1, 2, 64, 128, 128))
+    assert chunk_states_kernel("auto", key, u, gc[..., None]) == chosen
 
 
 REFUSED = {
@@ -195,8 +200,8 @@ def test_a_call_the_kernels_cannot_take_runs_the_scan_and_says_why(monkeypatch, 
     monkeypatch.setattr(kernels.generation, "_logged", set())
     monkeypatch.setattr(linear, "triton_runs", lambda: True)
     with jax.enable_x64(new_val=dtype == jnp.float64):
-        key, _, u, _, _ = (jnp.asarray(t, dtype) for t in recurrence_operands(shape))
-        assert [chunk_states_kernel("auto", key, u) for _ in range(2)] == ["xla"] * 2
+        key, _, u, gc, _ = (jnp.asarray(t, dtype) for t in recurrence_operands(shape))
+        assert [chunk_states_kernel("auto", key, u, gc[..., None]) for _ in range(2)] == ["xla"] * 2
     logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
     assert len(logged) == 1 and reason in logged[0], logged
 
@@ -210,7 +215,7 @@ def test_forward_mode_runs_the_scan():
     operands = rule_operands()
     tangents = tuple(jnp.ones_like(t) for t in operands)
     with forward_mode_attention():
-        assert chunk_states_kernel("pallas", operands[1], operands[2]) == "xla"
+        assert chunk_states_kernel("pallas", operands[1], operands[2], operands[3][..., None]) == "xla"
         _, got = jax.jvp(lambda *a: chunk_gated_delta_rule(*a, implementation='pallas'), operands, tangents)
     _, want = jax.jvp(lambda *a: chunk_gated_delta_rule(*a, implementation='xla'), operands, tangents)
     for have, wanted in zip(got, want, strict=True):
@@ -221,10 +226,17 @@ def test_forward_mode_runs_the_scan():
 def test_a_split_batch_runs_the_scan():
     """The kernels see whole arrays; under a mesh that splits the rows they
     would run every row on every device, so the call takes the scan."""
-    key, _, u, _, _ = recurrence_operands((2, 1, 2, 64, 128, 128))
+    key, _, u, gc, _ = recurrence_operands((2, 1, 2, 64, 128, 128))
     with jax.set_mesh(MeshSpec(fsdp=2).build(jax.devices()[:2])):
-        assert chunk_states_kernel("pallas", key, u) == "xla"
-    assert chunk_states_kernel("pallas", key, u) == "pallas"
+        assert chunk_states_kernel("pallas", key, u, gc[..., None]) == "xla"
+    assert chunk_states_kernel("pallas", key, u, gc[..., None]) == "pallas"
+
+
+def test_a_decay_per_key_dimension_runs_the_scan():
+    """The kernels decay per head; a rule decaying per key dimension, Kimi
+    Delta Attention's, takes the scan."""
+    key, _, u, gc, _ = recurrence_operands((1, 1, 2, 64, 128, 128))
+    assert chunk_states_kernel("pallas", key, u, jnp.repeat(gc[..., None], 128, axis=-1)) == "xla"
 
 
 @pytest.mark.skipif(jax.default_backend() != "gpu", reason="the compiled kernels run on CUDA")
