@@ -1036,3 +1036,9 @@ def test_artifact_exclusions_match_incremental_and_final_without_losing_nested_l
     sync.pack_outputs(tmp_path, ["out/"], final, "measurements", excludes)
     assert read(Path(str(final) + ".manifest.json")) == current
     assert (tmp_path / "out/e1/mix/train.jsonl").exists()
+
+
+def test_input_paths_preserve_plus_in_experiment_directories(tmp_path):
+    source = write(tmp_path / "step+profile/entry.json", b"metrics")
+    found = batch.input_paths({"inputs": f"{source} to /content/reference+metadata/", "command": "run"})
+    assert found == [(source, "/content/reference+metadata/entry.json")]
