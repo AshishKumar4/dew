@@ -21,7 +21,15 @@ def token_mu(tokens: int, base_tokens: int, max_tokens: int, base_shift: float, 
     return tokens * slope + (base_shift - slope * base_tokens)
 
 
-class FlowMatchingScheduler(ContinuousNoiseScheduler):
+class RectifiedFlow:
+    """A schedule on the rectified-flow path, x_t = (1 - sigma) x_0 + sigma
+    epsilon: its `rates(t)` are `(1 - sigma, sigma)`. A sampler whose step
+    holds only on that path (`dew.sampling.FlowSDE`) asks for this, whether
+    the schedule is Dew's own (`FlowMatchingScheduler`) or a published
+    source's grid (`dew.diffusion.schedules.source_grids.FlowGrid`)."""
+
+
+class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
     """Rectified flow / conditional flow matching on the linear path.
 
     x_t = (1 - t) * x_0 + t * epsilon for t in [0, 1], so alpha + sigma = 1 and
@@ -52,6 +60,8 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler):
         if density == "mode" and not -1.0 <= mode_scale <= 2.0 / (math.pi - 2.0):
             raise ValueError(f"mode_scale is in [-1, 2 / (pi - 2)], where the map is monotone; "
                              f"got {mode_scale}")
+        if not math.isfinite(shift) or shift <= 0:
+            raise ValueError(f"a rectified-flow timestep shift must be finite and positive, got {shift}")
         self.shift = shift
         self.logit_mean = logit_mean
         self.logit_std = logit_std

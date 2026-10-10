@@ -26,6 +26,7 @@ from dew import records
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
+from dew.diffusion.schedules.flow import RectifiedFlow
 from dew.diffusion.transforms import PredictionTransform
 from dew.records import JSON
 
@@ -173,7 +174,7 @@ class _UniformGrid(_PairedGrid, NoiseScheduler):
         return jnp.ones_like(jnp.asarray(t, jnp.float32))
 
 
-class FlowGrid(_UniformGrid):
+class FlowGrid(_UniformGrid, RectifiedFlow):
     """A rectified-flow grid, where alpha is 1 - sigma.
 
     The source's forward process is x_t = (1 - sigma) x_0 + sigma eps, so
