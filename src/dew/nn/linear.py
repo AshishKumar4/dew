@@ -31,7 +31,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.kernels import delta_chunks, delta_rule
+from dew.nn.kernels import delta_chunks, delta_output, delta_rule
 from dew.nn.scatter import DROPPED
 
 from .attention import FORWARD_MODE, unweighted_rmsnorm
@@ -235,13 +235,15 @@ def _compensated_add(left, right):
     return total, dropped + left_lo + right_lo
 
 
-def chunk_decay(g):
+def chunk_decay(g, *, halves: bool = False):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
     Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
     `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
-    the diagonal, `[..., C, C, F]`.
+    the diagonal, `[..., C, C, F]`. With `halves=True`, return the two halves
+    of the compensated sum instead; kernels form their own pairwise decay
+    on chip, and autodiff of the compensated sum remains in XLA.
 
     The references subtract two fp32 cumulative sums, so every exponent
     carries the rounding of the chunk's whole accumulated magnitude, which
@@ -261,6 +263,8 @@ def chunk_decay(g):
     """
     chunk_size = g.shape[-2]
     hi, lo = jax.lax.associative_scan(_compensated_add, (g, jnp.zeros_like(g)), axis=g.ndim - 2)
+    if halves:
+        return hi, lo
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     diff = ((hi[..., :, None, :] - hi[..., None, :, :]) + (lo[..., :, None, :] - lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
@@ -435,17 +439,36 @@ def chunk_delta_rule(query, key, value, g, beta, state=None,
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    if chunk_states_kernel(implementation, k_c, out_vals, gc) == 'pallas':
+    recurrence = chunk_states_kernel(implementation, k_c, out_vals, gc)
+    if recurrence == 'pallas':
         entered, v_corrected, state = delta_chunks.chunk_states(
             k_c, k_cumdecay, out_vals, gc[..., 0], state, not triton_runs())
     else:
         entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, state)
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
-    core = (q_c * jnp.exp(gc)) @ entered + _paired(q_c, k_c, decay) @ v_corrected
+    if chunk_output_kernel(implementation, recurrence, k_c, v_corrected) == 'pallas':
+        hi, lo = chunk_decay(chunks(g), halves=True)
+        core = delta_output.chunk_output(q_c, k_c, hi[..., 0], lo[..., 0], entered, v_corrected,
+                                         not triton_runs())
+    else:
+        core = (q_c * jnp.exp(gc)) @ entered + _paired(q_c, k_c, decay) @ v_corrected
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
     return core.astype(dtype), state.astype(dtype)
+
+
+def chunk_output_kernel(implementation: str, recurrence: str, key, value) -> str:
+    """The fused output only on a Pallas recurrence: its checks already
+    exclude KDA, forward mode, split operands and unsupported dot shapes.
+    Auto uses its own measured generation choice; explicit Pallas also
+    exercises the output in the CPU interpreter."""
+    chosen = measured_kernel('gated_delta_output', 'xla') if implementation == 'auto' else implementation
+    if chosen != 'pallas':
+        return chosen
+    refusal = first_refusal((recurrence == 'pallas', "the rule's recurrence does not run on Pallas"))
+    refusal = refusal or delta_output.refusal(key, value)
+    return 'pallas' if refusal is None else ran_kernel('gated_delta_output', 'xla', refusal)
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None,

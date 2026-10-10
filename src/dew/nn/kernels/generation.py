@@ -72,6 +72,8 @@ KERNELS: dict[str, dict[str, str]] = {
     # backward took 9.28 against 14.70 ms with 102 kernels against 1181, a GatedDeltaNet layer's
     # 14.60 against 20.68, as near float64 as the scan at either matmul precision.
     'gated_delta_rule': {'sm80': 'pallas'},
+    # Chunk-local output products (dew.nn.kernels.delta_output); explicit Pallas until measured.
+    'gated_delta_output': {},
     # The forward reads bf16 copies of the fp32 weights (dew.training.narrow): Qwen3-0.6B at 1 x 1024
     # runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4 against 125.9 on an A100. A
     # TPU fuses the cast into the matmul.
