@@ -34,6 +34,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import (
@@ -99,6 +100,24 @@ def test_the_chunked_rule_matches_the_reference(reference):
 
     assert largest(out, reference["chunk.output"]) < 1e-5
     assert largest(state, reference["chunk.state"]) < 1e-5
+
+
+def test_the_chunked_rule_rounds_as_close_to_float64_as_the_reference(reference):
+    """The same 70 tokens against the chunked rule evaluated in float64: Dew's
+    fp32 output and final state within twice the RMS distance of
+    `torch_chunk_gated_delta_rule`'s own fp32 ones (tests/reference_error.py),
+    at fp32 products, as the reference's were. Observed ratios @@ (output)
+    and @@ (state)."""
+    rule_inputs = operands(reference)
+    with jax.default_matmul_precision("highest"):
+        out, state = chunk_gated_delta_rule(*rule_inputs)
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        truth, truth_state = chunk_gated_delta_rule(
+            *(jax.device_put(np.asarray(x, np.float64), cpu) for x in rule_inputs))
+
+    assert_as_exact_as_the_reference(out, reference["chunk.output"], truth, "output")
+    assert_as_exact_as_the_reference(state, reference["chunk.state"], truth_state, "state")
 
 
 def test_the_recurrent_rule_matches_the_reference(reference):
