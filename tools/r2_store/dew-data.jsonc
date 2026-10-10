@@ -1,0 +1,10 @@
+// Dew's durable data store: built mixes and their indexes, kept until deleted.
+// `tools/r2_store/provision.sh dew-data`.
+{
+  "name": "dew-data",
+  "main": "worker.js",
+  "compatibility_date": "2026-09-30",
+  "workers_dev": true,
+  "preview_urls": false,
+  "r2_buckets": [{ "binding": "CACHE", "bucket_name": "dew-data" }]
+}
