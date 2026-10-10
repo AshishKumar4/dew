@@ -21,6 +21,7 @@ import dataclasses
 import inspect
 import types
 from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -47,10 +48,17 @@ class Supervised(Objective[Ratio]):
     running statistics among them. A model with no
     starting weights initializes on integer zeros of that shape, which a model
     that embeds ids reads as ids and any other promotes to its own dtype.
+
+    `mode` names the keyword the model's call reads its mode from, `train`
+    for a call `__call__(x, train=False)` whose BatchNorm and Dropout depend
+    on it: the model is called with it True while it trains and False when
+    it is initialized and when a validation pass scores it, which then
+    writes nothing. None calls the model on the sample alone, in whatever
+    mode its call defaults to.
     """
 
     def __init__(self, model: nn.Module | Source[nn.Module], loss: Criterion,
-                 metrics: Sequence[Criterion] = (), *, inputs: InputSpec):
+                 metrics: Sequence[Criterion] = (), *, inputs: InputSpec, mode: str | None = None):
         if inputs.conditions or inputs.mask is not None:
             raise ValueError("Supervised feeds its model the sample field alone; a condition or a mask is "
                              "a generative objective's")
@@ -60,19 +68,30 @@ class Supervised(Objective[Ratio]):
             raise ValueError(f"the metrics' names {sorted(named)} repeat or include loss; each reports under "
                              "its own name")
         self.model = self.bind_model(model)
-        call = inspect.signature(type(self.model).__call__).parameters.values()
-        needed = [parameter.name for parameter in list(call)[2:] if parameter.default is parameter.empty
-                  and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)]
+        call = list(inspect.signature(type(self.model).__call__).parameters.values())[2:]
+        needed = [parameter.name for parameter in call if parameter.default is parameter.empty
+                  and parameter.kind not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+                  and parameter.name != mode]
         if needed:
             raise TypeError(f"Supervised calls its model on the sample alone, and "
                             f"{type(self.model).__name__}'s call also needs {', '.join(needed)}")
+        takes = {parameter.name for parameter in call} | (
+            {mode} if any(parameter.kind is parameter.VAR_KEYWORD for parameter in call) else set())
+        if mode is not None and mode not in takes:
+            raise TypeError(f"mode names {mode!r}, which {type(self.model).__name__}'s call does not take")
         self.criterion = loss
         self.metrics: Mapping[str, Criterion] = named
         self.sample = inputs.sample
         self.inputs = inputs
+        self.mode = mode
+
+    def _called(self, *, training: bool) -> dict[str, Any]:
+        """The mode keyword the model is called with, none without a `mode`."""
+        return {} if self.mode is None else {self.mode: training}
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
-        return self.model.init(key, jnp.zeros((1, *self.sample.shape), jnp.int32))
+        sample = jnp.zeros((1, *self.sample.shape), jnp.int32)
+        return self.model.init(key, sample, **self._called(training=False))
 
     def loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
         # The model's own collections besides its parameters, such as a
@@ -80,14 +99,24 @@ class Supervised(Objective[Ratio]):
         # keeps the updates (`Aux.variables`).
         held = [name for name in variables if name not in ("params", FROZEN)]
         outputs, updates = self.model.apply(variables, batch[self.sample.key], rngs=training_rngs(step.key),
-                                            mutable=held)
+                                            mutable=held, **self._called(training=True))
+        return self._scored(outputs, batch, dict(updates) if held else None)
+
+    def validation_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Ratio, Aux]:
+        """With a `mode`, the model in its evaluation mode, writing nothing; otherwise `loss`."""
+        if self.mode is None:
+            return self.loss(variables, batch, step)
+        outputs = self.model.apply(variables, batch[self.sample.key], **self._called(training=False))
+        return self._scored(outputs, batch, None)
+
+    def _scored(self, outputs: Outputs, batch: Batch, updates: Variables | None) -> tuple[Ratio, Aux]:
         losses = self.criterion(outputs, batch)
         if jnp.ndim(losses) == 0:
             raise ValueError("the loss returns one loss per example, not their mean; Supervised "
                              "takes the mean over the batch's rows itself")
         metrics = {name: self.row_mean(metric(outputs, batch), batch).mean()[0]
                    for name, metric in self.metrics.items()}
-        return self.row_mean(losses, batch), Aux(metrics, variables=dict(updates) if held else None)
+        return self.row_mean(losses, batch), Aux(metrics, variables=updates)
 
 
 def selected(outputs: Outputs, output: tuple[int | str, ...]) -> jax.Array:
