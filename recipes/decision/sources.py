@@ -838,6 +838,176 @@ class Paws(Source):
                        {"paraphrase": "true" if row["label"] == 1 else "false"})
 
 
+def _multilabel(text: str, labels: Sequence[str], true: Sequence[int], instructions: str) -> Example:
+    """One true label is a Choice; otherwise every candidate gets its own independent Noul."""
+    if len(true) == 1:
+        return Example(text, {"label": Choice(instructions, labels)}, {"label": labels[true[0]]})
+    questions = {f"label_{index}": Noul(f"{instructions} Does this label apply? {label}")
+                 for index, label in enumerate(labels)}
+    answers = {f"label_{index}": "true" if index in true else "false" for index in range(len(labels))}
+    return Example(text, questions, answers)
+
+
+@dataclass(frozen=True)
+class GoEmotions(Source):
+    """GoEmotions simplified (google-research-datasets/go_emotions, Apache-2.0), all 28 emotions."""
+
+    weight: float = 1.0
+    revision: str = "add492243ff905527e67aeb8b80c082af02207c3"
+    repo: ClassVar[str] = "google-research-datasets/go_emotions"
+    files: ClassVar[tuple[str, ...]] = ("simplified/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+    label_column: ClassVar[str] = "labels"
+
+    def convert(self, row: dict) -> Example:
+        return _multilabel(row["text"], self.classes, row["labels"], "Which emotion is expressed in the text?")
+
+
+@dataclass(frozen=True)
+class DBpedia(Framed):
+    """DBpedia-14 (fancyzhx/dbpedia_14, CC-BY-SA-3.0), fourteen ontology classes."""
+
+    weight: float = 1.0
+    revision: str = "9abd46cf7fc8b4c64290f26993c540b92aa145ac"
+    repo: ClassVar[str] = "fancyzhx/dbpedia_14"
+    files: ClassVar[tuple[str, ...]] = ("dbpedia_14/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-SA-3.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(f"{row['title']}\n{row['content']}", "Which category describes this entity?",
+                            self.classes, row["label"])
+
+
+@dataclass(frozen=True)
+class CivilComments(Source):
+    """Civil Comments (google/civil_comments, CC0-1.0), annotator fractions for toxicity and subtypes."""
+
+    weight: float = 1.0
+    revision: str = "f2970eb3a55777454c94069077cc8d9b5866312d"
+    repo: ClassVar[str] = "google/civil_comments"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet")
+    licence: ClassVar[str] = "CC0-1.0"
+
+    def convert(self, row: dict) -> Example:
+        names = ("toxicity", "severe_toxicity", "obscene", "threat", "insult", "identity_attack", "sexual_explicit")
+        questions = {name: Noul(f"Does this comment contain {name.replace('_', ' ')}?") for name in names}
+        return Example(row["text"], questions, targets={name: (1 - row[name], row[name]) for name in names})
+
+
+@dataclass(frozen=True)
+class SmsSpam(Source):
+    """SMS Spam Collection (ucirvine/sms_spam, CC-BY-4.0 from UCI), ham versus spam."""
+
+    weight: float = 1.0
+    revision: str = "cae486f927c250fe1d4a5b55f11357964ed1646c"
+    repo: ClassVar[str] = "ucirvine/sms_spam"
+    files: ClassVar[tuple[str, ...]] = ("plain_text/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        return Example(row["sms"], {"spam": Noul("Is this message spam?")},
+                       {"spam": "true" if row["label"] == 1 else "false"})
+
+
+@dataclass(frozen=True)
+class BiasInBios(Framed):
+    """Bias in Bios (LabHC/bias_in_bios, MIT), occupations without the protected attribute as input."""
+
+    weight: float = 1.0
+    revision: str = "052f01de644dba841176e0449528b41f27d94a61"
+    repo: ClassVar[str] = "LabHC/bias_in_bios"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001-0ab65b32c47407e8.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        occupations = ("accountant architect attorney chiropractor comedian composer dentist dietitian dj filmmaker "
+                       "interior_designer journalist model nurse painter paralegal pastor personal_trainer "
+                       "photographer physician poet professor psychologist rapper software_engineer surgeon teacher "
+                       "yoga_teacher").split()
+        return self.example(row["hard_text"], "What is this person's occupation?", occupations, row["profession"])
+
+
+@dataclass(frozen=True)
+class MassiveIntent(Framed):
+    """MASSIVE English intents (SetFit/amazon_massive_intent_en-US, CC-BY-4.0), sixty user intents."""
+
+    weight: float = 1.0
+    revision: str = "f7672a018e8ceb37fc0184dcfbb7e665155ffea6"
+    repo: ClassVar[str] = "SetFit/amazon_massive_intent_en-US"
+    files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    @cached_property
+    def classes(self) -> list[str]:
+        labels = {row["label"]: row["label_text"] for row in _rows(self.repo, self.revision, self.files[0])}
+        return [labels[index] for index in sorted(labels)]
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["text"], "Which intent does this request express?", self.classes, row["label"])
+
+
+@dataclass(frozen=True)
+class Ledgar(Framed):
+    """LEDGAR (coastalcph/lex_glue, CC-BY-4.0), one of a hundred contract clause types."""
+
+    weight: float = 1.0
+    revision: str = "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"
+    repo: ClassVar[str] = "coastalcph/lex_glue"
+    files: ClassVar[tuple[str, ...]] = ("ledgar/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["text"], "Which type of contract clause is this?", self.classes, row["label"])
+
+
+@dataclass(frozen=True)
+class UnfairTos(Source):
+    """Unfair-ToS (coastalcph/lex_glue, CC-BY-4.0), all applicable unfair clause types."""
+
+    weight: float = 1.0
+    revision: str = "c23fdff1a6bf74e0e1a71cb86f1e781d37da888c"
+    repo: ClassVar[str] = "coastalcph/lex_glue"
+    files: ClassVar[tuple[str, ...]] = ("unfair_tos/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+    label_column: ClassVar[str] = "labels"
+
+    def convert(self, row: dict) -> Example:
+        return _multilabel(row["text"], self.classes, row["labels"], "Which unfair clause type applies to this text?")
+
+
+@dataclass(frozen=True)
+class Snips(Framed):
+    """SNIPS (benayas/snips, Apache-2.0), seven labelled personal-assistant intents."""
+
+    weight: float = 1.0
+    revision: str = "16915b895754dd4028068abe52b6851a904977d7"
+    repo: ClassVar[str] = "benayas/snips"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+
+    def convert(self, row: dict) -> Example:
+        labels = ["AddToPlaylist", "BookRestaurant", "GetWeather", "PlayMusic", "RateBook",
+                  "SearchCreativeWork", "SearchScreeningEvent"]
+        return self.example(row["text"], "Which intent does this request express?", labels, labels.index(row["category"]))
+
+
+@dataclass(frozen=True)
+class PhishingEmail(Source):
+    """Phishing Email Detection (zefang-liu/phishing-email-dataset, LGPL-3.0-only), labelled emails."""
+
+    weight: float = 1.0
+    revision: str = "34085a032c123ca237f314a01a67909cdea35e34"
+    repo: ClassVar[str] = "zefang-liu/phishing-email-dataset"
+    files: ClassVar[tuple[str, ...]] = ("Phishing_Email.csv",)
+    licence: ClassVar[str] = "LGPL-3.0-only"
+
+    def convert(self, row: dict) -> Example | None:
+        if not row["Email Text"].strip():
+            return None
+        return Example(row["Email Text"], {"phishing": Noul("Is this email a phishing attempt?")},
+                       {"phishing": "true" if row["Email Type"] == "Phishing Email" else "false"})
+
+
 @dataclass(frozen=True)
 class Mixture:
     """Every source a decision recipe reads, each at its weight; a weight of 0 leaves one out.
