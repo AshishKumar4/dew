@@ -16,7 +16,7 @@ import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
 from dew.data import Dataset
 from dew.objectives import Aux, Objective
-from dew.telemetry.instrumentation import StepFlops
+from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.training import Trainer, WandbTracker
 from dew.training.trainer import _Interval
 
@@ -112,17 +112,19 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
     interval = _Interval(time.time() - 2, last_saved=None, since_log=2, samples=16,
                          flops=StepFlops(model=312e12, hardware=624e12), waited=.02, compiling=.1, compiles=1)
     loss = jnp.asarray(1.)
+    accepted = jnp.asarray(a=True)
+    before = compilation_cache_counts()
     jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
     jax.monitoring.record_event('/jax/compilation_cache/cache_misses')
-    trainer._log_interval(3, loss, {}, jnp.asarray(a=True), state, interval)
+    trainer._log_interval(3, loss, {}, accepted, state, interval)
     row = run.history[-1]
     names = {'train/loss', 'train/learning_rate', 'train/step_time_ms', 'train/data_wait_ms',
              'train/compile_s', 'train/mfu', 'train/hfu', 'train/compiles', 'train/cache_hits',
              'train/cache_misses'}
     assert names <= row.keys()
-    assert row['train/cache_hits'] == first[-1]['train/cache_hits'] + 1
-    assert row['train/cache_misses'] == first[-1]['train/cache_misses'] + 2
+    assert row['train/cache_hits'] == before['train/cache_hits'] + 1
+    assert row['train/cache_misses'] == before['train/cache_misses'] + 2
     assert row['train/hfu'] == pytest.approx(2 * row['train/mfu'])
     assert row['train/compiles'] == 1
     if expected is None:
@@ -132,9 +134,24 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
     sink.close()
 
 
-def test_cache_listener_is_registered_once_across_trainers():
-    from dew.telemetry.instrumentation import compilation_cache_counts
+def test_wandb_counts_each_new_step_shape_once(monkeypatch):
+    import wandb
+    from test_publish import TrackedRun
 
+    run = TrackedRun()
+    monkeypatch.setattr(wandb, 'init', lambda **_: run)
+    with WandbTracker('dew', 'shapes', offline=True) as sink:
+        trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink)
+        data = Dataset(lambda partition: iter(
+            {'target': np.ones((8, columns), np.float32)} for columns in (1, 2, 1, 2)), None, None, 8)
+        trainer.fit(data, steps=4, log_every=1)
+    rows = [row for row in run.history if 'train/loss' in row]
+    assert [row['train/compiles'] for row in rows] == [1, 2, 2, 2]
+    assert rows[1]['train/compile_s'] > 0
+    assert sum(row.get('reporting/type') == 'StepCompiled' for row in run.history) == 2
+
+
+def test_cache_listener_is_registered_once_across_trainers():
     trainers = [Trainer(Squared(), optax.sgd(.1), key=0) for _ in range(3)]
     before = compilation_cache_counts()
     jax.monitoring.record_event('/jax/compilation_cache/cache_hits')
