@@ -141,6 +141,45 @@ def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():
     assert new_error < old_error
 
 
+def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
+    from dew.config import OptimConfig
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1,
+                              num_heads=2, mlp_features=16, max_seq_len=8, qk_norm=False)
+    objective = PPOObjective(model, 5, critic=ValueHead(model), qk_stats=True)
+    optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
+                            optimizer_opts={"qk_clip_threshold": .01}).build(1)
+    trainer = Trainer(objective, optimizer, key=jax.random.key(0))
+    initial = trainer.initial_state()
+    ids = jnp.tile(jnp.arange(6, dtype=jnp.int32), (jax.device_count(), 1))
+    mask = jnp.broadcast_to(jnp.arange(6) >= 3, ids.shape).astype(jnp.float32)
+    batch = {"input_ids": ids, "text_segment_ids": jnp.ones_like(ids),
+             "text_positions": jnp.broadcast_to(jnp.arange(6), ids.shape),
+             "response_mask": mask, "advantages": mask,
+             "behavior_log_probs": jnp.full(ids.shape, -3.),
+             "old_values": jnp.zeros_like(mask), "returns": mask}
+    _, aux = objective.loss(initial.variables, batch, Step(jnp.array(0), jax.random.key(1), None))
+    assert aux.qk_stats is not None and set(aux.qk_stats) == {"policy", "critic"}
+    for name, path in (("policy", ()), ("critic", ("backbone",))):
+        stats = aux.qk_stats[name]
+        for component in path:
+            stats = stats[component]
+        assert np.max(stats["layers_0"]["self_attn"]["max_logits"][0]) > .01
+    start = jax.tree.map(np.asarray, initial.variables["params"])
+    compiled = trainer.compile(initial, batch)
+    final, *_ = compiled(initial, batch)
+    assert int(final.updates) == 1
+    for name, path in (("policy", ()), ("critic", ("backbone",))):
+        before, after = start[name], final.variables["params"][name]
+        for component in path:
+            before, after = before[component], after[component]
+        for projection in ("q_proj", "k_proj"):
+            own = before["layers_0"]["self_attn"][projection]["kernel"]
+            changed = after["layers_0"]["self_attn"][projection]["kernel"]
+            assert np.linalg.norm(changed) < np.linalg.norm(own)
+
+
 @pytest.mark.parametrize("field", [OLD_VALUES_KEY, RETURNS_KEY])
 def test_ppo_refuses_missing_critic_targets(field):
     trainer, rollout = build_ppo()

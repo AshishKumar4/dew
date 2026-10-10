@@ -132,6 +132,32 @@ class Zero(nn.Module):
         return jnp.zeros_like(x) * self.param("w", nn.initializers.ones, ())
 
 
+def test_compiled_samples_follow_the_substituted_denoiser():
+    class Velocity(nn.Module):
+        value: float
+
+        @nn.compact
+        def __call__(self, x, temb, train=False):
+            return jnp.full_like(x, self.value) * self.param("w", nn.initializers.ones, ())
+
+    inputs = InputSpec(Field("image", (2, 2, 1)))
+    objective = DiffusionObjective(Velocity(0.), presets.Flow(), inputs, guidance=None, steps=3)
+    variables = objective.init(jax.random.key(0))
+    batch = {"image": jnp.zeros((2, 2, 2, 1))}
+    step = Step(jnp.array(0), jax.random.key(1), None)
+    before = objective.evaluate(variables, batch, step).images
+    compiled = objective._sample
+    replacement = Velocity(.5)
+    objective.substitute([replacement])
+    after = objective.evaluate(variables, batch, step).images
+    fresh = DiffusionObjective(replacement, presets.Flow(), inputs, guidance=None, steps=3)
+    expected = fresh.evaluate(variables, batch, step).images
+    assert not np.allclose(before, expected)
+    np.testing.assert_array_equal(after, expected)
+    assert objective._sample is not compiled
+    assert objective._sample is objective._sample
+
+
 def test_a_preset_builds_the_same_loss_and_images_as_its_process():
     from dew.sampling import TextToImage
 
