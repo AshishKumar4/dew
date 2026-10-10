@@ -32,7 +32,15 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import bank_sites, entry_tree, in_namespace, layer_index, narrowed, one_layer
+from dew.inference.banks import (
+    bank_sharding,
+    bank_sites,
+    entry_tree,
+    in_namespace,
+    layer_index,
+    narrowed,
+    one_layer,
+)
 from dew.nn.backbones.layer_plan import group_name
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.training.distributed import batch_shardings
@@ -113,8 +121,7 @@ def resident(placement, sites, accelerator):
         kind = BANK_MEMORY if _in_stack(keys, sites) else None
         return NamedSharding(accelerator, sharding.spec, memory_kind=kind)
     placed = jax.tree_util.tree_map_with_path(leaf, placement)
-    return banked(placed, sites, lambda rows, path: NamedSharding(
-        accelerator, P(None, *rows[0].spec), memory_kind=BANK_MEMORY))
+    return banked(placed, sites, lambda rows, path: bank_sharding(rows[0], memory_kind=BANK_MEMORY))
 
 
 def banked(tree, sites, stack, release=None):
@@ -217,9 +224,11 @@ def _drop(tree, keys):
 
 def _bank_shardings(placed, accelerator, count):
     """Place one bank in bank memory, layer axis in front when it stacks rows."""
-    return jax.tree.map(
-        lambda s: NamedSharding(accelerator, P(None, *s.spec) if count > 1 else s.spec,
-                                memory_kind=BANK_MEMORY), placed)
+    def place(sharding):
+        row = NamedSharding(accelerator, sharding.spec, memory_kind=BANK_MEMORY)
+        return bank_sharding(row, memory_kind=BANK_MEMORY) if count > 1 else row
+
+    return jax.tree.map(place, placed)
 
 
 def _replaced(tree, namespace, subtrees):
