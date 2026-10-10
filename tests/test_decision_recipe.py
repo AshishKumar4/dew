@@ -206,3 +206,19 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     answers = decide("charged twice", {"team": team, "urgent": Noul("Is it urgent?")})
     assert answers["team"].choice in team.options and 0 <= answers["urgent"].noul <= 1
     assert math.isfinite(-sum(math.log(value) for value in answers["team"].probabilities))
+
+
+
+def test_a_looped_checkpoint_runs_the_passes_asked_and_another_is_refused():
+    """--loop-steps sets the passes of Ouro's tiny looped decoder, leaving its
+    weights as they were; a decoder that does not loop is refused by name."""
+    from dew.decision.config import looping
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+
+    ouro = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "ouro-tiny", dtype="float32")
+    once = looping(ouro, 1)
+    assert once.model.loop == Loop(1, exit_gate=True) and ouro.model.loop == Loop(3, exit_gate=True)
+    assert once.variables is ouro.variables
+    with pytest.raises(ValueError, match="runs its stack once"):
+        looping(Pretrained.load(QWEN, dtype="float32"), 2)

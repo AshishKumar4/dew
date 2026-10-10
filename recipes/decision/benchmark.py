@@ -225,8 +225,10 @@ def held(run: Path, mixture: Path) -> dict:
         if len(examples) != count["held"]:
             raise ValueError(f"{path} has {len(examples)} rows, but mixture.json records {count['held']}")
         losses, correct = [], []
-        for example in examples:
-            answers = decide(example.state, example.questions)
+        answered = [answers for first in range(0, len(examples), 64)
+                    for answers, _ in decide.batch([(example.state, example.questions)
+                                                    for example in examples[first:first + 64]])]
+        for example, answers in zip(examples, answered, strict=True):
             for name, label in example.labels().items():
                 truth = example.distribution(name)
                 found = answers[name].probabilities

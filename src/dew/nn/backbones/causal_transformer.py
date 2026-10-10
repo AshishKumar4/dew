@@ -1924,6 +1924,11 @@ class CausalTransformer(nn.Module):
         return self.clone(max_seq_len=capacity)
 
     @nn.nowrap
+    def with_passes(self, steps: int) -> Self | None:
+        """This model with its loop run `steps` times; None when its stack does not loop."""
+        return None if self.loop is None else self.clone(loop=dataclasses.replace(self.loop, steps=steps))
+
+    @nn.nowrap
     def recompute_record(self) -> JSON:
         return remat_record(self.remat)
 
