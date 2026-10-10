@@ -11,6 +11,7 @@ uses the current pool's devices. A just-trained state needs no reload; its objec
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
@@ -22,7 +23,7 @@ from etils import epath
 from jax.typing import DTypeLike
 
 from dew.cache import persist_compilations
-from dew.checkpoints import RUN_FILE
+from dew.checkpoints import PYTHON_RUN, RUN_FILE
 from dew.data.text import Tokenizer
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
@@ -85,8 +86,12 @@ def pipeline(
             root, revision = epath.Path(pull_from_hub(source, metadata.name)), None
         else:
             revision = metadata.name
-    if root.is_dir() and (
-            (root / RUN_FILE).is_file() or any(path.name.isdecimal() for path in root.iterdir())):
+    if root.is_dir() and not (root / RUN_FILE).is_file() and any(path.name.isdecimal()
+                                                                for path in root.iterdir()):
+        raise ValueError(f"{source} holds checkpoint steps but no {RUN_FILE}, the record at the root of "
+                         f"every run; a run saved without one gains it at its next save, or write "
+                         f"{json.dumps(PYTHON_RUN)} there for a run defined in Python")
+    if root.is_dir() and (root / RUN_FILE).is_file():
         if revision is not None:
             raise ValueError("revision pins a Hub source; a run directory has checkpoints, selected by step")
         return _from_run(root, mesh=mesh, layout=layout, dtype=dtype,

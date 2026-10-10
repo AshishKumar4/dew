@@ -121,6 +121,21 @@ class Counting(Objective):
                 Aux(metrics={}, variables={"count": {"n": variables["count"]["n"] + 1}}))
 
 
+def test_part_of_a_stored_collection_restores_as_a_bank_reader_asks_for_it(tmp_path):
+    """A template naming one layer of the stored frozen base, as a bank reader's
+    does, reads that layer alone, equal to the whole read's; the content
+    check stays with the whole read."""
+    _, checkpoints, _ = adapted_run(tmp_path / "run", 1)
+    stored = checkpoints.stored()["variables"]
+    whole, _ = checkpoints.restore({"variables": stored})
+    layer = {FROZEN: {"layers_0": stored[FROZEN]["layers_0"]}}
+    part, _ = Checkpoints(str(tmp_path / "run")).restore({"variables": layer})
+    assert jax.tree.structure(part["variables"]) == jax.tree.structure(layer)
+    read = dict(jax.tree_util.tree_leaves_with_path(whole["variables"]))
+    for path, leaf in jax.tree_util.tree_leaves_with_path(part["variables"]):
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(read[path]))
+
+
 def test_a_stored_collection_stays_while_a_kept_step_records_it_and_goes_with_the_last(tmp_path):
     """Keeping one step, the store holds the frozen table and the moving
     count's digest of each step still kept or in flight: a superseded count

@@ -64,19 +64,64 @@ def wandb(monkeypatch):
     return module
 
 
+class TrackedRun(Run):
+    """The run `wandb.init` opens for a config's run: what it logs, ignored, and its artifacts."""
+
+    def __init__(self):
+        super().__init__()
+        self.config, self.summary = types.SimpleNamespace(update=lambda *_, **__: None), {}
+
+    def define_metric(self, *_, **__):
+        pass
+
+    def log(self, *_, **__):
+        pass
+
+    def finish(self, **_):
+        pass
+
+
+def test_what_a_run_writes_after_training_is_published_with_its_checkpoint(tmp_path, wandb):
+    """`after` runs before the final checkpoint is published, so a file it
+    writes into the run, as a decision run's calibrated task, is published
+    beside the step."""
+    from test_instrumentation import Regression, batches
+
+    from dew.config import RunConfig, TrainerConfig, Wandb
+    from dew.data import Dataset, Loading
+
+    run = TrackedRun()
+    wandb.init = lambda **_: run
+    config = RunConfig(trainer=TrainerConfig(
+        name="after", checkpoint_dir=str(tmp_path / "runs"), steps=1, batch_size=8, eval_every=None,
+        checkpoint_every=1, wandb=Wandb(project="dew", offline=True)))
+
+    def calibrate(state, directory):
+        (Path(directory) / "decide.json").write_text("{}")
+
+    batch = next(batches())
+    rows = [{"x": x, "y": y} for x, y in zip(batch["x"], batch["y"], strict=True)]
+    config.train(Regression(), Dataset.from_records(rows, batch=8, loading=Loading(workers=0)), name="after",
+                 after=calibrate)
+    ((artifact, _),) = run.logged
+    assert sorted(name for _, name in artifact.files) == ["decide.json", RUN_FILE]
+
+
 def test_a_local_checkpoint_is_uploaded_with_its_run_spec(tmp_path, wandb):
     run = tmp_path / "flowers"
     step = run / "step_6"
     step.mkdir(parents=True)
     (step / "params").write_text("weights")
     (run / RUN_FILE).write_text("{}")
+    (run / "decide.json").write_text("{}")
     tracker = Tracker()
 
     logged = dew.io.publish(str(step), "flowers", tracker=tracker, aliases=("v1",))
 
     assert logged is not None
     assert logged.dirs == [(str(step), "step_6")] and logged.references == []
-    assert logged.files == [(str(run / RUN_FILE), RUN_FILE)], "the run spec rides with the weights"
+    assert logged.files == [(str(run / "decide.json"), "decide.json"), (str(run / RUN_FILE), RUN_FILE)], \
+        "the run's own files, its spec and what it wrote beside it, ride with the weights"
     assert tracker.run.logged[0][1] == ("latest", "v1")
     assert tracker.run.linked[0][1] == f"{dew.io.REGISTRY}/flowers"
 
@@ -86,8 +131,8 @@ def test_a_bucket_checkpoint_is_referenced_rather_than_uploaded(monkeypatch, tmp
     gs:// path is False, so the spec is found through the path's own parent
     and the reference carries it with no local read."""
     class Uri:
-        """The three things publish asks a path: its parent, a child, and
-        whether it is there. A real gs:// path would need credentials."""
+        """What publish asks a path: its parent, a child, its listing, and
+        whether it is a file. A real gs:// path would need credentials."""
 
         def __init__(self, uri):
             self.uri = str(uri)
@@ -105,6 +150,12 @@ def test_a_bucket_checkpoint_is_referenced_rather_than_uploaded(monkeypatch, tmp
 
         def exists(self):
             return True
+
+        def is_file(self):
+            return self.name == RUN_FILE
+
+        def iterdir(self):
+            return [self / "step_6", self / RUN_FILE]
 
         def read_text(self):
             """The step's Orbax metadata, recording one stored collection."""
@@ -158,6 +209,12 @@ class FileUri:
 
     def exists(self):
         return self.local.exists()
+
+    def is_file(self):
+        return self.local.is_file()
+
+    def iterdir(self):
+        return [FileUri(f"file://{entry}") for entry in self.local.iterdir()]
 
     def read_text(self):
         return self.local.read_text()
@@ -215,7 +272,7 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
             patched.setattr(dew.io.epath, "Path", FileUri)
         logged = dew.io.publish(f"file://{step}" if reference else step, "lora", tracker=Tracker())
     assert isinstance(logged, library.Artifact)
-    assert {name.split("/")[0] for name in logged.manifest.entries} == {"2", FROZEN_STORE}
+    assert {name.split("/")[0] for name in logged.manifest.entries} == {"2", FROZEN_STORE, RUN_FILE}
 
     local = downloaded(logged, tmp_path / "download")
     shutil.rmtree(run)
