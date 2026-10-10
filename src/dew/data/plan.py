@@ -8,6 +8,7 @@ import inspect
 import json
 import logging
 import platform
+import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -53,8 +54,9 @@ class StepIdentity:
         name = f"{module}.{kind.__qualname__}"
         frozen = dataclasses.is_dataclass(step) and not isinstance(step, type)
         declared = identity or (step.identity if isinstance(step, _DeclaredIdentity) else None)
-        unstable = "<lambda>" in name or "<locals>" in name
-        exact = bool(declared) or frozen or not unstable
+        config = repr(step) if frozen else declared or name
+        unstable = any(marker in name or marker in config for marker in ("<lambda>", "<locals>", " at 0x"))
+        exact = bool(declared) or not unstable
         external = not module.startswith("dew.")
         if cache and (not exact or (external and declared is None)
                       or (inspect.isfunction(step) and declared is None)):
@@ -62,7 +64,8 @@ class StepIdentity:
         path = inspect.getsourcefile(kind)
         module_hash = (hashlib.sha256(Path(path).read_bytes()).hexdigest()
                        if external and path is not None and Path(path).is_file() else None)
-        return cls(name, repr(step) if frozen else declared or name, exact, module_hash, declared)
+        config = re.sub(r" at 0x[0-9a-fA-F]+", "", config)
+        return cls(name, config, exact, module_hash, declared)
 
 
 @runtime_checkable

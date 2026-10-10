@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
+import logging
 import math
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import Literal, Protocol, runtime_checkable
@@ -65,6 +66,7 @@ from dew.data.sources.base import Read, ShardManifest, Source
 from dew.records import integer, record
 
 type Rows = pygrain.MapDataset | pygrain.IterDataset
+_log = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -213,6 +215,8 @@ class _Prefix:
                    for stage in self.stages)
 
     def __call__(self, index: int, raw: object) -> tuple[object, ...]:
+        if not isinstance(raw, (Mapping, bytes)) and raw is not None:
+            raise TypeError("a cache source record must be a mapping or encoded bytes")
         held = (raw,)
         for stage in self.stages:
             emitted = []
@@ -272,7 +276,19 @@ class _Memory:
 def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts]) -> Pipeline:
     if isinstance(pipeline.source, Mixture):
         children = tuple(_materialize(child, counts) for child in pipeline.source.pipelines)
-        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+        kept = tuple((child, weight) for child, weight in zip(children, pipeline.source.weights, strict=True)
+                     if isinstance(child.source, Mixture) or len(child.source.records("memory")))
+        omitted = [_name(child) for child in children if all(child is not accepted for accepted, _ in kept)]
+        if omitted:
+            _log.warning("left out of the mixture: %s (zero accepted rows)", ", ".join(omitted))
+        if not kept:
+            raise ValueError(f"no accepted row of {', '.join(_name(child) for child in children)}; raise the row budgets")
+        if len(kept) == 1:
+            child = kept[0][0]
+            return dataclasses.replace(child, stages=(*child.stages, *pipeline.stages))
+        children, weights = zip(*kept, strict=True)
+        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=tuple(children),
+                                                                       weights=tuple(weights)))
     source = pipeline.source
     stored = source.records("memory")
     rows: list[tuple[tuple[int, ...], Batch]] = []
@@ -832,7 +848,12 @@ def compile(train: Pipeline, *, validation: Pipeline | None = None, host: tuple[
         source = train.source
         if isinstance(source, Mixture):
             sizes = [len(child.source.records(read)) for child in source.pipelines if not isinstance(child.source, Mixture)]
-            records = max(math.ceil(size * sum(source.weights) / weight) for size, weight in zip(sizes, source.weights, strict=True))
+            weights = source.weights
+            if source.tokens is not None:
+                facts = [child.source.metadata() for child in source.pipelines if not isinstance(child.source, Mixture)]
+                weights = token_weights([_name(child) for child in source.pipelines], weights, sizes,
+                                        [integer(stated["valid_targets"], "valid_targets") for stated in facts])
+            records = max(math.ceil(size * sum(weights) / weight) for size, weight in zip(sizes, weights, strict=True))
         else:
             records = len(source.records(read))
     return Dataset(training, held_reader, records, batch)
