@@ -3,6 +3,7 @@
 Streamed-bank ownership and placement are Dew execution policies; Optax oracles the updates.
 """
 import dataclasses
+import os
 
 import jax
 import jax.numpy as jnp
@@ -13,12 +14,13 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition
+from dew.data import DataPartition, Dataset, Loading
+from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, freeze, merge
+from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, freeze
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
@@ -84,19 +86,8 @@ def close(left, right, bound=STREAMED_BOUND):
 
 
 def unbanked(tree):
-    """A frozen collection with every run's bank spread back over its
-    layers, `layers_3_7` as `layers_3` through `layers_7`."""
-    spread = {}
-    for name, value in tree.items():
-        layers = group_layers(name) if isinstance(value, dict) else None
-        if layers is None or len(layers) == 1:
-            held = unbanked(value) if isinstance(value, dict) and layers is None else value
-            spread[name] = merge(spread.get(name, {}), held) if isinstance(held, dict) else held
-            continue
-        for offset, index in enumerate(layers):
-            row = jax.tree.map(lambda leaf, offset=offset: np.asarray(leaf)[offset], value)
-            spread[f"layers_{index}"] = merge(spread.get(f"layers_{index}", {}), row)
-    return spread
+    """A frozen collection with every run's bank spread back over its layers, as host arrays."""
+    return spread(tree, lambda leaf, offset: np.asarray(leaf)[offset])
 
 
 class Coupled(Objective):
@@ -453,6 +444,44 @@ def test_streamed_banks_train_a_mixed_frozen_root_decoder_like_the_resident_stac
     equal(prefix, restored)
     resumed = updated(objective(), batch, HOST, checkpoints=Checkpoints(str(tmp_path / "mixed")))
     equal(resumed, updated(objective(), batch, HOST, steps=2))
+
+
+def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_path):
+    """A LoRA run whose frozen base the CPU owns stores it banked; a fresh
+    process loads it through `dew.pipeline` with its layers spread back, its
+    logits those of the trained state, and generates from it."""
+    import json
+    import subprocess
+    import sys
+
+    from dew.lora import LoRA
+
+    base = decoder()
+    adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(
+        base, base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)), key=1)
+    objective = LMObjective(adapter.model, 8, head_chunks=1, ema_decay=None,
+                            variables=jax.tree.map(np.asarray, adapter.variables))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    rows = [{"text": np.arange(1, 10, dtype=np.int32)} for _ in range(8)]
+    trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, checkpoints=checkpoints)
+    data = Dataset.from_records(rows, batch=jax.device_count(), loading=Loading(workers=0))
+    state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=100)
+    checkpoints.wait()
+    assert any(group_layers(name) and len(group_layers(name)) > 1 for name in state.variables[FROZEN])
+    prompt = [[1, 2, 3, 4]]
+    script = (f"import json, dew, jax.numpy as jnp\n"
+              f"task = dew.pipeline({str(tmp_path / 'run')!r}, ema=False)\n"
+              f"logits = task.model.apply(task.variables, jnp.asarray({prompt}))\n"
+              f"tokens = task(jnp.asarray({prompt}), max_new_tokens=2).tokens\n"
+              f"print(json.dumps({{'logits': logits.tolist(), 'tokens': jnp.asarray(tokens).tolist()}}))")
+    done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu"})
+    assert done.returncode == 0, done.stderr[-3000:]
+    loaded = json.loads(done.stdout.strip().splitlines()[-1])
+    trained = {**state.variables, FROZEN: unbanked(state.variables[FROZEN])}
+    expected = objective.model.apply(trained, jnp.asarray(prompt))
+    np.testing.assert_allclose(np.asarray(loaded["logits"]), np.asarray(expected), atol=1e-5)
+    assert np.asarray(loaded["tokens"]).shape[-1] >= 2
 
 
 def multimodal(**overrides):

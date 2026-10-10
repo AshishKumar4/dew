@@ -41,6 +41,7 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew.nn.backbones.decoder_stack import DecoderBank
+from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.hyper_connections import Carried
 from dew.objectives.base import Variables, merge
 
@@ -562,6 +563,54 @@ class StreamedBank:
         with jax.named_scope("ssd_bank_fetch"):
             return io_callback(read, self.shapes(), index, hidden.reshape(-1)[0],
                                sharding=self.device, ordered=True)
+
+
+def spread(tree: Mapping, row=lambda leaf, offset: leaf[offset]) -> dict:
+    """`tree` with every run's bank spread back over its layers: a mapping under
+    a run's name, `layers_3_7`, as `layers_3` through `layers_7`, each leaf the
+    bank's row `row(leaf, offset)` gives (an array's, or a shape's with
+    `row` dropping the axis), beside the leaves a layer holds on its own.
+
+    A CPU-owned training run stores its frozen collection banked
+    (`dew.training.execution.banked`); this is the layer view every reader
+    keyed by `layers_N`, a placement or a model, takes of it.
+    """
+    spread_tree = {}
+    for name, value in tree.items():
+        layers = group_layers(name) if isinstance(value, Mapping) else None
+        if layers is None or len(layers) == 1:
+            held = spread(value, row) if isinstance(value, Mapping) and layers is None else value
+            spread_tree[name] = merge(spread_tree.get(name, {}), held) if isinstance(held, Mapping) else held
+            continue
+        for offset, index in enumerate(layers):
+            rows = jax.tree.map(lambda leaf, offset=offset: row(leaf, offset), value)
+            spread_tree[f"layers_{index}"] = merge(spread_tree.get(f"layers_{index}", {}), rows)
+    return spread_tree
+
+
+def shape_row(leaf: jax.ShapeDtypeStruct, offset: int) -> jax.ShapeDtypeStruct:
+    """One row of a bank's shape (`spread`): the layer axis dropped."""
+    return jax.ShapeDtypeStruct(leaf.shape[1:], leaf.dtype)
+
+
+def banked_placement(tree: Mapping, rows: Mapping) -> dict:
+    """The placement of `tree`, which may hold banks, from `rows`, the placement of
+    its `spread` view: a bank's leaf is its first layer's, the layer axis in front
+    and unsharded."""
+    placed = {}
+    for name, value in tree.items():
+        layers = group_layers(name) if isinstance(value, Mapping) else None
+        if layers is not None and len(layers) > 1:
+            first = rows[f"layers_{layers[0]}"]
+            placed[name] = jax.tree.map(
+                lambda _, sharding: NamedSharding(sharding.mesh, P(None, *sharding.spec),
+                                                  memory_kind=sharding.memory_kind),
+                value, narrowed(first, value))
+        elif isinstance(value, Mapping):
+            placed[name] = banked_placement(value, rows[name])
+        else:
+            placed[name] = rows[name]
+    return placed
 
 
 def narrowed(tree: Mapping, selection: Mapping) -> dict:

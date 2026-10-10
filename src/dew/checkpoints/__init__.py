@@ -1288,13 +1288,23 @@ class Checkpoints:
             checkpointer = ocp.PyTreeCheckpointer()
             stored = dict(_item_metadata(checkpointer.metadata(path)))
             template = None if templates is None else templates.get(name)
+            # A template may ask for part of the collection, as a bank reader does
+            # one layer of a frozen base; the part is read through the same partial
+            # restore a step's own leaves take, and only a whole read can check the
+            # content against the digest the step recorded.
+            whole = template is None or (jax.tree.structure(template) == jax.tree.structure(stored))
+            if not whole:
+                from dew.inference.banks import narrowed
+                stored, template = narrowed(stored, template), narrowed(template, stored)
             restore_args = (jax.tree.map(read, stored) if template is None
                             else jax.tree.map(read, stored, template))
-            tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(restore_args=restore_args))
-            found = _digest(tree)
-            if found != digest:
-                raise ValueError(f"{path} holds content with digest {found}, not the {digest} the step "
-                                 f"recorded for its {name} collection")
+            tree = checkpointer.restore(path, args=ocp.args.PyTreeRestore(
+                item=stored, restore_args=restore_args, partial_restore=not whole))
+            if whole:
+                found = _digest(tree)
+                if found != digest:
+                    raise ValueError(f"{path} holds content with digest {found}, not the {digest} the "
+                                     f"step recorded for its {name} collection")
             if template is not None:
                 tree = jax.tree.map(placed, tree, template)
             values[name] = tree
@@ -1469,7 +1479,8 @@ class Checkpoints:
         Parameter storage conversion applies only to the owner's parameter
         roots; other collections retain their recorded dtypes and placement.
         """
-        from dew.objectives.base import merge
+        from dew.inference.banks import banked_placement, shape_row, spread
+        from dew.objectives.base import FROZEN, merge
         from dew.registry import resolve_dtype
         from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh
 
@@ -1484,9 +1495,17 @@ class Checkpoints:
             template["ema"] = stored["ema"]
         device_mesh = (DefaultMesh() if mesh is None else mesh).build()
         chosen_layout = DefaultLayout() if layout is None else layout
+        # A CPU-owned run stores its frozen collection banked; the layout places
+        # its layers, and each bank reads onto its first layer's placement.
+        frozen = template["variables"].get(FROZEN)
+        rows = template if frozen is None else {
+            **template, "variables": {**template["variables"], FROZEN: spread(frozen, shape_row)}}
         with sharding.boxed(self.boxed(step)):
-            placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in template.items()}
-        chosen_layout.check(template["variables"], placement["variables"], device_mesh)
+            placement = {name: chosen_layout.shardings(device_mesh, tree) for name, tree in rows.items()}
+        chosen_layout.check(rows["variables"], placement["variables"], device_mesh)
+        if frozen is not None:
+            placement["variables"] = {**placement["variables"], FROZEN: banked_placement(
+                frozen, placement["variables"][FROZEN])}
         selected = set()
         if target is not None:
             roots = tuple(tuple(jax.tree_util.DictKey(name) for name in root) for root in parameter_roots)
@@ -1499,6 +1518,8 @@ class Checkpoints:
             template, placement)
         values, _ = self.restore(template, step=step)
         params = values["variables"]
+        if frozen is not None:
+            params = {**params, FROZEN: spread(params[FROZEN])}
         if averaged:
             params = merge(params, values["ema"])
 

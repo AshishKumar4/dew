@@ -215,7 +215,7 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
             patched.setattr(dew.io.epath, "Path", FileUri)
         logged = dew.io.publish(f"file://{step}" if reference else step, "lora", tracker=Tracker())
     assert isinstance(logged, library.Artifact)
-    assert {name.split("/")[0] for name in logged.manifest.entries} == {"2", FROZEN_STORE}
+    assert {name.split("/")[0] for name in logged.manifest.entries} == {"2", FROZEN_STORE, RUN_FILE}
 
     local = downloaded(logged, tmp_path / "download")
     shutil.rmtree(run)
