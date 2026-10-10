@@ -6,42 +6,28 @@
 //   pnpm build && pnpm test
 
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
-import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import { serveDist } from '../scripts/serve-dist.mjs';
 import { live } from '../src/live.mjs';
 
 const dist = fileURLToPath(new URL('../dist/', import.meta.url));
-const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml' };
 // A 1x1 PNG, for the step previews and the result.
 const PNG = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC';
 const SOCKET = 'wss://kernel.test/ws';
 
-let server;
+let site;
 let browser;
 
 before(async () => {
-	server = createServer(async (request, response) => {
-		let file = path.join(dist, decodeURIComponent(new URL(request.url, 'http://x').pathname));
-		if (file.endsWith('/')) file += 'index.html';
-		try {
-			const body = await readFile(file);
-			response.writeHead(200, { 'Content-Type': TYPES[path.extname(file)] ?? 'application/octet-stream' });
-			response.end(body);
-		} catch {
-			response.writeHead(404).end();
-		}
-	});
-	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+	site = await serveDist(dist);
 	browser = await chromium.launch({ channel: 'chrome' });
 });
 
 after(async () => {
 	await browser?.close();
-	server?.close();
+	site?.close();
 });
 
 test('Run sends the editor cell and shows the returned image', async () => {
@@ -76,7 +62,7 @@ test('Run sends the editor cell and shows the returned image', async () => {
 		});
 	});
 
-	await page.goto(`http://127.0.0.1:${server.address().port}/sample/`);
+	await page.goto(`${site.url}sample/`);
 	const editor = page.locator('[data-live-sampler] textarea[data-cell]');
 	const cell = `${await editor.inputValue()}\n# edited`;
 	await editor.fill(cell);
@@ -127,7 +113,7 @@ test('homepage text and diffusion cells run at once in their own contexts of one
 			}
 		});
 	});
-	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	await page.goto(site.url);
 	const editor = page.locator('[data-text-cell]');
 	const edited = `${await editor.inputValue()}\n# edited`;
 	await editor.fill(edited);
@@ -173,7 +159,7 @@ test('a training cell waits its turn on the host, then shows the run', { timeout
 			});
 		});
 	});
-	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	await page.goto(site.url);
 	const panel = page.locator('[data-live-train="finetune"]');
 	await panel.locator('[data-train-run]').click();
 	await page.waitForFunction(() => document.querySelector('[data-live-train="finetune"] [data-train-status]').textContent
@@ -206,7 +192,7 @@ test('a live stream shows nothing while it is blank, then its text without blank
 			});
 		});
 	});
-	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	await page.goto(site.url);
 	const panel = page.locator('[data-live-train="finetune"]');
 	await panel.locator('[data-train-run]').click();
 	const stream = panel.locator('[data-train-output] pre.nb-stream');
@@ -222,7 +208,7 @@ test('a live stream shows nothing while it is blank, then its text without blank
 test('Try it cards stay readable and the local sampler link opens at both widths', async () => {
 	for (const [width, scheme] of [[1440, 'dark'], [390, 'light']]) {
 		const page = await browser.newPage({ viewport: { width, height: 900 }, colorScheme: scheme, reducedMotion: 'reduce' });
-		await page.goto(`http://127.0.0.1:${server.address().port}/`);
+		await page.goto(site.url);
 		const links = page.locator('.try-list a');
 		assert.equal(await links.count(), 3);
 		for (const link of await links.all()) {
@@ -241,7 +227,7 @@ test('editable Python highlighting follows edits, scrolling and theme', async ()
 	const page = await browser.newPage({ viewport: { width: 390, height: 844 } });
 	const errors = [];
 	page.on('pageerror', (error) => errors.push(error.message));
-	await page.goto(`http://127.0.0.1:${server.address().port}/sample/`);
+	await page.goto(`${site.url}sample/`);
 	const editor = page.locator('[data-python-editor]').first();
 	const input = editor.locator('textarea');
 	const source = 'prompt = "a lake"\n# updated\n' + 'value = 1234567890'.repeat(30);
@@ -261,7 +247,7 @@ test('editable Python highlighting follows edits, scrolling and theme', async ()
 
 test('standalone examples copy the edited cell and reset its original text', async () => {
 	const page = await browser.newPage({ permissions: ['clipboard-read', 'clipboard-write'] });
-	await page.goto(`http://127.0.0.1:${server.address().port}/`);
+	await page.goto(site.url);
 	const examples = page.locator('[data-example-editor]');
 	assert.ok(await examples.count() >= 11);
 	const editor = examples.first();
@@ -296,7 +282,7 @@ test('a stale model revision asks for a reload instead of showing a traceback', 
 			socket.send(JSON.stringify({ id: message.id, type: 'done', status: 'error', count: 1 }));
 		});
 	});
-	await page.goto(`http://127.0.0.1:${server.address().port}/sample/`);
+	await page.goto(`${site.url}sample/`);
 	await page.locator('[data-run]').click();
 	await page.waitForFunction(() => document.querySelector('.sampler-stage').dataset.stage === 'error');
 	assert.equal(await page.locator('[data-status]').textContent(), 'This page was updated. Reload it to use the current model.');

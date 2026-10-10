@@ -2,7 +2,7 @@
 
 :root {
 	/* One family for display and UI, and a mono for code. Weight and optical size
-	   set the hierarchy. The preview compares three families (fonts.mjs). */
+	   set the hierarchy. */
 	--dew-font: var(--font-geist);
 	--dew-font-mono: var(--font-geist-mono);
 	--dew-font-display: var(--dew-font);
