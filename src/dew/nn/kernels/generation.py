@@ -66,9 +66,11 @@ KERNELS: dict[str, dict[str, str]] = {
     # decoder, MoE and DiT steps run 0-6% faster; on sm89 decoder steps run 3-10% faster, 3x where the
     # fusions hit a whole-logits head at 4096 tokens. A Mamba-2 mixer loses 7.7% and keeps them.
     'xla_triton_gemm': {'sm80': 'off', 'sm89': 'off'},
-    # The chunked gated delta rule's memory across chunks (dew.nn.kernels.delta_chunks), measured on
-    # no generation yet.
-    'gated_delta_rule': {},
+    # The chunked gated delta rule's memory across chunks (dew.nn.kernels.delta_chunks). At
+    # Qwen3.5-9B's widths (4 x 1280 tokens, 32 heads of 128) on an A100, the rule's forward and
+    # backward took 9.28 against 14.70 ms with 102 kernels against 1181, a GatedDeltaNet layer's
+    # 14.60 against 20.68, as near float64 as the scan at either matmul precision.
+    'gated_delta_rule': {'sm80': 'pallas'},
     # The forward reads bf16 copies of the fp32 weights (dew.training.narrow): Qwen3-0.6B at 1 x 1024
     # runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4 against 125.9 on an A100. A
     # TPU fuses the cast into the matmul.

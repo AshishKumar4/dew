@@ -12,11 +12,11 @@ widths.
 Tolerances and the differences observed, fp32 on CPU:
 
 - the recurrence, both shapes : entered states, corrected values and final
-  state at most @@ apart, relative to their largest entry; tolerance 1e-5
-- its gradients               : at most @@ relative; tolerance 1e-5
-- through the rule            : output and final state @@, the six
-  gradients @@, relative; tolerance 1e-5
-- against float64             : the kernels' RMS distance at most @@ times
+  state at most 4.8e-08 apart, relative to their largest entry; tolerance 1e-5
+- its gradients               : at most 4.0e-07 relative; tolerance 1e-5
+- through the rule            : output and final state 2.6e-08, the six
+  gradients 2.1e-07, relative; tolerance 1e-5
+- against float64             : the kernels' RMS distance at most 1.01 times
   the scan's over every output and gradient; bound 2
   (tests/reference_error.py)
 """
