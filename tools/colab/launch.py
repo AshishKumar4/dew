@@ -1,6 +1,7 @@
 """Launch a pinned packed session with a durable systemd supervisor."""
 
 import argparse
+import json
 import shlex
 import subprocess
 import sys
@@ -20,7 +21,11 @@ def main() -> None:
         parser.error("budget-cu must be finite and positive")
     directory = STATE / "colab-ops" / args.attempt
     driver = [sys.executable, "-m", "tools.colab.ops_driver", args.session, *sys.argv[separator + 1 :]]
-    subprocess.run([*driver, "--dry-run"], cwd=REPO, check=True)
+    prepared = subprocess.run([*driver, "--dry-run"], cwd=REPO, capture_output=True, text=True, check=True)
+    estimated = json.loads(prepared.stdout)["expected_cu"]
+    budget_cu = args.budget_cu if args.budget_cu is not None else estimated * 1.5
+    if not 0 < budget_cu < float("inf"):
+        parser.error("a finite positive session budget is required")
     supervisor = [sys.executable, "-m", "tools.colab.ops_supervisor"]
     reconciler = "dew-colab-ops-reconcile.timer"
     loaded = subprocess.run(
@@ -47,7 +52,12 @@ def main() -> None:
             check=True,
         )
     finalizer = [*supervisor, "--run-dir", str(directory), "--finalize-only"]
-    budget = ["--budget-cu", str(args.budget_cu)] if args.budget_cu is not None else []
+    budget = [
+        "--budget-cu",
+        str(budget_cu),
+        "--budget-source",
+        "explicit" if args.budget_cu is not None else "expected_cu_times_1.5",
+    ]
     subprocess.run(
         [
             "systemd-run",

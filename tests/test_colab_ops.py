@@ -24,6 +24,7 @@ from tools.colab import (
     colab_io as transfer,
     colab_new as allocation,
     colab_sync as sync,
+    launch,
     metadata_capture,
     ops_driver,
     ops_supervisor,
@@ -979,3 +980,34 @@ def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, m
     for expected in (sha, plan["jobs"][0]["commit"]):
         subprocess.run(["git", "-C", str(worker.repo), "cat-file", "-e", expected + "^{commit}"], check=True)
     assert (worker.repo / ".git/shallow").is_file()
+
+
+@pytest.mark.parametrize("expected,explicit", [(0.1, None), (0.7, None), (0.2, 0.08)])
+def test_launcher_always_sets_a_finite_session_budget(tmp_path, monkeypatch, expected, explicit):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    python = binary / "python"
+    python.write_text(f"#!{sys.executable}\nimport json\nprint(json.dumps({{'expected_cu':{expected}}}))\n")
+    python.chmod(0o700)
+    systemctl = binary / "systemctl"
+    systemctl.write_text("#!/bin/sh\nprintf 'loaded\\n'\n")
+    systemctl.chmod(0o700)
+    invoked = tmp_path / "invoked.json"
+    systemd = binary / "systemd-run"
+    systemd.write_text(
+        f"#!{sys.executable}\nimport sys,json,pathlib\n"
+        f"pathlib.Path({str(invoked)!r}).write_text(json.dumps(sys.argv))\n"
+    )
+    systemd.chmod(0o700)
+    monkeypatch.setenv("PATH", str(binary) + ":" + os.environ["PATH"])
+    monkeypatch.setattr(sys, "executable", str(python))
+    budget = ["--budget-cu", str(explicit)] if explicit is not None else []
+    monkeypatch.setattr(
+        sys, "argv", ["launch", "attempt", "gpu", "--rate", "1", *budget, "--", "--root", "batch"]
+    )
+    launch.main()
+    command = json.loads(invoked.read_text())
+    assert float(command[command.index("--budget-cu") + 1]) == pytest.approx(explicit or expected * 1.5)
+    assert command[command.index("--budget-source") + 1] == (
+        "explicit" if explicit else "expected_cu_times_1.5"
+    )
