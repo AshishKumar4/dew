@@ -64,6 +64,47 @@ def wandb(monkeypatch):
     return module
 
 
+class TrackedRun(Run):
+    """The run `wandb.init` opens for a config's run: what it logs, ignored, and its artifacts."""
+
+    def __init__(self):
+        super().__init__()
+        self.config, self.summary = types.SimpleNamespace(update=lambda *_, **__: None), {}
+
+    def define_metric(self, *_, **__):
+        pass
+
+    def log(self, *_, **__):
+        pass
+
+    def finish(self, **_):
+        pass
+
+
+def test_what_a_run_writes_after_training_is_published_with_its_checkpoint(tmp_path, wandb):
+    """`after` runs before the final checkpoint is published, so a file it
+    writes into the run, as a decision run's calibrated task, is published
+    beside the step."""
+    from test_instrumentation import Regression, batches
+
+    from dew.config import RunConfig, TrainerConfig, Wandb
+    from dew.data import Dataset
+
+    run = TrackedRun()
+    wandb.init = lambda **_: run
+    config = RunConfig(trainer=TrainerConfig(
+        name="after", checkpoint_dir=str(tmp_path / "runs"), steps=1, batch_size=8, eval_every=None,
+        checkpoint_every=1, wandb=Wandb(project="dew", offline=True)))
+
+    def calibrate(state, directory):
+        (Path(directory) / "decide.json").write_text("{}")
+
+    config.train(Regression(), Dataset(lambda partition: batches(), None, None, 8), name="after",
+                 after=calibrate)
+    ((artifact, _),) = run.logged
+    assert sorted(name for _, name in artifact.files) == ["decide.json", RUN_FILE]
+
+
 def test_a_local_checkpoint_is_uploaded_with_its_run_spec(tmp_path, wandb):
     run = tmp_path / "flowers"
     step = run / "step_6"

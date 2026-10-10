@@ -677,7 +677,11 @@ def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> di
         if isinstance(collections, Mapping):
             collections = dict(collections)
             held[tree] = {name: collections.pop(name) for name in names if name in collections}
-            state_tree[tree] = collections
+            # A template asking for stored collections alone leaves no tree for the step to read.
+            if collections:
+                state_tree[tree] = collections
+            else:
+                del state_tree[tree]
     return held
 
 
@@ -1252,9 +1256,9 @@ class Checkpoints:
         back into its tree, onto `held`'s templates (`_held_apart`) or, with
         none, as host arrays."""
         for tree, names in frozen.items():
-            collections = restored.get(tree)
+            templates = None if held is None else held.get(tree, {})
+            collections = restored.get(tree, {} if templates else None)
             if isinstance(collections, Mapping):
-                templates = None if held is None else held.get(tree, {})
                 wanted = names if templates is None else {name: names[name] for name in templates}
                 restored[tree] = {**collections, **self._frozen_values(wanted, templates)}
         return restored
@@ -1293,7 +1297,7 @@ class Checkpoints:
             # restore a step's own leaves take, and only a whole read can check the
             # content against the digest the step recorded.
             whole = template is None or (jax.tree.structure(template) == jax.tree.structure(stored))
-            if not whole:
+            if template is not None and not whole:
                 from dew.inference.banks import narrowed
                 stored, template = narrowed(stored, template), narrowed(template, stored)
             restore_args = (jax.tree.map(read, stored) if template is None

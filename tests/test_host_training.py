@@ -472,7 +472,7 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
     script = (f"import json, dew, jax.numpy as jnp\n"
               f"task = dew.pipeline({str(tmp_path / 'run')!r}, ema=False)\n"
               f"logits = task.model.apply(task.variables, jnp.asarray({prompt}))\n"
-              f"tokens = task(jnp.asarray({prompt}), max_new_tokens=2).tokens\n"
+              f"tokens = task(jnp.asarray({prompt}), max_new_tokens=2, key=0).tokens\n"
               f"print(json.dumps({{'logits': logits.tolist(), 'tokens': jnp.asarray(tokens).tolist()}}))")
     done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
