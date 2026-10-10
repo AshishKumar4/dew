@@ -336,6 +336,13 @@ class GRPOObjective(LMObjective):
             raise ValueError(f"session-mean aggregation reads {SESSION_WEIGHTS_KEY} from pack")
         return terms.session_weights * keep * (effective != 0)
 
+    def validation_loss(self, variables, batch, step):
+        """Score the source prompts' NLL, not the surrogate's rollout-only fields."""
+        scores = self.evaluate(variables, batch, step)
+        assert scores.weights is not None
+        return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
+                     self.row_mean(scores.weights, batch).total)
+
     def evaluate(self, params, batch, step):
         """Return the per-token scores of the prompts under the policy, for their perplexity.
 
