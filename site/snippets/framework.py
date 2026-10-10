@@ -308,7 +308,7 @@ def profile():
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                       profile=ProfileWindow("profile", steps=2))
-    trainer.fit(data, steps=5)
+    state = trainer.fit(data, steps=5)
     # End snippet: profile
     assert any(Path("profile").rglob("*.xplane.pb"))
     return {"profile": "profile"}
