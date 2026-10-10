@@ -21,6 +21,7 @@ import dataclasses
 import inspect
 import types
 from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -84,7 +85,7 @@ class Supervised(Objective[Ratio]):
         self.inputs = inputs
         self.mode = mode
 
-    def _called(self, *, training: bool) -> dict[str, bool]:
+    def _called(self, *, training: bool) -> dict[str, Any]:
         """The mode keyword the model is called with, none without a `mode`."""
         return {} if self.mode is None else {self.mode: training}
 

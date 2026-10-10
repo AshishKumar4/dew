@@ -252,7 +252,7 @@ def test_a_model_with_a_training_mode_trains_in_it_and_is_scored_out_of_it():
     writes nothing. Without it the model keeps its call's default."""
     moded = Supervised(Moded(), squared, inputs=INPUTS, mode="train")
     variables = moded.init(jax.random.key(0))
-    batch = {"x": jnp.full((4, 3), 5.0)}
+    batch = {"x": jnp.full((4, 3), 5.0), "y": jnp.zeros((4, 3))}
     _, aux = moded.loss(variables, batch, Step(jnp.int32(0), jax.random.key(1), None))
     np.testing.assert_allclose(aux.variables["batch_stats"]["BatchNorm_0"]["mean"], 2.5)
     first, second = (moded.validation_loss(variables, batch, Step(jnp.int32(0), jax.random.key(seed), None))
