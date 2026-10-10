@@ -145,7 +145,8 @@ def _unit(text: str, salt: str) -> float:
 class Source:
     """One labelled set: a positive `weight` enables it and weight 0 leaves it out.
 
-    `limit` caps the training examples, drawn with `seed`, and `held` holds that
+    `limit` caps the training examples, drawn with `seed` (None follows the
+    conversion cap), and `held` holds that
     many back for validation and calibration. With no count, hold out 2% of
     the examples (rounded down), at least 50 and at most 2,000, and never
     more than half of them, so a small set still trains. An explicit zero
@@ -407,7 +408,7 @@ class Intents(Framed):
     """BANKING77's training requests (mteb/banking77, CC BY 4.0), each asking its intent among all 77."""
 
     most: int | None = 24
-    weight: float = 0.04
+    weight: float = 1.0
     revision: str = "18072d2685ea682290f7b8924d94c62acc19c0b2"
     repo: ClassVar[str] = "mteb/banking77"
     licence: ClassVar[str] = "CC-BY-4.0"
@@ -424,7 +425,7 @@ class Clinc(Framed):
     """CLINC150's training queries (clinc/clinc_oos `plus`, CC BY 3.0): 150 intents and out-of-scope."""
 
     most: int | None = 24
-    weight: float = 0.04
+    weight: float = 1.0
     revision: str = "155b9c710419136e17307b80d0a13e68cd46b4ec"
     repo: ClassVar[str] = "clinc/clinc_oos"
     licence: ClassVar[str] = "CC-BY-3.0"
@@ -444,7 +445,7 @@ class Clinc(Framed):
 class Wanli(Framed):
     """WANLI's training pairs (alisawuffles/WANLI, CC BY 4.0): entailment, neutral or contradiction."""
 
-    weight: float = 0.08
+    weight: float = 1.0
     revision: str = "61c95318fd71c55b6ba355d76253254615f387ec"
     repo: ClassVar[str] = "alisawuffles/WANLI"
     files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
@@ -463,7 +464,7 @@ class Wanli(Framed):
 class Arc(Framed):
     """ARC's Easy and Challenge training questions (allenai/ai2_arc, CC BY-SA 4.0)."""
 
-    weight: float = 0.03
+    weight: float = 1.0
     revision: str = "210d026faf9955653af8916fad021475a3f00453"
     repo: ClassVar[str] = "allenai/ai2_arc"
     licence: ClassVar[str] = "CC-BY-SA-4.0"
@@ -483,7 +484,7 @@ class Arc(Framed):
 class BoolQ(Source):
     """BoolQ's training questions (google/boolq, CC BY-SA 3.0): a passage and a yes-or-no question."""
 
-    weight: float = 0.05
+    weight: float = 1.0
     revision: str = "35b264d03638db9f4ce671b711558bf7ff0f80d5"
     repo: ClassVar[str] = "google/boolq"
     licence: ClassVar[str] = "CC-BY-SA-3.0"
@@ -509,7 +510,7 @@ class Gsm8k(Framed):
     do not give the answer away.
     """
 
-    weight: float = 0.03
+    weight: float = 1.0
     revision: str = "740312add88f781978c0658806c59bc2815b9866"
     repo: ClassVar[str] = "openai/gsm8k"
     licence: ClassVar[str] = "MIT"

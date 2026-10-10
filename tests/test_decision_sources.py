@@ -368,6 +368,11 @@ def test_framed_classifiers(sources, monkeypatch, name, input_row, state, instru
     assert example.questions["answer"].wire() == {
         "type": "choice", "instructions": instructions, "criteria": dict.fromkeys(labels)}
     assert example.answers == {"answer": gold}
+    column = "profession" if name == "BiasInBios" else "category" if name == "Snips" else "label"
+    second = source.convert({**input_row, column: labels[-1] if name == "Snips" else len(labels) - 1})
+    assert second.state == state
+    assert second.questions == example.questions
+    assert second.answers == {"answer": labels[-1]}
 
 
 @pytest.mark.parametrize(("name", "count"), [("Qasc", 8), ("CommonsenseQA", 5)])
@@ -474,6 +479,9 @@ def test_lavoir_keeps_exact_posteriors_in_option_order_and_hides_profiles(source
     assert example.state == state
     assert example.questions["route"].wire() == question
     assert example.targets == {"route": (.25, .75)} and not example.answers
+    certain = sources.Lavoir().convert({"state": state, "question": question, "target": {"a": 1., "b": 0.}})
+    assert certain.state == state and certain.questions["route"].wire() == question
+    assert certain.targets == {"route": (1., 0.)}
 
 
 def test_winogrande_reproduces_the_kits_empty_state_and_letter_options(sources):
