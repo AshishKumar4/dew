@@ -140,9 +140,11 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     assert set(decide.calibration.temperatures.types) == {"choice"}
     team = Choice("Which team?", {"billing": "payments", "technical": "outages", "sales": "pricing"})
     assert decide("charged twice", {"team": team})["team"].choice in team.options
-    hard = [{**rows[1], "targets": {}, "answers": {"team": "technical"}},
+    # A state may hold a line separator that is not a newline, which a row's JSON keeps raw.
+    hard = [{**rows[1], "state": "charged\u2028twice", "targets": {}, "answers": {"team": "technical"}},
             {**rows[2], "targets": {}, "answers": {"team": "billing"}}]
-    (mixture / "hard.held.jsonl").write_text("".join(json.dumps(row) + "\n" for row in hard))
+    written = "".join(json.dumps(row, ensure_ascii=False) + "\n" for row in hard)
+    (mixture / "hard.held.jsonl").write_text(written)
     made["rows"]["hard"] = {"train": 0, "held": len(hard)}
     (mixture / "mixture.json").write_text(json.dumps(made))
     benchmark = _module("benchmark")
@@ -153,7 +155,7 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
     for source, metrics in scored["sources"].items():
         assert set(metrics) == {"rows", "questions", "log_loss", "infinite", "accuracy"}
         expected = []
-        for line in (mixture / f"{source}.held.jsonl").read_text().splitlines():
+        for line in (mixture / f"{source}.held.jsonl").read_text().split("\n")[:-1]:
             example = Example.of(json.loads(line))
             probabilities = decide(example.state, example.questions)["team"].probabilities
             target = example.distribution("team")
