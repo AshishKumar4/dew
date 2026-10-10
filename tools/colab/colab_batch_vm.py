@@ -67,8 +67,20 @@ def join_parts(root: Path, parts: list[str], target: Path, expected: str) -> Non
 
 def install(venv: Path, tree: Path, log: Path) -> None:
     declared = tomllib.loads((tree / "pyproject.toml").read_text())["project"]["optional-dependencies"]
-    gpu = command(["nvidia-smi", "--query-gpu=driver_version", "--format=csv,noheader"], timeout=30).stdout
-    cuda = "cuda13" if int(gpu.strip().split(".")[0]) >= 580 else "cuda12"
+    gpu = command(
+        ["nvidia-smi", "--query-gpu=driver_version,compute_cap", "--format=csv,noheader"], timeout=30
+    ).stdout
+    driver, compute = gpu.strip().splitlines()[0].split(",")
+    major = int(driver.split(".")[0])
+    sm = tuple(map(int, compute.strip().split(".")))
+    # Bootstrap precedes importing Dew. These are the floors documented by
+    # dew.telemetry.devices.CUDA_BUILDS and JAX's installation guide.
+    if major >= 580 and sm >= (7, 5):
+        cuda = "cuda13"
+    elif major >= 525 and sm >= (5, 2):
+        cuda = "cuda12"
+    else:
+        raise ValueError(f"unsupported CUDA driver/SM: {gpu.strip()}")
     extras = [
         item
         for item in ("test", "av", "tfds", "metrics", "plots", "inference-clients", "vision", "profile")
@@ -185,13 +197,38 @@ class Batch:
         save(self.root / "progress.json", self.progress)
 
     def prepare(self) -> None:
-        bundle = self.root / "dew.bundle"
-        join_parts(self.root, self.plan["bundle_parts"], bundle, self.plan["bundle_sha256"])
         command(["git", "init", "-q", str(self.repo)], timeout=30)
-        command(
-            ["git", "-C", str(self.repo), "fetch", "-q", str(bundle), f"{self.plan['refs']}*:refs/colab/*"],
-            timeout=300,
-        )
+        for sha in self.plan["fetch_commits"]:
+            command(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo),
+                    "fetch",
+                    "--depth=1",
+                    "-q",
+                    self.plan["origin"],
+                    f"{sha}:refs/colab/{sha}",
+                ],
+                timeout=300,
+            )
+        if self.plan.get("bundle_parts"):
+            bundle = self.root / "dew.bundle"
+            join_parts(self.root, self.plan["bundle_parts"], bundle, self.plan["bundle_sha256"])
+            command(
+                [
+                    "git",
+                    "-C",
+                    str(self.repo),
+                    "fetch",
+                    "-q",
+                    str(bundle),
+                    f"{self.plan['refs']}*:refs/colab/*",
+                ],
+                timeout=300,
+            )
+        for key, sha in self.plan["source_refs"].items():
+            command(["git", "-C", str(self.repo), "update-ref", "refs/colab/" + key, sha], timeout=30)
         for target, source in self.plan["uploads"].items():
             join_parts(self.root, source["parts"], Path(target).expanduser(), source["sha256"])
         if shutil.which("uv") is None:

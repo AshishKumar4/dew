@@ -2,6 +2,7 @@
 
 import base64
 import hashlib
+import multiprocessing
 import os
 import re
 import time
@@ -16,6 +17,30 @@ from tools.colab.common import read, save
 
 
 def capture(run_dir: Path, plan: dict, session: Session, remote_root: str, seconds: float = 60) -> dict:
+    journal = run_dir / "emergency-metadata/capture.json"
+    if journal.exists():
+        return read(journal)
+    if seconds <= 0:
+        return _capture(run_dir, plan, session, remote_root, seconds)
+    # Requests' read timeout measures inactivity, so a slow response can outlive
+    # it. The supervisor owns a separate process with a whole-capture deadline.
+    worker = multiprocessing.get_context("fork").Process(
+        target=_capture, args=(run_dir, plan, session, remote_root, seconds)
+    )
+    worker.start()
+    worker.join(min(60, seconds))
+    timed_out = worker.is_alive()
+    if timed_out:
+        worker.kill()
+        worker.join(timeout=1)
+    receipt = read(journal)
+    receipt.update(timed_out=timed_out, capture_exit=worker.exitcode, driver_sha=plan["driver_sha"])
+    save(journal, receipt)
+    worker.close()
+    return receipt
+
+
+def _capture(run_dir: Path, plan: dict, session: Session, remote_root: str, seconds: float) -> dict:
     root = Path(run_dir) / "emergency-metadata"
     root.mkdir(parents=True, exist_ok=True)
     receipt = {

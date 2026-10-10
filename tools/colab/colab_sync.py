@@ -1,5 +1,6 @@
 """Incremental job output snapshots, retained locally for re-release."""
 
+import errno
 import glob
 import hashlib
 import json
@@ -178,7 +179,7 @@ def apply_snapshot(archive, output, current, known=None, manifest=None):
         os.replace(temporary, manifest)
 
 
-def pack_retained(cache, archive):
+def retained_files(cache):
     """Only acknowledged bytes may be sent back to a fresh runtime."""
     cache = Path(cache)
     acknowledged = json.loads((cache / "manifest.json").read_text())
@@ -204,7 +205,32 @@ def pack_retained(cache, archive):
             if hashlib.file_digest(stream, "sha256").hexdigest() != expected:
                 raise ValueError(f"unacknowledged retained artifact: {name}; resync required")
         files[name] = file
-    return pack_files(files, archive)
+    return files
+
+
+def pack_retained(cache, archive):
+    return pack_files(retained_files(cache), archive)
+
+
+def publish_retained(cache, output):
+    """Publish only the acknowledged manifest, excluding stale cached outputs."""
+    output = Path(output)
+    for name, file in retained_files(cache).items():
+        target = output / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(target.name + ".publish")
+        try:
+            try:
+                os.link(file, temporary)
+            except OSError as error:
+                if error.errno != errno.EXDEV:
+                    raise
+                # Retained caches may live on the data disk, while integration
+                # receipts live on the home filesystem.
+                shutil.copyfile(file, temporary)
+            os.replace(temporary, target)
+        finally:
+            temporary.unlink(missing_ok=True)
 
 
 def restore(archive, tree, patterns):
@@ -236,5 +262,5 @@ def restore(archive, tree, patterns):
                 shutil.copyfileobj(source, destination)
 
 
-def retained_key(device, ref, lane, outputs):
-    return hashlib.sha256(json.dumps([device, ref, lane, outputs]).encode()).hexdigest()
+def retained_key(commit: str, identity: dict) -> str:
+    return hashlib.sha256(json.dumps([commit, identity], sort_keys=True).encode()).hexdigest()

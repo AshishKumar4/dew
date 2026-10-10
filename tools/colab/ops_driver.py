@@ -3,15 +3,20 @@
 import argparse
 import json
 import os
-import shutil
 import sys
 import threading
 import time
 from pathlib import Path
 
+import requests
+
 from tools.colab import colab_batch, colab_io, colab_sync
 from tools.colab.colab_new import Colab, Session
 from tools.colab.common import STATE, command, name, read, redact, save
+
+
+class TransportError(RuntimeError):
+    """A control channel failed without evidence that the workload stopped."""
 
 
 class Driver:
@@ -32,13 +37,19 @@ class Driver:
         runtime = self.client.kernel(session)
         self.record(action="control", action_deadline=time.time() + timeout + 30)
         try:
-            outputs = runtime.execute_code(script, timeout=timeout)
+            try:
+                outputs = runtime.execute_code(script, timeout=timeout)
+            except Exception as error:
+                raise TransportError(type(error).__name__) from error
             errors = [item for item in outputs if item.get("output_type") == "error"]
             if errors:
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)
         finally:
-            runtime.stop(shutdown_kernel=True)
+            try:
+                runtime.stop(shutdown_kernel=True)
+            except Exception as error:
+                self.record(control_cleanup_error=type(error).__name__)
             self.record(action="poll", action_deadline=None)
 
     def upload(self, session_name: str, source: Path, remote: str) -> None:
@@ -136,18 +147,11 @@ class Driver:
 
     def collect(self, session: Session, remote: str, plan: dict, job: dict, status: dict) -> None:
         cache = self.sync(session, remote, job)
-        target = (
-            STATE
-            / "integration"
-            / plan["base"]
-            / job["lane"]
-            / (plan["device"] + "-" + self.run_dir.name + f"-job-{job['index']}")
-        )
+        target = colab_batch.artifact_path(plan, self.run_dir.name, job)
         target.mkdir(parents=True, exist_ok=True)
         for filename in ("status.json", "run.log"):
             colab_io.download(session, remote + f"/job-{job['index']}/" + filename, target / filename)
-        if not (target / "outputs").exists():
-            shutil.copytree(cache / "outputs", target / "outputs", copy_function=os.link)
+        colab_sync.publish_retained(cache, target / "outputs")
         result = {
             "index": job["index"],
             "lane": job["lane"],
@@ -166,38 +170,57 @@ class Driver:
     def poll(self, endpoint: str, remote: str, plan: dict) -> None:
         collected = set()
         synced = {}
-        progress: dict
+        failures = 0
         while True:
             try:
-                session = self.client.session(endpoint)
-            except LookupError:
-                raise RuntimeError("owned assignment disappeared; no retry") from None
-            try:
-                progress = json.loads(
-                    colab_io.content_bytes(
-                        colab_io.contents(session, remote + "/progress.json", content=True)
-                    )
+                finished = self.poll_once(endpoint, remote, plan, collected, synced)
+                failures = 0
+                if finished:
+                    return
+                time.sleep(30)
+            except (requests.RequestException, TransportError, ConnectionError, TimeoutError) as error:
+                failures += 1
+                delay = min(30, 2 ** min(failures, 5))
+                self.record(
+                    transport_error=type(error).__name__,
+                    consecutive_transport_failures=failures,
+                    retry_seconds=delay,
+                    action="poll",
+                    action_deadline=None,
                 )
-            except FileNotFoundError:
-                progress = {"phase": "starting"}
-            self.record(progress=progress)
-            for job in plan["jobs"]:
-                index = job["index"]
-                status = progress.get("jobs", {}).get(str(index), {})
-                if index in collected:
-                    continue
-                if status.get("artifact_manifest"):
-                    self.collect(session, remote, plan, job, status)
-                    collected.add(index)
-                elif status and time.monotonic() - synced.get(index, 0) >= 600:
-                    self.sync(session, remote, job)
-                    synced[index] = time.monotonic()
-            if progress.get("phase") in ("done", "failed"):
-                self.preamble(session, remote, plan, progress)
-                if progress["phase"] == "failed":
-                    raise RuntimeError("VM batch failed: " + progress.get("error", "unknown cause"))
-                return
-            time.sleep(30)
+                time.sleep(delay)
+
+    def poll_once(self, endpoint: str, remote: str, plan: dict, collected: set, synced: dict) -> bool:
+        progress: dict
+        try:
+            session = self.client.session(endpoint)
+        except LookupError:
+            # Independent supervisor checks decide whether absence is real.
+            raise TransportError("assignment lookup absent; awaiting supervisor confirmation") from None
+        try:
+            progress = json.loads(
+                colab_io.content_bytes(colab_io.contents(session, remote + "/progress.json", content=True))
+            )
+        except FileNotFoundError:
+            progress = {"phase": "starting"}
+        self.record(progress=progress)
+        for job in plan["jobs"]:
+            index = job["index"]
+            status = progress.get("jobs", {}).get(str(index), {})
+            if index in collected:
+                continue
+            if status.get("artifact_manifest"):
+                self.collect(session, remote, plan, job, status)
+                collected.add(index)
+            elif status and time.monotonic() - synced.get(index, 0) >= 600:
+                self.sync(session, remote, job)
+                synced[index] = time.monotonic()
+        if progress.get("phase") in ("done", "failed"):
+            self.preamble(session, remote, plan, progress)
+            if progress["phase"] == "failed":
+                raise RuntimeError("VM batch failed: " + progress.get("error", "unknown cause"))
+            return True
+        return False
 
     def preamble(self, session: Session, remote: str, plan: dict, progress: dict) -> None:
         receipt = progress.get("profile_preamble", {"attempted": False})

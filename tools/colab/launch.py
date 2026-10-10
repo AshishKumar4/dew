@@ -23,8 +23,15 @@ def main() -> None:
     subprocess.run([*driver, "--dry-run"], cwd=REPO, check=True)
     supervisor = [sys.executable, "-m", "tools.colab.ops_supervisor"]
     reconciler = "dew-colab-ops-reconcile.timer"
-    active = subprocess.run(["systemctl", "--user", "is-active", "--quiet", reconciler], check=False)
-    if active.returncode:
+    loaded = subprocess.run(
+        ["systemctl", "--user", "show", "--property=LoadState", "--value", reconciler],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    if loaded.stdout.strip() == "loaded":
+        subprocess.run(["systemctl", "--user", "start", reconciler], check=True)
+    else:
         subprocess.run(
             [
                 "systemd-run",
