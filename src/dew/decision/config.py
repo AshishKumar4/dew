@@ -198,17 +198,20 @@ def _fitting(objective: DecisionObjective, weighted: dict[str, Weighted],
     A joint row holds every question of an example, and one whose questions
     alone pass the layout's `max_len` cannot be laid out at all: it is dropped
     and counted here, rather than stopping the run when a worker reaches it. A
-    layout of one row per question lays out every example.
+    layout of one row per question lays out every example. The check reads a
+    row's schema alone (`JointLayout.fits`), once for each schema the mix
+    holds, since a set's rows mostly ask the same questions.
     """
-    if not objective.layout.joint:
+    layout = objective.layout
+    if not layout.joint:
         return weighted, held, {}
+    known: dict[str, bool] = {}
 
     def fits(example: Example) -> bool:
-        try:
-            objective.layout.rows(objective.tokenizer, objective.specials, example.state, example.questions)
-        except ValueError:
-            return False
-        return True
+        schema = repr(example.questions)
+        if schema not in known:
+            known[schema] = layout.fits(objective.tokenizer, example.questions)
+        return known[schema]
 
     kept, unfit = {}, {}
     for name, entry in weighted.items():

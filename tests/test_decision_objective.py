@@ -413,3 +413,33 @@ def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_
     live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
     np.testing.assert_array_equal(live("charged twice!", {"team": INTENT})["team"].probabilities,
                                   reloaded("charged twice!", {"team": INTENT})["team"].probabilities)
+
+
+def test_a_joint_rows_fit_is_read_from_its_schema_as_laying_it_out_finds():
+    """A joint row lays out exactly when its schema leaves room, whatever its
+    state, which the layout cuts: `fits` reads the schema alone and agrees
+    with `rows` on every case, a long state, a schema at the edge and one past it."""
+    from dew.decision import JointLayout
+    from dew.decision.config import _fitting
+    from dew.decision.data import Weighted
+
+    layout = JointLayout(max_len=900)
+    wide = Choice("Which code?", {f"code-{index}": f"the {index}th code" for index in range(60)})
+    narrow = Choice("Which code?", {f"code-{index}": f"the {index}th code" for index in range(12)})
+    cases = [Example("x" * 5000, {"team": INTENT}), Example("short", {"code": wide}),
+             Example("short", {"code": narrow}), Example("y" * 3000, {"team": INTENT, "code": narrow})]
+
+    def laid_out(example):
+        try:
+            layout.rows(TOKENIZER, SPECIALS, example.state, example.questions)
+        except ValueError:
+            return False
+        return True
+
+    expected = [laid_out(example) for example in cases]
+    assert expected == [True, False, True, True]
+    assert [layout.fits(TOKENIZER, example.questions) for example in cases] == expected
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout)
+    kept, held, unfit = _fitting(objective, {"rows": Weighted(cases, 1.0)}, cases[:2])
+    assert kept["rows"].examples == [case for case, fit in zip(cases, expected, strict=True) if fit]
+    assert unfit == {"rows": 1, "held out": 1} and held == cases[:1]
