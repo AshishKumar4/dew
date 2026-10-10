@@ -178,6 +178,7 @@ def identity(plan: dict) -> dict:
         "jobs": [
             {
                 "artifact_excludes": job.get("artifact_excludes", []),
+                "data_sources": job.get("data_sources", []),
                 **{
                     key: job[key]
                     for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
@@ -214,6 +215,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
         for source, target in input_paths(fields):
             with source.open("rb") as stream:
                 inputs.append((target, hashlib.file_digest(stream, "sha256").hexdigest()))
+        job.update(data_inputs(fields))
         job["resume_key"] = colab_sync.retained_key(
             job["commit"],
             {
@@ -224,6 +226,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 "artifact_policy": job["artifact_policy"],
                 "artifact_excludes": job["artifact_excludes"],
                 "inputs": sorted(inputs),
+                "data_sources": job["data_sources"],
             },
         )
         jobs.append(job)
@@ -238,6 +241,23 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
     }
 
 
+def data_inputs(fields: dict) -> dict:
+    """An explicit private descriptor names cached datasets and their credential."""
+    if not fields.get("data_inputs"):
+        return {"data_sources": []}
+    descriptor = read(Path(fields["data_inputs"]).expanduser())
+    result = {"data_sources": [], "data_token_file": descriptor["token_file"]}
+    for source in descriptor["sources"]:
+        if not re.fullmatch(r"[0-9a-f]{64}", source["manifest_sha256"]):
+            raise ValueError("cached input descriptor requires an immutable manifest hash")
+        destination = Path(source["target"])
+        if not destination.is_absolute() or ".." in destination.parts:
+            raise ValueError("cached dataset requires an absolute VM target")
+        result["data_sources"].append({"endpoint": descriptor["url"], "target": str(destination),
+                                      "prefix": source["prefix"], "manifest_sha256": source["manifest_sha256"]})
+    return result
+
+
 def split_file(source: Path, work: Path, prefix: str) -> tuple[list[str], str]:
     names = []
     digest = hashlib.sha256()
@@ -250,10 +270,12 @@ def split_file(source: Path, work: Path, prefix: str) -> tuple[list[str], str]:
     return names, digest.hexdigest()
 
 
-def stage(plan: dict, work: Path, repo: Path = REPO) -> None:
+def stage(plan: dict, work: Path, repo: Path = REPO, *, netrc_file: Path | None = None) -> None:
     work.mkdir(mode=0o700, parents=True, exist_ok=False)
     stage_sources(plan, work, repo)
     stage_inputs(plan, work)
+    from tools.colab.credentials import stage_wandb
+    stage_wandb(plan, work, netrc_file if netrc_file is not None else Path.home() / ".netrc")
     with tarfile.open(work / "runner.tar.gz", "w:gz") as archive:
         for file in HERE.glob("*.py"):
             archive.add(file, arcname="tools/colab/" + file.name)
@@ -331,8 +353,21 @@ def stage_sources(plan: dict, work: Path, repo: Path) -> None:
 
 
 def stage_inputs(plan: dict, work: Path) -> None:
+    plan["data_sources"] = []
     for job in plan["jobs"]:
+        plan["data_sources"].extend(job.get("data_sources", []))
+        if job.get("data_sources"):
+            source = Path(job["data_token_file"]).expanduser()
+            parts, digest = split_file(source, work, "data-token")
+            target = "/content/.dew-data.token"
+            previous = plan["uploads"].get(target)
+            if previous and previous["sha256"] != digest:
+                raise ValueError("packed jobs request different data-cache credentials")
+            plan["uploads"][target] = {"parts": parts, "sha256": digest, "private": True}
+            plan.setdefault("private_parts", []).extend(parts)
         for source, target in input_paths(job["entry"]["fields"]):
+            if any(Path(target).is_relative_to(Path(data["target"])) for data in job.get("data_sources", [])):
+                raise ValueError("R2 dataset inputs must not also be staged through the PC")
             parts, digest = split_file(source, work, "input-" + str(len(plan["uploads"])))
             previous = plan["uploads"].get(target)
             if previous and previous["sha256"] != digest:
