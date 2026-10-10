@@ -1,7 +1,7 @@
 """Where a profiled training step's device time and peak memory go, by model part.
 
-    python tools/attribute_step.py --trace PROFILE_DIR --hlo HLO_DIR_OR_TGZ --out OUT.json
-                                   [--steps N] [--entry entry.json] [--module jit_step]
+    PYTHONPATH=src python tools/attribute_step.py --trace PROFILE_DIR --hlo HLO_DIR_OR_TGZ --out OUT.json
+                                                  [--steps N] [--entry entry.json] [--module jit_step]
 
 `--trace` is a dew.Profiler directory (or a capture inside one); the newest capture holding
 `reports/hlo_stats.json` is read. Profile it with XLA_FLAGS=--xla_gpu_enable_command_buffer= :
@@ -26,7 +26,9 @@ Memory, from the dump: the peak's bytes by role (arguments: parameters, optimize
 saved forward activations; backward working set; rematerialized forward; unattributed) and model
 part, and its largest buffers.
 
-Reads only text and JSON: no JAX, so it runs anywhere.
+It reads text and JSON only, through Dew's own readers: the HLO parser the FLOP count uses
+(`dew.telemetry.instrumentation.hlo_instructions`, `custom_call_kind`) and XProf's report tables
+(`dew.telemetry.profile.report_table`).
 """
 
 from __future__ import annotations
@@ -39,6 +41,9 @@ import re
 import tarfile
 from collections import defaultdict
 from pathlib import Path
+
+from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
+from dew.telemetry.profile import report_table
 
 PARTS = (
     # The decision head's own attention and norms are the head's; Qwen3.5 names every mixer
@@ -55,13 +60,8 @@ PARTS = (
     ("mlp", r"/mlp/|gate_proj|up_proj|down_proj|SwiGLU|experts|nn/moe\.py"),
     ("embedding", r"[Ee]mbed|table_rows|wte|tok_emb"),
 )
-TARGETS = (
-    ("gemm", r"^__cublas|^__cudnn\$conv"),
-    ("attention", r"^__cudnn\$fmha|^dew_flash_mha"),
-    ("pallas", r"^__gpu\$xla\.gpu\.triton$|mosaic"),
-)
-"""A custom call's kind by its target: cuBLAS and cuDNN's convolutions, the fused attentions
-(cuDNN's and Dew's FlashAttention-2), and the Triton calls Pallas lowers to."""
+CALL_KINDS = {"gemm": "gemm", "convolution": "gemm", "attention": "attention", "triton": "pallas"}
+"""A custom call's kind here, from `custom_call_kind`'s: Pallas lowers to Triton calls."""
 COLLECTIVES = {"all-reduce", "all-gather", "reduce-scatter", "collective-permute", "all-to-all",
                "all-reduce-start", "all-gather-start", "collective-permute-start", "all-reduce-done",
                "all-gather-done", "collective-permute-done"}
@@ -96,80 +96,27 @@ def direction_of(name: str) -> str:
 # ---- time, from XProf's reports --------------------------------------------------------------
 
 
-def table(path: Path, index: int = 0) -> list[dict]:
-    """The rows of one of an XProf report's DataTables, as dicts by column id."""
-    if not path.exists():
-        return []
-    data = json.loads(path.read_text())
-    tables = data if isinstance(data, list) else [data]
-    if index >= len(tables) or "cols" not in tables[index]:
-        return []
-    columns = [column.get("id") for column in tables[index]["cols"]]
-    return [{name: (cell.get("v") if isinstance(cell, dict) else cell)
-             for name, cell in zip(columns, row["c"], strict=False)}
-            for row in tables[index].get("rows", [])]
-
-
-_INSTRUCTION = re.compile(r"^\s*(?:ROOT\s+)?%(?P<name>[\w.\-]+) = (?:\([^()]*\)|[^\s(]+) "
-                          r"(?P<op>[a-z][a-z0-9-]*)\((?P<rest>.*)$")
-_COMPUTATION = re.compile(r"^\s*(?:ENTRY\s+)?%(?P<name>[\w.\-]+) \(.*\{\s*$")
-
-
-def instructions(text: str) -> dict[str, tuple[str, str, frozenset[str]]]:
-    """Each instruction of an optimized HLO module by name: its opcode, a custom call's target, and
-    the opcodes of what a fusion calls (the fused computation's, nested ones included)."""
-    computations: dict[str, set[str]] = defaultdict(set)
-    calls: dict[str, list[str]] = defaultdict(list)
-    found: dict[str, tuple[str, str, list[str]]] = {}
-    current = ""
-    for line in text.splitlines():
-        computation = _COMPUTATION.match(line)
-        if computation:
-            current = computation.group("name")
-            continue
-        match = _INSTRUCTION.match(line)
-        if not match:
-            continue
-        op, rest = match.group("op"), match.group("rest")
-        computations[current].add(op)
-        called = re.findall(r"calls=%([\w.\-]+)", rest)
-        calls[current].extend(called)
-        target = re.search(r'custom_call_target="([^"]+)"', rest)
-        found[match.group("name")] = (op, target.group(1) if target else "", called)
-
-    def fused(name: str, seen: frozenset = frozenset()) -> set[str]:
-        ops = set(computations.get(name, ()))
-        for inner in calls.get(name, ()):
-            if inner not in seen:
-                ops |= fused(inner, seen | {name})
-        return ops
-
-    return {name: (op, target, frozenset().union(*(fused(called) for called in called_list)) if called_list
-                   else frozenset())
-            for name, (op, target, called_list) in found.items()}
-
-
-def kind_of(row: dict, ops: dict[str, tuple[str, str, frozenset[str]]] | None = None) -> str:
+def kind_of(row: dict, ops: dict[str, HloInstruction] | None = None) -> str:
     """An op's kind, read from the op: its opcode, a custom call's target, the ops a fusion runs.
-    From the module (`instructions`) where it was given, else from the op's expression and name;
-    never from the names of its operands, which the expression also holds."""
+    From the module (`hlo_instructions`) where it was given, else from the op's own expression,
+    and a fusion from its name; never from the names of its operands, which the expression also
+    holds."""
     name = str(row.get("hlo_op_name") or "")
-    expression = str(row.get("hlo_op_expression") or "")
     known = (ops or {}).get(name)
-    if known:
-        op, target, fused = known
+    if known is None:
+        # The row's expression is one instruction, cut short: read as a module of it alone.
+        alone = hlo_instructions(f"ENTRY %row () -> () {{\n  {row.get('hlo_op_expression') or ''}\n}}")
+        found = next(iter(alone.values()), None)
+        op, target = (found.op, found.target) if found else ("", "")
+        fused = frozenset(re.sub(r"\.\d+$", "", name).split("_")) if op == "fusion" else frozenset()
     else:
-        match = _INSTRUCTION.match(expression)
-        op = match.group("op") if match else ""
-        target = (re.search(r'custom_call_target="([^"]+)"', expression) or re.search(r"()", "")).group(1)
-        base = re.sub(r"\.\d+$", "", name)
-        fused = frozenset(base.split("_")) if op == "fusion" else frozenset()
+        op, target, fused = known.op, known.target, known.fused
     if op in COLLECTIVES:
         return "collective"
     if op == "custom-call":
         if not target and name.startswith("pallas_call"):
             return "pallas"
-        return next((kind for kind, pattern in TARGETS if re.search(pattern, target)), "custom-call")
+        return CALL_KINDS.get(custom_call_kind(target), "custom-call")
     for kind, members in FUSED_KINDS:
         if (fused if op == "fusion" else {op}) & members:
             return kind
@@ -205,10 +152,10 @@ def heaviest(groups: dict) -> list:
 
 
 def attribute_time(trace: Path, steps: int, model_flops: float | None,
-                   ops: dict[str, tuple[str, str, frozenset[str]]] | None = None) -> dict:
+                   ops: dict[str, HloInstruction] | None = None) -> dict:
     capture = capture_of(trace)
     reports = capture / "reports"
-    rows = table(reports / "hlo_stats.json")
+    rows = report_table(reports / "hlo_stats.json")[1]
     if not rows:
         return {"capture": str(capture), "error": "hlo_stats.json has no ops: profile with "
                 "XLA_FLAGS=--xla_gpu_enable_command_buffer= so XProf can attribute kernels"}
@@ -242,7 +189,8 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         if kind == "layout":
             layouts.append(record)
     device_us = sum(by_kind.values())
-    idle_us = sum(float(row["total_self_time"]) for row in table(reports / "framework_op_stats.json")
+    _, operations = report_table(reports / "framework_op_stats.json")
+    idle_us = sum(float(row["total_self_time"]) for row in operations
                   if row.get("host_or_device") == "Device" and row.get("type") == "IDLE") / steps
     gemm_us = by_kind.get("gemm", 0.0)
     gemm_work = sum(record["us"] * record["gflops"] for record in gemms)
@@ -261,7 +209,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "gemms_by_lost_time": sorted(gemms, key=lambda record: -record["lost_us"])[:25],
         "layout_moves": sorted(layouts, key=lambda record: -record["us"])[:25],
         "top_ops": sorted(everything, key=lambda record: -record["us"])[:40],
-        "xprof_steps": table(reports / "input_pipeline_analyzer.json", 1)[:8],
+        "xprof_steps": report_table(reports / "input_pipeline_analyzer.json", 1)[1][:8],
     }
     if model_flops and peak:
         result["model_flops_per_step"] = model_flops
@@ -395,7 +343,7 @@ def main(argv: list[str] | None = None) -> int:
     files = dump_files(args.hlo, args.module) if args.hlo else {}
     if args.trace:
         result["time"] = attribute_time(args.trace, args.steps, flops,
-                                        instructions(files[".txt"]) if ".txt" in files else None)
+                                        hlo_instructions(files[".txt"]) if ".txt" in files else None)
     if files:
         result["memory"] = attribute_memory(files)
     args.out.write_text(json.dumps(result, indent=1))

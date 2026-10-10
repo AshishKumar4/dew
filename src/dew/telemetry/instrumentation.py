@@ -42,6 +42,12 @@ _LABELS = re.compile(r'dim_labels=(\S+?)(?:[,\s]|$)')
 _GROUPS = re.compile(r'feature_group_count=(\d+)')
 # A multiply-add is two FLOPs.
 _MAC = 2
+_CUSTOM_CALLS = (
+    ("gemm", re.compile(r'^__cublas')),
+    ("convolution", re.compile(r'^__cudnn\$conv')),
+    ("attention", re.compile(r'^__cudnn\$fmha|^dew_flash_mha')),
+    ("triton", re.compile(r'^__gpu\$xla\.gpu\.triton$')),
+)
 
 
 @dataclass(frozen=True)
@@ -237,6 +243,54 @@ def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[in
     return products * _MAC * batch * heads * length * key[1] * width
 
 
+def custom_call_kind(target: str) -> str | None:
+    """What a custom call computes, by its target: cuBLAS's GEMMs ('gemm'),
+    cuDNN's convolutions ('convolution'), the fused attentions of cuDNN and
+    dew_flash_attn ('attention'), the Triton kernels Pallas lowers to
+    ('triton'); None for any other. The FLOP count and
+    tools/attribute_step.py read custom calls through this one table."""
+    return next((kind for kind, pattern in _CUSTOM_CALLS if pattern.search(target)), None)
+
+
+@dataclass(frozen=True)
+class HloInstruction:
+    """One instruction of an optimized HLO module, as a profile attributes it."""
+
+    op: str
+    target: str
+    """A custom call's target, empty for any other op."""
+    fused: frozenset[str]
+    """The ops of the computations it calls, theirs included: a fusion's body."""
+    recomputed: bool
+
+
+def hlo_instructions(text: str) -> dict[str, HloInstruction]:
+    """Every instruction of the module in `text` (`compiled.as_text()`, or an XLA
+    dump's after-optimizations HLO) by name, read by the parser the FLOP count
+    reads (`hlo_flops`)."""
+    computations, _ = _parse(text)
+
+    def fused(name: str, seen: frozenset[str]) -> set[str]:
+        computation = computations.get(name)
+        if computation is None or name in seen:
+            return set()
+        ops = {instruction.op for instruction in computation.instructions.values()}
+        for instruction in computation.instructions.values():
+            for called in _CALLS.findall(instruction.attributes):
+                ops |= fused(called, seen | {name})
+        return ops
+
+    found = {}
+    for computation in computations.values():
+        for name, instruction in computation.instructions.items():
+            target = _TARGET.search(instruction.attributes)
+            calls = _CALLS.findall(instruction.attributes) if instruction.op == 'fusion' else []
+            found[name] = HloInstruction(
+                instruction.op, target.group(1) if target else '',
+                frozenset().union(*(fused(called, frozenset()) for called in calls)), instruction.recomputed)
+    return found
+
+
 def _instruction_flops(instruction: _Instruction,
                        shapes: dict[str, tuple[int, ...]]) -> float:
     """The multiply-add work of one instruction, and zero for anything else.
@@ -258,18 +312,17 @@ def _instruction_flops(instruction: _Instruction,
         return 0.0
     target = _TARGET.search(instruction.attributes)
     target = target.group(1) if target else ''
-    if target.startswith('__cublas'):
+    kind = custom_call_kind(target)
+    if kind == 'gemm':
         contracting = _GEMM_CONTRACTING.search(instruction.attributes)
         axes = () if contracting is None else tuple(
             int(axis.strip(' "')) for axis in contracting.group(1).split(',')
             if axis.strip(' "'))
         return _dot_flops(instruction, shapes, axes)
-    if target.startswith('__cudnn$conv'):
+    if kind == 'convolution':
         return _cudnn_convolution_flops(target, instruction, shapes)
-    if target.startswith('__cudnn$fmha'):
-        return _fused_attention_flops(instruction, shapes, query=0, backward=target.endswith('Backward'))
-    if target in _FLASH:
-        query, backward = _FLASH[target]
+    if kind == 'attention':
+        query, backward = _FLASH.get(target, (0, target.endswith('Backward')))
         return _fused_attention_flops(instruction, shapes, query=query, backward=backward)
     return 0.0
 
