@@ -33,7 +33,7 @@ from flax import struct
 from jax.experimental import checkify
 
 from dew.records import JSON
-from dew.sampling.decoding import FILTER, StepState
+from dew.sampling.decoding import FILTER, LogitsChain, StepState
 from dew.sampling.vocabulary import (
     Referencing,
     Tokenizing,
@@ -69,8 +69,15 @@ class Grammar:
 
     def guiding(self, transform: Callable[[StepState, jax.Array], jax.Array],
                 state: jax.Array) -> Callable[[StepState, jax.Array], jax.Array]:
-        """Return `transform`, applied after masking the tokens each row's state forbids."""
-        return lambda step, logits: transform(step, self.masked(state, logits))
+        """Return `transform`, applied after masking the tokens each row's state
+        forbids. A `LogitsChain` stays one, the mask its first transform, so a
+        terminal Greedy still draws by argmax (`strategies.draw`)."""
+        def mask(step: StepState, logits: jax.Array) -> jax.Array:
+            return self.masked(state, logits)
+
+        if isinstance(transform, LogitsChain):
+            return LogitsChain((mask, *transform.transforms))
+        return lambda step, logits: transform(step, mask(step, logits))
 
     def advanced(self, state: jax.Array, token: jax.Array, drawn: jax.Array) -> jax.Array:
         """Return each row's state after `token`; a row that did not draw keeps its state.

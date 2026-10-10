@@ -231,6 +231,21 @@ def test_a_length_penalty_on_a_masked_eos_leaves_the_row_drawing(tokenizer):
     assert re.fullmatch("[0-9]{4}", continuation(tokenizer, rows)) and bool(rows.terminated[0])
 
 
+def test_a_grammar_keeps_a_greedy_chain_an_argmax(tokenizer):
+    """The mask joins a transform chain as its first transform, so a chain
+    ending in Greedy still draws by argmax with no categorical draw
+    (`strategies.draw`), and the masked argmax is a token the state allows."""
+    grammar = guided.regex(tokenizer, "[0-9]{4}", EOS, vocab_size=EOS + 1)
+    state = grammar.start(2)
+    guided_chain = grammar.guiding(decoding.chain((decoding.Greedy(),)), state)
+    assert isinstance(guided_chain, decoding.LogitsChain) and guided_chain.greedy
+    logits = jax.random.normal(jax.random.key(0), (2, EOS + 1))
+    step = decoding.StepState(jnp.zeros((2, 4), jnp.int32), jnp.zeros((2, 4), bool), jnp.zeros(2, jnp.int32),
+                              jnp.ones(2, bool), jax.random.split(jax.random.key(1), 2), prompt_width=2)
+    scores = decoding.chain(guided_chain.transforms[:-1])(step, logits)
+    np.testing.assert_array_equal(scores, grammar.masked(state, logits))
+
+
 def test_a_transform_forcing_a_token_the_grammar_forbids_fails_the_request(tokenizer):
     """ForcedEOS draws EOS at the last slot whatever the mask allowed; a
     grammar that cannot end there refuses the draw instead of leaving the
