@@ -1223,6 +1223,30 @@ output and five gradients), and two calls agree bit for bit. Value blocks of
 memory); the block stays 32 until the G4, whose sm120 holds less shared
 memory a block, is measured. `KERNELS` takes the kernels on sm80 only.
 
+A fused chunk-local output experiment, 2026-10-10 (c45), did not improve
+that rule. The forward and its two backward kernels keep the pairwise
+products and compensated decays on chip. On the same A100 shape, medians
+of 20 calls, with the preceding Pallas path measured in the same session:
+
+| rule | forward, ms / kernels | forward + backward, ms / kernels |
+|---|---:|---:|
+| Pallas recurrence, XLA chunk-local products | 3.20 / 36 | 9.33 / 103 |
+| fused output, 32-column blocks, 4 warps | 3.24 / 35 | 24.02 / 106 |
+| fused output, best training tile: 16 columns, 4 warps | 3.95 / 35 | 10.91 / 107 |
+| fla 0.5.2 (Triton, torch) | 1.36 | 3.60 |
+
+All nine tiles (16, 32 or 64 columns, 2, 4 or 8 warps) lost to the
+preceding path. The operand-gradient kernel alone took 15.54 ms at
+32 columns and 1.93 at 16; the value-gradient kernel took another 1.44 ms
+at 16. The fused forward's temporary memory fell from 608.6 to 489.3 MiB,
+but this did not produce a time gain. Whole-rule output and gradient RMS
+errors against float64 were within 1.001 times XLA's at default precision
+and 1.324 at highest, with bitwise repeatability. The direct output tests
+passed on the GPU. A separate, pre-existing recurrence-only IEEE test
+failed for the `u` gradient (1.504e-7 versus XLA's 4.926e-8 RMS, ratio
+3.05); changing dot precision alone had not fixed that narrower case.
+No automatic fused-output dispatch was enabled from this measurement.
+
 With canonical metadata the call is exactly the plain call. Its outputs are
 bitwise equal to the no-metadata forward, and its parameter gradients are
 within 2.4e-06 of it. The opaque all-true mask stays on the xla kernel at
