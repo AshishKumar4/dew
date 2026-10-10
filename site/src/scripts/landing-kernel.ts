@@ -98,24 +98,31 @@ export function liveCell(run: HTMLButtonElement, editor: HTMLTextAreaElement, ho
 	});
 }
 
-/** A status line that counts the seconds of its current phase: `set` names the phase, `stop` ends the count. */
+/** A status line that counts the seconds of its current phase while a run is on: `start` begins a run's count,
+ * `set` names the phase, and `stop` ends the count until the next `start`. */
 export function phases(status: HTMLElement, format = (phase: string, seconds: number) => `${phase} · ${seconds} s`) {
 	let phase = '';
 	let since = 0;
 	let timer: number | undefined;
+	const set = (text: string) => {
+		if (timer === undefined) return;
+		phase = text;
+		since = performance.now();
+		status.textContent = text;
+	};
 	return {
 		get phase() {
 			return phase;
 		},
-		set(text: string) {
-			phase = text;
-			since = performance.now();
-			status.textContent = text;
+		start(text: string) {
 			window.clearInterval(timer);
 			timer = window.setInterval(() => (status.textContent = format(phase, Math.round((performance.now() - since) / 1000))), 1000);
+			set(text);
 		},
+		set,
 		stop() {
 			window.clearInterval(timer);
+			timer = undefined;
 		},
 	};
 }

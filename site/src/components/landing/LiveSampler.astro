@@ -167,10 +167,12 @@ const liveEnabled = Boolean(live.endpoint && live.turnstileSitekey);
 				log.open = false;
 				// On a phone the figure sits below the editor; bring it into view for the run.
 				if (stage.getBoundingClientRect().bottom > window.innerHeight) stage.scrollIntoView({ behavior: 'smooth', block: 'center' });
+				// Until the kernel is ready, which another cell may be opening already.
+				show('starting', 'Starting');
+				tick('Waiting');
 			},
 			kernel: (text) => {
-				if (stage.dataset.stage !== 'starting') tick('Waiting');
-				show('starting', text.replace(/…$/, ''));
+				if (!stopping) show('starting', text.replace(/…$/, ''));
 			},
 			begin: (session) => {
 				if (session !== last) {
