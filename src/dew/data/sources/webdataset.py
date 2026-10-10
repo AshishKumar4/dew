@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import tarfile
 from collections.abc import Mapping
+from contextlib import ExitStack
 
 import grain.python as grain
 
@@ -26,8 +27,9 @@ class _TarIterator(grain.DatasetIterator):
         self.position = 0
         self.pending: tuple[str, str, bytes] | None = None
         fs, path = Store(source.url, source.storage_options).resolve()
-        self.file = fs.open(path, "rb")
-        self.archive = tarfile.open(fileobj=self.file, mode="r|*")
+        self.opened = ExitStack()
+        self.file = self.opened.enter_context(fs.open(path, "rb"))
+        self.archive = self.opened.enter_context(tarfile.open(fileobj=self.file, mode="r|*"))
         self.members = iter(self.archive)
 
     def _member(self) -> tuple[str, str, bytes]:
@@ -48,19 +50,19 @@ class _TarIterator(grain.DatasetIterator):
         raise StopIteration
 
     def __next__(self) -> dict[str, bytes | str]:
-        key, extension, data = self._member()
-        row: dict[str, bytes | str] = {"__key__": key, extension: data}
+        key, extension, payload = self._member()
+        row: dict[str, bytes | str] = {"__key__": key, extension: payload}
         while True:
             try:
-                next_key, extension, data = self._member()
+                next_key, extension, payload = self._member()
             except StopIteration:
                 break
             if next_key != key:
-                self.pending = next_key, extension, data
+                self.pending = next_key, extension, payload
                 break
             if extension in row:
                 raise ValueError(f"WebDataset key {key!r} has two {extension!r} members")
-            row[extension] = data
+            row[extension] = payload
         self.position += 1
         return row
 
@@ -77,5 +79,4 @@ class _TarIterator(grain.DatasetIterator):
             next(self)
 
     def close(self) -> None:
-        self.archive.close()
-        self.file.close()
+        self.opened.close()
