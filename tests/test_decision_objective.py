@@ -413,3 +413,21 @@ def test_diffusion_gemma_reads_each_row_once_whole_and_reloads_from_the_run(tmp_
     live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
     np.testing.assert_array_equal(live("charged twice!", {"team": INTENT})["team"].probabilities,
                                   reloaded("charged twice!", {"team": INTENT})["team"].probabilities)
+
+
+def test_a_joint_run_cuts_its_state_to_the_state_budget_and_a_layout_refuses_a_budget_it_lacks():
+    """--max-state-tokens reaches a fresh joint layout, whose rows keep that much
+    state under a `max_len` sized for their schema; a layout refuses a budget it
+    has no field for, a row per question the state's and a joint row a question's."""
+    from dew.decision import JointLayout
+    from dew.decision.config import _fresh_layout
+
+    layout = _fresh_layout(causal=True, joint=True, budgets={"max_len": 3072, "max_state_tokens": 16})
+    assert layout == JointLayout(max_len=3072, max_state_tokens=16)
+    (row,) = layout.rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
+    (whole,) = JointLayout(max_len=3072).rows(TOKENIZER, SPECIALS, "x" * 500, {"team": INTENT})
+    assert row.state_kept == 16 and len(whole.tokens) - len(row.tokens) == whole.state_kept - 16
+    with pytest.raises(ValueError, match="--head-max-len budget a row that JointLayout"):
+        _fresh_layout(causal=True, joint=True, budgets={"max_len": 3072, "head_max_len": 96})
+    with pytest.raises(ValueError, match="--max-state-tokens budget a row that StateFirstLayout"):
+        _fresh_layout(causal=True, joint=False, budgets={"max_len": 1024, "max_state_tokens": 16})
