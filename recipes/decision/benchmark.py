@@ -220,7 +220,8 @@ def held(run: Path, mixture: Path) -> dict:
     scores = {}
     for source, count in recorded["rows"].items():
         path = mixture / f"{source}.held.jsonl"
-        examples = ([Example.of(json.loads(line)) for line in path.read_text().splitlines() if line.strip()]
+        # A row ends at a newline alone; a JSON string may hold any other line separator.
+        examples = ([Example.of(json.loads(line)) for line in path.read_text().split("\n") if line.strip()]
                     if count["held"] else [])
         if len(examples) != count["held"]:
             raise ValueError(f"{path} has {len(examples)} rows, but mixture.json records {count['held']}")
