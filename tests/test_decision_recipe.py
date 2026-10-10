@@ -224,7 +224,8 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
     assert once.variables is ouro.variables
     qwen = Pretrained.load(QWEN, dtype="float32")
     retrofit = looping(qwen, 2, (1, 2))
-    assert retrofit.model.loop == Loop(2, step_norm=False, layers=(1, 2)) and qwen.model.loop is None
+    assert retrofit.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2))
+    assert qwen.model.language_model.loop is None
     assert retrofit.variables is qwen.variables
     for steps, layers in ((2, None), (None, (1, 2))):
         with pytest.raises(ValueError, match="has no loop"):

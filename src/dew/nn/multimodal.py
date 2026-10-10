@@ -466,6 +466,11 @@ class MultimodalTransformer(nn.Module):
         return self.clone(language_model=self.language_model.restore_recompute(record))
 
     @nn.nowrap
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None:
+        language_model = self.language_model.with_passes(steps, layers)
+        return None if language_model is None else self.clone(language_model=language_model)
+
+    @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """The towers run once per prefill and keep their layout."""
         text = {collection: tree["language_model"] for collection, tree in variables.items()
