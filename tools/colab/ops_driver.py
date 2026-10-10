@@ -127,7 +127,8 @@ class Driver:
             f"import sys,json\nsys.path.insert(0,{remote!r})\n"
             "from tools.colab.colab_sync import snapshot\n"
             f"manifest,count=snapshot({home + '/dew'!r},{job['outputs']!r},{known!r},"
-            f"{home + '/sync.tar.gz'!r},policy={job['artifact_policy']!r},excludes={job.get('artifact_excludes', [])!r})\n"
+            f"{home + '/sync.tar.gz'!r},policy={job['artifact_policy']!r},"
+            f"excludes={job.get('artifact_excludes', [])!r})\n"
             "print('SYNC',json.dumps([manifest,count]))\n"
         )
         output = self.control(session, script, timeout=600)
