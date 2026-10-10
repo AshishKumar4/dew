@@ -21,10 +21,10 @@ options under their own names, or under letters (`option_i` past 26) with
 their text as the description. Requests reach a decision model in both
 shapes, so the model learns both.
 
-Licences: Open-Jev's generated rows are CC0; typed-decisions, gliclass and
-BoolQ's card state Apache-2.0, Apache-2.0 and CC BY-SA 3.0; BANKING77 CC BY
-4.0; CLINC150 CC BY 3.0; WANLI CC BY 4.0; HellaSwag and GSM8K MIT; ARC CC
-BY-SA 4.0. Nothing non-commercial is read.
+Only permissive or share-alike sources are read. Each source's licence,
+evidence URL and pinned revision are recorded in `mixture.json`. Shares
+are computed from the written training counts with temperature 3, a
+configurable 200,000-row cap and at most ten epochs per mixture pass.
 """
 
 import csv
@@ -140,7 +140,7 @@ def _unit(text: str, salt: str) -> float:
 
 @dataclass(frozen=True)
 class Source:
-    """One labelled set a mixture reads, at `weight`, a share of every step; weight 0 leaves it out.
+    """One labelled set: a positive `weight` enables it and weight 0 leaves it out.
 
     `limit` caps the training examples, drawn with `seed`, and `held` holds that
     many back for validation and calibration. With no count, hold out 2% of
@@ -174,6 +174,11 @@ class Source:
         """The pinned source's train rows, before sampling or holding any out."""
         return sum(_count(self.repo, self.revision, path) for path in self.files)
 
+    def licence_record(self) -> dict[str, str]:
+        """The grant and pinned data revision carried into each training run's summary."""
+        url = self.licence_url or f"https://huggingface.co/datasets/{self.repo}/blob/{self.revision}/README.md"
+        return {"name": self.licence, "url": url, "revision": self.revision}
+
     def rows(self) -> Iterator[dict]:
         """Seeded rows from training files only, capped before they become Python objects."""
         counts = [_count(self.repo, self.revision, path) for path in self.files]
@@ -201,7 +206,8 @@ class Source:
         """The training examples and the held-out ones."""
         examples = self.examples()
         random.Random(self.seed).shuffle(examples)
-        count = _held(self.count() if self.files else len(examples), self.held)
+        population = self.count() if self.files and self.limit is not None and len(examples) >= self.limit else len(examples)
+        count = _held(population, self.held)
         count = min(count, len(examples))
         held, train = examples[:count], examples[count:]
         return (train if self.limit is None else train[:self.limit]), held
@@ -262,16 +268,21 @@ class OpenJev(Source):
     """
 
     natural: ClassVar[bool] = False
-    weight: float = 0.30
+    weight: float = 1.0
     calibration: int | None = None
     config: str = "release-v2-redistributable"
     revision: str = "c67699e13d0ae25e35b77165a4b6b079bedc8aba"
     questions: int = 2
 
+    repo: ClassVar[str] = "ZefanCai/Open-Jev"
+    licence: ClassVar[str] = "CC0-1.0"
+
     def read(self, split: str) -> list[Example]:
         rows = _rows("ZefanCai/Open-Jev", self.revision, f"data/{self.config}/{split}-00000-of-00001.parquet")
         groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         for row in rows:
+            if row["group_id"].startswith("customer-control-v1:"):
+                continue
             groups[(row["group_id"], row["state_json"])].append(row)
         examples = []
         for (_, state), members in groups.items():
@@ -321,9 +332,11 @@ class TypedDecisions(Source):
     """
 
     natural: ClassVar[bool] = False
-    weight: float = 0.05
+    weight: float = 1.0
     held: int = 100
     revision: str = "d0e2f0c42fef86cc15d1688d25a19f5ba7c85b18"
+    repo: ClassVar[str] = "LocalLLaMA/typed-decisions"
+    licence: ClassVar[str] = "Apache-2.0"
 
     def examples(self) -> list[Example]:
         examples = []
@@ -354,16 +367,17 @@ class GliClass(Source):
     what it is classified for.
     """
 
-    weight: float = 0.20
-    limit: int | None = 200_000
+    weight: float = 1.0
     most: int = 24
     """A text of more candidates asks its true ones and others drawn up to this many."""
     revision: str = "93d3cdc82257a9e821f4b21d08e3dc81979bb653"
-    shard: str = "data/train-00000-of-00003.parquet"
+    repo: ClassVar[str] = "knowledgator/gliclass-v2.0"
+    files: ClassVar[tuple[str, ...]] = tuple(f"data/train-{index:05}-of-00003.parquet" for index in range(3))
+    licence: ClassVar[str] = "Apache-2.0"
 
     def examples(self) -> list[Example]:
         examples = []
-        for row in _rows("knowledgator/gliclass-v2.0", self.revision, self.shard):
+        for row in self.rows():
             labels, true = list(dict.fromkeys(row["all_labels"])), set(row["true_labels"])
             if len(labels) < 2 or not true <= set(labels):
                 continue
@@ -390,6 +404,8 @@ class Intents(Framed):
     most: int | None = 24
     weight: float = 0.04
     revision: str = "18072d2685ea682290f7b8924d94c62acc19c0b2"
+    repo: ClassVar[str] = "mteb/banking77"
+    licence: ClassVar[str] = "CC-BY-4.0"
 
     def examples(self) -> list[Example]:
         rows = list(_rows("mteb/banking77", self.revision, "data/train-00000-of-00001.parquet"))
@@ -405,6 +421,8 @@ class Clinc(Framed):
     most: int | None = 24
     weight: float = 0.04
     revision: str = "155b9c710419136e17307b80d0a13e68cd46b4ec"
+    repo: ClassVar[str] = "clinc/clinc_oos"
+    licence: ClassVar[str] = "CC-BY-3.0"
 
     def examples(self) -> list[Example]:
         import pyarrow.parquet as pq
@@ -422,30 +440,18 @@ class Wanli(Framed):
     """WANLI's training pairs (alisawuffles/WANLI, CC BY 4.0): entailment, neutral or contradiction."""
 
     weight: float = 0.08
-    limit: int | None = 60_000
     revision: str = "61c95318fd71c55b6ba355d76253254615f387ec"
+    repo: ClassVar[str] = "alisawuffles/WANLI"
+    files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
+    licence: ClassVar[str] = "CC-BY-4.0"
 
     def examples(self) -> list[Example]:
         relations = ["entailment", "neutral", "contradiction"]
         return [self.example(f"Premise: {row['premise']}\nHypothesis: {row['hypothesis']}",
                              "How does the hypothesis relate to the premise?", relations,
                              relations.index(row["gold"]))
-                for row in _rows("alisawuffles/WANLI", self.revision, "train.jsonl")
+                for row in self.rows()
                 if row["gold"] in relations]
-
-
-@dataclass(frozen=True)
-class HellaSwag(Framed):
-    """HellaSwag's training contexts (Rowan/hellaswag, MIT), each with four endings."""
-
-    weight: float = 0.05
-    revision: str = "218ec52e09a7e7462a5400043bb9a69a41d06b76"
-
-    def examples(self) -> list[Example]:
-        return [self.example(row["ctx"], "Which continuation is most plausible?", list(row["endings"]),
-                             int(row["label"]))
-                for row in _rows("Rowan/hellaswag", self.revision, "data/train-00000-of-00001.parquet")
-                if str(row["label"]).isdigit()]
 
 
 @dataclass(frozen=True)
@@ -454,6 +460,8 @@ class Arc(Framed):
 
     weight: float = 0.03
     revision: str = "210d026faf9955653af8916fad021475a3f00453"
+    repo: ClassVar[str] = "allenai/ai2_arc"
+    licence: ClassVar[str] = "CC-BY-SA-4.0"
 
     def examples(self) -> list[Example]:
         examples = []
@@ -472,6 +480,8 @@ class BoolQ(Source):
 
     weight: float = 0.05
     revision: str = "35b264d03638db9f4ce671b711558bf7ff0f80d5"
+    repo: ClassVar[str] = "google/boolq"
+    licence: ClassVar[str] = "CC-BY-SA-3.0"
 
     def examples(self) -> list[Example]:
         examples = []
@@ -496,6 +506,8 @@ class Gsm8k(Framed):
 
     weight: float = 0.03
     revision: str = "740312add88f781978c0658806c59bc2815b9866"
+    repo: ClassVar[str] = "openai/gsm8k"
+    licence: ClassVar[str] = "MIT"
 
     def examples(self) -> list[Example]:
         rows = list(_rows("openai/gsm8k", self.revision, "main/train-00000-of-00001.parquet"))
@@ -525,6 +537,8 @@ class Rows(Source):
     """
 
     path: str | None = None
+    licence: str = "LicenseRef-User-Provided"
+    licence_url: str = ""
 
     def examples(self) -> list[Example]:
         if self.path is None:
@@ -541,29 +555,42 @@ class Esci(Source):
     are kept because DI 0.2.1 evaluates US, ES and JP, and products join on
     both their id and locale. The option names, descriptions and state are
     the kit's, without the alternate framing used by other sources. Of the
-    781,638 pairs, `limit` keeps 15,000 drawn with the seed, about what one
-    pass of the `--headroom` mix reads at ESCI's weight, so neither the
-    decontamination nor a run's layout check reads the rest.
+    781,638 pairs, only the seeded cap plus hold-out are joined to products.
     """
 
-    limit: int | None = 15_000
+    weight: float = 1.0
     revision: str = "7916cdf6ab75a462e77f20ab40428a10923998d5"
+    repo: ClassVar[str] = "amazon-science/esci-data"
+    licence: ClassVar[str] = "Apache-2.0"
+    licence_url: ClassVar[str] = "https://github.com/amazon-science/esci-data/blob/7916cdf6ab75a462e77f20ab40428a10923998d5/LICENSE"
 
     def rows(self) -> Iterator[dict]:
-        """The pinned small training split, joined to its product text in example-id order."""
+        """Seeded small training pairs, joined only to the product texts they actually need."""
+        import pyarrow as pa
+        import pyarrow.compute as pc
         import pyarrow.parquet as pq
 
         root = "shopping_queries_dataset/shopping_queries_dataset_"
-        examples = pq.read_table(_github("amazon-science/esci-data", self.revision,
-                                         root + "examples.parquet", media=True),
-                                  filters=[("split", "=", "train"), ("small_version", "=", 1)])
-        products = pq.read_table(_github("amazon-science/esci-data", self.revision,
-                                         root + "products.parquet", media=True))
-        joined = examples.join(products, keys=["product_id", "product_locale"], join_type="left outer")
-        if joined.num_rows != examples.num_rows or joined["product_title"].null_count:
-            raise ValueError("ESCI needs exactly one product with a title for every training pair")
-        for batch in joined.sort_by([("example_id", "ascending")]).to_batches(max_chunksize=4096):
-            yield from batch.to_pylist()
+        path = _github(self.repo, self.revision, root + "examples.parquet", media=True)
+        selected = _draw(781638, self.limit, self.held, self.seed)
+        examples, offset = [], 0
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=4096):
+            batch = batch.filter(pc.and_(pc.equal(batch["split"], "train"), pc.equal(batch["small_version"], 1)))
+            positions = [index for index in range(len(batch)) if selected is None or offset + index in selected]
+            examples.extend(batch.take(positions).to_pylist())
+            offset += len(batch)
+        needed = {(row["product_id"], row["product_locale"]) for row in examples}
+        ids, products = pa.array(list({key[0] for key in needed})), {}
+        path = _github(self.repo, self.revision, root + "products.parquet", media=True)
+        for batch in pq.ParquetFile(path).iter_batches(batch_size=4096):
+            for row in batch.filter(pc.is_in(batch["product_id"], value_set=ids)).to_pylist():
+                key = row["product_id"], row["product_locale"]
+                if key in needed:
+                    if key in products or row["product_title"] is None:
+                        raise ValueError("ESCI needs exactly one titled product per pair")
+                    products[key] = row
+        for row in examples:
+            yield {**row, **products[(row["product_id"], row["product_locale"])]}
 
     @staticmethod
     def example(row: dict) -> Example:
@@ -594,7 +621,11 @@ class ISarcasm(Source):
     subtype annotations are not part of the model's input.
     """
 
+    weight: float = 1.0
     revision: str = "dfc708b53bde1bb571abfb5692f63231c2232195"
+    repo: ClassVar[str] = "iabufarha/iSarcasmEval"
+    licence: ClassVar[str] = "MIT"
+    licence_url: ClassVar[str] = "https://github.com/iabufarha/iSarcasmEval/blob/dfc708b53bde1bb571abfb5692f63231c2232195/LICENSE"
 
     @staticmethod
     def example(row: dict) -> Example:
@@ -619,6 +650,7 @@ class Sgd(Source):
     revision: str = "e852981ae34990f4358979625854259302feaa78"
     repo: ClassVar[str] = "google-research-datasets/dstc8-schema-guided-dialogue"
     licence: ClassVar[str] = "CC-BY-SA-4.0"
+    licence_url: ClassVar[str] = "https://github.com/google-research-datasets/dstc8-schema-guided-dialogue/blob/e852981ae34990f4358979625854259302feaa78/README.md"
 
     def dialogues(self) -> Iterator[dict]:
         """The 127 pinned training shards, never the dev or test dialogues."""
@@ -689,6 +721,7 @@ class Hover(Source):
     revision: str = "39b84697f196308f398a251a7aea9b82ae0f0562"
     repo: ClassVar[str] = "hover-nlp/hover"
     licence: ClassVar[str] = "MIT AND CC-BY-SA-4.0"
+    licence_url: ClassVar[str] = "https://huggingface.co/datasets/hover-nlp/hover/blob/c0e43052759879b3461642ca6c0dd26658f47691/README.md"
 
     def claims(self) -> list[dict]:
         return json.loads(_github(self.repo, self.revision, "data/hover/hover_train_release_v1.1.json").read_text())
@@ -732,6 +765,7 @@ class ContractNli(Source):
     revision: str = "eced6528dd3c1d14d73f9a87df8f7bdbc03126f9"
     repo: ClassVar[str] = "stanfordnlp/contract-nli"
     licence: ClassVar[str] = "CC-BY-4.0"
+    licence_url: ClassVar[str] = "https://github.com/stanfordnlp/contract-nli/blob/eced6528dd3c1d14d73f9a87df8f7bdbc03126f9/LICENSE"
 
     def data(self) -> dict:
         import zipfile
@@ -762,6 +796,7 @@ class WinoGrande(Source):
     repo: ClassVar[str] = "allenai/winogrande"
     files: ClassVar[tuple[str, ...]] = ("winogrande_xl/train-00000-of-00001.parquet",)
     licence: ClassVar[str] = "Apache-2.0"
+    licence_url: ClassVar[str] = "https://github.com/allenai/winogrande/blob/727e837f77521ef38bcc56df3b275c8da43f45af/LICENSE"
 
     def convert(self, row: dict) -> Example:
         question = Choice("Which option correctly fills the blank?\n" + row["sentence"],
@@ -903,6 +938,7 @@ class SmsSpam(Source):
     repo: ClassVar[str] = "ucirvine/sms_spam"
     files: ClassVar[tuple[str, ...]] = ("plain_text/train-00000-of-00001.parquet",)
     licence: ClassVar[str] = "CC-BY-4.0"
+    licence_url: ClassVar[str] = "https://archive.ics.uci.edu/dataset/228/sms+spam+collection"
 
     def convert(self, row: dict) -> Example:
         return Example(row["sms"], {"spam": Noul("Is this message spam?")},
@@ -936,6 +972,7 @@ class MassiveIntent(Framed):
     repo: ClassVar[str] = "SetFit/amazon_massive_intent_en-US"
     files: ClassVar[tuple[str, ...]] = ("train.jsonl",)
     licence: ClassVar[str] = "CC-BY-4.0"
+    licence_url: ClassVar[str] = "https://huggingface.co/datasets/AmazonScience/massive/blob/ff6bd8e4b27c3543e4f8fe2108f32bb95a6f8740/README.md"
 
     @cached_property
     def classes(self) -> list[str]:
@@ -1175,13 +1212,7 @@ class Lavoir(Source):
 
 @dataclass(frozen=True)
 class Mixture:
-    """Every source a decision recipe reads, each at its weight; a weight of 0 leaves one out.
-
-    The weights are shares of each step, so they need not sum to one.
-    Laya's application battery and every evaluation split stay out: AG News,
-    DAIR Emotion, Enron spam, the phishing set, toxic-chat, MS MARCO and the
-    customer-support tickets are read by no source here.
-    """
+    """The licensed sources; positive weights enable sources, and `write` computes their shares."""
 
     open_jev: OpenJev = field(default_factory=OpenJev)
     typed_decisions: TypedDecisions = field(default_factory=TypedDecisions)
@@ -1189,12 +1220,38 @@ class Mixture:
     banking77: Intents = field(default_factory=Intents)
     clinc150: Clinc = field(default_factory=Clinc)
     wanli: Wanli = field(default_factory=Wanli)
-    hellaswag: HellaSwag = field(default_factory=HellaSwag)
     arc: Arc = field(default_factory=Arc)
     boolq: BoolQ = field(default_factory=BoolQ)
     gsm8k: Gsm8k = field(default_factory=Gsm8k)
     esci: Esci = field(default_factory=Esci)
     isarcasm: ISarcasm = field(default_factory=ISarcasm)
+    sgd: Sgd = field(default_factory=Sgd)
+    hover: Hover = field(default_factory=Hover)
+    contract_nli: ContractNli = field(default_factory=ContractNli)
+    winogrande: WinoGrande = field(default_factory=WinoGrande)
+    go_emotions: GoEmotions = field(default_factory=GoEmotions)
+    dbpedia: DBpedia = field(default_factory=DBpedia)
+    civil_comments: CivilComments = field(default_factory=CivilComments)
+    sms_spam: SmsSpam = field(default_factory=SmsSpam)
+    paws: Paws = field(default_factory=Paws)
+    fever: Fever = field(default_factory=Fever)
+    snli: Snli = field(default_factory=Snli)
+    mnli: MultiNli = field(default_factory=MultiNli)
+    pubmedqa: PubMedQA = field(default_factory=PubMedQA)
+    medmcqa: MedMCQA = field(default_factory=MedMCQA)
+    qasc: Qasc = field(default_factory=Qasc)
+    bias_in_bios: BiasInBios = field(default_factory=BiasInBios)
+    massive_intent: MassiveIntent = field(default_factory=MassiveIntent)
+    helpsteer2: HelpSteer2 = field(default_factory=HelpSteer2)
+    hate_speech_scales: HateSpeech = field(default_factory=HateSpeech)
+    commonsense_qa: CommonsenseQA = field(default_factory=CommonsenseQA)
+    sci_ents_bank: SciEntsBank = field(default_factory=SciEntsBank)
+    ledgar: Ledgar = field(default_factory=Ledgar)
+    unfair_tos: UnfairTos = field(default_factory=UnfairTos)
+    strategyqa: StrategyQA = field(default_factory=StrategyQA)
+    snips: Snips = field(default_factory=Snips)
+    phishing_email: PhishingEmail = field(default_factory=PhishingEmail)
+    lavoir_dialogues: Lavoir = field(default_factory=Lavoir)
     rows: Rows = field(default_factory=Rows)
 
     def sources(self) -> Iterator[tuple[str, Source]]:
@@ -1214,26 +1271,57 @@ def row(example: Example) -> dict[str, Value]:
             "targets": {name: list(target) for name, target in example.targets.items()}}
 
 
-def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None) -> dict[str, Value]:
+def shares(counts: dict[str, int], cap: int = 200_000) -> dict[str, float]:
+    """T=3 temperature shares of capped train counts, redistributing excess above ten epochs per pass."""
+    if cap <= 0 or any(count < 0 for count in counts.values()):
+        raise ValueError("the cap must be positive and training counts non-negative")
+    sizes = {name: min(count, cap) for name, count in counts.items()}
+    total = sum(sizes.values())
+    result = {name: 0.0 for name in sizes}
+    free = {name: size ** (1 / 3) for name, size in sizes.items() if size}
+    while free:
+        room, scale = 1 - sum(result.values()), sum(free.values())
+        proposed = {name: room * weight / scale for name, weight in free.items()}
+        limited = {name for name, share in proposed.items() if share * total > 10 * sizes[name]}
+        if not limited:
+            result.update(proposed)
+            break
+        for name in limited:
+            result[name] = 10 * sizes[name] / total
+            del free[name]
+    return result
+
+
+def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None, cap: int = 200_000) -> dict[str, Value]:
     """Write `mixture`'s sets under `out`, each decontaminated against `overlaps`, and return what
     `<out>/mixture.json` records."""
     out.mkdir(parents=True, exist_ok=True)
+    if cap <= 0:
+        raise ValueError("cap must be positive")
     counts: dict[str, Value] = {}
+    sizes = {}
     for name, source in mixture.sources():
+        source = dataclasses.replace(source, limit=cap if source.limit is None else min(source.limit, cap))
         train, held = source.split()
         if overlaps is not None:
             train = overlaps.keep(name, train, source.natural)
             held = overlaps.keep(f"{name} (held out)", held, source.natural)
         for suffix, examples in ((".jsonl", train), (".held.jsonl", held)):
             if examples:
-                lines = (json.dumps(row(example), ensure_ascii=False) + "\n" for example in examples)
-                (out / f"{name}{suffix}").write_text("".join(lines))
+                with (out / f"{name}{suffix}").open("w") as file:
+                    for example in examples:
+                        file.write(json.dumps(row(example), ensure_ascii=False) + "\n")
         counts[name] = {"train": len(train), "held": len(held)}
+        sizes[name] = len(train)
     made: dict[str, Value] = {
-        "weights": {name: source.weight for name, source in mixture.sources()},
+        "temperature": 3,
+        "cap": cap,
+        "max_epochs": 10,
+        "weights": shares(sizes, cap),
         "rows": counts,
         "sources": {name: {"class": type(source).__name__, **dataclasses.asdict(source)}
                     for name, source in mixture.sources()},
+        "licences": {name: source.licence_record() for name, source in mixture.sources()},
         "decontamination": None if overlaps is None else dict(overlaps.report),
     }
     (out / "mixture.json").write_text(json.dumps(made, indent=1) + "\n")
@@ -1246,16 +1334,8 @@ class Conversion:
 
     out: str = "data/mixture"
     decontaminate: str | None = None
-    headroom: bool = False
-    """Add ESCI and iSarcasmEval at weights 0.02 and 0.01; the default mixture does not read either."""
+    cap: int = 200_000
     mixture: Mixture = field(default_factory=Mixture)
-
-    def selected(self) -> Mixture:
-        """The mixture, with the two permissively licensed headroom sources when requested."""
-        if not self.headroom:
-            return self.mixture
-        return dataclasses.replace(self.mixture, esci=dataclasses.replace(self.mixture.esci, weight=0.02),
-                                   isarcasm=dataclasses.replace(self.mixture.isarcasm, weight=0.01))
 
 
 if __name__ == "__main__":
@@ -1264,4 +1344,4 @@ if __name__ == "__main__":
 
     conversion = tyro.cli(Conversion)
     overlaps = None if conversion.decontaminate is None else Overlaps.load(conversion.decontaminate)
-    print(json.dumps(write(conversion.selected(), Path(conversion.out), overlaps)["rows"]))
+    print(json.dumps(write(conversion.mixture, Path(conversion.out), overlaps, conversion.cap)["rows"]))
