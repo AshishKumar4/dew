@@ -449,6 +449,9 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
     prompts, width, keep = start.rows, search.width, search.keep
     penalty, never = search.length_penalty, search.early_stopping == "never"
     real = jnp.repeat(start.active, width)
+    # The request's own budget, which the scan's `budget` trips can exceed:
+    # a hypothesis ends at it and none longer is recorded.
+    limit = start.budgets()[:, None]
     top = (jnp.arange(keep) < width)[None, :]
 
     def step(carry: _BeamCarry, position):
@@ -461,7 +464,7 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         flat = token.reshape(-1)
         ended = stopping(candidates.commit(flat, jnp.repeat(start.active, keep)), flat)
         ended = ended.reshape(prompts, keep) & jnp.repeat(start.active, keep).reshape(prompts, keep)
-        hit = ended | (position + 1 >= budget)
+        hit = ended | (position + 1 >= limit)
 
         grown = jnp.take(carry.drawn, branch, axis=0).reshape(prompts, keep, budget)
         grown = grown.at[:, :, position].set(token)
@@ -473,13 +476,13 @@ def _beam_search(state: DecoderState, start: StepState, ops: DecodeOps,
         state, beams, selected = _beam_continue(carry.state, carry.beams, ops, parent, token, forward,
                                                 real, prompts, width)
 
-        done = _completed(carry.done, search, top, carry.extending, position,
+        done = _completed(carry.done, search, top, carry.extending & (position < limit), position,
                           best=best, hit=hit, ended=ended, tokens=grown, raw=traced)
 
         live = _pick(alive, forward)
         # `never` estimates the best score still reachable from the whole
         # budget where the penalty rewards length; otherwise from here.
-        reach = float(budget) if never and penalty > 0 else (position + 1.0)
+        reach = limit.astype(jnp.float32) if never and penalty > 0 else (position + 1.0)
         worst = jnp.where(done.flag, jnp.min(done.score, axis=1, keepdims=True), DEAD)
         extending = carry.extending & jnp.any(live[:, :1] / jnp.power(reach, penalty) > worst,
                                 axis=-1, keepdims=True)

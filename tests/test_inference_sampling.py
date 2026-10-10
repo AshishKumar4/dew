@@ -486,6 +486,24 @@ def test_neutral_beam_controls_preserve_the_search(task):
         np.testing.assert_array_equal(getattr(actual, name), getattr(expected, name))
 
 
+@pytest.mark.parametrize("strategy", ["sample", "beam"])
+def test_a_bucketed_budget_ends_where_the_request_does(roomy, strategy):
+    """A three-token request scans a bucket of four trips and still ends at
+    three: ForcedEOS forces EOS at its third token, and beam search ends and
+    scores its hypotheses there, as generation at exactly three does."""
+    from dew.sampling import decoding
+    from dew.sampling.strategies import Beam
+
+    forced = (decoding.Greedy(), decoding.ForcedEOS(jnp.array([5], jnp.int32)))
+    search = None if strategy == "sample" else Beam(width=2)
+    exact = generate(roomy.model, roomy.variables, ramp(10), 3, key=0, logits=forced, strategy=search)
+    drawn = roomy(ramp(10), 3, key=0, logits=forced, strategy=search)
+    for field in ("tokens", "lengths", "terminated"):
+        np.testing.assert_array_equal(getattr(drawn, field), getattr(exact, field), err_msg=field)
+    np.testing.assert_allclose(drawn.raw_log_probs, exact.raw_log_probs, rtol=0, atol=1e-6)
+    assert int(np.asarray(drawn.tokens)[0, -1]) == 5
+
+
 def test_prompts_inside_one_bucket_trace_once_and_draw_what_their_own_width_draws(roomy):
     """A 100-token and a 120-token prompt both pad to 128, so the second call
     reuses the first's executable, and both draw what generation at the exact

@@ -426,15 +426,17 @@ class KVStore:
         """Every row's slots of `pool` `[heads, pages, page_size, ...]`, as `[rows, capacity, heads, ...]`."""
         return _gather_pages(pool, self._get(TABLE), self.layout.groups)
 
-    def kernel(self) -> bool:
-        """Return whether decode can read a full-precision BF16 page pool natively.
+    def kernel(self, query: jax.Array) -> bool:
+        """Return whether a decode query `[rows, heads, head_dim]` can read a
+        full-precision BF16 page pool natively.
 
         The TPU kernel reads bfloat16 and casts other page dtypes (its int8
         path broadcasts the scales to full width first), so a float32 or
         quantized pool uses the gather. On a GPU, decode reads the pages
-        through Dew's Pallas decode kernel where it fits the heads and the
-        page (`decode_attention.fits_paged`). A grouped pool also uses the
-        gather, which keeps each group's pages where they are.
+        through Dew's Pallas decode kernel where it fits the query's heads
+        over the pool's and the page (`decode_attention.fits_paged`). A
+        grouped pool also uses the gather, which keeps each group's pages
+        where they are.
         """
         page_size = self.layout.page_size
         if (page_size is None or self.layout.quantized is not None
@@ -447,7 +449,6 @@ class KVStore:
         from dew.nn.attention import FORWARD_MODE
         from dew.nn.kernels import decode_attention
 
-        query = jax.ShapeDtypeStruct((self.rows, self.kv_heads, self.head_dim), self.dtype)
         pages = jax.ShapeDtypeStruct((self.kv_heads, 1, page_size, self.head_dim), self.dtype)
         return decode_attention.fits_paged(query, pages) and not FORWARD_MODE.get()
 

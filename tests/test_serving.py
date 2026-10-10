@@ -973,16 +973,38 @@ def test_a_text_prompt_through_the_hf_processor_serves_what_the_task_draws():
     np.testing.assert_array_equal(ticket.result().tokens, bound("hello there", 4, key=0).tokens)
 
 
-def test_a_prompt_with_custom_valid_positions_is_refused():
-    """Only the positions the row cursor reproduces are safe to drop."""
+def test_a_served_request_is_forced_to_end_at_its_own_budget():
+    """ForcedEOS forces EOS at a request's own last token, not at the slots'
+    capacity, which a server's rows hold whatever their budget."""
+    from dew.sampling import decoding
+
+    forced = (decoding.Greedy(), decoding.ForcedEOS(jnp.array([5], jnp.int32)))
+    bound = dataclasses.replace(task(Sampling(temperature=0)), logits=forced)
+    server = Server.from_task(bound, slots=2, capacity=64)
+    ticket = server.submit("12", 3, key=0)
+    server.run()
+    expected = bound("12", 3, key=0)
+    np.testing.assert_array_equal(ticket.result().tokens, expected.tokens)
+    assert int(np.asarray(ticket.result().tokens)[0, -1]) == 5
+
+
+@pytest.mark.parametrize("through", ["submit", "batch"])
+@pytest.mark.parametrize("fields, conditioning, refusal", [
+    ({"positions": jnp.array([[5, 6, 7]], jnp.int32)}, {}, "positions"),
+    ({"attention_mask": jnp.array([[1, 2, 1]], jnp.int32)}, {}, "binary"),
+    ({}, {"pixel_values": jnp.zeros((1, 3, 4, 4))}, "media"),
+], ids=["noncanonical positions", "a validity of 2", "media"])
+def test_a_prompt_the_row_cursor_cannot_reproduce_is_refused(through, fields, conditioning, refusal):
+    """Only the positions the row cursor reproduces are safe to drop, and a
+    served row carries tokens and binary validity alone: a batch through the
+    server's call is held to what `submit` holds one row to."""
     from dew.nn.inputs import ModelInputs
 
     bound = task(Sampling(temperature=0))
     server = Server.from_task(bound, slots=2, capacity=64)
-    inputs = ModelInputs(jnp.array([[1, 2, 3]], jnp.int32),
-                         {"positions": jnp.array([[5, 6, 7]], jnp.int32)})
-    with pytest.raises(ValueError, match="positions"):
-        server.submit(inputs, 4, key=0)
+    inputs = ModelInputs(jnp.array([[1, 2, 3]], jnp.int32), fields, conditioning)
+    with pytest.raises(ValueError, match=refusal):
+        server.submit(inputs, 4, key=0) if through == "submit" else server(inputs, 4, key=0)
 
 
 def test_a_padding_positions_value_is_not_part_of_a_served_row():

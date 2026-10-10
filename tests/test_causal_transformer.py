@@ -1459,6 +1459,21 @@ def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
     return (out if scale is None else out * scale).astype(x.dtype)
 
 
+@pytest.mark.parametrize("sinks, kernel", [(False, "cudnn"), (True, "xla")])
+def test_a_masked_prefill_takes_cudnn_only_where_it_honors_the_layer(monkeypatch, sinks, kernel):
+    """A cache call over several queries prefers cuDNN for its mask where
+    cuDNN runs; a layer with attention sinks keeps xla, which honors them,
+    where cuDNN would refuse the call."""
+    from dew.nn.mixers import attention
+    from dew.nn.mixers.attention import CausalSelfAttention
+
+    monkeypatch.setattr(attention, "cudnn_runs", lambda query, softcap=None: True)
+    monkeypatch.setattr(attention, "kernel_for_materialized_mask", lambda *args, **kwargs: "xla")
+    layer = CausalSelfAttention(emb_features=8, num_heads=2, num_kv_heads=2, head_dim=4, max_seq_len=4,
+                                attention_sinks=sinks)
+    assert layer._mask_kernel(jnp.zeros((1, 3, 2, 4), jnp.bfloat16), decode=True) == kernel
+
+
 def test_a_per_axis_rotary_without_its_axes_is_refused():
     """Turning each axis in its own halves needs the axes; without them the
     layer would rotate by its positions and drop the per-axis layout."""
