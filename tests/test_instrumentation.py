@@ -508,25 +508,26 @@ def test_fit_reports_throughput_to_the_tracker():
 
 
 def test_fit_reports_the_wait_on_input_and_a_later_compile():
-    """A slow input shows as train/data_wait_ms on every tick, and a batch
-    of a shape the loop has not met compiles inside its tick, which reports
-    the compile as train/compile_s; the ticks that compiled nothing report
-    none."""
+    """An input slower than the step shows as train/data_wait_ms once the
+    batches read ahead during the first compile are spent, and a batch of a
+    shape the loop has not met compiles inside its tick, which reports the
+    compile as train/compile_s; the ticks that compiled nothing report none."""
     tracker = RecordingTracker()
 
     def slow():
         rng = np.random.default_rng(0)
         for rows in itertools.chain([BATCH] * 2, itertools.repeat(2 * BATCH)):
-            time.sleep(0.05)
+            time.sleep(0.1)
             x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
             yield {"x": x, "y": 2 * x[:, :2]}
 
-    make_trainer(tracker=tracker).fit(Data(slow), steps=4, log_every=1)
+    make_trainer(tracker=tracker).fit(Data(slow), steps=10, log_every=1)
 
     ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
-    assert len(ticks) == 4
-    assert all(p["train/data_wait_ms"] >= 40 for p in ticks), [p["train/data_wait_ms"] for p in ticks]
-    assert [("train/compile_s" in p) for p in ticks] == [False, False, True, False]
+    assert len(ticks) == 10
+    waits = [p["train/data_wait_ms"] for p in ticks]
+    assert min(waits[-4:]) >= 50, waits
+    assert [("train/compile_s" in p) for p in ticks] == [False, False, True] + [False] * 7
     assert ticks[2]["train/compile_s"] > 0
 
 
