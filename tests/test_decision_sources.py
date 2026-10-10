@@ -68,6 +68,39 @@ def test_sources_hold_out_a_seeded_two_percent_with_bounds(sources, monkeypatch,
     assert sources.OpenJev().split()[1] == calibration
 
 
+def test_url_producer_shards_without_changing_training_or_held_bytes(sources, monkeypatch):
+    import numpy as np
+
+    from dew.data.storage import Store
+
+    question = Choice("Pick", ["a", "b"])
+    examples = [Example(str(index), {"q": question}, {"q": "a"}) for index in range(20)]
+    monkeypatch.setattr(sources.Intents, "examples", lambda self: examples)
+    default = sources.Mixture()
+    off = {entry.name: dataclasses.replace(getattr(default, entry.name), weight=0.0)
+           for entry in dataclasses.fields(default)}
+    mixture = sources.Mixture(**{**off, "banking77": sources.Intents(held=4)})
+    root = Store("memory://decision-producer/shards")
+    made = sources.write(mixture, root.url, shard_bytes=400)
+    for split, expected in zip(("train", "held"), mixture.banking77.split(), strict=True):
+        part = made["files"]["banking77"][split]
+        encoded = b"".join(root.child(shard["path"]).read() for shard in part["shards"])
+        golden = "".join(json.dumps(sources.row(example), ensure_ascii=False) + "\n"
+                         for example in expected).encode()
+        assert encoded == golden
+        assert part["sha256"] == hashlib.sha256(golden).hexdigest()
+        index = np.load(io.BytesIO(root.child(part["index"]["path"]).read()), allow_pickle=False)
+        for position, entry in enumerate(index):
+            data = root.child(part["shards"][int(entry["shard"])]["path"]).read()
+            start = int(entry["offset"])
+            row = json.loads(data[start:start + int(entry["bytes"])])
+            assert row == sources.row(expected[position])
+        assert len(part["shards"]) > 1
+    assert made["slots"] == {"questions": 1, "options": 2}
+    manifest = root.child("manifest.json").read()
+    assert root.child("manifest.sha256").read().strip().decode() == hashlib.sha256(manifest).hexdigest()
+
+
 @pytest.mark.parametrize("label", ["E", "S", "C", "I"])
 def test_esci_rows_reproduce_the_kits_request(sources, label):
     example = sources.Esci.example({"query": "red shoes", "esci_label": label, "product_title": "blue shoes",

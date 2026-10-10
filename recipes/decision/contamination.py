@@ -180,11 +180,20 @@ class Overlaps:
 
     @classmethod
     def load(cls, path: str | Path) -> "Overlaps":
-        with np.load(path) as saved:
+        from dew.data.storage import Store
+
+        fs, location = Store(str(path)).resolve()
+        with fs.open(location, "rb") as file, np.load(file) as saved:
             return cls(saved["wholes"], saved["grams"], saved["decisions"])
 
     def save(self, path: str | Path) -> None:
-        np.savez_compressed(path, wholes=self.wholes, grams=self.grams, decisions=self.decisions)
+        import io
+
+        from dew.data.storage import Store
+
+        buffer = io.BytesIO()
+        np.savez_compressed(buffer, wholes=self.wholes, grams=self.grams, decisions=self.decisions)
+        Store(str(path)).write(buffer.getvalue())
 
     def hits(self, example: Example, *, natural: bool = True) -> bool:
         """Whether one of `example`'s decisions is an evaluation decision, or its content
@@ -263,7 +272,7 @@ def _decoded(value: Value) -> Value:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--out", required=True)
     parser.add_argument("--jsonl", nargs="*", default=[], help="request files with state and questions")
     parser.add_argument("--hub", nargs="*", default=[],
                         help="repo@revision:path=column,column files and the columns that hold their content")

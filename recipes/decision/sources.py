@@ -32,6 +32,7 @@ import csv
 import dataclasses
 import gzip
 import hashlib
+import io
 import json
 import random
 from collections import defaultdict
@@ -42,6 +43,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
 from dew.decision import Choice, Example, Noul, Question, Score
+from dew.data.storage import PreconditionFailed, Store
 
 if TYPE_CHECKING:
     from contamination import Overlaps
@@ -1421,28 +1423,122 @@ def shares(counts: dict[str, int], cap: int = 200_000) -> dict[str, float]:
     return result
 
 
-def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None,
-          cap: int = 200_000) -> dict[str, Value]:
-    """Write `mixture`'s sets under `out`, each decontaminated against `overlaps`, and return what
-    `<out>/mixture.json` records."""
-    out.mkdir(parents=True, exist_ok=True)
+def _publish(store: Store, data: bytes) -> dict:
+    digest = hashlib.sha256(data).hexdigest()
+    try:
+        store.put_if_absent(data)
+    except PreconditionFailed:
+        pass
+    found = store.read()
+    if len(found) != len(data) or hashlib.sha256(found).hexdigest() != digest:
+        raise ValueError(f"immutable decision artifact differs: {store.url}")
+    return {"bytes": len(data), "sha256": digest}
+
+
+def _json(store: Store, value: dict) -> dict:
+    return _publish(store, (json.dumps(value, indent=1, ensure_ascii=False) + "\n").encode())
+
+
+def _examples(out: Store, stem: str, examples: list[Example], max_bytes: int) -> dict:
+    import numpy as np
+
+    dtype = [("shard", "<u4"), ("offset", "<u8"), ("bytes", "<u4"), ("questions", "<u4"),
+             ("options", "<u4"), ("labelled", "?"), ("estimated_length", "<u8")]
+    index = np.empty(len(examples), dtype=dtype)
+    buffer = bytearray()
+    files = []
+    digest = hashlib.sha256()
+    slots = {"questions": 0, "options": 0}
+
+    def flush(final: bool) -> None:
+        if not buffer:
+            return
+        path = f"{stem}.jsonl" if final and not files else f"{stem}.{len(files):05d}.jsonl"
+        files.append({"path": path, **_publish(out.child(path), bytes(buffer))})
+        buffer.clear()
+
+    for position, example in enumerate(examples):
+        data = (json.dumps(row(example), ensure_ascii=False) + "\n").encode()
+        if len(data) > max_bytes:
+            raise ValueError(f"{stem} row {position} exceeds shard_bytes={max_bytes}")
+        if buffer and len(buffer) + len(data) > max_bytes:
+            flush(False)
+        questions = len(example.questions)
+        options = max((len(question.options) for question in example.questions.values()), default=0)
+        index[position] = (len(files), len(buffer), len(data), questions, options,
+                           bool(example.labels()), len(data))
+        slots["questions"] = max(slots["questions"], questions)
+        slots["options"] = max(slots["options"], options)
+        digest.update(data)
+        buffer.extend(data)
+    flush(True)
+    encoded = io.BytesIO()
+    np.save(encoded, index, allow_pickle=False)
+    path = f"{stem}.index.npy"
+    indexed = {"path": path, **_publish(out.child(path), encoded.getvalue())}
+    return {"rows": len(examples), "sha256": digest.hexdigest(), "shards": files,
+            "index": indexed, "slots": slots}
+
+
+def write_source(mixture: Mixture, name: str, out: str | Path, overlaps: "Overlaps | None" = None,
+                 cap: int = 200_000, shard_bytes: int = 128 * 2**20) -> dict:
+    """Build one source independently, with immutable shards and a completion manifest."""
     if cap <= 0:
         raise ValueError("cap must be positive")
-    counts: dict[str, Value] = {}
-    sizes = {}
+    if shard_bytes <= 0 or shard_bytes > 256 * 2**20:
+        raise ValueError("shard_bytes must be between 1 and 256 MiB")
+    enabled = dict(mixture.sources())
+    if name not in enabled:
+        raise ValueError(f"unknown or disabled decision source {name!r}")
+    source = enabled[name]
+    limited = dataclasses.replace(source, limit=cap if source.limit is None else min(source.limit, cap))
+    train, held = limited.split()
+    if overlaps is not None:
+        train = overlaps.keep(name, train, source.natural)
+        held = overlaps.keep(f"{name} (held out)", held, source.natural)
+    root = Store(str(out))
+    result = {"name": name, "cap": cap, "source": dataclasses.asdict(source),
+              "train": _examples(root, name, train, shard_bytes),
+              "held": _examples(root, f"{name}.held", held, shard_bytes),
+              "decontamination": None if overlaps is None else {
+                  key: value for key, value in overlaps.report.items()
+                  if key in (name, f"{name} (held out)")}}
+    _json(root.child(f"parts/{name}.json"), result)
+    return result
+
+
+def publish(mixture: Mixture, out: str | Path, cap: int = 200_000) -> dict:
+    """Commit a mixture only after every enabled source has a verified completion."""
+    import subprocess
+
+    root = Store(str(out))
+    parts = {name: json.loads(root.child(f"parts/{name}.json").read()) for name, _ in mixture.sources()}
+    files = []
+    report = {}
     for name, source in mixture.sources():
-        source = dataclasses.replace(source, limit=cap if source.limit is None else min(source.limit, cap))
-        train, held = source.split()
-        if overlaps is not None:
-            train = overlaps.keep(name, train, source.natural)
-            held = overlaps.keep(f"{name} (held out)", held, source.natural)
-        for suffix, examples in ((".jsonl", train), (".held.jsonl", held)):
-            if examples:
-                with (out / f"{name}{suffix}").open("w") as file:
-                    for example in examples:
-                        file.write(json.dumps(row(example), ensure_ascii=False) + "\n")
-        counts[name] = {"train": len(train), "held": len(held)}
-        sizes[name] = len(train)
+        part = parts[name]
+        if part["cap"] != cap or part["source"] != dataclasses.asdict(source):
+            raise ValueError(f"source configuration changed while building {name!r}")
+        report.update(part["decontamination"] or {})
+        for split in ("train", "held"):
+            built = part[split]
+            digest = hashlib.sha256()
+            for entry in built["shards"]:
+                data = root.child(entry["path"]).read()
+                if len(data) != entry["bytes"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                    raise ValueError(f"decision shard failed verification: {entry['path']}")
+                digest.update(data)
+                files.append(entry)
+            if digest.hexdigest() != built["sha256"]:
+                raise ValueError(f"decision concatenated checksum failed: {name} {split}")
+            indexed = built["index"]
+            data = root.child(indexed["path"]).read()
+            if len(data) != indexed["bytes"] or hashlib.sha256(data).hexdigest() != indexed["sha256"]:
+                raise ValueError(f"decision index failed verification: {indexed['path']}")
+            files.append(indexed)
+    counts = {name: {split: part[split]["rows"] for split in ("train", "held")}
+              for name, part in parts.items()}
+    sizes = {name: counts[name]["train"] for name in counts}
     made: dict[str, Value] = {
         "temperature": 3,
         "cap": cap,
@@ -1453,10 +1549,27 @@ def write(mixture: Mixture, out: Path, overlaps: "Overlaps | None" = None,
                     for name, source in mixture.sources()},
         "licences": {entry.name: source.licence_record() for entry in fields(mixture)
                      if (source := getattr(mixture, entry.name)).repo or source.weight > 0},
-        "decontamination": None if overlaps is None else dict(overlaps.report),
+        "decontamination": report or None,
+        "files": {name: {split: part[split] for split in ("train", "held")} for name, part in parts.items()},
+        "slots": {key: max((part[split]["slots"][key] for part in parts.values()
+                            for split in ("train", "held")), default=0)
+                  for key in ("questions", "options")},
     }
-    (out / "mixture.json").write_text(json.dumps(made, indent=1) + "\n")
+    files.append({"path": "mixture.json", **_json(root.child("mixture.json"), made)})
+    revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    manifest = {"schema": 1, "name": str(out).rstrip("/").rsplit("/", 1)[-1],
+                "dew": revision, "files": files}
+    digest = _json(root.child("manifest.json"), manifest)["sha256"]
+    _publish(root.child("manifest.sha256"), (digest + "\n").encode())
     return made
+
+
+def write(mixture: Mixture, out: str | Path, overlaps: "Overlaps | None" = None,
+          cap: int = 200_000, shard_bytes: int = 128 * 2**20) -> dict:
+    """Build and commit every enabled source directly to a filesystem URL."""
+    for name, _ in mixture.sources():
+        write_source(mixture, name, out, overlaps, cap, shard_bytes)
+    return publish(mixture, out, cap)
 
 
 @dataclass(frozen=True)
@@ -1466,6 +1579,9 @@ class Conversion:
     out: str = "data/mixture"
     decontaminate: str | None = None
     cap: int = 200_000
+    shard_bytes: int = 128 * 2**20
+    only: str | None = None
+    publish: bool = False
     mixture: Mixture = field(default_factory=Mixture)
 
 
@@ -1475,4 +1591,11 @@ if __name__ == "__main__":
 
     conversion = tyro.cli(Conversion)
     overlaps = None if conversion.decontaminate is None else Overlaps.load(conversion.decontaminate)
-    print(json.dumps(write(conversion.mixture, Path(conversion.out), overlaps, conversion.cap)["rows"]))
+    if conversion.publish:
+        result = publish(conversion.mixture, conversion.out, conversion.cap)
+    elif conversion.only is not None:
+        result = write_source(conversion.mixture, conversion.only, conversion.out, overlaps,
+                              conversion.cap, conversion.shard_bytes)
+    else:
+        result = write(conversion.mixture, conversion.out, overlaps, conversion.cap, conversion.shard_bytes)
+    print(json.dumps(result.get("rows", result)))
