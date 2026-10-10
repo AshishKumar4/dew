@@ -163,6 +163,8 @@ class ReadOptions:
     """Reader threads and buffers behind an iterable dataset."""
 
     def __init__(self, num_threads: int = ..., prefetch_buffer_size: int = ...) -> None: ...
+    num_threads: int
+    prefetch_buffer_size: int
 
 
 class MultiprocessingOptions:
@@ -174,6 +176,8 @@ class MultiprocessingOptions:
         per_worker_buffer_size: int = ...,
         enable_profiling: bool = ...,
     ) -> None: ...
+    num_workers: int
+    per_worker_buffer_size: int
 
 
 class ArrayRecordDataSource(RandomAccessDataSource[bytes]):

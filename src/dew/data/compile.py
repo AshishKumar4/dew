@@ -32,6 +32,7 @@ from dew.data.mix import Accepted, CorpusCounts, SearchBudget, TokenDeficit, tok
 from dew.data.pipeline import (
     Artifact,
     BatchStage,
+    Expansion,
     Filter,
     FlatMap,
     Group,
@@ -626,6 +627,7 @@ def _derived(pipeline: Pipeline, seed: int) -> Mapping[str, str]:
 
 
 def compile(train: Pipeline, *, validation: Pipeline | None = None, host: tuple[HostStep, ...] = (),
+            objective: ObjectiveData | Callable[[Mapping[str, object]], ObjectiveData] | None = None,
             read: Read = "indexed", provision: bool = False, loading: Loading = Loading(),
             seed: int = 0, rejections: Literal["drop", "mask"] = "drop", budget: SearchBudget = SearchBudget(),
             resume: Literal["exact", "non-exact"] = "exact") -> Dataset:
@@ -638,6 +640,13 @@ def compile(train: Pipeline, *, validation: Pipeline | None = None, host: tuple[
     for pipeline in pipelines:
         _check(pipeline, read, validation=pipeline is validation)
     _capabilities(pipelines, read, provision)
+    if objective is not None:
+        shaped = objective if isinstance(objective, ObjectiveData) else objective(_metadata(pipelines, read))
+        train = _objective_branch(train, shaped, train=True)
+        validation = None if validation is None else _objective_branch(validation, shaped, train=False)
+        _check(train, read)
+        if validation is not None:
+            _check(validation, read, validation=True)
     batches = [stage.size for stage in train.stages if isinstance(stage, BatchStage)]
     if len(batches) != 1:
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
@@ -698,5 +707,44 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
         children = tuple(objective_steps(child, objective, train=train) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     for step in objective.train if train else objective.evaluate:
-        pipeline = pipeline.random_map(step) if isinstance(step, pygrain.RandomMapTransform) else pipeline.map(step)
+        if isinstance(step, Expansion):
+            pipeline = pipeline.flat_map(step)
+        elif isinstance(step, pygrain.RandomMapTransform):
+            pipeline = pipeline.random_map(step)
+        else:
+            pipeline = pipeline.map(step)
     return pipeline
+
+
+def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool) -> Pipeline:
+    before = next((index for index, stage in enumerate(pipeline.stages)
+                   if isinstance(stage, (Shuffle, Repeat, Group, BatchStage))), len(pipeline.stages))
+    prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:before])
+    prefix = objective_steps(prefix, objective, train=train)
+    branch = dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[before:]))
+    if train and objective.group is not None:
+        at = next(index for index, stage in enumerate(branch.stages) if isinstance(stage, BatchStage))
+        branch = dataclasses.replace(branch, stages=(*branch.stages[:at], Group(objective.group), *branch.stages[at:]))
+    return branch.map_batch(*(objective.train_batch if train else objective.evaluate_batch))
+
+
+def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
+    combined: dict[str, object] = {}
+    slots: dict[str, int] = {}
+    for pipeline in pipelines:
+        for leaf in _leaves(pipeline):
+            source = leaf.source
+            if isinstance(source, Mixture):
+                continue
+            if read == "memory":
+                source.records(read)
+            facts = source.metadata()
+            for key, value in facts.items():
+                if key == "slots":
+                    for name, size in record(value, "slots").items():
+                        slots[name] = max(slots.get(name, 0), integer(size, f"slots.{name}"))
+                elif key not in combined:
+                    combined[key] = value
+                elif combined[key] != value:
+                    combined.pop(key, None)
+    return {**combined, "slots": slots} if slots else combined
