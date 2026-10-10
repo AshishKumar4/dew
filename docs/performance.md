@@ -1223,37 +1223,15 @@ output and five gradients), and two calls agree bit for bit. Value blocks of
 memory); the block stays 32 until the G4, whose sm120 holds less shared
 memory a block, is measured. `KERNELS` takes the kernels on sm80 only.
 
-A fused chunk-local output experiment, 2026-10-10 (c45), did not improve
-that rule. The forward and its two backward kernels keep the pairwise
-products and compensated decays on chip. On the same A100 shape, medians
-of 20 calls, with the preceding Pallas path measured in the same session:
+A fused output lost at all nine tested tiles (c45), its forward and backward
+taking 24.02 ms against the preceding path's 9.33 at the default tile.
+The output stays in XLA.
 
-| rule | forward, ms / kernels | forward + backward, ms / kernels |
-|---|---:|---:|
-| Pallas recurrence, XLA chunk-local products | 3.20 / 36 | 9.33 / 103 |
-| fused output, 32-column blocks, 4 warps | 3.24 / 35 | 24.02 / 106 |
-| fused output, best training tile: 16 columns, 4 warps | 3.95 / 35 | 10.91 / 107 |
-| fla 0.5.2 (Triton, torch) | 1.36 | 3.60 |
-
-All nine tiles (16, 32 or 64 columns, 2, 4 or 8 warps) lost to the
-preceding path. The operand-gradient kernel alone took 15.54 ms at
-32 columns and 1.93 at 16; the value-gradient kernel took another 1.44 ms
-at 16. The fused forward's temporary memory fell from 608.6 to 489.3 MiB,
-but this did not produce a time gain. Whole-rule output and gradient RMS
-errors against float64 were within 1.001 times XLA's at default precision
-and 1.324 at highest, with bitwise repeatability. The direct output tests
-passed on the GPU. A separate, pre-existing recurrence-only IEEE test
-failed for the `u` gradient (1.504e-7 versus XLA's 4.926e-8 RMS, ratio
-3.05); changing dot precision alone had not fixed that narrower case.
-No automatic fused-output dispatch was enabled from this measurement.
-
-The fused prep did improve training in the follow-up A100 session (c46).
-`dew.nn.kernels.delta_prep` keeps the key products and the strictly lower
-solve on chip, then prepares `w` and `u`. It saves one fp32 inverse for the
-backward (40 MiB at this shape), not the attention or decay matrices. Its
-16-wide diagonal blocks use masked row reductions, then the 16-to-32-to-64
-merges use `X2 A21 X1`, the same bounded block-doubling structure as the
-XLA inverse. Output remains XLA. Same-session medians of 20 calls:
+Fused prep did improve training (c46). `dew.nn.kernels.delta_prep` keeps the
+key products and strictly lower solve on chip and saves one fp32 inverse
+for the backward (40 MiB here). Its 16-wide diagonal blocks use masked row
+reductions, then 16-to-32-to-64 merges use `X2 A21 X1`, the XLA inverse's
+bounded block doubling. Same-session medians of 20 calls on the A100:
 
 | call | recurrence only, ms / kernels | fused prep, ms / kernels |
 |---|---:|---:|
@@ -1262,24 +1240,14 @@ XLA inverse. Output remains XLA. Same-session medians of 20 calls:
 | GatedDeltaNet, forward | 6.13 / 50 | 6.14 / 30 |
 | GatedDeltaNet, forward + input gradient | 15.15 / 127 | 13.70 / 69 |
 
-The rule's training time fell 10.1%, the mixer's 9.6%. Temporary memory
-fell from 1254.8 to 1051.8 MiB for the rule and 1659.0 to 1387.7 MiB for
-the mixer. Eighteen prep tiles (16/32/64 columns, 2/4/8 warps, 1/2 stages)
-did not improve on the default 32-column, 4-warp, 2-stage tile: the lowest
-repeat was 8.25 ms. Prep plus output took 9.81 ms for the rule and 16.19
-for the mixer, so the output kernel was removed. The choice stays the
-single `KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}`: recurrence and
-prep together, every other generation unmeasured. Against float64, the
-whole rule's output and gradients had RMS ratios at most 1.002 at default
-precision and 1.324 at highest, and repeated bit for bit. KDA stays XLA.
-
-This session also tested the recurrence-only `u` discrepancy above.
-Moving its two exp factors to XLA left every output and gradient's RMS
-error bitwise unchanged. Both kernel traces used IEEE dots at highest
-precision, so neither an approximate exp nor an ignored dot-precision
-context explained it. That experiment was reverted; the narrower `u`
-gradient failure remains a separate issue in the preceding recurrence,
-not a claimed passing gate for this prep change.
+The rule's training time fell 10.1%, the mixer's 9.6%; fla's rule took
+1.36/3.61 ms. Temporary memory fell from 1254.8 to 1051.8 MiB for the rule
+and 1659.0 to 1387.7 for the mixer. Eighteen prep tiles did not beat the
+default 32-column, 4-warp, 2-stage tile (lowest repeat 8.25 ms). The single
+`KERNELS['gated_delta_rule'] = {'sm80': 'pallas'}` takes recurrence and prep
+together; other generations remain unmeasured, and KDA stays XLA. The
+whole rule's float64 RMS ratios were at most 1.002 at default precision
+and 1.324 at highest, with bitwise repeats.
 
 With canonical metadata the call is exactly the plain call. Its outputs are
 bitwise equal to the no-metadata forward, and its parameter gradients are
