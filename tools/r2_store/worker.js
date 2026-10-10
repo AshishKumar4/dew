@@ -36,11 +36,13 @@ export default {
       let object;
       try {
         object = await env.CACHE.get(key, ranged ? { range: request.headers } : {});
-      } catch {
-        // R2 throws on a range the object cannot satisfy, as one past its end.
-        const head = await env.CACHE.head(key);
-        return head === null ? new Response(null, { status: 404 })
-          : new Response(null, { status: 416, headers: { 'content-range': `bytes */${head.size}` } });
+      } catch (error) {
+        // R2 throws on a range the object cannot satisfy, one starting past its
+        // end; any other failure is the request's 500.
+        const start = /^bytes=(\d+)-/.exec(request.headers.get('range') ?? '');
+        const head = ranged && start !== null ? await env.CACHE.head(key) : null;
+        if (head === null || Number(start[1]) < head.size) throw error;
+        return new Response(null, { status: 416, headers: { 'content-range': `bytes */${head.size}` } });
       }
       if (object === null) return new Response(null, { status: 404 });
       if (!ranged || object.range === undefined) {
