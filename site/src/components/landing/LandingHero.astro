@@ -1,13 +1,12 @@
 ---
 // The hero: the headline, one line, the install command and three links, over
-// a full-screen shader that src/hero/hero.ts picks after the first paint.
-// data-particles names the particle model trained on this font's letters.
+// the full-screen condensation shader src/hero/hero.ts starts after the first paint.
 import CopyCommand from './CopyCommand.astro';
 
 const install = 'pip install dewml';
 ---
 
-<section class="hero" data-hero data-particles="geist">
+<section class="hero" data-hero>
 	<div class="hero-stage" aria-hidden="true">
 		<div class="hero-still"></div>
 		<canvas></canvas>

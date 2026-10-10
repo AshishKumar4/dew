@@ -87,32 +87,20 @@ html[data-has-hero][data-past-hero] header.header {
 	opacity: 1;
 }
 
-/* The still frames: one per hero, theme and orientation (public/hero/stills/),
+/* The still frames, one per theme and orientation (public/hero/stills/),
    fetched only when the hero falls back to one. */
-.hero[data-mode='still'][data-pick='condensation'] .hero-still {
+.hero[data-mode='still'] .hero-still {
 	background-image: url('/hero/stills/condensation-dark-wide.webp');
 }
-.hero[data-mode='still'][data-pick='particles'] .hero-still {
-	background-image: url('/hero/stills/particles-dark-wide.webp');
-}
-:root[data-theme='light'] .hero[data-mode='still'][data-pick='condensation'] .hero-still {
+:root[data-theme='light'] .hero[data-mode='still'] .hero-still {
 	background-image: url('/hero/stills/condensation-light-wide.webp');
 }
-:root[data-theme='light'] .hero[data-mode='still'][data-pick='particles'] .hero-still {
-	background-image: url('/hero/stills/particles-light-wide.webp');
-}
 @media (orientation: portrait) {
-	.hero[data-mode='still'][data-pick='condensation'] .hero-still {
+	.hero[data-mode='still'] .hero-still {
 		background-image: url('/hero/stills/condensation-dark-tall.webp');
 	}
-	.hero[data-mode='still'][data-pick='particles'] .hero-still {
-		background-image: url('/hero/stills/particles-dark-tall.webp');
-	}
-	:root[data-theme='light'] .hero[data-mode='still'][data-pick='condensation'] .hero-still {
+	:root[data-theme='light'] .hero[data-mode='still'] .hero-still {
 		background-image: url('/hero/stills/condensation-light-tall.webp');
-	}
-	:root[data-theme='light'] .hero[data-mode='still'][data-pick='particles'] .hero-still {
-		background-image: url('/hero/stills/particles-light-tall.webp');
 	}
 }
 

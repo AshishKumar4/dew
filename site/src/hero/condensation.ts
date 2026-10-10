@@ -1,4 +1,4 @@
-// One of the landing page's two heroes: condensation on a pane of glass.
+// The landing page's hero: condensation on a pane of glass.
 //
 // The pane holds a field of droplets that spell the wordmark, x0. Every pixel
 // follows the forward and reverse process of a cosine-schedule diffusion model,

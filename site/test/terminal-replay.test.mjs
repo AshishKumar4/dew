@@ -2,37 +2,26 @@
 // the final frame. Reduced motion (and a failed fetch) leave the static screen.
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
-import { createServer } from 'node:http';
 import path from 'node:path';
 import { after, before, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import { serveDist } from '../scripts/serve-dist.mjs';
 
 const dist = process.env.SITE_TEST_DIST ?? fileURLToPath(new URL('../dist/', import.meta.url));
-const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.json': 'application/json' };
-let server;
+let site;
 let browser;
 
 before(async () => {
-	server = createServer(async (request, response) => {
-		let file = path.join(dist, new URL(request.url, 'http://x').pathname);
-		if (file.endsWith('/')) file += 'index.html';
-		try {
-			response.writeHead(200, { 'Content-Type': types[path.extname(file)] ?? 'application/octet-stream' });
-			response.end(await readFile(file));
-		} catch {
-			response.end();
-		}
-	});
-	await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+	site = await serveDist(dist);
 	browser = await chromium.launch({ channel: 'chrome' });
 });
 after(async () => {
 	await browser?.close();
-	server?.close();
+	site?.close();
 });
 
-const url = () => `http://127.0.0.1:${server.address().port}/`;
+const url = () => site.url;
 const fixture = {
 	seconds: 6, duration: 1.5,
 	frames: [
