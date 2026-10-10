@@ -202,6 +202,10 @@ class PPOObjective(Objective[Ratio, Variables]):
         metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
         return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics)
 
+    def validation_loss(self, variables: Variables, batch, step: Step):
+        """Score source prompts under the live actor, without rollout targets or the critic."""
+        return self.actor.validation_loss(part(variables, "policy"), batch, replace(step, ema=None))
+
     def evaluate(self, params: Variables, batch, step: Step):
         return self.actor.evaluate(part(params, "policy"), batch, replace(step, ema=None))
 

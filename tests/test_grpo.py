@@ -198,6 +198,50 @@ def test_evaluation_scores_prompt_perplexity():
                                     LENGTH_KEY: jnp.ones(1, jnp.int32)}, step)
 
 
+@pytest.mark.parametrize("kind", ["grpo", "ppo"])
+def test_checkpointed_policy_fit_validates_source_prompts(tmp_path, kind):
+    import itertools
+
+    import optax
+    from affine_run import Data
+    from flax import linen as nn
+    from recording import RecordingTracker
+
+    from dew.objectives.base import VALID_ROWS
+    from dew.objectives.rl import PPOObjective
+    from dew.training import Checkpoints, Trainer
+
+    class Critic(nn.Module):
+        @nn.compact
+        def __call__(self, tokens, **packing):
+            return nn.Embed(VOCAB, 1)(tokens)[..., 0]
+
+    model = TinyHead(vocab_size=VOCAB)
+    width = PROMPT_WIDTH + RESPONSE_WIDTH - 1
+    objective = (GRPOObjective(model, width, beta=.01) if kind == "grpo"
+                 else PPOObjective(model, width, critic=Critic(), beta=.01))
+    rows = 2 * jax.device_count()
+    source = {PROMPT_KEY: np.tile(np.arange(1, 6, dtype=np.int32), (rows, 1)),
+              LENGTH_KEY: np.tile(np.array([5, 3], np.int32), rows // 2)}
+    validation = {**source, VALID_ROWS: np.arange(rows) < rows - 1}
+    packed = jax.tree.map(lambda value: jnp.tile(value, (rows // ROWS, 1)), rollout_batch())
+    if kind == "ppo":
+        packed.update(old_values=jnp.zeros_like(packed[RESPONSE_MASK_KEY]),
+                      returns=jnp.ones_like(packed[RESPONSE_MASK_KEY]))
+    tracker = RecordingTracker()
+    trainer = Trainer(objective, optax.sgd(0.), key=jax.random.key(0), tracker=tracker,
+                      checkpoints=Checkpoints(str(tmp_path / kind)),
+                      rollout=lambda state, batch, key: packed)
+    data = Data(train=lambda: itertools.repeat(source), val=lambda: iter((validation,)), batch=rows)
+    final = trainer.fit(data, steps=1, eval_every=1)
+    reported = [scalars["val/loss"] for _, scalars in tracker.scalars if "val/loss" in scalars]
+    assert reported and np.isfinite(reported).all()
+    scores = objective.evaluate(final.variables, validation, Step(jnp.array(1), jax.random.key(1), None))
+    weights = np.asarray(scores.weights) * validation[VALID_ROWS][:, None]
+    expected = np.sum(np.asarray(scores.losses) * weights) / weights.sum()
+    assert reported[-1] == pytest.approx(float(expected), rel=1e-5)
+
+
 def test_the_rollout_batch_feeds_the_objective():
     """The `SampledRollout` pack and the `GRPOObjective` loss agree on every
     key: a rollout straight into the loss, shapes fixed, loss finite."""
