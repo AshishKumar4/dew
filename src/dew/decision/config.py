@@ -94,7 +94,8 @@ class DecisionRunConfig(RunConfig):
     cut from backpropagation; None keeps the loop's own choice."""
     loop_remat: bool = False
     """Checkpoint every pass of the loop, including the first, and recompute
-    it in the backward pass; requires a loop and leaves decoding unchanged."""
+    it in the backward pass; requires a loop and leaves decoding unchanged.
+    False keeps a checkpoint's own choice."""
     remat: str | None = None
     """A `REMAT_POLICIES` name for the loaded backbone's layers, applied before
     looping and LoRA. The trainer's fitting ladder starts here; a policy
