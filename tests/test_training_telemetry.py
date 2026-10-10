@@ -44,7 +44,7 @@ def test_grad_norm_averages_committed_windows_only(cadence, expected):
     sink = RecordingTracker()
     trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, accumulation=2)
     trainer.fit(targets([1., 3., 2., 6., 1., 3.]), steps=6, log_every=cadence)
-    rows = {step: values['train/grad_norm'] for step, values in sink.logs
+    rows = {step: values['train/grad_norm'] for step, values in sink.scalars
             if 'train/grad_norm' in values}
     assert rows == pytest.approx(expected)
 
@@ -53,7 +53,7 @@ def test_rejected_attempts_do_not_contribute_to_grad_norm():
     sink = RecordingTracker()
     trainer = Trainer(Squared(), optax.sgd(.1), key=0, tracker=sink, accumulation=2, dynamic_scale=True)
     trainer.fit(targets([1., float('nan'), 3., 2.]), steps=4, log_every=1)
-    rows = {step: values['train/grad_norm'] for step, values in sink.logs
+    rows = {step: values['train/grad_norm'] for step, values in sink.scalars
             if 'train/grad_norm' in values}
     assert rows == pytest.approx({3: 4.})
 
