@@ -162,12 +162,13 @@ class _RoutingLayer(nn.Module):
     attention_impl: str = "auto"
 
     @nn.compact
-    def __call__(self, queries: jax.Array, memory: jax.Array, mask: jax.Array) -> jax.Array:
+    def __call__(self, queries: jax.Array, memory: jax.Array, tokens: jax.Array) -> jax.Array:
         attention = NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                     dtype=self.dtype, precision=self.precision,
                                     attention_impl=self.attention_impl, name="attention")
         memory = _layer_norm(self.dtype, "memory_norm")(memory)
-        queries = queries + attention(_layer_norm(self.dtype, "query_norm")(queries), memory, mask=mask)
+        normed = _layer_norm(self.dtype, "query_norm")(queries)
+        queries = queries + attention(normed, memory, key_value_seq_lengths=tokens)
         mlp = GatedMLP(hidden_features=self.feedforward, out_features=self.width, activation="gelu_exact",
                        use_bias=True, dtype=self.dtype, precision=self.precision, name="feedforward")
         return queries + mlp(_layer_norm(self.dtype, "feedforward_norm")(queries))
@@ -185,16 +186,17 @@ class _FieldLayer(nn.Module):
     attention_impl: str = "auto"
 
     @nn.compact
-    def __call__(self, fields: jax.Array, memory: jax.Array, among: jax.Array, onto: jax.Array) -> jax.Array:
+    def __call__(self, fields: jax.Array, memory: jax.Array, questions: jax.Array,
+                 tokens: jax.Array) -> jax.Array:
         def attention(name: str) -> NormalAttention:
             return NormalAttention(self.width, heads=self.heads, dim_head=self.width // self.heads,
                                    dtype=self.dtype, precision=self.precision,
                                    attention_impl=self.attention_impl, name=name)
 
         normed = _layer_norm(self.dtype, "norm1")(fields)
-        fields = fields + attention("self_attn")(normed, mask=among)
+        fields = fields + attention("self_attn")(normed, key_value_seq_lengths=questions)
         normed = _layer_norm(self.dtype, "norm2")(fields)
-        fields = fields + attention("multihead_attn")(normed, memory, mask=onto)
+        fields = fields + attention("multihead_attn")(normed, memory, key_value_seq_lengths=tokens)
         mlp = GatedMLP(hidden_features=self.feedforward, out_features=self.width, activation="gelu_exact",
                        use_bias=True, dtype=self.dtype, precision=self.precision, name="mlp")
         return fields + mlp(_layer_norm(self.dtype, "norm3")(fields))
@@ -286,7 +288,7 @@ class JointSchemaHead(Head):
         if table is None:
             raise ValueError("Clef's head reads the backbone's output table, its lexical prior")
         hidden = self.hidden_norm(states)
-        batch, length = inputs.valid.shape
+        batch = inputs.valid.shape[0]
         memory = self.memory_projection(hidden)
         last = jnp.maximum(jnp.sum(inputs.valid, axis=1) - 1, 0)
         last_state = hidden[jnp.arange(batch), last]
@@ -298,10 +300,14 @@ class JointSchemaHead(Head):
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
                    + self.option_question_projection(questions)[:, :, None])
-        onto = jnp.broadcast_to(inputs.valid[:, None, None, :], (batch, 1, count * width, length))
+        # A row's tokens and questions are right-padded, so each attention is told where its keys end
+        # (at least one, for a padding row) rather than given a dense mask, which a fused kernel reads
+        # as a bias per head: [B, H, Q*K, T], gigabytes on a batch of long rows with many options.
+        tokens = jnp.maximum(jnp.sum(inputs.valid, axis=1, dtype=jnp.int32), 1)
+        asked = jnp.maximum(jnp.sum(inputs.questions, axis=1, dtype=jnp.int32), 1)
         routed = queries.reshape(batch, count * width, self.width)
         for layer in self.evidence_layers:
-            routed = layer(routed, memory, onto)
+            routed = layer(routed, memory, tokens)
         routed = routed.reshape(batch, count, width, self.width)
 
         fields = self.question_projection(questions)
@@ -311,10 +317,8 @@ class JointSchemaHead(Head):
         rows = jnp.asarray(_CLEF_ROWS)[inputs.kinds]
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)[:, None]
                   + self.type_embedding(rows))
-        among = jnp.broadcast_to(inputs.questions[:, None, None, :], (batch, 1, count, count))
-        onto = jnp.broadcast_to(inputs.valid[:, None, None, :], (batch, 1, count, length))
         for layer in self.field_layers:
-            fields = layer(fields, memory, among, onto)
+            fields = layer(fields, memory, asked, tokens)
         fields = self.field_norm(fields)
 
         anchor = l2_normalized(questions + last_state[:, None], 1e-12)
