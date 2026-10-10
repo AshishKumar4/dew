@@ -134,14 +134,14 @@ class DewDataFileSystem(AbstractFileSystem):
             query = "?" + urllib.parse.urlencode({"list": prefix, "cursor": cursor})
             body, _ = self._request("GET", self.bucket, query=query)
             page = json.loads(body)
-            for item in page["objects"]:
-                key = item["key"]
+            for suffix in page["keys"]:
+                key = prefix + suffix
                 tail = key[len(prefix):].lstrip("/")
                 first, slash, _ = tail.partition("/")
                 name = f"{self.bucket}/{prefix.rstrip('/') + '/' if prefix else ''}{first}"
-                entries[name] = {"name": name, "type": "directory" if slash else "file",
-                                 "size": 0 if slash else item["size"], "etag": item.get("etag")}
-            if not page.get("truncated"):
+                entries[name] = ({"name": name, "type": "directory", "size": 0} if slash
+                                 else self.info(f"{self.bucket}/{key}"))
+            if page["cursor"] is None:
                 break
             cursor = page["cursor"]
         found = sorted(entries.values(), key=lambda entry: str(entry["name"]))
@@ -161,6 +161,8 @@ class DewDataFileSystem(AbstractFileSystem):
         return body
 
     def pipe_file(self, path: str, value: bytes, **kwargs: object) -> None:
+        if not 0 < len(value) <= 100_000_000:
+            raise ValueError(f"dew-data object {path} must be between 1 byte and 100 MB; write shards")
         self._request("PUT", path, data=value)
 
     def makedirs(self, path: str, exist_ok: bool = False) -> None:
@@ -187,8 +189,8 @@ class _WorkerWriter(io.BytesIO):
         self.path = path
 
     def write(self, data: bytes) -> int:
-        if self.tell() + len(data) > 256 * 2**20:
-            raise ValueError(f"dew-data object {self.path} exceeds 256 MiB; write smaller shards")
+        if self.tell() + len(data) > 100_000_000:
+            raise ValueError(f"dew-data object {self.path} exceeds 100 MB; write smaller shards")
         return super().write(data)
 
     def close(self) -> None:
