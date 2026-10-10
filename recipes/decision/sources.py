@@ -1481,7 +1481,7 @@ def _examples(out: Store, stem: str, examples: list[Example], max_bytes: int) ->
 
 
 def write_source(mixture: Mixture, name: str, out: str | Path, overlaps: "Overlaps | None" = None,
-                 cap: int = 200_000, shard_bytes: int = 128 * 2**20) -> dict:
+                 cap: int = 200_000, shard_bytes: int = 64 * 2**20) -> dict:
     """Build one source independently, with immutable shards and a completion manifest."""
     if cap <= 0:
         raise ValueError("cap must be positive")
@@ -1565,7 +1565,7 @@ def publish(mixture: Mixture, out: str | Path, cap: int = 200_000) -> dict:
 
 
 def write(mixture: Mixture, out: str | Path, overlaps: "Overlaps | None" = None,
-          cap: int = 200_000, shard_bytes: int = 128 * 2**20) -> dict:
+          cap: int = 200_000, shard_bytes: int = 64 * 2**20) -> dict:
     """Build and commit every enabled source directly to a filesystem URL."""
     for name, _ in mixture.sources():
         write_source(mixture, name, out, overlaps, cap, shard_bytes)
@@ -1579,7 +1579,7 @@ class Conversion:
     out: str = "data/mixture"
     decontaminate: str | None = None
     cap: int = 200_000
-    shard_bytes: int = 128 * 2**20
+    shard_bytes: int = 64 * 2**20
     only: str | None = None
     publish: bool = False
     mixture: Mixture = field(default_factory=Mixture)

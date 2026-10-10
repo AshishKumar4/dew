@@ -57,16 +57,22 @@ def _index(work: Path, url: str) -> None:
     if digest != INDEX_SHA256:
         raise ValueError(f"rebuilt c32 index differs: sha256={digest}, expected {INDEX_SHA256}")
     root = Store(url)
-    target = root.child("eval-index.npz")
-    try:
-        target.put_if_absent(data)
-    except PreconditionFailed:
-        pass
-    if hashlib.sha256(target.read()).hexdigest() != digest:
-        raise ValueError("published evaluation index differs from the rebuilt index")
+    files = []
+    for offset in range(0, len(data), 64 * 2**20):
+        part = data[offset:offset + 64 * 2**20]
+        path = f"eval-index.npz.{len(files):05d}"
+        target = root.child(path)
+        try:
+            target.put_if_absent(part)
+        except PreconditionFailed:
+            pass
+        checksum = hashlib.sha256(part).hexdigest()
+        if hashlib.sha256(target.read()).hexdigest() != checksum:
+            raise ValueError(f"published evaluation index shard differs: {path}")
+        files.append({"path": path, "sha256": checksum, "bytes": len(part)})
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     manifest = {"schema": 1, "name": "decision-eval-index-v1", "dew": revision,
-                "files": [{"path": "eval-index.npz", "sha256": digest, "bytes": len(data)}]}
+                "sha256": digest, "files": files}
     encoded = (json.dumps(manifest, indent=1) + "\n").encode()
     root.child("manifest.json").put_if_absent(encoded)
     root.child("manifest.sha256").put_if_absent((hashlib.sha256(encoded).hexdigest() + "\n").encode())

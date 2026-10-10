@@ -180,8 +180,24 @@ class Overlaps:
 
     @classmethod
     def load(cls, path: str | Path) -> "Overlaps":
+        import io
+
         from dew.data.storage import Store
 
+        if not str(path).endswith(".npz"):
+            root = Store(str(path))
+            manifest = json.loads(root.child("manifest.json").read())
+            parts = []
+            for entry in manifest["files"]:
+                data = root.child(entry["path"]).read()
+                if len(data) != entry["bytes"] or hashlib.sha256(data).hexdigest() != entry["sha256"]:
+                    raise ValueError(f"evaluation index shard differs: {entry['path']}")
+                parts.append(data)
+            data = b"".join(parts)
+            if hashlib.sha256(data).hexdigest() != manifest["sha256"]:
+                raise ValueError("evaluation index concatenated checksum differs")
+            with np.load(io.BytesIO(data)) as saved:
+                return cls(saved["wholes"], saved["grams"], saved["decisions"])
         fs, location = Store(str(path)).resolve()
         with fs.open(location, "rb") as file, np.load(file) as saved:
             return cls(saved["wholes"], saved["grams"], saved["decisions"])
