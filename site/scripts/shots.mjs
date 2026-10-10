@@ -1,29 +1,14 @@
 // node scripts/shots.mjs [out]: the built landing page (dist/) at 1440 and 390 wide, dark and light, its
 // first screen and the whole page, once the hero has started or fallen back to its still frame. Exits 1 on a
 // page error, a hero that never starts, or a page wider than the screen.
-import { mkdirSync, readFileSync } from 'node:fs';
-import { createServer } from 'node:http';
+import { mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { chromium } from 'playwright-core';
+import { serveDist } from './serve-dist.mjs';
 
 const out = process.argv[2] ?? 'shots';
-const dist = fileURLToPath(new URL('../dist/', import.meta.url));
-const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css', '.svg': 'image/svg+xml', '.json': 'application/json',
-	'.webp': 'image/webp', '.png': 'image/png', '.woff2': 'font/woff2' };
-const server = createServer((request, response) => {
-	let file = path.join(dist, decodeURIComponent(new URL(request.url, 'http://x').pathname));
-	if (file.endsWith('/')) file += 'index.html';
-	try {
-		const body = readFileSync(file);
-		response.writeHead(200, { 'Content-Type': types[path.extname(file)] ?? 'application/octet-stream' });
-		response.end(body);
-	} catch {
-		response.writeHead(404).end();
-	}
-});
-await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
-const base = `http://127.0.0.1:${server.address().port}/`;
+const site = await serveDist(fileURLToPath(new URL('../dist/', import.meta.url)));
 mkdirSync(out, { recursive: true });
 const browser = await chromium.launch({ channel: 'chrome' });
 let failed = 0;
@@ -35,7 +20,7 @@ try {
 			const page = await context.newPage();
 			const problems = [];
 			page.on('pageerror', (error) => problems.push(error.message));
-			await page.goto(base, { waitUntil: 'load' });
+			await page.goto(site.url, { waitUntil: 'load' });
 			const mode = await page
 				.waitForFunction(() => document.querySelector('[data-hero]')?.dataset.mode, null, { timeout: 15_000 })
 				.then((handle) => handle.jsonValue())
@@ -44,6 +29,15 @@ try {
 			await page.waitForTimeout(1500);
 			const name = `landing-${width}-${theme}`;
 			await page.screenshot({ path: path.join(out, `${name}-top.png`) });
+			// The sections fade in as they reach the screen, so scroll through them before the whole page.
+			await page.evaluate(async () => {
+				for (let y = 0; y < document.documentElement.scrollHeight; y += innerHeight * 0.7) {
+					scrollTo(0, y);
+					await new Promise((done) => setTimeout(done, 250));
+				}
+				scrollTo(0, 0);
+			});
+			await page.waitForTimeout(1000);
 			await page.screenshot({ path: path.join(out, `${name}.png`), fullPage: true });
 			if (await page.evaluate(() => document.documentElement.scrollWidth > innerWidth)) problems.push('wider than the screen');
 			failed += problems.length ? 1 : 0;
@@ -53,6 +47,6 @@ try {
 	}
 } finally {
 	await browser.close();
-	server.close();
+	site.close();
 }
 process.exit(failed ? 1 : 0);
