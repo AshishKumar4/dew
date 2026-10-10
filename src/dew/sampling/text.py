@@ -492,6 +492,13 @@ def _seeded_depths(ops: DecodeOps, state: DecoderState, states: jax.Array,
     return dataclasses.replace(state, drafts=carried[1:])
 
 
+def drafts(strategy: Strategy) -> bool:
+    """Whether `strategy` drafts with the model's prediction depths or block
+    drafter. `Sample` and `Beam` say they do not; a strategy that says
+    nothing gets them, as it may call `DecodeOps.propose`."""
+    return getattr(strategy, "drafts", True)
+
+
 def prediction_depths(model: nn.Module) -> int:
     """How many multi-token prediction depths the model declares; none unless it is `Predicting`."""
     return model.num_nextn_predict_layers if isinstance(model, Predicting) else 0
@@ -527,6 +534,10 @@ def _refuse_exchange(model: nn.Module) -> None:
 def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int) -> DecodeOps:
     """The model operations a strategy may run, bound to these weights.
 
+    `depths` is the prediction depths a drafting strategy runs (`drafts`);
+    0 runs none and no block drafter, so the prefill allocates and seeds no
+    drafting cache.
+
     Parameters stay unmapped: every operation reads the same tree, and only
     the cache moves with the rows. A model with a block drafter hands its
     drafter's context back as the states `verify` returns.
@@ -534,7 +545,8 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int) ->
     to keep static shapes; it happens once per request.
     """
     exposed = isinstance(model, Exposing)
-    blocks = _block_drafting(model, params) if isinstance(model, BlockDrafting) and model.dspark else None
+    blocks = (_block_drafting(model, params) if depths and isinstance(model, BlockDrafting) and model.dspark
+              else None)
     recorded = [] if blocks is None else ["prediction_inputs"]
 
     def run(state: DecoderState, tokens: jax.Array, valid: jax.Array
@@ -676,7 +688,7 @@ def _generate(model: nn.Module, params: Variables, inputs: ModelInputs, keys: ja
         empty = jnp.zeros((batch * n, 0), jnp.float32)
         return Generation(prompt, jnp.zeros(batch * n, jnp.int32),
                           jnp.zeros(batch * n, bool), empty, empty)
-    ops = decode_ops(model, params, pad_id, prediction_depths(model))
+    ops = decode_ops(model, params, pad_id, prediction_depths(model) if drafts(strategy) else 0)
     state, real = prefill_state(model, params, inputs, ops)
     start = StepState(
         tokens=jnp.concatenate([inputs.tokens, jnp.zeros((batch, trips), jnp.int32)], axis=1),

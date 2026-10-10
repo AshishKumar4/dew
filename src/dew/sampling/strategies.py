@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Callable, Sequence
-from typing import NamedTuple, Protocol
+from typing import ClassVar, NamedTuple, Protocol
 
 import jax
 import jax.numpy as jnp
@@ -262,6 +262,9 @@ class Sample:
     the raw likelihood is still the model's own.
     """
 
+    drafts: ClassVar[bool] = False
+    """It runs no prediction depth or block drafter (`text.drafts`)."""
+
     grammar: Grammar | None = None
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
@@ -344,6 +347,9 @@ class Beam:
     probability is zero. The raw log probabilities are still the model's own
     for the tokens on the path.
     """
+
+    drafts: ClassVar[bool] = False
+    """It runs no prediction depth or block drafter (`text.drafts`)."""
 
     width: int = struct.field(pytree_node=False, default=1)
     length_penalty: float = struct.field(pytree_node=False, default=1.0)
