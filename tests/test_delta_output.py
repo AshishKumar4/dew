@@ -52,7 +52,7 @@ def test_output_and_all_gradients_compute_xla_and_are_as_exact(shape):
     output = kernel_output(*operands)
     gradients = jax.vjp(kernel_output, *operands)[1](seed)
     cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(True), jax.default_device(cpu):
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
         exact = [jax.device_put(np.asarray(t, np.float64), cpu) for t in operands]
         truth = xla_output(*exact)
         truth_gradients = jax.vjp(xla_output, *exact)[1](jnp.asarray(np.asarray(seed), jnp.float64))
@@ -89,7 +89,7 @@ def test_the_rule_with_fused_output_is_as_exact_as_xla():
     actual = rule("pallas")(*operands)
     gradients = jax.vjp(rule("pallas"), *operands)[1](seed)
     cpu = jax.devices("cpu")[0]
-    with jax.enable_x64(True), jax.default_device(cpu):
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
         exact = [jax.device_put(np.asarray(t, np.float64), cpu) for t in operands]
         truth = rule("xla")(*exact)
         truth_gradients = jax.vjp(rule("xla"), *exact)[1](
