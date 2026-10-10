@@ -117,6 +117,10 @@ def collective_host[T](value: T, *, phase: str, held_by: Literal["every", "first
         paths, tree = jax.tree_util.tree_flatten_with_path(value)
         local = []
         for path, leaf in paths:
+            # A rank that copies nothing home would otherwise meet a deleted
+            # leaf only as the runtime's error from waiting on it.
+            if isinstance(leaf, jax.Array) and leaf.is_deleted():
+                raise RuntimeError(f"{phase}: {jax.tree_util.keystr(path)} has been deleted")
             if isinstance(leaf, jax.Array) and not leaf.is_fully_addressable:
                 global_indices.append(len(leaves))
                 plan.append([jax.tree_util.keystr(path), list(leaf.shape), str(leaf.dtype),

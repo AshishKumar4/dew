@@ -118,8 +118,13 @@ class Strategy(Protocol):
     rows, the composed transform chain, the stopping criterion, the token
     budget and the number of continuations. It returns one `Draws` record
     per output row. `Sample`, `Beam` and `Speculative` use nothing else, so
-    your own strategy is a callable with the same signature.
+    your own strategy is a callable with the same signature that says
+    whether it drafts.
     """
+
+    drafts: ClassVar[bool]
+    """Whether it runs the model's prediction depths or block drafter
+    (`DecodeOps.propose`), which the prefill then allocates and seeds."""
 
     def __call__(self, state: DecoderState, start: StepState, ops: DecodeOps,
                  transform: Callable[[StepState, jax.Array], jax.Array],
@@ -263,7 +268,7 @@ class Sample:
     """
 
     drafts: ClassVar[bool] = False
-    """It runs no prediction depth or block drafter (`text.drafts`)."""
+    """It runs no prediction depth or block drafter (`Strategy.drafts`)."""
 
     grammar: Grammar | None = None
 
@@ -349,7 +354,7 @@ class Beam:
     """
 
     drafts: ClassVar[bool] = False
-    """It runs no prediction depth or block drafter (`text.drafts`)."""
+    """It runs no prediction depth or block drafter (`Strategy.drafts`)."""
 
     width: int = struct.field(pytree_node=False, default=1)
     length_penalty: float = struct.field(pytree_node=False, default=1.0)
@@ -602,6 +607,9 @@ class Speculative:
     that has neither prediction depths nor a block drafter raises
     `ValueError`.
     """
+
+    drafts: ClassVar[bool] = True
+    """It drafts with the prediction depths or the block drafter."""
 
     block: int = struct.field(pytree_node=False, default=4)
     confidence: float = struct.field(pytree_node=False, default=0.0)

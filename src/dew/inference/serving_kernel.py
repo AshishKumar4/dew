@@ -96,7 +96,7 @@ class Draws:
 def opened(model: nn.Module, params: Variables, pad_id: int, slots: int, capacity: int) -> Slots:
     """Every slot free: zeros in the shapes of a prefill over an all-invalid
     prompt, which leave the cursors at zero and the validity false."""
-    ops = decode_ops(model, params, pad_id, 0)
+    ops = decode_ops(model, params, pad_id, None)
     blank = ModelInputs(jnp.zeros((slots, 1), jnp.int32),
                         {"attention_mask": jnp.zeros((slots, 1), bool)})
     _, decoder = jax.eval_shape(checkify.checkify(lambda: prefill_state(model, params, blank, ops)[0],
@@ -177,7 +177,7 @@ class Dense:
         """
         narrow = cache_sized(model, admission.prompts.tokens.shape[1])
         fresh, real = prefill_state(narrow, params, admission.prompts,
-                               decode_ops(narrow, params, pad_id, 0))
+                               decode_ops(narrow, params, pad_id, None))
         def place(resident: jax.Array, incoming: jax.Array) -> jax.Array:
             return _placed(resident, incoming, admission.slots, self.groups)
 
@@ -214,7 +214,7 @@ class Paged:
                 return admission.cursors
             return leaf
 
-        fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, 0),
+        fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
                                cache=jax.tree_util.tree_map_with_path(view, state.decoder.cache))
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
@@ -260,7 +260,7 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
         assert admission is not None
         decoder = _mixed_step(model, params, pad_id, placement, state.decoder, last, fed, admission)
     else:
-        ops = decode_ops(model, params, pad_id, 0)
+        ops = decode_ops(model, params, pad_id, None)
         decoder = ops.advance(state.decoder, last, fed)
     if admission is not None and not mixed:
         # Only a row seated this step draws without feeding; with no admission
