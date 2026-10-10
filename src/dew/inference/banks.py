@@ -612,8 +612,10 @@ def shape_rows(leaf: jax.ShapeDtypeStruct, count: int) -> list[jax.ShapeDtypeStr
 def placed_rows(bank: jax.Array, count: int) -> tuple[jax.Array, ...]:
     """A restored bank cut into its rows (`spread`), each where the bank's row
     sharding places it, in the bank's memory, and the bank deleted after."""
+    sharding = bank.sharding
+    assert isinstance(sharding, NamedSharding), "a restored bank is placed by a layout's NamedSharding"
     cut = jax.jit(lambda held: tuple(held[offset] for offset in range(count)),
-                  out_shardings=(row_sharding(bank.sharding),) * count)(bank)
+                  out_shardings=(row_sharding(sharding),) * count)(bank)
     bank.delete()
     return cut
 
