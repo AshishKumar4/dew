@@ -144,10 +144,11 @@ class CacheCapacity(Protocol):
 
 @runtime_checkable
 class Looping(Protocol):
-    """A model whose layer stack can run several passes over its own output,
-    and the same model at `steps` passes; None where its stack runs once."""
+    """A model whose layer stack can run a block of it several times over its own output,
+    and the same model at `steps` passes of its block (None keeps its count), or of the block
+    `layers`, [first, end), which gives a model with no loop one; None where they cannot."""
 
-    def with_passes(self, steps: int) -> Self | None: ...
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None: ...
 
 
 @runtime_checkable

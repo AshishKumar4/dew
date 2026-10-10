@@ -718,6 +718,12 @@ class CausalTransformer(nn.Module):
         if self.loop is not None and carried:
             raise ValueError(f"a loop norms the one residual between its passes, and {carried} carry "
                              "others beside it; a model with them runs its stack once (loop=None)")
+        if self.loop is not None and self.loop.layers is not None:
+            if self.loop.layers[1] > self.num_layers:
+                raise ValueError(f"the loop's block {self.loop.layers} ends past layer {self.num_layers}")
+            if self.sharing_layers:
+                raise ValueError("a loop over a block reads its layers' keys and values apart from the rest, "
+                                 "and kv_shared_layers reads them across it; loop the whole stack")
         if self.num_heads % self.kv_heads:
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
@@ -1566,23 +1572,31 @@ class CausalTransformer(nn.Module):
             admitted=admitted)
 
     def looped(self, x, **stack):
-        """Run the layer stack over `x` once, or as `loop` says: each pass after
-        the first reads the last one's output, normed under `step_norm`, and
-        the passes before the last `backprop_steps` pass no gradient back."""
+        """Run the layer stack over `x` once, or as `loop` says: the layers before
+        its block once, the block `steps` times, each pass after the first
+        reading the last one's output, normed under `step_norm`, and the layers
+        after it once; the passes before the last `backprop_steps` pass no
+        gradient back."""
         loop = self.loop
         if loop is None:
             return self.stack(x, **stack)
-        x = self.stack(x, **stack)
+        first, end = loop.layers or (0, self.num_layers)
+        block = None if loop.layers is None else (first, end)
+        if first:
+            x = self.stack(x, span=(0, first), **stack)
+        x = self.stack(x, span=block, **stack)
         for step in range(1, loop.steps):
             normed = self.norm(x)
             self._gate_exit(normed)
             x = normed if loop.step_norm else x
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
-            view = PassView(step, self.num_layers)
+            view = PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
             run = nn.map_variables(type(self).stack, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                    trans_out_fn=view.outside, mutable=True)
-            x = run(self, x, **stack)
+            x = run(self, x, span=block, **stack)
+        if end < self.num_layers:
+            x = self.stack(x, span=(end, self.num_layers), **stack)
         return x
 
     def _gate_exit(self, normed):
@@ -1594,8 +1608,11 @@ class CausalTransformer(nn.Module):
             self.sow('exits', 'logits', logit)
 
     def stack(self, x, *, train: bool, decode: bool, positions, segment_ids,
-              per_layer_input, attention_metadata=None):
+              per_layer_input, attention_metadata=None, span: tuple[int, int] | None = None):
         """Run the layer stack over `x` as the plain loop, as scanned runs, or as a pipeline over the stages.
+
+        `span` runs layers [first, end) alone, as a `Loop` over a block runs its
+        prelude, its block and its coda; on one stage, with no banked store.
 
         `init` draws like runs under the scan and then unstacks them, so the
         tree is the plain loop's; under a stage mesh or with `decode`, init
@@ -1608,11 +1625,14 @@ class CausalTransformer(nn.Module):
         for a banked store.
         """
         stages = pipeline_stages()
+        first, end = (0, self.num_layers) if span is None else span
+        spanned = tuple((first + start, count) for start, count in scan_groups(self.specs[first:end],
+                                                                               self.bank_layers))
         # A seeded initialization (PTQ's abstract annotation pass) reads the
         # supplied layout; the scan's init=True pass would draw over it first.
         if (self.is_initializing() and stages == 1 and not decode
-                and not self.has_variable('params', 'layers_0')):
-            groups = scan_groups(self.specs, self.bank_layers)
+                and not self.has_variable('params', f'layers_{first}')):
+            groups = spanned
             if any(count > 1 for _, count in groups):
                 view = StackView(groups)
                 run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
@@ -1622,14 +1642,20 @@ class CausalTransformer(nn.Module):
         if self.is_initializing() or (stages == 1 and not self.scan_layers):
             return run_stack(
                 self.layers, self.block, self.specs,
-                tuple((index, 1) for index in range(self.num_layers)), x,
+                tuple((index, 1) for index in range(first, end)), x,
                 train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 kv_store={} if self.sharing_layers else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata)
         banked = self.banked_collections()
         if stages == 1:
-            view = StackView(self.groups, banked=banked)
+            if span is not None and banked:
+                raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
+                                    f"by run holds whole runs; {list(banked)} arrived banked")
+            view = StackView(self.groups if span is None else spanned, banked=banked)
         else:
+            if span is not None:
+                raise LayoutRefused(f"a loop over layers {span} runs part of the stack, which a pipeline "
+                                    "over the stage axis cuts into stages of its own; run it on one stage")
             if decode:
                 raise LayoutRefused(
                     "decoding appends one token at a time to the cache, which no "
@@ -1924,9 +1950,19 @@ class CausalTransformer(nn.Module):
         return self.clone(max_seq_len=capacity)
 
     @nn.nowrap
-    def with_passes(self, steps: int) -> Self | None:
-        """This model with its loop run `steps` times; None when its stack does not loop."""
-        return None if self.loop is None else self.clone(loop=dataclasses.replace(self.loop, steps=steps))
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None:
+        """This model with its loop run `steps` times (None keeps its count), over the
+        block `layers` where given (None keeps its block).
+
+        A model with no loop gains one over `layers`, with no norm between its
+        passes, so one pass computes the model as it was; None when it has no
+        loop and the two do not both say what to add."""
+        if self.loop is None:
+            if steps is None or layers is None:
+                return None
+            return self.clone(loop=Loop(steps, step_norm=False, layers=layers))
+        return self.clone(loop=dataclasses.replace(self.loop, steps=steps or self.loop.steps,
+                                                   layers=layers or self.loop.layers))
 
     @nn.nowrap
     def recompute_record(self) -> JSON:
