@@ -1009,6 +1009,171 @@ class PhishingEmail(Source):
 
 
 @dataclass(frozen=True)
+class PubMedQA(Framed):
+    """PubMedQA's human-labelled subset (qiaojin/PubMedQA, MIT), yes/no/maybe over abstract context."""
+
+    weight: float = 1.0
+    revision: str = "9001f2853fb87cab8d220904e0de81ac6973b318"
+    repo: ClassVar[str] = "qiaojin/PubMedQA"
+    files: ClassVar[tuple[str, ...]] = ("pqa_labeled/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        options = ["yes", "no", "maybe"]
+        return self.example("\n".join(row["context"]["contexts"]), row["question"],
+                            options, options.index(row["final_decision"]))
+
+
+@dataclass(frozen=True)
+class MedMCQA(Framed):
+    """MedMCQA (openlifescienceai/medmcqa, Apache-2.0), four medical answers with the provided gold."""
+
+    weight: float = 1.0
+    revision: str = "91c6572c454088bf71b679ad90aa8dffcd0d5868"
+    repo: ClassVar[str] = "openlifescienceai/medmcqa"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "Apache-2.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["question"], "Which answer is correct?",
+                            [row[key] for key in ("opa", "opb", "opc", "opd")], row["cop"])
+
+
+@dataclass(frozen=True)
+class Qasc(Framed):
+    """QASC (allenai/qasc, CC-BY-4.0), eight answers without exposing the gold supporting facts."""
+
+    weight: float = 1.0
+    revision: str = "a34ba204eb9a33b919c10cc08f4f1c8dae5ec070"
+    repo: ClassVar[str] = "allenai/qasc"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["question"], "Which answer is correct?", row["choices"]["text"],
+                            row["choices"]["label"].index(row["answerKey"]))
+
+
+@dataclass(frozen=True)
+class CommonsenseQA(Framed):
+    """CommonsenseQA (tau/commonsense_qa, MIT), five alternatives with human-authored gold answers."""
+
+    weight: float = 1.0
+    revision: str = "94630fe30dad47192a8546eb75f094926d47e155"
+    repo: ClassVar[str] = "tau/commonsense_qa"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        return self.example(row["question"], "Which answer is correct?", row["choices"]["text"],
+                            row["choices"]["label"].index(row["answerKey"]))
+
+
+@dataclass(frozen=True)
+class StrategyQA(Source):
+    """StrategyQA (ChilleD/StrategyQA, MIT), binary questions without gold reasoning in the state."""
+
+    weight: float = 1.0
+    revision: str = "705562638fe1d8ca6bb98c66fc8f94d45fda8c83"
+    repo: ClassVar[str] = "ChilleD/StrategyQA"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001-506370352f622815.parquet",)
+    licence: ClassVar[str] = "MIT"
+
+    def convert(self, row: dict) -> Example:
+        return Example("", {"answer": Noul(row["question"])}, {"answer": "true" if row["answer"] else "false"})
+
+
+@dataclass(frozen=True)
+class SciEntsBank(Source):
+    """SciEntsBank (nkazi/SciEntsBank, CC-BY-4.0), its five categorical student-answer grades."""
+
+    weight: float = 1.0
+    revision: str = "abaadf77345c5d68b73b630131a8ae164a45f3ab"
+    repo: ClassVar[str] = "nkazi/SciEntsBank"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        criteria = {"correct": "Correct", "contradictory": "Contradicts the reference answer",
+                    "partially_correct_incomplete": "Partially correct but incomplete",
+                    "irrelevant": "Irrelevant", "non_domain": "Not in the question's domain"}
+        question = Choice("How should the student's answer be graded against the reference answer?", criteria)
+        return Example({key: row[key] for key in ("question", "reference_answer", "student_answer")},
+                       {"grade": question}, {"grade": question.options[row["label"]]})
+
+
+@dataclass(frozen=True)
+class HelpSteer2(Source):
+    """HelpSteer2 (nvidia/HelpSteer2, CC-BY-4.0), five human 0–4 ratings in each example."""
+
+    weight: float = 1.0
+    revision: str = "990b2711a36180dd19d9c94b8627844866f8982a"
+    repo: ClassVar[str] = "nvidia/HelpSteer2"
+    files: ClassVar[tuple[str, ...]] = ("train.jsonl.gz",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        levels = {"helpfulness": ["Not helpful", "Slightly helpful", "Somewhat helpful", "Helpful", "Very helpful"],
+                  "correctness": ["Incorrect", "Mostly incorrect", "Partially correct", "Mostly correct", "Correct"],
+                  "coherence": ["Incoherent", "Mostly incoherent", "Somewhat coherent", "Mostly coherent", "Coherent"],
+                  "complexity": ["Basic", "Simple", "Moderate", "Complex", "Highly complex"],
+                  "verbosity": ["Very brief", "Brief", "Moderate length", "Detailed", "Very detailed"]}
+        questions = {name: Score(f"Rate the response's {name} on a scale from 0 to 4.", descriptions)
+                     for name, descriptions in levels.items()}
+        return Example({"prompt": row["prompt"], "response": row["response"]}, questions,
+                       {name: int(row[name]) for name in levels})
+
+
+@dataclass(frozen=True)
+class HateSpeech(Source):
+    """Measuring Hate Speech (ucberkeley-dlab/measuring-hate-speech, CC-BY-4.0), human ordinal votes."""
+
+    weight: float = 1.0
+    revision: str = "5468f6e118396646b02a2f691e771f6b6d9502ea"
+    repo: ClassVar[str] = "ucberkeley-dlab/measuring-hate-speech"
+    files: ClassVar[tuple[str, ...]] = ("data/train-00000-of-00001.parquet",)
+    licence: ClassVar[str] = "CC-BY-4.0"
+
+    def convert(self, row: dict) -> Example:
+        # Sachdeva et al. 2022, Appendix A; codes increase in hatefulness (section 3.5).
+        question = Score("Does this comment contain hate speech, defined as bias-motivated, hostile and "
+                         "malicious language targeted at a person/group because of their actual or perceived "
+                         "innate characteristics, especially when the group is unnecessarily labeled?",
+                         ["No", "Unclear", "Yes"])
+        votes = row["votes"]
+        return Example(row["text"], {"hatespeech": question},
+                       targets={"hatespeech": tuple(vote / sum(votes) for vote in votes)})
+
+    def examples(self) -> list[Example]:
+        grouped = {}
+        for row in _rows(self.repo, self.revision, self.files[0]):
+            group = grouped.setdefault(row["comment_id"], {"text": row["text"], "votes": [0, 0, 0]})
+            group["votes"][int(row["hatespeech"])] += 1
+        selected = _draw(len(grouped), self.limit, self.held, self.seed)
+        return [self.convert(row) for index, row in enumerate(grouped.values())
+                if selected is None or index in selected]
+
+
+@dataclass(frozen=True)
+class Lavoir(Source):
+    """Lavoir dialogues (moganai/lavoir-dialogues, CC-BY-4.0), exact rule-derived routing posteriors."""
+
+    weight: float = 1.0
+    revision: str = "d2c66dc86c782fadccc14748d8fa073ca16a6090"
+    repo: ClassVar[str] = "moganai/lavoir-dialogues"
+    files: ClassVar[tuple[str, ...]] = tuple(f"data/train/{name}.jsonl" for name in
+                                           ("banking_support", "ecommerce_returns", "hr_requests", "insurance_claims",
+                                            "it_helpdesk", "privacy_requests", "telecom_support", "travel_changes"))
+    licence: ClassVar[str] = "CC-BY-4.0"
+    natural: ClassVar[bool] = False
+
+    def convert(self, row: dict) -> Example:
+        question = Question.from_wire(row["question"])
+        return Example(row["state"], {"route": question},
+                       targets={"route": tuple(row["target"][name] for name in question.options)})
+
+
+@dataclass(frozen=True)
 class Mixture:
     """Every source a decision recipe reads, each at its weight; a weight of 0 leaves one out.
 
