@@ -1198,6 +1198,31 @@ identical runs. The packed forward gave 496.02 and 476.02 MiB on two repeats
 of the same executable, whose own `memory_analysis` is byte-identical, so
 read the peak column at that resolution.
 
+The chunked delta rule's memory, 2026-10-10. Only the memory `S` crosses
+chunks; each chunk's output reads the state it entered and its corrected
+values. The `lax.scan` now carries `S` alone and the output is batched over
+every chunk after it, and on an sm80 GPU the recurrence is two Pallas kernels
+(`dew.nn.kernels.delta_chunks`, fla's `chunk_delta_h` design): one program a
+row-head and block of value columns walks its chunks with its slice of `S` on
+chip, forward and in reverse for the gradient. On a Colab A100 40GB at
+Qwen3.5-9B's widths (4 x 1280 tokens, 32 heads of 128, fp32 rule, default
+matmul precision), medians of 20 calls (c43):
+
+| call | before | scan restructured | Pallas recurrence | fla 0.5.2 (Triton, torch) |
+|---|---:|---:|---:|---:|
+| rule, forward | 4.37 ms, 298 kernels | 5.14, 262 | 3.17, 36 | 1.35 |
+| rule, forward + backward | 14.70, 1181 | 14.28, 772 | 9.28, 102 | 3.55 |
+| GatedDeltaNet layer, forward + input gradient | 20.68, 1243 | 19.73, 800 | 14.60, 126 | |
+
+The two kernels take 1.43 of the 8.2 ms the forward and backward keep the
+device busy; the rest is the prep and the products around them, which fla
+runs as Triton kernels too. Against the rule in float64 the kernels sit as
+near as the scan at TF32 and at IEEE products (RMS ratios 0.80-1.32 over the
+output and five gradients), and two calls agree bit for bit. Value blocks of
+64 columns ran 8.80 ms on the A100 (three pipeline stages exceed its shared
+memory); the block stays 32 until the G4, whose sm120 holds less shared
+memory a block, is measured. `KERNELS` takes the kernels on sm80 only.
+
 With canonical metadata the call is exactly the plain call. Its outputs are
 bitwise equal to the no-metadata forward, and its parameter gradients are
 within 2.4e-06 of it. The opaque all-true mask stays on the xla kernel at
