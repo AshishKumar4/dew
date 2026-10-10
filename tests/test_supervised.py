@@ -234,3 +234,34 @@ def test_batch_statistics_update_as_the_model_trains_and_reload_from_its_checkpo
     assert json.loads(restored.stdout.splitlines()[-1]) == {
         jax.tree_util.keystr(path): np.asarray(leaf).tobytes().hex()
         for path, leaf in jax.tree_util.tree_leaves_with_path(trained)}
+
+
+class Moded(nn.Module):
+    """A layer whose BatchNorm and Dropout read the mode its call is given."""
+
+    @nn.compact
+    def __call__(self, x, train=False):
+        x = nn.BatchNorm(use_running_average=not train, momentum=0.5)(x.astype(jnp.float32))
+        return nn.Dropout(0.5)(x, deterministic=not train)
+
+
+def test_a_model_with_a_training_mode_trains_in_it_and_is_scored_out_of_it():
+    """With `mode`, the step calls the model in training mode, so its BatchNorm
+    moves toward the batch and its Dropout draws; a validation pass calls it in
+    evaluation mode, on the running statistics, the same whatever the key, and
+    writes nothing. Without it the model keeps its call's default."""
+    moded = Supervised(Moded(), squared, inputs=INPUTS, mode="train")
+    variables = moded.init(jax.random.key(0))
+    batch = {"x": jnp.full((4, 3), 5.0), "y": jnp.zeros((4, 3))}
+    _, aux = moded.loss(variables, batch, Step(jnp.int32(0), jax.random.key(1), None))
+    np.testing.assert_allclose(aux.variables["batch_stats"]["BatchNorm_0"]["mean"], 2.5)
+    first, second = (moded.validation_loss(variables, batch, Step(jnp.int32(0), jax.random.key(seed), None))
+                     for seed in (1, 2))
+    assert first[0].mean()[0] == second[0].mean()[0] and first[1].variables is None
+    trained, _ = moded.loss(variables, batch, Step(jnp.int32(0), jax.random.key(1), None))
+    assert trained.mean()[0] != first[0].mean()[0]
+    _, default = Supervised(Moded(), squared, inputs=INPUTS).loss(
+        variables, batch, Step(jnp.int32(0), jax.random.key(1), None))
+    np.testing.assert_array_equal(default.variables["batch_stats"]["BatchNorm_0"]["mean"], 0.0)
+    with pytest.raises(TypeError, match="does not take"):
+        Supervised(Moded(), squared, inputs=INPUTS, mode="training")

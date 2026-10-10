@@ -206,3 +206,68 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     answers = decide("charged twice", {"team": team, "urgent": Noul("Is it urgent?")})
     assert answers["team"].choice in team.options and 0 <= answers["urgent"].noul <= 1
     assert math.isfinite(-sum(math.log(value) for value in answers["team"].probabilities))
+
+
+def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_its_state(tmp_path):
+    """The Clef recipe under LoRA on length-bucketed batches, stopped at step 2
+    and resumed to 4, ends bitwise where an unbroken run does: parameters,
+    optimizer state, counters and keys, on the same records. Resumed under
+    another attention kernel, a change that keeps the state's shape, it reads
+    the same records and lands within rounding of the unbroken run; resumed
+    on another data order, it refuses."""
+    import jax
+    import numpy as np
+
+    mixture = _mixture(tmp_path, _requests(24, joint=True), ["nothing these rows share at all"], held=8)
+    clef = _module("clef")
+
+    def run(directory: Path, steps: int, *changed: str):
+        flags = _flags(mixture, directory)
+        flags[flags.index("--trainer.steps") + 1] = str(steps)
+        flags += ["--pretrained", str(QWEN), "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
+                  "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
+                  "--max-len", "1024", "--objective.bucket", "64", "--no-calibrate", *changed]
+        return DecisionRunConfig.cli(flags, default=clef.run_config()).run()
+
+    def leaves(state) -> list:
+        return [np.asarray(jax.random.key_data(leaf) if isinstance(leaf, jax.Array)
+                           and jax.dtypes.issubdtype(leaf.dtype, jax.dtypes.prng_key) else leaf)
+                for leaf in jax.tree.leaves(state)]
+
+    unbroken = run(tmp_path / "unbroken", 4)
+    run(tmp_path / "broken", 2)
+    resumed = run(tmp_path / "broken", 4)
+    assert int(resumed.step) == 4
+    assert jax.tree.structure(resumed) == jax.tree.structure(unbroken)
+    for ours, theirs in zip(leaves(resumed), leaves(unbroken), strict=True):
+        np.testing.assert_array_equal(ours, theirs)
+    run(tmp_path / "changed", 2)
+    changed = run(tmp_path / "changed", 4, "--model.attention-impl", "reference")
+    assert jax.tree.structure(changed) == jax.tree.structure(unbroken)
+    for ours, theirs in zip(leaves(changed), leaves(unbroken), strict=True):
+        np.testing.assert_allclose(ours, theirs, rtol=1e-4, atol=1e-6)
+    with pytest.raises(ValueError, match="record count"):
+        run(tmp_path / "changed", 6, "--data.seed", "1")
+
+
+def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
+    """--loop-steps sets the passes of Ouro's tiny looped decoder, leaving its
+    weights as they were; --loop-layers gives the tiny Qwen 3.5, which does not
+    loop, a loop over a block of its own layers; a block with no passes, or
+    passes with no block, on a decoder that does not loop is refused."""
+    from dew.decision.config import looping
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+
+    ouro = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / "ouro-tiny", dtype="float32")
+    once = looping(ouro, 1, None)
+    assert once.model.loop == Loop(1, exit_gate=True) and ouro.model.loop == Loop(3, exit_gate=True)
+    assert once.variables is ouro.variables
+    qwen = Pretrained.load(QWEN, dtype="float32")
+    retrofit = looping(qwen, 2, (1, 2))
+    assert retrofit.model.language_model.loop == Loop(2, step_norm=False, layers=(1, 2))
+    assert qwen.model.language_model.loop is None
+    assert retrofit.variables is qwen.variables
+    for steps, layers in ((2, None), (None, (1, 2))):
+        with pytest.raises(ValueError, match="has no loop"):
+            looping(qwen, steps, layers)

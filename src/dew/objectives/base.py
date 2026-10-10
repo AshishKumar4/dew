@@ -631,7 +631,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         if cached is None or len(cached[0]) != len(programs) or any(
                 module is not was or tile != had for (module, tile), (was, had) in zip(programs, cached[0],
                                                                                       strict=True)):
-            compiled = jax.jit(lambda variables, batch, step: self._loss(variables, batch, step)[0])
+            compiled = jax.jit(
+                lambda variables, batch, step: self._loss(variables, batch, step, validation=True)[0])
             cached = (programs, compiled)
             self._validation_loss_cache = cached
         return cached[1]
@@ -660,6 +661,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         objective defines; their leaves add across microbatches before
         `reduce_loss` runs on the sum.
         """
+
+    def validation_loss(self, variables: Variables, batch: Batch,
+                        step: Step) -> Loss | tuple[Loss, Aux[Effects]]:
+        """Return the statistics a validation pass sums for `batch`: `loss`'s, unless the
+        objective scores held-out rows another way, as a model with a training mode does
+        in its evaluation mode (`Supervised(mode=...)`). What it writes is discarded."""
+        return self.loss(variables, batch, step)
 
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
@@ -712,8 +720,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         hits = Objective.row_mean(correct * counted, batch, rows=rows).total
         return Ratio(hits, Objective.row_mean(counted, batch, rows=rows).total)
 
-    def _loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[Loss, Aux[Effects]]:
-        loss = self.loss(variables, batch, step)
+    def _loss(self, variables: Variables, batch: Batch, step: Step, *,
+              validation: bool = False) -> tuple[Loss, Aux[Effects]]:
+        loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
             return loss
         return loss, Aux(metrics={})
@@ -752,18 +761,40 @@ class Objective(ABC, Generic[Loss, Effects]):
         one gradient path, with its microbatching, accumulation, sharding and
         logging, applies the rule as it applies `jax.grad`'s, and a pass that
         reads only the values, a validation pass's, never computes the rule.
+
+        A rule binds to the parameter at its own path, so each statistic's
+        gradients name exactly the parameters' paths, each leaf of its
+        parameter's shape; any mapping container will do (a dict for a
+        FrozenDict), and its dtype may differ. Anything else is refused,
+        naming the statistic and the paths.
         """
-        def held(value, gradient):
+        def paths(tree) -> dict:
+            leaves = jax.tree_util.tree_leaves_with_path(tree)
+            return {jax.tree_util.keystr(path): leaf for path, leaf in leaves}
+
+        expected = paths(params)
+
+        def held(where, value, gradient):
             value = jax.lax.stop_gradient(jnp.asarray(value))
             if gradient is None:
                 return value
+            name = jax.tree_util.keystr(where) or "the loss"
             if value.ndim:
-                raise ValueError(f"a statistic with supplied gradients is a scalar, not {value.shape}")
-            if len(jax.tree.leaves(gradient)) != len(jax.tree.leaves(params)):
-                raise ValueError("a statistic's gradients hold one rule for each trained parameter")
-            return _ruled(value, jax.lax.stop_gradient(gradient), params)
+                raise ValueError(f"{name} has supplied gradients, so it is a scalar, not {value.shape}")
+            given = paths(gradient)
+            if given.keys() != expected.keys():
+                raise ValueError(f"the gradients of {name} name {sorted(given.keys() - expected.keys())}, "
+                                 f"which no trained parameter is, and miss "
+                                 f"{sorted(expected.keys() - given.keys())}")
+            wrong = [f"{path} {jnp.shape(given[path])} for {jnp.shape(leaf)}"
+                     for path, leaf in expected.items() if jnp.shape(given[path]) != jnp.shape(leaf)]
+            if wrong:
+                raise ValueError(f"the gradients of {name} are not their parameters' shapes: "
+                                 f"{', '.join(wrong)}")
+            rule = jax.tree.unflatten(jax.tree.structure(params), [given[path] for path in expected])
+            return _ruled(value, jax.lax.stop_gradient(rule), params)
 
-        return jax.tree.map(held, stats, gradients)
+        return jax.tree_util.tree_map_with_path(held, stats, gradients)
 
     def scalar_loss(self, variables: Variables, batch: Batch, step: Step) -> tuple[jax.Array, Aux[Effects]]:
         """Return the reduced loss and the `Aux` for `batch`, so JAX can differentiate the loss directly."""
