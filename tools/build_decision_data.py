@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -26,7 +27,8 @@ HUB = (
     "SetFit/enron_spam@1916f66c89d52221ae33eb57d44498b4f3a5df22:test.jsonl=text",
     "lmsys/toxic-chat@29df8e4dba60e1f4af4b4075c0705c5b313548a8:"
     "data/0124/toxic-chat_annotation_test.csv=user_input",
-    "zefang-liu/phishing-email-dataset@34085a032c123ca237f314a01a67909cdea35e34:Phishing_Email.csv=Email Text",
+    "zefang-liu/phishing-email-dataset@34085a032c123ca237f314a01a67909cdea35e34:"
+    "Phishing_Email.csv=Email Text",
     "Tobi-Bueck/customer-support-tickets@ddf1c81a5475992c4fa6752bf1e8b4e31f07bbeb:"
     "dataset-tickets-multi-lang-4-20k.csv=subject,body",
 )
@@ -62,10 +64,8 @@ def _index(work: Path, url: str) -> None:
         part = data[offset:offset + 64 * 2**20]
         path = f"eval-index.npz.{len(files):05d}"
         target = root.child(path)
-        try:
+        with contextlib.suppress(PreconditionFailed):
             target.put_if_absent(part)
-        except PreconditionFailed:
-            pass
         checksum = hashlib.sha256(part).hexdigest()
         if hashlib.sha256(target.read()).hexdigest() != checksum:
             raise ValueError(f"published evaluation index shard differs: {path}")

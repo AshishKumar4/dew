@@ -24,9 +24,10 @@ def store(request, tmp_path):
     _, port = server.get_host_and_port()
     options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
     fs = fsspec.filesystem("s3", **options)
-    fs.mkdir("storage-test")
+    bucket = "storage-test-" + uuid4().hex
+    fs.mkdir(bucket)
     request.addfinalizer(server.stop)
-    return Store("s3://storage-test/value", options)
+    return Store(f"s3://{bucket}/value", options)
 
 
 def test_compare_and_swap_rejects_stale_and_duplicate_publication(store):
@@ -62,7 +63,7 @@ def test_two_finalizers_publish_only_one_snapshot(store):
 def test_named_profile_resolves_secrets_lazily(monkeypatch):
     _profile("credentialtest", "memory", {"credential": "env:DEW_TEST_MISSING_SECRET"})
     monkeypatch.delenv("DEW_TEST_MISSING_SECRET", raising=False)
-    with pytest.raises(ValueError, match="credentialtest.*DEW_TEST_MISSING_SECRET"):
+    with pytest.raises(ValueError, match=r"credentialtest.*DEW_TEST_MISSING_SECRET"):
         Store("credentialtest://bucket/key").resolve()
     monkeypatch.setenv("DEW_TEST_MISSING_SECRET", "secret-value")
     fs, path = Store("credentialtest://bucket/key").resolve()

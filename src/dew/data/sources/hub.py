@@ -64,7 +64,7 @@ class Hub:
     def describe(self) -> str:
         return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> Mapping[str, object]:
         return {"store": "hf", "repo": self.repo, "revision": self.commit,
                 "config": self.config, "split": self.split}
 

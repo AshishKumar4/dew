@@ -28,6 +28,7 @@ are computed from the written training counts with temperature 3, a
 configurable 200,000-row cap and at most ten epochs per mixture pass.
 """
 
+import contextlib
 import csv
 import dataclasses
 import gzip
@@ -42,8 +43,8 @@ from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from dew.decision import Choice, Example, Noul, Question, Score
 from dew.data.storage import PreconditionFailed, Store
+from dew.decision import Choice, Example, Noul, Question, Score
 
 if TYPE_CHECKING:
     from contamination import Overlaps
@@ -1425,10 +1426,8 @@ def shares(counts: dict[str, int], cap: int = 200_000) -> dict[str, float]:
 
 def _publish(store: Store, data: bytes) -> dict:
     digest = hashlib.sha256(data).hexdigest()
-    try:
+    with contextlib.suppress(PreconditionFailed):
         store.put_if_absent(data)
-    except PreconditionFailed:
-        pass
     found = store.read()
     if len(found) != len(data) or hashlib.sha256(found).hexdigest() != digest:
         raise ValueError(f"immutable decision artifact differs: {store.url}")
@@ -1462,7 +1461,7 @@ def _examples(out: Store, stem: str, examples: list[Example], max_bytes: int) ->
         if len(data) > max_bytes:
             raise ValueError(f"{stem} row {position} exceeds shard_bytes={max_bytes}")
         if buffer and len(buffer) + len(data) > max_bytes:
-            flush(False)
+            flush(final=False)
         questions = len(example.questions)
         options = max((len(question.options) for question in example.questions.values()), default=0)
         index[position] = (len(files), len(buffer), len(data), questions, options,
@@ -1471,7 +1470,7 @@ def _examples(out: Store, stem: str, examples: list[Example], max_bytes: int) ->
         slots["options"] = max(slots["options"], options)
         digest.update(data)
         buffer.extend(data)
-    flush(True)
+    flush(final=True)
     encoded = io.BytesIO()
     np.save(encoded, index, allow_pickle=False)
     path = f"{stem}.index.npy"

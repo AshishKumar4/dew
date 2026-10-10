@@ -302,7 +302,7 @@ class TFDS:
     def describe(self) -> str:
         return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> Mapping[str, object]:
         import hashlib
 
         from dew.data.storage import Store

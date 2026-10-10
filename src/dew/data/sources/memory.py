@@ -42,9 +42,9 @@ class Memory:
             raise ValueError("memory shard_rows must be positive")
 
     def describe(self) -> str:
-        return "memory:" + (self.identity or self.snapshot()["sha256"])
+        return f"memory:{self.identity or self.snapshot()['sha256']}"
 
-    def snapshot(self) -> dict[str, object]:
+    def snapshot(self) -> Mapping[str, object]:
         rows = self.records("indexed")
         return {"store": "memory", "identity": self.identity, "rows": len(rows),
                 "sha256": fingerprint(rows[index] for index in range(len(rows)))}

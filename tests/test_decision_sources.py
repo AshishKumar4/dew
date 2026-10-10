@@ -75,7 +75,7 @@ def test_url_producer_shards_without_changing_training_or_held_bytes(sources, mo
 
     question = Choice("Pick", ["a", "b"])
     examples = [Example(str(index), {"q": question}, {"q": "a"}) for index in range(20)]
-    monkeypatch.setattr(sources.Intents, "examples", lambda self: examples)
+    monkeypatch.setattr(sources.Intents, "examples", lambda self: list(examples))
     default = sources.Mixture()
     off = {entry.name: dataclasses.replace(getattr(default, entry.name), weight=0.0)
            for entry in dataclasses.fields(default)}
