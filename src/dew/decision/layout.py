@@ -16,7 +16,7 @@ of a request, each option a span of its own.
 """
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import ClassVar
 
@@ -339,8 +339,34 @@ class JointLayout(Layout):
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None,
              media: Sequence[int] = ()) -> list[Encoded]:
+        opening, schema, suffix, laid = self._frame(encoder.encode, questions, orders=orders)
+        prefix = opening + list(media)
+        state_ids = encoder.encode(_compact(state), add_special_tokens=False)
+        whole = len(state_ids)
+        if self.max_state_tokens is not None:
+            state_ids = state_ids[:self.max_state_tokens]
+        fixed = len(prefix) + len(schema) + len(suffix)
+        if fixed > self.max_len:
+            raise ValueError(f"the schema needs {fixed} tokens before the state, more than the "
+                             f"maximum context length, max_len={self.max_len}")
+        state_ids = state_ids[:self.max_len - fixed]
+        offset = len(prefix) + len(state_ids)
+
+        def moved(span: tuple[int, int]) -> tuple[int, int]:
+            return span[0] + offset, span[1] + offset
+
+        shifted = tuple(Laid(question.name, question.kind, moved(question.span),
+                             tuple(moved(option) for option in question.options), question.order)
+                        for question in laid)
+        return [Encoded(tuple(prefix + state_ids + schema + suffix), shifted, None, None, whole,
+                        len(state_ids), (len(opening), len(prefix)) if media else None)]
+
+    def _frame(self, encode: Callable[..., list[int]], questions: Mapping[str, Question], *,
+               orders: Mapping[str, Sequence[int]] | None = None
+               ) -> tuple[list[int], list[int], list[int], list[Laid]]:
+        """The separately tokenized pieces around the state, shared with the length index."""
         def tokens(text: str) -> list[int]:
-            return encoder.encode(text, add_special_tokens=False)
+            return encode(text, add_special_tokens=False)
 
         schema = tokens("\n\nSCHEMA FIELDS:\n")
         laid = []
@@ -368,27 +394,8 @@ class JointLayout(Layout):
             schema.extend(tokens("END FIELD\n"))
             laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
         opening = tokens(f"<|im_start|>system\n{CLEF_SYSTEM}<|im_end|>\n<|im_start|>user\nSTATE:\n")
-        prefix = opening + list(media)
         suffix = tokens("\n<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\nJOINT SCHEMA DECISIONS:")
-        state_ids = tokens(_compact(state))
-        whole = len(state_ids)
-        if self.max_state_tokens is not None:
-            state_ids = state_ids[:self.max_state_tokens]
-        fixed = len(prefix) + len(schema) + len(suffix)
-        if fixed > self.max_len:
-            raise ValueError(f"the schema needs {fixed} tokens before the state, more than the "
-                             f"maximum context length, max_len={self.max_len}")
-        state_ids = state_ids[:self.max_len - fixed]
-        offset = len(prefix) + len(state_ids)
-
-        def moved(span: tuple[int, int]) -> tuple[int, int]:
-            return span[0] + offset, span[1] + offset
-
-        shifted = tuple(Laid(question.name, question.kind, moved(question.span),
-                             tuple(moved(option) for option in question.options), question.order)
-                        for question in laid)
-        return [Encoded(tuple(prefix + state_ids + schema + suffix), shifted, None, None, whole,
-                        len(state_ids), (len(opening), len(prefix)) if media else None)]
+        return opening, schema, suffix, laid
 
     @staticmethod
     def options(question: Question) -> tuple[tuple[str, JSON], ...]:
