@@ -60,9 +60,12 @@ def detected_cluster() -> Cluster | None:
 
 
 def runs_on_gpu(env: Mapping[str, str]) -> bool:
-    """Whether JAX_PLATFORMS in `env` leaves jax the GPUs; unset lets it pick them."""
+    """Whether `env` leaves jax the GPUs: JAX_PLATFORMS unset or naming them,
+    and CUDA_VISIBLE_DEVICES, where set, naming some (empty or -1 hides all)."""
     platforms = env.get("JAX_PLATFORMS", "")
-    return not platforms or any(name in platforms for name in ("cuda", "gpu"))
+    visible = env.get("CUDA_VISIBLE_DEVICES")
+    hidden = visible is not None and visible.strip() in ("", "-1")
+    return not hidden and (not platforms or any(name in platforms for name in ("cuda", "gpu")))
 
 
 def answered(argv: Sequence[str], timeout: float = 60) -> str | None:
