@@ -211,6 +211,9 @@ class GRPOObjective(LMObjective):
 
         The loss and a proximal rescoring share its scoring path. A
         packed column whose shape differs from `input_ids` raises `ValueError`.
+        With `qk_stats`, the loss scores through `_packed_scores`, which returns
+        the QK collection from the same forward, so an override of this method
+        must override that one too.
         """
         return self._packed_scores(params, batch)[0]
 
