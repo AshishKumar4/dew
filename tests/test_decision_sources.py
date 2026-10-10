@@ -338,6 +338,11 @@ def test_original_fever_samples_labelled_claims_and_joins_only_gold_sentences(
         archive.writestr("license.html", "Not a JSONL member")
         archive.writestr("__MACOSX/._wiki-001.jsonl", "Not a JSONL member")
         archive.writestr("wiki-pages/wiki-001.jsonl", "".join(json.dumps(page) + "\n" for page in pages))
+
+    def whole_member(*args, **kwargs):
+        raise AssertionError("Wiki JSONL members must be streamed, not read whole")
+
+    monkeypatch.setattr(zipfile.ZipFile, "read", whole_member)
     monkeypatch.setattr(sources, "_http", lambda url, digest, namespace:
                         wiki_path if url.endswith(".zip") else claims_path)
     monkeypatch.setattr(sources, "_unit", lambda text, salt: 1. if salt == "keys" else 0.)
@@ -387,6 +392,17 @@ def test_release_download_verifies_bytes_before_caching(sources, monkeypatch, tm
     with pytest.raises(ValueError, match="pinned SHA-256"):
         sources._http("https://example.com/changed.zip", "0" * 64, "release")
     assert not (tmp_path / "changed.zip").exists()
+
+
+def test_sparse_parquet_rows_skip_batches_without_selected_indices(sources, monkeypatch, tmp_path):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    path = tmp_path / "rows.parquet"
+    pq.write_table(pa.table({"id": list(range(8200))}), path)
+    monkeypatch.setattr(sources, "_download", lambda *args: str(path))
+    assert list(sources._rows("repo", "revision", "rows.parquet", {8199})) == [{"id": 8199}]
+    assert list(sources._rows("repo", "revision", "rows.parquet", set())) == []
 
 
 @pytest.mark.parametrize(("name", "text_key", "label_key", "question", "answer_key", "yes", "no"), [
