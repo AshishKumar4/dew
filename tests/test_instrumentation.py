@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import BATCH, TimingRegression as Regression, batches as batches
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
@@ -18,7 +19,6 @@ from recording import RecordingTracker
 import dew
 import dew.nn.backbones  # registers the decoder the FLOP formula test builds
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
-from dew.objectives.base import Aux, EMASpec, Objective
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import compiled_flops, hlo_flops, model_flops_utilization
@@ -29,27 +29,6 @@ from dew.training.distributed import shard_batch
 pytestmark = pytest.mark.mesh
 
 
-BATCH = 8
-
-
-class Affine(nn.Module):
-    @nn.compact
-    def __call__(self, x):
-        return nn.Dense(2)(x)
-
-
-class Regression(Objective):
-    def __init__(self):
-        self.model = Affine()
-        self.ema = EMASpec(decay=optax.constant_schedule(0.9))
-
-    def init(self, key, variables=None):
-        return self.model.init(key, jnp.zeros((1, 3)))
-
-    def loss(self, variables, batch, step):
-        return jnp.mean((self.model.apply(variables, batch["x"]) - batch["y"]) ** 2), Aux({})
-
-
 class Data:
     def __init__(self, train, batch=BATCH):
         self._train, self.val, self.batch, self.records = train, None, batch, None
@@ -58,14 +37,6 @@ class Data:
         return self._train()
 
     steps_per_epoch = None
-
-
-def batches():
-    rng = np.random.default_rng(0)
-    x = rng.normal(size=(BATCH, 3)).astype(np.float32)
-    batch = {"x": x, "y": 2 * x[:, :2]}
-    while True:
-        yield batch
 
 
 def make_trainer(**kwargs):

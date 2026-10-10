@@ -18,6 +18,21 @@ WORKER = Path(__file__).with_name("multiprocess_worker.py")
 DEVICES = 8
 
 
+def prepare_worker(args, *, multi_host: bool | None = False) -> None:
+    """Join a test pool through the same Open MPI detection as a launched run."""
+    if args.coordinator:
+        os.environ.update({
+            "OMPI_MCA_orte_hnp_uri": f"0.0;tcp://{args.coordinator}",
+            "OMPI_COMM_WORLD_SIZE": str(args.processes),
+            "OMPI_COMM_WORLD_RANK": str(args.process_id),
+            "OMPI_COMM_WORLD_LOCAL_RANK": str(args.process_id),
+            "JAX_COORDINATOR_ADDRESS": args.coordinator,
+        })
+    from dew.training.runtime import prepare_process
+
+    prepare_process(multi_host=True if args.coordinator else multi_host)
+
+
 def free_port() -> int:
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))

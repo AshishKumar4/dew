@@ -12,12 +12,12 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+from process_support import prepare_worker
 
 from dew.data import Loading
 from dew.telemetry.records import RECORD_TYPES
@@ -2257,21 +2257,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> None:
     args = parse_args(argv)
-    if args.coordinator:
-        # What mpirun puts in the environment, and what a pod run finds its
-        # pool by: jax's OMPI detector reads the size and the ranks from it,
-        # and JAX_COORDINATOR_ADDRESS names the coordinator. The join and the
-        # rendezvous right after it are then the recipes' own.
-        os.environ.update({
-            "OMPI_MCA_orte_hnp_uri": f"0.0;tcp://{args.coordinator}",
-            "OMPI_COMM_WORLD_SIZE": str(args.processes),
-            "OMPI_COMM_WORLD_RANK": str(args.process_id),
-            "OMPI_COMM_WORLD_LOCAL_RANK": str(args.process_id),
-            "JAX_COORDINATOR_ADDRESS": args.coordinator,
-        })
-    from dew.training.runtime import prepare_process
-
-    prepare_process(multi_host=bool(args.coordinator))
+    prepare_worker(args)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(MODES[args.mode](args)))
 

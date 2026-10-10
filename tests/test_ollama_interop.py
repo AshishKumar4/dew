@@ -51,6 +51,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from token_support import write_token_corpus
 
 from dew.data import HFTokenizer
 from dew.inference import Completion, OllamaCompletion
@@ -120,13 +121,10 @@ def write_token_files(directory: Path, tokenizer: HFTokenizer) -> dict:
     ids = np.asarray(tokenizer.encode(text), np.uint16)
     assert ids.size > 64 * SEQ, f"{ids.size} tokens is too little to train on"
     split = ids.size // 20
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / "val.bin").write_bytes(ids[:split].tobytes())
-    (directory / "train.bin").write_bytes(ids[split:].tobytes())
-    meta = {"tokenizer": str(TOKENIZER), "vocab_size": tokenizer.vocab_size,
+    write_token_corpus(directory, ids[split:], ids[:split], tokenizer=str(TOKENIZER),
+                       vocab_size=tokenizer.vocab_size)
+    return {"tokenizer": str(TOKENIZER), "vocab_size": tokenizer.vocab_size,
             "dtype": "uint16", "eos_id": None}
-    (directory / "meta.json").write_text(json.dumps(meta))
-    return meta
 
 
 def train_and_export(root: Path) -> Path:
