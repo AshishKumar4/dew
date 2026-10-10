@@ -106,6 +106,28 @@ def test_the_tied_decoder_reads_its_kernels_through_copies_with_the_same_gradien
         np.testing.assert_array_equal(np.asarray(a), np.asarray(b))
 
 
+def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
+    """The fit check reads the state's arguments as already on the devices;
+    the copies are not yet when the first step compiles, since `run` builds
+    them before its first call, so their bytes count beside the step with the
+    prefetched batches."""
+    from dew.training import trainer as module
+    from dew.training.distributed import placed_bytes
+
+    asked = []
+
+    def fits(executable, mesh, held=0):
+        asked.append(held)
+        return True
+
+    monkeypatch.setattr(module, "step_fits", fits)
+    narrow, _ = _trained(monkeypatch, {device_generation()}, optax.adam(1e-3), steps=1)
+    _trained(monkeypatch, set(), optax.adam(1e-3), steps=1)
+    copies = placed_bytes(jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), narrow.compute))
+    assert copies > 0 and asked[0] - asked[1] == copies
+
+
 def test_no_copy_off_the_measured_generations(monkeypatch):
     """Off `KERNELS['narrow_copies']` the state holds no copies."""
     state, _ = _trained(monkeypatch, set(), optax.adam(1e-3), steps=1)
