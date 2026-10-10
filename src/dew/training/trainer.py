@@ -457,7 +457,10 @@ class _Interval:
     The records and FLOPs are summed per step rather than taken off the
     dataset's batch, so a ramped interval reports the records it read and
     their FLOPs. `rollout_seconds` is the time spent sampling, logged under
-    train/rollout_seconds when a rollout is set."""
+    train/rollout_seconds when a rollout is set. `waited` is the time the
+    loop spent waiting on its next batch and `compiling` the time it spent
+    compiling the step for a shape it had not met, both in seconds, since
+    the last log."""
 
     last_log_time: float
     last_saved: int | None
@@ -468,6 +471,8 @@ class _Interval:
     samples: int = 0
     flops: float | None = 0.0
     rollout_seconds: float = 0.0
+    waited: float = 0.0
+    compiling: float = 0.0
 
     def count(self, batch: Batch, flops: float | None, loss: jax.Array, finite: jax.Array) -> None:
         """Add one step: its records, its FLOPs and its loss."""
@@ -507,7 +512,7 @@ class _Interval:
     def logged(self, now: float) -> None:
         """Start the next logging interval at `now`."""
         self.last_log_time, self.since_log, self.samples = now, 0, 0
-        self.flops, self.rollout_seconds = 0.0, 0.0
+        self.flops, self.rollout_seconds, self.waited, self.compiling = 0.0, 0.0, 0.0, 0.0
 
     def saved(self, step: int) -> None:
         """Start the next checkpoint interval after the one saved at `step`."""
@@ -1432,7 +1437,9 @@ class Trainer(Generic[Loss, Effects]):
                     # its reader on the prefetch worker, and a stream that may
                     # run out can on any read: a process whose read failed
                     # stops its peers before they compile or step without it.
+                    asked = time.perf_counter()
                     batch = run.read() if seen and run.endless else agreed("training read", run.read)
+                    interval.waited += time.perf_counter() - asked
                 if self.rollout is not None:
                     batch, sampled = self._rolled_out(state, batch)
                     interval.rollout_seconds += sampled
@@ -1441,11 +1448,17 @@ class Trainer(Generic[Loss, Effects]):
                     # A rollout writes the batch its loss reads, from prompts it reads itself.
                     agreed("training input declaration", functools.partial(inputs.check, batch))
                 first_compile = not compiled
+                began = time.perf_counter()
                 train_step, measured_flops = self._compiled_for(compiled, state, batch)
                 if first_compile:
                     # Rebound once the step is compiled, so the first tick
                     # measures steps, not the compile.
                     interval.last_log_time = time.time()
+                    interval.waited = 0.0
+                else:
+                    # A shape met later compiles inside the interval, which
+                    # reports that time apart from its steps'.
+                    interval.compiling += time.perf_counter() - began
                 with region("train.step"):
                     state, loss, aux, finite, accepted = train_step(state, batch)
                 if self._unproven:
@@ -2192,7 +2205,8 @@ class Trainer(Generic[Loss, Effects]):
             scalars = {"train/loss": float(read["loss"]),
                        **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
-                                          interval.samples, interval.flops)}
+                                          interval.samples, interval.flops, waited=interval.waited,
+                                          compiling=interval.compiling)}
             scalars["train/accepted"] = float(read["accepted"])
             if read["rate"] is not None:
                 scalars["train/learning_rate"] = float(read["rate"])
@@ -2355,22 +2369,32 @@ class Trainer(Generic[Loss, Effects]):
         self._report(ProfileWindowRecord(profile.directory, traced), run.current)
         agreed("profile announcement", announce)
 
-    def _throughput(self, elapsed: float, steps: int, samples: int,
-                    flops: float | None) -> dict[str, float]:
+    def _throughput(self, elapsed: float, steps: int, samples: int, flops: float | None, *,
+                    waited: float = 0.0, compiling: float = 0.0) -> dict[str, float]:
         """Compute the interval's rates from the records it read and its FLOPs.
 
         The FLOPs are the ones the compiler measured for each step's own
         shape; `flops` is None when a shape's measurement was unavailable.
 
-        An interval that spans a stage boundary carries that stage's compile
-        in its wall time. MaxText instead hides the performance metrics
-        during a ramp (`common/metric_logger.py:166-194`).
+        `compiling` is the seconds the interval spent compiling the step for
+        shapes it met for the first time (a bucket length, a ramp's stage).
+        The rates are over the rest of `elapsed`, so a step that compiled
+        does not read as a slow step, and the compile is reported on its own
+        as train/compile_s. `waited` is the seconds the loop waited on its
+        next batch, reported per step as train/data_wait_ms. The loop
+        dispatches steps ahead of the device, so a wait the device's queued
+        work covers costs no device time; a wait near the step time is a
+        stalled input.
         """
-        if elapsed <= 0 or steps <= 0:
+        stepping = elapsed - compiling
+        if stepping <= 0 or steps <= 0:
             return {}
-        step_time = elapsed / steps
+        step_time = stepping / steps
         scalars = {"train/step_time_ms": step_time * 1000,
-                   "train/samples_per_sec": samples / elapsed}
+                   "train/samples_per_sec": samples / stepping,
+                   "train/data_wait_ms": waited / steps * 1000}
+        if compiling > 0:
+            scalars["train/compile_s"] = compiling
         mfu = None if flops is None else model_flops_utilization(flops / steps, step_time)
         if mfu is not None:
             scalars["train/mfu"] = mfu
