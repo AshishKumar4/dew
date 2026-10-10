@@ -1263,8 +1263,7 @@ class Trainer(Generic[Loss, Effects]):
         selection, stop = self._fit_policies(best, stop, metrics, suites, checkpoint_every, restore_best)
         if metrics and eval_every is None and validation is None:
             raise ValueError("metrics need eval_every to schedule their validation pass")
-        self._preflight(dataset, stop, suites, preview=preview,
-                        loss=self.checkpoints is not None and not selection)
+        self._preflight(dataset, stop, suites, preview=preview)
         preview = preview and self.tracker is not None
         run = _FitRun(time.perf_counter())
         # A display of this fit's own: one before it may have run other steps.
@@ -1820,16 +1819,13 @@ class Trainer(Generic[Loss, Effects]):
             elapsed_seconds=sum(report.elapsed_seconds for report in evaluations),
         )
 
-    def _preflight(self, dataset: Dataset, stop, suites: Mapping[str, EvalSuite], *,
-                   preview: bool, loss: bool) -> None:
+    def _preflight(self, dataset: Dataset, stop, suites: Mapping[str, EvalSuite], *, preview: bool) -> None:
         """The refusals `fit` makes before it places anything: validation
         nothing reads, and a pipeline's batch, whose placement could take
         minutes or run out of memory before the error. Every other mesh's
         batch is checked with its stream (`_check_stream`), a ramp's at each
         of its stages."""
         for name, suite in suites.items():
-            if loss and not any(metric.name == 'loss' for metric in suite.metrics):
-                self.objective._check_validation_loss()
             if suite.metrics and suite.every is None:
                 raise ValueError(f"{name}'s metrics need eval_every or EvalSuite.every to schedule its pass")
             if (stop is None or not isinstance(stop.metric, TrainingScalar)) and suite.every:

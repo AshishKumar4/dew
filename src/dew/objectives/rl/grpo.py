@@ -62,8 +62,7 @@ class _Terms(NamedTuple):
     """The loss's inputs on the packed grid, aligned with `input_ids`: current,
     old and behavior log-probabilities, advantages, the trainable mask, chain
     ids, the per-session weights when the batch carries them, and whether the
-    old policy was rescored rather than standing in for behavior, and the live
-    policy's QK collection."""
+    old policy was rescored rather than standing in for behavior."""
 
     policy: jax.Array
     old: jax.Array
@@ -73,7 +72,6 @@ class _Terms(NamedTuple):
     segments: jax.Array
     session_weights: jax.Array | None
     proximal: bool
-    qk_stats: Variables | None
 
 
 def onto_ids(batch, scores: jax.Array) -> jax.Array:
@@ -209,14 +207,9 @@ class GRPOObjective(LMObjective):
     def packed_log_probs(self, params: Variables, batch) -> jax.Array:
         """Return each packed id's log-probability given its own chain's prefix, placed by `onto_ids`.
 
-        The loss and a proximal rescoring share its scoring path. A
+        The loss and a proximal rescoring both use this one function. A
         packed column whose shape differs from `input_ids` raises `ValueError`.
         """
-        return self._packed_scores(params, batch)[0]
-
-    def _packed_scores(self, params: Variables, batch, *, qk_stats: bool = False
-                       ) -> tuple[jax.Array, Variables | None]:
-        """The packed policy likelihoods and, when requested, its live QK collection."""
         ids = jnp.asarray(batch[IDS_KEY], jnp.int32)
         segments = jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32)
         for key in (SEGMENT_IDS_KEY, POSITIONS_KEY, RESPONSE_MASK_KEY):
@@ -226,12 +219,11 @@ class GRPOObjective(LMObjective):
         routes = (None if ROUTED_EXPERTS_KEY not in batch
                   else (batch[ROUTED_EXPERTS_KEY], batch.get(ROUTED_KEY)))
         scores = self.token_scores(params, ids, segment_ids=segments,
-                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32), routes=routes,
-                                   qk_stats=qk_stats)
+                                   positions=jnp.asarray(batch[POSITIONS_KEY], jnp.int32), routes=routes)
         support = (None if SUPPORT_KEY not in batch
                    else (batch[SUPPORT_KEY], batch[SUPPORT_COLUMNS_KEY]))
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
-        return onto_ids(batch, sampled), scores.qk
+        return onto_ids(batch, sampled)
 
     def _terms(self, params, batch) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.
@@ -248,11 +240,10 @@ class GRPOObjective(LMObjective):
         proximal = OLD_LOG_PROBS_KEY in batch
         old = jnp.asarray(batch[OLD_LOG_PROBS_KEY], jnp.float32) if proximal else behavior
         weights = batch.get(SESSION_WEIGHTS_KEY)
-        policy, qk = self._packed_scores(params, batch, qk_stats=self.qk_stats)
-        return _Terms(policy, old, behavior,
+        return _Terms(self.packed_log_probs(params, batch), old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
                       jnp.asarray(batch[SEGMENT_IDS_KEY], jnp.int32),
-                      None if weights is None else jnp.asarray(weights, jnp.float32), proximal, qk)
+                      None if weights is None else jnp.asarray(weights, jnp.float32), proximal)
 
     def loss(self, variables, batch, step):
         """Compute the policy surrogate over the trainable tokens, plus the KL to the reference.
@@ -313,9 +304,8 @@ class GRPOObjective(LMObjective):
             kl_terms = k3_kl(terms.policy, self.packed_log_probs(step.ema, batch))
             kl = Ratio(jnp.sum(jnp.where(weights != 0, kl_terms, 0) * weights), mass)
             metrics["kl"], _ = kl.mean()
-            return Ratio(pg.total + self.beta * kl.total, mass), Aux[Variables](
-                metrics, qk_stats=terms.qk_stats)
-        return pg, Aux[Variables](metrics, qk_stats=terms.qk_stats)
+            return Ratio(pg.total + self.beta * kl.total, mass), Aux[Variables](metrics)
+        return pg, Aux[Variables](metrics)
 
     def _policy_terms(self, terms: _Terms, mask: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """The chosen surrogate's per-token terms and verl's three actor metrics."""
@@ -345,13 +335,6 @@ class GRPOObjective(LMObjective):
         if terms.session_weights is None:
             raise ValueError(f"session-mean aggregation reads {SESSION_WEIGHTS_KEY} from pack")
         return terms.session_weights * keep * (effective != 0)
-
-    def validation_loss(self, variables, batch, step):
-        """Score the source prompts' NLL, not the surrogate's rollout-only fields."""
-        scores = self.evaluate(variables, batch, step)
-        assert scores.weights is not None
-        return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
-                     self.row_mean(scores.weights, batch).total)
 
     def evaluate(self, params, batch, step):
         """Return the per-token scores of the prompts under the policy, for their perplexity.

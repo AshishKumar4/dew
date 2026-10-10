@@ -23,6 +23,7 @@ that collapse shows in the training curves, before a probe run.
 
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
@@ -249,10 +250,10 @@ class JepaObjective(Objective[Ratio]):
         features = self._embed(self._target_variables(step), batch[self.sample.key])
         return Representations(features=features, labels=jnp.asarray(batch[self.label_key]))
 
-    @property
+    @functools.cached_property
     def _embed(self):
         def embed(encoder_variables, pixels):
             features = self.encode(encoder_variables, unit_range(pixels))
             return jnp.mean(features, axis=tuple(range(1, features.ndim - 1)))
 
-        return self._compiled_program('embed', embed)
+        return jax.jit(embed)

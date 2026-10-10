@@ -201,12 +201,7 @@ class PPOObjective(Objective[Ratio, Variables]):
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), pg.mass)
         metrics = {**aux.metrics, "critic/loss": critic.mean()[0]}
-        qk = None if aux.qk_stats is None else {"policy": aux.qk_stats}
-        return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics, qk_stats=qk)
-
-    def validation_loss(self, variables: Variables, batch, step: Step):
-        """Score source prompts under the live actor, without rollout targets or the critic."""
-        return self.actor.validation_loss(part(variables, "policy"), batch, replace(step, ema=None))
+        return Ratio(pg.total + self.value_coefficient * critic.total, pg.mass), Aux(metrics)
 
     def evaluate(self, params: Variables, batch, step: Step):
         return self.actor.evaluate(part(params, "policy"), batch, replace(step, ema=None))
