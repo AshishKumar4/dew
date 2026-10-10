@@ -113,7 +113,8 @@ class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "counts": self._predicate.counts.state(),
+        return {"parent": self._read.get_state(), "corpus": self._predicate.counts.name,
+                "counts": self._predicate.counts.state(),
                 "consecutive": self._predicate.consecutive, "warned": self._predicate.warned}
 
     def set_state(self, state: Mapping[str, object]) -> None:

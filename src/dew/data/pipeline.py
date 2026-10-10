@@ -117,6 +117,13 @@ class Pack:
 
 
 @dataclasses.dataclass(frozen=True)
+class Windows:
+    seq_len: int
+    stride: int | None = None
+    fields: tuple[str, ...] = ("text",)
+
+
+@dataclasses.dataclass(frozen=True)
 class Rebatch:
     size: int
 
@@ -155,7 +162,7 @@ class Artifact:
 
 type Stage = (Map | RandomMap | MapWithIndex | Filter | FlatMap | Shuffle | Repeat | Slice
               | ShardByHost | Interleave | BatchStage | Pack | Rebatch | Prefetch | Workers
-              | Limit | Group | MapBatch | Artifact)
+              | Limit | Group | MapBatch | Artifact | Windows)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -228,6 +235,10 @@ class Pipeline:
     def pack(self, seq_len: int, *, fields: tuple[str, ...] = ("text",), bins: int = 32,
              policy: Literal["first-fit", "best-fit", "concat"] = "first-fit") -> Pipeline:
         return self.then(Pack(seq_len, fields, bins, policy))
+
+    def windows(self, seq_len: int, *, stride: int | None = None,
+                fields: tuple[str, ...] = ("text",)) -> Pipeline:
+        return self.then(Windows(seq_len, stride, fields))
 
     def rebatch(self, size: int) -> Pipeline:
         return self.then(Rebatch(size))
