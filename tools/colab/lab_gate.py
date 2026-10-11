@@ -26,7 +26,7 @@ def gate(tree: Path, gpu: str, config: Path = STORE_CONFIG) -> tuple[dict, list[
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
     parser.add_argument("--gpu", required=True, choices=sorted(LAB_GPUS.values()))
     parser.add_argument("--tree", type=Path, default=Path("."), help="the Dew checkout the session trains")
     parser.add_argument("--store", type=Path, default=STORE_CONFIG, help="the store's JSON (provision.sh's)")
