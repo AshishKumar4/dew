@@ -56,16 +56,21 @@ def dit(args) -> WorkloadWork:
 
 
 def qwen35(args) -> WorkloadWork:
-    """The backbone runner declares its hidden-state objective's own geometry."""
-    from dew_qwen35_step import BackboneLoss
-    from qwen35 import config, inputs
+    """The backbone runner's hidden-state objective over the backbone it trains: the checkpoint
+    through its own loader (`dew_qwen35_step.backbone`), or with --smoke the tiny config the torch
+    side exports as its fixture."""
+    from dew_qwen35_step import BackboneLoss, backbone
+    from qwen35 import MODEL, REVISION, config, inputs
 
     from dew.interop import translate_config
 
     batch, sequence = (2, 16) if args.smoke else (8, 3072)
-    fields = translate_config(config(args.smoke))
-    fields.update(dtype=args.dtype, attention_impl=args.attention)
-    model = fields.value.clone(remat=None)
+    if args.smoke:
+        fields = translate_config(config(True))
+        fields.update(dtype=args.dtype, attention_impl=args.attention)
+        model = fields.value.clone(remat=None)
+    else:
+        model, _ = backbone(MODEL, REVISION, args.dtype)
     rows, projection = inputs(17, model.vocab_size, model.emb_features, batch, sequence)
     return measure(BackboneLoss(model, None, projection, sequence), {"tokens": rows})
 

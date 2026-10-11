@@ -230,9 +230,6 @@ class CausalSelfAttention(nn.Module):
             raise ValueError(
                 f"values {self.value_dim} wide under {self.head_dim}-wide heads take no output gate "
                 "and are not the keys")
-        if self.packed and self._group() is None:
-            raise ValueError("a packed qkv_proj holds the layer's own keys and values, which a "
-                             "KV-sharing or keys-are-values layer does not project")
         dense = functools.partial(
             self.linear, use_bias=self.attention_bias, dtype=self.dtype, precision=self.precision,
             **normal_kernel(self.init_std))
@@ -241,6 +238,9 @@ class CausalSelfAttention(nn.Module):
             # A Server packs its constant weights once, not on every decode
             # step. The ordinary parameter tree remains the training layout.
             group = self._group()
+            if group is None:
+                raise ValueError("a packed qkv_proj holds the layer's own keys and values, which a "
+                                 "KV-sharing or keys-are-values layer does not project")
             self.qkv_proj = dense(sum(group.widths), name=group.packed)
         else:
             self.q_proj = dense(projections['q_proj'][1], name='q_proj')
@@ -510,8 +510,9 @@ class CausalSelfAttention(nn.Module):
         # The projections and the kernel's output carry the names a remat
         # policy saves or offloads (decoder_block.RESIDUALS).
         projected_kv = None
-        if self._packed():
-            projected, key, value = self._group().split(self.qkv_proj(x))
+        group = self._group()
+        if group is not None and self._packed():
+            projected, key, value = group.split(self.qkv_proj(x))
             projected_kv = (key, value)
         else:
             projected = self.q_proj(x)
