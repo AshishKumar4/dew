@@ -38,9 +38,9 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 
+from dew.data import Memory, Pipeline, compile
 from dew.interop import Pretrained, PretrainedDecoder
 from tools import masked_diffusion_export_reference as tool
-from dew.data import Memory, Pipeline, compile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "hf"
@@ -179,7 +179,7 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
     import optax
 
     from dew.checkpoints import Checkpoints
-    from dew.data import Dataset, Loading
+    from dew.data import Loading
     from dew.diffusion.discrete import MDLM
     from dew.interop import PretrainedMaskedDecoder
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
@@ -191,7 +191,8 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
                                          int(ids.shape[1]), ema_decay=None, variables=source.variables)
     count = math.lcm(int(ids.shape[0]), jax.device_count())
     rows = [{"text": row} for row in np.concatenate([ids] * (count // int(ids.shape[0])))]
-    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(count), read="indexed", loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(count), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     state = Trainer(objective, optax.sgd(1.0), key=jax.random.key(0), checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1)

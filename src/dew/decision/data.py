@@ -313,8 +313,15 @@ class Decisions:
                                 if index is None
                                 else self.source.rstrip("/") + "/" + records.text(index, "index.path")
                             )
+                            declared = {
+                                self.source.rstrip("/") + "/" + records.text(record(shard, "shard")["path"], "shard.path"):
+                                record(shard, "shard") for shard in shards if isinstance(shards, list)
+                            } if isinstance(shards, list) else None
+                            if declared is not None and source_index is not None:
+                                declared[source_index] = record(entry["index"], "index")
                             dataset = _DecisionSource(
-                                Files(paths, format="jsonl", index=source_index), slots or None, descriptor=pinned
+                                Files(paths, format="jsonl", index=source_index, file_info=declared),
+                                slots or None, descriptor=pinned
                             )
                             destination.append(Pipeline(dataset, name=name).map(ParseExample()))
                     weights.append(weight)

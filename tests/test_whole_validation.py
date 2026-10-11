@@ -123,7 +123,7 @@ EVALUATED = sorted(set(objectives) - ROLLOUT)
 
 def evaluated(name: str, windows, tmp_path) -> dict:
     """`name`'s pass over a split of `RECORDS` in batches of `ROWS`, run on
-    every process of the pool: once through `Dataset.from_records`, whose
+    every process of the pool: once through `load(Records(...))`, whose
     repeats fill the last batch with its own rows, and once with the repeats
     another record's. Each pass's scores and counts, and for a loss that draws
     nothing (the same under two keys) the loss of every record in one batch

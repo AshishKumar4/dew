@@ -71,7 +71,7 @@ def first_sentence(text: str) -> str:
 
 def input_paths(fields: dict) -> list[tuple[Path, str]]:
     sources, _, destinations = first_sentence(fields.get("inputs", "")).partition(" to ")
-    pattern = r"(?<![\w.])~?/[\w./-]+"
+    pattern = r"(?<![\w.])~?/[\w./+-]+"
     remote = re.findall(pattern, destinations)
     pairs = []
     for value in re.findall(pattern, sources):
@@ -84,7 +84,7 @@ def input_paths(fields: dict) -> list[tuple[Path, str]]:
             if file.is_file():
                 suffix = file.relative_to(source) if source.is_dir() else file.name
                 pairs.append((file, remote[0].rstrip("/.") + "/" + str(suffix)))
-    for value in re.findall(r"~/[\w./-]+", fields["command"]):
+    for value in re.findall(r"~/[\w./+-]+", fields["command"]):
         path = Path(value).expanduser()
         if path.is_file():
             pairs.append((path, value))
@@ -159,8 +159,12 @@ def select(device: str, selector: str, hardware: str, order: list[str]) -> list[
             raise ValueError("expected_cu must be finite and positive")
         if fields.get("artifact_policy", "all") not in ("all", "measurements"):
             raise ValueError("invalid artifact_policy")
+        if any(Path(pattern).is_absolute() for pattern in fields.get("artifact_excludes", "").split()):
+            raise ValueError("artifact exclusions must be archive-relative")
         if fields.get("compile_cache", "off") not in ("on", "off"):
             raise ValueError("compile_cache must be on or off")
+        if fields.get("wandb", "off") not in ("on", "off"):
+            raise ValueError("wandb must be on or off")
     return sorted(
         chosen,
         key=lambda entry: next(
@@ -177,8 +181,13 @@ def identity(plan: dict) -> dict:
         "hardware": plan["hardware"],
         "jobs": [
             {
-                key: job[key]
-                for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
+                "artifact_excludes": job.get("artifact_excludes", []),
+                "data_sources": job.get("data_sources", []),
+                "wandb": job.get("wandb", False),
+                **{
+                    key: job[key]
+                    for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
+                },
             }
             for job in plan["jobs"]
         ],
@@ -200,7 +209,9 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             commit=exact_ref(repo, fields["ref"]),
             minutes=int(fields.get("minutes") or 30),
             artifact_policy=fields.get("artifact_policy", "all"),
+            artifact_excludes=fields.get("artifact_excludes", "").split(),
             compile_cache=fields.get("compile_cache", "off"),
+            wandb=fields.get("wandb", "off") == "on",
             entry=entry,
             economics={
                 key: fields[key] for key in ("gpu_reason", "expected_cu", "decision", "memory_estimate")
@@ -210,6 +221,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
         for source, target in input_paths(fields):
             with source.open("rb") as stream:
                 inputs.append((target, hashlib.file_digest(stream, "sha256").hexdigest()))
+        job.update(data_inputs(fields))
         job["resume_key"] = colab_sync.retained_key(
             job["commit"],
             {
@@ -218,7 +230,10 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 "command": job["command"],
                 "outputs": job["outputs"],
                 "artifact_policy": job["artifact_policy"],
+                "artifact_excludes": job["artifact_excludes"],
                 "inputs": sorted(inputs),
+                "data_sources": job["data_sources"],
+                "wandb": job["wandb"],
             },
         )
         jobs.append(job)
@@ -233,6 +248,32 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
     }
 
 
+def data_inputs(fields: dict) -> dict:
+    """An explicit private descriptor names cached datasets and their credential."""
+    if not fields.get("data_inputs"):
+        return {"data_sources": []}
+    descriptor = read(Path(fields["data_inputs"]).expanduser())
+    if not descriptor.get("read_token_file"):
+        raise ValueError("restore-only data inputs require a read_token_file descriptor")
+    result = {"data_sources": [], "data_token_file": descriptor["read_token_file"]}
+    for source in descriptor["sources"]:
+        if not re.fullmatch(r"[0-9a-f]{64}", source["manifest_sha256"]):
+            raise ValueError("cached input descriptor requires an immutable manifest hash")
+        destination = Path(source["target"])
+        if not destination.is_absolute() or ".." in destination.parts:
+            raise ValueError("cached dataset requires an absolute VM target")
+        result["data_sources"].append(
+            {
+                "endpoint": descriptor["url"],
+                "target": str(destination),
+                "prefix": source["prefix"],
+                "manifest_sha256": source["manifest_sha256"],
+                "manifest_key": source.get("manifest_key", source["prefix"].rstrip("/") + "/manifest.json"),
+            }
+        )
+    return result
+
+
 def split_file(source: Path, work: Path, prefix: str) -> tuple[list[str], str]:
     names = []
     digest = hashlib.sha256()
@@ -245,10 +286,25 @@ def split_file(source: Path, work: Path, prefix: str) -> tuple[list[str], str]:
     return names, digest.hexdigest()
 
 
-def stage(plan: dict, work: Path, repo: Path = REPO) -> None:
-    work.mkdir(parents=True, exist_ok=False)
+def stage(
+    plan: dict,
+    work: Path,
+    repo: Path = REPO,
+    *,
+    netrc_file: Path | None = None,
+    wandb_config: Path | None = None,
+) -> None:
+    work.mkdir(mode=0o700, parents=True, exist_ok=False)
     stage_sources(plan, work, repo)
     stage_inputs(plan, work)
+    from tools.colab.credentials import stage_wandb
+
+    stage_wandb(
+        plan,
+        work,
+        netrc_file if netrc_file is not None else Path.home() / ".netrc",
+        wandb_config if wandb_config is not None else Path.home() / ".config/dew/wandb.toml",
+    )
     with tarfile.open(work / "runner.tar.gz", "w:gz") as archive:
         for file in HERE.glob("*.py"):
             archive.add(file, arcname="tools/colab/" + file.name)
@@ -326,13 +382,38 @@ def stage_sources(plan: dict, work: Path, repo: Path) -> None:
 
 
 def stage_inputs(plan: dict, work: Path) -> None:
+    plan["data_sources"] = []
     for job in plan["jobs"]:
+        for source in job.get("data_sources", []):
+            if source in plan["data_sources"]:
+                continue
+            target = Path(source["target"])
+            if any(
+                target.is_relative_to(Path(known["target"])) or Path(known["target"]).is_relative_to(target)
+                for known in plan["data_sources"]
+            ):
+                raise ValueError("different R2 datasets have overlapping VM targets")
+            plan["data_sources"].append(source)
+        if job.get("data_sources"):
+            source = Path(job["data_token_file"]).expanduser()
+            parts, digest = split_file(source, work, "data-read-token")
+            target = "/content/.dew-data-read.token"
+            previous = plan["uploads"].get(target)
+            if previous and previous["sha256"] != digest:
+                raise ValueError("packed jobs request different data-cache credentials")
+            plan["uploads"][target] = {"parts": parts, "sha256": digest, "private": True}
+            plan.setdefault("private_parts", []).extend(parts)
         for source, target in input_paths(job["entry"]["fields"]):
+            if any(Path(target).is_relative_to(Path(data["target"])) for data in job.get("data_sources", [])):
+                raise ValueError("R2 dataset inputs must not also be staged through the PC")
             parts, digest = split_file(source, work, "input-" + str(len(plan["uploads"])))
             previous = plan["uploads"].get(target)
             if previous and previous["sha256"] != digest:
                 raise ValueError(f"two inputs target {target} with different bytes")
             plan["uploads"][target] = {"parts": parts, "sha256": digest}
+            if source.stat().st_mode & 0o077 == 0:
+                plan["uploads"][target]["private"] = True
+                plan.setdefault("private_parts", []).extend(parts)
         cache = STATE / "colab-resume" / job["resume_key"]
         if job["artifact_policy"] != "measurements" and (cache / "manifest.json").is_file():
             archive = work / f"resume-{job['index']}.tar.gz"
@@ -343,6 +424,8 @@ def stage_inputs(plan: dict, work: Path) -> None:
 
 def staged(plan: dict, work: Path) -> dict:
     saved = read(work / "plan.json")
+    if any(upload.get("private") for upload in saved.get("uploads", {}).values()):
+        raise ValueError("private credentials require fresh staging at launch; do not reuse their snapshot")
     validate_reuse(saved, plan)
     for filename, expected in saved["staged_files"].items():
         file = work / filename

@@ -157,6 +157,54 @@ python tools/perf_gate.py run --base main=<tree> --head head=<tree> --rounds 3 \
 python tools/perf_gate.py report gate.json --table gate.md
 ```
 
+Every kernel or trainer change that claims speed must also pass the
+same-session Qwen3.5-0.8B backbone reference row on an A100-SXM4-80GB. The
+minimum is parity with the reference, within measured spread; the target is
+to beat it. This is a new requirement, not a claim that the historical tables
+below passed it. The paired runner uses this checkout's Dew and the pinned
+torch 2.10.0 / transformers 5.3.0 environment printed by
+`torch_qwen35_step.py --requirements cuda`:
+
+```
+python tools/reference_runs/qwen35_pair.py --torch-python /content/torch-reference/bin/python \
+    --rounds 2 --claim --out /content/qwen35-pair.json
+```
+
+Both processes load Qwen/Qwen3.5-0.8B at
+`2fc06364715b967f1860aea9cf38778875588b17`: full fine-tuning, 8 x 3072
+fixed synthetic unpadded causal tokens, bf16 compute, fp32 master weights and
+AdamW state, no checkpointing or accumulation, and a squared fixed scalar
+projection of final hidden states (no vocabulary head or cross entropy).
+They use identical seeded token and projection bytes. Each round starts fresh
+processes, torch followed immediately by Dew. Compilation and 20 warmup steps
+are excluded from the 200-step window; both sides synchronize only at its
+endpoints. The ratio uses median **window throughput** across rounds. Its
+tolerance is the larger relative min-max window spread, with no fixed noise
+floor. A deficit beyond that spread exits 1. A result inside it is *level*,
+not evidence of a speedup. Torch's CUDA-event step samples and Dew's later
+synchronized per-step pass are diagnostics only and never set the ratio.
+
+The comparison record retains both commits, environments, input hashes,
+step-0 losses, every timing window, MFUs on the same 81,029,926,748,160
+FLOPs/step, and both whole-run peaks through the timing window. Those peaks
+include load/compile/warmup, but exclude the later diagnostics; torch also
+records its separately reset steady-window peak. JAX cannot reset its
+`peak_bytes_in_use`. Even with matched scopes the two allocators account
+memory differently, so their peaks are not a device-wide free-memory measure.
+
+The battery includes this as a hardware-qualified row. Pass `--torch-python`
+to `perf_gate.py run` and `--claim` to require all hardware rows even under
+`--only`; `report --claim` also refuses missing required rows. On other
+devices the row says **not measured on this hardware**, never passed. The
+reference row runs on the head tree only: a base that trails torch must not
+prevent a head that reaches parity from qualifying. A slower pair is
+**failed**, with its exit code and throughput ratio in the report, not
+unmeasured. Ordinary base-versus-head rows keep their existing rule, and the
+battery can still report its other rows on unsupported hardware. Per-probe JSON
+evidence is retained beside the gate file. `qwen35_pair.py --smoke` runs both
+tiny CPU steps from identical exported weights and checks loss agreement;
+it cannot qualify a performance claim.
+
 A row that one tree cannot run is reported as not compared, not gated. The
 serving tool, for example, needs a newer PRNG API than main had on 2026-09-30.
 The 32-slot serving row is host-bound, and its median across rounds spread 33%
@@ -199,6 +247,12 @@ every row:
 
 ## Training scoreboard, 2026-10-03
 
+All ratios below hold only for the named workload, shape, precision,
+implementation and device. They do not establish that Dew is generally
+faster than PyTorch, torch.compile, MaxText or vLLM. Historical rows from
+different sessions are descriptive evidence, not a pass of the required
+same-session performance gate.
+
 I ran Dew and `torch.compile` on the same models with the same batch, bf16
 compute over fp32 master weights and the same optimizer constants. Both time
 the same warm step (forward, backward, update, and the EMA where both keep
@@ -209,6 +263,27 @@ come from `tools/reference_runs/torch_lm.py` (transformers models) and
 Dew rows from `tools/reference_runs/dew_lm.py` and
 `tools/benchmark_step.py`. `tools/reference_runs/scoreboard.py` collects the
 reference-run rows into one table.
+
+### Qwen3.5-0.8B hybrid backbone, A100-80: unresolved gap
+
+| implementation | step | MFU | peak | Dew / torch throughput |
+|---|---:|---:|---:|---:|
+| torch.compile, transformers 5.3.0 + FLA/Liger, measured | 646.6 ms | 40.2% | 45.5 GiB, torch steady-window allocated peak | 1.00 |
+| Dew, estimated backbone from c50 Qwen3.5-0.8B minus decision head | approximately 901 ms | approximately 28.8% | not measured head-free | approximately 0.72 |
+
+The torch reference (`229677367e29043fa1cafa080747d71db923fa7a`) measured
+the 8 x 3072 full-fine-tune workload above on an A100-SXM4-80GB. Dew's
+figure is **an estimate, not a matched rerun**: Qwen3.5-0.8B's 951.7 ms includes the
+decision head, whose profile attributed 50.3 ms. Subtracting that gives
+901.4 ms; the head-free step and its peak have not been measured. Qwen3.5-0.8B also
+used different data and a decision loss; the old torch run drew its rows
+with torch.randint. Shared NumPy rows apply to the new paired runner only.
+The estimate makes Dew about 0.72 times the reference's throughput, not
+faster. The next same-session pair replaces this estimate; until then no
+matched Qwen3.5 speed claim is established. The reference's recorded evidence
+is `~/.cache/dew/verification-evidence/torch_qwen35_step_result.json`.
+
+### Earlier workload-qualified scoreboard
 
 RTX 4080 16 GiB, Dew at `6464cb95` (2026-10-05, jax 0.11.2.post3), torch
 2.13.0+cu130, transformers 5.17.0, SDPA attention. The torch rows come from
@@ -288,7 +363,8 @@ elementwise 6.0, loss 1.0 and reductions 0.5. Both frameworks cast the fp32
 master weights to bf16 every step and cast the gradients back, and torch's
 casts are its `_to_copy` kernels.
 
-Dew is faster in the optimizer update. XLA fuses Adam (or AdamW), the EMA
+On the Qwen3-0.6B 1 x 1024 and 768-wide SimpleDiT scoreboard workloads,
+Dew's optimizer update is faster than the measured torch update. XLA fuses Adam (or AdamW), the EMA
 and the finiteness guard into one bandwidth-bound pass over the state. That
 pass takes 6.9 ms on the 768-wide SimpleDiT, against 16.2 for torch's fused
 Adam and foreach EMA, and 27.6 ms on Qwen3-0.6B, against 39.5 for torch's
@@ -754,6 +830,11 @@ batch's dtypes (`DiffusionObjective.blank_conditions` in
 
 ### Comparison with PyTorch
 
+These are comparisons of the particular presets and input/timing paths
+named below, not general framework rankings. For the currently unresolved
+Qwen3.5-0.8B hybrid-backbone gap, see the scoreboard above; a new speed claim
+requires the same-session pair in the performance-gate section.
+
 `tools/benchmark_torch.py` ran in a fresh venv with torch 2.14.0+cu130 and
 cuDNN 9.24. The run the week before used 2.11.0+cu128 with cuDNN 9.19. The
 flags were `--mode compile --warmup 20 --steps 100`, with the small presets
@@ -982,8 +1063,8 @@ stack that beats cuDNN with gradients as accurate as its own:
   attention (non-deterministic is already the default).
 - Closing FlashAttention-2's lead of 1.3-1.9 ms a step would take a
   Pallas-Triton backward of Dew's own, on the backend JAX 0.11 deprecates,
-  and it would save under 2% on steps where Dew is already faster than
-  torch.
+  and it would save under 2% on the measured Qwen3-0.6B 1 x 1024 and
+  2 x 1024 steps, whose Dew throughput exceeded those torch reference rows.
 
 At 64-wide heads tokamax's backward trails JAX's `mha` by 10-18% (0.35
 against 0.29 ms of the SimpleDiT-B call; the forwards take 0.093 and 0.087),

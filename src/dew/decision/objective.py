@@ -19,7 +19,15 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.data import Example
 from dew.decision.head import DecisionHead, Head
-from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
+from dew.decision.layout import (
+    OPTION_TILE,
+    DecisionInputs,
+    Layout,
+    MarkerLayout,
+    Specials,
+    StateFirstLayout,
+    compacted,
+)
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
@@ -72,7 +80,9 @@ class Encoding:
     their right option, which makes "none of the above" the right answer. That
     teaches the model to say that no option fits instead of picking the nearest
     wrong one. Each scored slot's target is its gold distribution (`Example.distribution`)
-    in the order the row shows the options.
+    in the order the row shows the options. With `option_slots`, a row also
+    carries its real options compacted to that many slots (`compacted`), which
+    a joint head computes alone.
     """
 
     layout: Layout
@@ -82,6 +92,7 @@ class Encoding:
     questions: int = 1
     shuffle: bool = True
     none_of_the_above: float = 0.0
+    option_slots: int | None = None
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
         labels = example.labels()
@@ -152,6 +163,8 @@ class Encoding:
         if encoded.positions is not None and encoded.slots is not None:
             row["positions"] = _padded(encoded.positions, length, 0)
             row["slots"] = _padded(encoded.slots, length, 0)
+        if self.option_slots is not None:
+            row["option_slots"], row["slotted"] = compacted(row["options"], self.option_slots)
         return row
 
 
@@ -334,6 +347,14 @@ class ConfigureLayout:
             raise ValueError("decision source slot maxima must be positive")
         encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
                             self.shuffle, self.none_of_the_above)
+        total = slots.get("total_options")
+        if total is not None:
+            count = integer(total, "slots.total_options")
+            if self.none_of_the_above > 0:
+                count += integer(slots.get("choice_questions"), "slots.choice_questions")
+            capacity = -(-count // 128) * 128
+            if capacity < questions * width:
+                encoding = dataclasses.replace(encoding, option_slots=capacity)
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
 
 

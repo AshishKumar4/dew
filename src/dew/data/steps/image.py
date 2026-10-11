@@ -12,7 +12,8 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch
-from dew.data.images import Augment, as_rgb, augment_image, decode_image, import_opencv, resize_image
+from dew.data.image_codec import decode_image
+from dew.data.images import Augment, as_rgb, augment_image, import_opencv, resize_image
 from dew.data.pipeline import Rejected
 
 

@@ -237,9 +237,13 @@ def test_video_dit_remat_matches():
 
 def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends():
     """The trainer's remat ladder, weakest first: a decoder climbs from no
-    recomputation through 'minimal' to 'full', a diffusion backbone from
-    False through 'dots' to 'full', and neither leaves a policy the ladder
-    does not name."""
+    recomputation through 'minimal' and 'save_dot_except_mlp' to 'full', a
+    diffusion backbone from False through 'dots' to 'full', and neither
+    leaves a policy the ladder does not name. On Qwen 3.5-0.8B at 8 x 3072 on
+    an A100 (c50), 'minimal' cost 14.7% a token over none and kept 13.5 GiB
+    of temporaries, 'save_dot_except_mlp' 18.4% and 6.4 GiB: between minimal
+    and full, a step minimal does not fit recomputes the MLP before it
+    recomputes everything."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import REMAT_POLICIES
     from dew.objectives.base import ProgramModule
@@ -265,7 +269,7 @@ def test_a_step_that_does_not_fit_recomputes_one_rung_more_until_the_ladder_ends
     climbed = []
     while recompute_more(decoder):
         climbed.append(decoder.model.remat)
-    assert climbed == [REMAT_POLICIES['minimal'], REMAT_POLICIES['full']]
+    assert climbed == [REMAT_POLICIES[name] for name in ('minimal', 'save_dot_except_mlp', 'full')]
 
     diffusion = Holding(BUILDERS['simple_dit'](remat=True))
     assert recompute_more(diffusion) and diffusion.model.remat == 'full'
@@ -451,7 +455,85 @@ def recording_runs(monkeypatch, fits):
     return run, compiled
 
 
-def test_a_later_run_of_a_step_starts_at_the_rung_an_earlier_run_chose(monkeypatch):
+def shape_runs(monkeypatch, fits):
+    """A decoder trainer whose fit check answers `fits(rows, rung)` for the
+    rows of the batch being compiled and the rung (whether the head is
+    tiled, the remat's record) it is compiled at. Returns a function that
+    builds a fresh trainer and places its state, the current trainer, and
+    the (rows, *rung) of every compile."""
+    import optax
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import Trainer, memory, trainer as trainer_module
+
+    compiled, current = [], []
+
+    def headroom(executable, devices, held=0):
+        trainer, rows = current[-1], current[-1].compiling_rows
+        rung = (trainer.objective.head_tile is not None, memory.recompute_record(trainer.objective))
+        compiled.append((rows, *rung))
+        return 0 if fits(rows, rung) else -1
+
+    monkeypatch.setattr(memory, 'step_headroom', headroom)
+    monkeypatch.setattr(trainer_module, 'step_compiler_options', lambda objective, rows, frozen: None)
+
+    def fresh():
+        model = CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=1,
+                                  mlp_features=16, max_seq_len=8)
+        current.append(Trainer(LMObjective(model, seq_len=4), optax.sgd(1e-3), key=jax.random.key(0)))
+        state, _, _ = current[-1].place()
+        return current[-1], state
+
+    def compile_rows(trainer, state, rows):
+        trainer.compiling_rows = rows
+        return trainer.compile(state, {'text': jnp.zeros((rows, 5), jnp.int32)})
+
+    return fresh, compile_rows, compiled
+
+
+def test_each_shape_a_run_meets_climbs_from_the_runs_own_rung(monkeypatch):
+    """A rung a long shape climbs to is that shape's alone. A run bucketed
+    by length met a long bucket that took 'minimal', then compiled every
+    later, shorter bucket at 'minimal' too, though those fitted with no
+    recomputation (c50 E5: six shapes 15% slower a token). Each shape a run
+    meets starts from the run's own rung and climbs only as far as it must."""
+    fresh, compile_rows, compiled = shape_runs(
+        monkeypatch, lambda rows, rung: rows == 8 or rung == (True, 'minimal'))
+    trainer, state = fresh()
+    compile_rows(trainer, state, 16)
+    compile_rows(trainer, state, 8)
+    assert compiled == [(16, False, None), (16, True, None), (16, True, 'minimal'), (8, False, None)]
+
+
+def test_a_checkpoint_records_each_shapes_rung_and_a_resumed_run_compiles_each_there(monkeypatch, tmp_path):
+    """The rung a checkpoint records is the run's own and, under `shapes`,
+    each compiled shape's, by its layout: a resumed process that finds more
+    free memory compiles every shape at the rung the run it continues did,
+    so it trains bit for bit as that run, and a shape that fitted lightly
+    stays light. The resumed process runs where the first one kept no rung
+    records (another machine), so only its checkpoint tells it the rungs."""
+    from dew.training import rungs
+
+    fitting = [lambda rows, rung: rows == 8 or rung == (True, 'minimal')]
+    fresh, compile_rows, compiled = shape_runs(monkeypatch, lambda rows, rung: fitting[0](rows, rung))
+    trainer, state = fresh()
+    compile_rows(trainer, state, 16)
+    compile_rows(trainer, state, 8)
+    rung = trainer._checkpoint_rung()
+    assert (rung['head_tile'], rung['remat'], rung['xla_defaults']) == (None, None, False)
+    shapes = {name: (shape['head_tile'] is not None, shape['remat'])
+              for name, shape in rung['shapes'].items()}
+    assert shapes == {"['text'] int32[16, 5]": (True, 'minimal'), "['text'] int32[8, 5]": (False, None)}
+
+    fitting[0] = lambda rows, rung: True
+    compiled.clear()
+    monkeypatch.setattr(rungs, "rung_records", lambda: tmp_path)
+    resumed, state = fresh()
+    resumed._resume_rung(rung)
+    compile_rows(resumed, state, 8)
+    compile_rows(resumed, state, 16)
+    assert compiled == [(8, False, None), (16, True, 'minimal')]
     """Identical runs of a step can read different free memory. On an RTX
     4080 the 99M MoE at 8 x 1024 tiled its head in the process that compiled
     the step, whose growing pool kept its autotuner's scratch, and kept the
@@ -545,13 +627,15 @@ def test_a_step_xla_refuses_at_every_rung_raises_its_refusal(monkeypatch):
     """Where XLA refuses the last rung too, the run stops with the refusal it
     already gave, with no compile of that rung again: on a large program each
     one costs minutes."""
-    rungs = {(tiled, remat) for tiled in (False, True) for remat in (None, 'minimal', 'full')}
+    remats = (None, 'minimal', 'save_dot_except_mlp', 'full')
+    rungs = {(tiled, remat) for tiled in (False, True) for remat in remats}
     trainer, attempts = refusing_trainer(monkeypatch, rungs)
     state, _, _ = trainer.place()
 
     with pytest.raises(jax.errors.JaxRuntimeError, match="RESOURCE_EXHAUSTED: Ran out of memory on HBM"):
         trainer.compile(state, {'text': jnp.zeros((8, 5), jnp.int32)})
-    assert attempts == [(False, None), (True, None), (True, 'minimal'), (True, 'full')]
+    assert attempts == [(False, None), (True, None), (True, 'minimal'), (True, 'save_dot_except_mlp'),
+                        (True, 'full')]
 
 
 def test_a_compile_error_that_is_not_about_memory_is_not_a_rung(monkeypatch):

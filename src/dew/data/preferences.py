@@ -1,6 +1,6 @@
 """Preference pairs for DPO: chosen and rejected rows with their masks.
 
-A `PreferencePairs` source reads a parquet file or in-memory JSON rows of
+A `PreferencePair` step reads records of
 `chosen` and `rejected` token-id lists, with `chosen_mask` and
 `rejected_mask` marking the completion tokens. Each batch stacks them in
 TRL's layout: chosen rows over rejected rows, padded to the longest row,

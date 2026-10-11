@@ -1,11 +1,4 @@
-"""The `Dataset` a run trains on, and the Grain plumbing every dataset shares.
-
-A `DatasetSpec` is a frozen dataclass that
-says what a dataset is and how to read it. `load(batch=)` turns it into a
-`Dataset`, which a recipe passes to the trainer. This module holds what the
-image, video and token specs have in common: the share of each batch a reader
-reads, the shuffled training stream, the ordered validation pass, and the
-slice that keeps the two disjoint.
+"""The compiled `Dataset`, shared reader partitions and checkpoint contracts.
 
 Every stream is opened for a `DataPartition`, the share of each global batch
 its reader reads. The trainer gets it from the mesh (`DataPartition.of`),
@@ -13,11 +6,9 @@ because processes that a pipeline or a split sequence spans hold the same rows
 and so read the same share. A loader reads the share it is given and nothing
 else.
 
-A training stream's position is one global record count, not a shard offset,
-so a run saved on one process count resumes on another. `GlobalStream` here
-and `dew.position` define that contract. A weighted `mixture` of corpora and a
-`Ramp` of the batch are both cut from that one order, so neither adds anything
-to what a checkpoint holds.
+An indexed global order resumes from a record count across process counts.
+Unknown-length, rejecting and token-budget orders instead save Grain's
+per-share state and refuse changed topology before a reader opens.
 """
 
 from __future__ import annotations
@@ -1490,7 +1481,7 @@ class PhasedStream:
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
         if saved.plan is not None:
-            plans = saved.plan.get("phases")
+            plans = saved.plan.get("phases") if "phases" in saved.plan else [saved.plan]
             if not isinstance(plans, list) or len(plans) != len(saved.completed) + 1:
                 raise ValueError("saved phase plans do not cover the completed and current phases")
             for index, plan in enumerate(plans):
