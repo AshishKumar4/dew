@@ -128,10 +128,12 @@ else:
     raise AssertionError("a training context exceeded its memory allowance")
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import load
+from dew.data import HoldOut, Hub, Loading, Text, load
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
-data = load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=32)
+data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=32,
+                 eos=True, token_holdout=HoldOut(fraction=0.01)), batch=64, read="memory",
+            provision=True, validation_records=256, loading=Loading(workers=0))
 model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                           mlp_features=64, max_seq_len=64)
 state = Trainer(LMObjective(model, seq_len=32), OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=1000)

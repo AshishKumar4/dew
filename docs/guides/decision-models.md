@@ -84,16 +84,18 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 ```python
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, DecisionTable, LogLoss
+from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, Decisions, LogLoss
 from dew.interop import Pretrained
 from dew.lora import LoRA
+from dew.data import HoldOut, Hub, load
 
 qwen = Pretrained.load("Qwen/Qwen3-0.6B").adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
-banking77 = DecisionTable(path="mteb/banking77", label="label_text", question="intent",
-                          instructions="Which banking request is this?")
+banking77 = Decisions(source=Hub("mteb/banking77"), label="label_text", question="intent",
+                      instructions="Which banking request is this?",
+                      validation=HoldOut(fraction=0.1, by="random", most=400))
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-data = objective.dataset(banking77, batch=32)  # a tenth held out, for validation and calibration
+data = load(banking77, batch=32, read="memory", provision=True, objective=objective.data())
 state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
     data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
 
@@ -134,11 +136,11 @@ A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebui
 `recipes/decision/train.py` is `laya-train --data tickets.csv`:
 
 ```bash
-python recipes/decision/train.py --data.path tickets.csv --data.text text --data.label label \
+python recipes/decision/train.py --data.source tickets.csv --data.text text --data.label label \
     --trainer.batch-size 32 --trainer.epochs 4
 ```
 
-It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `DecisionTable` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
+It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `Decisions` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
 
 ## Train a general decision model
 
@@ -172,7 +174,7 @@ It records their weights beside them, in `mixture.json`. Benchmark-style items a
 
 What was dropped is recorded with the sets.
 
-The recipes are default `DecisionRunConfig`s, so every value is a flag. `mixture` (a `DecisionMixture`) reads the sets at their shares of every step through `DecisionObjective.dataset`. `--mixture.weights mine 0.1` adds a set of your own from the same directory. `head` draws Clef's joint head. An example a joint row cannot hold is dropped and counted in the run's summary.
+The recipes are default `DecisionRunConfig`s, so every value is a flag. Their `data` is a `Decisions` recipe over a mixture manifest, with accepted-row shares applied before sharding. `--data.weights '{"mine": 0.1}'` adds a set of your own. The objective's data hook fits and lays out rows; an example a joint row cannot hold is dropped and counted. `head` draws Clef's joint head.
 
 The loss is the log loss plus half the Brier score, plus the ranked probability score on ordered levels: the proper scoring rules that Laya's RLCD and Clef's post-training reward.
 

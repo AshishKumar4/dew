@@ -30,31 +30,39 @@ Wrote corpus.txt with 53640 bytes
 Tokenize it with the byte tokenizer, which maps each UTF-8 byte to one of 256 IDs:
 
 ```bash
-dew tokenize \
-    --input corpus.txt --out tokens --tokenizer byte --val-fraction 0.1
+python - <<'PY'
+from pathlib import Path
+import numpy as np
+from dew.data import ByteTokenizer, export
+ids = np.asarray(ByteTokenizer().encode(Path("corpus.txt").read_text()), np.int32)
+held = int(len(ids) * 0.1)
+metadata = {"token_store": True, "tokenizer": "byte", "vocab_size": 256,
+            "dtype": "int32", "eos_id": None}
+export([{"text": ids[held:]}], "tokens/train", format="array_record", metadata=metadata, length_field="text")
+export([{"text": ids[:held]}], "tokens/val", format="array_record", metadata=metadata, length_field="text")
+PY
 ```
 
 ```text
-wrote 48276 tokens to tokens/train.bin and 5364 to tokens/val.bin
-tokens/meta.json: {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint8", "train_tokens": 48276, "val_tokens": 5364, "eos_id": null}
+The train and validation stores contain 48276 and 5364 tokens respectively.
 ```
 
-`tokens/meta.json` records the tokenizer, the vocabulary size, the storage dtype and the token counts, so keep the three files together. The validation split is the first 10% of the token stream, not a random sample. This corpus repeats itself, so it tests the workflow and tells you nothing about generalization.
+Each store's producer manifest records the tokenizer, vocabulary, dtype, row counts and length index. Validation is the head 10% of the token stream. This repeated corpus exercises the workflow rather than generalization.
 
 `--help` prints the flags and trains nothing:
 
 ```bash
 python "$DEW_REPO/recipes/lm/train.py" --help
-python "$DEW_REPO/recipes/lm/train.py" data:token-windows --help
+python "$DEW_REPO/recipes/lm/train.py" data:text --help
 ```
 
 Train two updates of a small decoder:
 
 ```bash
-python "$DEW_REPO/recipes/lm/train.py" data:token-windows \
-    --data.path tokens --data.seq-len 16 \
-    --data.loading.workers 0 --data.loading.threads 1 \
-    --data.loading.read-buffer 2 --data.val-batches 2 \
+python "$DEW_REPO/recipes/lm/train.py" data:text \
+    --data.source tokens/train --data.validation tokens/val --data.seq-len 16 \
+    --loading.workers 0 --loading.threads 1 \
+    --loading.read-buffer 2 --validation-records 16 \
     --model.dtype float32 --model.attention-impl reference \
     --model.emb-features 16 --model.num-layers 1 --model.num-heads 2 --model.mlp-features 32 \
     --trainer.batch-size 8 --trainer.steps 2 --trainer.log-every 1 \
@@ -87,11 +95,11 @@ Every recipe's configuration extends `RunConfig` with five parts:
 | --- | --- | --- |
 | `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | `--model causal_transformer --model.num-layers 12` |
 | `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | `--objective lm --objective.ema-decay 0.999` |
-| `data` | A dataset specification and its loading settings. | `data:token-windows --data.seq-len 16` |
+| `data` | A typed Recipe and its source/transform fields. | `data:text --data.seq-len 16` |
 | `optim` (`OptimConfig`) | Optimizer, learning rate, schedule, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, batch size, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
-A dotted flag sets a field inside a configuration object. A subcommand such as `data:token-windows` picks a dataset type by its alias and makes its flags available. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. `--objective` works the same way: it picks the objective's class, and each argument of its constructor is a flag, `--objective.<argument>`, except those it takes positionally without a default, which the recipe builds from the model and the data. Meshes and layouts are trainer fields ([Distributed training](concepts/distributed.md)), not model fields.
+A dotted flag sets a field inside a configuration object. A subcommand such as `data:text` picks a dataset type by its alias and makes its flags available. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. `--objective` works the same way: it picks the objective's class, and each argument of its constructor is a flag, `--objective.<argument>`, except th…
 
 | Setting | Default | Notes |
 |---|---|---|
@@ -119,13 +127,13 @@ With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local 
 
 ## Token data and pretrained models
 
-To train on your own text, replace `corpus.txt` with a UTF-8 file or a directory of `.txt` files. Tokenize it into a new output directory with the tokenizer the run will train with. The recipe reads the vocabulary size from `meta.json`, so there is no flag for it. `data:token-windows` cuts fixed-width windows from the token stream.
+To train on your own text, export records with the tokenizer the run will use. The producer manifest carries the vocabulary, dtype and length index, so the model does not guess them. `data:text` reads the committed store and cuts fixed-width windows.
 
-For whole documents, tokenize with `--pack` and add `--data.pack`. `--pack` treats each input file as one document and writes the tokenizer's EOS ID after it. The byte tokenizer's EOS is ID 255, a byte that never occurs in UTF-8 text. The packed loader then resets attention boundaries and positions between documents.
+For whole documents, preserve their boundaries when exporting, or append EOS with the producer's `--eos` flag, and select `--data.pack first-fit`. The byte tokenizer's EOS is ID 255, which never occurs in UTF-8 text. Packing resets attention boundaries and positions between documents.
 
 `--pretrained` takes a supported Hugging Face model directory, a Hub ID, or `repo@revision` for a branch, tag or commit. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its fields `--model.max-seq-len` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
 
-The LM recipe's `--objective` takes `lm`, `masked_diffusion` or `block_diffusion`, each with its own constructor's arguments as flags: `--objective.mtp-weight 0.3` for `LMObjective`, say. `masked_diffusion` trains a bidirectional masked-denoising model, with an EMA (`--objective.ema-decay`, 0.999) unless set to `None`. With `--pretrained` it continues from a LLaDA or Dream checkpoint. Without it, the model starts from a fresh initialization, and needs `--model.mask-token-id` as well as `--model.no-causal`. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and needs both `--pretrained` and `data:token-windows`, and `--objective.prompt-length`, the clean prefix of each row. The recipe does not run SFT, DPO or GRPO; those run in Python ([Post-training](concepts/post_training.md)).
+The LM recipe's `--objective` takes `lm`, `masked_diffusion` or `block_diffusion`, each with its own constructor's arguments as flags: `--objective.mtp-weight 0.3` for `LMObjective`, say. `masked_diffusion` trains a bidirectional masked-denoising model, with an EMA (`--objective.ema-decay`, 0.999) unless set to `None`. With `--pretrained` it continues from a LLaDA or Dream checkpoint. Without it, the model starts from a fresh initialization, and needs `--model.mask-token-id` as well as `--model.no-causal`. `block_diffusion` fine-tunes a DiffusionGemma checkpoint and needs both `--pretrained` and `data:text`, and `--objective.prompt-length`, the clean prefix of each row. The recipe does not run SFT, DPO or GRPO; those run in Python ([Post-training](concep…
 
 ## Diffusion and JEPA recipes
 
@@ -134,19 +142,11 @@ python "$DEW_REPO/recipes/diffusion/train.py" --help
 python "$DEW_REPO/recipes/jepa/train.py" --help
 ```
 
-A diffusion configuration adds a training `preset`, a text condition and an optional autoencoder. You pick a preset with a subcommand such as `preset:edm`. The objective (`--objective`, `diffusion` by default) holds the EMA, the condition dropout and how validation samples: `--objective.ema-decay 0.9999`, `--objective.steps 40`, and records for the solver and the guidance, `--objective.solver '{"class": "heun"}'` and `--objective.guidance '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 4.0}}'`. Another objective trains a loss of its own in place of the denoising loss: `mean_flow`, `shortcut`, `flow_grpo`, or a distillation of a saved run, `rcm`, `ladd` or `guidance_distillation` with `--objective.teacher-run <run directory>`. Each refuses a preset or a guidance its loss cannot train or sample with.
+A diffusion configuration adds a training `preset`, a text condition and an optional autoencoder. You pick a preset with a subcommand such as `preset:edm`. The objective (`--objective`, `diffusion` by default) holds the EMA, the condition dropout and how validation samples: `--objective.ema-decay 0.9999`, `--objective.steps 40`, and records for the solver and the guidance, `--objective.solver '{"class": "heun"}'` and `--objective.guidance '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 4.0}}'`. Another objective trains a loss of its own in place of the denoising loss: `mean_flow`, `shortcut`, `flow_grpo`, or a distillation of a saved run, `rcm`, `ladd` or `guidance_distillation` with `--objective.teacher-run <run directory>`. Each refuses a p…
 
-By default the recipe trains on Oxford Flowers with a CLIP text encoder and scores validation with a CLIP metric. Prepare Oxford Flowers first and pass it as `--data.path` ([Installation](installation.md)). The larger corpora are values of the image specs, given by their fields:
+By default the recipe trains on Oxford Flowers with a CLIP condition encoder. Prepare TFDS separately and bind a typed TFDS Source through --data.source (see Installation). Large corpora use the same Images recipe over Files URLs, including ArrayRecord and Parquet. Choose the read mode explicitly; preparation and provisioning are not step-zero fallbacks.
 
-| Corpus | Flags |
-| --- | --- |
-| LAION-aesthetics 12M with MS-COCO 2017 (236 GiB) | `data:array-record-images --data.shards arrayrecord2/laion12m_coco --data.path <mount>` |
-| LAION-2B-en aesthetic >= 4.2 (550 GiB) | `data:array-record-images --data.shards arrayrecord2/laion2B-en-aesthetic --data.path <mount>` |
-| DiffusionDB (60 GiB) | `data:array-record-images --data.shards arrayrecord2/diffusiondb --data.path <mount>` |
-| Conceptual Captions 3M, 12M | `data:array-record-images --data.shards arrayrecord2/cc3m --data.path <mount>`, or `arrayrecord2/cc12m` |
-| URL tables in a bucket | `data:online-images --data.sources gs://<bucket>/datasets/<table> ...` |
-
-Shards are read under a gcsfuse mount handed over as `--data.path`, several at once by naming them all in `--data.shards`; a URL table is fetched as it is read. The CLIP text encoder and the CLIP metric download `openai/clip-vit-large-patch14` from Hugging Face unless it is cached. An offline tracker does not prepare any of these.
+For a committed store, --data.source is its URL. For native shards, pass a JSON Files record with url and format. A URL catalog adds Fetch before decoding in a custom Pipeline. The CLIP condition and metric need their pretrained checkpoint; an offline tracker does not prepare it.
 
 `--pretrained` fine-tunes a published diffusion pipeline in the diffusers layout. It takes a Hub ID, `repo@revision` or a local directory holding SD 1.x/2.x/XL, SD3, Flux, FLUX.2, Qwen-Image or Z-Image. The pipeline decides the model, its autoencoder and its text conditioning, which comes from all of its text encoders and reaches the model as `conditioning`. So the model flags then set only `--model.dtype` and `--model.attention-impl`, the parameters load in float32, and `text` and `autoencoder` stay unset. The pipeline runs at the data's resolution, and its images use the autoencoder's own channels; Qwen-Image 2.1's, for example, are RGBA.
 
@@ -167,7 +167,7 @@ A JEPA configuration adds predictor fields, target-mask settings and optional re
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
-from dew.data import HFOptions, HubDataset
+from dew.data import Records
 from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy, CrossEntropy
 
@@ -182,7 +182,7 @@ class MLP(nn.Module):
 
 run = RunConfig(
     model=ModelConfig.from_model(MLP(hidden=32)),
-    data=HubDataset(name="json", options=HFOptions(data_files="rows.jsonl")),
+    data=Records(source="rows.jsonl"),
     objective=ObjectiveConfig("supervised", {
         "loss": CrossEntropy(), "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
     trainer=TrainerConfig(steps=300, batch_size=64))
