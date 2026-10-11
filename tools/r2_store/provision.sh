@@ -1,0 +1,51 @@
+#!/bin/sh
+# Provision one of Dew's R2 object stores on this machine's wrangler login:
+# its bucket, the lifecycle that expires its objects, its Worker (worker.js,
+# the same code for every store, named and bound by NAME.jsonc) and the
+# bearer token that Worker asks for.
+#
+#   tools/r2_store/provision.sh NAME [EXPIRE_DAYS]
+#
+# EXPIRE_DAYS deletes an object that many days after it is written; without
+# it the bucket keeps every object until it is deleted, except under _smoke/,
+# where a remote smoke's objects expire after a day. Two tokens are made
+# once: the write token at ~/.config/dew/NAME.token, which also reads, and a
+# read token at ~/.config/dew/NAME.read.token, refused a PUT, for readers
+# such as a restore-only VM (both mode 600). The Worker's URL is written to
+# ~/.config/dew/NAME.json. Run again, it deploys the Worker and sets the same
+# tokens. WRANGLER names the wrangler to run (default `bunx wrangler@4`).
+set -eu
+name=$1
+days=${2:-}
+here=$(cd "$(dirname "$0")" && pwd)
+config="$here/$name.jsonc"
+wrangler=${WRANGLER:-bunx wrangler@4}
+[ -f "$config" ] || { echo "no store $name: $config is missing" >&2; exit 2; }
+
+if ! $wrangler r2 bucket info "$name" >/dev/null 2>&1; then
+  $wrangler r2 bucket create "$name"
+fi
+if [ -n "$days" ] && ! $wrangler r2 bucket lifecycle list "$name" 2>/dev/null | grep -q "expire-${days}d"; then
+  $wrangler r2 bucket lifecycle add "$name" "expire-${days}d" --expire-days "$days" --force
+elif [ -z "$days" ] && ! $wrangler r2 bucket lifecycle list "$name" 2>/dev/null | grep -q "smoke-1d"; then
+  $wrangler r2 bucket lifecycle add "$name" smoke-1d _smoke/ --expire-days 1 --force
+fi
+
+mkdir -p "$HOME/.config/dew"
+token="$HOME/.config/dew/$name.token"
+reader="$HOME/.config/dew/$name.read.token"
+for file in "$token" "$reader"; do
+  if [ ! -s "$file" ]; then
+    (umask 077 && head -c 48 /dev/urandom | base64 | tr -d '/+=\n' > "$file")
+  fi
+  chmod 600 "$file"
+done
+
+deployed=$($wrangler deploy -c "$config" 2>&1) || { echo "$deployed" >&2; exit 1; }
+url=$(echo "$deployed" | grep -o "https://$name\.[A-Za-z0-9.-]*workers\.dev" | head -1)
+[ -n "$url" ] || { echo "$deployed" >&2; echo "the deploy named no URL" >&2; exit 1; }
+tr -d '\n' < "$token" | $wrangler secret put CACHE_TOKEN -c "$config" >/dev/null
+tr -d '\n' < "$reader" | $wrangler secret put READ_TOKEN -c "$config" >/dev/null
+printf '{"url": "%s", "token_file": "%s", "read_token_file": "%s"}\n' "$url" "$token" "$reader" \
+  > "$HOME/.config/dew/$name.json"
+echo "$name: $url (tokens in $token and $reader)"
