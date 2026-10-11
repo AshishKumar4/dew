@@ -57,7 +57,9 @@ def discover(job: dict, tree: Path) -> list[dict]:
             candidates = [
                 file.parent for file in files.values() if file.name.endswith("after_optimizations.txt")
             ]
-            hlo = max(candidates, key=lambda path: len(os.path.commonpath([str(path), str(capture)])), default=None)
+            hlo = max(
+                candidates, key=lambda path: len(os.path.commonpath([str(path), str(capture)])), default=None
+            )
         matched = [
             profile
             for profile in settings
