@@ -389,7 +389,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 version = self.fs.ukey(path)
             with FileLock(str(directory / ".dew-lock")):
                 self.load_cache()
-                cached = self._metadata.check_file(path)
+                cached = self._metadata.check_file(path, cfs=None)
                 if cached and (
                     cached[0]["uid"] == version
                     and (not self.expiry or time.time() - cached[0]["time"] <= self.expiry)
