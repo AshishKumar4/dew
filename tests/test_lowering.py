@@ -15,6 +15,7 @@ from jax.sharding import Mesh
 
 from dew.nn.kernels.generation import (
     KERNELS,
+    PALLAS_CHOICES,
     assumed,
     backend,
     bf16_dot_runs,
@@ -22,7 +23,7 @@ from dew.nn.kernels.generation import (
     measured_kernel,
     triton_runs,
 )
-from dew.training.lowering import DEVICE_KINDS, gpu_mesh, triton_kernels
+from dew.training.lowering import DEVICE_KINDS, UNLOWERABLE, gpu_mesh, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -103,8 +104,8 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
 # and the probe that runs them: the Clef recipe's step (tools/clef_step.py), or an expert layer's
-# forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering this host cannot
-# reach (`_experts_lowered`'s tokamax).
+# forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering no CPU reaches
+# (`dew.training.lowering.UNLOWERABLE`).
 FAMILIES = {
     ('gated_delta_rule', 'pallas'): ("step", {"gated_delta_states", "gated_delta_states_backward",
                                               "gated_delta_prep", "gated_delta_prep_backward"}),
@@ -126,11 +127,10 @@ def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
 def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
     """A Pallas kernel KERNELS chooses for some GPU is one this file lowers for that GPU on a CPU: a new
     row needs its kernels in FAMILIES, so no Triton lowering first runs in a GPU session's compile."""
-    from tools.colab.preflight import PALLAS_CHOICES
-
     named = {(choice, kernel) for choice, row in KERNELS.items() for kernel in row.values()
              if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
+    assert {key for key, (_, names) in FAMILIES.items() if names is None} == set(UNLOWERABLE)
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])

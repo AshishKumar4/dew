@@ -44,6 +44,13 @@ DEVICE_KINDS = {
 """A `device_kind` of each CUDA generation a step lowers for, as the device reports it: JAX's
 Pallas lowering reads the compute capability it targets from the kind (`get_gpu_info`)."""
 
+UNLOWERABLE = {
+    ('tokamax_grouped_matmul', 'triton'): (
+        "tokamax registers its Triton ragged dot on GPU hosts only, so no CPU lowers it, and the "
+        "kernel lab's verify on the GPU is its only check"),
+}
+"""The Pallas choices a `KERNELS` row can name whose Triton lowering no CPU reaches, and why."""
+
 _TRITON_CALL = re.compile(r'custom_call @__gpu\$xla\.gpu\.triton\(.*?\bname = "([^"]*)"')
 
 
@@ -75,4 +82,4 @@ class Lowered(SystemExit):
         self.kernels = triton_kernels(lowered)
 
 
-__all__ = ["DEVICE_KINDS", "Lowered", "gpu_mesh", "triton_kernels"]
+__all__ = ["DEVICE_KINDS", "UNLOWERABLE", "Lowered", "gpu_mesh", "triton_kernels"]
