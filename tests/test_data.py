@@ -747,11 +747,12 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     from dew.data import Files
     from dew.data.steps.video import VideoPath
 
-    rows = Files(str(tmp_path), format="files").records("memory")
+    patterns = (str(tmp_path / "**" / "*.mp4"), str(tmp_path / "**" / "*.webm"))
+    rows = Files(patterns, format="files").records("memory")
     records = [VideoPath(caption="a clip").map(row) for row in rows]
 
-    assert [r["video_path"] for r in records] == sorted(
-        [str(c) for c in clips] + [str(tmp_path / "extra.webm")]
+    assert sorted(r["video_path"] for r in records) == sorted(
+        [c.as_uri() for c in clips] + [(tmp_path / "extra.webm").as_uri()]
     )
     assert {r["caption"] for r in records} == {"a clip"}
     with pytest.raises((ValueError, FileNotFoundError), match=r"source|files|directory"):
@@ -1672,7 +1673,7 @@ def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
 
 
 def test_columns_of_different_lengths_are_refused_by_name():
-    with pytest.raises(ValueError, match="'x' holds 3 records and 'index' holds 4"):
+    with pytest.raises(ValueError, match=r"different row counts:.*'index': 4.*'x': 3"):
         load(Records(source={"index": np.arange(4), "x": np.zeros((3, 2))}), batch=2, read="memory")
 
 
@@ -1742,7 +1743,7 @@ def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
 def test_training_records_too_few_for_one_batch_are_refused():
     """An endless stream would fill a batch by repeating records inside it,
     and an epoch would be zero steps long."""
-    with pytest.raises(ValueError, match="3 training records, fewer than one batch of 4"):
+    with pytest.raises(ValueError, match="3 records, fewer than one batch of 4"):
         load(Records(source=_columns(3)), batch=4, read="memory")
 
 

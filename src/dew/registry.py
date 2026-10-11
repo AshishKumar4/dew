@@ -344,11 +344,11 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
 
 @overload
 def from_record(annotation: types.UnionType | TypeAliasType, value: Configured, *,
-                dtypes: bool = True) -> object: ...
+                dtypes: bool = True) -> Configured: ...
 
 
 def from_record(annotation: type | types.UnionType | TypeAliasType, value: Configured, *,
-                dtypes: bool = True) -> object:
+                dtypes: bool = True) -> Configured:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
