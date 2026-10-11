@@ -321,16 +321,14 @@ class Cache:
             "metadata": metadata,
             "plan": {},
             "source_shards": dict(source_shards),
+            "source_metadata": source.metadata(),
         }
         if plan is not None:
             candidate = Generation(target.url, self._mirror_options(), definition)
             for name, array in plan(candidate).items():
                 if not name.replace("_", "").isalnum():
                     raise ValueError(f"invalid packing-plan field {name!r}")
-                encoded = io.BytesIO()
-                np.save(encoded, array, allow_pickle=False)
-                path = f"plan/{name}.npy"
-                definition["plan"][name] = {"path": path, **target.child(path).verified(encoded.getvalue())}
+                definition["plan"][name] = _write_plan(target, name, array)
         payload = _json(definition)
         target.child("manifest.json").verified(payload)
         reference = _json(
@@ -341,6 +339,31 @@ class Cache:
         else:
             root.child("CURRENT").put_if_match(reference, current.version)
         return opened
+
+
+def _write_plan(root: Store, name: str, array: np.ndarray) -> Mapping[str, object]:
+    if array.dtype.fields is not None or array.dtype.hasobject:
+        raise ValueError(f"packing plan {name!r} must be a homogeneous numeric array")
+    rows = array.reshape(1) if array.ndim == 0 else array
+    row_bytes = max(1, int(np.prod(rows.shape[1:])) * array.dtype.itemsize)
+    page_rows = min(4096, max(1, 4 * 2**20 // row_bytes))
+    digest = hashlib.sha256(_json({"dtype": array.dtype.str, "shape": list(array.shape)}))
+    pages = []
+    for offset in range(0, len(rows), page_rows):
+        page = np.ascontiguousarray(rows[offset : offset + page_rows])
+        digest.update(page.tobytes())
+        encoded = io.BytesIO()
+        np.save(encoded, page, allow_pickle=False)
+        path = f"plan/{name}/{len(pages):06d}.npy"
+        pages.append({"path": path, **root.child(path).verified(encoded.getvalue())})
+    return {
+        "dtype": array.dtype.str,
+        "shape": list(array.shape),
+        "rows": len(rows),
+        "page_rows": page_rows,
+        "pages": pages,
+        "sha256": digest.hexdigest(),
+    }
 
 
 def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
@@ -932,8 +955,33 @@ class Generation:
             self.__dict__.pop(cached, None)
 
     def plan(self, name: str) -> np.ndarray:
-        encoded = _checked(Store(self.url, self.storage_options), self.manifest["plan"][name])
-        return np.load(io.BytesIO(encoded), allow_pickle=False)
+        metadata = self.manifest["plan"][name]
+        pages = [self._plan_page(name, page) for page in range(len(metadata["pages"]))]
+        values = np.concatenate(pages) if pages else np.empty(metadata["shape"], dtype=metadata["dtype"])
+        return values.reshape(metadata["shape"])
+
+    @cached_property
+    def _plan_page(self):
+        @lru_cache(maxsize=4)
+        def opened(name: str, page: int) -> np.ndarray:
+            reference = self.manifest["plan"][name]["pages"][page]
+            encoded = _checked(Store(self.url, self.storage_options), reference)
+            return np.load(io.BytesIO(encoded), allow_pickle=False)
+
+        return opened
+
+    def plan_at(self, name: str, index: int) -> np.ndarray:
+        metadata = self.manifest["plan"][name]
+        if not 0 <= index < metadata["rows"]:
+            raise IndexError(index)
+        page, offset = divmod(index, metadata["page_rows"])
+        return np.asarray(self._plan_page(name, page)[offset])
+
+    def plan_length(self, name: str) -> int:
+        return self.manifest["plan"][name]["rows"]
+
+    def plan_hash(self, name: str) -> str:
+        return self.manifest["plan"][name]["sha256"]
 
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
@@ -1055,7 +1103,14 @@ class _GenerationSource:
 
     def metadata(self) -> Mapping[str, object]:
         metadata = self.generation.manifest["metadata"]
+        original = self.generation.manifest["source_metadata"]
+        stable = {
+            name: value
+            for name, value in original.items()
+            if name not in ("rows", "accepted_rows", "windows", "valid_targets", "zero_target_windows")
+        }
         return {
+            **stable,
             "rows": len(self.generation),
             "accepted_rows": len(self.generation),
             **(
