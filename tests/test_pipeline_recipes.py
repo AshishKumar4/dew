@@ -1,15 +1,14 @@
 """Recipe encodings against the frozen pre-migration loader behavior."""
 
-import functools
 import itertools
+import re
 
 import numpy as np
 import pytest
 
 from dew.data import ByteTokenizer, DataPartition, Loading
 from dew.data.recipes import Chat, Prompts, Text, load
-from dew.data.sources.memory import Memory
-from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout, Weighted
+from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
 from dew.decision.data import Decisions
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
@@ -23,28 +22,36 @@ def _objective(bucket=None):
         layout=StateFirstLayout(max_len=128), shuffle_options=True, bucket=bucket)
 
 
-def _assert_batches(left, right, count=4):
-    try:
-        for ours, expected in zip(itertools.islice(left, count), itertools.islice(right, count), strict=True):
-            assert set(ours) == set(expected)
-            for key in ours:
-                np.testing.assert_array_equal(ours[key], expected[key], err_msg=key)
-    finally:
-        left.close()
-        right.close()
-
-
 @pytest.mark.parametrize("bucket", [None, 16])
-def test_decision_objective_data_matches_legacy_augmented_and_unaugmented_batches(bucket):
+def test_decision_branches_keep_labels_aligned_with_option_order_and_cut_only_training(bucket):
     examples = [Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
                 for index in range(40)]
     objective = _objective(bucket)
     recipe = Decisions(examples, validation=examples[:5])
     ours = load(recipe, batch=4, read="memory", objective=objective.data(),
                 seed=7, loading=READ)
-    old = objective.dataset(examples, validation=examples[:5], batch=4, seed=7, loading=READ)
-    _assert_batches(ours.train(DataPartition()), old.train(DataPartition()))
-    _assert_batches(ours.val(DataPartition()), old.val(DataPartition()))
+    reader = ours.train(DataPartition())
+    try:
+        for batch in itertools.islice(reader, 8):
+            for tokens, valid, labels in zip(batch["tokens"], batch["valid"], batch["labels"], strict=True):
+                text = ByteTokenizer().decode(tokens[valid])
+                matched = re.search(r"state (\d+)", text)
+                assert matched is not None
+                index = int(matched[1])
+                order = ("yes", "no") if text.index("yes") < text.index("no") else ("no", "yes")
+                assert order[int(labels[0])] == ("yes" if index % 2 == 0 else "no")
+            if bucket is not None:
+                longest = int(batch["valid"].sum(axis=1).max())
+                assert batch["tokens"].shape[1] == min(128, -(-longest // bucket) * bucket)
+    finally:
+        reader.close()
+    held = ours.val(DataPartition())
+    try:
+        batch = next(held)
+        assert batch["tokens"].shape[1] == 128
+        np.testing.assert_array_equal(batch["labels"][:, 0], [0, 1, 0, 1])
+    finally:
+        held.close()
 
 
 def test_text_windows_keep_document_continuations_and_global_resume():

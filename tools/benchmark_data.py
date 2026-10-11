@@ -29,20 +29,20 @@ from absl import flags  # noqa: E402
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
-from dew.data import DatasetSpec, TFDSImages  # noqa: E402
+from dew.data import Images, Loading, Recipe, load  # noqa: E402
 from dew.registry import datasets  # noqa: E402
 
 if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the registered specs, and
     # a type checker cannot read a variable in a type expression.
-    AnySpec = DatasetSpec
+    AnySpec = Recipe
 else:
     AnySpec = datasets.union
 
 
 @dataclass(frozen=True)
 class Benchmark:
-    data: AnySpec = field(default_factory=TFDSImages)
+    data: AnySpec = field(default_factory=lambda: Images(source="tfds://oxford_flowers102:2.1.1"))
     """Which dataset, with its own fields as flags."""
     batch: int = 32
     """Global batch size."""
@@ -50,6 +50,8 @@ class Benchmark:
     """Steps to time."""
     warmup: int = 5
     """Steps to run before timing starts."""
+    read: str = "indexed"
+    loading: Loading = field(default_factory=Loading)
 
 
 def measure(batches: Iterable, steps: int, warmup: int) -> List[float]:
@@ -82,7 +84,7 @@ def report(latencies: List[float], batch_size: int) -> None:
 
 
 def main(config: Benchmark) -> None:
-    dataset = config.data.load(batch=config.batch)
+    dataset = load(config.data, batch=config.batch, read=config.read, loading=config.loading)
     print(f"{datasets.alias_of(type(config.data))}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
     from dew.data import DataPartition
