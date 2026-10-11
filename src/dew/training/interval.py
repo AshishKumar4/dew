@@ -87,11 +87,8 @@ class Interval:
     `steps` counts since the last checkpoint, the rest since the last log.
     The records and FLOPs are summed per step rather than taken off the
     dataset's batch, so a ramped interval reports the records it read and
-    their FLOPs. `counted_steps` is how many steps since the last log
-    reported their analytical work: train/mfu reads the interval's work only
-    where every one did, so a run that stops counting reports none for the
-    interval rather than part of it. `tokens_counted` says whether a step
-    reported its real tokens.
+    their FLOPs. `model_counted` and `tokens_counted` say whether a step
+    since the last log reported its analytical work and real tokens.
     `rollout_seconds` is the time spent sampling, logged under
     train/rollout_seconds when a rollout is set. `waited` is the time the
     loop spent waiting on its next batch and `compiling` the time it spent
@@ -107,7 +104,7 @@ class Interval:
     since_log: int = 0
     samples: int = 0
     flops: StepFlops | None = NO_FLOPS
-    counted_steps: int = 0
+    model_counted: bool = False
     tokens_counted: bool = False
     rollout_seconds: float = 0.0
     waited: float = 0.0
@@ -124,7 +121,7 @@ class Interval:
         if self.book is None:
             self.book = self.fresh = fresh_book(loss)
         aux = {} if aux is None else aux
-        self.counted_steps += TRAINING_FLOPS in aux
+        self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
         self.book = bookkeep(self.book, loss, finite, committed,
@@ -158,7 +155,7 @@ class Interval:
         """Start the next logging interval at `now`."""
         self.last_log_time, self.since_log, self.samples = now, 0, 0
         self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
-        self.counted_steps, self.tokens_counted = 0, False
+        self.model_counted = self.tokens_counted = False
         if self.book is not None and self.fresh is not None:
             self.book = self.book._replace(training=self.fresh.training, tokens=self.fresh.tokens,
                                            norms=self.fresh.norms, commits=self.fresh.commits)
