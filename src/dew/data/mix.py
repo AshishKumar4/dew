@@ -446,8 +446,10 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
             if isinstance(corpus, str) and isinstance(stored, Mapping):
                 parsed = CorpusCounts(corpus)
                 parsed.restore(stored)
-                combined = counted.setdefault(corpus, CorpusCounts(corpus))
-                combined.accepted = max(combined.accepted, parsed.accepted)
+                if corpus not in counted:
+                    counted[corpus] = CorpusCounts(corpus, accepted=parsed.accepted)
+                combined = counted[corpus]
+                combined.attempted = max(combined.attempted, parsed.attempted)
                 combined.truncated = max(combined.truncated, parsed.truncated)
                 combined.chunks = max(combined.chunks, parsed.chunks)
                 combined.rejected.update(parsed.rejected)
@@ -458,6 +460,4 @@ def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
                 visit(child)
 
     visit(state)
-    for counts in counted.values():
-        counts.attempted = counts.accepted + sum(counts.rejected.values())
     return counted
