@@ -1142,7 +1142,7 @@ class Trainer(Generic[Loss, Effects]):
         microbatch count, the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
         parameters, and the links of the axes the step measured, none by
-        default."""
+        default. An abstract mesh is a GPU's this process lacks (`_lowered_for`)."""
         on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
         with (on, pipeline_microbatches(self.mesh.microbatches) as schedule,
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
@@ -1165,10 +1165,10 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint accumulation window_size differs from this trainer")
         if (state.scale is not None) != self.dynamic_scale:
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
-        if self.host_master:
-            return self._compile_host(state, batch)
         if self.lower_for is not None:
             raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
+        if self.host_master:
+            return self._compile_host(state, batch)
         mesh = self.device_mesh
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
@@ -1286,7 +1286,12 @@ class Trainer(Generic[Loss, Effects]):
         The step traces on an abstract mesh of that GPU's devices, the device
         mesh's axes over them, so JAX's Pallas lowering reads the GPU from each
         kernel's trace and lowers it to Triton. Only shapes cross over: the
-        state and the batch on this process's devices sit on another mesh."""
+        state and the batch on this process's devices sit on another mesh. A
+        CPU-owned state's step realizes its parameters on the host as it runs,
+        and is not lowered whole."""
+        if self.host_master:
+            raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
+                             "the variables on the host")
         mesh = gpu_mesh(self.device_mesh, generation)
         self._at_base_rung(batch)
         with assumed(generation), self._traced_on(mesh) as schedule:
