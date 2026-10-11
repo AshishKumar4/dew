@@ -1127,7 +1127,13 @@ class _Build:
                 lengths = None if lengths is None else lengths[: min(stage.count, len(lengths))]
             else:
                 rows = gx.LimitIterDataset(rows, stage.count)
-        elif isinstance(stage, Pack):
+        else:
+            return self.layout_stage(rows, lengths, stage, pipeline, partition)
+        return rows, lengths
+
+    def layout_stage(self, rows: Rows, lengths: pygrain.MapDataset | None, stage: Stage,
+                     pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
+        if isinstance(stage, Pack):
             parent = _as_iter(rows, self.loading).map(_Payload())
             sizes = dict.fromkeys(stage.fields, stage.seq_len)
             if stage.policy == "concat":
@@ -1483,6 +1489,9 @@ def compile(
         )
     combined = (train,) if validation is None else (train, validation)
     if any(isinstance(stage, Configured) for branch in combined for stage in _steps(branch)):
+        if read == "memory" and all(not len(leaf.source.records(read)) for leaf in _leaves(train)
+                                     if not isinstance(leaf.source, (Mixture, Phases))):
+            raise ValueError(f"no accepted rows of {_name(train)}; source is empty")
         metadata = _metadata(combined, read)
         if read == "memory":
             train = _materialize(_configured(train, metadata, read, "source"), counts)
