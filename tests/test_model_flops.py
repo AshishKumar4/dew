@@ -13,6 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from reference_error import equations
 
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
@@ -280,3 +281,56 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     interval.logged(3.0)
     np.testing.assert_array_equal(np.asarray(interval.book[3:]), [0, 0])
     assert not interval.model_counted and not interval.tokens_counted
+
+
+def forward_products(function, *operands):
+    """Independent shape count of forward dots/convolutions, not an HLO estimate.
+
+    Elementwise ops and normalization are excluded, so no tolerance can
+    hide a missing Dense. Noncausal, unpadded fixtures make attention's
+    logical product equal its executed product; chunked recurrence model
+    FLOPs instead follow their documented algorithm-independent formula.
+    """
+    total = 0
+    for equation in equations(jax.make_jaxpr(function)(*operands)):
+        if equation.primitive.name == "dot_general":
+            left = equation.invars[0].aval.shape
+            contracted = equation.params["dimension_numbers"][0][0]
+            terms = np.prod([left[axis] for axis in contracted], dtype=np.int64)
+            total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64) * terms
+        elif equation.primitive.name == "conv_general_dilated":
+            kernel = equation.invars[1].aval.shape
+            dims = equation.params["dimension_numbers"].rhs_spec
+            terms = np.prod([kernel[axis] for axis in dims[1:]], dtype=np.int64)
+            total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64) * terms
+    return float(total)
+
+
+@pytest.mark.parametrize("family", ["decoder", "loop", "mlp", "attention", "dit", "jepa"])
+def test_analytical_count_equals_every_forward_dot_and_convolution(family):
+    lengths = np.array([4, 4], np.int64)
+    if family in ("decoder", "loop"):
+        model = decoder(causal=False, attention_impl="reference",
+                        loop=Loop(2) if family == "loop" else None)
+        operands = (jnp.ones((2, 4), jnp.int32),)
+        count = model.model_flops(lengths) + model.logits_flops(lengths)
+    elif family == "mlp":
+        model = GatedMLP(16, 8)
+        operands = (jnp.ones((2, 4, 8)),)
+        count = model.model_flops(lengths)
+    elif family == "attention":
+        model = CausalSelfAttention(8, 2, 1, 4, 16, causal=False, attention_impl="reference")
+        operands = (jnp.ones((2, 4, 8)),)
+        count = model.model_flops(lengths)
+    elif family == "dit":
+        model = SimpleDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2,
+                          attention_impl="reference")
+        operands = (jnp.ones((2, 4, 4, 3)), jnp.ones((2,)))
+        count = model.image_flops(lengths, 3)
+    else:
+        model = JepaEncoder(emb_features=8, num_heads=2, num_layers=2, patch_size=2,
+                            attention_impl="reference")
+        operands = (jnp.ones((2, 4, 4, 3)),)
+        count = model.image_flops(lengths, 3)
+    variables = model.init(jax.random.key(201), *operands)
+    assert count == forward_products(model.apply, variables, *operands)
