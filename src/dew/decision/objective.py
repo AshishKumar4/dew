@@ -540,10 +540,13 @@ class DecisionObjective(Objective[Ratio]):
     def inference_record(self):
         """Return what a saved run rebuilds its task from.
 
-        That is the backbone, head, layout, tokenizer and special tokens.
+        That is the backbone, head, layout, tokenizer, special tokens and the
+        image processor's source config. The processor reloads from the same
+        source identity as the tokenizer, through the shared interop loader.
         """
         from dew.config import ModelConfig
         from dew.inference.tasks import recorded_tokenizer
+        from dew.records import json_value
         from dew.registry import to_record
 
         return {
@@ -554,6 +557,10 @@ class DecisionObjective(Objective[Ratio]):
                        "fields": to_record(self.layout, type(self.layout))},
             "specials": to_record(self.specials, Specials),
             "tokenizer": recorded_tokenizer(RunProcessor(self.tokenizer)),
+            "processor": (None if self.image_processor is None else {
+                "config": json_value(self.image_processor.config, "processor.config"),
+                "fields": json_value(self.image_processor.record, "processor.fields"),
+            }),
         }
 
     def pipeline(self, state: "TrainState", *, ema: bool | None = None,

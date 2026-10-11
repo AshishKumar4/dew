@@ -364,6 +364,44 @@ def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metri
     assert result.scores["val/accuracy"] == float(right)
 
 
+def test_a_saved_vision_run_answers_image_rows(tmp_path):
+    """A shared decision record restores the backbone's image processor.
+
+    A local multimodal source under Dew's own head trains and checkpoints
+    without a released decision format. Its reloaded task answers an image
+    row with the live task's probabilities, and those differ from the text
+    row's, so the saved processor and vision tower both reach the answer.
+    """
+    from PIL import Image
+
+    from dew.data.text import HFTokenizer
+    from dew.decision import JointLayout
+    from dew.interop import Pretrained
+
+    directory = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
+    tokenizer = HFTokenizer(str(directory), local_files_only=True)
+    layout = JointLayout(max_len=1024)
+    base = DecisionObjective(source, tokenizer=tokenizer, layout=layout)
+    task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
+                  processor=source.processor)
+    objective = DecisionObjective(task)
+    data = objective.dataset(EXAMPLES, batch=8)
+    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
+    images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
+    asked = {"team": INTENT}
+    first = live("charged twice!", asked, images=images)["team"].probabilities
+    second = reloaded("charged twice!", asked, images=images)["team"].probabilities
+
+    assert reloaded.processor is not None
+    np.testing.assert_array_equal(second, first)
+    assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
+
+
 def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     """A calibration saved into a run reloads with the step it was fitted
     on; trained further, the run's latest weights refuse it rather than

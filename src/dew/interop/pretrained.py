@@ -933,11 +933,11 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
 
 
 def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module, gguf_path: Path | None = None, *, media: bool = False
+                      model: nn.Module, gguf_path: Path | None = None
                       ) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
-    Only a `media` source, a wrapper whose towers the loader built beside its
+    Only a media source, a wrapper whose config names towers beside its
     decoder (`_media_wrapper`), reads images or audio, and only through the
     processor its repo ships; a text decoder takes its tokenizer whatever
     processor files sit beside it (DiffusionGemma publishes a Gemma 4
@@ -946,7 +946,7 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
-    if media and processor_files:
+    if _media_wrapper(config) and processor_files:
         from transformers import AutoProcessor
         options = {"backend": "pil"} if config.get("model_type") == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
@@ -1287,7 +1287,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             # by going back over its source names (`weight_layouts`).
             export_adapter = _derived_weights
     model = _input_quantization(model, layouts, config, grid)
-    processor = source_processor(directory, config, record, model, gguf_path, media=media)
+    processor = source_processor(directory, config, record, model, gguf_path)
     generation_config = _generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in
