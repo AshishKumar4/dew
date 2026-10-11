@@ -223,8 +223,23 @@ class Mixture:
 
 
 @dataclasses.dataclass(frozen=True)
+class Phases:
+    pipelines: tuple[Pipeline, ...]
+    until_steps: tuple[int | None, ...]
+
+    def __post_init__(self) -> None:
+        if not self.pipelines or len(self.pipelines) != len(self.until_steps) or self.until_steps[-1] is not None:
+            raise ValueError("phases need one boundary per pipeline; the last boundary is None")
+        previous = 0
+        for boundary in self.until_steps[:-1]:
+            if boundary is None or boundary <= previous:
+                raise ValueError("phase step boundaries must increase from above zero")
+            previous = boundary
+
+
+@dataclasses.dataclass(frozen=True)
 class Pipeline:
-    source: Source | Mixture
+    source: Source | Mixture | Phases
     stages: tuple[Stage, ...] = ()
     name: str | None = None
 

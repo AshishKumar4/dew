@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 import numpy as np
 
 from dew.data.compile import compile
-from dew.data.dataset import Batch, Dataset, Loading
+from dew.data.dataset import Batch, DataPhase, Dataset, Loading
 from dew.data.dataset import Records as IndexedRecords
-from dew.data.pipeline import Artifact, Configured, HostStep, Mixture, ObjectiveData, Pipeline, RandomMap, Rejected, Stage
+from dew.data.pipeline import Artifact, Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, RandomMap, Rejected, Stage
 from dew.records import integer
 
 if TYPE_CHECKING:
@@ -37,7 +37,7 @@ from dew.data.steps.image import (
     Resize,
 )
 from dew.data.steps.text import Chunks, LengthPolicy, Tokenize
-from dew.data.steps.video import Audio, DecodeClip, FixedClip
+from dew.data.steps.video import Audio, DecodeClip, VideoPath
 
 type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
 type Validation = HoldOut | Split | Pipeline | SourceValue | None
@@ -254,6 +254,19 @@ class Recipe(Protocol):
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]: ...
 
 
+@runtime_checkable
+class _HostBinding(Protocol):
+    binding: str
+
+
+def _host_stages(defaults: tuple[HostStep, ...], explicit: tuple[HostStep, ...]) -> tuple[HostStep, ...]:
+    bindings = {stage.binding: stage for stage in explicit if isinstance(stage, _HostBinding)}
+    configured = tuple(bindings.pop(stage.binding, stage) if isinstance(stage, _HostBinding) else stage
+                       for stage in defaults)
+    return (*configured, *(stage for stage in explicit if not isinstance(stage, _HostBinding)),
+            *bindings.values())
+
+
 @dataclasses.dataclass(frozen=True)
 class Records:
     source: SourceValue
@@ -268,7 +281,7 @@ class Records:
 
 @dataclasses.dataclass(frozen=True)
 class Text:
-    source: SourceValue
+    source: SourceValue | Mapping[str, float] = ""
     tokenizer: str = "byte"
     seq_len: int = 256
     stride: int | None = None
@@ -278,10 +291,31 @@ class Text:
     packing_bins: int = 8
     validation: Validation = None
     split: str = "train"
+    phases: tuple[DataPhase, ...] = ()
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.sources.files import TokenFiles
 
+        if self.phases:
+            if self.source:
+                raise ValueError("Text takes source or phases, not both")
+            branches = [dataclasses.replace(self, source=phase.path, phases=()).pipelines()
+                        for phase in self.phases]
+            return Pipeline(Phases(tuple(branch[0] for branch in branches),
+                                   tuple(phase.until_step for phase in self.phases))), branches[0][1], ()
+        if isinstance(self.source, Mapping) and all(isinstance(weight, (int, float))
+                                                   for weight in self.source.values()):
+            branches = [dataclasses.replace(self, source=path).pipelines() for path in sorted(self.source)]
+            if not branches:
+                raise ValueError("Text mixture has no corpora")
+            weights = [float(self.source[path]) for path in sorted(self.source)]
+            trains = [branch[0] for branch in branches]
+            held = [branch[1] for branch in branches]
+            train = trains[0] if len(trains) == 1 else trains[0].mix(*trains[1:], weights=weights)
+            scored = [branch for branch in held if branch is not None]
+            validation = (None if not scored else scored[0] if len(scored) == 1
+                          else scored[0].mix(*scored[1:], weights=weights))
+            return train, validation, ()
         stored = _source(self.source, split=self.split)
         if isinstance(stored, TokenFiles):
             return self._token_pipelines(stored)
@@ -314,7 +348,7 @@ class Text:
             raise ValueError("token-store validation uses its named split; slice a windows Pipeline for HoldOut")
         if held is None and stored.metadata().get("val_tokens", 0):
             held = dataclasses.replace(stored, split="val")
-        sources = (stored, None if held is None else _source(held))
+        sources = (stored, None if held is None or isinstance(held, Pipeline) else _source(held))
 
         def windows(source, stride):
             if self.pack is None:
@@ -325,7 +359,7 @@ class Text:
                 self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
 
         return (windows(sources[0], self.stride or self.seq_len),
-                None if sources[1] is None else windows(sources[1], self.seq_len), ())
+                held if isinstance(held, Pipeline) else None if sources[1] is None else windows(sources[1], self.seq_len), ())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -458,8 +492,15 @@ class Images:
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
+        from dew.data.sources.tfds import TFDS
+
         size = self.staging_size or self.image_size
-        train, held = _branches(self.source, self.validation, split=self.split, prefix=())
+        source = _source(self.source, split=self.split)
+        if isinstance(source, TFDS):
+            import tensorflow_datasets as tfds
+
+            source = dataclasses.replace(source, decoders={self.field: tfds.decode.SkipDecoding()})
+        train, held = _branches(source, self.validation, split=self.split, prefix=())
         augment = self.augment
         classes = self.classes
         if self.labels is not None:
@@ -487,6 +528,8 @@ class Video:
     frame_size: int = 256
     audio_padding: int = 3
     audio_model: str = "facebook/wav2vec2-base-960h"
+    caption: str = ""
+    extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm")
     validation: Validation = None
     split: str = "train"
 
@@ -497,7 +540,18 @@ class Video:
         return (self.frames + 2 * self.audio_padding) / FPS
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        train, held = _branches(self.source, self.validation, split=self.split, prefix=())
+        from pathlib import PurePosixPath
+
+        from dew.data.sources.files import Files
+
+        source = _source(self.source, split=self.split, format="files")
+        if isinstance(source, Files):
+            extensions = tuple(extension.lower() if extension.startswith(".") else "." + extension.lower()
+                               for extension in self.extensions)
+            source = dataclasses.replace(source, url=tuple(path for path in source.paths
+                                                          if PurePosixPath(path).suffix.lower() in extensions))
+        prefix = Pipeline(source).map(VideoPath(self.caption)).stages
+        train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
         audio = Audio(self.audio_model)
         decoder = DecodeClip(self.frames, self.frame_size, self.audio_padding, audio.processor.sampling_rate)
         train = train.random_map(decoder).map(audio)
@@ -550,7 +604,7 @@ def load(
     return compile(
         train,
         validation=held,
-        host=(*shared, *host),
+        host=_host_stages(shared, host),
         objective=objective,
         read=read,
         provision=provision,
@@ -560,6 +614,9 @@ def load(
 
 
 def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
+    if isinstance(pipeline.source, Phases):
+        children = tuple(_ordered(child, read, seed) for child in pipeline.source.pipelines)
+        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     if isinstance(pipeline.source, Mixture):
         children = tuple(_ordered(child, read, seed) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
@@ -602,7 +659,7 @@ def _batched(pipeline: Pipeline, batch: int, *, train: bool) -> Pipeline:
 def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
     from dew.data.pipeline import MapBatch, Pack, Windows
 
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         children = tuple(_cached(child, cache) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     at = next((index for index, stage in enumerate(pipeline.stages)
