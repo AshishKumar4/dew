@@ -172,12 +172,11 @@ type Reader = Callable[[DataPartition], Iterator[Batch]]
 partition names. The iterator is its caller's to close."""
 
 type GrainPipeline = pygrain.MapDataset[Batch] | Callable[[DataPartition], pygrain.IterDataset[Batch]]
-"""A grain pipeline a caller built, for `Dataset.from_grain`: a `MapDataset`,
-read by index, which a share is cut from; or a function of the partition that
-builds the `IterDataset` one share reads, since a pipeline read as it comes is
-sharded by whoever builds it. Which of the two it is decides what a saved
-position can be. Elements are one example's fields, the shape `Batch` names,
-since grain stacks them into a batch of those fields."""
+"""An indexed Grain root or a partition-specific iterator factory.
+
+The root determines where a share is cut and what a saved position can be.
+Elements contain one record's fields until Grain stacks them into a batch.
+"""
 
 
 @runtime_checkable
@@ -656,9 +655,9 @@ class Dataset:
 
     Whether a run can checkpoint its position depends on the iterator.
     Grain-backed iterators have `get_state` and `set_state`, a fetch-as-you-go
-    stream has neither, and `tokenized` forwards the pair. A run over a stream
+    stream has neither, and host transforms forward the pair. A run over a stream
     without them must train with `checkpoint_every=None` and is refused
-    otherwise. A `train_stream` position is global and resumes on any
+    otherwise. An indexed global-order position resumes on any
     partition, over one corpus or a weighted mixture. A stream that batches
     its own records reports its share's own position, and `dew.checkpoints`
     resumes it only on a reader of that share.
@@ -1650,7 +1649,7 @@ class RampedStream(Forwarding):
     """Grows a training stream's step over the run's first records.
 
     It wraps a stream whose position is a global record count (a
-    `GlobalStream`, or `tokenized` over one) and decides only how many of its
+    `GlobalStream` or a host transform over one) and decides only how many of its
     records each step reads. Reads run one whole final-size batch ahead, and
     each step is cut from a rolling buffer, as in MaxText's loader. A step
     therefore reads the records the run would have read without the ramp, in
