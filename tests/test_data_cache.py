@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -188,3 +189,102 @@ def test_cache_refuses_stochastic_prefix_by_step_name():
     source = Memory([{"id": index} for index in range(8)])
     with pytest.raises(ValueError, match=r"cache prefix.*Draw"):
         compile(Pipeline(source).random_map(Draw()).cache(_cache()).batch(2))
+
+
+def test_published_generation_exposes_only_declared_order_metadata_and_plan():
+    import numpy as np
+
+    source = Memory(
+        [{"id": index, "_dew_length": index + 2, "_dew_valid_targets": index + 1} for index in range(4)]
+    )
+    cache, key = _cache(), Manifest()
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    for index in range(len(rows)):
+        rows[index]
+    rows.close()
+    generation = cache.publish(key, source, plan=lambda ready: {"offsets": np.arange(len(ready) + 1)})
+    assert generation.source().metadata()["valid_targets"] == 10
+    assert generation.source().lengths().tolist() == [2, 3, 4, 5]
+    assert generation.plan("offsets").tolist() == [0, 1, 2, 3, 4]
+
+
+def test_transient_failures_never_certify_cache_coverage_but_permanent_rejections_do():
+    from dew.data.pipeline import Rejected
+
+    source = Memory([{"id": 0}, {"id": 1}])
+    cache, key = _cache(), Manifest()
+    transient = cache.mapped(
+        grain.MapDataset.source(source.records("indexed")),
+        key,
+        source,
+        transform=lambda index, row: (Rejected("transient", permanent=False),),
+    )
+    assert transient[0][0].reason == "transient"
+    transient.close()
+    with pytest.raises(ValueError, match="missing"):
+        cache.publish(key, source)
+    permanent = cache.mapped(
+        grain.MapDataset.source(source.records("indexed")),
+        key,
+        source,
+        transform=lambda index, row: (Rejected("http_404"),) if index == 0 else (row,),
+    )
+    permanent[0], permanent[1]
+    permanent.close()
+    generation = cache.publish(key, source)
+    assert len(generation) == 1
+    assert generation[0] == {"id": 1}
+    assert generation.outputs(0)[0].reason == "http_404"
+
+
+def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_path):
+    source = Memory([{"id": 0}])
+    cache = Cache(str(tmp_path), keep_local_bytes=250_000, shard_bytes=1, retry=0)
+    first_key, second_key = Manifest(b'{"source":"one"}'), Manifest(b'{"source":"two"}')
+    first = cache.mapped(grain.MapDataset.source(source.records("indexed")), first_key, source)
+    first[0]
+    first.close()
+    generation = cache.publish(first_key, source)
+    second = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key, source)
+    second[0]
+    second.close()
+    assert generation[0] == {"id": 0}
+    with pytest.raises(ValueError, match="missing"):
+        cache.publish(second_key, source)
+    generation.close()
+    retry = cache.mapped(grain.MapDataset.source(source.records("indexed")), second_key, source)
+    retry[0]
+    retry.close()
+    assert cache.publish(second_key, source)[0] == {"id": 0}
+    assert cache.generation(first_key) is None
+
+
+@pytest.mark.network
+def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
+    root = os.environ.get("DEW_DATA_TEST_URL")
+    if not root:
+        pytest.skip("DEW_DATA_TEST_URL names the writable R2 smoke prefix")
+    source = Memory([{"id": index, "text": "remote"} for index in range(4)])
+    key = Manifest(b'{"r2-smoke":"artifact-v1"}')
+    cache = Cache(
+        root.rstrip("/") + "/generation",
+        storage_options={"dewcache": {"cache_storage": str(tmp_path), "max_bytes": 2**20}},
+    )
+    generation = cache.generation(key)
+    if generation is None:
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+        for index in range(len(rows)):
+            rows[index]
+        rows.close()
+        generation = cache.publish(key, source)
+    try:
+        assert [generation[index] for index in range(len(generation))] == [
+            {"id": index, "text": "remote"} for index in range(4)
+        ]
+        assert cache.generation(key).url == generation.url
+    finally:
+        generation.close()
+        fs, path = Store(cache.url + "/" + key.key).resolve()
+        for object_path in fs.find(path):
+            fs.rm(object_path)
+        assert not fs.exists(path + "/CURRENT")

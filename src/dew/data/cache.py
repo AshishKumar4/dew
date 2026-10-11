@@ -466,9 +466,13 @@ class _Writer:
         row_key = _row_key(row_id)
         with self.lock:
             existing = None if self.closing else self.pending.get(row_key)
-            completed = None if self.closing else self.index.execute(
-                "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
-            ).fetchone()
+            completed = (
+                None
+                if self.closing
+                else self.index.execute(
+                    "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
+                ).fetchone()
+            )
         if existing is not None:
             values = _decode_outputs(existing)
             if not isinstance(values, tuple):
@@ -743,8 +747,9 @@ class _CachedMap(grain.MapDataset[CachedValue]):
         if "_writer" in self.__dict__:
             self.writer.close()
 
-    def to_iter_dataset(self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
-                        ) -> grain.IterDataset[CachedValue]:
+    def to_iter_dataset(
+        self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
+    ) -> grain.IterDataset[CachedValue]:
         return _ClosingCache(super().to_iter_dataset(read_options, allow_nones=allow_nones), self)
 
     def __getstate__(self) -> dict:
