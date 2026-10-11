@@ -196,14 +196,6 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
 BF16_GPU = 80
 
 
-def _compute_capability() -> str | None:
-    """The first device's compute capability, '8.9' for an sm89 card. jax's
-    Device declares no such field, and a CUDA device carries it, so it is
-    read at this boundary; a device without one gives None."""
-    import jax
-    return getattr(jax.devices()[0], 'compute_capability', None)
-
-
 def device_generation() -> str:
     """Return the default device's hardware generation.
 
@@ -216,7 +208,7 @@ def device_generation() -> str:
     if generation is not None:
         return generation
     device = jax.devices()[0]
-    capability = _compute_capability() if device.platform == 'gpu' else None
+    capability = getattr(device, 'compute_capability', None) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
     if device.platform == 'tpu':
