@@ -466,7 +466,15 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
     """The unprofiled metrics and later launch evidence keep separate scopes."""
     import torch
     from common import chrome_trace_kernels, git_head, host, peak_flops, throughput, trim_trace
-    from qwen35 import FLOPS_PER_STEP, MODEL, REVISION, TOKENS_PER_STEP, WHOLE_PEAK_SCOPE, workload
+    from qwen35 import (
+        FLOPS_FORMULA,
+        FLOPS_PER_STEP,
+        MODEL,
+        REVISION,
+        TOKENS_PER_STEP,
+        WHOLE_PEAK_SCOPE,
+        workload,
+    )
     from torch._dynamo.utils import counters
 
     config = model.backbone.config
@@ -504,8 +512,7 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
                          "liger": [] if args.smoke else ["RMSNorm (offset=1)", "SwiGLU"],
                          "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
                          "model_flops_per_token": None if args.smoke else FLOPS_PER_STEP / TOKENS_PER_STEP,
-                         "flops_formula": "Qwen3.5-0.8B: training=3*forward; mixer/MLP/causal-attention/GDN chunk64; "
-                                          "embeddings/head/recompute excluded"},
+                         "flops_formula": FLOPS_FORMULA},
               "steady": timed,
               "memory": {"peak_allocated_bytes": window.peak_allocated,
                          "peak_allocated_gib": None if args.smoke else window.peak_allocated / 2**30,
