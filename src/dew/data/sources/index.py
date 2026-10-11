@@ -41,7 +41,8 @@ class ArrayIndex:
         self.pin.seek(0, 2)
         size = self.pin.tell()
         self.pin.seek(0)
-        checksum = hashlib.file_digest(self.pin, "sha256").hexdigest()
+        with open(self.pin.name, "rb") as reader:
+            checksum = hashlib.file_digest(reader, "sha256").hexdigest()
         self.pin.seek(0)
         if size != reference["bytes"] or checksum != reference["sha256"]:
             raise OSError(f"committed NumPy index is corrupt: {self.url}")

@@ -22,6 +22,7 @@ import pyarrow.fs as pafs
 
 from dew.data.dataset import Batch, Records
 from dew.data.storage import Store
+from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest
 from .index import ArrayIndex
@@ -280,7 +281,10 @@ class Files:
                 count = len(opened)
                 mirror, mirrored_path = Store(url, self.storage_options).cached().resolve()
                 with mirror.open(mirrored_path, "rb") as reader:
-                    digest = hashlib.file_digest(reader, "sha256").hexdigest()
+                    if not isinstance(reader.name, str):
+                        raise ValueError(f"ArrayRecord provisioning needs a mirror that can hold {url}")
+                    with open(reader.name, "rb") as local:
+                        digest = hashlib.file_digest(local, "sha256").hexdigest()
             finally:
                 opened.close()
             files.append(
@@ -317,7 +321,7 @@ class Files:
             from .records import ArrayRecords
 
             committed = self.committed
-            counts = None if committed is None else tuple(entry["rows"] for entry in committed["files"])
+            counts = self._declared_rows()
             rows = ArrayRecords(
                 self.paths,
                 self.storage_options,
@@ -401,10 +405,18 @@ class Files:
         if self.kind in ("parquet", "arrow") and self.filter is None:
             return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
         if self.kind == "array_record" and self.committed is not None:
-            return tuple(entry["rows"] for entry in self.committed["files"]), remote
+            return self._declared_rows() or (), remote
         if self.kind == "files":
             return tuple(1 for _ in self.paths), remote
         return (), remote
+
+    def _declared_rows(self) -> tuple[int, ...] | None:
+        if self.committed is None:
+            return None
+        entries = self.committed["files"]
+        if not isinstance(entries, list):
+            raise ValueError("export manifest files must be a list")
+        return tuple(integer(record(entry, "export file")["rows"], "export shard rows") for entry in entries)
 
     def metadata(self) -> Mapping[str, object]:
         if self.committed is not None:
