@@ -51,6 +51,7 @@ from dew.nn.protocols import (
     CountedLogits,
     CountedLogitsTraining,
     CountedPredictions,
+    CountedPredictionTraining,
     DecoderTraining,
     Logits,
     TokenModel,
@@ -632,8 +633,6 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             return f"{type(model).__name__} does not declare logits_flops for the LM head"
         if self.mtp_weight and not isinstance(model, CountedPredictions):
             return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
-        if self.mtp_weight and isinstance(model, CountedLogitsTraining):
-            return "LMObjective needs its adapted prediction depths' matrix usage"
         return None
 
     def _counted_tokens(self, batch: Batch):
@@ -687,7 +686,14 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if not isinstance(model, CountedLogitsTraining):
             return super().training_flops(model, batch)
         targets = self._prediction_lengths(batch)
-        return model.training_flops(self.real_lengths(batch)) + model.logits_training_flops(targets)
+        lengths = self.real_lengths(batch)
+        count = model.training_flops(lengths) + model.logits_training_flops(targets)
+        if self.mtp_weight:
+            if not isinstance(model, CountedPredictionTraining):
+                raise MissingFlopsCount(f"{type(model).__name__} has no prediction_training_flops "
+                                        "for adapted depths")
+            count += model.prediction_training_flops(lengths)
+        return count
 
     def _check_flop_geometry(self, batch: Batch) -> None:
         """Media needs its own FLOP count, but does not prevent counting token lengths."""

@@ -971,6 +971,15 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def prediction_flops(self, lengths) -> float:
         """Each trained prediction depth shortens the real sequence by one token."""
+        return self._prediction_flops(lengths, counted_flops)
+
+    @nn.nowrap
+    def prediction_parameter_flops(self, lengths) -> float:
+        """The same shortened depth forwards' learned matrices, head included."""
+        return self._prediction_flops(lengths, parameter_flops)
+
+    @nn.nowrap
+    def _prediction_flops(self, lengths, counter) -> float:
         types, factories = self.per_layer_types, self.feedforward_factories()
         kinds = self.layer_kinds(types)
         mixer = self.mixer if self.mixer is not None else AttentionMixer()
@@ -978,8 +987,23 @@ class CausalTransformer(nn.Module):
         count = 0.0
         for depth, block in enumerate(blocks, start=1):
             shorter = np.maximum(np.asarray(lengths) - depth, 0)
-            count += block.model_flops(shorter) + self.logits_flops(shorter)
+            count += counter(block, shorter) + self.logits_flops(shorter)
         return count
+
+    @nn.nowrap
+    def prediction_matrix_usage(self, path: tuple[str, ...], lengths):
+        """Each depth's maps run once; the shared head runs on every shorter state."""
+        relative = path[1:] if path and path[0] == 'params' else path
+        if not relative:
+            raise MissingFlopsCount("CausalTransformer prediction matrix has no native scope")
+        lengths = np.asarray(lengths)
+        if relative[0].startswith('mtp_'):
+            depth = int(relative[0].removeprefix('mtp_')) + 1
+            return np.maximum(lengths - depth, 0)
+        if relative[0] in ('lm_head', 'head_dense'):
+            return sum((np.maximum(lengths - depth, 0)
+                        for depth in range(1, self.num_nextn_predict_layers + 1)), np.zeros_like(lengths))
+        return np.zeros_like(lengths)
 
     @nn.nowrap
     def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):

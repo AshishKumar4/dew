@@ -22,7 +22,7 @@ from dew.nn.flops import MissingFlopsCount, counted_flops, dense_training_flops,
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import CountedTraining
 from dew.objectives.base import FROZEN
-from dew.objectives.lm import LMObjective
+from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import Trainer
 from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts
 
@@ -81,6 +81,34 @@ def test_decoder_frozen_matrices_and_repeated_adapter_scopes_are_separate(loop):
     assert adapted.model.model_flops(lengths) == forward + extra
     assert adapted.model.training_flops(lengths) == 3 * forward - learned + 3 * extra
     assert adapted.model.logits_training_flops(lengths) == 2 * model.logits_flops(lengths)
+
+
+def test_adapted_prediction_depths_count_their_maps_and_the_reused_head():
+    model = decoder(num_nextn_predict_layers=2, attention_impl="reference", tie_embeddings=False)
+    tokens = jnp.ones((1, 6), jnp.int32)
+    variables = model.init(jax.random.key(409), tokens)
+    adapted = LoRA(rank=2, alpha=4, modules=("q_proj", "eh_proj", "lm_head")).apply(
+        model, variables, key=509)
+    lengths = np.array([6], np.int64)
+    # The input projection exists once per depth and the head is shared across both.
+    predicted = 5 + 4
+    factors = 2 * 2 * predicted * ((8 + 8) + (16 + 8) + (8 + model.vocab_size))
+    native = model.prediction_flops(lengths)
+    learned = model.prediction_parameter_flops(lengths)
+    assert adapted.model.prediction_flops(lengths) == native + factors
+    assert adapted.model.prediction_training_flops(lengths) == 3 * native - learned + 3 * factors
+
+    def forward(variables, tokens):
+        hidden = adapted.model.apply(variables, tokens, method="hidden_states")
+        logits = adapted.model.apply(variables, hidden, method="logits_from_hidden")
+        return logits, adapted.model.apply(variables, hidden, tokens, method="mtp_logits")
+
+    objective = LMObjective(adapted, seq_len=6, mtp_weight=1.0)
+    batch = {TEXT_KEY: np.ones((1, 7), np.int32)}
+    upper = 2 * model.num_heads * model.head_dim * (model.num_layers * 6**2 + 5**2 + 4**2)
+    assert objective.model_flops(None, batch) == forward_products(forward, adapted.variables, tokens) - upper
+    assert objective.training_flops(None, batch) == (adapted.model.training_flops(lengths)
+        + adapted.model.logits_training_flops(lengths) + adapted.model.prediction_training_flops(lengths))
 
 
 def test_objective_assembles_peft_training_work_without_three_times_forward():

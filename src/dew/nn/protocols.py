@@ -71,6 +71,8 @@ __all__ = [
     "CountedMatrixUsage",
     "CountedMultimodal",
     "CountedParameters",
+    "CountedPredictionParameters",
+    "CountedPredictionTraining",
     "CountedPredictions",
     "CountedSequences",
     "CountedSpatial",
@@ -196,6 +198,22 @@ class CountedPredictions(Protocol):
     """The extra decoder depths and heads trained beside a language model's trunk."""
 
     def prediction_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedPredictionParameters(CountedPredictions, Protocol):
+    """Prediction depths declare their learned maps and adapted scopes separately."""
+
+    def prediction_parameter_flops(self, lengths: np.ndarray) -> float: ...
+
+    def prediction_matrix_usage(self, path: tuple[str, ...], lengths: np.ndarray) -> np.ndarray: ...
+
+
+@runtime_checkable
+class CountedPredictionTraining(CountedPredictions, Protocol):
+    """An adapted prediction stack's frozen-base and trainable-factor training work."""
+
+    def prediction_training_flops(self, lengths: np.ndarray) -> float: ...
 
 
 @runtime_checkable

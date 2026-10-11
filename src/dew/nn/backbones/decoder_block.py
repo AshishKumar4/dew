@@ -1001,12 +1001,21 @@ class MTPBlock(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Prediction input maps, one decoder block and any learned stream collapse."""
+        return self._flops(lengths, counted_flops)
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Prediction input maps and the decoder's learned matrices."""
+        return self._flops(lengths, parameter_flops)
+
+    @nn.nowrap
+    def _flops(self, lengths, counter) -> float:
         maps = self.projections()
         count = sum(projection_flops(lengths, *shape) for shape in maps.values())
         if self.hyper_connections is not None:
             count += (self.hyper_connections.hc_mult - 1) * projection_flops(lengths, *maps['h_proj'])
             count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
-        return count + self._decoder(parent=None).model_flops(lengths)
+        return count + counter(self._decoder(parent=None), lengths)
 
     def _decoder(self, **scope):
         return DecoderBlock(

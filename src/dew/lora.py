@@ -37,7 +37,7 @@ import dataclasses
 import json
 import math
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path as FilePath
 from typing import ClassVar, Protocol, TypedDict, runtime_checkable
@@ -54,7 +54,13 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
-from dew.nn.protocols import Counted, CountedLogits, CountedMatrixUsage, CountedParameters
+from dew.nn.protocols import (
+    Counted,
+    CountedLogits,
+    CountedMatrixUsage,
+    CountedParameters,
+    CountedPredictionParameters,
+)
 from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
 
@@ -417,7 +423,8 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
 
     class CountedAdapter(base):
         @nn.nowrap
-        def _adapter_forward(self, lengths, *, logits: bool = False) -> float:
+        def _adapter_forward(self, lengths, *, logits: bool = False,
+                              usage: Callable[[Path, np.ndarray], np.ndarray] | None = None) -> float:
             original = unadapted(self)
             if not isinstance(original, CountedMatrixUsage):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared adapter matrix usage")
@@ -431,8 +438,9 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
                     if len(layout.transpose) != 2:
                         raise MissingFlopsCount(f"adapter {'/'.join(path)} has nonmatrix native axes")
                     shape = tuple(shape[layout.transpose.index(axis)] for axis in range(2))
-                usage = original.matrix_usage(path, lengths, logits=logits)
-                total += projection_flops(usage, shape[0] + shape[1], target.rank)
+                positions = (original.matrix_usage(path, lengths, logits=logits) if usage is None
+                             else usage(path, lengths))
+                total += projection_flops(positions, shape[0] + shape[1], target.rank)
             return total
 
         @nn.nowrap
@@ -454,6 +462,24 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             return 3 * forward - learned + 3 * self._adapter_forward(lengths)
 
     class LogitsAdapter(CountedAdapter):
+        @nn.nowrap
+        def prediction_flops(self, lengths) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedPredictionParameters):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
+            return original.prediction_flops(lengths) + self._adapter_forward(
+                lengths, usage=original.prediction_matrix_usage)
+
+        @nn.nowrap
+        def prediction_training_flops(self, lengths) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedPredictionParameters):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared prediction matrix work")
+            forward = original.prediction_flops(lengths)
+            learned = original.prediction_parameter_flops(lengths)
+            return 3 * forward - learned + 3 * self._adapter_forward(
+                lengths, usage=original.prediction_matrix_usage)
+
         @nn.nowrap
         def logits_flops(self, lengths) -> float:
             original = unadapted(self)
