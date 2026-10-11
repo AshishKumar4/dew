@@ -678,7 +678,7 @@ def _memory_stages(
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
             rows = [((index,), windows[index]) for index in range(len(windows))]
         elif isinstance(stage, Pack):
-            from dew.data.tokens import PackedWindows, chunk_lengths, first_fit
+            from dew.data.tokens import PackedWindows
 
             derived[f"accepted_before_pack_{consumed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
@@ -688,8 +688,7 @@ def _memory_stages(
             packed = PackedWindows(
                 pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe()
             )
-            plan, starts = first_fit(chunk_lengths(sizes, stage.seq_len), stage.seq_len, stage.bins)
-            derived["packing"] = fingerprint([plan.tolist(), starts.tolist()])
+            derived["packing"] = fingerprint([packed.order.tolist(), packed.starts.tolist()])
             rows = [((index,), packed[index]) for index in range(len(packed))]
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []

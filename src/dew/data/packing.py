@@ -13,7 +13,7 @@ from dew.data.dataset import Batch
 from dew.data.pipeline import Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
-from dew.data.tokens import chunk_counts, chunk_lengths, first_fit
+from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
 from dew.records import record
 
 
@@ -31,11 +31,8 @@ class PackingPlan:
         lengths = generation.source().lengths()
         if lengths is None:
             raise ValueError("published packing needs certified per-document lengths")
-        counts = chunk_counts(lengths, self.pack.seq_len)
         chunk_sizes = chunk_lengths(lengths, self.pack.seq_len)
-        documents = np.repeat(np.arange(len(lengths), dtype=np.int64), counts)
-        first = np.repeat(np.cumsum(counts) - counts, counts)
-        offsets = (np.arange(len(documents)) - first) * self.pack.seq_len
+        documents, offsets = chunk_table(lengths, self.pack.seq_len)
         order, starts = first_fit(chunk_sizes, self.pack.seq_len, self.pack.bins)
         targets = np.asarray(
             [
@@ -84,20 +81,8 @@ class _PackedRows:
             chunks.append(
                 {name: np.asarray(document[name])[offset : offset + size] for name in self._pack.fields}
             )
-        fields = {name: np.zeros(self._pack.seq_len, chunks[0][name].dtype) for name in self._pack.fields}
-        segments, positions = np.zeros(self._pack.seq_len, np.int32), np.zeros(self._pack.seq_len, np.int32)
-        at = 0
-        for segment, chunk in enumerate(chunks, start=1):
-            size = len(chunk[self._pack.fields[0]])
-            for name, value in chunk.items():
-                fields[name][at : at + size] = value
-            segments[at : at + size], positions[at : at + size] = segment, np.arange(size, dtype=np.int32)
-            at += size
-        first = self._pack.fields[0]
         return {
-            **fields,
-            f"{first}_segment_ids": segments,
-            f"{first}_positions": positions,
+            **packed_window(chunks, self._pack.seq_len),
             "_dew_valid_targets": self._at("targets", window),
         }
 
