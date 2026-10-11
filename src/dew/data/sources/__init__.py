@@ -12,6 +12,7 @@ from .base import Read, Shard, ShardManifest, Source
 from .files import Files, Format, TokenFiles
 from .hub import Hub
 from .memory import Memory
+from .pytorch import Torch
 from .tfds import TFDS
 
 
@@ -60,4 +61,4 @@ def source(
     return resolved
 
 
-__all__ = ["Files", "Hub", "Memory", "Read", "Shard", "ShardManifest", "Source", "TFDS"]
+__all__ = ["TFDS", "Files", "Hub", "Memory", "Read", "Shard", "ShardManifest", "Source", "Torch"]

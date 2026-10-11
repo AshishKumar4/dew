@@ -103,6 +103,7 @@ quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
     "moto[server,s3]>=5.1.15",
+    "deltalake>=1.0",
     # The gate's behavior tests run the same linter and rule set as CI.
     "ruff==0.14.3",
     # The legacy decoder graph test deserializes jax.export; JAX does not

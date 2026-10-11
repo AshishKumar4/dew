@@ -204,3 +204,80 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     from dew.data.sources import source as resolve
 
     assert isinstance(resolve(root), TokenFiles)
+
+
+def test_torch_source_refuses_streaming_and_cache_without_content_identity():
+    import torch
+    from torch.utils.data import TensorDataset
+
+    from dew.data.cache import Cache
+    from dew.data.plan import Manifest
+    from dew.data.sources import Torch
+
+    rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
+    assert not rows.supports("streamed")
+    assert int(rows.records("indexed")[2]["id"]) == 2
+    with pytest.raises(ValueError, match="cannot read streamed"):
+        rows.records("streamed")
+    import grain.python as grain
+
+    with pytest.raises(ValueError, match="explicit content identity"):
+        Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
+            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.snapshot()), rows
+        )
+
+
+def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
+    from deltalake import write_deltalake
+
+    from dew.data.sources.delta import Delta
+
+    root = str(tmp_path / "delta")
+    write_deltalake(root, pa.table({"value": [1, 2], "split": ["train", "held"]}), partition_by=["split"])
+    first = Delta(root)
+    snapshot = first.snapshot()
+    write_deltalake(root, pa.table({"value": [3], "split": ["train"]}), mode="append")
+    rows = Delta(root, version=snapshot["version"]).records("indexed")
+    assert sorted(rows[index]["value"] for index in range(len(rows))) == [1, 2]
+    assert {rows[index]["split"] for index in range(len(rows))} == {"train", "held"}
+
+
+def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
+    import datetime
+    from decimal import Decimal
+
+    from dew.data.sources.codec import decode, encode
+
+    row = {
+        "when": datetime.datetime(2026, 1, 2, 3, 4, tzinfo=datetime.UTC),
+        "price": Decimal("12.340"),
+        "interval": datetime.timedelta(days=2, seconds=3),
+        "features": [np.arange(4, dtype=np.uint16), {"nan": float("nan")}],
+        "binary": b"\0\xff",
+    }
+    actual = decode(encode(row))
+    assert actual["when"] == row["when"]
+    assert actual["price"].as_tuple() == row["price"].as_tuple()
+    assert actual["interval"] == row["interval"]
+    assert np.array_equal(actual["features"][0], row["features"][0])
+    assert np.isnan(actual["features"][1]["nan"])
+    assert actual["binary"] == row["binary"]
+
+
+def test_empty_shard_cycles_exhaust_a_named_search_budget():
+    root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
+    root.write(b" \n\n")
+    files = Files(root.url)
+    dataset = streamed(
+        files.manifest(),
+        partition=DataPartition(),
+        epochs=None,
+        empty_shard_budget=3,
+        name="empty-corpus",
+        cycle_length=1,
+        loading=Loading(workers=0, threads=1, read_buffer=1),
+    )
+    reader = iter(dataset)
+    with pytest.raises(ValueError, match=r"empty-corpus.*search budget"):
+        next(reader)
+    reader.close()

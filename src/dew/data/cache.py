@@ -192,6 +192,9 @@ class Cache:
         transform: Transform | None = None,
     ) -> grain.MapDataset:
         self._root(key)
+        snapshot = source.snapshot()
+        if snapshot.get("identity_required") is True and snapshot.get("identity") is None:
+            raise ValueError(f"cache source {source.describe()} needs an explicit content identity")
         return _CachedMap(parent, self, key, source, transform)
 
     def streamed(
@@ -688,17 +691,22 @@ class _CachedMap(grain.MapDataset[CachedValue]):
         super().__init__(parent)
         self.cache, self.key, self.input_source, self.transform = cache, key, source, transform
         self.input_parent = parent
+        self.writer_lock = threading.RLock()
 
-    @cached_property
+    @property
     def writer(self) -> _Writer:
-        writer = _Writer(
-            self.cache,
-            self.key,
-            volatile=isinstance(self.transform, _Volatile) and self.transform.volatile,
-            expected=len(self),
-        )
-        weakref.finalize(self, writer.close)
-        return writer
+        with self.writer_lock:
+            if "_writer" not in self.__dict__:
+                writer = _Writer(
+                    self.cache,
+                    self.key,
+                    volatile=isinstance(self.transform, _Volatile) and self.transform.volatile,
+                    expected=len(self),
+                )
+                finalizer = weakref.finalize(self, writer.close)
+                finalizer.atexit = False
+                self.__dict__["_writer"] = writer
+            return self.__dict__["_writer"]
 
     def __len__(self) -> int:
         return len(self.input_parent)
@@ -717,11 +725,15 @@ class _CachedMap(grain.MapDataset[CachedValue]):
         )
 
     def close(self) -> None:
-        if "writer" in self.__dict__:
+        if "_writer" in self.__dict__:
             self.writer.close()
 
     def __getstate__(self) -> dict:
-        return {key: value for key, value in self.__dict__.items() if key != "writer"}
+        return {key: value for key, value in self.__dict__.items() if key not in ("_writer", "writer_lock")}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        self.__dict__.update(state)
+        self.writer_lock = threading.RLock()
 
 
 @dataclass(frozen=True)
