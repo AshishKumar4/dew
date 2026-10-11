@@ -144,12 +144,18 @@ TARGETS = {target.generation: target for target in (
 def gpu_target(identifier: str | None = None) -> GpuTarget:
     """The target for a generation, reported device kind or case-insensitive lab alias.
 
-    None reads the assumed generation, otherwise the default device. SKU
-    queries retain that SKU's peaks. Unknown kinds have empty resources.
+    None is the default device's: its generation is `device_generation`'s, the
+    one seam that `assumed` and tests set, and its device kind only picks the
+    SKU's peaks within that generation. SKU queries retain that SKU's peaks.
+    Unknown kinds have empty resources.
     """
     if identifier is None:
         import jax
-        identifier = ASSUMED.get() or jax.devices()[0].device_kind
+        generation, kind = device_generation(), jax.devices()[0].device_kind
+        target = gpu_target(kind)
+        if target.generation == generation:
+            return target
+        return TARGETS.get(generation, GpuTarget(generation, kind))
     if identifier in TARGETS:
         return TARGETS[identifier]
     for target in TARGETS.values():
