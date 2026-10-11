@@ -8,6 +8,7 @@ import math
 import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
+from fractions import Fraction
 
 import grain.python as pygrain
 
@@ -197,7 +198,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
     def __init__(
         self,
         parents: Sequence[pygrain.DatasetIterator[Batch]],
-        weights: tuple[float, ...],
+        weights: tuple[int, ...],
         tokens: Callable[[Batch], int],
     ):
         super().__init__(parents)
@@ -206,9 +207,9 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
 
     def __next__(self) -> Batch:
         total = sum(self._delivered)
-        chosen = max(
-            range(len(self._reads)), key=lambda index: self._weights[index] * total - self._delivered[index]
-        )
+        scale = sum(self._weights)
+        chosen = max(range(len(self._reads)),
+                     key=lambda index: self._weights[index] * total - self._delivered[index] * scale)
         value = next(self._reads[chosen])
         tokens = self._tokens(value)
         if tokens <= 0:
@@ -262,10 +263,11 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
             for parent, name in zip(parents, names, strict=True)
         )
         super().__init__(filtered)
-        total = sum(weights)
+        ratios = tuple(Fraction(weight) for weight in weights)
+        scale = math.lcm(*(ratio.denominator for ratio in ratios))
         self._corpora, self._weights, self._tokens = (
             filtered,
-            tuple(weight / total for weight in weights),
+            tuple(ratio.numerator * (scale // ratio.denominator) for ratio in ratios),
             tokens,
         )
 

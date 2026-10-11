@@ -180,6 +180,19 @@ class ImageRecord(grain.RandomMapTransform):
     crop_scale: tuple[float, float] = (1., 1.)
     backend: Literal["host", "device"] = "host"
 
+    def __post_init__(self) -> None:
+        if min(self.size, self.staging_size) < 1:
+            raise ValueError("image size and staging_size must be positive")
+        if self.backend not in ("host", "device"):
+            raise ValueError("image augmentation backend must be host or device")
+        if len(self.crop_scale) != 2 or not 0 < self.crop_scale[0] <= self.crop_scale[1] <= 1:
+            raise ValueError("crop_scale must satisfy 0 < low <= high <= 1")
+        import_opencv()
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        import_opencv()
+        self.__dict__.update(state)
+
     def random_map(self, element: Batch | bytes, rng: np.random.Generator) -> Batch:
         import_opencv()
         if isinstance(element, bytes):
