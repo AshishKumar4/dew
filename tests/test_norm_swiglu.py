@@ -75,10 +75,20 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17), (24576, 17)])
+@pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
     compare(norm_functions(dtype, offset=True, after_cast=True), operands, seed, ("y", "x", "scale"))
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
+    # Repeated tokens hold the row arithmetic fixed while the column sum
+    # grows to Qwen3.5-0.8B's size, isolating partial-sum error from bf16 midpoint flips.
+    (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32)
+    x = jnp.broadcast_to(row, (24576, 1000))
+    seed = jnp.broadcast_to(seed, x.shape)
+    compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"))
 
 
 @pytest.mark.parametrize("input_dtype,output_dtype", [(jnp.bfloat16, jnp.float32),
