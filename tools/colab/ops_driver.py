@@ -214,15 +214,16 @@ class Driver:
                 )
                 time.sleep(delay)
 
-    def collect_action(self, job: dict, operation, *args) -> None:
+    def collect_action(self, job: dict, operation, *args) -> bool:
         failures = self.state.get("collection_failures", {})
         key = str(job["index"])
         if failures.get(key, {}).get("needs_attention"):
-            return
+            return False
         try:
             operation(*args)
             failures[key] = {"count": 0, "needs_attention": False}
             self.record(collection_failures=failures)
+            return True
         except (OSError, ValueError, RuntimeError) as error:
             if isinstance(error, (TransportError, requests.RequestException)):
                 # Live prune races/outages are not deterministic bad artifacts.
@@ -233,7 +234,7 @@ class Driver:
             self.record(collection_failures=failures)
             self.record(collection_error=type(error).__name__, collection_needs_attention=True)
             if count >= 3:
-                return
+                return False
             raise TransportError("artifact collection failed; workload liveness is independent") from error
 
     def failed_collections(self, plan: dict, progress: dict) -> None:
@@ -276,6 +277,8 @@ class Driver:
         for job in plan["jobs"]:
             index = job["index"]
             status = progress.get("jobs", {}).get(str(index), {})
+            if job.get("boundary_control") and status and "artifact_manifest" not in status:
+                self.boundary_ack(session, remote, job)
             if index in collected:
                 continue
             if status.get("artifact_manifest"):
@@ -291,6 +294,25 @@ class Driver:
                 raise RuntimeError("VM batch failed: " + progress.get("error", "unknown cause"))
             return True
         return False
+
+    def boundary_ack(self, session: Session, remote: str, job: dict) -> None:
+        directory = remote + f"/job-{job['index']}/boundary"
+        try:
+            ready = json.loads(colab_io.content_bytes(colab_io.contents(session, directory + "/ready.json", content=True)))
+        except FileNotFoundError:
+            return
+        acknowledgments = self.state.get("boundary_snapshots", {})
+        if ready["request_id"] in acknowledgments:
+            return
+        if not self.collect_action(job, self.sync, session, remote, job):
+            self.record(boundary_needs_attention=ready)
+            return
+        acknowledgments[ready["request_id"]] = {**ready, "snapshot_acknowledged": True, "at": time.time()}
+        script = (f"import sys\nsys.path.insert(0,{remote!r})\nfrom tools.colab.common import save\n"
+                  f"from pathlib import Path\nsave(Path({directory + '/snapshot-ack.json'!r}),"
+                  f"{acknowledgments[ready['request_id']]!r})\n")
+        self.control(session, script)
+        self.record(boundary_snapshots=acknowledgments)
 
     def preamble(self, session: Session, remote: str, plan: dict, progress: dict) -> None:
         receipt = progress.get("profile_preamble", {"attempted": False})
