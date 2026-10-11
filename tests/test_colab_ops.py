@@ -394,6 +394,40 @@ def test_allocator_refuses_g4_high_memory_before_journaling_or_request(tmp_path,
     assert not (tmp_path / "allocation.json").exists()
 
 
+@pytest.mark.parametrize("accelerator", ["G4", "A100"])
+@pytest.mark.parametrize("endpoint", [None, "owned"])
+def test_recovery_omits_only_unsupported_g4_shape_without_altering_journal(
+    tmp_path, fake_colab, accelerator, endpoint
+):
+    client, _, _, _, service = fake_colab
+    client.types.Accelerator[accelerator] = types.SimpleNamespace(name=accelerator, value=accelerator)
+    high_ram = types.SimpleNamespace(name="HIGH_RAM", value="HIGH_RAM")
+    client.types.Shape["HIGH_RAM"] = high_ram
+    request = {
+        "notebook": "00000000-0000-0000-0000-000000000001",
+        "variant": "GPU",
+        "accelerator": accelerator,
+        "shape": "HIGH_RAM",
+        "requested_at": 100,
+    }
+    journal = tmp_path / "allocation.json"
+    save(journal, request)
+    before = journal.read_bytes()
+    seen = []
+
+    def lookup(notebook, **options):
+        assert str(notebook) == request["notebook"]
+        assert options["variant"].name == "GPU" and options["accelerator"].name == accelerator
+        assert options["shape"] is (None if accelerator == "G4" else high_ram)
+        seen.append(1)
+        return types.SimpleNamespace(endpoint=endpoint)
+
+    service._get_assignment = lookup
+    service.assign = lambda *args, **kwargs: pytest.fail("recovery must not POST an allocation")
+    assert client.recover_endpoint(journal) == endpoint and seen == [1]
+    assert journal.read_bytes() == before
+
+
 def test_driver_dry_run_refuses_g4_high_memory_before_queue_selection(monkeypatch):
     monkeypatch.setattr(
         sys,
