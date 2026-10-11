@@ -144,6 +144,7 @@ class FlatMap:
 class Shuffle:
     seed: int
     window: int | None = None
+    block_shards: int | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -328,8 +329,13 @@ class Pipeline:
     def flat_map(self, step: Expansion, *, identity: str | None = None) -> Pipeline:
         return self.then(FlatMap(step, identity))
 
-    def shuffle(self, seed: int = 0, *, window: int | None = None) -> Pipeline:
-        return self.then(Shuffle(seed, window))
+    def shuffle(self, seed: int = 0, *, window: int | None = None,
+                block_shards: int | None = None) -> Pipeline:
+        if window is not None and block_shards is not None:
+            raise ValueError("shuffle uses a window or physical shard blocks, not both")
+        if block_shards is not None and block_shards < 1:
+            raise ValueError("block_shards must be positive")
+        return self.then(Shuffle(seed, window, block_shards))
 
     def repeat(self, epochs: int | None = None) -> Pipeline:
         return self.then(Repeat(epochs))
