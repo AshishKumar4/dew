@@ -255,6 +255,12 @@ _EAGER = (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)
 """The stages a memory read runs over the whole source before the first other stage."""
 
 
+def _random(stage: Stage) -> bool:
+    """Whether a stage draws from the record rng, so what it makes differs
+    each epoch and no cache can hold it."""
+    return isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
+
+
 def _drops(stage: Stage) -> bool:
     """Whether a stage can drop or make rows, so the rows after it are not
     the rows before it, one for one."""
@@ -381,7 +387,7 @@ def _checked(
         layout = isinstance(stage, (Pack, Windows, Group, BatchStage, TokenBudget))
         combined = combined or (type(stage).__name__ if layout else None)
         finite = finite and not isinstance(stage, Repeat)
-        if isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random):
+        if _random(stage):
             random = _identity(stage).name
             if validation and not canonical:
                 raise ValueError(f"validation random step {random} must use the canonical record index")
