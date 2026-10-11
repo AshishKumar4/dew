@@ -245,7 +245,7 @@ def dew_side(args, images, total, attention):
     def run(state, batch):
         if not compiled:
             compiled["step"] = trainer.compile(state, batch)
-        state, loss, _, _, _ = compiled["step"](state, batch)
+        state, loss, _, _, _, _ = compiled["step"](state, batch)
         return state, loss
 
     return state, run, place, schedule, dict(trainer.device_mesh.shape), trainer

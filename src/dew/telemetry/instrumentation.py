@@ -13,12 +13,38 @@ matmul (docs/research/benchmark-parity.md:5-9,93-102).
 import math
 import re
 import sys
+import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 
 import jax
 
 from dew.nn.kernels.generation import gpu_target
+
+_cache_counts = {'/jax/compilation_cache/cache_hits': 0, '/jax/compilation_cache/cache_misses': 0}
+_cache_lock = threading.Lock()
+
+
+def _cache_event(event: str, **metadata) -> None:
+    if event in _cache_counts:
+        with _cache_lock:
+            _cache_counts[event] += 1
+
+
+jax.monitoring.register_event_listener(_cache_event)
+
+
+def compilation_cache_counts() -> dict[str, float]:
+    """Cumulative JAX persistent-cache events since Dew's instrumentation was imported.
+
+    The listener is registered once per process. Counts include every jitted
+    program, not just training steps. JAX emits cache_misses when it writes a
+    cache entry, so compilations below its write thresholds do not count as
+    misses. An unavailable or disabled persistent cache emits neither event.
+    """
+    with _cache_lock:
+        return {f'train/{event.rsplit("/", 1)[-1]}': float(count)
+                for event, count in _cache_counts.items()}
 
 # One instruction: `%name = shape op(operands), attributes`, with ROOT optional.
 # The shape is non-greedy so it stops at the operand list, which leaves a tuple

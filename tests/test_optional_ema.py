@@ -122,7 +122,7 @@ def test_disabled_ema_trains_previews_and_resumes_without_a_copy(tmp_path, kind)
     step = trainer.compile(initial, batch)
     frozen_step = frozen_trainer.compile(frozen_state, batch)
     for _ in range(2):
-        state, loss, _, _, accepted = step(state, batch)
+        state, loss, _, _, accepted, _ = step(state, batch)
         frozen_state, frozen_loss, *_ = frozen_step(frozen_state, batch)
         assert bool(accepted) and state.ema is None
         np.testing.assert_allclose(loss, frozen_loss, rtol=1e-6)
@@ -168,7 +168,7 @@ def test_zero_beta_grpo_has_no_reference_and_keeps_live_updates_and_preview():
     expected_gradient = jax.grad(unregularized)(initial.variables["params"])
     updates, _ = optimizer.update(expected_gradient, initial.opt_state, initial.variables["params"])
     expected = optax.apply_updates(initial.variables["params"], updates)
-    state, loss, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    state, loss, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted) and state.ema is None and int(state.updates) == 1
     assert float(loss) == pytest.approx(-1.)
     for got, want in zip(jax.tree.leaves(state.variables["params"]), jax.tree.leaves(expected), strict=True):

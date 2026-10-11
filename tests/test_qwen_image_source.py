@@ -340,7 +340,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
         return float(loss.total / loss.mass)
 
     before = value(initial.variables)
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
     assert value(state.variables) < before
     assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
