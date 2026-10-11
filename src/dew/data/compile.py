@@ -1012,6 +1012,19 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False)
 
 
+def _reordered(stage: Shuffle | Repeat | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
+    """An order stage over an indexed dataset, applied alike to its rows and their lengths."""
+    if isinstance(stage, Shuffle):
+        if stage.window is None:
+            return rows.shuffle(stage.seed)
+        return gx.WindowShuffleMapDataset(rows, window_size=stage.window, seed=stage.seed)
+    if isinstance(stage, Repeat):
+        return rows.repeat(stage.epochs)
+    if isinstance(stage, Slice):
+        return rows.slice(stage.selection)
+    return rows[: min(stage.count, len(rows))]
+
+
 @dataclasses.dataclass(frozen=True)
 class _Build:
     read: Read
@@ -1173,40 +1186,19 @@ class _Build:
     ) -> tuple[Rows, pygrain.MapDataset | None]:
         if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
             return self.record_stage(rows, lengths, stage, pipeline)
-        if isinstance(stage, Shuffle):
-            if stage.block_shards is not None:
-                return self.block_shuffle(rows, lengths, stage, pipeline, partition)
-            if isinstance(rows, pygrain.MapDataset):
-                rows = (
-                    rows.shuffle(stage.seed)
-                    if stage.window is None
-                    else gx.WindowShuffleMapDataset(rows, window_size=stage.window, seed=stage.seed)
-                )
-                if lengths is not None:
-                    lengths = (
-                        lengths.shuffle(stage.seed)
-                        if stage.window is None
-                        else gx.WindowShuffleMapDataset(lengths, window_size=stage.window, seed=stage.seed)
-                    )
-            elif stage.window is not None:
-                rows = gx.WindowShuffleIterDataset(rows, window_size=stage.window, seed=stage.seed)
-            else:
-                raise ValueError(f"global shuffle needs an indexed pipeline: {_name(pipeline)}")
+        if isinstance(stage, Shuffle) and stage.block_shards is not None:
+            return self.block_shuffle(rows, lengths, stage, pipeline, partition)
+        if isinstance(stage, (Shuffle, Repeat, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
+            return _reordered(stage, rows), None if lengths is None else _reordered(stage, lengths)
+        if isinstance(stage, (Slice, ShardByHost)) or (isinstance(stage, Shuffle) and stage.window is None):
+            if not isinstance(rows, pygrain.MapDataset):
+                raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} needs an indexed pipeline")
+        elif isinstance(stage, Shuffle):
+            rows = gx.WindowShuffleIterDataset(rows, window_size=stage.window, seed=stage.seed)
         elif isinstance(stage, Repeat):
-            rows = (
-                rows.repeat(stage.epochs)
-                if isinstance(rows, pygrain.MapDataset)
-                else gx.RepeatIterDataset(rows, stage.epochs)
-            )
-            lengths = None if lengths is None else lengths.repeat(stage.epochs)
-        elif isinstance(stage, Slice):
-            if not isinstance(rows, pygrain.MapDataset):
-                raise ValueError(f"slice needs an indexed pipeline: {_name(pipeline)}")
-            rows = rows.slice(stage.selection)
-            lengths = None if lengths is None else lengths.slice(stage.selection)
-        elif isinstance(stage, ShardByHost):
-            if not isinstance(rows, pygrain.MapDataset):
-                raise ValueError("shard_by_host must be applied at the indexed or shard-manifest root")
+            rows = gx.RepeatIterDataset(rows, stage.epochs)
+        elif isinstance(stage, Limit):
+            rows = gx.LimitIterDataset(rows, stage.count)
         elif isinstance(stage, Prefetch):
             rows = gx.ThreadPrefetchIterDataset(
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
@@ -1218,12 +1210,6 @@ class _Build:
                 )
             )
             lengths = None
-        elif isinstance(stage, Limit):
-            if isinstance(rows, pygrain.MapDataset):
-                rows = rows[: min(stage.count, len(rows))]
-                lengths = None if lengths is None else lengths[: min(stage.count, len(lengths))]
-            else:
-                rows = gx.LimitIterDataset(rows, stage.count)
         else:
             return self.layout_stage(rows, lengths, stage, pipeline, partition)
         return rows, lengths
