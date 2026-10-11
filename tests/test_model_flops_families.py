@@ -328,20 +328,18 @@ def test_diffusion_objective_counts_one_real_encoder_and_the_conditioned_denoise
     def forward(variables, encoder_params, image, time, tokens):
         return model.apply(variables, image, time, encoder.encode(encoder_params, tokens))
 
-    assert objective.counts_work
     count = objective.model_flops(None, {"images": np.asarray(image), "text": tokens})
     assert count == forward_products(forward, variables, encoder.params, image, time, tokens)
     assert objective.training_flops(None, {"images": np.asarray(image), "text": tokens}) == 3 * count
 
 
-def test_multiple_conditions_remain_unavailable_and_the_explicit_refusal_names_the_composition():
+def test_multiple_conditions_refuse_the_unknown_composition():
     encoder = CharTable.from_pretrained(tokens=4, features=8)
     model = SimpleUDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2)
     objective = DiffusionObjective(model, presets.Flow(),
         InputSpec(Field("images", (4, 4, 3)), conditions={"textcontext": Condition(encoder),
                                                        "other": Condition(encoder, field="other_text")}),
         autoencoder=None, ema_decay=None)
-    assert not objective.counts_work
     with pytest.raises(MissingFlopsCount, match="multiple condition geometries"):
         objective.model_flops(None, {"images": np.ones((1, 4, 4, 3)), **objective.inputs.tokenize(["a"])})
 
@@ -392,7 +390,6 @@ def test_prediction_depths_and_the_lm_objective_match_every_forward_product(dept
 
     objective = LMObjective(model, seq_len=6, mtp_weight=1.0)
     batch = {TEXT_KEY: np.ones((1, 7), np.int32)}
-    assert objective.counts_work
     count = objective.model_flops(None, batch)
     assert count == forward_products(forward, variables, tokens)
     assert objective.training_flops(None, batch) == 3 * count

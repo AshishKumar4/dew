@@ -24,6 +24,7 @@ from dew.cache import default_compilation_cache_dir, enable_compilation_cache
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.lora import LoRA
 from dew.nn.flops import MissingFlopsCount
+from dew.nn.hyper_connections import HyperConnections
 from dew.nn.protocols import Counted
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl.preference import DPOObjective
@@ -82,12 +83,6 @@ class CountedRegression(TokenRegression):
     def __init__(self):
         super().__init__()
         self.model = CountedAffine()
-        self.resolutions = 0
-
-    @property
-    def counts_work(self):
-        self.resolutions += 1
-        return super().counts_work
 
 
 def hlo_module(*instructions: str) -> str:
@@ -588,7 +583,7 @@ def test_fit_reports_throughput_to_the_tracker():
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
 
 
-@pytest.mark.parametrize("kind", ["custom", "tokens", "lora", "dpo"])
+@pytest.mark.parametrize("kind", ["custom", "tokens", "lora", "dpo", "multistream"])
 def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, capsys, kind):
     from dew.nn.kernels import TARGETS, GpuTarget
 
@@ -612,6 +607,12 @@ def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, 
                 yield {IDS_KEY: ids, MASK_KEY: np.ones_like(ids, bool)}
 
         data = Data(pairs)
+    elif kind == "multistream":
+        # Counted as a decoder, but its residual streams' mixing declares no work.
+        model = models.build('causal_transformer', vocab_size=16, emb_features=8, num_layers=1, num_heads=1,
+                             mlp_features=16, max_seq_len=4, hyper_connections=HyperConnections(hc_mult=2))
+        objective = LMObjective(model, 4)
+        data = Data(lambda: token_batches(BATCH, 4, 16))
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
     state = trainer.fit(data, steps=3, log_every=1)
@@ -619,7 +620,7 @@ def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, 
     assert int(state.step) == int(state.updates) == 3
     assert len(ticks) == 3
     assert all("train/mfu" not in values for values in ticks)
-    message = f"train/mfu is unavailable: {type(objective).__name__}"
+    message = f"train/mfu is unavailable for {type(objective).__name__}: "
     assert capsys.readouterr().out.count(message) == 1
     if kind in ("tokens", "lora"):
         assert all(values["train/tokens"] == BATCH for values in ticks)
@@ -657,8 +658,6 @@ def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch
         expected = work / (seconds * peak * trainer.device_mesh.devices.size)
         assert values["train/mfu"] == pytest.approx(expected)
     assert "train/mfu is unavailable" not in capsys.readouterr().out
-    if kind == "custom":
-        assert objective.resolutions == 1
 
 
 @pytest.mark.parametrize("count", ["model_flops", "training_flops", "real_lengths"])
