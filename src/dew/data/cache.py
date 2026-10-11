@@ -200,7 +200,7 @@ class Cache:
         source: Source,
         *,
         transform: Transform | None = None,
-    ) -> grain.MapDataset:
+    ) -> _CachedMap:
         self._root(key)
         snapshot = source.snapshot()
         if snapshot.get("identity_required") is True and snapshot.get("identity") is None:
@@ -861,6 +861,13 @@ class _CachedMap(grain.MapDataset[CachedValue]):
         self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
     ) -> grain.IterDataset[CachedValue]:
         return _ClosingCache(super().to_iter_dataset(read_options, allow_nones=allow_nones), self)
+
+    def iterated(
+        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
+    ) -> grain.IterDataset[CachedValue]:
+        """A view of this map, such as one share of it, read as an iterator that
+        finishes the fill when it runs out and closes the cache with it."""
+        return _ClosingCache(view.to_iter_dataset(read_options), self)
 
     def __getstate__(self) -> dict:
         return {key: value for key, value in self.__dict__.items() if key not in ("_writer", "writer_lock")}
