@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import io
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -146,7 +148,8 @@ class DewDataFileSystem(AbstractFileSystem):
             raise ValueError(f"invalid dew-data object key {key!r}")
         return key
 
-    def _request(
+    @contextlib.contextmanager
+    def _response(
         self,
         method: str,
         path: str,
@@ -154,7 +157,7 @@ class DewDataFileSystem(AbstractFileSystem):
         payload: bytes | None = None,
         headers: Mapping[str, str] | None = None,
         query: str = "",
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> Iterator[http.client.HTTPResponse]:
         token = self.token or os.environ.get("DEW_DATA_TOKEN")
         if not token and self.token_file:
             token = Path(self.token_file).expanduser().read_text().strip()
@@ -169,16 +172,31 @@ class DewDataFileSystem(AbstractFileSystem):
         )
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
-                body = response.read()
                 if headers and "Range" in headers and response.status != 206:
                     raise OSError(f"dew-data did not honour range read for {path}")
-                return body, dict(response.headers.items())
+                yield response
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 raise FileNotFoundError(path) from error
             if error.code in (409, 412):
                 raise PreconditionFailed(path) from error
             raise OSError(f"dew-data {method} {path}: HTTP {error.code}") from error
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+        query: str = "",
+    ) -> tuple[bytes, dict[str, str]]:
+        with self._response(method, path, payload=payload, headers=headers, query=query) as response:
+            return response.read(), dict(response.headers.items())
+
+    def get_file(self, rpath: str, lpath: str, **kwargs) -> None:
+        with self._response("GET", rpath) as response, open(lpath, "wb") as target:
+            shutil.copyfileobj(response, target, length=2**20)
 
     def info(self, path: str, **kwargs) -> dict[str, str | int]:
         key = self._key(path)
@@ -350,7 +368,12 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         with FileLock(str(directory / ".dew-lock")):
             self.load_cache()
             path = self._strip_protocol(path)
-            cached = self._check_file(path)
+            cached = self._metadata.check_file(path)
+            version = self.fs.ukey(path)
+            if cached and (
+                cached[0]["uid"] != version or self.expiry and time.time() - cached[0]["time"] > self.expiry
+            ):
+                cached = False
             if not cached:
                 self._dew_misses += 1
                 previous = self._metadata.cached_files[-1].get(path)
@@ -366,18 +389,35 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                     raise ValueError(f"dewcache source {path!r} does not declare its byte size")
                 if not self._dew_room(size):
                     return self.fs.open(path, mode=mode, **kwargs)
-                self._dew_downloaded += size
+                local = directory / self._mapper(path)
+                self._dew_download(path, local, size, version)
             else:
                 self._dew_hits += 1
-            opened = super()._open(path, mode=mode, **kwargs)
-            local = Path(opened.name)
+                local = Path(cached[1])
             pin = (directory / (local.name + ".pin")).open("a+b")
             fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
             os.utime(local, None)
             self._dew_wait += time.monotonic() - started
             raw = io.FileIO(str(local), "r")
-            opened.close()
             return _PinnedReader(raw, pin)
+
+    def _dew_download(self, path: str, local: Path, size: int, version: str) -> None:
+        descriptor, temporary = tempfile.mkstemp(dir=local.parent, prefix=".download-")
+        os.close(descriptor)
+        pending = Path(temporary)
+        try:
+            self.fs.get_file(path, str(pending))
+            if pending.stat().st_size != size or self.fs.ukey(path) != version:
+                raise OSError(f"dewcache source changed while downloading {path}")
+            os.replace(pending, local)
+            self._metadata.update_file(
+                path,
+                {"original": path, "fn": local.name, "blocks": True, "time": time.time(), "uid": version},
+            )
+            self.save_cache()
+            self._dew_downloaded += size
+        finally:
+            pending.unlink(missing_ok=True)
 
     def _dew_room(self, needed: int) -> bool:
         if needed > self._dew_max_bytes:
