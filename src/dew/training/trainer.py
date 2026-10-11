@@ -496,7 +496,9 @@ class _Interval:
         aux = {} if aux is None else aux
         self.model_counted |= FORWARD_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
-        self.book = bookkeep(self.book, loss, finite, aux.get(FORWARD_FLOPS, 0.0), aux.get(TOKENS, 0.0))
+        assert self.fresh is not None
+        self.book = bookkeep(self.book, loss, finite,
+                             aux.get(FORWARD_FLOPS, self.fresh[3]), aux.get(TOKENS, self.fresh[4]))
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Raise RuntimeError once the loss has been non-finite for
