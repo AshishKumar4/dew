@@ -21,7 +21,7 @@ class Tokenize(grain.MapTransform):
     eos: bool = False
 
     def dependencies(self) -> Mapping[str, object]:
-        return tokenizer_snapshot(self.tokenizer)
+        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
 
     def map(self, element: Batch) -> Batch:
         value = element[self.field]

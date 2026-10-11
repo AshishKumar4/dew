@@ -23,8 +23,10 @@ from dew.data.prompts import (
     _prompt_ids,
     _text,
     _utf8,
+    FIELDS as PROMPT_FIELDS,
 )
 from dew.data.text import load_tokenizer, tokenizer_snapshot
+from dew.records import integer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -33,7 +35,7 @@ class RenderChat(grain.MapTransform):
     column: str = "messages"
 
     def dependencies(self) -> Mapping[str, object]:
-        return tokenizer_snapshot(self.tokenizer)
+        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
 
     def map(self, element: Batch) -> Batch:
         messages = element.get(self.column, element.get("prompt"))
@@ -52,10 +54,17 @@ class RenderPrompt(grain.MapTransform):
     thinking: bool | None = None
     rejects = True
 
+    def __post_init__(self) -> None:
+        if self.max_prompt_len < 1 or self.reward_bytes < 1:
+            raise ValueError("prompt max_prompt_len and reward_bytes must be positive")
+
     def dependencies(self) -> Mapping[str, object]:
-        return tokenizer_snapshot(self.tokenizer)
+        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
 
     def map(self, element: Batch) -> Batch | Rejected:
+        unknown = element.keys() - set(PROMPT_FIELDS)
+        if unknown:
+            raise ValueError(f"prompt unknown fields {sorted(unknown)}")
         if "prompt" not in element:
             raise ValueError("RenderPrompt needs a prompt column")
         ids = _prompt_ids(self.tokenizer, element["prompt"], element.get("tools"), "prompt", self.thinking)
@@ -81,11 +90,33 @@ class RenderPrompt(grain.MapTransform):
 
 
 @dataclasses.dataclass(frozen=True)
+class ConfigurePrompt:
+    tokenizer: str
+    max_prompt_len: int
+    pad_id: int
+    long: Literal["drop", "truncate"]
+    thinking: bool | None
+
+    def __call__(self, metadata: Mapping[str, object]) -> RenderPrompt:
+        return RenderPrompt(self.tokenizer, self.max_prompt_len, self.pad_id,
+                            integer(metadata["reward_bytes"], "reward_bytes"), self.long, self.thinking)
+
+
+@dataclasses.dataclass(frozen=True)
 class PreferencePair(grain.MapTransform):
     seq_len: int = 256
     pad_id: int = 0
 
+    def __post_init__(self) -> None:
+        if self.seq_len < 1:
+            raise ValueError("preference seq_len must be positive")
+
     def map(self, element: Batch) -> Batch:
+        unknown = element.keys() - {"chosen", "rejected", "chosen_mask", "rejected_mask"}
+        if unknown:
+            raise ValueError(f"preference unknown fields {sorted(unknown)}")
+        if "chosen" not in element or "rejected" not in element:
+            raise ValueError("a preference pair needs both chosen and rejected ids")
         ids = np.full((2, self.seq_len), self.pad_id, np.int32)
         mask = np.zeros((2, self.seq_len), np.int32)
         for row, name in enumerate(("chosen", "rejected")):

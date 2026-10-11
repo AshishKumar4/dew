@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import inspect
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
@@ -49,7 +49,17 @@ class SingleReader(Protocol):
 
 @runtime_checkable
 class Expansion(Protocol):
-    def flat_map(self, element: Batch) -> Sequence[Batch | Rejected]: ...
+    def flat_map(self, element: Batch, /) -> Sequence[Batch | Rejected]: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Configured:
+    """Resolve one record step from source facts before any record reader opens."""
+
+    factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
+    needs: tuple[str, ...]
+    scope: Literal["source", "run"] = "source"
+    random: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,6 +67,7 @@ class Map:
     step: RecordStep
     identity: str | None = None
     rejects: bool = False
+    configured: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -64,6 +75,7 @@ class RandomMap:
     step: RandomStep
     identity: str | None = None
     rejects: bool = False
+    configured: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -84,6 +96,7 @@ class Filter:
 class FlatMap:
     step: Expansion
     identity: str | None = None
+    configured: Mapping[str, object] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -192,6 +205,7 @@ type Stage = (
     | MapBatch
     | Artifact
     | Windows
+    | Configured
 )
 
 
@@ -209,21 +223,37 @@ class Mixture:
 
 
 @dataclasses.dataclass(frozen=True)
+class Phases:
+    pipelines: tuple[Pipeline, ...]
+    until_steps: tuple[int | None, ...]
+
+    def __post_init__(self) -> None:
+        if not self.pipelines or len(self.pipelines) != len(self.until_steps) or self.until_steps[-1] is not None:
+            raise ValueError("phases need one boundary per pipeline; the last boundary is None")
+        previous = 0
+        for boundary in self.until_steps[:-1]:
+            if boundary is None or boundary <= previous:
+                raise ValueError("phase step boundaries must increase from above zero")
+            previous = boundary
+
+
+@dataclasses.dataclass(frozen=True)
 class Pipeline:
-    source: Source | Mixture
+    source: Source | Mixture | Phases
     stages: tuple[Stage, ...] = ()
     name: str | None = None
 
     def then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
 
-    def map(self, *steps: RecordStep, identity: str | None = None, rejects: bool | None = None) -> Pipeline:
+    def map(self, *steps: RecordStep | Configured, identity: str | None = None,
+            rejects: bool | None = None) -> Pipeline:
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
                 raise ValueError(f"stochastic step {type(step).__name__} needs random_map after the cache prefix")
         return self.then(
             *(
-                Map(step, identity, _rejects(step) if rejects is None else rejects)
+                step if isinstance(step, Configured) else Map(step, identity, _rejects(step) if rejects is None else rejects)
                 for step in steps
             )
         )
@@ -325,8 +355,8 @@ class Pipeline:
 
 @dataclasses.dataclass(frozen=True)
 class ObjectiveData:
-    train: tuple[RecordStep | pygrain.RandomMapTransform | Expansion, ...] = ()
-    evaluate: tuple[RecordStep | Expansion, ...] = ()
+    train: tuple[RecordStep | pygrain.RandomMapTransform | Expansion | Configured, ...] = ()
+    evaluate: tuple[RecordStep | Expansion | Configured, ...] = ()
     group: LengthGroups | None = None
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()

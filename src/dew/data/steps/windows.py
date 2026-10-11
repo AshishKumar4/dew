@@ -82,6 +82,8 @@ class WindowSource:
         return self.original.supports(read)
 
     def records(self, read: Read) -> IndexedWindows:
+        if read == "memory":
+            self.original.records(read)
         return IndexedWindows(self.tokens, self.length, self.stride)
 
     def metadata(self) -> Mapping[str, object]:

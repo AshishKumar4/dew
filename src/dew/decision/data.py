@@ -1,5 +1,6 @@
 """Labelled requests: what a decision model trains and calibrates on."""
 
+import dataclasses
 import functools
 import json
 import random
@@ -11,7 +12,8 @@ import numpy as np
 
 from dew import records
 from dew.data.dataset import Dataset, DatasetSpec, Tokenize
-from dew.data.pipeline import HostStep, Pipeline
+from dew.data.pipeline import Configured, HostStep, Pipeline
+from dew.data.recipes import HoldOut, Split, Validation, _branches
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.data.sources.hf import HFDatasetSource, HFOptions
 from dew.decision.questions import Choice, Question
@@ -307,6 +309,7 @@ class ParseTable:
 class _DecisionSource:
     source: Source
     slots: Mapping[str, int] | None = None
+    table: ParseTable | None = None
 
     def describe(self) -> str:
         return self.source.describe()
@@ -319,9 +322,24 @@ class _DecisionSource:
 
     def records(self, read: Read):
         records = self.source.records(read)
-        if read == "memory" and self.slots is None:
+        if read == "memory" and self.slots is None and not self._facts:
+            if self.table is not None:
+                stated = self.source.metadata().get("class_names", {})
+                names = record(stated, "class names").get(self.table.label)
+                first = records[0] if len(records) else None
+                if isinstance(names, (list, tuple)):
+                    self._classes.extend(str(name) for name in names)
+                elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
+                    if self.table.label not in first:
+                        raise ValueError(f"decision table needs column {self.table.label!r}")
+                    self._classes.extend(dict.fromkeys(str(record(records[index], "decision row")[self.table.label])
+                                                      for index in range(len(records))))
             self._memory_slots(records)
         return records
+
+    @functools.cached_property
+    def _classes(self) -> list[str]:
+        return []
 
     @functools.cached_property
     def _facts(self) -> dict[str, int]:
@@ -331,6 +349,9 @@ class _DecisionSource:
         for index in range(len(rows)):
             row = rows[index]
             if row is None:
+                continue
+            if self.table is not None and "questions" not in row and "example" not in row:
+                self._facts.update(questions=1, options=len(self.table.options or self._classes))
                 continue
             example = row.get("example")
             example = Example.of(row) if example is None else Example.of(example)
@@ -342,6 +363,12 @@ class _DecisionSource:
 
     def metadata(self) -> Mapping[str, object]:
         stated = self.source.metadata()
+        if self.table is not None:
+            names = (self.table.options or tuple(self._classes) or
+                     records.strings(record(stated.get("class_names", {}), "class names").get(
+                         self.table.label, ()), "class names"))
+            if names:
+                return {**stated, "slots": {"questions": 1, "options": len(names)}, "decision_options": names}
         return {**stated, "slots": self._facts} if self._facts else stated
 
     def lengths(self) -> np.ndarray | None:
@@ -355,8 +382,8 @@ class _DecisionSource:
 class Decisions:
     """Decision rows and their corpus shares, with layout supplied by the objective."""
 
-    source: str | Source | Sequence[Example | Mapping[str, object]] = "tickets.csv"
-    validation: str | Source | Sequence[Example | Mapping[str, object]] | None = None
+    source: str | Source | Sequence[Example | Mapping[str, object]] | Mapping[str, Sequence[Example | Mapping[str, object]]] = "tickets.csv"
+    validation: Validation | Sequence[Example | Mapping[str, object]] = None
     weights: Mapping[str, float] = field(default_factory=dict)
     options: tuple[str, ...] = ()
     text: str = "text"
@@ -370,6 +397,16 @@ class Decisions:
         from dew.data.sources.concatenate import Concatenate
         from dew.data.storage import Store
 
+        table = ParseTable(self.options, self.text, self.label, self.question, self.instructions)
+        if isinstance(self.source, Mapping):
+            branches = [dataclasses.replace(
+                dataclasses.replace(self, source=rows, validation=None, weights={}).pipelines()[0], name=name)
+                        for name, rows in sorted(self.source.items())]
+            weights = [self.weights.get(name, 1.) for name in sorted(self.source)]
+            train = branches[0] if len(branches) == 1 else branches[0].mix(*branches[1:], weights=weights)
+            held = None if self.validation is None else dataclasses.replace(
+                self, source=(), weights={}).pipelines()[1]
+            return train, held, ()
         if isinstance(self.source, str):
             root = Store(self.source)
             fs, path = root.resolve()
@@ -436,27 +473,49 @@ class Decisions:
                 )
                 return train, evaluated, ()
         if isinstance(self.source, Sequence) and not isinstance(self.source, str):
-            rows = tuple({"example": Example.of(row)} for row in self.source)
-            dataset = _DecisionSource(Memory(rows))
-            dataset._memory_slots(rows)
-            train = Pipeline(dataset)
+            rows = tuple({"example": row} if isinstance(row, Example) else row for row in self.source)
+            dataset = _DecisionSource(Memory(rows), table=table)
+            dataset.records("memory")
+            if any("example" not in row for row in rows):
+                dataset.records("memory")
+                train = Pipeline(dataset, name="examples").map(Configured(_ParseConfigured(table), needs=()))
+            else:
+                train = Pipeline(dataset, name="examples")
         else:
             dataset = _DecisionSource(
                 source(self.source, split=self.split),
                 {"questions": 1, "options": len(self.options)} if self.options else None,
+                table=table,
             )
-            train = Pipeline(dataset).map(
-                ParseTable(self.options, self.text, self.label, self.question, self.instructions)
-                if self.options
-                else ParseExample()
-            )
+            train = Pipeline(dataset, name="examples").map(Configured(_ParseConfigured(table), needs=()))
         if self.validation is None:
             evaluated = None
+        elif isinstance(self.validation, HoldOut):
+            train, evaluated = _branches(dataset, self.validation, split=self.split, prefix=train.stages)
+        elif isinstance(self.validation, Pipeline):
+            evaluated = self.validation
+        elif isinstance(self.validation, Split):
+            held_source = _DecisionSource(source(self.source, split=self.validation.name), table=table)
+            evaluated = Pipeline(held_source).map(Configured(_ParseConfigured(table), needs=()))
         elif isinstance(self.validation, Sequence) and not isinstance(self.validation, str):
             rows = tuple({"example": Example.of(row)} for row in self.validation)
             held_source = _DecisionSource(Memory(rows))
             held_source._memory_slots(rows)
-            evaluated = Pipeline(held_source)
+            evaluated = Pipeline(held_source, name="held out")
         else:
-            evaluated = Pipeline(_DecisionSource(source(self.validation))).map(ParseExample())
+            evaluated = Pipeline(_DecisionSource(source(self.validation), table=table)).map(
+                Configured(_ParseConfigured(table), needs=()))
         return train, evaluated, ()
+
+
+@dataclass(frozen=True)
+class _ParseConfigured:
+    table: ParseTable
+
+    def __call__(self, metadata: Mapping[str, object]) -> ParseTable | ParseExample:
+        names = metadata.get("decision_options")
+        if names is None:
+            if "slots" in metadata:
+                return ParseExample()
+            raise ValueError("decision flat table needs options, ClassLabel metadata or read='memory'")
+        return dataclasses.replace(self.table, options=records.strings(names, "decision_options"))
