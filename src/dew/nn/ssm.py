@@ -130,15 +130,13 @@ class S5Layer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """The two real-form maps and the diagonal complex recurrence.
+        """The real-form input/state write and output read, 8*F*N per token.
 
-        A complex state occupies 2*N real channels. Its complex multiply
-        costs six real FLOPs and its addition two; the real D skip costs
-        another multiply/add per feature. Discretization of the parameters
-        and nonlinear functions are outside the token-matmul convention.
+        The complex state occupies 2*N real channels. Each of the write/read
+        maps is 2*F*(2*N). Diagonal complex decay, skips and discretization
+        are pointwise work, excluded as in the other recurrent families.
         """
-        return (2 * projection_flops(lengths, self.features, 2 * self.state_dim)
-                + float(real_lengths(lengths).sum()) * (8 * self.state_dim + 2 * self.features))
+        return 2 * projection_flops(lengths, self.features, 2 * self.state_dim)
 
     def setup(self):
         # A: diagonal complex state matrix, S4D-Lin init, parameterized as

@@ -28,10 +28,15 @@ matmul is counted, including patch input projections and per-row timestep or
 conditioning MLPs. Padding and rematerialization are excluded. Every executed
 loop pass counts once.
 
-The chunked gated delta rule contributes
-`4 * Hv * Dk * Dv + 2 * Hv * C * (Dk + Dv)` per token, in addition to its learned
-projections and convolution: the first term reads/writes the state, and the second
-comes from the chunk's key products and value application (`nn.flops.delta_flops`).
+GDN and KDA contribute `6 * H * Dk * Dv` per token, in addition to their learned
+projections and convolution: the recurrent function has a stored-value
+correction read, an outer-product write and an output read, each `2 * H * Dk * Dv`
+(`nn.flops.delta_flops`). Prep/inversion, chunking and tiling belong to hardware
+FLOPs only. SSD/Mamba-2 has only the state write and output read, `4 * H * N * P`
+per token; its chunk size likewise changes no model count.
+Mamba-1 uses the same write/read convention, `4 * D * N` per token. Across
+all recurrent families, pointwise decay and gates are excluded; a state MAC
+counts as two FLOPs, including outer-product writes and multiply/reduce reads.
 MoE counts only active expert assignments plus the router and shared branch. A
 vocabulary head adds `2 * width * vocabulary` per predicted real token, tied or
 untied and tiled or not. A decision head uses the real question/option counts for
@@ -61,6 +66,10 @@ over the training mesh; the compiler's FLOPs remain per-device.
 The former HLO model count, with a recomputed forward counted once, is now
 `train/hlo_flops_util`; it is not MFU. Both HLO metrics keep their own compiler
 availability checks, independently of the analytical model count.
+
+MFU previously used the HLO model count. It now uses analytical real-token
+model work: old `train/mfu` and new `train/mfu` values are not directly comparable.
+The previous count remains available as `train/hlo_flops_util` for that comparison.
 
 ## A CPU cluster against one GPU, 2026-10-08
 

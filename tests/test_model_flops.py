@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import equations
+from jax.extend import core as jaxpr_core
 
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
@@ -28,16 +28,19 @@ from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.jepa import FactorizedTokenStack, JepaEncoder, JepaPredictor, TokenStack
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.flops import MissingFlopsCount, attention_flops, counted_flops, delta_flops, projection_flops
+from dew.nn.gemma4_moe import Gemma4Experts
+from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.linear import GatedDeltaNet
+from dew.nn.linear import GatedDeltaNet, recurrent_delta_rule, recurrent_gated_delta_rule
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-from dew.nn.mixers.mamba import Mamba
-from dew.nn.mixers.mamba2 import Mamba2
+from dew.nn.mixers.mamba import Mamba, selective_scan
+from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
+from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import Counted, CountedLogits
-from dew.nn.ssm import BidirectionalS5Layer, S5Layer
+from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl.preference import DPOObjective
@@ -87,11 +90,12 @@ def test_causal_mixer_counts_queries_shared_keys_and_output_gate():
 def test_qwen_delta_shapes_count_rule_projections_and_conv(width, heads):
     mixer = GatedDeltaNet(width, heads, heads, 128, 128, chunk_size=64)
     tokens = 7
-    state_and_chunk = (4 * heads * 128 * 128 + 2 * heads * 64 * (128 + 128)) * tokens
+    state_and_chunk = 6 * heads * 128 * 128 * tokens
     projected = 2 * width * (5 * heads * 128 + 2 * heads) * tokens
     convolution = 2 * (3 * heads * 128) * 4 * tokens
-    assert delta_flops(LENGTHS, heads, 128, 128, 64) == state_and_chunk
+    assert delta_flops(LENGTHS, heads, 128, 128) == state_and_chunk
     assert mixer.model_flops(LENGTHS) == projected + convolution + state_and_chunk
+    assert mixer.clone(chunk_size=128).model_flops(LENGTHS) == mixer.model_flops(LENGTHS)
 
 
 @pytest.mark.parametrize("module", [Mamba(8, 16), Mamba2(8, 2, 8), KimiDeltaAttention(8, 2, 4)])
@@ -104,7 +108,7 @@ def test_other_recurrences_declare_additive_real_token_work(module):
 
 def test_s5_real_maps_complex_recurrence_and_bidirectional_output():
     one = S5Layer(8, 4)
-    assert one.model_flops(LENGTHS) == (8 * 8 * 4 + 8 * 4 + 2 * 8) * 7
+    assert one.model_flops(LENGTHS) == 8 * 8 * 4 * 7
     assert BidirectionalS5Layer(8, 4).model_flops(LENGTHS) == 2 * one.model_flops(LENGTHS) + 4 * 8 * 8 * 7
 
 
@@ -283,7 +287,7 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     assert not interval.model_counted and not interval.tokens_counted
 
 
-def forward_products(function, *operands):
+def forward_products(function, *operands, state_mac: bool = False):
     """Independent shape count of forward dots/convolutions, not an HLO estimate.
 
     Elementwise ops and normalization are excluded, so no tolerance can
@@ -291,19 +295,69 @@ def forward_products(function, *operands):
     logical product equal its executed product; chunked recurrence model
     FLOPs instead follow their documented algorithm-independent formula.
     """
-    total = 0
-    for equation in equations(jax.make_jaxpr(function)(*operands)):
-        if equation.primitive.name == "dot_general":
+    return float(jaxpr_products(jax.make_jaxpr(function)(*operands), state_mac=state_mac))
+
+
+def jaxpr_products(graph, *, state_mac=False):
+    """Count a scan body once per iteration, and one executed cond branch."""
+    if isinstance(graph, jaxpr_core.ClosedJaxpr):
+        return jaxpr_products(graph.jaxpr, state_mac=state_mac)
+    if isinstance(graph, dict):
+        return sum(jaxpr_products(part, state_mac=state_mac) for part in graph.values())
+    if isinstance(graph, tuple | list):
+        return sum(jaxpr_products(part, state_mac=state_mac) for part in graph)
+    if not isinstance(graph, jaxpr_core.Jaxpr):
+        return 0
+    total, producers = 0, {}
+    consumers = {}
+    for equation in graph.eqns:
+        for variable in equation.invars:
+            if not isinstance(variable, jaxpr_core.Literal):
+                consumers.setdefault(variable, []).append(equation)
+    for equation in graph.eqns:
+        primitive = equation.primitive.name
+        if primitive == "scan":
+            total += equation.params["length"] * jaxpr_products(equation.params["jaxpr"], state_mac=state_mac)
+        elif primitive == "cond":
+            total += max(jaxpr_products(branch, state_mac=state_mac)
+                         for branch in equation.params["branches"])
+        elif primitive == "dot_general":
             left = equation.invars[0].aval.shape
             contracted = equation.params["dimension_numbers"][0][0]
             terms = np.prod([left[axis] for axis in contracted], dtype=np.int64)
+            factor = 2
+            if np.issubdtype(equation.outvars[0].aval.dtype, np.complexfloating):
+                factor = 8
+                for operand in equation.invars:
+                    source = producers.get(operand)
+                    if source is not None and source.primitive.name == "convert_element_type" and (
+                            np.issubdtype(source.invars[0].aval.dtype, np.floating)):
+                        factor = 4  # Real input against complex weights.
+                if all(user.primitive.name == "real" for user in consumers.get(equation.outvars[0], [])):
+                    factor = 4  # Only the real component of a complex read is returned.
+            total += factor * np.prod(equation.outvars[0].aval.shape, dtype=np.int64) * terms
+        elif primitive == "ragged_dot":
+            terms = equation.invars[0].aval.shape[-1]
             total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64) * terms
-        elif equation.primitive.name == "conv_general_dilated":
+        elif primitive == "conv_general_dilated":
             kernel = equation.invars[1].aval.shape
             dims = equation.params["dimension_numbers"].rhs_spec
-            terms = np.prod([kernel[axis] for axis in dims[1:]], dtype=np.int64)
-            total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64) * terms
-    return float(total)
+            total += (2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64)
+                      * np.prod([kernel[axis] for axis in dims[1:]], dtype=np.int64))
+        elif state_mac and primitive == "reduce_sum":
+            product = producers.get(equation.invars[0])
+            if product is not None and product.primitive.name == "mul":
+                total += 2 * np.prod(product.outvars[0].aval.shape, dtype=np.int64)
+        elif state_mac and primitive == "mul":
+            left, right = (var.aval.shape for var in equation.invars)
+            if (len(left) >= 2 and len(right) >= 2 and left[-1] == 1 and right[-2] == 1
+                    and left[-2] > 1 and right[-1] > 1):
+                total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64)
+        else:
+            total += jaxpr_products(equation.params, state_mac=state_mac)
+        for variable in equation.outvars:
+            producers[variable] = equation
+    return total
 
 
 @pytest.mark.parametrize("family", ["decoder", "loop", "mlp", "attention", "dit", "jepa"])
@@ -334,3 +388,93 @@ def test_analytical_count_equals_every_forward_dot_and_convolution(family):
         count = model.image_flops(lengths, 3)
     variables = model.init(jax.random.key(201), *operands)
     assert count == forward_products(model.apply, variables, *operands)
+
+
+@pytest.mark.parametrize("kind", ["gdn", "kda", "ssd", "mamba"])
+def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
+    """Three delta MACs, two SSD/Mamba MACs, executed once per real token."""
+    batch, length, heads, key, value = 2, 7, 2, 3, 5
+    q = jnp.ones((batch, length, heads, key))
+    v = jnp.ones((batch, length, heads, value))
+    beta = jnp.ones((batch, length, heads))
+    if kind in ("gdn", "kda"):
+        g = jnp.zeros((batch, length, heads, key) if kind == "kda" else (batch, length, heads))
+        rule = recurrent_delta_rule if kind == "kda" else recurrent_gated_delta_rule
+        counted = forward_products(rule, q, q, v, g, beta, state_mac=True)
+        assert counted == 6 * batch * length * heads * key * value
+    elif kind == "ssd":
+        b = jnp.ones((batch, length, heads, key))
+        counted = forward_products(recurrent_ssd, v, beta, jnp.ones((heads,)), b, b,
+                                    jnp.ones((heads,)), state_mac=True)
+        assert counted == 4 * batch * length * heads * key * value
+    else:
+        channels = 5
+        x = jnp.ones((batch, length, channels))
+        b = jnp.ones((batch, length, key))
+        def rule(x, dt, a, b, c, d):
+            return selective_scan(x, dt, a, b, c, d, chunk_size=1)
+        counted = forward_products(rule, x, x, jnp.ones((channels, key)), b, b,
+                                    jnp.ones((channels,)), state_mac=True)
+        assert counted == 4 * batch * length * channels * key
+
+
+@pytest.mark.parametrize("model", [
+    GatedDeltaNet(8, 2, 2, 4, 3), KimiDeltaAttention(8, 2, 4),
+    Mamba(8, 16, state_size=3, chunk_size=1), Mamba2(8, 2, 4, state_size=3, chunk_size=1),
+    MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False, attention_impl="reference"),
+])
+def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
+    """One-token recurrence avoids chunk prep and matches the model MAC convention."""
+    x = jnp.ones((2, 1, 8))
+    variables = model.init(jax.random.key(202), x)
+    assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
+
+
+@pytest.mark.parametrize("kind", ["sparse", "gpt_oss", "gemma4"])
+def test_active_expert_products_match_the_executed_forward(kind):
+    lengths = np.array([4, 4])
+    x = jnp.ones((2, 4, 8))
+    if kind == "sparse":
+        model = SparseMLP(4, 2, 16, 8, implementation="xla")
+    elif kind == "gpt_oss":
+        model = GptOssMLP(8, 16, 4, 2, implementation="xla")
+    else:
+        model = Gemma4Experts(4, 2, 16, 8, implementation="xla")
+    operands = (x, x) if kind == "gemma4" else (x,)
+    variables = model.init(jax.random.key(203), *operands)
+    assert model.model_flops(lengths) == forward_products(model.apply, variables, *operands)
+
+
+def test_microbatches_two_sum_real_tokens_before_interval_throughput():
+    """An accumulation window counts its two different real batches, not padded rows."""
+    import optax
+
+    from dew.training import Trainer
+
+    objective = LMObjective(decoder(), seq_len=6, pad_id=0)
+    interval = _Interval(last_log_time=0, last_saved=None)
+    for inputs in (np.array([[1, 2, 3, 0, 0, 0, 0]], np.int32),
+                   np.array([[1, 2, 3, 4, 5, 0, 0]], np.int32)):
+        counted = prepare_counts(objective, {"text": inputs}, count_model=True)
+        aux = step_counts(jax.tree.map(jnp.asarray, counted))
+        interval.count(counted, StepFlops(10, 20), jnp.asarray(1.0), jnp.asarray(a=True), aux)
+    trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2)
+    totals = np.asarray(interval.book[3:])
+    assert totals[1] == 8
+    metrics = trainer._throughput(2, 2, 2, interval.flops,
+                                  model_flops=float(totals[0]), tokens=float(totals[1]))
+    assert metrics["train/tokens"] * 2 == 8
+    assert metrics["train/tokens_per_s"] == 4
+
+
+def test_s5_write_read_matches_the_native_scanned_path():
+    """CPU/GPU chunked S5 executes extra pole-power GEMMs, which belong to HFU.
+    The native TPU scan implements the recurrent function directly and its
+    real-input/complex-state maps exactly match the model write/read count."""
+    module = S5Layer(8, 3)
+    x = jnp.ones((2, 7, 8))
+    variables = module.init(jax.random.key(204), x)
+    operators = module.bind(variables).operators()
+    def forward(x, operators):
+        return _scanned_directions(x, (operators,), (False,), x.dtype)
+    assert module.model_flops(np.array([7, 7])) == forward_products(forward, x, operators)

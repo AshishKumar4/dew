@@ -3,6 +3,14 @@
 Dew's releases, newest first. The version is `dew.__version__`, and a
 release's tag is that version with a `v` in front (`v0.1.0`).
 
+## Unreleased
+
+- `train/mfu` now measures analytical model FLOPs over real row/segment lengths,
+  rather than HLO model FLOPs. Old and new MFU values are not directly comparable;
+  the old metric is `train/hlo_flops_util`, and hardware/remat work stays `train/hfu`.
+  `train/tokens` counts real tokens per attempted microbatch and `train/tokens_per_s`
+  reports their interval rate, independently of gradient accumulation.
+
 ## 0.1.0
 
 The first release on PyPI, as `dewml`: `pip install dewml` for the CPU, with
