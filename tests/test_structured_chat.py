@@ -520,7 +520,7 @@ def test_a_source_that_holds_no_conversation_column_says_what_it_holds(tmp_path)
 
     path = tmp_path / "chat.jsonl"
     path.write_text(json.dumps({"conversation": [], "tools": None}) + "\n")
-    with pytest.raises(ValueError, match="messages|prompt|conversation"):
+    with pytest.raises(ValueError, match=r"messages|prompt|conversation"):
         load(Chat(source=str(path), tokenizer=str(CHAT_TOKENIZER)), batch=1, read="memory",
             loading=Loading(workers=0))
 

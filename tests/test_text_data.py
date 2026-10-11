@@ -455,7 +455,7 @@ def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, pack):
     with pytest.raises(FileNotFoundError, match="train"):
         load(Text(source=TokenFiles(str(tmp_path)), pack="first-fit" if pack else None),
              batch=4, read="memory", loading=Loading(workers=0))
-    with pytest.raises(ValueError, match="source|format|files"):
+    with pytest.raises(ValueError, match=r"source|format|files"):
         load(Text(source="", pack="first-fit" if pack else None), batch=4, read="memory",
             loading=Loading(workers=0), validation_records=4 * (4))
 

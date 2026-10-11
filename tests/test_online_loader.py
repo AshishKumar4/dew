@@ -70,7 +70,7 @@ def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
                    budget=SearchBudget(consecutive=8, seconds=2))
     stream = data.train(DataPartition())
     try:
-        with pytest.raises(ValueError, match="accepted|rejection|budget"):
+        with pytest.raises(ValueError, match=r"accepted|rejection|budget"):
             next(stream)
     finally:
         stream.close()

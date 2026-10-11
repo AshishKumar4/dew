@@ -62,6 +62,7 @@ SHAPES = {
 def corpus(cache: Path) -> Path:
     """The pinned text as a produced ArrayRecord token store."""
     from dew.data import ByteTokenizer, export
+    import numpy as np
 
     tokens = cache / "tokens"
     if (tokens / "_dew_manifest.json").is_file():

@@ -40,7 +40,8 @@ from dew.data import (
     load,
 )
 from dew.data.compile import validation
-from dew.data.dataset import Forwarding, GlobalStream, _batches, hold_out, train_stream, validation_pass
+from dew.data.dataset import Forwarding, GlobalStream, _batches, describe, hold_out, train_stream, validation_pass
+from dew.data.dataset import Records as IndexedRows
 from dew.data.images import decode_image
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
@@ -146,13 +147,13 @@ class Indexed:
 
 @dataclasses.dataclass(frozen=True)
 class _Synthetic:
-    values: object
+    values: IndexedRows
 
     def describe(self):
-        return repr(self.values)
+        return describe(self.values)
 
     def snapshot(self):
-        return {"source": type(self.values).__name__, "records": len(self.values)}
+        return {"source": describe(self.values), "records": len(self.values)}
 
     def supports(self, read):
         return read != "streamed"
@@ -730,7 +731,7 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
         [str(c) for c in clips] + [str(tmp_path / "extra.webm")]
     )
     assert {r["caption"] for r in records} == {"a clip"}
-    with pytest.raises((ValueError, FileNotFoundError), match="source|files|directory"):
+    with pytest.raises((ValueError, FileNotFoundError), match=r"source|files|directory"):
         stored_source(str(tmp_path / "missing"), format="files").records("memory")
 
 
@@ -882,7 +883,8 @@ class Augmenting:
             training = training.map_batch(DeviceAugment(self.image_size,
                 self.crop_scale if mode else (1.0, 1.0),
                 False if mode is None else mode.flip, False if mode is None else mode.jitter))
-        validation = None if held is None else Pipeline(_Synthetic(held)).random_map(self.transform(training=False))
+        validation = (None if held is None else
+                      Pipeline(_Synthetic(held)).random_map(self.transform(training=False)))
         return training, validation, (EncodeCaptions(),)
 
 
