@@ -6,7 +6,7 @@ import argparse
 import hashlib
 import json
 
-from dew.data.storage import DewDataFileSystem, PreconditionFailed, Store
+from dew.data.storage import PreconditionFailed, Store
 
 DESCRIPTOR = "descriptors/a4fce93cb8456a3f3fae5f830ddd7bf185d9e2494d658809dd67f79695ec58f3.json"
 
@@ -25,15 +25,13 @@ def _json(store: Store, value: dict) -> str:
 
 def _version(root: Store, entry: dict) -> dict:
     fs, path = root.child(entry["path"]).resolve()
-    if not isinstance(fs, DewDataFileSystem):
-        raise ValueError("version proof needs the scoped data Worker filesystem")
+    etag = fs.ukey(path)
     digest, size = hashlib.sha256(), 0
-    with fs._response("GET", path) as response:
-        etag = response.headers["ETag"]
-        while block := response.read(2**20):
+    with fs.open(path, "rb") as source:
+        while block := source.read(2**20):
             digest.update(block)
             size += len(block)
-    if size != entry["bytes"] or digest.hexdigest() != entry["sha256"]:
+    if fs.ukey(path) != etag or size != entry["bytes"] or digest.hexdigest() != entry["sha256"]:
         raise ValueError(f"canonical object changed: {entry['path']}")
     return {**entry, "etag": etag}
 

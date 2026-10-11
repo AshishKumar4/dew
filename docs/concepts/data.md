@@ -160,7 +160,19 @@ Pipeline stages execute where written. Use `map`, `random_map`, `filter`, `flat_
 
 `publish(prefix, Cache(url), read=...)` drains a deterministic prefix, certifies source coverage and publishes one generation transactionally. A future run names `Generation(url)` explicitly to read it. Random steps belong after the cache; a plain function before it needs a stable identity. Cache writes require a clean checkout.
 
-`export(pipeline, url, format="parquet" | "array_record")` writes committed shards. Reads follow fsspec URLs; transactional publication supports local files, memory, S3/R2, GCS and Hub repositories, and refuses other write protocols rather than putting a partial publication. Producer manifests and indexes are the indexed reader's authority. Transport caches use URL chaining such as `dewcache::r2://bucket/path` and are separate from transformed artifacts.
+`export(pipeline, url, format="parquet" | "array_record")` writes committed shards. Reads follow fsspec URLs. Transactional publication supports local files, memory, S3 and the S3-compatible endpoints that honour its conditional PUTs, GCS, Hub repositories, and any fsspec filesystem that supplies its own conditional writes through a `put_conditional` method (`dew.data.storage.Store`). It refuses other write protocols rather than putting a partial publication. Producer manifests and indexes are the indexed reader's authority. Transport caches use URL chaining such as `dewcache::s3://bucket/path` and are separate from transformed artifacts.
+
+A storage profile names a filesystem and its options once. Profiles live in `~/.config/dew/storage.toml`, or the file `DEW_STORAGE_CONFIG` names, as one table per profile with the `base` protocol it extends. A value written `env:NAME` or `file:PATH` is read from that environment variable or file when the filesystem opens. Cloudflare R2, for example, is an S3 endpoint:
+
+```toml
+[r2]
+base = "s3"
+endpoint_url = "https://ACCOUNT_ID.r2.cloudflarestorage.com"
+key = "env:R2_ACCESS_KEY_ID"
+secret = "env:R2_SECRET_ACCESS_KEY"
+```
+
+With it, `r2://bucket/path` reads and publishes through s3fs with those options.
 
 ## Loading and image augmentation
 

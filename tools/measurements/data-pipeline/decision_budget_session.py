@@ -14,12 +14,15 @@ from pathlib import Path
 
 ATTRIBUTOR = "b420100f20856822ae19d7f314a9a22ba24e26df"
 BENCHMARK = Path(__file__).resolve().parents[2] / "benchmark_decision_budgets.py"
+SOURCE = "r2://dew-data/decision/gold-v3"
+DESCRIPTOR = SOURCE + "/descriptors/aa0e68216c5f003699efe87081edb525cb095b4ddaef64c9748ea579ee055627.json"
 
 
 def run_arm(args: argparse.Namespace, arm: str, timeout: int, *, profile: bool = False) -> Path:
     output = args.output / (arm + ("-profile" if profile else ""))
     output.mkdir(parents=True, exist_ok=True)
-    flags = [sys.executable, str(BENCHMARK), "--arm", arm, "--output", str(output / "entry.json")]
+    flags = [sys.executable, str(BENCHMARK), "--arm", arm, "--output", str(output / "entry.json"),
+             "--source", SOURCE, "--descriptor", DESCRIPTOR]
     if args.smoke:
         flags.extend(["--smoke", "--warmup-updates", "1", "--timed-updates", "2", "--windows", "1"])
     env = {**os.environ, "PYTHONPATH": "src", "XLA_PYTHON_CLIENT_PREALLOCATE": "false"}

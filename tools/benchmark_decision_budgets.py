@@ -44,9 +44,6 @@ from dew.training.trainer import CompiledStep, Rollout, Shapes, batch_shapes
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
-ROOT = "r2://dew-data/decision/gold-v3"
-DESCRIPTOR = (ROOT + "/descriptors/"
-              "aa0e68216c5f003699efe87081edb525cb095b4ddaef64c9748ea579ee055627.json")
 
 
 class Counted:
@@ -282,7 +279,7 @@ def configuration(args: argparse.Namespace) -> BenchmarkRun:
         objective=ObjectiveConfig("decision", {
             "loss": LogLoss() + 0.5 * Brier() + RankedProbability(), "label_smoothing": 0.05,
             "bucket": None if tokens else (64 if args.smoke else 256), "shuffle_options": True}),
-        data=Decisions(rows) if args.smoke else Decisions(ROOT, descriptor=DESCRIPTOR),
+        data=Decisions(rows) if args.smoke else Decisions(args.source, descriptor=args.descriptor),
         data_read="memory" if args.smoke else "indexed", data_seed=0,
         loading=Loading(workers=args.workers, threads=4, read_buffer=16),
         trainer=TrainerConfig(batch_size=None if tokens else (4 if args.smoke else 8),
@@ -309,9 +306,13 @@ def main() -> None:
     parser.add_argument("--accumulation", type=int, default=2)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--profile-directory")
+    parser.add_argument("--source", help="the decision mixture's root URL, for the full run")
+    parser.add_argument("--descriptor", help="the URL of its immutable source descriptor, for the full run")
     args = parser.parse_args()
     if min(args.warmup_updates, args.timed_updates, args.windows, args.accumulation) < 1:
         parser.error("warmup, timing, windows and accumulation must be positive")
+    if not args.smoke and (args.source is None or args.descriptor is None):
+        parser.error("the full run reads the decision mixture --source names, through --descriptor")
     args.output.parent.mkdir(parents=True, exist_ok=True)
     prepare_process(multi_host=False, compilation_cache_dir=None)
     device = jax.local_devices()[0]

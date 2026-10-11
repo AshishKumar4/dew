@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
+import fsspec
 import grain.python as grain
 import pytest
 
@@ -348,69 +349,58 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
 
 
 def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment():
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from fsspec.implementations.memory import MemoryFileSystem
 
     from dew.data.dataset import _QUIET_STOP_SECONDS
 
     entered, release = threading.Event(), threading.Event()
-    stored = {}
+    stored = []
 
-    class Worker(BaseHTTPRequestHandler):
-        def log_message(self, *args):
-            return
+    class Stalled(MemoryFileSystem):
+        """Memory objects behind a third-party conditional write whose upload
+        hangs until the test releases it."""
 
-        def do_PUT(self):
-            payload = self.rfile.read(int(self.headers["Content-Length"]))
+        protocol = "stalled"
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("stalled://", "memory://", 1))
+
+        def put_conditional(self, path, payload, version):
             entered.set()
             release.wait(15)
-            stored[self.path] = payload
-            self.send_response(204)
-            self.send_header("ETag", '"stored"')
-            self.end_headers()
+            if self.exists(path):
+                raise FileExistsError(path)
+            self.pipe_file(path, payload)
+            stored.append(path)
+            return hashlib.sha256(payload).hexdigest()
 
-        def do_GET(self):
-            payload = stored[self.path]
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(payload)))
-            self.send_header("ETag", '"stored"')
-            self.end_headers()
-            self.wfile.write(payload)
-
-    with ThreadingHTTPServer(("127.0.0.1", 0), Worker) as server:
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        source = Memory([{"id": 0}])
-        cache = Cache(
-            "dewdata://dew-data/stalled",
-            shard_bytes=1,
-            retry=0,
-            storage_options={"endpoint_url": f"http://127.0.0.1:{server.server_port}", "token": "test"},
-        )
-        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest(), source)
-        try:
-            assert rows[0] == {"id": 0}
-            assert entered.wait(5)
-            started = time.monotonic()
-            rows.close()
-            assert time.monotonic() - started < _QUIET_STOP_SECONDS + 2
-            assert rows.metrics()["abandoned"] > 0
-        finally:
-            release.set()
-            for future in rows.writer.futures:
-                try:
-                    future.result(timeout=5)
-                except RuntimeError as error:
-                    assert "abandoned" in str(error) or "cancelled" in str(error)
-            server.shutdown()
-            thread.join()
-        assert not any("/segments/" in path for path in stored)
+    fsspec.register_implementation("stalled", Stalled, clobber=True)
+    source = Memory([{"id": 0}])
+    cache = Cache(f"stalled://cache-{uuid4().hex}", shard_bytes=1, retry=0)
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest(), source)
+    try:
+        assert rows[0] == {"id": 0}
+        assert entered.wait(5)
+        started = time.monotonic()
+        rows.close()
+        assert time.monotonic() - started < _QUIET_STOP_SECONDS + 2
+        assert rows.metrics()["abandoned"] > 0
+    finally:
+        release.set()
+        for future in rows.writer.futures:
+            try:
+                future.result(timeout=5)
+            except RuntimeError as error:
+                assert "abandoned" in str(error) or "cancelled" in str(error)
+    assert stored and not any("/segments/" in path for path in stored)
 
 
 @pytest.mark.network
 def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
     root = os.environ.get("DEW_DATA_TEST_URL")
     if not root:
-        pytest.skip("DEW_DATA_TEST_URL names the writable R2 smoke prefix")
+        pytest.skip("DEW_DATA_TEST_URL names a writable remote smoke prefix")
     source = Memory([{"id": index, "text": "remote"} for index in range(4)])
     key = Manifest(b'{"r2-smoke":"artifact-v1"}')
     cache = Cache(
