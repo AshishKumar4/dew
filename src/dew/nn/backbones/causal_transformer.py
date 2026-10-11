@@ -899,9 +899,16 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Real-row hidden-state work, summing the same block factories as setup."""
-        if self.altup is not None or self.hyper_connections is not None:
-            raise MissingFlopsCount("CausalTransformer needs its multi-stream expansion geometry")
-        return self._layer_flops(lengths, counted_flops)
+        count = self._layer_flops(lengths, counted_flops)
+        maps = self.projections()
+        count += sum(projection_flops(lengths, *shape) for name, shape in maps.items()
+                     if name.startswith(('altup_projections_', 'altup_unembed_projections_')))
+        if self.hyper_connections is not None and self.hyper_connections.head == 'weighted':
+            count += HyperHead(self.hyper_connections, self.emb_features, parent=None).model_flops(lengths)
+        if self.attention_residuals is not None:
+            sources = self.attention_residuals.blocks(self.num_layers) + 1
+            count += DepthAttention(self.emb_features, parent=None).depth_flops(lengths, sources)
+        return count
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
@@ -957,6 +964,19 @@ class CausalTransformer(nn.Module):
         count = projection_flops(lengths, self.emb_features, self.vocab_size)
         if self.head_transform is not None:
             count += projection_flops(lengths, *self.projections()['head_dense'])
+        return count
+
+    @nn.nowrap
+    def prediction_flops(self, lengths) -> float:
+        """Each trained prediction depth shortens the real sequence by one token."""
+        types, factories = self.per_layer_types, self.feedforward_factories()
+        kinds = self.layer_kinds(types)
+        mixer = self.mixer if self.mixer is not None else AttentionMixer()
+        blocks = self._prediction_depths(types, kinds, mixer, factories[0], factories[1], BlockWiring())
+        count = 0.0
+        for depth, block in enumerate(blocks, start=1):
+            shorter = np.maximum(np.asarray(lengths) - depth, 0)
+            count += block.model_flops(shorter) + self.logits_flops(shorter)
         return count
 
     @nn.nowrap

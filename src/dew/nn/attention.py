@@ -2091,9 +2091,16 @@ class FlaxGEGLU(nn.Module):
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
     approximate: bool = True
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        return {"proj": (self.dim, self.dim * 4 * 2)}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        return projection_flops(lengths, *self.projections()["proj"])
+
     def setup(self):
-        inner_dim = self.dim * 4
-        self.proj = nn.Dense(inner_dim * 2, dtype=self.dtype, precision=self.precision)
+        self.proj = nn.Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2118,13 +2125,19 @@ class FlaxFeedForward(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """GEGLU's gate/up and down projections, with its fourfold hidden width."""
-        return 3 * projection_flops(lengths, self.dim, 4 * self.dim)
+        return (FlaxGEGLU(self.dim, parent=None).model_flops(lengths)
+                + projection_flops(lengths, *self.projections()["net_2"]))
+
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        inner = FlaxGEGLU(self.dim, parent=None).projections()["proj"][1] // 2
+        return {"net_2": (inner, self.dim)}
 
     def setup(self):
         self.net_0 = FlaxGEGLU(
             self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
         )
-        self.net_2 = nn.Dense(self.dim, dtype=self.dtype, precision=self.precision)
+        self.net_2 = nn.Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2152,6 +2165,17 @@ class BasicTransformerBlock(nn.Module):
     force_fp32_for_softmax: bool = True
     norm_epsilon: float = 1e-4
     attention_impl: str = "auto"  # an AttentionImpl
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
+        """The configured attention branches and optional GEGLU maps."""
+        attention = NormalAttention(self.query_dim, self.heads, self.dim_head, parent=None)
+        count = attention.cross_flops(lengths, context_lengths, context_features)
+        if not self.only_pure_attention:
+            if not self.use_cross_only:
+                count += attention.model_flops(lengths)
+            count += FlaxFeedForward(self.query_dim, parent=None).model_flops(lengths)
+        return count
 
     def setup(self):
         attention = functools.partial(
@@ -2246,6 +2270,19 @@ class TransformerBlock(nn.Module):
     norm_inputs: bool = True
     explicitly_add_residual: bool = True
     norm_epsilon: float = 1e-4
+
+    @nn.nowrap
+    def cross_flops(self, lengths, input_features: int, context_lengths=None,
+                    context_features: int | None = None) -> float:
+        """Stage projections and its self/cross/FFN branches at actual widths."""
+        inner = self.heads * self.dim_head if self.use_projection else input_features
+        context_lengths = lengths if context_lengths is None else context_lengths
+        context_features = inner if context_features is None else context_features
+        block = BasicTransformerBlock(inner, self.heads, self.dim_head,
+                                       use_cross_only=not self.use_self_and_cross,
+                                       only_pure_attention=self.only_pure_attention, parent=None)
+        count = block.cross_flops(lengths, context_lengths, context_features)
+        return count + (2 * projection_flops(lengths, input_features, inner) if self.use_projection else 0)
 
     @nn.compact
     def __call__(self, x, context=None):

@@ -19,16 +19,26 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import Conv
+from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
 
-from .joint import DoubleStreamBlock, Modulation, embedding, layer_norm, modulate
+from .joint import (
+    TIME_FEATURES,
+    DoubleStreamBlock,
+    Modulation,
+    embedding,
+    embedding_flops,
+    layer_norm,
+    modulate,
+)
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -96,6 +106,31 @@ class SD3Transformer(nn.Module):
         """Every call takes the text as `conditioning`, a stream beside the image in the joint blocks."""
         return "conditioning"
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("SD3Transformer needs multisequence_flops(image_lengths, text_lengths)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """Patch/text/pooled/time maps and SD3.5's selected dual-attention layers."""
+        image, _ = matching_lengths(lengths, context_lengths)
+        rows = np.ones(image.shape, np.int64)
+        count = (projection_flops(lengths, self.patch_size**2 * self.in_channels, self.features)
+                 + projection_flops(context_lengths, self.joint_attention_dim, self.caption_projection_dim)
+                 + embedding_flops(rows, TIME_FEATURES, self.features)
+                 + embedding_flops(rows, self.pooled_projection_dim, self.features))
+        for index in range(self.num_layers):
+            block = DoubleStreamBlock(self.features, self.heads, self.head_dim,
+                                       context_pre_only=index == self.num_layers - 1,
+                                       dual_attention=index in self.dual_attention_layers, parent=None)
+            count += block.multisequence_flops(lengths, context_lengths)
+        return (count + self._output_modulation().model_flops(rows)
+                + projection_flops(lengths, self.features, self.patch_size**2 * self.out_channels))
+
     def position(self, height: int, width: int):
         """Return the stored position buffer, cropped centred on a `height` by `width` patch grid.
 
@@ -114,6 +149,10 @@ class SD3Transformer(nn.Module):
         top, left = (maximum - height) // 2, (maximum - width) // 2
         cropped = table[:, top:top + height, left:left + width, :]
         return cropped.reshape(1, height * width, self.features)
+
+    @nn.nowrap
+    def _output_modulation(self):
+        return Modulation(self.features, 2, dtype=self.dtype, precision=self.precision, name="norm_out")
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -142,7 +181,8 @@ class SD3Transformer(nn.Module):
         image = image.reshape(image.shape[0], rows * columns, self.features)
         image = image + self.position(rows, columns).astype(image.dtype)
 
-        times = sinusoidal_time(time, 256, dtype=at_least_fp32(self.dtype)).astype(conditioning.pooled.dtype)
+        times = sinusoidal_time(time, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
+        times = times.astype(conditioning.pooled.dtype)
         conditioned = (embedding(times, self.features, "timestep_embedder", **dense)
                        + embedding(conditioning.pooled, self.features, "text_embedder", **dense))
 
@@ -156,7 +196,7 @@ class SD3Transformer(nn.Module):
                 attention_impl=self.attention_impl, name=f"transformer_blocks_{index}", **dense)(
                     image, context, conditioned)
 
-        scale, shift = Modulation(self.features, 2, name="norm_out", **dense)(conditioned)
+        scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
         image = nn.Dense(patch * patch * self.out_channels, name="proj_out", **dense)(image)
         return unpatchify(image, patch, rows * patch, columns * patch, self.out_channels)

@@ -31,12 +31,13 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import sinusoidal_time
+from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables
 from dew.nn.sharding import logical_axes
 
 from .decoder_block import GatedMLP
-from .joint import JointAttention, embedding, layer_norm
+from .joint import TIME_FEATURES, JointAttention, embedding, embedding_flops, layer_norm
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -122,17 +123,35 @@ class _Block(nn.Module):
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def _attention(self, image: int = 0):
+        return _Attention(self.heads, self.head_dim, bias=False, epsilon=self.eps, image_tokens=image,
+                          dtype=self.dtype, precision=self.precision,
+                          attention_impl=self.attention_impl, name="attn")
+
+    @nn.nowrap
+    def _feed_forward(self):
+        return GatedMLP(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
+                        precision=self.precision, name="img_mlp")
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """Image queries read image/text; text queries read the text causally."""
+        image, context = matching_lengths(lengths, context_lengths)
+        joined = (image + context).astype(np.int64)
+        count = self._attention().stream_flops(joined, None, self.features)
+        # The text queries read no image keys and only their causal text half.
+        omitted = 4 * self.heads * self.head_dim * np.sum(image * context + 0.5 * context * context)
+        return count + self._feed_forward().model_flops(joined) - float(omitted)
+
     @nn.compact
     def __call__(self, x, modulation, rotation, lengths, image: int):
         scale, gate, scale_mlp, gate_mlp = modulation
-        attended, _ = _Attention(self.heads, self.head_dim, bias=False, epsilon=self.eps, image_tokens=image,
-                                 dtype=self.dtype, precision=self.precision,
-                                 attention_impl=self.attention_impl, name="attn")(
+        attended, _ = self._attention(image)(
             _per_rows(layer_norm(self.dtype, self.eps)(x), scale, image, _scaled), rotation=rotation,
             lengths=lengths)
         x = x + _per_rows(attended, gate, image, lambda rows, value: jnp.tanh(value) * rows)
-        hidden = GatedMLP(self.features * self.mlp_ratio, self.features, dtype=self.dtype,
-                          precision=self.precision, name="img_mlp")(
+        hidden = self._feed_forward()(
             _per_rows(layer_norm(self.dtype, self.eps)(x), scale_mlp, image, _scaled))
         x = x + _per_rows(hidden, gate_mlp, image, lambda rows, value: jnp.tanh(value) * rows)
         if x.dtype == jnp.float16:
@@ -182,10 +201,40 @@ class QwenImageTransformer(nn.Module):
         """Every call takes the text as `conditioning`, which shares the image's residual stream."""
         return "conditioning"
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        width = self.features
+        return {'img_in': (self.in_channels, width), 'modulation': (width, 4 * width),
+                'norm_out_linear': (width, width), 'proj_out': (width, self.out_channels)}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("QwenImageTransformer requires "
+                                "multisequence_flops(image_lengths, text_lengths)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (1, 1), rows)
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """Text's two input maps and the shared time-zero row are included."""
+        image, _ = matching_lengths(lengths, context_lengths)
+        rows, timed = np.ones(image.shape, np.int64), np.ones((len(image) + 1,), np.int64)
+        maps = self.projections()
+        count = (projection_flops(lengths, *maps['img_in'])
+                 + _TextIn(self.features, parent=None).model_flops(context_lengths, self.context_in_dim)
+                 + embedding_flops(timed, TIME_FEATURES, self.features)
+                 + projection_flops(timed, *maps['modulation'])
+                 + projection_flops(rows, *maps['norm_out_linear'])
+                 + projection_flops(lengths, *maps['proj_out']))
+        block = _Block(self.features, self.heads, self.head_dim, self.mlp_ratio, parent=None)
+        return count + self.num_layers * block.multisequence_flops(lengths, context_lengths)
+
     def _time(self, time):
         """`QwenImage21TimestepProjEmbeddings`: cosines first, then two
         bias-free linears with a SiLU between."""
-        sinusoids = sinusoidal_time(time, 256, dtype=at_least_fp32(self.dtype))
+        sinusoids = sinusoidal_time(time, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
         return embedding(sinusoids.astype(self.dtype or jnp.float32), self.features, "timestep_embedder",
                          bias=False, dtype=self.dtype, precision=self.precision)
 
@@ -205,7 +254,8 @@ class QwenImageTransformer(nn.Module):
         valid = (jnp.ones((batch, text), bool) if conditioning.mask is None
                  else jnp.broadcast_to(jnp.asarray(conditioning.mask, bool), (batch, text)))
         lengths = jnp.sum(valid, axis=1, dtype=jnp.int32)
-        image = _dense(self.features, "img_in", self.dtype, self.precision)(
+        maps = self.projections()
+        image = _dense(maps['img_in'][1], "img_in", self.dtype, self.precision)(
             x.reshape(batch, image_tokens, x.shape[-1]))
         context = _TextIn(self.features, self.eps, dtype=self.dtype, precision=self.precision,
                           name="txt_in")(conditioning.context)
@@ -217,7 +267,7 @@ class QwenImageTransformer(nn.Module):
         times = jnp.broadcast_to(jnp.asarray(time, wide).reshape(-1), (batch,))
         embedded = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
         embedded, zero = embedded[:batch], embedded[batch:]
-        projected = _dense(4 * self.features, "modulation", self.dtype, self.precision)(
+        projected = _dense(maps['modulation'][1], "modulation", self.dtype, self.precision)(
             nn.silu(jnp.concatenate([embedded, zero])))
         sampled = jnp.split(projected[:batch], 4, axis=-1)
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
@@ -235,10 +285,10 @@ class QwenImageTransformer(nn.Module):
         # Only the image's rows leave; the text's final norm and projection
         # are rows the source computes and its pipeline drops.
         image = joint[:, :image_tokens]
-        scale = _dense(self.features, "norm_out_linear", self.dtype, self.precision)(
+        scale = _dense(maps['norm_out_linear'][1], "norm_out_linear", self.dtype, self.precision)(
             nn.silu(embedded))
         image = _scaled(layer_norm(self.dtype, self.eps)(image), scale[:, None])
-        output = _dense(self.out_channels, "proj_out", self.dtype, self.precision)(image)
+        output = _dense(maps['proj_out'][1], "proj_out", self.dtype, self.precision)(image)
         return output.reshape(batch, rows, columns, self.out_channels)
 
 
@@ -250,6 +300,10 @@ class _TextIn(nn.Module):
     eps: float = 1e-6
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return embedding_flops(lengths, input_features, self.features)
 
     @nn.compact
     def __call__(self, x):

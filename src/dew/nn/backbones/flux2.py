@@ -31,11 +31,20 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import sinusoidal_time
+from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
-from .joint import DoubleStreamBlock, Modulation, embedding, guided_time, layer_norm, modulate
+from .joint import (
+    DoubleStreamBlock,
+    Modulation,
+    embedding,
+    embedding_flops,
+    guided_time,
+    layer_norm,
+    modulate,
+)
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -72,12 +81,25 @@ class Flux2SingleBlock(nn.Module):
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        inner = self.heads * self.head_dim
+        return {'to_qkv_mlp_proj': (self.features, 3 * inner + 2 * self.hidden),
+                'proj_fused': (inner + self.hidden, self.features)}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The fused QKV/gate/up map and joined output; modulation is shared."""
+        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+                + attention_flops(lengths, self.heads, self.head_dim, self.head_dim, causal=False))
+
     @nn.compact
     def __call__(self, x, mods, rotation):
         shift, scale, gate = mods
         inner = self.heads * self.head_dim
         normalized = modulate(layer_norm(self.dtype, self.epsilon)(x), shift, scale)
-        projected = nn.Dense(3 * inner + 2 * self.hidden, use_bias=False, dtype=self.dtype,
+        maps = self.projections()
+        projected = nn.Dense(maps['to_qkv_mlp_proj'][1], use_bias=False, dtype=self.dtype,
                              precision=self.precision, name="to_qkv_mlp_proj")(normalized)
         heads = (x.shape[0], x.shape[1], self.heads, self.head_dim)
         query, key, value = (
@@ -94,7 +116,7 @@ class Flux2SingleBlock(nn.Module):
         )
         # The source's `attn.to_out`, named as Flux's single block names its
         # fused output map.
-        return x + gate[:, None] * nn.Dense(self.features, use_bias=False, dtype=self.dtype,
+        return x + gate[:, None] * nn.Dense(maps['proj_fused'][1], use_bias=False, dtype=self.dtype,
                                             precision=self.precision, name="proj_fused")(joined)
 
 
@@ -142,6 +164,38 @@ class Flux2Transformer(nn.Module):
         """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
         return "conditioning"
 
+    @property
+    def modulation_pieces(self) -> dict[str, int]:
+        return {'double_stream_modulation_img': 6, 'double_stream_modulation_txt': 6,
+                'single_stream_modulation': 3, 'norm_out': 2}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("Flux2Transformer needs multisequence_flops(image_lengths, text_lengths)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (1, 1), rows)
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """Static input widths and one shared modulation, not one per block."""
+        image, context = matching_lengths(lengths, context_lengths)
+        rows = np.ones(image.shape, np.int64)
+        count = (projection_flops(lengths, self.in_channels, self.features)
+                 + projection_flops(context_lengths, self.joint_attention_dim, self.features))
+        time = embedding_flops(rows, self.timestep_guidance_channels, self.features)
+        count += (1 + self.guidance_embeds) * time
+        count += sum(Modulation(self.features, pieces, parent=None).model_flops(rows)
+                     for pieces in self.modulation_pieces.values())
+        hidden = int(self.features * self.mlp_ratio)
+        block = DoubleStreamBlock(self.features, self.heads, self.head_dim, mlp_hidden=hidden,
+                                   swiglu=True, shared_modulation=True, parent=None)
+        count += self.num_layers * block.multisequence_flops(lengths, context_lengths)
+        single = Flux2SingleBlock(self.features, self.heads, self.head_dim, hidden, parent=None)
+        count += self.num_single_layers * single.model_flops((image + context).astype(np.int64))
+        return count + projection_flops(lengths, self.features, self.out_channels)
+
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
         """Return the flow for the latents `x` at `time` under `conditioning`.
@@ -167,12 +221,13 @@ class Flux2Transformer(nn.Module):
 
         embedded = guided_time(embed, time, conditioning.guidance, guidance_embeds=self.guidance_embeds)
 
-        def modulation(pieces: int, name: str):
-            return Modulation(self.features, pieces, bias=False, dtype=self.dtype, precision=self.precision,
+        def modulation(name: str):
+            return Modulation(self.features, self.modulation_pieces[name], bias=False,
+                              dtype=self.dtype, precision=self.precision,
                               name=name)(embedded)
 
-        mods = (modulation(6, "double_stream_modulation_img"), modulation(6, "double_stream_modulation_txt"))
-        single_mods = modulation(3, "single_stream_modulation")
+        mods = (modulation("double_stream_modulation_img"), modulation("double_stream_modulation_txt"))
+        single_mods = modulation("single_stream_modulation")
         tables = axis_tables(flux2_positions(rows, columns, context.shape[1]), self.axes_dims_rope,
                              self.rope_theta, dtype=np.float64)
         rotation = tuple(jnp.asarray(table[None], at_least_fp32(image.dtype)) for table in tables)
@@ -190,7 +245,7 @@ class Flux2Transformer(nn.Module):
                                       name=f"single_transformer_blocks_{index}", **block)(
                 joined, single_mods, rotation)
         image = joined[:, context.shape[1]:]
-        scale, shift = modulation(2, "norm_out")
+        scale, shift = modulation("norm_out")
         image = modulate(layer_norm(self.dtype, self.eps)(image), shift, scale)
         out = nn.Dense(self.out_channels, name="proj_out", **dense)(image)
         return out.reshape(batch, rows, columns, self.out_channels)

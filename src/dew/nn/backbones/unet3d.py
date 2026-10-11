@@ -10,11 +10,13 @@ point and training only has to learn motion.
 
 
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from ..attention import NormalAttention, RMSNorm
 from ..dit import ROPE_THETA
+from ..flops import MissingFlopsCount, projection_flops
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from .unet import Unet, unet_body
@@ -30,6 +32,11 @@ class TemporalBlock(nn.Module):
     norm_epsilon: float = 1e-5
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        attention = NormalAttention(input_features, self.heads, input_features // self.heads, parent=None)
+        return attention.model_flops(lengths) + projection_flops(lengths, input_features, input_features)
 
     @nn.compact
     def __call__(self, x, frames: int):
@@ -69,6 +76,25 @@ class UNet3D(Unet):
     directly.
     """
     temporal_heads: int = 8
+
+    @nn.nowrap
+    def spatial_flops(self, sample_shape: tuple[int, ...], rows: int, context_lengths=None,
+                       text_features: int | None = None) -> float:
+        """Spatial UNet per frame and temporal attention at each walked level."""
+        if len(sample_shape) != 4:
+            raise MissingFlopsCount("UNet3D needs [frames, height, width, channels] geometry")
+        frames, height, width, _ = sample_shape
+        text = None if context_lengths is None else np.repeat(context_lengths, frames)
+        count = super().spatial_flops(sample_shape[1:], rows * frames, text, text_features)
+        for level, features in enumerate(self.feature_depths):
+            tokens = np.full((rows * height * width // 4**level,), frames, np.int64)
+            down_features = self.feature_depths[max(0, level - 1)]
+            for channels in (down_features, features):
+                count += TemporalBlock(self.temporal_heads, parent=None).model_flops(tokens, channels)
+            if level == len(self.feature_depths) - 1:
+                middle = TemporalBlock(self.temporal_heads, parent=None).model_flops(tokens, features)
+                count += self.num_middle_res_blocks * middle
+        return count
 
     @nn.compact
     def __call__(self, x, temb, textcontext=None, train: bool = False):

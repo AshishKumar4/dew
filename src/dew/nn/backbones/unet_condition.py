@@ -5,16 +5,19 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import FlaxFeedForward, LayerNorm, NormalAttention
 from dew.nn.blocks import ResidualBlock, sinusoidal_time, torch_nearest_resize
 from dew.nn.conv import Conv
+from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.precision import at_least_fp32
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
+    from dew.inputs.encoders import ConditionWork
 
 
 @dataclass(frozen=True)
@@ -39,6 +42,10 @@ class _TimeMLP(nn.Module):
     features: int
     dtype: Dtype
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return projection_flops(lengths, input_features + self.features, self.features)
 
     @nn.compact
     def __call__(self, x):
@@ -100,6 +107,17 @@ class _SpatialAttention(nn.Module):
     norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
 
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths, text_features: int) -> float:
+        """Spatial input/output maps and every configured transformer sublayer."""
+        width = self.stage.features
+        attention = NormalAttention(width, self.stage.heads, width // self.stage.heads, parent=None)
+        crossed = attention.cross_flops(lengths, context_lengths, text_features)
+        first = crossed if self.stage.cross_only else attention.model_flops(lengths)
+        feedforward = FlaxFeedForward(width, parent=None).model_flops(lengths)
+        return (2 * projection_flops(lengths, width, width)
+                + self.stage.depth * (first + crossed + feedforward))
+
     @nn.compact
     def __call__(self, x, context, *, train=False):
         residual = x
@@ -150,6 +168,12 @@ class _Level(nn.Module):
     attention_norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
 
+    @nn.nowrap
+    def _resize_conv(self, **scope):
+        stride = (2, 2) if self.direction == "down" else (1, 1)
+        return Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
+                    dtype=self.dtype, precision=self.precision, **scope)
+
     @nn.compact
     def __call__(self, x, time, context, skips=(), *, upsample_shape=None, train=False):
         outputs = []
@@ -185,9 +209,7 @@ class _Level(nn.Module):
                     raise ValueError("Upsampling requires the next skip spatial shape")
                 height, width = upsample_shape
                 x = torch_nearest_resize(x, height, width)
-            stride = (2, 2) if self.direction == "down" else (1, 1)
-            x = Conv(self.stage.features, (3, 3), strides=stride, padding=((1, 1), (1, 1)),
-                     dtype=self.dtype, precision=self.precision, name="resize")(x)
+            x = self._resize_conv(name="resize")(x)
             outputs.append(x)
         return x, tuple(outputs)
 
@@ -218,6 +240,89 @@ class UNet2DCondition(nn.Module):
     attention_norm_epsilon: float = 1e-5
     approximate_gelu: bool = True
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("UNet2DCondition needs spatial_flops with image/text/pooled geometry")
+
+    @property
+    def time_features(self) -> int:
+        return self.stages[0].features * 4
+
+    @nn.nowrap
+    def _convolution(self, features: int, **scope):
+        return Conv(features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+
+    @nn.nowrap
+    def conditioned_spatial_flops(self, sample_shape: tuple[int, ...], rows: int,
+                                   condition: ConditionWork) -> float:
+        additional = None
+        if self.additional_time_features:
+            if condition.pooled_features is None or condition.time_ids is None:
+                raise MissingFlopsCount("UNet2DCondition needs pooled width and the number of time ids")
+            additional = condition.pooled_features + condition.time_ids * self.additional_time_features
+        return self.spatial_flops(sample_shape, rows, condition.lengths, condition.features,
+                                  additional_features=additional)
+
+    @nn.nowrap
+    def spatial_flops(self, sample_shape: tuple[int, ...], rows: int, context_lengths=None,
+                       text_features: int | None = None, *, additional_features: int | None = None) -> float:
+        """The residual/attention stage walk, including every resizer and skip width."""
+        if len(sample_shape) != 3 or context_lengths is None or text_features is None:
+            raise MissingFlopsCount("UNet2DCondition needs [height,width,channels] and text geometry")
+        height, width, _ = sample_shape
+        first = self.stages[0].features
+        row = np.ones((rows,), np.int64)
+        time = _TimeMLP(self.time_features, self.dtype, parent=None)
+        count = time.model_flops(row, first)
+        if self.additional_time_features:
+            if additional_features is None:
+                raise MissingFlopsCount("UNet2DCondition needs pooled width plus sinusoidal time-id width")
+            count += time.model_flops(row, additional_features)
+        area = row * height * width
+        count += self._convolution(first, parent=None).model_flops(area, self.in_channels)
+        channels, skips = first, [(first, height, width)]
+
+        def attention(stage, area):
+            if not stage.cross_attention:
+                return 0.0
+            spatial = _SpatialAttention(stage, self.linear_projection, self.dropout, self.dtype, parent=None)
+            return spatial.cross_flops(area, context_lengths, text_features)
+
+        def resize(stage, area, direction):
+            level = _Level(stage, self.blocks_per_level, direction, resize=True,
+                           linear_projection=self.linear_projection, dropout=self.dropout,
+                           dtype=self.dtype, parent=None)
+            return level._resize_conv(parent=None).model_flops(area, stage.features)
+
+        for level, stage in enumerate(self.stages):
+            for _ in range(self.blocks_per_level):
+                count += ResidualBlock(stage.features, parent=None).model_flops(
+                    area, channels, self.time_features)
+                channels = stage.features
+                count += attention(stage, area)
+                skips.append((channels, height, width))
+            if level < len(self.stages) - 1:
+                height, width = (height + 1) // 2, (width + 1) // 2
+                area = row * height * width
+                count += resize(stage, area, "down")
+                skips.append((channels, height, width))
+        if self.middle_attention:
+            stage = self.stages[-1]
+            count += 2 * ResidualBlock(channels, parent=None).model_flops(area, channels, self.time_features)
+            count += attention(UNetStage(stage.features, stage.heads, stage.depth), area)
+        for level, stage in enumerate(reversed(self.stages)):
+            for _ in range(self.blocks_per_level + 1):
+                skip, _, _ = skips.pop()
+                count += ResidualBlock(stage.features, parent=None).model_flops(
+                    area, channels + skip, self.time_features)
+                channels = stage.features
+                count += attention(stage, area)
+            if level < len(self.stages) - 1:
+                _, height, width = skips[-1]
+                area = row * height * width
+                count += resize(stage, area, "up")
+        return count + self._convolution(self.out_channels, parent=None).model_flops(area, channels)
+
     @property
     def text_keyword(self) -> str:
         """Every call takes the text as `conditioning`, which every attention stage cross-attends to."""
@@ -236,7 +341,7 @@ class UNet2DCondition(nn.Module):
         first = self.stages[0].features
         time = sinusoidal_time(time, first, dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                cosine_first=self.cosine_first)
-        time = _TimeMLP(first * 4, self.dtype, self.precision, name="time")(time)
+        time = _TimeMLP(self.time_features, self.dtype, self.precision, name="time")(time)
         if self.additional_time_features:
             if conditioning.pooled is None or conditioning.time_ids is None:
                 raise ValueError("This UNet needs pooled text and size/aesthetic conditioning")
@@ -244,8 +349,9 @@ class UNet2DCondition(nn.Module):
                                   dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                   cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
-            time = time + _TimeMLP(first * 4, self.dtype, self.precision, name="additional_time")(extra)
-        x = Conv(first, (3, 3), dtype=self.dtype, precision=self.precision, name="input")(x)
+            time = time + _TimeMLP(self.time_features, self.dtype, self.precision,
+                                   name="additional_time")(extra)
+        x = self._convolution(first, name="input")(x)
         skips = [x]
         for index, stage in enumerate(self.stages):
             x, outputs = _Level(stage, self.blocks_per_level, "down", index + 1 < len(self.stages),
@@ -309,4 +415,4 @@ class UNet2DCondition(nn.Module):
             )(x, time, conditioning.context, inputs, upsample_shape=target, train=train)
         x = nn.silu(nn.GroupNorm(self.norm_groups, epsilon=self.norm_epsilon, dtype=self.dtype,
                                   name="output_norm")(x))
-        return Conv(self.out_channels, (3, 3), dtype=self.dtype, precision=self.precision, name="output")(x)
+        return self._convolution(self.out_channels, name="output")(x)

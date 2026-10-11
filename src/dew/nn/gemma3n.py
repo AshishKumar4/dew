@@ -24,6 +24,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
+from dew.nn.flops import projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 
@@ -114,12 +115,21 @@ class LaurelBlock(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        return sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        return {'linear_left': (self.emb_features, self.rank), 'linear_right': (self.rank, self.emb_features)}
+
     @nn.compact
     def __call__(self, x):
         dense = functools.partial(nn.Dense, use_bias=False, dtype=self.dtype,
                                   precision=self.precision)
-        low = dense(self.rank, name='linear_left')(x)
-        projected = dense(self.emb_features, name='linear_right')(low)
+        maps = self.projections()
+        low = dense(maps['linear_left'][1], name='linear_left')(x)
+        projected = dense(maps['linear_right'][1], name='linear_right')(low)
         return x + RMSNorm(epsilon=self.norm_eps, dtype=self.dtype,
                            name='post_laurel_norm')(projected)
 
@@ -173,15 +183,29 @@ class AltUpLayer(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        copies = self.spec.num_inputs
+        return {'modality_router': (self.emb_features, copies), 'correction_coefs': (copies, copies),
+                'prediction_coefs': (copies, copies * copies)}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Both router reads, coefficient maps and the prediction's copy contraction."""
+        maps = self.projections()
+        return (sum(projection_flops(lengths, *shape) for shape in maps.values())
+                + projection_flops(lengths, *maps['modality_router'])
+                + projection_flops(lengths, self.spec.num_inputs, self.spec.num_inputs * self.emb_features))
+
     def setup(self):
-        n = self.spec.num_inputs
+        maps = self.projections()
         coefficients = functools.partial(
             _Coefficients, clip=self.spec.coef_clip, dtype=self.dtype, precision=self.precision)
         self.correct_output_scale = self.param(
             'correct_output_scale', nn.initializers.zeros, (self.emb_features,), jnp.float32)
-        self.correction_coefs = coefficients(n, name='correction_coefs')
-        self.prediction_coefs = coefficients(n * n, name='prediction_coefs')
-        self.modality_router = nn.Dense(n, use_bias=False, dtype=self.dtype,
+        self.correction_coefs = coefficients(maps['correction_coefs'][1], name='correction_coefs')
+        self.prediction_coefs = coefficients(maps['prediction_coefs'][1], name='prediction_coefs')
+        self.modality_router = nn.Dense(maps['modality_router'][1], use_bias=False, dtype=self.dtype,
                                         precision=self.precision, name='modality_router')
         self.router_norm = RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name='router_norm')
 

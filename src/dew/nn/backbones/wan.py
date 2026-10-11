@@ -29,15 +29,16 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import LayerNorm, RMSNorm, scaled_dot_product_attention
+from dew.nn.attention import LayerNorm, NormalAttention, RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import Conv
+from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
 from .decoder_block import GatedMLP
-from .joint import Modulation, embedding, layer_norm, modulate
+from .joint import Modulation, embedding, embedding_flops, layer_norm, modulate
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -79,6 +80,17 @@ class WanAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        return NormalAttention(self.heads * self.head_dim, self.heads, self.head_dim,
+                               parent=None).model_flops(lengths)
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths) -> float:
+        inner = self.heads * self.head_dim
+        return NormalAttention(inner, self.heads, self.head_dim, parent=None).cross_flops(
+            lengths, context_lengths, inner)
 
     def _projected(self, name: str, x, *, norm: str | None = None):
         projected = nn.Dense(self.heads * self.head_dim, dtype=self.dtype, precision=self.precision,
@@ -126,6 +138,29 @@ class WanBlock(nn.Module):
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def _attention(self, name=None):
+        return WanAttention(self.heads, self.features // self.heads, qk_norm=self.qk_norm,
+                            epsilon=self.epsilon, dtype=self.dtype, precision=self.precision,
+                            attention_impl=self.attention_impl, name=name)
+
+    @nn.nowrap
+    def _feed_forward(self, name=None):
+        return GatedMLP(self.ffn_dim, self.features, activation="gelu", use_bias=True, dtype=self.dtype,
+                        precision=self.precision, name=name)
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("WanBlock requires multisequence_flops(video_lengths, text_lengths)")
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """Self-attention, cross-attention maps/products and the ungated FFN."""
+        matching_lengths(lengths, context_lengths)
+        attention = self._attention()
+        return (attention.model_flops(lengths) + attention.cross_flops(lengths, context_lengths)
+                + self._feed_forward().model_flops(lengths))
+
     @nn.compact
     def __call__(self, x, context, modulation, rotation):
         wide = at_least_fp32(self.dtype)
@@ -133,19 +168,15 @@ class WanBlock(nn.Module):
                            (1, 6, self.features), jnp.float32)
         pieces = table.astype(wide) + modulation.astype(wide)
         shift, scale, gate, shift_mlp, scale_mlp, gate_mlp = (pieces[:, index] for index in range(6))
-        attention = {"qk_norm": self.qk_norm, "epsilon": self.epsilon, "dtype": self.dtype,
-                     "precision": self.precision, "attention_impl": self.attention_impl}
-        head_dim = self.features // self.heads
         norm = layer_norm(wide, self.epsilon)
 
-        attended = WanAttention(self.heads, head_dim, name="attn1", **attention)(
+        attended = self._attention("attn1")(
             modulate(norm(x), shift, scale).astype(x.dtype), rotation=rotation)
         x = (x.astype(wide) + attended * gate[:, None]).astype(x.dtype)
         normalized = (LayerNorm(epsilon=self.epsilon, dtype=x.dtype, name="norm2")(x)
                       if self.cross_attn_norm else x)
-        x = x + WanAttention(self.heads, head_dim, name="attn2", **attention)(normalized, context)
-        fed = GatedMLP(self.ffn_dim, self.features, activation="gelu", use_bias=True, dtype=self.dtype,
-                       precision=self.precision, name="ffn")(
+        x = x + self._attention("attn2")(normalized, context)
+        fed = self._feed_forward("ffn")(
             modulate(norm(x), shift_mlp, scale_mlp).astype(x.dtype))
         return (x.astype(wide) + fed.astype(wide) * gate_mlp[:, None]).astype(x.dtype)
 
@@ -192,6 +223,32 @@ class WanTransformer(nn.Module):
         """Every call takes the text as `conditioning`, which every block cross-attends to."""
         return "conditioning"
 
+    @nn.nowrap
+    def _modulation(self):
+        return Modulation(self.features, 6, dtype=self.dtype, precision=self.precision, name="time_proj")
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("WanTransformer requires multisequence_flops(video_lengths, text_lengths)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, tuple(self.patch_size), rows)
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """Every video/text/time projection and the shared sixfold time modulation."""
+        image, _ = matching_lengths(lengths, context_lengths)
+        rows = np.ones(image.shape, np.int64)
+        patch = int(np.prod(self.patch_size))
+        count = (projection_flops(lengths, patch * self.in_channels, self.features)
+                 + embedding_flops(context_lengths, self.text_dim, self.features)
+                 + embedding_flops(rows, self.freq_dim, self.features)
+                 + self._modulation().model_flops(rows))
+        block = WanBlock(self.features, self.num_attention_heads, self.ffn_dim, parent=None)
+        return (count + self.num_layers * block.multisequence_flops(lengths, context_lengths)
+                + projection_flops(lengths, self.features, patch * self.out_channels))
+
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
         """Return the flow for the latent `x` at `time` under `conditioning`.
@@ -227,7 +284,7 @@ class WanTransformer(nn.Module):
         sinusoids = sinusoidal_time(time, self.freq_dim, dtype=wide)
         embedded = embedding(sinusoids, self.features, "time_embedder", dtype=wide,
                              precision=self.precision).astype(tokens.dtype)
-        modulation = jnp.stack(Modulation(self.features, 6, name="time_proj", **dense)(embedded), axis=1)
+        modulation = jnp.stack(self._modulation()(embedded), axis=1)
         context = embedding(conditioning.context, self.features, "text_embedder",
                             activation=lambda hidden: nn.gelu(hidden, approximate=True), **dense)
         rotation = tuple(jnp.asarray(table[None], wide)
