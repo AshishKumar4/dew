@@ -21,6 +21,9 @@ from dew.decision.objective import DecisionObjective
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
+from dew.nn.backbones.dit import SimpleDiT
+from dew.nn.backbones.jepa import FactorizedTokenStack, JepaEncoder, JepaPredictor, TokenStack
+from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
 from dew.nn.flops import MissingFlopsCount, attention_flops, counted_flops, delta_flops, projection_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
@@ -31,6 +34,7 @@ from dew.nn.mixers.mamba import Mamba
 from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import Counted, CountedLogits
+from dew.nn.ssm import BidirectionalS5Layer, S5Layer
 from dew.objectives.lm import LMObjective
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
@@ -52,6 +56,12 @@ def test_dense_and_attention_equations_use_each_real_length():
     assert attention_flops(LENGTHS, 2, 4, 4, causal=False) == 4 * 2 * 4 * (4 + 25)
     assert projection_flops(np.array([2**32], np.int64), 8192, 16384) == 2.0 * 8192 * 16384 * 2**32
     assert attention_flops(np.array([2**32], np.int64), 2, 4, 4, causal=True) == 16.0 * 2**64
+
+
+def test_windowed_and_chunked_attention_do_not_count_unread_pairs():
+    lengths = np.array([8], np.int64)
+    assert attention_flops(lengths, 2, 4, 4, causal=True, window=4) == 32 * (8 * 4 - 4 * 4 / 2)
+    assert attention_flops(lengths, 2, 4, 4, causal=True, chunk=4) == 16 * (4 * 4 + 4 * 4)
 
 
 @pytest.mark.parametrize("lengths", [np.array([-1]), np.array([1.5]), np.array([[2, 5]])])
@@ -85,6 +95,41 @@ def test_other_recurrences_declare_additive_real_token_work(module):
     one = module.model_flops(np.asarray([1], np.int64))
     assert one > 0
     assert module.model_flops(LENGTHS) == 7 * one
+
+
+def test_s5_real_maps_complex_recurrence_and_bidirectional_output():
+    one = S5Layer(8, 4)
+    assert one.model_flops(LENGTHS) == (8 * 8 * 4 + 8 * 4 + 2 * 8) * 7
+    assert BidirectionalS5Layer(8, 4).model_flops(LENGTHS) == 2 * one.model_flops(LENGTHS) + 4 * 8 * 8 * 7
+
+
+def test_dit_counts_routed_tokens_modulation_and_output_but_not_remat():
+    model = SimpleDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2)
+    block = 24 * 8 * 8 * 7 + 4 * 8 * 29 + 12 * 8 * 8 * 2
+    output = 2 * 8 * 4 * 3 * 7
+    assert model.model_flops(LENGTHS) == 2 * block + output
+    assert model.clone(remat='full').model_flops(LENGTHS) == model.model_flops(LENGTHS)
+    routed = model.clone(routes=((0.5, 0, 0),))
+    shortened = 24 * 8 * 8 * 4 + 4 * 8 * (1 + 9) + 12 * 8 * 8 * 2
+    assert routed.model_flops(LENGTHS) == shortened + block + output
+    hybrid = HybridSSMAttentionDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2,
+                                   ssm_state_dim=4, ssm_attention_ratio="all-ssm")
+    ssm = BidirectionalS5Layer(8, 4).model_flops(LENGTHS)
+    assert hybrid.model_flops(LENGTHS) == 2 * (ssm + 16 * 8 * 8 * 7 + 12 * 8 * 8 * 2) + output
+
+
+def test_jepa_supplies_context_target_and_factorized_geometry_explicitly():
+    stack = TokenStack(8, 2, num_heads=2)
+    encoder = JepaEncoder(emb_features=8, num_layers=2, num_heads=2)
+    assert encoder.model_flops(LENGTHS) == stack.model_flops(LENGTHS)
+    factorized = FactorizedTokenStack(8, 2, num_heads=2)
+    with pytest.raises(MissingFlopsCount, match="spatiotemporal_flops"):
+        factorized.model_flops(np.array([10]))
+    assert factorized.spatiotemporal_flops(np.array([2]), np.array([5])) == (
+        stack.model_flops(np.array([5, 5])) + stack.model_flops(np.array([2] * 5)))
+    predictor = JepaPredictor(emb_features=16, predictor_features=8, num_layers=2, num_heads=2)
+    assert predictor.multisequence_flops(np.array([3]), np.array([2])) == (
+        stack.model_flops(np.array([5])) + 2 * 16 * 8 * 5)
 
 
 def test_dense_mlp_gate_and_active_experts_are_counted():

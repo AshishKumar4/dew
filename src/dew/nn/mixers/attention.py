@@ -294,8 +294,10 @@ class CausalSelfAttention(nn.Module):
         kv = 0 if self.kv_shared else self.num_kv_heads * (
             self.head_dim + (0 if self.k_eq_v else self.value_dim))
         output = self.num_heads * self.value_dim
+        window = self.sliding_window if self.causal or self.bidirectional_window else None
         return (projection_flops(lengths, self.emb_features, query + kv + output)
-                + attention_flops(lengths, self.num_heads, self.head_dim, self.value_dim, causal=self.causal))
+                + attention_flops(lengths, self.num_heads, self.head_dim, self.value_dim, causal=self.causal,
+                                  window=window, chunk=self.attention_chunk))
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its query, key and value projections packed as `qkv_proj`

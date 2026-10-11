@@ -47,6 +47,13 @@ class GptOssExperts(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Three maps per expert assignment; lengths count dispatched rows."""
+        if self.capacity_factor is not None:
+            raise MissingFlopsCount("GptOssExperts needs admitted expert counts when capacity drops tokens")
+        return 3 * projection_flops(lengths, self.hidden_size, self.intermediate_size)
+
     @nn.compact
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
         initializer = nn.initializers.variance_scaling(
