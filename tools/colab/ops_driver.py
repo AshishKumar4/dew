@@ -151,7 +151,7 @@ class Driver:
             "from tools.colab.colab_sync import snapshot\n"
             f"manifest,count=snapshot({home + '/dew'!r},{job['outputs']!r},{known!r},"
             f"{home + '/sync.tar.gz'!r},policy={job['artifact_policy']!r},"
-            f"excludes={job.get('artifact_excludes', [])!r})\n"
+            f"excludes={job.get('artifact_excludes', [])!r},include_raw={job.get('raw_profiles', False)!r})\n"
             "print('SYNC',json.dumps([manifest,count]))\n"
         )
         output = self.control(session, script, timeout=600, live_read=True)
@@ -184,6 +184,7 @@ class Driver:
             "results": str(target),
             "commit": job["commit"],
             "driver_sha": plan["driver_sha"],
+            "profile_analysis": status.get("profile_analysis"),
             "seconds": status["seconds"],
             "stage_seconds": status["stage_seconds"],
             "finished_at": time.time(),
