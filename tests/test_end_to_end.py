@@ -579,7 +579,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import TFDSImages
+    from dew.data import Images
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 
     for name in ("tiny_diffusers", "rae"):
@@ -588,7 +588,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=32), preset=presets.Flow(), val_metrics=(),
+        data=Images(source="tfds://oxford_flowers102", image_size=32), preset=presets.Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),

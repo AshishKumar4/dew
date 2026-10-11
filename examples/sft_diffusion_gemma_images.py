@@ -34,12 +34,12 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data import ByteTokenizer, DataPartition, HFImages, HFOptions, Loading
-from dew.data.dataset import mapped
+from dew.data import Augment, ByteTokenizer, DataPartition, Files, Images, Loading, load
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import Perplexity
+from dew.records import record as read_record, strings
 from dew.training import MeshSpec, prepare_process
 from dew.training.optim import Cosine
 
@@ -97,6 +97,15 @@ def model_config(config: Config):
 
 def caption(name: str) -> str:
     return "a photo of a " + name
+
+
+@dataclass(frozen=True)
+class CaptionLayout:
+    config: Config
+    labels: tuple[str, ...]
+
+    def __call__(self, batch):
+        return caption_batch(batch, self.config, self.labels)
 
 
 def caption_batch(batch, config: Config, labels):
@@ -190,16 +199,23 @@ def main(config: Config) -> Path:
     (config.out / "data").mkdir(parents=True, exist_ok=True)
     files = smoke_splits(config) if config.smoke else staged_splits(config)
     # Train on train + validation, score on test, which the run never reads.
-    spec = HFImages(name="parquet", split="train+validation", val_split="test", caption_columns=(),
-                    options=HFOptions(data_files=files, cache_dir=str(config.out / "data" / "cache")),
-                    image_size=config.image_size, augmentation="flip_only", crop_scale=(0.6, 1.0),
-                    augmentation_size=config.staging_size, val_batches=None,
-                    loading=Loading(workers=0, threads=1 if config.smoke else 8))
-    labels = [name.strip() for name in spec.source().features["label"].names]
+    import pyarrow.parquet as pq
+
+    spec = Images(source=Files((files["train"], files["validation"]), format="parquet"),
+                  validation=Files(files["test"], format="parquet"), caption_columns=(),
+                  image_size=config.image_size, staging_size=config.staging_size,
+                  augment=Augment(flip=True, crop_scale=(0.6, 1.0)))
+    metadata = pq.read_schema(files["train"]).metadata
+    if metadata is None or b"huggingface" not in metadata:
+        raise ValueError("the staged Parquet must record its label names")
+    info = read_record(read_record(json.loads(metadata[b"huggingface"]), "HF schema")["info"], "info")
+    features = read_record(info["features"], "features")
+    labels = tuple(name.strip() for name in strings(read_record(features["label"], "label")["names"], "label names"))
     record = model_config(config)
     model = build(record, dtype="float32" if config.smoke else "bfloat16")
     run = RunConfig(
         model=ModelConfig.from_model(model), data=spec,
+        loading=Loading(workers=0, threads=1 if config.smoke else 8),
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
                                                       "pad_token_id": PAD}),
         optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, schedule=Cosine(
@@ -212,9 +228,8 @@ def main(config: Config) -> Path:
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
                     run.trainer.compilation_cache_dir, layout=run.trainer.layout)
     objective = run.objective.build(model=model)
-    images = spec.load(batch=run.trainer.batch_size)
-    data = replace(images, train=mapped(images.train, lambda batch: caption_batch(batch, config, labels)),
-                   val=mapped(images.val, lambda batch: caption_batch(batch, config, labels)))
+    data = load(spec, batch=run.trainer.batch_size, read="memory", loading=run.loading,
+                host=(CaptionLayout(config, labels),))
     started = time.perf_counter()
     name = "flowers-caption"
     run.train(objective, data, name=name, metrics=(Perplexity(),),
@@ -243,7 +258,7 @@ def main(config: Config) -> Path:
                 correct += text == caption(labels[int(label)])
     finally:
         stream.close()
-    report = {"dataset": config.dataset, "train_images": images.records, "test_images": len(captions),
+    report = {"dataset": config.dataset, "train_images": data.records, "test_images": len(captions),
               "classes": len(labels), "device": jax.devices()[0].device_kind, "steps": config.steps,
               "batch_size": config.batch_size, "train_seconds": round(trained - started, 1),
               "caption_accuracy": correct / len(captions), "captions": captions[:32]}

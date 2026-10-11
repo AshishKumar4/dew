@@ -22,7 +22,7 @@ import dew
 import dew.nn.backbones  # registers the models
 from dew.artifacts import VideoGrid
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.data import ByteTokenizer, Dataset, TFDSImages, VideoDataset
+from dew.data import ByteTokenizer, Dataset, Images as ImageRecipe, Video
 from dew.diffusion import FlowMatchPredictionTransform
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -46,7 +46,7 @@ def run_config(directory, preset=_DEFAULT_RUN_CONFIG_PRESET, encoder=STUB_TEXT, 
     text condition names the registered stub encoder by default."""
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {**MODEL, "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=RES),
+        data=ImageRecipe(source="tfds://oxford_flowers102", split="all", image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=8, steps=2, keep=1),
         preset=preset, text=TextCondition(encoder=encoder, checkpoint=checkpoint),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 3}))
@@ -347,7 +347,7 @@ def test_an_unconditional_unet_takes_a_step():
             "norm_groups": 4, "attention_configs": [None, {"heads": 2}]}
     config = DiffusionRunConfig(
         model=ModelConfig("unet", {**unet, "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=16), text=None)
+        data=ImageRecipe(source="tfds://oxford_flowers102", split="all", image_size=16), text=None)
     objective = config.build()
     images = np.zeros((8, 16, 16, 3), np.uint8)
 
@@ -369,7 +369,7 @@ def test_build_eval_metrics_follows_the_sample_field(tmp_path):
     factories read that grid there, and an image-only metric raises a
     ValueError naming it in `build_eval_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
-                                data=VideoDataset(frame_size=8, frames=2),
+                                data=Video(frame_size=8, frames=2),
                                 val_metrics=("psnr",))
     (metric,) = video.build_eval_metrics()
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)

@@ -23,7 +23,7 @@ from reference_error import assert_as_exact_as_the_reference
 from releases import released_sampling
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
-from dew.data import TFDSImages
+from dew.data import Images
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -69,7 +69,7 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     directory = pipelines / family / "pipeline"
     size = 16 if family != "qwen_image" else 32
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                data=TFDSImages(image_size=size), val_metrics=(),
+                                data=Images(source="tfds://oxford_flowers102", image_size=size), val_metrics=(),
                                 objective=ObjectiveConfig("diffusion",
                                                           {"solver": Euler(), "guidance": None, "steps": 2,
                                                            "unconditional_prob": 0.0, "ema_decay": None}))
@@ -107,7 +107,7 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     size = 16 if family != "qwen_image" else 32
     settings = {"guidance": None, "unconditional_prob": 0.25, "ema_decay": None}
     configured = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                    data=TFDSImages(image_size=size), val_metrics=(),
+                                    data=Images(source="tfds://oxford_flowers102", image_size=size), val_metrics=(),
                                     objective=ObjectiveConfig("diffusion", {
                                         "solver": Euler(), "steps": 2, **settings})).build()
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
@@ -136,7 +136,7 @@ def test_a_pretrained_run_refuses_a_preset_of_another_kind(pipelines):
     """Flux was trained as a velocity flow; the default EDM preset is not
     that convention, and a flow preset is."""
     common = {"pretrained": str(pipelines / "flux" / "pipeline"), "model": precision(),
-              "data": TFDSImages(image_size=16), "val_metrics": (),
+              "data": Images(source="tfds://oxford_flowers102", image_size=16), "val_metrics": (),
               "objective": ObjectiveConfig("diffusion", {"solver": Euler(), "guidance": None, "steps": 2})}
     with pytest.raises(ValueError, match="name a preset of its kind"):
         DiffusionRunConfig(**common).build()
@@ -150,7 +150,7 @@ def test_a_pretrained_run_records_its_pipelines_sampling_and_builds_it_after_a_r
     release that defaults a denoiser's sampling otherwise builds the run as
     it sampled."""
     config = DiffusionRunConfig(pretrained=str(pipelines / "sd3" / "pipeline"), preset=None,
-                                model=precision(), data=TFDSImages(image_size=16), val_metrics=(),
+                                model=precision(), data=Images(source="tfds://oxford_flowers102", image_size=16), val_metrics=(),
                                 objective=ObjectiveConfig("diffusion", {"solver": Euler(),
                                                                         "ema_decay": None}))
     objective = config.build()
@@ -165,7 +165,7 @@ def test_a_pretrained_run_records_its_pipelines_sampling_and_builds_it_after_a_r
 
 def flow_run(family: str, size: int, pipelines) -> DiffusionRunConfig:
     return DiffusionRunConfig(pretrained=str(pipelines / family / "pipeline"), preset=None,
-                              model=precision(), data=TFDSImages(image_size=size),
+                              model=precision(), data=Images(source="tfds://oxford_flowers102", image_size=size),
                               val_metrics=(),
                               objective=ObjectiveConfig("diffusion",
                                                         {"solver": Euler(), "guidance": None, "steps": 2}))
@@ -251,7 +251,7 @@ def test_a_scratch_flow_run_shifts_by_the_datas_resolution(size):
     """The preset's resolution shift at the data's 16-pixel token count is
     exp of Diffusers' Flux `calculate_shift` there, to the bit."""
     config = DiffusionRunConfig(preset=Flow(resolution_shift=ResolutionShift()),
-                                data=TFDSImages(image_size=size), text=None,
+                                data=Images(source="tfds://oxford_flowers102", image_size=size), text=None,
                                 model=ModelConfig("simple_dit"), val_metrics=())
     assert config.preset().schedule.shift == flux_shift((size // 16) ** 2)
 
@@ -286,7 +286,7 @@ def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pip
     objective = ObjectiveConfig("diffusion", {"guidance": None, "ema_decay": None})
     configured = DiffusionRunConfig(pretrained=str(pipelines / "flux" / "pipeline"), preset=None,
                                     model=precision(), pretrained_param_dtype="bfloat16",
-                                    data=TFDSImages(image_size=16), val_metrics=(),
+                                    data=Images(source="tfds://oxford_flowers102", image_size=16), val_metrics=(),
                                     objective=objective).build()
     state = Trainer(configured, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
     floating = [leaf for leaf in jax.tree.leaves(state.variables["params"])
@@ -315,7 +315,7 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
             "heads": 2, "head_dim": 12, "joint_attention_dim": 16, "pooled_projection_dim": 10,
             "guidance_embeds": True, "axes_dims_rope": [4, 4, 4],
             "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=8), preset=Flow(), val_metrics=(),
+        data=Images(source="tfds://oxford_flowers102", image_size=8), preset=Flow(), val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(directory)),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
@@ -336,7 +336,7 @@ def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRu
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                          "num_heads": 2, "dtype": "float32", "attention_impl": "xla"}),
-        data=TFDSImages(image_size=4), preset=Flow(), val_metrics=(),
+        data=Images(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("flow_grpo",
