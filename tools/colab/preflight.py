@@ -857,7 +857,9 @@ def runtime_gate(texts: dict[str, str], command: str) -> str | None:
     for name, text in [("<command>", command), *texts.items()]:
         if name != "<command>" and not name.endswith(SCRIPTS[1:]):
             continue
-        lines, stops = text.splitlines(), False
+        # A comment names what the script runs without running it.
+        lines = [re.sub(r"(^|\s)#.*", "", line) for line in text.splitlines()]
+        stops = False
         for number, line in enumerate(lines, 1):
             stops = stops or re.match(r"\s*set\s+-\w*e", line) is not None
             if not GATE.search(line) or not (stops or re.search(r"\|\|\s*(exit|return)\b", line)):
@@ -915,7 +917,9 @@ def geometry(texts: dict[str, str], command: str) -> dict[str, str]:
     leaves the tiny model's widths, and says so."""
     found: dict[str, str] = {}
     for name, flag in GEOMETRY.items():
-        pattern = re.compile(rf"--{flag}[\"'\s,=]+([\w./-]+)")
+        # `--flag value` or `--flag=value` in a shell; `"--flag", "value"` in a Python list, whose value
+        # is a literal only where it is quoted.
+        pattern = re.compile(rf"--{flag}(?:[= ]+[\"']?|[\"']\s*,\s*[\"'])([\w./-]+)")
         for text in [command, *texts.values()]:
             if name not in found and (match := pattern.search(text)) and match[1] != "None":
                 found[name] = match[1]

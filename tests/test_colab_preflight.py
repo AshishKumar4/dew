@@ -451,9 +451,10 @@ def test_a_session_that_trains_only_after_the_lab_gate_stops_it_is_gated_at_runt
     """The gate must stop the session where it fails, by `set -e` before it or `|| exit` on its line,
     and stand before everything that trains, here a staged driver that runs the Clef recipe."""
     driver = {"train.py": "subprocess.run([python, 'recipes/decision/clef.py'])\n"}
-    verified = "set -eu\npython -m tools.kernel_lab.verify --gpu a100 --ref X\n"
+    verified = ("set -eu\n# then train.py, once the gate holds\n"
+                "python -m tools.kernel_lab.verify --gpu a100 --ref X\n")
     gated = {"run.sh": verified + "python -m tools.colab.lab_gate --gpu a100\npython train.py\n", **driver}
-    assert preflight.runtime_gate(gated, "bash run.sh") == "run.sh:3"
+    assert preflight.runtime_gate(gated, "bash run.sh") == "run.sh:4"
     stopped = {"run.sh": "python -m tools.colab.lab_gate --gpu a100 || exit 1\npython train.py\n", **driver}
     assert preflight.runtime_gate(stopped, "bash run.sh") == "run.sh:1"
     for unsafe in ("python -m tools.colab.lab_gate --gpu a100\npython train.py\n",
@@ -488,3 +489,5 @@ def test_the_lowered_step_takes_the_checkpoint_and_rows_the_request_trains():
                                                         "max-len": "3072", "batch": "8"}
     local = "python recipes/decision/clef.py --pretrained /content/ckpt --revision None"
     assert preflight.geometry({}, local) == {"local": "/content/ckpt"}
+    computed = {"c50.py": 'run(["--pretrained", backbone[0], "--max-len", str(row)])\n'}
+    assert preflight.geometry(computed, "python c50.py") == {}
