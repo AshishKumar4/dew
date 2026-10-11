@@ -186,7 +186,9 @@ def _(value: TokenScores) -> Payload:
 def _(value: Decisions) -> Payload:
     import wandb
 
-    table = wandb.Table(columns=["row", "question", "label", "predicted", "p_label"], data=_decided(value))
+    table = wandb.Table(columns=["row", "question", "label", "predicted", "p_label"])
+    for row in _decided(value):
+        table.add_data(*row)
     return {"val/decisions": table}
 
 
