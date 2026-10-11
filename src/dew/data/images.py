@@ -3,14 +3,9 @@
 from __future__ import annotations
 
 import dataclasses
-import functools
 import importlib
-import os
-from typing import Literal
 
 import numpy as np
-
-Augmentation = Literal["none", "flip_only", "flip_jitter"]
 
 
 def import_opencv() -> None:
@@ -58,26 +53,13 @@ def resize_image(image: np.ndarray, size: int) -> np.ndarray:
 
 @dataclasses.dataclass(frozen=True)
 class Augment:
-    """The augmentations an augmentation mode applies.
-
-    'flip_only' sets `flip`, 'flip_jitter' sets both `flip` and `jitter`, and
-    'none' gives no Augment at all.
+    """The host augmentations `augment_image` applies: a random horizontal
+    flip with `flip` and a colour jitter with `jitter`. No Augment at all
+    leaves the image as it is.
     """
 
     flip: bool
     jitter: bool
-
-
-def image_augmentations(mode: Augmentation) -> Augment | None:
-    """The augmentations `mode` names: flip_only (DiT style), flip_jitter,
-    or none (deterministic evaluation and debugging)."""
-    if mode == 'none':
-        return None
-    if mode == 'flip_only':
-        return Augment(flip=True, jitter=False)
-    if mode == 'flip_jitter':
-        return Augment(flip=True, jitter=True)
-    raise ValueError(f"augmentation {mode!r} is not one of none, flip_only, flip_jitter")
 
 
 # ColorJitter(brightness=0.2, contrast=0.05, saturation=0.2, hue=0): the three
@@ -107,26 +89,3 @@ def augment_image(augment: Augment | None, image: np.ndarray,
     factors = np.asarray([rng.uniform(low, high) for low, high in _JITTER_RANGES])
     pixels = jitter_host(image.astype(np.float32), factors, rng.permutation(3))
     return np.rint(pixels).astype(np.uint8)
-
-
-@functools.cache
-def class_names(path: str) -> tuple[str, ...]:
-    """Read the class names of a labels file, one per line.
-
-    The result is cached, so each file is read once per process.
-    """
-    with open(os.path.expanduser(path)) as handle:
-        return tuple(line.strip() for line in handle)
-
-
-def record_caption(element, columns: tuple[str, ...] = ("caption", "text")) -> str:
-    """The caption a record already carries, for datasets that ship their text:
-    the first of `columns` it holds."""
-    for key in columns:
-        if key in element:
-            return element[key]
-    raise KeyError(
-        f"an image record needs one of the columns {list(columns)}, this one has "
-        f"{sorted(element)}")
-
-

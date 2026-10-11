@@ -36,7 +36,6 @@ import numpy as np
 import tyro
 from absl import flags
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
-from numpy.typing import ArrayLike
 
 from dew import position
 from dew.nn.sharding import BATCH_AXES, LayoutRefused
@@ -48,8 +47,6 @@ from dew.objectives.base import VALID_ROWS, Batch
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from _typeshed import DataclassInstance
-
     from dew.data.mix import CorpusCounts
     from dew.data.plan import Plan
 
@@ -58,12 +55,6 @@ if TYPE_CHECKING:
 # would crash on any worker_count > 0 with UnparsedFlagAccessError.
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
-
-
-type Tokenize = Callable[[Sequence[str]], Batch]
-"""A run's caption reader: the batch's captions in, the batch fields its
-conditions want out. The dataset carries the text, the encoder behind this
-decides what tokens it becomes."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,13 +162,6 @@ type Reader = Callable[[DataPartition], Iterator[Batch]]
 """Opens a fresh iterator over one share of every global batch, the share the
 partition names. The iterator is its caller's to close."""
 
-type GrainPipeline = pygrain.MapDataset[Batch] | Callable[[DataPartition], pygrain.IterDataset[Batch]]
-"""An indexed Grain root or a partition-specific iterator factory.
-
-The root determines where a share is cut and what a saved position can be.
-Elements contain one record's fields until Grain stacks them into a batch.
-"""
-
 
 @runtime_checkable
 class Records(Protocol):
@@ -203,82 +187,6 @@ type Indexed = Records | Sequence[Batch]
 """Records read by index: a source that answers grain's two methods, or a
 plain sequence of them. A spec that lists its records in memory hands over
 the sequence, the way the video specs list their clips."""
-
-type InMemory = Mapping[str, ArrayLike] | Indexed
-"""Records a caller holds, for `Records(source=...)`: columns whose first
-axis is the record, or anything `Indexed`."""
-
-
-class Columns:
-    """Reads records from equal-length columns, one row of each column per record.
-
-    The description that a saved position is compared against names the
-    fields, their per-record shapes and dtypes, and the record count. It cannot
-    tell apart two tables with the same layout; no source description can
-    without reading the data.
-    """
-
-    def __init__(self, columns: Mapping[str, ArrayLike]):
-        held = {name: np.asarray(column) for name, column in columns.items()}
-        if not held:
-            raise ValueError("in-memory records need at least one column")
-        first, *_ = held
-        for name, column in held.items():
-            if column.ndim == 0:
-                raise ValueError(
-                    f"column {name!r} is a single value; a column holds one value per "
-                    f"record along its first axis"
-                )
-            if len(column) != len(held[first]):
-                raise ValueError(
-                    f"a column holds one row per record, and {name!r} holds "
-                    f"{len(column)} records and {first!r} holds {len(held[first])}"
-                )
-        self._columns = held
-
-    def __len__(self) -> int:
-        return len(next(iter(self._columns.values())))
-
-    def __getitem__(self, index: int) -> Batch:
-        return {name: column[index] for name, column in self._columns.items()}
-
-    def __repr__(self) -> str:
-        fields = ", ".join(
-            f"{name} {column.dtype}{list(column.shape[1:])}" for name, column in self._columns.items()
-        )
-        return f"Columns({fields}; {len(self)} records)"
-
-
-def in_memory(records: InMemory) -> Indexed:
-    """`records` as a source read by index: columns wrapped, the rest as given."""
-    return Columns(records) if isinstance(records, Mapping) else records
-
-
-def json_argument[Options: DataclassInstance](
-    options: type[Options],
-) -> tyro.constructors.PrimitiveConstructorSpec[Options]:
-    """`options` written as one JSON object on the command line.
-
-    A spec holds a provider's options as one frozen value, and some of that
-    value's fields are the library's own objects: a `datasets.Features`, a
-    tfds decoder tree. Their types are imported on use, so a flag per field
-    would need annotations this process has not resolved and has no spelling
-    for the objects anyway. The whole value is one argument instead, the way
-    a model field holding records is one JSON value.
-    """
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda given: options(**json.loads(given[0])),
-        is_instance=lambda given: isinstance(given, options),
-        # Only for the help text, where a library object is best shown as
-        # itself; nothing reads this back.
-        str_from_instance=lambda given: [
-            json.dumps(
-                {field.name: getattr(given, field.name) for field in dataclasses.fields(given)}, default=repr
-            )
-        ],
-    )
 
 
 def record_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
@@ -532,9 +440,6 @@ class Loading:
             _log.warning("stopping %s grain workers without a progress line: %s", self.workers, refused)
             return None
         return timer
-
-
-_DEFAULT_LOADING = Loading()
 
 
 def _data_statistics() -> Mapping[str, float]:
@@ -867,38 +772,6 @@ def hold_out(
             f"nothing of its {records} records to train on"
         )
     return (SourceSlice(source, held_out, records), SourceSlice(source, 0, held_out))
-
-
-def checked_count(count: int, length: int, name: str) -> int:
-    """`count` records off the head of `name`'s `length`, refused when there
-    are fewer of them than that."""
-    if count > length:
-        raise ValueError(f"count {count} is more than the {length} records of {name}")
-    return count
-
-
-def _refuse_filters(pipeline: pygrain.MapDataset[Batch]) -> None:
-    """Refuse a pipeline holding a `filter`, as grain's `ElasticIterator` does.
-
-    A filter answers None at the indices it drops, so an index range yields
-    fewer records than it spans: a global record count then no longer says
-    where a resumed run starts, and process shares cut by index fill uneven
-    batches. grain names no public type for the filter, so it is read from
-    where grain's own iterator reads it.
-    """
-    from grain._src.python.dataset.transformations.filter import FilterMapDataset
-
-    pending: list[pygrain.MapDataset[Batch]] = [pipeline]
-    while pending:
-        node = pending.pop()
-        if isinstance(node, FilterMapDataset):
-            raise ValueError(
-                "this MapDataset filters its records, and a filter yields fewer records than "
-                "the indices it reads, so a record count cannot say where a resumed run "
-                "starts; filter the records before the source, or pass a function of the "
-                "partition that builds an IterDataset, whose position is grain's own"
-            )
-        pending.extend(node.parents)
 
 
 def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
@@ -1278,31 +1151,6 @@ def _batches[Record](
             )
         )
     return iter(stream)
-
-
-def _shared(
-    source: GrainPipeline,
-    *,
-    rows: int,
-    partition: DataPartition,
-    loading: Loading,
-    offset: int = 0,
-    remainder: bool = False,
-) -> pygrain.DatasetIterator[Batch]:
-    """The partition's share of `source`, in batches of `rows` records.
-
-    A `MapDataset` is read by index, which is what `_batches` needs to cut a
-    share and to start it at a record offset. A pipeline read as it comes has
-    neither, so the caller's function builds the share's own and it is
-    batched where it is. Only the indexed branch is opened at an offset,
-    since only it has a position to resume.
-    """
-    if isinstance(source, pygrain.MapDataset):
-        return _batches(
-            source, rows=rows, partition=partition, loading=loading, offset=offset, remainder=remainder
-        )
-    batches = source(partition).batch(rows, drop_remainder=not remainder)
-    return iter(batches.map(FilledBatch(rows)) if remainder else batches)
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -1924,7 +1772,6 @@ __all__ = [
     "Budgeted",
     "Checkpointable",
     "Closeable",
-    "Columns",
     "Corpus",
     "DataPartition",
     "DataPhase",
@@ -1943,7 +1790,6 @@ __all__ = [
     "SourceSlice",
     "Stage",
     "Stoppable",
-    "Tokenize",
     "mapped",
     "record_argument",
     "train_stream",

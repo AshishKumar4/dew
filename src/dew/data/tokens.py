@@ -1,63 +1,13 @@
-"""Indexed document chunks, first-fit plans and finite reader forwarding."""
+"""Indexed document chunks and first-fit plans."""
 
 from __future__ import annotations
 
-import itertools
-from collections.abc import Iterator
 from typing import overload
 
 import grain.python as pygrain
 import numpy as np
 
-from .dataset import Batch, DataPartition, Forwarding, Reader
-
-
-class _BoundedIterator(Forwarding):
-    """Yields the first `batches` batches of `source` and closes `source`.
-
-    `Forwarding.close` reaches the source, so stopping early still releases
-    the grain workers the source owns.
-    """
-
-    def __init__(self, source: Iterator[Batch], batches: int):
-        self._source: Iterator[Batch] | None = source
-        self._iterator: Iterator[Batch] = itertools.islice(source, batches)
-
-    @property
-    def endless(self) -> bool:
-        return False
-
-    def __iter__(self):
-        return self
-
-    def __next__(self):
-        return next(self._iterator)
-
-    def close(self):
-        try:
-            super().close()
-        finally:
-            self._iterator = iter(())
-            self._source = None
-
-
-def bounded(stream: Reader, batches: int | None) -> Reader:
-    """`stream` stopped after `batches` batches, or `stream` itself when `batches` is None.
-
-    The wrapper forwards close to the source, so a caller that stops early
-    still releases the grain workers the stream owns.
-    """
-    if batches is None:
-        return stream
-    if batches < 0:
-        raise ValueError("validation batch limit must be nonnegative")
-    if batches == 0:
-        return lambda partition: iter(())
-
-    def first(partition: DataPartition) -> Iterator[Batch]:
-        return _BoundedIterator(stream(partition), batches)
-
-    return first
+from .dataset import Batch
 
 
 def chunk_counts(lengths, chunk_len: int):
