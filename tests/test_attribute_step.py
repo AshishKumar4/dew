@@ -216,3 +216,110 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     assert time["by_kind_ms"] == {"attention": 6.0, "pallas": 2.0, "layout": 1.0, "gemm": 0.5}
     assert time["by_part_kind_ms"]["attention"] == {"attention": 6.0}
     assert time["by_part_kind_ms"]["mlp"] == {"gemm": 0.5}
+
+
+def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
+    """XProf's roofline gives an RTX PRO 6000 a 3,742 TFLOP/s peak, a sparse low-precision figure:
+    every MFU field reads Dew's dense bf16 table where the entry names the device, and none is
+    written where it does not, XProf's figure kept beside for reference."""
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info"]
+    cells = ("15", "custom-call", "custom-call.1", "%custom-call.1 = bf16[8,8]{1,0} custom-call()",
+             "jit(step)/dot_general", "1", 1000.0, "")
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": [{"c": [{"v": v} for v in cells]}]}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
+    entry = tmp_path / "entry.json"
+    entry.write_text(json.dumps({"model_flops_per_step": 2.5e11,
+                                 "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition"}))
+    out = tmp_path / "attribution.json"
+    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    assert attribute.main(command) == 0
+    time = json.loads(out.read_text())["time"]
+    assert time["peak_gflops"] == 500e3 and time["peak_source"].startswith("dew.telemetry.peaks")
+    assert time["mfu_bf16_of_device_time"] == time["mfu_mixed_of_device_time"] == 0.5
+    assert time["bf16_equiv_throughput_tflops"] == 250.0
+    entry.write_text(json.dumps({"model_flops_per_step": 2.5e11}))
+    assert attribute.main(command) == 0
+    time = json.loads(out.read_text())["time"]
+    assert time["peak_source"] == "no device named" and time["xprof_peak_gflops"] == 3742430.0
+    assert (time["peak_gflops"], time["mfu_bf16_of_device_time"], time["mfu_mixed_of_device_time"],
+            time["gemm_lost_ms"], time["gemm_fraction_of_peak"]) == (None, None, None, None, None)
+    assert time["device_ms_per_step"] == 1.0
+
+
+def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
+    """With an FP8 GEMM in the step, mfu_bf16 is a bf16-equivalent throughput, and mfu_mixed takes
+    that GEMM's FLOPs over the FP8 peak; with no FP8 peak for the device, mfu_mixed is unknown."""
+    from dew.telemetry import peaks
+
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info", "normalized_flop_rate"]
+    cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = bf16[8,8]{1,0} custom-call('
+              'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
+              "jit(step)/dot_general", "1", 1000.0, "", 1.0e5),
+             ("15", "custom-call", "custom-call.2", '%custom-call.2 = bf16[8,8]{1,0} custom-call('
+              'bf16[8,8]{1,0} %a, bf16[8,8]{1,0} %b), custom_call_target="__cublas$gemm"',
+              "jit(step)/dot_general", "1", 1000.0, "", 1.0e5)]
+    rows = [{"c": [{"v": v} for v in row]} for row in cells]
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": rows}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
+    entry = tmp_path / "entry.json"
+    entry.write_text(json.dumps({"model_flops_per_step": 2e11, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
+    out = tmp_path / "attribution.json"
+    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    assert attribute.main(command) == 0
+    time = json.loads(out.read_text())["time"]
+    # 1e5 GFLOP/s for 1 ms is 1e11 FLOPs on FP8 of the 2e11 the model does, over 2 ms.
+    assert time["fp8_gemm_flops_per_step"] == 1e11 and time["mfu_mixed_of_device_time"] is None
+    assert time["mfu_bf16_of_device_time"] == 0.2 and time["bf16_equiv_throughput_tflops"] == 100.0
+    monkeypatch.setitem(peaks.PEAK_FP8_FLOPS_PER_DEVICE, "NVIDIA RTX PRO 6000 Blackwell", 1000e12)
+    assert attribute.main(command) == 0
+    # 1e11 / 5e14 + 1e11 / 1e15 over 2 ms.
+    assert json.loads(out.read_text())["time"]["mfu_mixed_of_device_time"] == 0.15
+def test_a_module_read_as_it_streams_is_the_module_read_whole():
+    """Line by line, with the metadata kept only as traced names: the same instructions, kinds and
+    traced names as the whole text, braces inside a quoted op_name included."""
+    quoted = MODULE.replace('kind=kInput, calls=%fused_reduce.89',
+                            'kind=kInput, calls=%fused_reduce.89, metadata={op_name="jit(step)/a{b}" '
+                            'source_file="x.py" source_line=3}, backend_config={"k":1}')
+    whole, streamed = hlo_instructions(quoted), hlo_instructions(iter(quoted.splitlines()))
+    assert whole == streamed
+    assert streamed["input_reduce_fusion.89"].traced == {"jit(step)/a{b} x.py:3"}
+    assert streamed["input_reduce_fusion.89"].fused == {"parameter", "constant", "reduce"}
+
+
+def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
+    """A dump holds every compile of the step; only the newest one's four files are extracted,
+    and the memory breakdown reads them a line at a time."""
+    import tarfile
+
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    for number, peak in (("0003", 1 << 30), ("0015", 2 << 30)):
+        stem = f"module_{number}.jit_step.sm_8.0_gpu_after_optimizations"
+        (dump / f"{stem}.txt").write_text(MODULE)
+        (dump / f"{stem}-live-range.txt").write_text(
+            f"Stack trace breakdown for peak usage: {peak} bytes\n"
+            f"  main ({100.0:.1f}%, total: {peak} bytes, current: 0 bytes)\n"
+            f"    p/params/kernel (50.0%, total: {peak // 2} bytes, current: {peak // 2} bytes)\n")
+        (dump / f"{stem}-buffer-assignment.txt").write_text(f"allocation 0: size {peak}, parameter 0\n")
+        (dump / f"{stem}-memory-usage-report.txt").write_text(f"Total bytes: {peak}\n")
+    (dump / "module_0016.jit_other.sm_8.0_gpu_after_optimizations.txt").write_text(MODULE)
+    archive = tmp_path / "hlo.tgz"
+    with tarfile.open(archive, "w:gz") as writer:
+        writer.add(dump, arcname="hlo")
+    for source in (archive, dump):
+        with attribute.dump_files(source, "jit_step") as files:
+            assert files["module_number"] == "15"
+            assert set(files) == {"module_number", ".txt", "-live-range.txt", "-buffer-assignment.txt",
+                                  "-memory-usage-report.txt"}
+            memory = attribute.attribute_memory(files)
+        assert (memory["peak_gib"], memory["total_bytes_gib"], memory["allocations_gib"]) == (
+            2.0, 2.0, {"parameter": 2.0})
+        assert memory["peak_by_role_and_part_gib"][0]["role"] == "argument: parameters"
