@@ -23,6 +23,9 @@ class Rejected:
     permanent: bool = True
 
 
+type Record = Batch | bytes | Rejected | None
+
+
 type RecordStep = pygrain.MapTransform | Callable[[Batch], Batch | Rejected]
 type RandomStep = pygrain.RandomMapTransform | Callable[[Batch, np.random.Generator], Batch | Rejected]
 type HostStep = Callable[[Batch], Batch] | pygrain.MapTransform
@@ -160,9 +163,28 @@ class Artifact:
     cache: Cache | Generation
 
 
-type Stage = (Map | RandomMap | MapWithIndex | Filter | FlatMap | Shuffle | Repeat | Slice
-              | ShardByHost | Interleave | BatchStage | Pack | Rebatch | Prefetch | Workers
-              | Limit | Group | MapBatch | Artifact | Windows)
+type Stage = (
+    Map
+    | RandomMap
+    | MapWithIndex
+    | Filter
+    | FlatMap
+    | Shuffle
+    | Repeat
+    | Slice
+    | ShardByHost
+    | Interleave
+    | BatchStage
+    | Pack
+    | Rebatch
+    | Prefetch
+    | Workers
+    | Limit
+    | Group
+    | MapBatch
+    | Artifact
+    | Windows
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -188,18 +210,24 @@ class Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
 
     def map(self, *steps: RecordStep, identity: str | None = None, rejects: bool = False) -> Pipeline:
-        return self.then(*(Map(step, identity, rejects or isinstance(step, Rejecting) and step.rejects)
-                           for step in steps))
+        return self.then(
+            *(
+                Map(step, identity, rejects or (isinstance(step, Rejecting) and step.rejects))
+                for step in steps
+            )
+        )
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
         return self.then(*(RandomMap(step, identity) for step in steps))
 
-    def map_with_index(self, step: Callable[[int, Batch], Batch | Rejected], *,
-                       identity: str | None = None) -> Pipeline:
+    def map_with_index(
+        self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None
+    ) -> Pipeline:
         return self.then(MapWithIndex(step, identity))
 
-    def filter(self, predicate: Callable[[Batch], bool], *, reason: str = "filtered",
-               identity: str | None = None) -> Pipeline:
+    def filter(
+        self, predicate: Callable[[Batch], bool], *, reason: str = "filtered", identity: str | None = None
+    ) -> Pipeline:
         return self.then(Filter(predicate, reason, identity))
 
     def flat_map(self, step: Expansion, *, identity: str | None = None) -> Pipeline:
@@ -217,27 +245,44 @@ class Pipeline:
     def shard_by_host(self) -> Pipeline:
         return self.then(ShardByHost())
 
-    def mix(self, *others: Pipeline, weights: Sequence[float] | None = None,
-            tokens: Callable[[Batch], int] | None = None) -> Pipeline:
+    def mix(
+        self,
+        *others: Pipeline,
+        weights: Sequence[float] | None = None,
+        tokens: Callable[[Batch], int] | None = None,
+    ) -> Pipeline:
         pipelines = (self, *others)
-        return Pipeline(Mixture(pipelines, tuple(weights) if weights is not None else (1.,) * len(pipelines),
-                                tokens))
+        return Pipeline(
+            Mixture(pipelines, tuple(weights) if weights is not None else (1.0,) * len(pipelines), tokens)
+        )
 
     def interleave(self, cycle_length: int = 16) -> Pipeline:
         return self.then(Interleave(cycle_length))
 
-    def batch(self, size: int, *, drop_remainder: bool = True,
-              batch_fn: Callable[[Sequence[Batch]], Batch] | None = None) -> Pipeline:
+    def batch(
+        self,
+        size: int,
+        *,
+        drop_remainder: bool = True,
+        batch_fn: Callable[[Sequence[Batch]], Batch] | None = None,
+    ) -> Pipeline:
         if size < 1:
             raise ValueError("batch size must be positive")
         return self.then(BatchStage(size, drop_remainder, batch_fn))
 
-    def pack(self, seq_len: int, *, fields: tuple[str, ...] = ("text",), bins: int = 32,
-             policy: Literal["first-fit", "best-fit", "concat"] = "first-fit") -> Pipeline:
+    def pack(
+        self,
+        seq_len: int,
+        *,
+        fields: tuple[str, ...] = ("text",),
+        bins: int = 32,
+        policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
+    ) -> Pipeline:
         return self.then(Pack(seq_len, fields, bins, policy))
 
-    def windows(self, seq_len: int, *, stride: int | None = None,
-                fields: tuple[str, ...] = ("text",)) -> Pipeline:
+    def windows(
+        self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
+    ) -> Pipeline:
         return self.then(Windows(seq_len, stride, fields))
 
     def rebatch(self, size: int) -> Pipeline:
@@ -269,7 +314,7 @@ class Pipeline:
 
 @dataclasses.dataclass(frozen=True)
 class ObjectiveData:
-    train: tuple[RecordStep | RandomStep | Expansion, ...] = ()
+    train: tuple[RecordStep | pygrain.RandomMapTransform | Expansion, ...] = ()
     evaluate: tuple[RecordStep | Expansion, ...] = ()
     group: LengthGroups | None = None
     train_batch: tuple[HostStep, ...] = ()
