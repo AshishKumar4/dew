@@ -14,7 +14,10 @@ import numpy as np
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
-FLOPS_PER_STEP = 81_029_926_748_160
+# Dew's Counted Qwen3.5-0.8B backbone, 8x3072 real tokens, forward x3:
+# recurrent 6*H*Dk*Dv state MACs and the learned depthwise conv included.
+# tests/test_model_flops.py binds this numerator to the released native config.
+FLOPS_PER_STEP = 81_095_156_563_968
 TOKENS_PER_STEP = 8 * 3072
 WHOLE_PEAK_SCOPE = ("process start through timed-window end; includes load/compile/warmup, "
                     "excludes diagnostics")
