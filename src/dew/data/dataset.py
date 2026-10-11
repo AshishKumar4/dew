@@ -17,7 +17,6 @@ import bisect
 import contextlib
 import dataclasses
 import functools
-import hashlib
 import itertools
 import json
 import logging
@@ -754,26 +753,6 @@ class SourceSlice:
         return self.source[self.start + index]
 
 
-def hold_out(
-    source: Indexed, records: int, held_out: int, name: str
-) -> tuple[SourceSlice, SourceSlice | None]:
-    """`(train_source, val_source)`: the first `held_out` of `records` records,
-    in canonical order, as the validation split, and the rest as training.
-
-    A held-out slice off the head keeps the two disjoint, so FID and CLIP are
-    not measured on records the model trained on. `held_out` of zero holds
-    nothing out and validates nothing.
-    """
-    if not held_out:
-        return SourceSlice(source, 0, records), None
-    if not held_out < records:
-        raise ValueError(
-            f"{name} holds out {held_out} validation records, which leaves "
-            f"nothing of its {records} records to train on"
-        )
-    return (SourceSlice(source, held_out, records), SourceSlice(source, 0, held_out))
-
-
 def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     """`source`'s own description, or its type when it has none.
 
@@ -789,78 +768,6 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     return repr(source) if described else type(source).__name__
 
 
-@dataclasses.dataclass(frozen=True)
-class Corpus:
-    """One corpus of a weighted mixture: what it reads and how much of a step it fills.
-
-    `weight` is a share of the step, not a record count, so the mixture keeps
-    its proportions whatever the corpora's lengths. A small corpus comes round
-    again while a large one is still on its first pass.
-
-    `offset` is how many records of the corpus's endless training order
-    earlier phases of the run already read (`PhasedStream`). The corpus starts
-    after them, so a phase continues the order instead of replaying its start.
-    It is zero for a run with one order.
-    """
-
-    name: str
-    source: Records
-    weight: float
-    offset: int = 0
-
-
-def _endless(source: Records, seed: int, offset: int) -> pygrain.MapDataset[Batch]:
-    """`source` reshuffled from `seed` every epoch, endlessly, past its first
-    `offset` records."""
-    order = pygrain.MapDataset.source(source).seed(seed).shuffle(seed).repeat(None)
-    return order[offset:] if offset else order
-
-
-SAMPLED_RECORDS = 16
-"""How many records, spread evenly over a corpus, `sampled` reads."""
-
-
-def sampled(source: Indexed) -> str:
-    """A digest of `SAMPLED_RECORDS` records spread evenly over `source`, read
-    as stored, before any transformation.
-
-    Two copies of a corpus with one name and one length can hold different
-    records, and a pool whose hosts read different copies trains on neither.
-    The digest is a sample, not a checksum: it reads a few records of a corpus
-    that may be terabytes.
-    """
-    digest, count = hashlib.sha256(), len(source)
-    spread = {count * part // SAMPLED_RECORDS for part in range(SAMPLED_RECORDS)} if count else set()
-    for index in sorted(spread):
-        record = source[index]
-        digest.update(str(jax.tree.structure(record)).encode())
-        for leaf in jax.tree.leaves(record):
-            value = np.asarray(leaf)
-            digest.update(f"{value.dtype}{value.shape}".encode())
-            digest.update(type(leaf).__name__.encode() if value.dtype == object else value.tobytes())
-    return digest.hexdigest()[:16]
-
-
-def _described(corpus: Corpus) -> str:
-    """`corpus` as a saved position names it: its source, and where in its
-    order the run starts it."""
-    start = f", from record {corpus.offset}" if corpus.offset else ""
-    return f"{describe(corpus.source)}, {len(corpus.source)} records{start}"
-
-
-def mixed_counts(corpora: Sequence[Corpus], records: int) -> tuple[int, ...]:
-    """How many of the first `records` records of `mixture(corpora, seed)`
-    each corpus supplies, for any seed.
-
-    This is grain's own selection read in closed form: weights scaled to
-    integers against the smallest (`_float_to_int_proportions`) and the count
-    of dataset i in the first k + 1 elements peeled off one proportion at a
-    time (`_dataset_and_key_of_next_element`, mix.py at grain 0.2).
-    """
-    shares = _shares(corpora)
-    return weight_counts(shares, records)
-
-
 def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
     """Grain's proportional selection counts over a prefix of an indexed mixture."""
     scale = 100 / min(shares)
@@ -871,85 +778,6 @@ def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
         counts.append(left - rest)
         left, remaining = rest, remaining - proportion
     return tuple(counts)
-
-
-def _shares(corpora: Sequence[Corpus]) -> tuple[float, ...]:
-    """What each corpus of `corpora` fills of a step, as fractions of one.
-
-    Normalised here, as MaxText normalises a mixture's weights before it
-    hands them to grain (`input_pipeline/grain_data_processing.py:180-184`),
-    so weights are read as ratios and 7/3 is the mixture 0.7/0.3 is.
-    """
-    if len(corpora) < 2:
-        raise ValueError(
-            f"a mixture reads two or more corpora, and this one names "
-            f"{len(corpora)}; one corpus is that corpus"
-        )
-    weights = [corpus.weight for corpus in corpora]
-    if min(weights) <= 0:
-        raise ValueError(
-            f"every corpus of a mixture fills a positive share of a step, and "
-            f"{ {corpus.name: corpus.weight for corpus in corpora} } does not; a "
-            f"corpus a run reads none of is a corpus the run does not read"
-        )
-    total = sum(weights)
-    return tuple(weight / total for weight in weights)
-
-
-def mixture(corpora: Sequence[Corpus], seed: int | None) -> pygrain.MapDataset[Batch]:
-    """`corpora` read together at their weights, as one order over records.
-
-    `MapDataset.mix` decides which corpus record k comes from: the one whose
-    share of the first k + 1 records is short by one. Every prefix of the
-    order, and so every global batch, holds each corpus's share to within one
-    record, and nothing is drawn at random
-    (`grain/_src/python/dataset/transformations/mix.py:314-347`). Weights
-    reach grain as ratios and it scales them to integers against the
-    smallest, so a share is exact to a hundredth of the smallest one
-    (`mix.py:305-311`).
-
-    With `seed`, every corpus is reshuffled per epoch and repeated before the
-    mixing, so the mixture is endless and each corpus cycles its own records
-    at its own rate. That is grain's own instruction for keeping a mixture's
-    proportions under a shuffle, and what MaxText's pipeline does
-    (`input_pipeline/grain_data_processing.py:110-112,169-184`). Without a
-    seed the corpora are read in their own order and the mixture stops before
-    any of them would come round again (grain's own length rule,
-    `mix.py:52-68`), which is the pass a validation split wants.
-
-    The mixing happens before the shard, so a mixture's position is one
-    global record count: which corpus record k comes from is a function of k.
-    The shares hold over the global batch, not over one process's rows. Two
-    corpora at equal weights alternate, so of two processes one reads only
-    the first and the other only the second; the step's gradient is the same
-    sum either way. A resume onto a changed mixture is refused, as a resume
-    onto a changed corpus is.
-    """
-    shares = _shares(corpora)
-
-    def order(corpus: Corpus) -> pygrain.MapDataset[Batch]:
-        if seed is not None:
-            return _endless(corpus.source, seed, corpus.offset)
-        if corpus.offset:
-            raise ValueError("an ordered pass reads each corpus from its first record")
-        return pygrain.MapDataset.source(corpus.source)
-
-    return pygrain.MapDataset.mix([order(corpus) for corpus in corpora], list(shares))
-
-
-def mixed_records(corpora: Sequence[Corpus]) -> int:
-    """One pass over a mixture: the records in which every corpus of it has
-    been read at least once.
-
-    A mixture has no pass of its own: a corpus filling a tenth of a step
-    comes round ten times while one filling the rest is read once. The pass
-    is the longest of the corpora's own, which is `len(source)` for one
-    corpus and the records of both for two equal corpora at equal weights.
-    That is the count `steps_per_epoch` divides everywhere else.
-    """
-    return max(
-        math.ceil(len(corpus.source) / share) for corpus, share in zip(corpora, _shares(corpora), strict=True)
-    )
 
 
 class _WorkerBatches[Record](pygrain.MapDataset[Record]):
@@ -1099,60 +927,6 @@ class FilledBatch(pygrain.MapTransform):
         return {**plan.pad(element), VALID_ROWS: ~plan.padding & self._real}
 
 
-def _batches[Record](
-    records: pygrain.MapDataset[Record],
-    *,
-    rows: int,
-    partition: DataPartition,
-    loading: Loading,
-    offset: int = 0,
-    remainder: bool = False,
-    cut: Callable[[Batch], Batch] | None = None,
-) -> pygrain.DatasetIterator[Batch]:
-    """The partition's share of `records`, in batches of `rows` records.
-
-    A training stream is endless and takes whole batches. An evaluation pass
-    (`remainder`) takes every record: its last batch is filled out to `rows`
-    (`FilledBatch`). `cut` maps each batch once it is stacked.
-
-    The slice is `offset + index :: count`. Global batch k is then the same
-    records at every count, and an offset is a slice bound rather than a
-    replay.
-
-    Reads are records: the threads behind `to_iter_dataset` each fetch one,
-    so no read waits on a whole batch. Grain's `ElasticIterator` batches
-    ahead of its read and is an order of magnitude slower on a slow source.
-    The batch is stacked inside the worker, so each transfer to this process
-    is a whole batch. `_WorkerBatches` permutes the slice to make a worker's
-    share whole batches, and that permutation depends only on the batch and
-    worker counts, so neither changes which records a batch holds.
-    """
-    if loading.workers == "auto":
-        loading = loading.resolved(records.to_iter_dataset(pygrain.ReadOptions(1, 0)))
-    mine = records[offset + partition.index :: partition.count]
-    # A share a pass's split holds no record for, as process 1's of one record
-    # on two, reads one batch of the split's first record with every row a
-    # repeat: it meets its peers' first batch and scores nothing.
-    empty = remainder and not len(mine) and len(records)
-    if empty:
-        mine = records[:1]
-    if loading.workers:
-        mine = _WorkerBatches(mine, rows, loading.worker_count, remainder=remainder)
-    stream = mine.to_iter_dataset(pygrain.ReadOptions(loading.threads, loading.read_buffer))
-    stream = stream.batch(rows, drop_remainder=not remainder)
-    if cut is not None:
-        stream = stream.map(cut)
-    if remainder:
-        stream = stream.map(FilledBatch(rows, real=not empty))
-    if loading.workers:
-        stream = stream.mp_prefetch(
-            pygrain.MultiprocessingOptions(
-                num_workers=loading.worker_count, per_worker_buffer_size=loading.worker_buffer
-            )
-        )
-    return iter(stream)
-
-
 def rows_of(batch: Mapping[str, object]) -> int:
     """The records `batch` holds, read off its first field that has rows.
 
@@ -1224,7 +998,6 @@ class GlobalStream:
         batch: int,
         order: str,
         loading: Loading,
-        content: Callable[[], str] | None = None,
         *,
         plan: Plan | None = None,
         resume: Literal["exact", "non-exact"] = "exact",
@@ -1234,7 +1007,6 @@ class GlobalStream:
         self.endless = endless
         self._batch = batch
         self._order = order
-        self._content = content
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
@@ -1274,13 +1046,11 @@ class GlobalStream:
         return self._order
 
     def identity(self) -> str:
-        """The order, and a sample of the records it reads (`sampled`) when
-        the stream can read them as stored.
-
-        The order names the corpus by its source, length and seed, and two
-        hosts' copies of a corpus can hold different records under one name.
-        """
-        return self._order if self._content is None else f"{self._order}, sampled {self._content()}"
+        """The order, which a pool agrees before it reads. A compiled order
+        names each corpus by its source's description (`Source.describe`), so
+        hosts whose copies of a corpus describe themselves differently are
+        refused."""
+        return self._order
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
@@ -1325,8 +1095,8 @@ class GlobalReader(Protocol):
 class PhasedStream:
     """Reads one global order per phase, switching at step boundaries.
 
-    Each phase is a `GlobalStream` factory (`train_stream`, `mixed_stream`)
-    with the global record count it ends at, or None for the last phase, which
+    Each phase opens a `GlobalReader`, such as a compiled global order, and
+    has the global record count it ends at, or None for the last phase, which
     runs on. Phase k starts its own order at its own record zero when the
     run's count reaches the end of phase k - 1, so the records a step reads
     depend only on the step and the phase list, at any process count.
@@ -1457,18 +1227,6 @@ class PhasedStream:
         if self._current is not None:
             self._streams[self._current].close()
         self._current = None
-
-
-def phased(
-    phases: Sequence[tuple[Callable[[DataPartition], GlobalStream], int | None]], *, loading: Loading
-) -> Callable[[DataPartition], PhasedStream]:
-    """A `PhasedStream` factory over `phases`, each a stream factory and the
-    global record count it ends at (None for the last); every phase reads
-    the share its reader is handed."""
-    return lambda partition: PhasedStream(
-        [(functools.partial(open_stream, partition), end) for open_stream, end in phases],
-        loading.stop_seconds,
-    )
 
 
 @runtime_checkable
@@ -1603,176 +1361,16 @@ def ramped(dataset: Dataset, ramp: Ramp) -> Dataset:
         raise TypeError(
             f"a batch ramp cuts the step out of a global record order, and "
             f"{type(stream).__name__} hands over batches it has cut itself; ramp "
-            f"a dataset read through train_stream or mixed_stream"
+            f"a dataset compiled to a global record order"
         )
 
     return dataclasses.replace(dataset, train=train, ramp=ramp)
-
-
-def train_stream(
-    source: Records,
-    operations: Sequence[pygrain.Transformation],
-    *,
-    batch: int,
-    seed: int,
-    loading: Loading,
-    offset: int = 0,
-    groups: LengthGroups | None = None,
-    cut: Callable[[Batch], Batch] | None = None,
-) -> Callable[[DataPartition], GlobalStream]:
-    """Return an endless shuffled stream over `source`, `batch` records a global step.
-
-    The order is the corpus reshuffled from `seed` every epoch, endlessly, and
-    the reader's share is cut from it. Global batch k is then the same records
-    at every partition, and a `GlobalStream` position is a record count rather
-    than a shard offset.
-
-    `operations` run after the order and before the slice. So they run inside
-    the workers, a record's rng is keyed by its place in the endless stream,
-    and what a record turns into depends on neither the share count nor the worker
-    count.
-
-    `offset` starts the order past the records earlier phases read. `groups`
-    reads the order a window of batches at a time with each batch's records
-    of like length (`LengthGroups`), and `cut` maps every batch once it is
-    stacked, as a stream that pads each batch only to its longest record
-    does; a cut batch's shape is its own, so one reader reads the stream.
-    """
-    start = f", from record {offset}" if offset else ""
-    order = f"{describe(source)}, {len(source)} records reshuffled from seed {seed}{start}{_grouping(groups)}"
-
-    def records() -> pygrain.MapDataset[Batch]:
-        return _ordered(_endless(source, seed, offset), groups, batch, seed).apply(list(operations))
-
-    return _global_stream(
-        records, order, batch=batch, loading=loading, content=functools.partial(sampled, source), cut=cut
-    )
-
-
-def mixed_stream(
-    corpora: Sequence[Corpus],
-    operations: Sequence[pygrain.Transformation],
-    *,
-    batch: int,
-    seed: int,
-    loading: Loading,
-    groups: LengthGroups | None = None,
-    cut: Callable[[Batch], Batch] | None = None,
-) -> Callable[[DataPartition], GlobalStream]:
-    """An endless stream over `corpora` at their weights, `batch` records a global step.
-
-    The order is `mixture(corpora, seed)` and everything after it is
-    `train_stream`'s: the same share's slice, the same batch behind the
-    reads, and the same position. A mixture's place in its corpora is
-    therefore one record count and resumes on any partition. The
-    `operations` sit above the mixture, so a record's rng is keyed by its
-    place in the mixed stream rather than in the corpus it came from.
-    `groups` and `cut` are `train_stream`'s.
-    """
-    shares = _shares(corpora)
-    order = "mixture reshuffled from seed {} of [{}]{}".format(
-        seed,
-        ", ".join(
-            f"{corpus.name} at {share:.6g}: {_described(corpus)}"
-            for corpus, share in zip(corpora, shares, strict=True)
-        ),
-        _grouping(groups),
-    )
-
-    def records() -> pygrain.MapDataset[Batch]:
-        return _ordered(mixture(corpora, seed).seed(seed), groups, batch, seed).apply(list(operations))
-
-    def content() -> str:
-        return ", ".join(sampled(corpus.source) for corpus in corpora)
-
-    return _global_stream(records, order, batch=batch, loading=loading, content=content, cut=cut)
-
-
-def _ordered(
-    records: pygrain.MapDataset[Batch], groups: LengthGroups | None, batch: int, seed: int
-) -> pygrain.MapDataset[Batch]:
-    return records if groups is None else _Grouped(records, groups, batch, seed)
-
-
-def _grouping(groups: LengthGroups | None) -> str:
-    """What `groups` adds to an order's description: a position saved under
-    one grouping is refused under another."""
-    return "" if groups is None else f", grouped by length {groups.window} batches at a time"
-
-
-def _global_stream(
-    records: Callable[[], pygrain.MapDataset[Batch]],
-    order: str,
-    *,
-    batch: int,
-    loading: Loading,
-    content: Callable[[], str],
-    cut: Callable[[Batch], Batch] | None = None,
-) -> Callable[[DataPartition], GlobalStream]:
-    """A `GlobalStream` factory over the endless order `records` builds.
-
-    Each reader gets its own pipeline over its share, opened at whatever
-    record offset a restore hands it, and `order` is the description a saved
-    position is compared against. `content` samples the corpus under it.
-    """
-
-    def stream(partition: DataPartition) -> GlobalStream:
-        rows = partition.rows(batch)
-        if cut is not None and partition.count > 1:
-            raise ValueError(
-                f"a cut batch takes a shape of its own, and {partition.count} readers would each cut "
-                "their share to a different one; read a cut stream on one process"
-            )
-
-        def open_at(offset: int) -> pygrain.DatasetIterator[Batch]:
-            return _batches(
-                records(), rows=rows, partition=partition, loading=loading, offset=offset, cut=cut
-            )
-
-        return GlobalStream(open_at, batch, order, loading, content)
-
-    return stream
-
-
-def validation_pass(
-    source: Records,
-    transformations: Sequence[pygrain.Transformation],
-    *,
-    batch: int,
-    seed: int,
-    loading: Loading,
-) -> Reader:
-    """One pass over `source` in record order, `batch` records a global step.
-
-    Grain's DataLoader gives each worker its own slice of the split to fill a
-    whole batch out of, so which records a batch holds moves with
-    worker_count. `_batches` hands a worker the records of one batch instead,
-    so the split is cut into the same batches at every count.
-
-    Sharding is grain's slice convention, so share p of n reads records
-    p, p + n, ... of the split. The transforms are applied before that slice
-    because grain keys a record's rng by its index in the dataset the random
-    map sits on. Applied after the slice, record k would take its key from
-    its place in the slice, and one seed would augment it differently on one
-    host than on a pod. A part-full batch cannot be sharded over a device
-    mesh, so the last one is filled out to the batch's rows with repeats
-    that `VALID_ROWS` marks, and the pass still counts every record once.
-    """
-
-    def stream(partition: DataPartition) -> Iterator[Batch]:
-        records = pygrain.MapDataset.source(source).seed(seed).apply(list(transformations))
-        return _batches(
-            records, rows=partition.rows(batch), partition=partition, loading=loading, remainder=True
-        )
-
-    return stream
 
 
 __all__ = [
     "Budgeted",
     "Checkpointable",
     "Closeable",
-    "Corpus",
     "DataPartition",
     "DataPhase",
     "Dataset",
@@ -1792,5 +1390,4 @@ __all__ = [
     "Stoppable",
     "mapped",
     "record_argument",
-    "train_stream",
 ]

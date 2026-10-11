@@ -216,20 +216,17 @@ def indexed_loader(records: int, batch: int = BATCH):
 
 
 def elastic_loader(records: int, workers: int):
-    """`train_stream` over the same records, whose position is a global count.
+    """The same records compiled to a global order, whose position is a global count.
 
     The loader above is grain's own `DataLoader`, whose position is one
     process's offset into its shard. This one is the path every dataset spec
     takes, so what a pool reading it exercises is a position every process
     reports alike and a pool of another size reads back.
     """
-    from dew.data.dataset import Loading as ReadLoading, train_stream
+    from dew.data import Memory, Pipeline, compile
 
     class Indexed:
         """Records that say which they are, in the field the objective reads."""
-
-        def __repr__(self):
-            return f"Indexed(records={records})"
 
         def __len__(self):
             return records
@@ -237,9 +234,8 @@ def elastic_loader(records: int, workers: int):
         def __getitem__(self, index):
             return {"image": np.full((RES, RES, 3), index, np.uint8)}
 
-    return train_stream(Indexed(), [], batch=BATCH, seed=0,
-                        loading=ReadLoading(workers=workers, threads=2, read_buffer=8,
-                                            worker_buffer=2))
+    return compile(Pipeline(Memory(Indexed())).shuffle(0).repeat().batch(BATCH), seed=0,
+                   loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
 
 
 def batch_records(batch) -> list[int]:
@@ -649,7 +645,7 @@ def mode_fit(args) -> dict:
 def mode_pool_refusals(args) -> dict:
     """What a pool refuses on every process before any trains on it, each a
     fit of the affine regression over a stream that differs on process 1
-    only: another corpus under the same name and length, another length,
+    only: other records of the same length, another length,
     a first read that fails there, a stream that runs out after one batch
     there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
@@ -659,27 +655,16 @@ def mode_pool_refusals(args) -> dict:
     import orbax.checkpoint as ocp
     from affine_run import FEATURES, Regression
 
-    from dew.data import Dataset
-    from dew.data.dataset import train_stream
+    from dew.data import Dataset, Memory, Pipeline, compile
     from dew.training import Checkpoints, MeshSpec, Trainer
 
     rank = jax.process_index()
 
-    class Corpus:
-        """Records under one name, each process reading its own copy."""
-
-        def __init__(self, count: int, shift: int):
-            self.count, self.shift = count, shift
-
-        def __repr__(self) -> str:
-            return "Corpus('shared')"
-
-        def __len__(self) -> int:
-            return self.count
-
-        def __getitem__(self, index: int) -> dict:
-            x = np.full((FEATURES,), index + self.shift, np.float32)
-            return {"x": x, "y": 2 * x[:2]}
+    def corpus(count: int, shift: int) -> Memory:
+        """Records each process holds its own copy of, with no name of their
+        own, so the source describes them by their contents."""
+        x = np.repeat(np.arange(shift, count + shift, dtype=np.float32)[:, None], FEATURES, axis=1)
+        return Memory({"x": x, "y": 2 * x[:, :2]})
 
     class Reads:
         """Batches of this process's rows, failing at the first read, running
@@ -702,9 +687,8 @@ def mode_pool_refusals(args) -> dict:
             return {name: value for name, value in {"x": x, "y": 2 * x[:, :2]}.items() if name in self.fields}
 
     def stream(count: int, shift: int) -> Dataset:
-        return Dataset(train=train_stream(Corpus(count, shift), [], batch=BATCH, seed=0,
-                                          loading=Loading(workers=0)),
-                       val=None, records=count, batch=BATCH)
+        return compile(Pipeline(corpus(count, shift)).shuffle(0).repeat().batch(BATCH), seed=0,
+                       loading=Loading(workers=0))
 
     def reads(fail: bool = False, fields: tuple[str, ...] = ("x", "y"), ends: int | None = None) -> Data:
         return Data(lambda partition: Reads(fail, fields, ends))
@@ -727,6 +711,7 @@ def mode_pool_refusals(args) -> dict:
         "eof": trained(reads(ends=1 if other else None)),
         "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
+        "counted": [corpus(64, 0).describe(), corpus(96, 0).describe()],
     }
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
     if other:
@@ -2271,7 +2256,7 @@ def parse_args(argv=None):
     parser.add_argument("--part", default="0/1", help="i/n: whole_validation's share of the objectives")
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--elastic", action="store_true",
-                        help="read the training records through train_stream, whose "
+                        help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
     return parser.parse_args(argv)

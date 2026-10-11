@@ -26,6 +26,7 @@ import pytest
 from dew.data import (
     Checkpointable,
     DataPartition,
+    HoldOut,
     Images,
     Loading,
     Memory,
@@ -39,16 +40,7 @@ from dew.data import (
     load,
 )
 from dew.data.compile import validation
-from dew.data.dataset import (
-    Forwarding,
-    GlobalStream,
-    Records as IndexedRows,
-    _batches,
-    describe,
-    hold_out,
-    train_stream,
-    validation_pass,
-)
+from dew.data.dataset import Forwarding, GlobalStream, Records as IndexedRows, SourceSlice, describe
 from dew.data.image_codec import decode_image
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
@@ -143,8 +135,9 @@ class Indexed:
     def pipelines(self):
         source = self.source()
         records = len(source) if self.count is None else self.count
-        train, val = hold_out(source, records, (self.val_batches or 0) * self.batch, "Indexed")
-        return Pipeline(_Synthetic(train)), None if val is None else Pipeline(_Synthetic(val)), ()
+        held = (self.val_batches or 0) * self.batch
+        val = Pipeline(_Synthetic(SourceSlice(source, 0, held))) if held else None
+        return Pipeline(_Synthetic(SourceSlice(source, held, records))), val, ()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -233,9 +226,9 @@ def test_a_validation_pass_reads_every_held_out_record_once(workers):
 
 def test_a_validation_split_cannot_swallow_every_record():
     """One record and a held-out one would leave nothing to train on."""
-    with pytest.raises(ValueError, match="leaves nothing"):
+    with pytest.raises(ValueError, match="has no accepted rows"):
         load(Indexed(val_batches=4, batch=8), batch=8, read="indexed", seed=0, loading=Loading(workers=0))
-    with pytest.raises(ValueError, match="leaves nothing"):
+    with pytest.raises(ValueError, match="has no accepted rows"):
         load(Indexed(length=1, val_batches=1, batch=1), batch=1, read="indexed", seed=0,
             loading=Loading(workers=0))
 
@@ -307,7 +300,7 @@ def test_a_dataset_of_one_pile_refuses_a_split_it_cannot_name(tmp_path):
     rows = [{"image": images.resize_image(_Images(8)[index]["image"], 8), "label": index,
              "caption": f"record {index}"} for index in range(8)]
     export(rows, str(tmp_path), format="array_record")
-    from dew.data import HoldOut, Split
+    from dew.data import Split
 
     spec = Images(source=str(tmp_path), image_size=8, augment=None, validation=HoldOut(records=2))
     assert load(spec, batch=2, read="memory", **WORKERS).records == 6
@@ -406,22 +399,17 @@ def test_the_training_iterator_carries_its_position():
 # The batch is stacked in the worker that read the records
 # ---------------------------------------------------------------------------------
 
-def _order(source, seed=None):
-    """The order `_batches` slices: the corpus, or it reshuffled endlessly."""
-    records = pygrain.MapDataset.source(source).seed(0 if seed is None else seed)
-    return records if seed is None else records.shuffle(seed).repeat(None)
-
-
-def _by_hand(order, *, batch, count, offset=0):
+def _by_hand(source, *, seed, batch, count):
     """`count` batches stacked the way the training process stacked them
-    before the workers did: this process's slice of `order`, read record by
-    record in order, `batch` records to a batch.
+    before the workers did: `source` reshuffled endlessly from `seed`, read
+    record by record in order, `batch` records to a batch.
 
-    Read off the `MapDataset` and not off `_batches`, so it is a reference
-    for what `_batches` returns rather than a restatement of it.
+    Read off a plain Grain `MapDataset` and not off the compiled stream, so
+    it is a reference for what the stream returns rather than a restatement
+    of it.
     """
-    mine = order[offset::1]
-    rows = [mine[index] for index in range(count * batch)]
+    order = pygrain.MapDataset.source(source).seed(seed).shuffle(seed).repeat(None)
+    rows = [order[index] for index in range(count * batch)]
     return [{field: [row[field] for row in rows[start:start + batch]]
              for field in rows[start]}
             for start in range(0, count * batch, batch)]
@@ -444,13 +432,13 @@ def test_which_records_a_batch_holds_does_not_depend_on_who_stacked_it(workers):
     permuted; unpermuted, three workers at a batch of four would have stacked
     records 0, 3, 6, 9 into batch 0."""
     source = _Indexed(30)
-    stream = _batches(_order(source, seed=5), rows=4, partition=DataPartition(), loading=Loading(
-        workers=workers, threads=2, read_buffer=4, worker_buffer=2))
+    stream = compile(Pipeline(Memory(source)).shuffle(5).repeat().batch(4), seed=5, loading=Loading(
+        workers=workers, threads=2, read_buffer=4, worker_buffer=2)).train(DataPartition())
 
     read = _fields(stream, 12)
     stream.close()
 
-    assert read == _by_hand(_order(source, seed=5), batch=4, count=12)
+    assert read == _by_hand(source, seed=5, batch=4, count=12)
     assert len({tuple(batch["index"]) for batch in read}) == 12, (
         "twelve batches of four is more than one pass over thirty records, "
         "so a reshuffled epoch is inside this comparison")
@@ -463,7 +451,7 @@ def test_a_pass_over_a_split_the_workers_do_not_divide_reads_every_record(worker
     one worker's alone: every batch arrives in its place, and the eighth
     holds the two records over, filled out with repeats of them that
     `VALID_ROWS` marks."""
-    passes = validation_pass(_Indexed(30), [], batch=4, seed=0, loading=Loading(
+    passes = validation(Pipeline(Memory(_Indexed(30))), batch=4, loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
 
     batches, ended = _bounded(passes(DataPartition()), 12)
@@ -480,9 +468,15 @@ def test_an_offset_stays_a_bound_on_the_slice_this_process_reads(workers):
     """A resume opens the stream `offset` records in, and the permutation the
     workers read through sits behind that slice, so the first batch is still
     the first four records the interrupted run had not reached."""
-    stream = _batches(_order(_Indexed(30)), rows=4, partition=DataPartition(), offset=8, loading=Loading(
+    data = compile(Pipeline(Memory(_Indexed(30))).repeat().batch(4), loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
+    interrupted = data.train(DataPartition())
+    _fields(interrupted, 2)
+    offset = interrupted.get_state()
+    interrupted.close()
 
+    stream = data.train(DataPartition())
+    stream.set_state(offset)
     first = _fields(stream, 1)
     stream.close()
 
@@ -615,29 +609,14 @@ def test_a_shard_offset_cannot_resume_a_global_stream():
     stream.close()
 
 
-class _Corpus:
-    """Records of one named corpus, described by that name as a source with
-    an identity is (`describe`)."""
-
-    def __init__(self, name, length=16):
-        self.name, self.length = name, length
-
-    def __repr__(self):
-        return f"_Corpus({self.name!r})"
-
-    def __len__(self):
-        return self.length
-
-    def __getitem__(self, index):
-        return {"index": np.int32(index)}
-
-
 def test_a_held_out_slice_keeps_the_identity_of_the_corpus_it_cuts():
     """Two corpora of one type and length, each with a slice held out, were
     described the same, so a position saved over one resumed the other."""
+    rows = [{"index": np.int32(index)} for index in range(16)]
+
     def stream(name):
-        train, _ = hold_out(_Corpus(name), 16, 4, "corpus")
-        return train_stream(train, [], batch=4, seed=0, loading=Loading(threads=1, read_buffer=1))(
+        recipe = Records(source=Memory(rows, identity=name), validation=HoldOut(records=4))
+        return load(recipe, batch=4, read="indexed", loading=Loading(threads=1, read_buffer=1)).train(
             DataPartition())
 
     saved = stream("flowers")
@@ -646,7 +625,7 @@ def test_a_held_out_slice_keeps_the_identity_of_the_corpus_it_cuts():
     saved.close()
 
     other = stream("faces")
-    with pytest.raises(ValueError, match="_Corpus\\('flowers'\\)"):
+    with pytest.raises(ValueError, match=r"memory:flowers\[4:None\]"):
         other.set_state(state)
     resumed = stream("flowers")
     resumed.set_state(state)
@@ -892,8 +871,9 @@ class Augmenting:
         count = len(source) if self.count is None else self.count
         if count > len(source):
             raise ValueError(f"count {count} is more than the {len(source)} records")
-        train, held = hold_out(source, count, 0 if self.val_split else (self.val_batches or 0) * self.batch,
-                               "Augmenting")
+        held_out = 0 if self.val_split else (self.val_batches or 0) * self.batch
+        train = SourceSlice(source, held_out, count)
+        held = SourceSlice(source, 0, held_out) if held_out else None
         if self.val_split is not None:
             held = self.source(self.val_split)
             if self.val_batches is not None:

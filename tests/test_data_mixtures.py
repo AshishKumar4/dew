@@ -20,6 +20,7 @@ import itertools
 import json
 from pathlib import Path
 
+import grain.python as pygrain
 import jax
 import numpy as np
 import optax
@@ -27,20 +28,22 @@ import pytest
 from flax import linen as nn
 from token_support import write_token_corpus
 
-from dew.data import Corpus, DataPartition, DataPhase, Files, Loading, Memory, Pipeline, Ramp, Text, compile
-from dew.data.dataset import (
-    CAPTION,
-    Dataset,
-    LengthGroups,
-    mixed_records,
-    mixed_stream,
-    mixture,
-    ramped,
-    train_stream,
+from dew.data import (
+    DataPartition,
+    DataPhase,
+    Files,
+    Loading,
+    Memory,
+    Pipeline,
+    Ramp,
+    Text,
+    compile,
+    validation,
 )
+from dew.data.dataset import CAPTION, Dataset, ramped, weight_counts
 from dew.data.recipes import load
 from dew.data.steps.image import EncodeCaptions
-from dew.objectives.base import Aux, Objective
+from dew.objectives.base import VALID_ROWS, Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
@@ -77,8 +80,8 @@ def pooled(build, processes: int, batches: int, state: bytes | None = None,
            rows=ids) -> list:
     """The global batches a pool of `processes` reads, each row where the
     share that holds it put it: share p owns rows p, p + n, ... of a step,
-    which is how `_batches` slices the order. `build` opens the stream a
-    share reads."""
+    which is how a compiled global order is sliced. `build` opens the stream
+    a share reads."""
     shards = []
     for index in range(processes):
         stream = build(DataPartition(index, processes))
@@ -92,13 +95,15 @@ def pooled(build, processes: int, batches: int, state: bytes | None = None,
 # Weighted mixtures
 # --------------------------------------------------------------------------
 
-def two_corpora(weights=(0.75, 0.25), records=(40, 8)) -> list[Corpus]:
-    return [Corpus("wiki", Indexed(1, records[0]), weights[0]),
-            Corpus("code", Indexed(2, records[1]), weights[1])]
+def two_corpora(weights=(0.75, 0.25), records=(40, 8), seed=0) -> Pipeline:
+    """Wiki and code records, each reshuffled every epoch and cycled, mixed at `weights`."""
+    wiki, code = (Pipeline(Memory(Indexed(tag, count)), name=name).shuffle(seed).repeat()
+                  for name, tag, count in (("wiki", 1, records[0]), ("code", 2, records[1])))
+    return wiki.mix(code, weights=weights)
 
 
 def mixed(corpora, batch=4, seed=0):
-    return mixed_stream(corpora, [], batch=batch, seed=seed, loading=READ)
+    return compile(corpora.batch(batch), read="memory", seed=seed, loading=READ).train
 
 
 def test_every_batch_of_a_mixture_holds_each_corpus_share_of_it():
@@ -132,7 +137,7 @@ def test_a_mixture_is_the_same_order_from_the_same_seed_and_another_from_another
     first = taken(mixed(two_corpora())(DataPartition()), 5)
 
     assert taken(mixed(two_corpora())(DataPartition()), 5) == first
-    assert taken(mixed(two_corpora(), seed=1)(DataPartition()), 5) != first
+    assert taken(mixed(two_corpora(seed=1), seed=1)(DataPartition()), 5) != first
 
 
 def test_a_mixture_resumes_on_the_batch_after_the_one_it_saved():
@@ -176,9 +181,12 @@ def test_a_mixtures_pass_is_the_records_every_corpus_has_been_read_in():
     forty records at three quarters of a step take fifty-four. Corpora of
     equal size at equal weights come to the records of both, which is what
     a pass counts everywhere else."""
-    assert mixed_records(two_corpora()) == 54
-    assert mixed_records(two_corpora(weights=(0.5, 0.5), records=(8, 8))) == 16
-    assert mixed_records([Corpus("a", Indexed(1, 10), 3), Corpus("b", Indexed(2, 30), 9)]) == 40
+    def records(corpora):
+        return compile(corpora.batch(4), read="memory", loading=READ).records
+
+    assert records(two_corpora()) == 54
+    assert records(two_corpora(weights=(0.5, 0.5), records=(8, 8))) == 16
+    assert records(two_corpora(weights=(3, 9), records=(10, 30))) == 40
 
 
 def length(record) -> int:
@@ -186,9 +194,8 @@ def length(record) -> int:
     return int(record["id"]) % 7
 
 
-def grouped(corpora, batch=4, window=3, cut=None):
-    return mixed_stream(corpora, [], batch=batch, seed=0, loading=READ, groups=LengthGroups(length, window),
-                        cut=cut)
+def grouped(corpora, batch=4, window=3):
+    return compile(corpora.group(length, window=window).batch(batch), read="memory", loading=READ).train
 
 
 def test_length_groups_read_each_window_as_batches_of_like_length():
@@ -215,17 +222,25 @@ def test_a_grouped_stream_resumes_mid_window_and_refuses_another_grouping():
     resumed = grouped(two_corpora())(DataPartition())
     resumed.set_state(state)
     assert taken(resumed, 4) == rest
-    with pytest.raises(ValueError, match="grouped by length"):
+    with pytest.raises(ValueError, match=r"plan order changed.*'groups': \[3\]"):
         mixed(two_corpora())(DataPartition()).set_state(state)
 
 
-def test_a_cut_stream_maps_every_batch_and_is_read_by_one_process():
-    def halved(batch):
+@dataclasses.dataclass(frozen=True)
+class Halved:
+    """A host step that cuts each batch to a shape of its own, as a stream
+    that pads each batch only to its longest record does."""
+
+    single_reader = True
+
+    def __call__(self, batch):
         return {"id": batch["id"][:2]}
 
-    stream = grouped(two_corpora(), cut=halved)
+
+def test_a_cut_stream_maps_every_batch_and_is_read_by_one_process():
+    stream = compile(two_corpora().batch(4).map_batch(Halved()), read="memory", loading=READ).train
     assert [len(batch) for batch in taken(stream(DataPartition()), 3)] == [2, 2, 2]
-    with pytest.raises(ValueError, match="one process"):
+    with pytest.raises(ValueError, match="one reader"):
         stream(DataPartition(0, 2))
 
 
@@ -233,23 +248,28 @@ def test_a_validation_pass_over_a_mixture_reads_each_record_at_most_once():
     """A mixed pass keeps the weights and each split's own order, and stops
     before any corpus comes round, so a score is a score of the same records
     every time."""
-    ordered = mixture(two_corpora(), None)
-
-    read = [ordered[index]["id"].item() for index in range(len(ordered))]
+    wiki, code = (Pipeline(Memory(Indexed(tag, count))) for tag, count in ((1, 40), (2, 8)))
+    held = validation(wiki.mix(code, weights=(0.75, 0.25)), batch=4, loading=READ)(DataPartition())
+    try:
+        read = [int(value) for batch in held
+                for value in batch["id"][batch.get(VALID_ROWS, np.ones(4, bool))]]
+    finally:
+        held.close()
 
     assert len(read) == 32, "a pass runs until the first corpus would repeat"
     assert len(set(read)) == len(read), "a record was scored twice"
     assert read[:8] == [1000, 1001, 1002, 2000, 1003, 1004, 1005, 2001]
 
 
-@pytest.mark.parametrize("corpora, message", [
-    ([Corpus("only", Indexed(1, 8), 1.0)], "two or more corpora"),
-    (two_corpora(weights=(1.0, 0.0)), "positive share"),
-    (two_corpora(weights=(1.0, -1.0)), "positive share"),
+@pytest.mark.parametrize("weights, message", [
+    ((1.0,), "at least two pipelines"),
+    ((1.0, 0.0), "finite and positive"),
+    ((1.0, -1.0), "finite and positive"),
 ])
-def test_a_mixture_that_is_not_one_is_refused(corpora, message):
+def test_a_mixture_that_is_not_one_is_refused(weights, message):
+    corpora = [Pipeline(Memory(Indexed(tag, 8))) for tag in range(1, len(weights) + 1)]
     with pytest.raises(ValueError, match=message):
-        mixture(corpora, 0)
+        corpora[0].mix(*corpora[1:], weights=weights)
 
 
 # --------------------------------------------------------------------------
@@ -530,14 +550,14 @@ def test_phases_switch_the_mixture_at_a_step(tmp_path):
     assert all([corpus_of(row) for row in step].count(1) == 2 for step in steps[3:])
 
 
-def test_mixed_counts_is_grains_own_selection():
+def test_weight_counts_is_grains_own_selection():
     """The closed form counts what `MapDataset.mix` hands out, prefix by prefix."""
-    from dew.data.dataset import mixed_counts
-    corpora = [Corpus(name, Indexed(tag, 50), weight)
-               for name, tag, weight in (("a", 1, 71), ("b", 2, 20), ("c", 3, 9))]
-    drawn = [int(mixture(corpora, 0)[index]["id"]) // 1000 for index in range(400)]
+    shares = tuple(weight / 100 for weight in (71, 20, 9))
+    order = pygrain.MapDataset.mix(
+        [pygrain.MapDataset.source(Indexed(tag, 50)).repeat() for tag in (1, 2, 3)], list(shares))
+    drawn = [int(order[index]["id"]) // 1000 for index in range(400)]
     for prefix in (1, 7, 100, 399, 400):
-        assert mixed_counts(corpora, prefix) == tuple(drawn[:prefix].count(tag) for tag in (1, 2, 3))
+        assert weight_counts(shares, prefix) == tuple(drawn[:prefix].count(tag) for tag in (1, 2, 3))
 
 
 def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
@@ -703,11 +723,10 @@ def test_a_pass_over_the_data_is_more_steps_under_a_ramp():
 # --------------------------------------------------------------------------
 
 def indexed_data(records: int, batch: int, seed: int = 0) -> Dataset:
-    """A dataset whose records say which they are, read through the stream
-    every dataset reads through."""
-    source = Indexed(1, records)
-    return Dataset(train=train_stream(source, [], batch=batch, seed=seed, loading=READ),
-                   val=None, records=records, batch=batch)
+    """A dataset whose records say which they are, compiled to the global
+    order every dataset reads through."""
+    return compile(Pipeline(Memory(Indexed(1, records))).shuffle(seed).repeat().batch(batch), seed=seed,
+                   loading=READ)
 
 
 def test_a_ramped_stream_reads_the_records_the_flat_stream_reads():
@@ -764,9 +783,7 @@ def test_a_ramped_steps_position_counts_every_process():
     are the single process's steps with the shares interleaved."""
     schedule = Ramp(start=2, increment=2, samples=8)
 
-    data = Dataset(train=train_stream(Indexed(1, 64), [], batch=4, seed=0, loading=READ),
-                   val=None, records=64, batch=4)
-    build = ramped(data, schedule).train
+    build = ramped(indexed_data(64, 4), schedule).train
 
     whole = pooled(build, 1, 6)
     stopped = build(DataPartition(1, 2))
@@ -1068,20 +1085,14 @@ def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_noth
     where the earlier phases left it, so no record of it repeats before its
     epoch ends, and each phase still reads its own mixture at its own shares."""
     from dew.data.pipeline import Phases
-    web, code, math = (Corpus(name, Indexed(tag, 1000), 1.0)
-                       for name, tag in (("web", 1), ("code", 2), ("math", 3)))
-    phases = [([dataclasses.replace(web, weight=71), dataclasses.replace(code, weight=20),
-                dataclasses.replace(math, weight=9)], 10),
-              ([dataclasses.replace(web, weight=15), dataclasses.replace(code, weight=85)], 20),
-              ([dataclasses.replace(web, weight=57), dataclasses.replace(code, weight=18),
-                dataclasses.replace(math, weight=25)], 30),
-              ([code], None)]
+    corpora = {name: Indexed(tag, 1000) for name, tag in (("web", 1), ("code", 2), ("math", 3))}
+    phases = [({"web": 71, "code": 20, "math": 9}, 10), ({"web": 15, "code": 85}, 20),
+              ({"web": 57, "code": 18, "math": 25}, 30), ({"code": 1.0}, None)]
     pipelines = []
-    for corpora, _ in phases:
-        children = tuple(Pipeline(Memory(corpus.source), name=corpus.name).shuffle(0).repeat()
-                         for corpus in corpora)
+    for weights, _ in phases:
+        children = tuple(Pipeline(Memory(corpora[name]), name=name).shuffle(0).repeat() for name in weights)
         pipelines.append(children[0] if len(children) == 1 else
-                         children[0].mix(*children[1:], weights=tuple(corpus.weight for corpus in corpora)))
+                         children[0].mix(*children[1:], weights=tuple(weights.values())))
     dataset = compile(Pipeline(Phases(tuple(pipelines), tuple(until for _, until in phases))).batch(8),
                       read="memory", seed=0, loading=READ)
     steps = taken(dataset.train(DataPartition()), 40)
