@@ -110,7 +110,9 @@ def pack_files(files, archive):
                         info = packed.gettarinfo(arcname=name, fileobj=stream)
                         if info is None or not info.isfile():
                             raise ValueError(f"artifact is not a regular file: {name}")
-                        with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024, dir=archive.parent) as copy:
+                        with tempfile.SpooledTemporaryFile(
+                            max_size=8 * 1024 * 1024, dir=str(archive.parent)
+                        ) as copy:
                             remaining = info.size
                             while remaining:
                                 block = stream.read(min(1024 * 1024, remaining))
