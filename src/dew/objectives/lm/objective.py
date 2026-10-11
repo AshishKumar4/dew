@@ -817,6 +817,15 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
                     prepared, targets, roles, losses.dtype, depth)))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls)
 
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import CountTargets
+
+        if self.loss_role is None and self.pad_id is None:
+            return ObjectiveData()
+        counted = CountTargets(role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id)
+        return ObjectiveData(train=(counted,), evaluate=(counted,))
+
     def _row_weights(self, prepared, targets, roles, dtype):
         """Weight the targets the row itself scores.
 

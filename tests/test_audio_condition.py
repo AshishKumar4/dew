@@ -16,7 +16,8 @@ import optax
 import pytest
 
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import DataPartition, Loading, LocalVideos
+from dew.data import DataPartition, Images, Loading, Video, load
+from dew.data.steps.image import EncodeCaptions
 from dew.inputs import Condition, HFAudio
 from dew.objectives.base import Step
 from dew.objectives.diffusion import AudioCondition, DiffusionRunConfig
@@ -145,9 +146,8 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     pytest.importorskip("moviepy.config", reason="needs the av extra")
     for hertz in range(220, 1100, 110):
         _clip(tmp_path / f"{hertz}.avi", hertz)
-    data = LocalVideos(path=str(tmp_path), extensions=(".avi",), frame_size=8, frames=2,
-                       audio_padding=1, audio_model=str(towers / "wav2vec2"), val_batches=0,
-                       loading=Loading(workers=0))
+    data = Video(source=str(tmp_path), extensions=(".avi",), frame_size=8, frames=2,
+                 audio_padding=1, audio_model=str(towers / "wav2vec2"))
     config = DiffusionRunConfig(
         model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
                                         "num_heads": 2, "dtype": "float32", "attention_impl": "reference"}),
@@ -156,7 +156,9 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     objective = config.build()
     assert objective.inputs.conditions["textcontext"].encoder.seconds == data.audio_seconds
     assert DiffusionRunConfig.from_dict(config.to_dict()) == config
-    batch = next(data.load(batch=8, tokenize=objective.inputs.tokenize).train(DataPartition()))
+    dataset = load(data, batch=8, read="memory", loading=Loading(workers=0),
+                   host=(EncodeCaptions(objective.inputs.tokenize),))
+    batch = next(dataset.train(DataPartition()))
     assert set(batch) == {"video", "audio"}
 
     keys = jax.random.split(jax.random.PRNGKey(7), 64)
@@ -168,7 +170,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
 
     before = losses(objective.init(jax.random.PRNGKey(0)))
     state = Trainer(objective, optax.adam(3e-3), key=jax.random.PRNGKey(0)).fit(
-        data.load(batch=8, tokenize=objective.inputs.tokenize), steps=40, log_every=100)
+        dataset, steps=40, log_every=100)
     drop = before - losses(state.variables)
     statistic = drop.mean() / (drop.std(ddof=1) / np.sqrt(drop.size))
     assert statistic > 7.0, (statistic, drop.mean())
@@ -183,9 +185,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
 def test_audio_conditioning_is_refused_beside_text_or_without_clip_audio():
     """The audio takes the models' one context keyword, so a run naming text
     too is refused, and so is a dataset whose samples carry no audio."""
-    from dew.data import TFDSImages
-
     with pytest.raises(ValueError, match="set text to None"):
-        DiffusionRunConfig(data=LocalVideos(path="clips"), audio=AudioCondition())
+        DiffusionRunConfig(data=Video(source="clips"), audio=AudioCondition())
     with pytest.raises(ValueError, match="carries none"):
-        DiffusionRunConfig(data=TFDSImages(), text=None, audio=AudioCondition())
+        DiffusionRunConfig(data=Images(source="tfds://oxford_flowers102"), text=None, audio=AudioCondition())

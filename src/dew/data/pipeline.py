@@ -148,6 +148,17 @@ class Windows:
 
 
 @dataclasses.dataclass(frozen=True)
+class TokenSplit:
+    fraction: float
+    held: bool
+    fields: tuple[str, ...] = ("text",)
+
+    def __post_init__(self) -> None:
+        if not 0 <= self.fraction < 1:
+            raise ValueError("token holdout fraction must be in [0, 1)")
+
+
+@dataclasses.dataclass(frozen=True)
 class Rebatch:
     size: int
 
@@ -206,6 +217,7 @@ type Stage = (
     | Artifact
     | Windows
     | Configured
+    | TokenSplit
 )
 
 
@@ -325,6 +337,10 @@ class Pipeline:
         self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
     ) -> Pipeline:
         return self.then(Windows(seq_len, stride, fields))
+
+    def token_split(self, fraction: float, *, held: bool,
+                    fields: tuple[str, ...] = ("text",)) -> Pipeline:
+        return self.then(TokenSplit(fraction, held, fields))
 
     def rebatch(self, size: int) -> Pipeline:
         return self.then(Rebatch(size))

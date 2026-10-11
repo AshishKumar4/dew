@@ -37,7 +37,7 @@ from transformers import (
     Qwen3MoeForCausalLM,
 )
 
-from dew.data import TokenCorpus
+from token_support import encoded_token_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"
@@ -132,8 +132,8 @@ def qualified(tmp_path_factory, request) -> Path:
     # checked for near ties in its routing over these tokens, and an edit to
     # the live file failed that check.
     (directory / "corpus.txt").write_bytes((FIXTURES / "qualification_corpus.txt").read_bytes())
-    TokenCorpus.write(directory / "corpus.txt", directory / "tokens", tokenizer=str(TOKENIZER),
-                      val_fraction=0.1)
+    encoded_token_fixture(directory / "tokens", [(directory / "corpus.txt").read_text()],
+                          tokenizer=str(TOKENIZER), val_fraction=0.1)
     tokenizer = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
     torch.manual_seed(13)
     source_model(request.param, len(tokenizer)).save_pretrained(directory / "source")

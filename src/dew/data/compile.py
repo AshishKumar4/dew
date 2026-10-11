@@ -32,6 +32,7 @@ from dew.data.dataset import (
     _Grouped,
     _WorkerBatches,
     weight_counts,
+    rows_of,
 )
 from dew.data.mix import Accepted, CorpusCounts, SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import (
@@ -64,6 +65,7 @@ from dew.data.pipeline import (
     SingleReader,
     Slice,
     Stage,
+    TokenSplit,
     Volatile,
     Windows,
     Workers,
@@ -121,6 +123,38 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     return StepIdentity.of(stage)
 
 
+def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
+    return Manifest.of(source.snapshot(), tuple(_identity(stage, cache=True) for stage in prefix),
+                       fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"})
+
+
+def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
+    references = []
+    for leaf in _leaves(pipeline):
+        if isinstance(leaf.source, (Mixture, Phases)):
+            continue
+        for index, stage in enumerate(leaf.stages):
+            if isinstance(stage, Artifact):
+                references.append(stage.cache.reference(_cache_manifest(leaf.source, leaf.stages[:index], read)))
+    return tuple(references)
+
+
+def _promoted(pipeline: Pipeline) -> tuple[Pipeline, tuple[str, ...]]:
+    from dew.data.cache import Generation
+
+    source = pipeline.source
+    references: tuple[str, ...] = ()
+    if isinstance(source, (Mixture, Phases)):
+        branches = [_promoted(child) for child in source.pipelines]
+        source = dataclasses.replace(source, pipelines=tuple(child for child, _ in branches))
+        references = tuple(reference for _, held in branches for reference in held)
+    for index, stage in enumerate(pipeline.stages):
+        if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
+            return (dataclasses.replace(pipeline, source=stage.cache.source(), stages=pipeline.stages[index + 1:]),
+                    (*references, f"generation {stage.cache.url}"))
+    return dataclasses.replace(pipeline, source=source), references
+
+
 def _check(pipeline: Pipeline, read: Read, *, validation: bool = False) -> None:
     if isinstance(pipeline.source, (Mixture, Phases)):
         for child in pipeline.source.pipelines:
@@ -136,6 +170,8 @@ def _check(pipeline: Pipeline, read: Read, *, validation: bool = False) -> None:
     prefix = list(ancestry)
     for stage in pipeline.stages:
         name = _name(pipeline)
+        if isinstance(stage, TokenSplit) and read != "memory":
+            raise ValueError(f"token holdout in {name} needs read='memory' or a producer-published token split")
         if isinstance(stage, RandomMap) or isinstance(stage, Configured) and stage.random:
             random = _identity(stage).name
             if validation and not canonical:
@@ -396,7 +432,7 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
         if not isinstance(artifact, Artifact):
             raise RuntimeError("cache stage changed in an immutable pipeline")
         prefix = pipeline.stages[:artifact_at]
-        manifest = Manifest.of(source.snapshot(), tuple(_identity(stage, cache=True) for stage in prefix))
+        manifest = _cache_manifest(source, prefix, "memory")
         cached = artifact.cache.mapped(
             pygrain.MapDataset.source(stored), manifest, source, transform=_Prefix(prefix)
         )
@@ -423,9 +459,11 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
                 rows.append(((index,), value))
     derived: dict[str, str] = {}
     for stage in pipeline.stages[consumed:]:
-        if not isinstance(stage, (Map, MapWithIndex, Filter, FlatMap, Pack, Windows)):
+        if not isinstance(stage, (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)):
             break
-        if isinstance(stage, Windows):
+        if isinstance(stage, TokenSplit):
+            rows = _split_tokens(rows, stage)
+        elif isinstance(stage, Windows):
             from dew.data.steps.windows import WindowRecords
 
             derived[f"accepted_before_windows_{consumed}"] = fingerprint([list(identifier) for identifier, _ in rows])
@@ -466,6 +504,24 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
         consumed += 1
     return _memory_order(pipeline, rows, consumed, source, len(stored), counter, derived, groups,
                          training=training)
+
+
+def _split_tokens(rows: Sequence[tuple[tuple[int, ...], Record]], split: TokenSplit
+                  ) -> list[tuple[tuple[int, ...], Record]]:
+    documents = [(identifier, record(value, "token split document")) for identifier, value in rows]
+    total = sum(len(value[split.fields[0]]) for _, value in documents)
+    boundary = min(round(total * split.fraction), max(0, total - 1))
+    start, stop = (0, boundary) if split.held else (boundary, total)
+    selected = []
+    offset = 0
+    for identifier, value in documents:
+        size = len(value[split.fields[0]])
+        first, last = max(0, start - offset), min(size, stop - offset)
+        if first < last:
+            selected.append(((*identifier, first, last), {
+                key: column[first:last] if key in split.fields else column for key, column in value.items()}))
+        offset += size
+    return selected
 
 
 def _memory_mixture(pipeline: Pipeline, mixture: Mixture, counts: dict[str, CorpusCounts],
@@ -635,10 +691,11 @@ class _Host(Forwarding):
 
 
 class _CanonicalPass:
-    def __init__(self, reader: Reader, partition: DataPartition):
+    def __init__(self, reader: Reader, partition: DataPartition, batch: int):
         import jax
 
         self._partition = partition
+        self._batch = batch
         self._source = reader(DataPartition()) if jax.process_index() == 0 else None
 
     def __iter__(self) -> Iterator[Batch]:
@@ -661,7 +718,7 @@ class _CanonicalPass:
             buffer = np.frombuffer(payload, np.uint8).copy() if root else np.zeros(size, np.uint8)
             payload = np.asarray(multihost_utils.broadcast_one_to_all(buffer, is_source=root)).tobytes()
         whole = record(decode(payload), "canonical validation batch")
-        return _ShareBatch(self._partition)(whole)
+        return _FillShare(self._partition, self._batch)(whole)
 
     def close(self) -> None:
         if isinstance(self._source, Closeable):
@@ -726,6 +783,12 @@ def _per_share(pipeline: Pipeline, read: Read) -> bool:
         return any(_per_share(child, read) for child in pipeline.source.pipelines)
     if read == "streamed":
         return True
+    iterable = False
+    for stage in pipeline.stages:
+        if isinstance(stage, Prefetch):
+            iterable = True
+        elif iterable and isinstance(stage, (RandomMap, MapWithIndex, Group)):
+            return True
     if isinstance(pipeline.source, (Mixture, Phases)):
         if pipeline.source.tokens is not None:
             for child in pipeline.source.pipelines:
@@ -811,7 +874,7 @@ class _Build:
         stored = source.records(self.read)
         rows = pygrain.MapDataset.source(stored).seed(self.seed)
         lengths = source.lengths()
-        measured = None if lengths is None else pygrain.MapDataset.source(lengths.tolist())
+        measured = None if lengths is None else pygrain.MapDataset.source(lengths)
         if not self.global_order and self.training:
             rows = rows[partition.index :: partition.count]
             measured = None if measured is None else measured[partition.index :: partition.count]
@@ -819,7 +882,8 @@ class _Build:
                 rows = rows.repeat(None)
         return rows, measured
 
-    def records(self, pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
+    def records(self, pipeline: Pipeline, partition: DataPartition,
+                offset: int = 0) -> tuple[Rows, pygrain.MapDataset | None]:
         source = pipeline.source
         artifact_at = next(
             (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Artifact)), None
@@ -834,7 +898,7 @@ class _Build:
                 raise ValueError(
                     f"cache prefix in {_name(pipeline)} must contain only deterministic record steps"
                 )
-            manifest = Manifest.of(source.snapshot(), tuple(_identity(stage, cache=True) for stage in prefix))
+            manifest = _cache_manifest(source, prefix, self.read)
             transform = _Prefix(prefix)
             if self.read == "streamed":
                 from dew.data.shards import streamed
@@ -862,7 +926,8 @@ class _Build:
                 )
                 if isinstance(rows, Closeable):
                     rows = _CacheRows(_as_iter(rows, self.loading), rows)
-            rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), _CachedOutputs())
+            rows = Accepted(gx.FlatMapIterDataset(_as_iter(rows, self.loading), _CachedOutputs()),
+                            _name(pipeline), budget=self.budget)
             lengths = None
             consumed = artifact_at + 1
         else:
@@ -872,6 +937,14 @@ class _Build:
                 break
             if self.read == "streamed" and isinstance(stage, Repeat) and _root_repeat(pipeline):
                 continue
+            if isinstance(stage, Prefetch) and isinstance(rows, pygrain.MapDataset) and self.global_order:
+                if self.training and not any(isinstance(step, Repeat) for step in pipeline.stages):
+                    rows = rows.repeat(None)
+                rows = rows[offset + partition.index::partition.count]
+                workers = _workers(pipeline, self.loading)
+                if workers:
+                    rows = _WorkerBatches(rows, partition.rows(self.batch), workers,
+                                          remainder=not self.training)
             rows, lengths = self.stage(rows, lengths, stage, pipeline, partition)
         if not self.global_order:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
@@ -955,9 +1028,7 @@ class _Build:
             if isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("cache belongs on each corpus before mix")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
-            manifest = Manifest.of(
-                pipeline.source.snapshot(), tuple(_identity(step, cache=True) for step in prefix)
-            )
+            manifest = _cache_manifest(pipeline.source, prefix, self.read)
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError("streamed cache must be applied to its shard reader before interleave")
             rows = stage.cache.mapped(rows, manifest, pipeline.source)
@@ -989,15 +1060,16 @@ class _Build:
                             _name(pipeline), budget=self.budget)
             lengths = None
         elif isinstance(stage, FlatMap):
-            rows = gx.FlatMapIterDataset(_as_iter(rows, self.loading), _Expand(stage))
+            rows = Accepted(gx.FlatMapIterDataset(_as_iter(rows, self.loading), _Expand(stage)),
+                            _name(pipeline), budget=self.budget)
             lengths = None
         return rows, lengths
 
     def batches(
-        self, pipeline: Pipeline, partition: DataPartition, offset: int = 0
+        self, pipeline: Pipeline, partition: DataPartition, offset: int = 0, *, fill: bool = True
     ) -> pygrain.DatasetIterator[Batch]:
         canonical = not self.training and not self.global_order
-        rows, _ = self.records(pipeline, DataPartition() if canonical else partition)
+        rows, _ = self.records(pipeline, DataPartition() if canonical else partition, offset)
         batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
         shared_size = partition.rows(batch_stage.size)
         size = batch_stage.size if canonical else shared_size
@@ -1021,10 +1093,9 @@ class _Build:
             drop_remainder=batch_stage.drop_remainder if self.training else False,
             batch_fn=batch_stage.batch_fn,
         )
-        if not self.training:
-            stream = stream.map(FilledBatch(size, real=not empty))
-            if canonical and partition.count > 1:
-                stream = stream.map(_ShareBatch(partition))
+        if not self.training and fill:
+            stream = stream.map(_FillShare(partition, batch_stage.size) if canonical
+                                else FilledBatch(size, real=not empty))
         explicit_workers = False
         for stage in pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]:
             if isinstance(stage, Workers):
@@ -1127,6 +1198,10 @@ def compile(
     pipelines = (train,) if validation is None else (train, validation)
     for pipeline in pipelines:
         _check(pipeline, read, validation=pipeline is validation)
+    train, generations = _promoted(train)
+    if validation is not None:
+        validation, _ = _promoted(validation)
+    pipelines = (train,) if validation is None else (train, validation)
     _capabilities(pipelines, read, provision)
     if objective is not None:
         train = _objective_branch(train, objective, train=True, read=read)
@@ -1167,7 +1242,7 @@ def compile(
         manifest,
         _order(train),
         _derived(train, seed, read),
-        cache=tuple(stage.cache.url for stage in _steps(original) if isinstance(stage, Artifact)),
+        cache=(*generations, *_cache_references(original, read)),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
             for stage in _steps(train)
@@ -1292,7 +1367,7 @@ def _validation_reader(partition: DataPartition, *, pipeline: Pipeline, build: _
         build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
     if build.read == "streamed":
         build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
-        opened = _CanonicalPass(functools.partial(build.batches, pipeline), partition)
+        opened = _CanonicalPass(functools.partial(build.batches, pipeline, fill=False), partition, build.batch)
     else:
         opened = build.batches(pipeline, partition)
     return _Host(opened, host) if host else opened
@@ -1327,6 +1402,21 @@ class _ShareBatch:
 
     def __call__(self, batch: Batch) -> Batch:
         return {name: value[self.partition.index :: self.partition.count] for name, value in batch.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class _FillShare:
+    partition: DataPartition
+    batch: int
+
+    def __call__(self, batch: Batch) -> Batch:
+        import jax
+
+        mine = jax.tree.map(lambda value: value[self.partition.index::self.partition.count], batch)
+        empty = rows_of(mine) == 0
+        if empty:
+            mine = jax.tree.map(lambda value: value[:1], batch)
+        return FilledBatch(self.partition.rows(self.batch), real=not empty).map(mine)
 
 
 def _workers(pipeline: Pipeline, loading: Loading) -> int:
@@ -1368,7 +1458,7 @@ class _LengthAt:
         measured = self.lengths[index]
         if measured is None:
             raise ValueError(f"length metadata is missing index {index}")
-        return measured
+        return int(measured)
 
 
 def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
@@ -1495,11 +1585,38 @@ def iterate(
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
     _check(pipeline, read)
     _capabilities((pipeline,), read, provision)
+    if any(isinstance(stage, Configured) for stage in _steps(pipeline)):
+        pipeline = _configured(pipeline, _metadata((pipeline,), read), read)
+        _check(pipeline, read)
     if read == "memory":
         pipeline = _materialize(pipeline, {}, training=False)
     build = _Build(read, loading, 0, 1, budget, not _per_share(pipeline, read), training=False)
     rows, _ = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
+
+
+def validation(pipeline: Pipeline, *, batch: int, objective: ObjectiveData | None = None,
+               host: tuple[HostStep, ...] = (), read: Read = "indexed", provision: bool = False,
+               loading: Loading = _DEFAULT_LOADING, seed: int = 0,
+               budget: SearchBudget = _DEFAULT_BUDGET) -> Reader:
+    """Compile one finite evaluation branch without constructing a training stream."""
+    if not any(isinstance(stage, BatchStage) for stage in pipeline.stages):
+        pipeline = pipeline.batch(batch, drop_remainder=False)
+    _check(pipeline, read, validation=True)
+    _capabilities((pipeline,), read, provision)
+    if objective is not None:
+        pipeline = _objective_branch(pipeline, objective, train=False, read=read)
+    if any(isinstance(stage, Configured) for stage in _steps(pipeline)):
+        pipeline = _configured(pipeline, _metadata((pipeline,), read), read)
+    _check(pipeline, read, validation=True)
+    if read == "memory":
+        pipeline = _materialize(pipeline, {}, training=False)
+    build = _Build(read, loading, seed, batch, budget, not _per_share(pipeline, read), training=False)
+    if loading.workers == "auto":
+        rows, _ = build.records(pipeline, DataPartition())
+        build = dataclasses.replace(build, loading=loading.resolved(_as_iter(rows, loading)))
+    stages = tuple(stage.step for stage in pipeline.stages if isinstance(stage, MapBatch)) + host
+    return functools.partial(_validation_reader, pipeline=pipeline, build=build, host=stages)
 
 
 def publish(pipeline: Pipeline, cache, *, read: Read = "streamed", provision: bool = False,
@@ -1513,8 +1630,7 @@ def publish(pipeline: Pipeline, cache, *, read: Read = "streamed", provision: bo
         raise ValueError("publish each source prefix before mixing")
     cached = pipeline.cache(cache)
     _check(cached, read)
-    manifest = Manifest.of(pipeline.source.snapshot(), tuple(_identity(stage, cache=True)
-                                                            for stage in pipeline.stages))
+    manifest = _cache_manifest(pipeline.source, pipeline.stages, read)
     iterator = iter(iterate(cached, read=read, provision=provision, loading=loading))
     try:
         for _ in iterator:

@@ -41,7 +41,7 @@ import numpy as np
 import optax
 
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.data import Dataset, TFDSImages
+from dew.data import Dataset, Images
 from dew.diffusion.presets import Flow
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
@@ -65,7 +65,7 @@ def run_config(directory):
         model=ModelConfig("simple_mmdit", {"patch_size": 2, "emb_features": 32, "num_layers": 1,
                                                "num_heads": 2, "mlp_ratio": 1,
                                                "dtype": "float32", "attention_impl": "reference"}),
-        data=TFDSImages(image_size=RES),
+        data=Images(source="tfds://oxford_flowers102", image_size=RES),
         trainer=TrainerConfig(checkpoint_dir=str(directory), batch_size=BATCH, steps=2),
         preset=Flow(), text=TextCondition(encoder="t5", checkpoint=str(T5_TINY), max_length=8),
         autoencoder=PretrainedAutoencoder(modelname=str(VAE_TINY), dtype="float32"),

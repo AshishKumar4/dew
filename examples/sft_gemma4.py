@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import ModelConfig, OptimConfig, TrainerConfig
-from dew.data import ChatMessages, HFTokenizer, Loading
+from dew.data import Chat, HFTokenizer, Loading, load
 from dew.data.chat import Role
 from dew.inference import RunProcessor
 from dew.interop import PretrainedDecoder
@@ -83,10 +83,11 @@ def run_config(config: Config, tokenizer: str, chat: str) -> LMRunConfig:
     # A row budget is the split slice `datasets` already understands.
     split = config.split if config.rows is None else f"{config.split}[:{config.rows}]"
     return LMRunConfig(
-        data=ChatMessages(tokenizer=tokenizer, path=chat, val_path=chat, column=config.column,
-                          split=split, seq_len=config.sequence_length, val_batches=1,
-                          loading=Loading(workers=0, threads=1, read_buffer=2,
-                                          worker_buffer=1) if smoke else Loading(workers=4)),
+        data=Chat(tokenizer=tokenizer, source=chat, validation=chat, column=config.column,
+                  split=split, seq_len=config.sequence_length, long="chunk"),
+        validation_records=config.batch_size,
+        loading=Loading(workers=0, threads=1, read_buffer=2,
+                        worker_buffer=1) if smoke else Loading(workers=4),
         tokenizer=tokenizer,
         max_new_tokens=4 if smoke else 64,
         optim=OptimConfig(learning_rate=config.learning_rate, weight_decay=0.0,
@@ -135,7 +136,9 @@ def main(config: Config) -> Path:
     # rebuild the checkpoint's own architecture at the precision it trained in.
     run = replace(run, model=ModelConfig.from_model(source.model))
 
-    data = run.data.load(batch=run.trainer.batch_size)
+    data = load(run.data, batch=run.trainer.batch_size, read=run.read,
+                provision=run.provision, loading=run.loading,
+                validation_records=run.validation_records)
     name = config.out.name
     state: TrainState = run.train(objective, data, name=name,
                                   metrics=(Perplexity(),),

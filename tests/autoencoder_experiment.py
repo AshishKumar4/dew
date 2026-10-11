@@ -12,7 +12,7 @@ import numpy as np
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data import HFOptions, HubDataset
+from dew.data import Records
 from dew.inputs import Field, InputSpec
 
 FEATURES = 8
@@ -62,8 +62,7 @@ def run() -> RunConfig:
              "validation": points(data / "validation.jsonl", 64, 2)}
     return RunConfig(
         model=ModelConfig.from_model(Autoencoder()),
-        data=HubDataset(name="json", split="train", val_split="validation",
-                        options=HFOptions(data_files=files)),
+        data=Records(source=files["train"], validation=files["validation"]),
         objective=ObjectiveConfig("supervised", {"loss": evidence_bound, "metrics": (reconstruction_error,),
                                                  "inputs": InputSpec(Field("x", (FEATURES,)))}),
         optim=OptimConfig(learning_rate=1e-2),
