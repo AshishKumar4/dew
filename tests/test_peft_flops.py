@@ -1,5 +1,7 @@
 """Frozen-base and trainable-factor work, including the actual gradient matrix shapes."""
 
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -13,6 +15,7 @@ from dew.data.text import ByteTokenizer
 from dew.decision.head import JointSchemaHead
 from dew.decision.layout import Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
+from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.flops import MissingFlopsCount, dense_training_flops, projection_flops
@@ -120,6 +123,21 @@ def test_unknown_adapted_family_is_refused_instead_of_being_counted_as_full_ft()
     adapted = LoRA(rank=2, modules=("layer",)).apply(model, variables, key=505)
     with pytest.raises(MissingFlopsCount, match="Unknown"):
         adapted.model.training_flops(np.array([1, 1]))
+
+
+def test_native_multimodal_qwen_adapter_counts_text_without_its_unused_image_tower():
+    """The same wrapper/adapter shape c57 uses, without downloading a 9B model."""
+    path = Path(__file__).parent / "fixtures" / "hf" / "qwen35-tiny-mm"
+    source = Pretrained.load(str(path), dtype=jnp.float32)
+    adapted = source.adapt(LoRA(rank=2, modules=("q_proj", "down_proj")), key=507)
+    lengths = np.array([3, 5])
+    original = source.model
+    forward = original.model_flops(lengths)
+    frozen_maps = original.parameter_flops(lengths)
+    adapter_forward = adapted.model.model_flops(lengths) - forward
+    assert adapter_forward > 0
+    assert adapted.model.training_flops(lengths) == 3 * forward - frozen_maps + 3 * adapter_forward
+    assert original.model_flops(lengths) == original.language_model.model_flops(lengths)
 
 
 def test_trainer_reads_training_work_once_from_the_existing_interval_record(monkeypatch):
