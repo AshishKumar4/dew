@@ -11,7 +11,7 @@ from pathlib import Path
 import requests
 
 from tools.colab import colab_batch, colab_io, colab_sync
-from tools.colab.colab_new import Colab, Session
+from tools.colab.colab_new import Colab, Session, validate_shape
 from tools.colab.common import STATE, command, name, read, redact, save
 
 
@@ -334,6 +334,7 @@ def parser() -> argparse.ArgumentParser:
 
 def main() -> None:
     args = parser().parse_args()
+    validate_shape(args.hardware, args.high_mem)
     chosen = colab_batch.select(args.device, args.only, args.hardware, args.order.split(","))
     if not chosen:
         raise SystemExit("no approved, unheld entries selected")

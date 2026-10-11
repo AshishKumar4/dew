@@ -335,7 +335,8 @@ def fake_colab(monkeypatch, tmp_path):
     member = types.SimpleNamespace(name="GPU", value="GPU")
     shape = types.SimpleNamespace(name="STANDARD", value="STANDARD")
     enums = types.SimpleNamespace(
-        Variant={"GPU": member}, Accelerator={"GPU": member}, Shape={"STANDARD": shape}
+        Variant={"GPU": member}, Accelerator={"GPU": member}, Shape={"STANDARD": shape},
+        ColabRequestError=requests.HTTPError,
     )
     monkeypatch.setitem(sys.modules, "colab_cli.client", enums)
     monkeypatch.setitem(
@@ -381,6 +382,84 @@ def test_allocator_refuses_full_account_before_request(tmp_path, fake_colab):
     with pytest.raises(RuntimeError, match="no slot"):
         client.allocate("test", "gpu:A100", high_mem=False, journal=tmp_path / "allocation.json")
     assert not (tmp_path / "allocation.json").exists()
+
+
+def test_allocator_refuses_g4_high_memory_before_journaling_or_request(tmp_path, fake_colab):
+    client, _, _, _, service = fake_colab
+    service.assign = lambda *args, **kwargs: pytest.fail("invalid shape reached allocation")
+    with pytest.raises(ValueError, match="high-memory shape is unsupported"):
+        client.allocate("test", "gpu:G4", high_mem=True, journal=tmp_path / "allocation.json")
+    assert not (tmp_path / "allocation.json").exists()
+
+
+def test_driver_dry_run_refuses_g4_high_memory_before_queue_selection(monkeypatch):
+    monkeypatch.setattr(sys, "argv", [
+        "driver", "test", "--commit", "ref", "--only", "test", "--root", "test",
+        "--hardware", "gpu:G4", "--high-mem", "--dry-run",
+    ])
+    monkeypatch.setattr(batch, "select", lambda *args: pytest.fail("invalid shape reached selection"))
+    with pytest.raises(ValueError, match="high-memory shape is unsupported"):
+        ops_driver.main()
+
+
+@pytest.mark.parametrize("method,status,rejected", [("GET", 400, True), ("POST", 400, False), ("GET", 500, False)])
+def test_allocator_journals_only_definitive_first_get_rejection(tmp_path, fake_colab, method, status, rejected):
+    client, _, _, _, service = fake_colab
+    journal = tmp_path / "allocation.json"
+
+    def assign(*args, **kwargs):
+        raise requests.HTTPError("private response must not enter journal",
+                                 request=types.SimpleNamespace(method=method),
+                                 response=types.SimpleNamespace(status_code=status))
+
+    service.assign = assign
+    with pytest.raises(requests.HTTPError):
+        client.allocate("test", "gpu:A100", high_mem=False, journal=journal)
+    assert allocation.no_assignment_acquired(read(journal), {}) is rejected
+    assert "private response" not in journal.read_text()
+
+
+def test_get_rejection_after_timeout_remains_ambiguous(tmp_path, fake_colab, monkeypatch):
+    client, _, _, _, service = fake_colab
+    calls = []
+
+    def assign(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise requests.ReadTimeout()
+        raise requests.HTTPError("rejected", request=types.SimpleNamespace(method="GET"),
+                                 response=types.SimpleNamespace(status_code=400))
+
+    service.assign = assign
+    monkeypatch.setattr(allocation.time, "sleep", lambda seconds: None)
+    journal = tmp_path / "allocation.json"
+    with pytest.raises(requests.HTTPError):
+        client.allocate("test", "gpu:A100", high_mem=False, journal=journal)
+    assert len(calls) == 2 and not allocation.no_assignment_acquired(read(journal), {})
+    assert ops_supervisor.accounting({"rate": 8.9}, read(journal), {}, None, time.time())["cu_provisional"]
+
+
+def test_definitive_get_rejection_finalizes_without_recovery_and_zero_cu(tmp_path, fake_colab):
+    client, _, _, released, _ = fake_colab
+    save(tmp_path / "run.json", {"session": "test", "driver_sha": "driver", "started_at": 100, "rate": 8.9})
+    save(tmp_path / "driver.json", {"action": "allocate"})
+    save(tmp_path / "allocation.json", {
+        "requested_at": 100, "allocation_rejected_at": 200,
+        "allocation_rejection": {"method": "GET", "http_status": 400},
+    })
+    result = ops_supervisor.finalize(tmp_path, client, code=1)
+    assert result["release"] == "no assignment acquired" and not released
+    assert result["cu_estimate"] == result["cu_upper_bound"] == 0
+    assert not result["cu_provisional"] and result["release_retry_at"] is None
+    assert result["billing_finished_at"] == 200
+
+
+@pytest.mark.parametrize("owner", ["allocation", "driver"])
+def test_rejection_receipt_cannot_override_an_owned_endpoint(owner):
+    request = {"allocation_rejected_at": 200, "allocation_rejection": {"method": "GET", "http_status": 400}}
+    driver = {}
+    (request if owner == "allocation" else driver)["endpoint"] = "owned"
+    assert not allocation.no_assignment_acquired(request, driver)
 
 
 def test_release_never_unassigns_a_reused_name(fake_colab):
