@@ -747,11 +747,12 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     from dew.data import Files
     from dew.data.steps.video import VideoPath
 
-    rows = Files(str(tmp_path), format="files").records("memory")
+    patterns = (str(tmp_path / "**" / "*.mp4"), str(tmp_path / "**" / "*.webm"))
+    rows = Files(patterns, format="files").records("memory")
     records = [VideoPath(caption="a clip").map(row) for row in rows]
 
     assert [r["video_path"] for r in records] == sorted(
-        [str(c) for c in clips] + [str(tmp_path / "extra.webm")]
+        [c.as_uri() for c in clips] + [(tmp_path / "extra.webm").as_uri()]
     )
     assert {r["caption"] for r in records} == {"a clip"}
     with pytest.raises((ValueError, FileNotFoundError), match=r"source|files|directory"):
