@@ -181,7 +181,9 @@ def test_a_ref_without_the_called_module_fails_the_preflight(tmp_path, monkeypat
     args.origin, args.accept, args.also, args.dew_python = "origin", [], [], sys.executable
     receipt = preflight.preflight(args, tmp_path / "work")
     assert receipt["commit"] == commit and not receipt["ok"]
-    assert receipt["failures"] == ["rules.py:2: dew.kernels.fla_gdn: dew.kernels has no fla_gdn"]
+    # The script runs Dew's code, and this ref predates the lowering dry run: both fail, by name.
+    assert receipt["failures"][0] == "rules.py:2: dew.kernels.fla_gdn: dew.kernels has no fla_gdn"
+    assert len(receipt["failures"]) == 2 and "predates the lowering dry run" in receipt["failures"][1]
     assert receipt["inputs"] == {"rules.py": hashlib.sha256(script.read_bytes()).hexdigest()}
     assert (receipt["interpreter"], receipt["tool"]) == ("system", preflight.TOOL)
 
