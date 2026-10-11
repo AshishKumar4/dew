@@ -216,3 +216,30 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     assert time["by_kind_ms"] == {"attention": 6.0, "pallas": 2.0, "layout": 1.0, "gemm": 0.5}
     assert time["by_part_kind_ms"]["attention"] == {"attention": 6.0}
     assert time["by_part_kind_ms"]["mlp"] == {"gemm": 0.5}
+
+
+def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
+    """XProf's roofline gives an RTX PRO 6000 a 3,742 TFLOP/s peak, a sparse low-precision figure:
+    every MFU field reads Dew's dense bf16 table where the entry names the device, and XProf's
+    roofline only where it does not."""
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info"]
+    cells = ("15", "custom-call", "custom-call.1", "%custom-call.1 = bf16[8,8]{1,0} custom-call()",
+             "jit(step)/dot_general", "1", 1000.0, "")
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": [{"c": [{"v": v} for v in cells]}]}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
+    entry = tmp_path / "entry.json"
+    entry.write_text(json.dumps({"model_flops_per_step": 2.5e11,
+                                 "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition"}))
+    out = tmp_path / "attribution.json"
+    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    assert attribute.main(command) == 0
+    time = json.loads(out.read_text())["time"]
+    assert time["peak_gflops"] == 500e3 and time["peak_source"].startswith("dew.telemetry.peaks")
+    assert time["mfu_of_device_time"] == 0.5
+    entry.write_text(json.dumps({"model_flops_per_step": 2.5e11}))
+    assert attribute.main(command) == 0
+    assert json.loads(out.read_text())["time"]["peak_source"] == "xprof roofline"
