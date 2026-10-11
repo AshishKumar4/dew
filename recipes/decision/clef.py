@@ -37,7 +37,7 @@ PROJECTIONS = ("q_proj", "k_proj", "v_proj", "o_proj", "in_proj_qkv", "in_proj_z
 
 
 def run_config() -> DecisionRunConfig:
-    """The Clef recipe's run, every value a flag."""
+    """Rows vary from 160 to 3,072+ tokens; a token budget fills each micro-batch with real tokens."""
     return DecisionRunConfig(
         pretrained="Qwen/Qwen3.5-4B", revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
         model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}),
@@ -45,7 +45,8 @@ def run_config() -> DecisionRunConfig:
         data=Decisions("data/mixture"),
         objective=ObjectiveConfig("decision", {"loss": RULES, "label_smoothing": 0.05}),
         optim=OptimConfig(learning_rate=1e-4, schedule=Cosine(peak=1e-4, warmup_steps=400)),
-        trainer=TrainerConfig(batch_size=4, steps=12_000, eval_every=1_000, checkpoint_every=1_000),
+        trainer=TrainerConfig(batch_size=None, batch_tokens=16_384, update_tokens=16_384,
+                              steps=12_000, eval_every=1_000, checkpoint_every=1_000),
         max_len=4096)
 
 

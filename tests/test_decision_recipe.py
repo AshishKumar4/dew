@@ -201,6 +201,34 @@ def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
         next(refused.train(DataPartition()))
 
 
+def test_the_clef_recipe_defaults_build_token_budget_batches():
+    import itertools
+
+    from recipes.decision.clef import run_config
+
+    run = run_config()
+    trainer = run.trainer.derived()
+    assert trainer.batch_size is None
+    assert trainer.batch_tokens == trainer.update_tokens == 16_384
+    assert trainer.accumulation == 1 and run.bucket_lengths == ()
+    choice = Choice("Which?", ["first", "second"])
+    examples = [Example("x" * size, {"team": choice}, {"team": 0})
+                for size in (160, 768, 1_536, 3_072)] * 64
+    objective = DecisionObjective(Decide.from_pretrained(TINY), layout=JointLayout(max_len=run.max_len),
+                                  shuffle_options=False)
+    data = load(Decisions(source=examples), batch=trainer.batch_size, tokens=trainer.batch_tokens,
+                lengths=run.bucket_lengths, objective=objective.data(), read="memory",
+                loading=Loading(workers=0))
+    assert data.batch_tokens == 16_384
+    stream = data.train(DataPartition())
+    try:
+        batches = list(itertools.islice(stream, 8))
+    finally:
+        stream.close()
+    assert len({batch["tokens"].shape[1] for batch in batches}) <= 6
+    assert all(batch["tokens"].shape[0] * batch["tokens"].shape[1] == 16_384 for batch in batches)
+
+
 @pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
 def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_path, param_dtype):
     """The Clef recipe end to end on the tiny Qwen 3.5: LoRA on its attention,
