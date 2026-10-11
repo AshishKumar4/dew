@@ -33,16 +33,21 @@ EVIDENCE = Path(os.environ.get(
     "REFERENCE_RUNS_DIR", Path.home() / ".cache/dew/verification-evidence/reference-runs"))
 
 
-def _peaks():
-    """dew.telemetry.peaks, read by path: a reference run's venv need not hold Dew."""
-    path = Path(__file__).resolve().parents[2] / "src/dew/telemetry/peaks.py"
-    spec = importlib.util.spec_from_file_location("dew_telemetry_peaks", path)
+def _targets():
+    """Dew's standard-library-only target table, read without importing the library's JAX modules."""
+    path = Path(__file__).resolve().parents[2] / "src/dew/nn/kernels/generation.py"
+    spec = importlib.util.spec_from_file_location("dew_gpu_targets", path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 
 
-peak_flops = _peaks().peak_flops
+gpu_target = _targets().gpu_target
+
+
+def peak_flops(device_kind: str) -> float | None:
+    return gpu_target(device_kind).bf16_peak
 
 
 def register_plain_causal_sdpa() -> str:

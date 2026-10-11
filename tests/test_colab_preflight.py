@@ -264,7 +264,9 @@ def test_selection_refuses_a_request_without_a_preflight(tmp_path, monkeypatch):
         batch.select("gpu", "test", "gpu:T4", [])
 
 
-KERNELS_SOURCE = "KERNELS = {'gated_delta_rule': {'sm80': 'fla'}, 'attention': {'sm80': 'flash'}}\n"
+KERNELS_SOURCE = (Path(__file__).resolve().parents[1] / 'src/dew/nn/kernels/generation.py').read_text() + (
+    "\nTARGETS['sm80'] = dataclasses.replace(TARGETS['sm80'], "
+    "kernels={'gated_delta_rule': 'fla', 'attention': 'flash'})\n")
 
 
 def kernel_tree(root: Path, kernels: str = KERNELS_SOURCE) -> Path:

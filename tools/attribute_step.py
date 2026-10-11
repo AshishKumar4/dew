@@ -46,8 +46,8 @@ from collections import defaultdict
 from collections.abc import Iterable, Iterator
 from pathlib import Path
 
+from dew.nn.kernels.generation import gpu_target
 from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
-from dew.telemetry.peaks import peak_flops
 from dew.telemetry.profile import report_table
 
 PARTS = (
@@ -175,9 +175,10 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is a
     # different kind of figure (on an RTX PRO 6000, 3,742 TFLOP/s, sparse low precision), kept for
     # reference only: a device Dew's table does not name gets no peak-derived field at all.
-    known = peak_flops(device) if device else None
+    target = gpu_target(device) if device else None
+    known = None if target is None else target.bf16_peak
     peak = known / 1e9 if known else None
-    peak_source = (f"dew.telemetry.peaks for {device}" if known
+    peak_source = (f"dew.nn.kernels.generation.gpu_target for {device}" if known
                    else f"unknown device: {device}" if device else "no device named")
     xprof_peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0) or None
     programs = defaultdict(float)
@@ -247,8 +248,8 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         # throughput. mfu_mixed: each GEMM's FLOPs over its own precision's peak, the true
         # utilization, null where an FP8 GEMM runs on a device with no FP8 peak in Dew's table.
         seconds = device_us * 1e-6
-        fp8 = fp8_gflop * 1e9 / steps
-        fp8_peak = peak_flops(device, "fp8") if device and fp8 else None
+        fp8 = fp8_gflop * 1e9
+        fp8_peak = None if target is None else target.fp8_peak
         result.update(model_flops_per_step=model_flops, fp8_gemm_flops_per_step=fp8,
                       bf16_equiv_throughput_tflops=round(model_flops / seconds / 1e12, 2))
         result["mfu_bf16_of_device_time"] = round(model_flops / seconds / (peak * 1e9), 4) if peak else None
