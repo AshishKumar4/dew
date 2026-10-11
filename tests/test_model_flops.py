@@ -364,7 +364,15 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [900, 7])
     interval.logged(3.0)
     np.testing.assert_array_equal(np.asarray([interval.book.training, interval.book.tokens]), [0, 0])
-    assert not interval.model_counted and not interval.tokens_counted
+    assert interval.counted_steps == 0 and not interval.tokens_counted
+
+
+def test_an_interval_with_an_uncounted_step_reports_no_partial_work():
+    interval = Interval(last_log_time=0, last_saved=None)
+    loss = jnp.asarray(1.0)
+    for aux in ({TRAINING_FLOPS: jnp.asarray(300.0), TOKENS: jnp.asarray(4.0)}, {TOKENS: jnp.asarray(3.0)}):
+        interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss, jnp.asarray(a=True), None, aux)
+    assert interval.counted_steps == 1 and interval.since_log == 2
 
 
 def forward_products(function, *operands, state_mac: bool = False):

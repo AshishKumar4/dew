@@ -626,6 +626,34 @@ def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, 
         assert all(values["train/tokens"] == BATCH for values in ticks)
 
 
+class StopsCounting(CountedRegression):
+    """Counts its rows until a batch carries work it cannot declare, as a media row's tower."""
+
+    def model_flops(self, model, batch):
+        if np.any(batch["late"]):
+            raise MissingFlopsCount("StopsCounting's late rows carry undeclared work")
+        return super().model_flops(model, batch)
+
+
+def test_a_batch_that_cannot_be_counted_ends_mfu_and_the_run_trains_on(monkeypatch, capsys):
+    from dew.nn.kernels import TARGETS, GpuTarget
+
+    device = jax.devices()[0].device_kind
+    monkeypatch.setitem(TARGETS, device, GpuTarget(device, device, dense_peaks={device: {"bf16": 100.0}}))
+
+    def marked():
+        for index, batch in enumerate(batches()):
+            yield {**batch, "late": np.full((BATCH,), index >= 2)}
+
+    tracker = RecordingTracker()
+    state = Trainer(StopsCounting(), optax.adam(1e-3), key=0, tracker=tracker).fit(
+        Data(marked), steps=4, log_every=1)
+    ticks = [values for _, values in tracker.scalars if "train/step_time_ms" in values]
+    assert int(state.step) == 4
+    assert ["train/mfu" in values for values in ticks] == [True, True, False, False]
+    assert capsys.readouterr().out.count("train/mfu is unavailable for StopsCounting: ") == 1
+
+
 @pytest.mark.parametrize("kind", ["custom", "lm", "lora"])
 def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch, capsys, kind):
     from dew.nn.kernels import TARGETS, GpuTarget
