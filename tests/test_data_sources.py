@@ -64,6 +64,19 @@ def test_remote_tfds_requires_explicit_provisioning_before_native_reads():
     assert not Path(source.directory, "dew_images-test.array_record-00000-of-00001").exists()
 
 
+def test_tfds_label_definitions_participate_in_source_identity(tmp_path):
+    import shutil
+
+    from dew.data.sources import TFDS
+
+    fixture = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    shutil.copytree(fixture, tmp_path, dirs_exist_ok=True)
+    before = TFDS("dew_images", path=str(tmp_path)).snapshot()
+    (tmp_path / "label.labels.txt").write_text("rouge\nbleu\n")
+    after = TFDS("dew_images", path=str(tmp_path)).snapshot()
+    assert before != after
+
+
 def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
     rows = [{"id": index, "text": "escaped\nline"} for index in range(30)]
     root = Store(f"memory://jsonl-{uuid4().hex}/rows.jsonl")
