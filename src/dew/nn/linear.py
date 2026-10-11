@@ -129,12 +129,28 @@ def _stream_order(valid):
     return rank, jnp.where(jnp.arange(length)[None, :] < counts[:, None], order, length).astype(jnp.int32)
 
 
-def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None):
+def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None, right_padded: bool = False):
     """`[B, D, S]` convolved causally after the `held` history, `[B, D, K - 1]`
     or None for none, and the history the next call holds: a linear-attention
     or state-space layer's conv over its decode cache, padded slots read and
     advanced by none (`_masked_conv1d`). `bias` is added before the silu, and
-    packed `segments` convolve each document alone."""
+    packed `segments` convolve each document alone.
+
+    `right_padded` says each row's `valid` slots are its first
+    (`AttentionMetadata.right_padded`). Its real tokens then follow the held
+    ones with no gap, so the row convolves as it stands and its padding is
+    zeroed after: the masked conv's values, without its two gathers over
+    every slot and their scattered gradients."""
+    if valid is not None and right_padded and segments is None:
+        width = kernel.shape[-1] - 1
+        start = rows_like(jnp.zeros((*x.shape[:2], width), x.dtype), x) if held is None else held
+        stream = jnp.concatenate([start, x], axis=2)
+        valid = jnp.asarray(valid, bool)
+        convolved = causal_conv1d(stream, kernel, bias=bias)[..., width:]
+        # The K-1 columns that end at the row's last real token.
+        ends = jnp.sum(valid, axis=1, dtype=jnp.int32)
+        history = jnp.take_along_axis(stream, ends[:, None, None] + jnp.arange(width)[None, None, :], axis=2)
+        return jnp.where(valid[:, None, :], convolved, 0), history
     if valid is not None or segments is not None:
         valid = jnp.ones(x.shape[::2], bool) if valid is None else valid
         return _masked_conv1d(x, kernel, valid, held, bias=bias, segments=segments)
@@ -144,7 +160,8 @@ def held_conv1d(x, kernel, valid, held=None, *, bias=None, segments=None):
 
 
 def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int, ...], *, decode: bool,
-              valid, segments=None, state: str = 'ssm_state', state_dtype=None, conv_dtype=None):
+              valid, segments=None, state: str = 'ssm_state', state_dtype=None, conv_dtype=None,
+              right_padded: bool = False):
     """The conv and scan of a mixer that holds per-row state: a decode step or
     prefill advancing `module`'s flax cache, `conv_state` `[B, D, K-1]` held
     in `conv_dtype` and `state` `[B, *state_shape]` held in `state_dtype`
@@ -154,7 +171,8 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
     as it is stored and returning `(output, final state)`. None for the
     allocation-only decode call. Packed `segments` reset the conv and the
     state at each document's first real token; the held state counts as the
-    call's first document, which it continues."""
+    call's first document, which it continues. `right_padded` is
+    `held_conv1d`'s."""
     batch = mixed.shape[0]
     mixed = jnp.moveaxis(mixed, 2, 1)                       # [B, D, S]
     held = conv_state = None
@@ -167,7 +185,7 @@ def held_scan(module: nn.Module, mixed, taps, bias, scan, state_shape: tuple[int
             return None
     mixed, history = held_conv1d(mixed, taps, valid,
                                  None if conv_state is None else conv_state.value.astype(mixed.dtype),
-                                 bias=bias, segments=segments)
+                                 bias=bias, segments=segments, right_padded=right_padded)
     if conv_state is not None:
         conv_state.value = history.astype(conv_state.value.dtype)
     starts = None if segments is None else document_starts(segments, valid=valid)
@@ -702,7 +720,8 @@ class GatedDeltaNet(nn.Module):
         out = held_scan(self, jnp.concatenate([query, key, value], axis=-1).astype(wide), self.conv1d()[0],
                         None, scan, (self.num_v_heads, self.head_k_dim, self.head_v_dim), decode=decode,
                         valid=valid, state='recurrent_state', state_dtype=stored,
-                        conv_dtype=jnp.promote_types(query.dtype, stored))
+                        conv_dtype=jnp.promote_types(query.dtype, stored),
+                        right_padded=attention_metadata is not None and attention_metadata.right_padded)
         if out is None:
             return self.out_proj(jnp.zeros((B, S, self.value_features), self.dtype))
 

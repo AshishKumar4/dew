@@ -1446,6 +1446,70 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
     assert chosen and all("Bias" in line for line in chosen), chosen[:1]
 
 
+@pytest.mark.parametrize("causal", [True, False])
+def test_right_padded_rows_attend_causally_with_no_mask(rng, monkeypatch, causal):
+    """Rows declared right-padded reach the attention kernel as an unpadded
+    call does, causal with no mask, which keeps 'auto' on its fused kernel
+    (a mask sends it to xla's dense dots, `_restricts_visibility`); their
+    real tokens' states are the masked call's. A bidirectional layer's real
+    queries read the padding after them, so it keeps the mask."""
+    from dew.nn.mixers import attention
+
+    asked = []
+
+    def spy(*args, **kwargs):
+        asked.append((kwargs["causal"], kwargs["mask"] is None))
+        return scaled_dot_product_attention(*args, **kwargs)
+
+    monkeypatch.setattr(attention, "scaled_dot_product_attention", spy)
+    model = tiny(causal=causal)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
+
+    def states(**declared):
+        asked.clear()
+        out = model.apply(params, ids, attention_mask=valid, method=CausalTransformer.hidden_states,
+                          **declared)
+        return out, set(asked)
+
+    masked, masked_calls = states()
+    declared, declared_calls = states(right_padded=True)
+
+    assert masked_calls == {(False, False)}
+    assert declared_calls == ({(True, True)} if causal else {(False, False)})
+    np.testing.assert_allclose(np.asarray(declared)[np.asarray(valid)], np.asarray(masked)[np.asarray(valid)],
+                               atol=1e-6)
+
+
+@pytest.mark.skipif(jax.default_backend() != "gpu", reason="needs a GPU")
+def test_right_padded_training_attends_on_a_fused_kernel_where_one_runs(rng, without_deterministic_ops):
+    """A right-padded training step's attention, forward and backward, runs
+    the fused kernel 'auto' takes for an unpadded call (FlashAttention-2 or
+    cuDNN), where the masked call's runs xla's dense dots."""
+    from dew.nn.attention import cudnn_runs, flash_refusal
+
+    model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
+    ids = tokens(rng)
+    params = model.init(rng, ids)
+    valid = jnp.arange(SEQ)[None, :] < jnp.asarray([[7], [SEQ]])
+
+    def fused(**declared):
+        def loss(params):
+            states = model.apply(params, ids, attention_mask=valid, method=CausalTransformer.hidden_states,
+                                 **declared)
+            return jnp.sum(jnp.where(valid[..., None], states, 0).astype(jnp.float32))
+        text = jax.jit(jax.grad(loss)).lower(params).compile().as_text() or ""
+        return [line for line in text.splitlines()
+                if 'custom_call_target="__cudnn$fmha' in line or 'custom_call_target="dew_flash_mha' in line]
+
+    query = jnp.zeros((1, SEQ, 4, 32), jnp.bfloat16)
+    if flash_refusal(query, query, causal=True) is not None and not cudnn_runs(query):
+        assert not fused(right_padded=True)
+        return
+    assert fused(right_padded=True) and not fused()
+
+
 def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
     """`dew.nn.rope`'s rotate-half as it was through 2026-10-06, and as the HF
     decoders write it, `x cos + rotate_half(x) sin`, at least fp32."""

@@ -343,7 +343,7 @@ class MultimodalTransformer(nn.Module):
                       positions=None, segment_ids=None, image_indices=None,
                       conditioning: Mapping[str, jax.Array] | None = None,
                       attention_mask=None, image_groups=None, rotary_positions=None,
-                      audio_indices=None, routed_experts=None, routed=None):
+                      audio_indices=None, routed_experts=None, routed=None, right_padded: bool = False):
         """Run the decoder over text with the media embeddings spliced in.
 
         `conditioning` holds the towers' payloads, and `image_indices` and
@@ -353,6 +353,7 @@ class MultimodalTransformer(nn.Module):
         `routed_experts` and `routed` replay a routing record and go to the
         language model unchanged. Engines record a row for every placeholder
         position too, so the `[B, S, layers, top_k]` layout matches the text.
+        `right_padded` is the language model's (`CausalTransformer.hidden_and_mtp_inputs`).
         """
         if self.family == "gemma4":
             placeholder = tokens == self.image_token_id
@@ -381,14 +382,14 @@ class MultimodalTransformer(nn.Module):
             return self.language_model.hidden_states(
                 tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
                 attention_mask=attention_mask, image_groups=image_groups, rotary_positions=rotary_positions,
-                routed_experts=routed_experts, routed=routed)
+                routed_experts=routed_experts, routed=routed, right_padded=right_padded)
         fused = self._conditioned_embeddings(tokens, image_indices, conditioning,
                                              train=train, audio_indices=audio_indices)
         return self.language_model.hidden_states(
             fused.tokens, train=train, decode=decode, positions=positions, segment_ids=segment_ids,
             input_embeddings=fused.embeddings, attention_mask=attention_mask,
             image_groups=image_groups, rotary_positions=rotary_positions, media_mask=fused.media,
-            routed_experts=routed_experts, routed=routed)
+            routed_experts=routed_experts, routed=routed, right_padded=right_padded)
 
     def __call__(self, tokens, train: bool = False, decode: bool = False,
                  positions=None, segment_ids=None, image_indices=None,
