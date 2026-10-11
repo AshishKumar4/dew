@@ -81,7 +81,7 @@ def _element_for(kind, seed=0):
     return _pack_records({"jpg": encoded, "txt": b"a yellow tulip"})
 
 
-def _spec(kind, labels_file, augment=FLIP_JITTER):
+def _spec(kind, augment=FLIP_JITTER):
     """A prepared TFDS spec, or an arrayrecord one: `record` is what differs.
     Both augment on the host, the per-record path these tests read."""
     return ImageRecord(SCALE, SCALE, templates=CAPTION_TEMPLATES if kind == "tfds" else (),
@@ -234,10 +234,9 @@ def test_a_spawned_worker_imports_opencv_before_its_readers_start(tmp_path):
 # ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
-    labels_file = _write_labels(tmp_path)
+def test_none_mode_returns_the_resized_image_bit_identical(kind):
     element = _element_for(kind)
-    transform = _spec(kind, labels_file, None)
+    transform = _spec(kind, None)
 
     out = transform.random_map(element, _record_rng(0))
 
@@ -250,10 +249,9 @@ def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path):
-    labels_file = _write_labels(tmp_path)
+def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind):
     element = _element_for(kind)
-    transform = _spec(kind, labels_file, images.Augment(flip=True, jitter=False))
+    transform = _spec(kind, images.Augment(flip=True, jitter=False))
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -269,10 +267,9 @@ def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path):
 
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp_path):
-    labels_file = _write_labels(tmp_path)
+def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind):
     element = _element_for(kind)
-    transform = _spec(kind, labels_file)
+    transform = _spec(kind)
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -292,19 +289,27 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp
     assert any(abs(int(o.mean()) - int(base.mean())) > 1 for o in outputs)
 
 
-@pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_the_default_augmentation_is_flip_jitter(kind, tmp_path):
-    labels_file = _write_labels(tmp_path)
-    element = _element_for(kind)
-    spec = _spec(kind, labels_file)
-    transform = spec
+def test_the_images_recipe_flips_and_jitters_by_default():
+    """A recipe that names no augmentation trains on the draws an explicit
+    flip and jitter makes, and a flip alone makes others."""
+    from dew.data import Augment
 
-    base = _resized(kind, element)
-    mirror = base[:, ::-1, :]
-    outputs = [transform.random_map(element, _record_rng(i))["image"]
-               for i in range(DRAWS)]
-    assert any(not np.array_equal(o, base) and not np.array_equal(o, mirror)
-               for o in outputs)
+    rows = [{"image": _synthetic_image(index), "label": index} for index in range(RECORDS)]
+
+    def trained(**fields):
+        data = load(Images(source=rows, image_size=SCALE, **fields), batch=4, read="memory", seed=7,
+                    loading=Loading(workers=0))
+        stream = data.train(DataPartition())
+        try:
+            return [batch["image"] for batch in itertools.islice(stream, 2)]
+        finally:
+            stream.close()
+
+    default = trained()
+    jittered = trained(augment=Augment(flip=True, jitter=True))
+    flipped = trained(augment=Augment(flip=True, jitter=False))
+    assert all(np.array_equal(left, right) for left, right in zip(default, jittered, strict=True))
+    assert not all(np.array_equal(left, right) for left, right in zip(default, flipped, strict=True))
 
 
 # ---------------------------------------------------------------------------------
@@ -312,13 +317,12 @@ def test_the_default_augmentation_is_flip_jitter(kind, tmp_path):
 # ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("kind", ["tfds", "gcs"])
-def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path):
+def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind):
     """The same record must get the same augmentation and the same caption
     whatever the worker or process count, and neither global RNG may move."""
-    labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    first = _spec(kind, labels_file)
-    other = _spec(kind, labels_file)
+    first = _spec(kind)
+    other = _spec(kind)
 
     numpy_state = np.random.get_state()[1]
     python_state = random.getstate()
@@ -333,10 +337,10 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path
     assert random.getstate() == python_state
 
 
-def test_the_caption_template_comes_from_the_record_rng(tmp_path):
+def test_the_caption_template_comes_from_the_record_rng():
     """A module-global random.choice picked the template, so a record's caption
     moved with the worker and process count while its image did not."""
-    spec = _spec("tfds", _write_labels(tmp_path), None)
+    spec = _spec("tfds", None)
     element = {"image": _synthetic_image(), "label": 1}
 
     captions = [spec.random_map(element, _record_rng(draw))["caption"] for draw in range(DRAWS)]
