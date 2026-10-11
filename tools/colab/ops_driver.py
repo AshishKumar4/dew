@@ -52,7 +52,9 @@ class Driver:
                     benign = all(name in ("FileNotFoundError", "NotADirectoryError") for name in names)
                     self.record(collection_error_names=names, collection_needs_attention=not benign)
                     if benign:
-                        raise TransportError("live output changed; re-list on next cycle, not a workload exit")
+                        raise TransportError(
+                            "live output changed; re-list on next cycle, not a workload exit"
+                        )
                     raise CollectionError("artifact RPC failed: " + ",".join(names))
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)
