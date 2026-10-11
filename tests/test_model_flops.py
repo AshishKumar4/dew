@@ -344,7 +344,7 @@ def jaxpr_products(graph, *, state_mac=False):
                 for operand in equation.invars:
                     if np.issubdtype(operand.aval.dtype, np.floating):
                         factor = 4
-                    source = producers.get(operand)
+                    source = producer(producers, operand)
                     if source is not None and source.primitive.name == "convert_element_type" and (
                             np.issubdtype(source.invars[0].aval.dtype, np.floating)):
                         factor = 4  # Real input against complex weights.
@@ -360,7 +360,7 @@ def jaxpr_products(graph, *, state_mac=False):
             total += (2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64)
                       * np.prod([kernel[axis] for axis in dims[1:]], dtype=np.int64))
         elif state_mac and primitive == "reduce_sum":
-            product = producers.get(equation.invars[0])
+            product = producer(producers, equation.invars[0])
             if product is not None and product.primitive.name == "mul":
                 total += 2 * np.prod(product.outvars[0].aval.shape, dtype=np.int64)
         elif primitive == "mul" and convolution_tap(equation, producers):
@@ -377,6 +377,11 @@ def jaxpr_products(graph, *, state_mac=False):
     return total
 
 
+def producer(producers, variable):
+    """Scalar constants have no producer and Literal is intentionally unhashable."""
+    return None if isinstance(variable, jaxpr_core.Literal) else producers.get(variable)
+
+
 def convolution_tap(equation, producers):
     """The explicit depthwise conv's [D,K] column times a shifted [B,D,T].
 
@@ -389,9 +394,9 @@ def convolution_tap(equation, producers):
     for variable in equation.invars:
         if isinstance(variable, jaxpr_core.Literal):
             continue
-        source = producers.get(variable)
+        source = producer(producers, variable)
         while source is not None and source.primitive.name in ("broadcast_in_dim", "convert_element_type"):
-            source = producers.get(source.invars[0])
+            source = producer(producers, source.invars[0])
         if source is not None and source.primitive.name == "slice":
             original, selected = source.invars[0].aval.shape, source.outvars[0].aval.shape
             if len(original) == 2 and original[1] > 1 and selected == (original[0], 1):
