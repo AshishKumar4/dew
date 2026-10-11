@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import inspect
 from collections.abc import Callable, Mapping, Sequence
 from typing import Literal
 
@@ -24,6 +25,15 @@ class DecodeImage(grain.MapTransform):
     def map(self, element: Batch) -> Batch | Rejected:
         import_opencv()
         image = element[self.field]
+        if isinstance(image, Mapping):
+            body = image.get("bytes")
+            if isinstance(body, bytes):
+                image = body
+            else:
+                from dew.data.storage import Store
+                from dew.records import text
+
+                image = Store(text(image.get("path"), "image.path")).read()
         if isinstance(image, bytes):
             try:
                 image = decode_image(image, at_least=self.at_least)
@@ -113,7 +123,16 @@ class AugmentationKey(grain.RandomMapTransform):
 
 @dataclasses.dataclass(frozen=True)
 class EncodeCaptions:
-    reader: Callable[[Sequence[str]], Batch] | None = None
+    reader: Callable[[Sequence[str]], Batch] | None = dataclasses.field(default=None, repr=False)
+    binding = "captions"
+
+    @property
+    def identity(self) -> str:
+        reader = self.reader
+        if reader is None:
+            return "dew.drop-captions@1"
+        kind = reader if inspect.ismethod(reader) or inspect.isfunction(reader) else type(reader)
+        return f"dew.encode-captions:{kind.__module__}.{kind.__qualname__}"
 
     def __call__(self, batch: Batch) -> Batch:
         held = dict(batch)
@@ -176,12 +195,22 @@ class ImageRecord(grain.RandomMapTransform):
                 element = {"image": decoded["jpg"], "caption": decoded["txt"].decode()}
         image = element[self.field]
         label = element.get("label")
+        if self.classes and label is None:
+            raise ValueError("caption classes need an image label")
+        described = label if not self.classes else self.classes[int(element["label"])]
+        if isinstance(image, Mapping):
+            body = image.get("bytes")
+            if isinstance(body, bytes):
+                image = body
+            else:
+                from dew.data.storage import Store
+                from dew.records import text
+
+                image = Store(text(image.get("path"), "image.path")).read()
         if self.templates:
             chosen = self.templates[int(rng.integers(len(self.templates)))]
-            described = self.classes[int(label)] if self.classes else label
             caption = chosen.format(described, label=described)
         elif self.caption is not None:
-            described = self.classes[int(label)] if self.classes else label
             caption = self.caption.format(**{**element, "label": described})
         elif not self.columns:
             caption = ""

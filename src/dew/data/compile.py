@@ -23,12 +23,15 @@ from dew.data.dataset import (
     FilledBatch,
     Forwarding,
     GlobalStream,
+    GlobalReader,
+    PhasedStream,
     LengthGroups,
     Loading,
     Position,
     Reader,
     _Grouped,
     _WorkerBatches,
+    weight_counts,
 )
 from dew.data.mix import Accepted, CorpusCounts, SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import (
@@ -48,6 +51,7 @@ from dew.data.pipeline import (
     Mixture,
     ObjectiveData,
     Pack,
+    Phases,
     Pipeline,
     Prefetch,
     RandomMap,
@@ -81,7 +85,7 @@ class _Provisionable(Protocol):
 
 
 def _leaves(pipeline: Pipeline) -> Iterator[Pipeline]:
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         for child in pipeline.source.pipelines:
             yield from _leaves(child)
     else:
@@ -89,7 +93,7 @@ def _leaves(pipeline: Pipeline) -> Iterator[Pipeline]:
 
 
 def _steps(pipeline: Pipeline) -> Iterator[Stage]:
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         for child in pipeline.source.pipelines:
             yield from _steps(child)
     yield from pipeline.stages
@@ -98,7 +102,7 @@ def _steps(pipeline: Pipeline) -> Iterator[Stage]:
 def _name(pipeline: Pipeline) -> str:
     if pipeline.name is not None:
         return pipeline.name
-    return "mixture" if isinstance(pipeline.source, Mixture) else pipeline.source.describe()
+    return "mixture" if isinstance(pipeline.source, (Mixture, Phases)) else pipeline.source.describe()
 
 
 def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
@@ -118,12 +122,12 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
 
 
 def _check(pipeline: Pipeline, read: Read, *, validation: bool = False) -> None:
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         for child in pipeline.source.pipelines:
             _check(child, read, validation=validation)
     ancestry = (
         tuple(stage for child in pipeline.source.pipelines for stage in _steps(child))
-        if isinstance(pipeline.source, Mixture)
+        if isinstance(pipeline.source, (Mixture, Phases))
         else ()
     )
     random = next((_identity(stage).name for stage in ancestry if isinstance(stage, RandomMap)), None)
@@ -179,7 +183,7 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
     for pipeline in pipelines:
         for leaf in _leaves(pipeline):
             source = leaf.source
-            if not isinstance(source, Mixture) and not source.supports(read):
+            if not isinstance(source, (Mixture, Phases)) and not source.supports(read):
                 missing.append(source)
     if provision:
         for source in missing:
@@ -195,7 +199,7 @@ def _capabilities(pipelines: Sequence[Pipeline], read: Read, provision: bool) ->
 
 def _configured(pipeline: Pipeline, shared: Mapping[str, object], read: Read) -> Pipeline:
     source = pipeline.source
-    if isinstance(source, Mixture):
+    if isinstance(source, (Mixture, Phases)):
         children = tuple(_configured(child, shared, read) for child in source.pipelines)
         source = dataclasses.replace(source, pipelines=children)
         local = shared
@@ -374,7 +378,9 @@ class _Memory:
 def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
                  groups: LengthGroups | None = None) -> Pipeline:
     groups = next((stage.groups for stage in pipeline.stages if isinstance(stage, Group)), groups)
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, Phases):
+        raise ValueError("materialize each phase before constructing its global order")
+    if isinstance(pipeline.source, (Mixture, Phases)):
         return _memory_mixture(pipeline, pipeline.source, counts, groups)
     source = pipeline.source
     stored = source.records("memory")
@@ -465,7 +471,7 @@ def _memory_mixture(pipeline: Pipeline, mixture: Mixture, counts: dict[str, Corp
                     groups: LengthGroups | None) -> Pipeline:
     children = tuple(_materialize(child, counts, groups) for child in mixture.pipelines)
     kept = tuple((child, weight) for child, weight in zip(children, mixture.weights, strict=True)
-                 if isinstance(child.source, Mixture) or len(child.source.records("memory")))
+                 if isinstance(child.source, (Mixture, Phases)) or len(child.source.records("memory")))
     omitted = [_name(child) for child in children if all(child is not accepted for accepted, _ in kept)]
     if omitted:
         _log.warning("left out of the mixture: %s (zero accepted rows)", ", ".join(omitted))
@@ -612,6 +618,18 @@ class _Host(Forwarding):
             raise TypeError("map_batch parent does not expose a checkpoint position")
         self._source.set_state(state)
 
+    @property
+    def records(self) -> int:
+        if not isinstance(self._source, GlobalReader):
+            raise TypeError("host-stage parent has no global record count")
+        return self._source.records
+
+    @property
+    def order(self) -> str:
+        if not isinstance(self._source, GlobalReader):
+            raise TypeError("host-stage parent has no global order")
+        return self._source.order
+
 
 class _CanonicalPass:
     def __init__(self, reader: Reader, partition: DataPartition):
@@ -701,12 +719,14 @@ class _PerShare(Forwarding):
 
 
 def _per_share(pipeline: Pipeline, read: Read) -> bool:
+    if isinstance(pipeline.source, Phases):
+        return any(_per_share(child, read) for child in pipeline.source.pipelines)
     if read == "streamed":
         return True
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         if pipeline.source.tokens is not None:
             for child in pipeline.source.pipelines:
-                if isinstance(child.source, Mixture) or "valid_targets" not in child.source.metadata():
+                if isinstance(child.source, (Mixture, Phases)) or "valid_targets" not in child.source.metadata():
                     return True
         if any(_per_share(child, read) for child in pipeline.source.pipelines):
             return True
@@ -737,7 +757,9 @@ class _Build:
 
     def source(self, pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
         source = pipeline.source
-        if isinstance(source, Mixture):
+        if isinstance(source, Phases):
+            raise ValueError("phases need the global phased lowering")
+        if isinstance(source, (Mixture, Phases)):
             built = [self.records(child, partition) for child in source.pipelines]
             parents, lengths = zip(*built, strict=True)
             if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
@@ -747,7 +769,7 @@ class _Build:
                     metadata = [
                         child.source.metadata()
                         for child in source.pipelines
-                        if not isinstance(child.source, Mixture)
+                        if not isinstance(child.source, (Mixture, Phases))
                     ]
                     weights = token_weights(
                         [_name(child) for child in source.pipelines],
@@ -800,7 +822,7 @@ class _Build:
             (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Artifact)), None
         )
         consumed = 0
-        if artifact_at is not None and not isinstance(source, Mixture):
+        if artifact_at is not None and not isinstance(source, (Mixture, Phases)):
             artifact = pipeline.stages[artifact_at]
             if not isinstance(artifact, Artifact):
                 raise RuntimeError("cache stage changed while compiling an immutable pipeline")
@@ -927,7 +949,7 @@ class _Build:
                 rows = _GroupedRows(rows, stage.groups, partition.rows(self.batch), self.seed)
             lengths = None
         elif isinstance(stage, Artifact):
-            if isinstance(pipeline.source, Mixture):
+            if isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("cache belongs on each corpus before mix")
             prefix = pipeline.stages[: pipeline.stages.index(stage)]
             manifest = Manifest.of(
@@ -1031,13 +1053,15 @@ class _Build:
 
 def _order(pipeline: Pipeline) -> Mapping[str, object]:
     source = pipeline.source
+    if isinstance(source, Phases):
+        return {"phases": [_order(child) for child in source.pipelines], "until_steps": list(source.until_steps)}
     children = (
         {
             "corpora": [_order(child) for child in source.pipelines],
             "weights": list(source.weights),
             "shares": "tokens" if source.tokens is not None else "accepted rows",
         }
-        if isinstance(source, Mixture)
+        if isinstance(source, (Mixture, Phases))
         else {"source": source.describe()}
     )
     return {
@@ -1055,7 +1079,7 @@ def _derived(pipeline: Pipeline, seed: int, read: Read) -> Mapping[str, str]:
     arrays: dict[str, str] = {}
     for index, leaf in enumerate(_leaves(pipeline)):
         source = leaf.source
-        if isinstance(source, Mixture):
+        if isinstance(source, (Mixture, Phases)):
             continue
         if isinstance(source, _Memory):
             arrays.update({f"{index}/{key}": value for key, value in source.derived.items()})
@@ -1087,6 +1111,10 @@ def compile(
     resume: Literal["exact", "non-exact"] = "exact",
 ) -> Dataset:
     """Check every leaf before opening readers, then build both branches."""
+    if isinstance(train.source, Phases):
+        return _compile_phases(train, validation=validation, host=host, objective=objective, read=read,
+                               provision=provision, loading=loading, seed=seed, rejections=rejections,
+                               budget=budget, resume=resume)
     if read not in ("memory", "indexed", "streamed"):
         raise ValueError(f"unknown read mode {read!r}")
     if rejections == "mask":
@@ -1123,7 +1151,7 @@ def compile(
     manifest = Manifest.of(
         {
             "sources": [
-                leaf.source.snapshot() for leaf in _leaves(original) if not isinstance(leaf.source, Mixture)
+                leaf.source.snapshot() for leaf in _leaves(original) if not isinstance(leaf.source, (Mixture, Phases))
             ]
         },
         tuple(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
@@ -1155,6 +1183,75 @@ def compile(
     if records == 0:
         raise ValueError(f"corpus {_name(train)} has no accepted rows")
     return Dataset(training, held_reader, records, batch, counts=counts, plan=plan)
+
+
+def _compile_phases(train: Pipeline, *, validation: Pipeline | None, host: tuple[HostStep, ...],
+                    objective: ObjectiveData | None, read: Read, provision: bool, loading: Loading,
+                    seed: int, rejections: Literal["drop", "mask"], budget: SearchBudget,
+                    resume: Literal["exact", "non-exact"]) -> Dataset:
+    source = train.source
+    if not isinstance(source, Phases):
+        raise TypeError("phased compilation needs a Phases source")
+    _capabilities((train,) if validation is None else (train, validation), read, provision)
+    consumed: dict[str, int] = {}
+    built: list[tuple[Dataset, int | None]] = []
+    previous = 0
+    for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
+        continued = _continued(pipeline, consumed).then(*train.stages)
+        loaded = compile(continued, validation=validation if index == 0 else None, host=host,
+                         objective=objective, read=read, provision=provision, loading=loading, seed=seed,
+                         rejections=rejections, budget=budget, resume=resume)
+        if loaded.plan is None or loaded.plan.lowering != "global":
+            raise ValueError(f"phase {index} needs a global order; streamed, rejecting and online-packed phases are refused")
+        end = None if until is None else until * loaded.batch
+        built.append((loaded, end))
+        if end is not None:
+            _delivered(pipeline, end - previous, consumed)
+            previous = end
+
+    def training(partition: DataPartition) -> Iterator[Batch]:
+        def global_reader(reader: Reader) -> GlobalReader:
+            opened = reader(partition)
+            if not isinstance(opened, GlobalReader):
+                if isinstance(opened, Closeable):
+                    opened.close()
+                raise ValueError("a phase must expose a global record-count position")
+            return opened
+
+        phases = [(functools.partial(global_reader, loaded.train), end) for loaded, end in built]
+        return PhasedStream(phases, loading.stop_seconds)
+
+    return dataclasses.replace(built[0][0], train=training)
+
+
+def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
+    if isinstance(pipeline.source, Phases):
+        raise ValueError("nested phases are not an indexed record order")
+    if isinstance(pipeline.source, Mixture):
+        children = tuple(_continued(child, consumed) for child in pipeline.source.pipelines)
+        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+    offset = consumed.get(_name(pipeline), 0)
+    if not offset:
+        return pipeline
+    at = next((index + 1 for index, stage in enumerate(pipeline.stages) if isinstance(stage, Repeat)), None)
+    if at is None:
+        pipeline = pipeline.repeat()
+        at = len(pipeline.stages)
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], Slice(slice(offset, None)),
+                                                 *pipeline.stages[at:]))
+
+
+def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, int]) -> None:
+    source = pipeline.source
+    if isinstance(source, Phases):
+        raise ValueError("nested phases have no single corpus share")
+    if isinstance(source, Mixture):
+        weights = tuple(weight / sum(source.weights) for weight in source.weights)
+        for child, taken in zip(source.pipelines, weight_counts(weights, count), strict=True):
+            _delivered(child, taken, consumed)
+    else:
+        name = _name(pipeline)
+        consumed[name] = consumed.get(name, 0) + count
 
 
 def _training_reader(partition: DataPartition, *, pipeline: Pipeline, build: _Build,
@@ -1192,14 +1289,16 @@ def _validation_reader(partition: DataPartition, *, pipeline: Pipeline, build: _
 
 def _epoch_records(train: Pipeline, read: Read) -> int | None:
     records = None
+    if isinstance(train.source, Phases):
+        return _epoch_records(train.source.pipelines[0], read)
     if not _per_share(train, read):
         source = train.source
-        if isinstance(source, Mixture):
+        if isinstance(source, (Mixture, Phases)):
             sizes = [len(child.source.records(read)) for child in source.pipelines
-                     if not isinstance(child.source, Mixture)]
+                     if not isinstance(child.source, (Mixture, Phases))]
             weights = source.weights
             if source.tokens is not None:
-                facts = [child.source.metadata() for child in source.pipelines if not isinstance(child.source, Mixture)]
+                facts = [child.source.metadata() for child in source.pipelines if not isinstance(child.source, (Mixture, Phases))]
                 weights = token_weights([_name(child) for child in source.pipelines], weights, sizes,
                                         [integer(stated["valid_targets"], "valid_targets") for stated in facts])
             records = max(
@@ -1263,7 +1362,7 @@ class _LengthAt:
 
 def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
     """Put objective record steps on each corpus before its mixture."""
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         children = tuple(objective_steps(child, objective, train=train, read=read)
                          for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
@@ -1289,7 +1388,7 @@ def _objective_order(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
 
     selected: tuple[Stage, ...] = ()
     source = pipeline.source
-    if isinstance(source, Mixture):
+    if isinstance(source, (Mixture, Phases)):
         choices = [tuple(stage for stage in child.stages if shared(stage)) for child in source.pipelines]
         if choices and all(stages == choices[0] for stages in choices):
             selected = choices[0]
@@ -1354,7 +1453,7 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
     for pipeline in pipelines:
         for leaf in _leaves(pipeline):
             source = leaf.source
-            if isinstance(source, Mixture):
+            if isinstance(source, (Mixture, Phases)):
                 continue
             if read == "memory":
                 source.records(read)
@@ -1399,7 +1498,7 @@ def publish(pipeline: Pipeline, cache, *, read: Read = "streamed", provision: bo
 
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         raise ValueError("publish each source prefix before mixing")
     cached = pipeline.cache(cache)
     _check(cached, read)

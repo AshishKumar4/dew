@@ -326,10 +326,13 @@ class _DecisionSource:
             if self.table is not None:
                 stated = self.source.metadata().get("class_names", {})
                 names = record(stated, "class names").get(self.table.label)
+                first = records[0] if len(records) else None
                 if isinstance(names, (list, tuple)):
                     self._classes.extend(str(name) for name in names)
-                elif len(records) and isinstance(records[0], Mapping) and "questions" not in records[0]:
-                    self._classes.extend(dict.fromkeys(str(records[index][self.table.label])
+                elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
+                    if self.table.label not in first:
+                        raise ValueError(f"decision table needs column {self.table.label!r}")
+                    self._classes.extend(dict.fromkeys(str(record(records[index], "decision row")[self.table.label])
                                                       for index in range(len(records))))
             self._memory_slots(records)
         return records
@@ -362,7 +365,8 @@ class _DecisionSource:
         stated = self.source.metadata()
         if self.table is not None:
             names = (self.table.options or tuple(self._classes) or
-                     tuple(record(stated.get("class_names", {}), "class names").get(self.table.label, ())))
+                     records.strings(record(stated.get("class_names", {}), "class names").get(
+                         self.table.label, ()), "class names"))
             if names:
                 return {**stated, "slots": {"questions": 1, "options": len(names)}, "decision_options": names}
         return {**stated, "slots": self._facts} if self._facts else stated
