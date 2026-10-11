@@ -36,13 +36,34 @@ from .base import Read, Shard, ShardManifest
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
 
+
+def _decoder_record(value: object) -> Mapping[str, object] | None:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        return {name: _decoder_record(decoder) for name, decoder in value.items()}
+    from dew.records import json_value
+
+    try:
+        settings = {
+            name: json_value(option, f"decoder.{name}")
+            for name, option in vars(value).items()
+            if not name.startswith("_")
+        }
+    except TypeError as error:
+        raise ValueError(f"TFDS decoder {type(value).__name__} has no stable public configuration") from error
+    return {"class": f"{type(value).__module__}.{type(value).__qualname__}", "config": settings}
+
+
 METADATA = ("dataset_info.json", "features.json")
 """What a prepared version directory holds beside its shards."""
 
-PREPARE = ("Prepare it in a separate environment with "
-           "download_and_prepare(file_format='array_record'), then pass the "
-           "builder.data_dir it wrote as path=. Where TensorFlow is installed, "
-           "leaving path unset has dew prepare it into its own TFDS directory.")
+PREPARE = (
+    "Prepare it in a separate environment with "
+    "download_and_prepare(file_format='array_record'), then pass the "
+    "builder.data_dir it wrote as path=. Where TensorFlow is installed, "
+    "leaving path unset has dew prepare it into its own TFDS directory."
+)
 
 # What `prepared` runs in a process of its own. TFDS's GCS copies are
 # TFRecords, which dew does not read, so they are not fetched.
@@ -80,22 +101,27 @@ def prepared(name: str, *, config: str | None = None, version: str | None = None
     if importlib.util.find_spec("tensorflow") is None:
         raise FileNotFoundError(
             f"No prepared {name!r} in {directory}, and preparing it needs TensorFlow, "
-            f"which this environment does not have. " + PREPARE)
+            f"which this environment does not have. " + PREPARE
+        )
     os.makedirs(directory, exist_ok=True)
     with FileLock(os.path.join(directory, ".prepare.lock")):
         if not held():
             done = subprocess.run(
                 [sys.executable, "-c", _PREPARING, name, directory, config or "", version or ""],
-                env={**os.environ, "CUDA_VISIBLE_DEVICES": ""}, capture_output=True, text=True,
-                check=False)
+                env={**os.environ, "CUDA_VISIBLE_DEVICES": ""},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
             if done.returncode:
-                raise RuntimeError(f"preparing {name!r} into {directory} failed:\n"
-                                   + "\n".join(done.stderr.splitlines()[-20:]))
+                raise RuntimeError(
+                    f"preparing {name!r} into {directory} failed:\n"
+                    + "\n".join(done.stderr.splitlines()[-20:])
+                )
     return directory
 
 
-def read_only_builder(path: str, *, name: str | None,
-                      config: str | None, version: str | None):
+def read_only_builder(path: str, *, name: str | None, config: str | None, version: str | None):
     """The read-only builder over the prepared data at `path`, checked against
     what was asked for.
 
@@ -123,8 +149,8 @@ def read_only_builder(path: str, *, name: str | None,
         import tensorflow_datasets as tfds
     except ImportError as missing:
         raise ImportError(
-            "reading prepared TFDS data needs the tfds extra: "
-            "pip install 'dewml[tfds]'") from missing
+            "reading prepared TFDS data needs the tfds extra: pip install 'dewml[tfds]'"
+        ) from missing
     root = epath.Path(os.path.expanduser(path))
     if not root.is_dir():
         raise FileNotFoundError(f"No prepared TFDS data at {path!r}. " + PREPARE)
@@ -138,14 +164,13 @@ def read_only_builder(path: str, *, name: str | None,
     else:
         from tensorflow_datasets.core.read_only_builder import builder_from_files
 
-        asked = "".join(f" {what} {value!r}" for what, value in (("config", config),
-                                                                 ("version", version)) if value)
+        asked = "".join(
+            f" {what} {value!r}" for what, value in (("config", config), ("version", version)) if value
+        )
         try:
-            reader = builder_from_files(name, data_dir=os.fspath(root), config=config,
-                                        version=version)
+            reader = builder_from_files(name, data_dir=os.fspath(root), config=config, version=version)
         except tfds.core.DatasetNotFoundError as missing:
-            raise FileNotFoundError(
-                f"{path!r} holds no prepared {name!r}{asked}. " + PREPARE) from missing
+            raise FileNotFoundError(f"{path!r} holds no prepared {name!r}{asked}. " + PREPARE) from missing
     directory = reader.data_path
     dataset_info = reader.info
     if dataset_info.file_format != tfds.core.FileFormat.ARRAY_RECORD:
@@ -153,15 +178,19 @@ def read_only_builder(path: str, *, name: str | None,
             f"Prepared data at {directory} uses {dataset_info.file_format}, and dew reads "
             f"ArrayRecords, which is what needs no TensorFlow in the training "
             f"process. Prepare file_format='array_record' in a directory of its "
-            f"own.")
-    for asked, found, what in ((name, dataset_info.name, "builder"),
-                               (config, dataset_info.config_name or None, "config"),
-                               (version, str(dataset_info.version), "version")):
+            f"own."
+        )
+    for asked, found, what in (
+        (name, dataset_info.name, "builder"),
+        (config, dataset_info.config_name or None, "config"),
+        (version, str(dataset_info.version), "version"),
+    ):
         if asked is not None and asked != found:
             raise ValueError(
                 f"{directory} holds {what} {found!r}, and load() asked for "
                 f"{asked!r}. The prepared metadata is what says which dataset "
-                f"this is; point path= at the {asked!r} data or ask for {found!r}.")
+                f"this is; point path= at the {asked!r} data or ask for {found!r}."
+            )
     return reader
 
 
@@ -179,20 +208,26 @@ def check_shards(builder, split: str, directory: epath.Path) -> None:
     splits = builder.info.splits
     plain = not any(character in split for character in "+[")
     if plain and split != "all" and split not in splits:
-        raise ValueError(
-            f"{directory} holds no split {split!r}; it holds {sorted(splits)}")
+        raise ValueError(f"{directory} holds no split {split!r}; it holds {sorted(splits)}")
     wanted = [split] if plain and split in splits else sorted(splits)
     for name in wanted:
         for instruction in splits[name].file_instructions:
             if not epath.Path(instruction.filename).is_file():
                 raise FileNotFoundError(
                     f"Missing prepared ArrayRecord shard {instruction.filename!r}. "
-                    f"Copy the complete prepared dataset or prepare it again.")
+                    f"Copy the complete prepared dataset or prepare it again."
+                )
 
 
-def prepared_source(path: str, split: str, *, name: str | None = None,
-                    config: str | None = None, version: str | None = None,
-                    decoders: DecoderTree | None = None) -> Records:
+def prepared_source(
+    path: str,
+    split: str,
+    *,
+    name: str | None = None,
+    config: str | None = None,
+    version: str | None = None,
+    decoders: DecoderTree | None = None,
+) -> Records:
     """Reads one split of a prepared TFDS dataset by index.
 
     The builder's own `as_data_source` is already grain's protocol. What this
@@ -208,8 +243,7 @@ def prepared_source(path: str, split: str, *, name: str | None = None,
     """
     reader = read_only_builder(path, name=name, config=config, version=version)
     check_shards(reader, split, epath.Path(reader.data_path))
-    return Prepared(reader.as_data_source(split, decoders=decoders),
-                    str(reader.data_path), split)
+    return Prepared(reader.as_data_source(split, decoders=decoders), str(reader.data_path), split)
 
 
 class Prepared:
@@ -245,7 +279,8 @@ class Prepared:
         raise TypeError(
             f"record {index} of {self.directory} split {self.split!r} is "
             f"{type(held).__name__}; a prepared record is its features or the "
-            f"bytes of the one feature a decoder skipped")
+            f"bytes of the one feature a decoder skipped"
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -273,8 +308,9 @@ class TFDSOptions:
     def source(self, name: str, split: str) -> Records:
         """Open `split` of the prepared builder `name` for reading by index."""
         path = self.path or prepared(name, config=self.config, version=self.version)
-        return prepared_source(path, split, name=name, config=self.config,
-                               version=self.version, decoders=self.decoders)
+        return prepared_source(
+            path, split, name=name, config=self.config, version=self.version, decoders=self.decoders
+        )
 
 
 PreparedOptions = Annotated[TFDSOptions, json_argument(TFDSOptions)]
@@ -296,8 +332,12 @@ class TFDS:
 
     @cached_property
     def builder(self):
-        return read_only_builder(self.path or os.path.join(dew_cache_dir(), "tfds"), name=self.name,
-                                  config=self.config, version=self.version)
+        return read_only_builder(
+            self.path or os.path.join(dew_cache_dir(), "tfds"),
+            name=self.name,
+            config=self.config,
+            version=self.version,
+        )
 
     def describe(self) -> str:
         return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
@@ -309,46 +349,99 @@ class TFDS:
 
         directory = str(self.builder.data_path)
         metadata = Store(directory.rstrip("/") + "/dataset_info.json").read()
-        return {"store": "tfds", "name": self.name, "split": self.split, "directory": directory,
-                "metadata_sha256": hashlib.sha256(metadata).hexdigest()}
+        splits = self.builder.info.splits
+        names = (
+            tuple(splits)
+            if self.split == "all"
+            else tuple(part.split("[", 1)[0] for part in self.split.split("+"))
+        )
+        files = []
+        for name in names:
+            if name not in splits:
+                raise ValueError(f"TFDS {self.name!r} has no split {name!r}")
+            for instruction in splits[name].file_instructions:
+                store = Store(instruction.filename)
+                fs, path = store.resolve()
+                header = fs.info(path)
+                files.append({"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
+        return {
+            "store": "tfds",
+            "name": self.name,
+            "split": self.split,
+            "directory": directory,
+            "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
+            "files": files,
+            "decoders": _decoder_record(self.decoders),
+        }
 
     def supports(self, read: Read) -> bool:
         try:
-            _ = self.builder
+            self.snapshot()
         except FileNotFoundError:
             return False
         return True
 
     def provision(self) -> TFDS:
         if self.path is not None:
-            raise ValueError(f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
-                             "with TFDS or omit path to use Dew's preparation directory")
+            raise ValueError(
+                f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
+                "with TFDS or omit path to use Dew's preparation directory"
+            )
         prepared(self.name, config=self.config, version=self.version)
         return self
 
     def records(self, read: Read) -> Records:
         if not self.supports(read):
-            raise FileNotFoundError(f"{self.describe()} has no prepared ArrayRecord data; "
-                                    "run dew data provision or set provision=True")
+            raise FileNotFoundError(
+                f"{self.describe()} has no prepared ArrayRecord data; "
+                "run dew data provision or set provision=True"
+            )
         rows = self.builder.as_data_source(self.split, decoders=self.decoders)
-        if not isinstance(rows, Records):
-            raise TypeError(f"TFDS split {self.split!r} did not return random-access records")
-        return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
+        import grain.python as grain
+
+        from .memory import _record
+
+        indexed = grain.MapDataset.source(rows).map(_record)
+        return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
         rows = self.records("indexed")
-        shards = tuple(Shard(f"{self.describe()}:{start}", str(self.builder.data_path), start,
-                             min(start + 1024, len(rows)), min(1024, len(rows) - start))
-                       for start in range(0, len(rows), 1024))
+        shards = tuple(
+            Shard(
+                f"{self.describe()}:{start}",
+                str(self.builder.data_path),
+                start,
+                min(start + 1024, len(rows)),
+                min(1024, len(rows) - start),
+            )
+            for start in range(0, len(rows), 1024)
+        )
         return ShardManifest(shards, self._read_shard)
 
     def _read_shard(self, shard: Shard):
         import grain.python as grain
 
-        return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
+        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
 
     def metadata(self) -> Mapping[str, object]:
-        return {"name": self.builder.info.name, "version": str(self.builder.info.version)}
+        import tensorflow_datasets as tfds
+
+        features = self.builder.info.features
+        class_names = (
+            {
+                name: tuple(feature.names)
+                for name, feature in features.items()
+                if isinstance(feature, tfds.features.ClassLabel)
+            }
+            if isinstance(features, Mapping)
+            else {}
+        )
+        return {
+            "name": self.builder.info.name,
+            "version": str(self.builder.info.version),
+            "rows": len(self.builder.as_data_source(self.split)),
+            "class_names": class_names,
+        }
 
     def lengths(self):
         return None

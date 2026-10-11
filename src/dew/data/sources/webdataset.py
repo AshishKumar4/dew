@@ -29,7 +29,7 @@ class _TarIterator(grain.DatasetIterator):
         fs, path = Store(source.url, source.storage_options).resolve()
         self.opened = ExitStack()
         self.file = self.opened.enter_context(fs.open(path, "rb"))
-        self.archive = self.opened.enter_context(tarfile.open(fileobj=self.file, mode="r|*"))
+        self.archive = self.opened.enter_context(tarfile.TarFile.open(fileobj=self.file, mode="r|*"))
         self.members = iter(self.archive)
 
     def _member(self) -> tuple[str, str, bytes]:

@@ -7,7 +7,7 @@ import csv
 import io
 import json
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
 from pathlib import PurePosixPath
 from typing import BinaryIO, Literal
@@ -28,9 +28,16 @@ type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record"
 
 def _format(url: str) -> Format:
     suffix = PurePosixPath(url).suffix.lower()
-    formats: dict[str, Format] = {".jsonl": "jsonl", ".txt": "text", ".csv": "csv", ".parquet": "parquet",
-                                  ".arrow": "arrow", ".feather": "arrow", ".array_record": "array_record",
-                                  ".tar": "webdataset"}
+    formats: dict[str, Format] = {
+        ".jsonl": "jsonl",
+        ".txt": "text",
+        ".csv": "csv",
+        ".parquet": "parquet",
+        ".arrow": "arrow",
+        ".feather": "arrow",
+        ".array_record": "array_record",
+        ".tar": "webdataset",
+    }
     if suffix not in formats:
         raise ValueError(f"source {url!r} needs format=; a URL does not declare its record format")
     return formats[suffix]
@@ -45,13 +52,24 @@ def _arrow_filesystem(fs) -> pafs.FileSystem:
 
         endpoint = fs.client_kwargs.get("endpoint_url") or fs.endpoint_url
         parsed = urlsplit(endpoint) if endpoint else None
-        return pafs.S3FileSystem(access_key=fs.key, secret_key=fs.secret, session_token=fs.token,
-                                 anonymous=fs.anon, region=fs.client_kwargs.get("region_name"),
-                                 endpoint_override=parsed.netloc if parsed else None,
-                                 scheme=parsed.scheme if parsed else "https")
+        return pafs.S3FileSystem(
+            access_key=fs.key,
+            secret_key=fs.secret,
+            session_token=fs.token,
+            anonymous=fs.anon,
+            region=fs.client_kwargs.get("region_name"),
+            endpoint_override=parsed.netloc if parsed else None,
+            scheme=parsed.scheme if parsed else "https",
+        )
     if "gs" in protocols and fs.token is None:
         return pafs.GcsFileSystem()
     return pafs.PyFileSystem(pafs.FSSpecHandler(fs))
+
+
+def _fragment_rows(fragment) -> int:
+    if isinstance(fragment, ds.ParquetFileFragment):
+        return sum(group.num_rows for group in fragment.row_groups)
+    return fragment.count_rows()
 
 
 @dataclass(frozen=True)
@@ -70,7 +88,7 @@ class Files:
     filter: ds.Expression | None = None
     partitioning: str | None = "hive"
     shard_bytes: int = 64 * 2**20
-    storage_options: Mapping[str, object] | None = None
+    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
     spark: bool = False
 
     @cached_property
@@ -104,11 +122,20 @@ class Files:
             if any(character in path for character in "*?["):
                 names = sorted(fs.glob(path))
             elif fs.isdir(path):
-                names = sorted(name for name in fs.find(path) if not any(
-                    part.startswith(("_", ".")) for part in PurePosixPath(name[len(path):]).parts))
-                extensions = {"parquet": ".parquet", "arrow": ".arrow", "jsonl": ".jsonl",
-                              "text": ".txt", "csv": ".csv", "array_record": ".array_record",
-                              "webdataset": ".tar"}
+                names = sorted(
+                    name
+                    for name in fs.find(path)
+                    if not any(part.startswith(("_", ".")) for part in PurePosixPath(name[len(path) :]).parts)
+                )
+                extensions = {
+                    "parquet": ".parquet",
+                    "arrow": ".arrow",
+                    "jsonl": ".jsonl",
+                    "text": ".txt",
+                    "csv": ".csv",
+                    "array_record": ".array_record",
+                    "webdataset": ".tar",
+                }
                 if self.kind != "files":
                     names = [name for name in names if name.endswith(extensions[self.kind])]
             else:
@@ -123,13 +150,35 @@ class Files:
 
     def snapshot(self) -> Mapping[str, object]:
         files = []
-        for url in self.paths:
+        indexes = (
+            ()
+            if self.kind not in ("jsonl", "text", "csv")
+            else (self.index,)
+            if self.index
+            else tuple(self._index_url(url) for url in self.paths)
+        )
+        for url in (*self.paths, *indexes):
             fs, path = Store(url, self.storage_options).resolve()
+            if url in indexes and not fs.exists(path):
+                continue
             metadata = fs.info(path)
-            files.append({"uri": url, "bytes": metadata["size"], "version": metadata.get(
-                "ETag", metadata.get("etag", metadata.get("generation", fs.ukey(path))))})
-        return {"store": self.kind, "files": files, "columns": self.columns,
-                "filter": str(self.filter), "partitioning": self.partitioning}
+            files.append(
+                {
+                    "uri": url,
+                    "bytes": metadata["size"],
+                    "version": metadata.get(
+                        "ETag", metadata.get("etag", metadata.get("generation", fs.ukey(path)))
+                    ),
+                }
+            )
+        return {
+            "store": self.kind,
+            "files": files,
+            "columns": self.columns,
+            "filter": str(self.filter),
+            "partitioning": self.partitioning,
+            "transport": Store(self.paths[0], self.storage_options).describe() if self.paths else {},
+        }
 
     def supports(self, read: Read) -> bool:
         if read != "indexed" or self.kind in ("files", "array_record"):
@@ -141,8 +190,12 @@ class Files:
         if self.kind == "webdataset":
             return False
         indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
-        return all(Store(url, self.storage_options).resolve()[0].exists(
-            Store(url, self.storage_options).resolve()[1]) for url in indexes)
+        return all(
+            Store(url, self.storage_options)
+            .resolve()[0]
+            .exists(Store(url, self.storage_options).resolve()[1])
+            for url in indexes
+        )
 
     @staticmethod
     def _index_url(url: str) -> str:
@@ -177,16 +230,21 @@ class Files:
                             json.loads(line)
                         offsets.append((0, start, len(line)))
             encoded = io.BytesIO()
-            np.save(encoded, np.array(offsets, dtype=[("shard", "<u4"), ("offset", "<u8"), ("bytes", "<u8")]),
-                    allow_pickle=False)
+            np.save(
+                encoded,
+                np.array(offsets, dtype=[("shard", "<u4"), ("offset", "<u8"), ("bytes", "<u8")]),
+                allow_pickle=False,
+            )
             Store(self._index_url(url), self.storage_options).write(encoded.getvalue())
         self.__dict__.pop("paths", None)
         return self
 
     def records(self, read: Read) -> Records:
         if not self.supports(read):
-            raise FileNotFoundError(f"{self.describe()} cannot read {read}; provision its offset or accepted "
-                                    "index with dew data provision, or choose read='streamed'")
+            raise FileNotFoundError(
+                f"{self.describe()} cannot read {read}; provision its offset or accepted "
+                "index with dew data provision, or choose read='streamed'"
+            )
         if self.kind == "files":
             return _Paths(self.paths)
         if self.kind in ("parquet", "arrow"):
@@ -205,33 +263,41 @@ class Files:
     def arrow(self) -> ds.Dataset:
         fs, _ = Store(self.paths[0], self.storage_options).resolve()
         paths = [Store(url, self.storage_options).resolve()[1] for url in self.paths]
-        return ds.dataset(paths, filesystem=_arrow_filesystem(fs), format="ipc" if self.kind == "arrow"
-                          else "parquet", partitioning=self.partitioning)
+        return ds.dataset(
+            paths,
+            filesystem=_arrow_filesystem(fs),
+            format="ipc" if self.kind == "arrow" else "parquet",
+            partitioning=self.partitioning,
+        )
 
     @cached_property
     def fragments(self):
         if not self.paths:
             return ()
-        return tuple(piece for fragment in self.arrow.get_fragments()
-                     for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,)))
+        return tuple(
+            piece
+            for fragment in self.arrow.get_fragments()
+            for piece in (fragment.split_by_row_group() if self.kind == "parquet" else (fragment,))
+        )
 
     def manifest(self) -> ShardManifest:
         shards = []
         if self.kind in ("parquet", "arrow"):
             for number, fragment in enumerate(self.fragments):
-                rows = None if self.filter is not None else fragment.count_rows()
+                rows = None if self.filter is not None else _fragment_rows(fragment)
                 shards.append(Shard(f"{fragment.path}:{number}", fragment.path, number, number + 1, rows))
         elif self.kind == "array_record":
             shards.extend(Shard(url, url) for url in self.paths)
         else:
             for url in self.paths:
-                fs, path = Store(url, self.storage_options).resolve()
                 size = Store(url, self.storage_options).size()
                 step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
                 if step < 1:
                     raise ValueError("file shard_bytes must be positive")
-                shards.extend(Shard(f"{url}:{start}", url, start, min(start + step, size))
-                              for start in range(0, size, step))
+                shards.extend(
+                    Shard(f"{url}:{start}", url, start, min(start + step, size))
+                    for start in range(0, size, step)
+                )
         return ShardManifest(tuple(shards), self._read_shard)
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
@@ -240,8 +306,9 @@ class Files:
         if self.kind == "array_record":
             from .records import ArrayRecords
 
-            return grain.MapDataset.source(ArrayRecords(
-                (shard.uri,), self.storage_options, record_codec=self.committed is not None)).to_iter_dataset()
+            return grain.MapDataset.source(
+                ArrayRecords((shard.uri,), self.storage_options, record_codec=self.committed is not None)
+            ).to_iter_dataset()
         if self.kind == "webdataset":
             from .webdataset import TarRows
 
@@ -251,7 +318,27 @@ class Files:
         return _Lines(self, shard)
 
     def metadata(self) -> Mapping[str, object]:
-        return self.committed or {}
+        if self.committed is not None:
+            metadata = self.committed.get("metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise ValueError("export metadata must be a mapping")
+            return {**metadata, "rows": self.committed["rows"], "format": self.committed["format"]}
+        if self.kind in ("parquet", "arrow"):
+            schema = self.arrow.schema.metadata or {}
+            details = json.loads(schema[b"huggingface"]) if b"huggingface" in schema else {}
+            features = details.get("info", {}).get("features", {})
+            names = {
+                name: tuple(feature["names"])
+                for name, feature in features.items()
+                if isinstance(feature, Mapping) and feature.get("_type") == "ClassLabel"
+            }
+            counts = (
+                {"rows": sum(_fragment_rows(fragment) for fragment in self.fragments)}
+                if self.filter is None
+                else {}
+            )
+            return {"class_names": names, **counts}
+        return {}
 
     def lengths(self) -> np.ndarray | None:
         if self.kind in ("parquet", "arrow") and "length" in self.arrow.schema.names:
@@ -285,7 +372,8 @@ class _ArrowFragment:
         return self.source.fragments[self.index].to_table(
             schema=self.source.arrow.schema,
             columns=list(self.source.columns) if self.source.columns is not None else None,
-            filter=self.source.filter)
+            filter=self.source.filter,
+        )
 
     def __len__(self) -> int:
         return self.table.num_rows
@@ -297,13 +385,14 @@ class _ArrowFragment:
 class _ArrowRecords:
     def __init__(self, source: Files):
         self.source = source
-        self.offsets = np.cumsum([0, *(fragment.count_rows() for fragment in source.fragments)])
+        self.offsets = np.cumsum([0, *(_fragment_rows(fragment) for fragment in source.fragments)])
 
     @cached_property
     def _group(self):
         @lru_cache(maxsize=1)
         def opened(index: int) -> _ArrowFragment:
             return _ArrowFragment(self.source, index)
+
         return opened
 
     def __getstate__(self) -> Mapping[str, object]:
@@ -322,9 +411,13 @@ class _ArrowRecords:
 class _IndexedLines:
     def __init__(self, source: Files):
         self.source = source
-        self.indexes = (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
-        self.tables = tuple(np.load(io.BytesIO(Store(url, source.storage_options).read()), allow_pickle=False)
-                            for url in self.indexes)
+        self.indexes = (
+            (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
+        )
+        self.tables = tuple(
+            np.load(io.BytesIO(Store(url, source.storage_options).read()), allow_pickle=False)
+            for url in self.indexes
+        )
         self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
 
     def __len__(self) -> int:
@@ -343,7 +436,7 @@ class _IndexedLines:
             payload = file.read(int(entry["bytes"]))
         if names is not None:
             return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
-        return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode().rstrip("\r\n")}
+        return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}
 
 
 class _CsvLines(Iterator[str]):
@@ -391,7 +484,7 @@ class _LineIterator(grain.DatasetIterator):
             if not line:
                 raise StopIteration
             if self.source.kind == "text":
-                return {"text": line.decode().rstrip("\r\n")}
+                return {"text": line.decode()}
             if line.strip():
                 return json.loads(line)
             if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
@@ -421,7 +514,6 @@ class TokenBytes:
 
     @cached_property
     def count(self) -> int:
-        fs, path = Store(self.url, self.storage_options).resolve()
         size = Store(self.url, self.storage_options).size()
         width = np.dtype(self.dtype).itemsize
         if size % width:
@@ -458,11 +550,12 @@ class TokenRecords:
     """ArrayRecord token documents with a producer's authoritative length index."""
 
     paths: tuple[str, ...]
-    lengths: np.ndarray
+    lengths: np.ndarray | None
     dtype: str = "int32"
     field: str | None = None
     eos_id: int | None = None
     storage_options: Mapping[str, object] | None = None
+    record_codec: bool = False
 
     @cached_property
     def records(self):
@@ -472,18 +565,37 @@ class TokenRecords:
 
     @cached_property
     def ends(self) -> np.ndarray:
+        if self.lengths is None:
+            raise FileNotFoundError(
+                "ArrayRecord token spans need the producer's length index; "
+                "set provision=True or choose read='memory'"
+            )
         return np.cumsum(self.lengths, dtype=np.int64)
 
+    def materialize_lengths(self) -> np.ndarray:
+        if self.lengths is None:
+            self.__dict__["lengths"] = np.asarray(
+                [len(self.piece(index)) for index in range(len(self.records))], dtype=np.int64
+            )
+        return self.__dict__["lengths"]
+
     def piece(self, index: int) -> np.ndarray:
-        from .codec import unpack_dict_of_byte_arrays
+        from .codec import decode, unpack_dict_of_byte_arrays
 
         payload = self.records[index]
         if not isinstance(payload, bytes):
             raise TypeError("ArrayRecord token document is not bytes")
-        if self.field is not None:
+        if self.record_codec:
+            value = decode(payload)
+            if self.field is None or not isinstance(value, Mapping) or self.field not in value:
+                raise ValueError(f"token document lacks field {self.field!r}")
+            values = np.asarray(value[self.field], dtype=self.dtype)
+        elif self.field is not None:
             payload = unpack_dict_of_byte_arrays(payload)[self.field]
-        values = np.frombuffer(payload, dtype=self.dtype)
-        if len(values) != int(self.lengths[index]):
+            values = np.frombuffer(payload, dtype=self.dtype)
+        else:
+            values = np.frombuffer(payload, dtype=self.dtype)
+        if self.lengths is not None and len(values) != int(self.lengths[index]):
             raise ValueError(f"token document {index} differs from the producer's length index")
         return values
 
@@ -499,7 +611,7 @@ class TokenRecords:
             begin = 0 if index == 0 else int(self.ends[index - 1])
             if begin >= stop:
                 break
-            pieces.append(self.piece(index)[max(start - begin, 0):stop - begin])
+            pieces.append(self.piece(index)[max(start - begin, 0) : stop - begin])
         return np.concatenate(pieces) if pieces else np.empty(0, self.dtype)
 
 
@@ -511,45 +623,164 @@ class TokenFiles:
     split: str = "train"
     storage_options: Mapping[str, object] | None = None
     chunk_tokens: int = 65536
+    field: str | None = None
 
     def describe(self) -> str:
-        return f"tokens:{self.url}:{self.split}"
+        return f"tokens:{self.url}:{self.split}:field={self.field}"
+
+    @cached_property
+    def array_paths(self) -> tuple[str, ...]:
+        fs, path = Store(self.url, self.storage_options).resolve()
+        return tuple(
+            fs.unstrip_protocol(name)
+            for name in sorted(fs.glob(path.rstrip("/") + f"/{self.split}*.array_record*"))
+            if fs.isfile(name)
+        )
+
+    @property
+    def length_index(self) -> Store:
+        return Store(self.url, self.storage_options).child(f"{self.split}.lengths.npy")
 
     @cached_property
     def meta(self) -> Mapping[str, object]:
+        committed = Files(self.url).committed
+        if committed is not None:
+            metadata = committed.get("metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise ValueError(f"token export metadata is not a mapping at {self.url}")
+            return metadata
         fs, path = Store(self.url, self.storage_options).child("meta.json").resolve()
         return json.loads(fs.cat_file(path)) if fs.exists(path) else {}
 
     @cached_property
-    def tokens(self) -> TokenBytes:
+    def tokens(self) -> TokenBytes | TokenRecords:
         eos = self.meta.get("eos_id")
         if eos is not None and not isinstance(eos, int):
             raise ValueError("token metadata eos_id must be an integer or null")
-        return TokenBytes(self.url.rstrip("/") + f"/{self.split}.bin", str(self.meta.get("dtype", "uint16")),
-                          eos, self.storage_options)
+        committed = Files(self.url).committed
+        if committed is not None:
+            if committed["format"] != "array_record":
+                raise ValueError("token exports must use ArrayRecord")
+            root = Store(self.url, self.storage_options)
+            lengths = []
+            paths = []
+            entries = committed["files"]
+            if not isinstance(entries, list):
+                raise ValueError("token export files must be a list")
+            for entry in entries:
+                if entry["lengths"] is None:
+                    raise FileNotFoundError(
+                        "token export needs the producer's lengths; export with length_field='text'"
+                    )
+                payload = root.child(entry["lengths"]["path"]).read()
+                if len(payload) != entry["lengths"]["bytes"]:
+                    raise ValueError("token export length index size differs from manifest")
+                import hashlib
+
+                if hashlib.sha256(payload).hexdigest() != entry["lengths"]["sha256"]:
+                    raise ValueError("token export length index checksum differs from manifest")
+                lengths.append(np.load(io.BytesIO(payload), allow_pickle=False))
+                paths.append(root.child(entry["path"]).url)
+            return TokenRecords(
+                tuple(paths),
+                np.concatenate(lengths) if lengths else np.zeros(0, np.int64),
+                str(self.meta.get("dtype", "int32")),
+                "text",
+                eos,
+                self.storage_options,
+                record_codec=True,
+            )
+        if self.array_paths:
+            binary = Store(self.url, self.storage_options).child(f"{self.split}.bin")
+            fs, path = binary.resolve()
+            if fs.exists(path):
+                raise ValueError(f"{self.url} holds {self.split} in both binary and ArrayRecord stores")
+            fs, path = self.length_index.resolve()
+            lengths = np.load(io.BytesIO(fs.cat_file(path)), allow_pickle=False) if fs.exists(path) else None
+            return TokenRecords(
+                self.array_paths,
+                lengths,
+                str(self.meta.get("dtype", "uint16")),
+                self.field,
+                eos,
+                self.storage_options,
+            )
+        return TokenBytes(
+            self.url.rstrip("/") + f"/{self.split}.bin",
+            str(self.meta.get("dtype", "uint16")),
+            eos,
+            self.storage_options,
+        )
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self.meta, "tokens": len(self.tokens), "token_store": True}
+        facts = dict(self.meta)
+        tokens = self.tokens
+        if isinstance(tokens, TokenBytes) or tokens.lengths is not None:
+            facts.update(tokens=len(tokens), **{f"{self.split}_tokens": len(tokens)})
+        elif f"{self.split}_tokens" in facts:
+            facts["tokens"] = facts[f"{self.split}_tokens"]
+        return {**facts, "token_store": True}
 
     def snapshot(self) -> Mapping[str, object]:
+        if isinstance(self.tokens, TokenRecords):
+            fs, path = self.length_index.resolve()
+            return {
+                "store": "tokens",
+                "url": self.url,
+                "split": self.split,
+                "metadata": self.meta,
+                "shards": Files(
+                    self.tokens.paths, format="array_record", storage_options=self.storage_options
+                ).snapshot(),
+                "index": fs.ukey(path) if fs.exists(path) else None,
+            }
         fs, path = Store(self.tokens.url, self.storage_options).resolve()
-        return {"store": "tokens", "url": self.url, "split": self.split,
-                "metadata": self.meta, "bytes": fs.size(path), "version": fs.ukey(path)}
+        return {
+            "store": "tokens",
+            "url": self.url,
+            "split": self.split,
+            "metadata": self.meta,
+            "bytes": fs.size(path),
+            "version": fs.ukey(path),
+        }
 
     def supports(self, read: Read) -> bool:
-        return True
+        if read == "memory":
+            return True
+        tokens = self.tokens
+        return isinstance(tokens, TokenBytes) or tokens.lengths is not None
+
+    def provision(self) -> TokenFiles:
+        tokens = self.tokens
+        if isinstance(tokens, TokenRecords):
+            encoded = io.BytesIO()
+            np.save(encoded, tokens.materialize_lengths(), allow_pickle=False)
+            self.length_index.write(encoded.getvalue())
+        return self
 
     def records(self, read: Read) -> Records:
+        if not self.supports(read):
+            raise FileNotFoundError(
+                f"{self.describe()} needs its producer length index; "
+                "run dew data provision or choose read='memory'"
+            )
+        if read == "memory" and isinstance(self.tokens, TokenRecords):
+            self.tokens.materialize_lengths()
         indexed = _TokenChunks(self.tokens, self.chunk_tokens)
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
         count = len(self.records("indexed"))
-        return ShardManifest(tuple(Shard(f"{self.tokens.url}:{index}", self.tokens.url, index, index + 1, 1)
-                                   for index in range(count)), self._read_shard)
+        return ShardManifest(
+            tuple(
+                Shard(f"{self.url}:{self.split}:{index}", self.url, index, index + 1, 1)
+                for index in range(count)
+            ),
+            self._read_shard,
+        )
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
+        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
 
     def lengths(self) -> np.ndarray | None:
         return None
@@ -557,11 +788,11 @@ class TokenFiles:
 
 @dataclass(frozen=True)
 class _TokenChunks:
-    tokens: TokenBytes
+    tokens: TokenBytes | TokenRecords
     size: int
 
     def __len__(self) -> int:
         return (len(self.tokens) + self.size - 1) // self.size
 
     def __getitem__(self, index: int) -> Batch:
-        return {"text": self.tokens[index * self.size:(index + 1) * self.size].astype(np.int32)}
+        return {"text": self.tokens[index * self.size : (index + 1) * self.size].astype(np.int32)}

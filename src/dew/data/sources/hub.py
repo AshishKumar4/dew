@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
+import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Records
 
 from .base import Read, ShardManifest
 from .files import Files
+from .memory import _record
 
 
 @dataclass(frozen=True)
@@ -38,7 +40,9 @@ class Hub:
     def builder(self):
         from datasets import load_dataset_builder
 
-        return load_dataset_builder(self.repo, name=self.config, revision=self.commit, cache_dir=self.cache_dir)
+        return load_dataset_builder(
+            self.repo, name=self.config, revision=self.commit, cache_dir=self.cache_dir
+        )
 
     @cached_property
     def parquet(self) -> Files:
@@ -48,17 +52,23 @@ class Hub:
         revision = self.commit
 
         def selected(paths: list[str]) -> list[str]:
-            return [path for path in paths if path.endswith(".parquet")
-                    and (f"/{self.split}/" in "/" + path or Path(path).name.startswith(self.split + "-"))
-                    and (self.config is None or f"/{self.config}/" in "/" + path)]
+            return [
+                path
+                for path in paths
+                if path.endswith(".parquet")
+                and (f"/{self.split}/" in "/" + path or Path(path).name.startswith(self.split + "-"))
+                and (self.config is None or f"/{self.config}/" in "/" + path)
+            ]
 
         paths = selected(HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision))
         if not paths:
             revision = HfApi().dataset_info(self.repo, revision="refs/convert/parquet").sha
             paths = selected(HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision))
         if not paths:
-            raise FileNotFoundError(f"HF {self.repo!r} split {self.split!r} has no physical Parquet shards; "
-                                    "name an hf:// Parquet URL or explicitly provision Arrow")
+            raise FileNotFoundError(
+                f"HF {self.repo!r} split {self.split!r} has no physical Parquet shards; "
+                "name an hf:// Parquet URL or explicitly provision Arrow"
+            )
         urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in sorted(paths))
         for url in urls:
             fs.info(url)
@@ -68,8 +78,14 @@ class Hub:
         return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
 
     def snapshot(self) -> Mapping[str, object]:
-        return {"store": "hf", "repo": self.repo, "revision": self.commit,
-                "config": self.config, "split": self.split}
+        return {
+            "store": "hf",
+            "repo": self.repo,
+            "revision": self.commit,
+            "config": self.config,
+            "split": self.split,
+            "shards": self.parquet.snapshot(),
+        }
 
     def supports(self, read: Read) -> bool:
         if read == "streamed":
@@ -82,20 +98,34 @@ class Hub:
 
     def records(self, read: Read) -> Records:
         if not self.supports(read):
-            raise FileNotFoundError(f"{self.describe()} has no prepared Arrow split at {self.builder.cache_dir}; "
-                                    "run dew data provision or set provision=True")
+            raise FileNotFoundError(
+                f"{self.describe()} has no prepared Arrow split at {self.builder.cache_dir}; "
+                "run dew data provision or set provision=True"
+            )
         dataset = self.builder.as_dataset(split=self.split, in_memory=read == "memory")
         from datasets import Dataset
 
         if not isinstance(dataset, Dataset):
             raise TypeError(f"{self.describe()} did not resolve to one split")
-        return dataset
+        return grain.MapDataset.source(dataset).map(_record)
 
     def manifest(self) -> ShardManifest:
         return self.parquet.manifest()
 
     def metadata(self) -> Mapping[str, object]:
-        return {}
+        from datasets import ClassLabel
+
+        features = self.builder.info.features
+        class_names = {
+            name: tuple(feature.names)
+            for name, feature in (features or {}).items()
+            if isinstance(feature, ClassLabel)
+        }
+        splits = self.builder.info.splits
+        rows = (
+            {"rows": splits[self.split].num_examples} if splits is not None and self.split in splits else {}
+        )
+        return {"class_names": class_names, **rows}
 
     def lengths(self) -> np.ndarray | None:
         return None
