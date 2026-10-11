@@ -1340,7 +1340,8 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
     root, fields = stores
 
     def validation(name, **spec):
-        data = load(Text(source=TokenFiles(str(root / name), field=fields[name]["field"])), batch=1, read="memory",
+        data = load(Text(source=TokenFiles(str(root / name), field=fields[name]["field"])), batch=1,
+            read="memory",
             loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1), **spec)
         rows = _read(data.val(DataPartition()))
         return [{key: value.tolist() for key, value in row.items()} for row in rows]

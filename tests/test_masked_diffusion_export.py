@@ -191,7 +191,8 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
                                          int(ids.shape[1]), ema_decay=None, variables=source.variables)
     count = math.lcm(int(ids.shape[0]), jax.device_count())
     rows = [{"text": row} for row in np.concatenate([ids] * (count // int(ids.shape[0])))]
-    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(count), read="indexed", loading=Loading(workers=0))
+    data = compile(Pipeline(Memory(grain.MapDataset.source(rows))).repeat().batch(count), read="indexed",
+        loading=Loading(workers=0))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     state = Trainer(objective, optax.sgd(1.0), key=jax.random.key(0), checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1)

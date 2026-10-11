@@ -1484,7 +1484,8 @@ def test_from_grain_batches_a_map_dataset_per_process_and_counts_its_records():
 def test_from_grain_repeats_a_map_dataset_so_a_run_outlasts_the_corpus():
     """`Dataset.train` is endless; a caller's finite pipeline would otherwise
     stop the run one pass in."""
-    stream = compile(Pipeline(Memory(_grain_points(8))).repeat().batch(4), read="indexed", **WORKERS).train(DataPartition())
+    stream = compile(Pipeline(Memory(_grain_points(8))).repeat().batch(4), read="indexed",
+        **WORKERS).train(DataPartition())
 
     assert len(_indices(stream, 6)) == 6
 
@@ -1524,7 +1525,9 @@ def test_from_grain_takes_a_streamed_pipeline_and_carries_grains_own_state():
 
 
 def test_from_grain_scores_a_validation_pass_that_ends():
-    data = compile(Pipeline(Memory(_grain_points(16))).repeat().batch(4), validation=Pipeline(Memory(pygrain.MapDataset.source(_Points(8)))).batch(4), read="indexed", **WORKERS)
+    data = compile(Pipeline(Memory(_grain_points(16))).repeat().batch(4),
+        validation=Pipeline(Memory(pygrain.MapDataset.source(_Points(8)))).batch(4), read="indexed",
+            **WORKERS)
 
     assert data.val is not None
     assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
@@ -1558,7 +1561,8 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
             layout=Layout(min_shard=1, tolerance=1.0),
             checkpoints=None if directory is None else Checkpoints(str(directory)))
         # The simulated mesh is eight devices wide, so a step is eight records.
-        return trainer.fit(compile(Pipeline(Memory(_grain_points())).repeat().batch(8), read="indexed", **WORKERS),
+        return trainer.fit(compile(Pipeline(Memory(_grain_points())).repeat().batch(8), read="indexed",
+            **WORKERS),
                            steps=steps, log_every=1,
                            checkpoint_every=None if directory is None else 2)
 
@@ -1585,7 +1589,8 @@ def test_a_default_loading_reads_in_the_training_process():
     started 32 worker processes took 17.8 s and 7.07 GiB to the first batch
     of a 100-record pipeline, and a script without a __main__ guard re-ran
     itself in every worker."""
-    data = compile(Pipeline(Memory(pygrain.MapDataset.range(16).map(_pid_of))).repeat().batch(4), read="indexed")
+    data = compile(Pipeline(Memory(pygrain.MapDataset.range(16).map(_pid_of))).repeat().batch(4),
+        read="indexed")
 
     stream = data.train(DataPartition())
     try:
