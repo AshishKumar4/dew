@@ -32,13 +32,6 @@ from collections import Counter
 
 import jax
 
-UNLOWERABLE = {
-    ('tokamax_grouped_matmul', 'triton'): (
-        "tokamax registers its Triton ragged dot on GPU hosts only, so no CPU lowers it, and the "
-        "kernel lab's verify on the GPU is its only check"),
-}
-"""The Pallas choices a `KERNELS` row can name whose Triton lowering no CPU reaches, and why."""
-
 _TRITON_CALL = re.compile(r'custom_call @__gpu\$xla\.gpu\.triton\(.*?\bname = "([^"]*)"')
 
 

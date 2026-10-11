@@ -994,9 +994,9 @@ def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: d
 
 def unlowered(pallas: Sequence[str]) -> dict:
     """The kernels the ref's KERNELS row names for the GPU (`lab_verified`'s `pallas`) that no CPU
-    lowers (`dew.training._lowering.UNLOWERABLE`), each with why, so a receipt never passes them as
+    lowers (`dew.nn.kernels.generation.UNLOWERABLE`), each with why, so a receipt never passes them as
     lowered: the kernel lab's record is their only check."""
-    from dew.training._lowering import UNLOWERABLE
+    from dew.nn.kernels.generation import UNLOWERABLE
 
     unseen = {f"{choice}={kernel}": why for (choice, kernel), why in UNLOWERABLE.items()
               if f"{choice}={kernel}" in pallas}

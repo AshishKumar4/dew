@@ -526,7 +526,7 @@ def test_the_lowered_step_takes_the_checkpoint_and_rows_the_request_trains():
 
 
 def test_a_kernel_no_cpu_lowers_is_named_in_the_receipt_and_never_passed_as_lowered():
-    """tokamax's Triton ragged dot registers on GPU hosts only (`dew.training._lowering.UNLOWERABLE`): a
+    """tokamax's Triton ragged dot registers on GPU hosts only (`dew.nn.kernels.generation.UNLOWERABLE`): a
     ref whose KERNELS row names it for the GPU gets a receipt that says it was not lowered, and why,
     so the kernel lab's record stands as its only check."""
     named = ["gated_delta_rule=pallas", "grouped_matmul=pallas", "tokamax_grouped_matmul=triton"]

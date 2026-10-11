@@ -40,6 +40,14 @@ Triton backend for a GPU only: what the CPU dry run lowers (`dew.training._lower
 lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
 
+UNLOWERABLE = {
+    ('tokamax_grouped_matmul', 'triton'): (
+        "tokamax registers its Triton ragged dot on GPU hosts only, so no CPU lowers it, and the "
+        "kernel lab's verify on the GPU is its only check"),
+}
+"""The Pallas choices a `KERNELS` row can name whose Triton lowering no CPU reaches, and why."""
+
+
 DEVICE_KINDS = {
     'sm75': "Tesla T4",
     'sm80': "NVIDIA A100-SXM4-80GB",
