@@ -233,11 +233,19 @@ class Driver:
             if job["index"] in recorded or not failures.get(str(job["index"]), {}).get("needs_attention"):
                 continue
             status = progress.get("jobs", {}).get(str(job["index"]), {})
-            result = {"index": job["index"], "lane": job["lane"], "commit": job["commit"],
-                      "driver_sha": plan["driver_sha"], "status": "collection failed: needs attention",
-                      "observed_exit": status.get("exit"), "collection_failed": True,
-                      "results": str(self.run_dir), "seconds": status.get("seconds", 0),
-                      "stage_seconds": status.get("stage_seconds", 0), "finished_at": time.time()}
+            result = {
+                "index": job["index"],
+                "lane": job["lane"],
+                "commit": job["commit"],
+                "driver_sha": plan["driver_sha"],
+                "status": "collection failed: needs attention",
+                "observed_exit": status.get("exit"),
+                "collection_failed": True,
+                "results": str(self.run_dir),
+                "seconds": status.get("seconds", 0),
+                "stage_seconds": status.get("stage_seconds", 0),
+                "finished_at": time.time(),
+            }
             colab_batch.finish(job["entry"], result)
             self.record(results=[*self.state["results"], result])
 

@@ -20,8 +20,10 @@ def is_run(path):
 
 
 def committed_file(file):
-    return any(path.name.isdigit() and all((path / marker).is_file() for marker in COMMIT_MARKERS)
-               for path in file.parents)
+    return any(
+        path.name.isdigit() and all((path / marker).is_file() for marker in COMMIT_MARKERS)
+        for path in file.parents
+    )
 
 
 def retained_path(file, policy):
