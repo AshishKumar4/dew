@@ -40,7 +40,7 @@ from dew.training import Trainer
 from dew.training.distributed import DevicePrefetchIterator
 from dew.training.runtime import prepare_process
 from dew.training.state import TrainState
-from dew.training.trainer import Rollout, batch_shapes
+from dew.training.trainer import CompiledStep, Rollout, Shapes, batch_shapes
 
 MODEL = "Qwen/Qwen3.5-0.8B"
 REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
@@ -90,7 +90,7 @@ class Counted:
 
 
 def model_flops(config: Mapping[str, object], real_tokens: float, squared_lengths: float) -> float:
-    """C50's analytic trunk work, without padding, decision head or recomputation."""
+    """Counted's recurrent convention, without padding, decision head or recomputation."""
     text = config.get("text_config", config)
     if not isinstance(text, Mapping):
         raise TypeError("the model config needs a text_config record")
@@ -102,19 +102,21 @@ def model_flops(config: Mapping[str, object], real_tokens: float, squared_length
                          "linear_num_key_heads"))
     attention = 3 * width * heads * head + 2 * width * kv * head
     delta = width * (2 * keys * gk + 2 * gh * gv + 2 * gh) + gh * gv * width
+    convolution = 2 * (2 * keys * gk + gh * gv) * int(text["linear_conv_kernel_dim"])
     total = 0.0
     for kind in text["layer_types"]:
         projection = attention if kind == "full_attention" else delta
         total += 6 * (projection + 3 * width * inner) * real_tokens
         total += (6 * heads * head * squared_lengths if kind == "full_attention" else
-                  3 * (4 * gh * gk * gv + 2 * gh * 64 * (gk + gv)) * real_tokens)
+                  3 * (6 * gh * gk * gv + convolution) * real_tokens)
     return total
 
 
 class Measurement:
     def __init__(self, trainer: Trainer, counted: Counted, config: BenchmarkRun):
         self.trainer, self.counted, self.config = trainer, counted, config
-        self.compiled = {}
+        self.compiled: dict[Shapes, CompiledStep] = {}
+        self.hardware: dict[Shapes, float | None] = {}
         self.compiles: list[dict[str, object]] = []
         self.rows: list[dict[str, float]] = []
         self.started = time.perf_counter()
@@ -135,6 +137,7 @@ class Measurement:
             with region("compile"):
                 self.compiled[shape] = self.trainer.compile(state, batch)
             compile_seconds = time.perf_counter() - began
+            self.hardware[shape] = self.trainer.flops_per_step
             self.compiles.append({
                 "microstep": index, "shape": list(batch["tokens"].shape), "seconds": compile_seconds,
                 "hlo_flops": self.trainer.flops_per_step, "memory": self.trainer.memory,
@@ -150,6 +153,8 @@ class Measurement:
         self.rows.append({
             **counted, "microstep": index, "loss": float(values[0]), "input_wait_seconds": wait,
             "compile_seconds": compile_seconds, "seconds": time.perf_counter() - started,
+            "hlo_flops": self.hardware[shape] or 0.0,
+            "hlo_flops_available": float(self.hardware[shape] is not None),
             "model_flops": 0.0 if self.flop_config is None else model_flops(
                 self.flop_config, counted["real_tokens"], counted["sum_lengths_squared"]),
         })
@@ -180,6 +185,8 @@ class Measurement:
                 "drift_fraction": after / before - 1,
                 "model_mfu": (None if self.config.smoke else
                               sum(row["model_flops"] for row in rows) / seconds / 312e12),
+                "hfu": (None if self.config.smoke or not all(row["hlo_flops_available"] for row in rows)
+                        else sum(row["hlo_flops"] for row in rows) / seconds / 312e12),
             })
         return results
 
@@ -200,7 +207,8 @@ class Measurement:
             "arm": self.config.arm, "smoke": self.config.smoke,
             "loss_normalization": (
                 "per real token" if self.config.trainer.batch_tokens else "per scored question"),
-            "analytic_mfu_scope": "C50 trunk work at real lengths, causal attention; head and remat excluded",
+            "analytic_mfu_scope": "Counted recurrent trunk work at real lengths; head and remat excluded",
+            "hfu_scope": "compiled HLO including padded work, head and recomputation; separate from model MFU",
             "model_flops_per_step": statistics.mean(row["model_flops"] for row in measured),
             "whole_run_compile_seconds": sum(float(row["seconds"]) for row in self.compiles),
             "compile_count": len(self.compiles), "compiles": self.compiles,
