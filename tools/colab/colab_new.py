@@ -77,8 +77,9 @@ class Colab:
                     raise
                 time.sleep(5)
             except self.types.ColabRequestError as error:
-                # Only the very first, read-only GET can prove that no POST
-                # provisioned a VM. A timeout on any earlier attempt is ambiguous.
+                # colab_cli.client.Client.assign GETs before any POST; re-audit
+                # this proof if a client upgrade changes that order. Only the
+                # first GET proves no POST; earlier timeouts remain ambiguous.
                 if (
                     attempt == 0
                     and getattr(error.request, "method", None) == "GET"
