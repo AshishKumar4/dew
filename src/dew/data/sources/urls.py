@@ -27,6 +27,11 @@ class Fetch:
     retries: int = 2
     max_bytes: int = 64 * 2**20
     volatile: ClassVar[bool] = True
+    rejects: ClassVar[bool] = True
+
+    def __post_init__(self) -> None:
+        if self.timeout <= 0 or self.retries < 0 or self.max_bytes < 1:
+            raise ValueError("Fetch needs positive timeout and max_bytes, and nonnegative retries")
 
     def __call__(self, record: Mapping[str, object]):
         from dew.data.pipeline import Rejected
@@ -46,12 +51,11 @@ class Fetch:
             except urllib.error.HTTPError as error:
                 if error.code in (404, 410):
                     return Rejected(f"http_{error.code}")
-                if error.code < 500 and error.code not in (408, 429):
-                    return Rejected(f"http_{error.code}")
+                _log.debug("fetch %s attempt %d returned HTTP %d", url, attempt + 1, error.code)
             except ValueError:
                 return Rejected("invalid_url")
             except (OSError, http.client.HTTPException) as error:
                 _log.debug("fetch %s attempt %d failed: %s", url, attempt + 1, error)
             if attempt < self.retries:
-                time.sleep(0.1 * 2**attempt)
+                time.sleep(min(0.1 * 2**attempt, 10))
         return Rejected("transient", permanent=False)

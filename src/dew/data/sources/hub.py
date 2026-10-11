@@ -7,12 +7,14 @@ from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
 
+import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Records
 
 from .base import Read, ShardManifest
 from .files import Files
+from .memory import _record
 
 
 @dataclass(frozen=True)
@@ -69,7 +71,7 @@ class Hub:
 
     def snapshot(self) -> Mapping[str, object]:
         return {"store": "hf", "repo": self.repo, "revision": self.commit,
-                "config": self.config, "split": self.split}
+                "config": self.config, "split": self.split, "shards": self.parquet.snapshot()}
 
     def supports(self, read: Read) -> bool:
         if read == "streamed":
@@ -89,7 +91,7 @@ class Hub:
 
         if not isinstance(dataset, Dataset):
             raise TypeError(f"{self.describe()} did not resolve to one split")
-        return dataset
+        return grain.MapDataset.source(dataset).map(_record)
 
     def manifest(self) -> ShardManifest:
         return self.parquet.manifest()

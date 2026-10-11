@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from typing import Protocol
 
 import grain.python as grain
 import numpy as np
@@ -12,6 +13,22 @@ from dew.data.dataset import Batch, Records
 
 from .base import Read, Shard, ShardManifest
 from .codec import fingerprint
+
+
+class ArrowTable(Protocol):
+    def to_pylist(self) -> list[Batch]: ...
+
+
+class SparkFrame(Protocol):
+    def toArrow(self) -> ArrowTable: ...
+
+
+def _record(value: object) -> Batch | bytes | None:
+    if value is None or isinstance(value, bytes):
+        return value
+    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
+        return value
+    raise TypeError(f"source feature record must have named fields or bytes, got {type(value).__name__}")
 
 
 @dataclass(frozen=True)
@@ -40,6 +57,15 @@ class Memory:
     def __post_init__(self) -> None:
         if self.shard_rows < 1:
             raise ValueError("memory shard_rows must be positive")
+
+    @classmethod
+    def from_arrow(cls, table: ArrowTable) -> Memory:
+        return cls(table.to_pylist())
+
+    @classmethod
+    def from_spark(cls, frame: SparkFrame) -> Memory:
+        """Gather a small pyspark 4.0+ frame through its Arrow handoff."""
+        return cls.from_arrow(frame.toArrow())
 
     def describe(self) -> str:
         return f"memory:{self.identity or self.snapshot()['sha256']}"

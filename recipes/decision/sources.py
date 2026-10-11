@@ -37,7 +37,7 @@ import io
 import json
 import random
 from collections import defaultdict
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, fields
 from functools import cached_property
 from pathlib import Path
@@ -1438,9 +1438,18 @@ def _json(store: Store, value: dict) -> dict:
     return _publish(store, (json.dumps(value, indent=1, ensure_ascii=False) + "\n").encode())
 
 
-def _examples(out: Store, stem: str, examples: list[Example], max_bytes: int) -> dict:
+def _examples(out: Store, stem: str, examples: list[Example], max_bytes: int,
+              expected: Mapping[str, str] | None = None) -> dict:
     import numpy as np
 
+    if expected is not None:
+        digest = hashlib.sha256()
+        for example in examples:
+            digest.update((json.dumps(row(example), ensure_ascii=False) + "\n").encode())
+        wanted = expected.get(f"{stem}.jsonl", hashlib.sha256(b"").hexdigest())
+        if digest.hexdigest() != wanted:
+            raise ValueError(f"{stem} differs from the canonical mix before publication: "
+                             f"{digest.hexdigest()} != {wanted}")
     dtype = [("shard", "<u4"), ("offset", "<u8"), ("bytes", "<u4"), ("questions", "<u4"),
              ("options", "<u4"), ("labelled", "?"), ("estimated_length", "<u8")]
     index = np.empty(len(examples), dtype=dtype)
@@ -1480,7 +1489,8 @@ def _examples(out: Store, stem: str, examples: list[Example], max_bytes: int) ->
 
 
 def write_source(mixture: Mixture, name: str, out: str | Path, overlaps: "Overlaps | None" = None,
-                 cap: int = 200_000, shard_bytes: int = 64 * 2**20) -> dict:
+                 cap: int = 200_000, shard_bytes: int = 64 * 2**20,
+                 expected: Mapping[str, str] | None = None) -> dict:
     """Build one source independently, with immutable shards and a completion manifest."""
     if cap <= 0:
         raise ValueError("cap must be positive")
@@ -1497,8 +1507,8 @@ def write_source(mixture: Mixture, name: str, out: str | Path, overlaps: "Overla
         held = overlaps.keep(f"{name} (held out)", held, source.natural)
     root = Store(str(out))
     result = {"name": name, "cap": cap, "source": dataclasses.asdict(source),
-              "train": _examples(root, name, train, shard_bytes),
-              "held": _examples(root, f"{name}.held", held, shard_bytes),
+              "train": _examples(root, name, train, shard_bytes, expected),
+              "held": _examples(root, f"{name}.held", held, shard_bytes, expected),
               "decontamination": None if overlaps is None else {
                   key: value for key, value in overlaps.report.items()
                   if key in (name, f"{name} (held out)")}}
@@ -1506,7 +1516,8 @@ def write_source(mixture: Mixture, name: str, out: str | Path, overlaps: "Overla
     return result
 
 
-def publish(mixture: Mixture, out: str | Path, cap: int = 200_000) -> dict:
+def publish(mixture: Mixture, out: str | Path, cap: int = 200_000,
+            expected: Mapping[str, Value] | None = None) -> dict:
     """Commit a mixture only after every enabled source has a verified completion."""
     import subprocess
 
@@ -1554,6 +1565,17 @@ def publish(mixture: Mixture, out: str | Path, cap: int = 200_000) -> dict:
                             for split in ("train", "held")), default=0)
                   for key in ("questions", "options")},
     }
+    if expected is not None:
+        canonical = {key: made[key] for key in ("weights", "rows", "licences")}
+        digest = hashlib.sha256(json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        if digest != expected["mixture_fields_sha256"]:
+            raise ValueError("mixture weights, row counts or licences differ from the canonical mix")
+        for name, part in parts.items():
+            for split in ("train", "held"):
+                stem = name if split == "train" else f"{name}.held"
+                wanted = expected["file_sha256"].get(f"{stem}.jsonl", hashlib.sha256(b"").hexdigest())
+                if part[split]["sha256"] != wanted:
+                    raise ValueError(f"{stem} concatenated checksum differs from the canonical mix")
     files.append({"path": "mixture.json", **_json(root.child("mixture.json"), made)})
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     manifest = {"schema": 1, "name": str(out).rstrip("/").rsplit("/", 1)[-1],
@@ -1564,11 +1586,13 @@ def publish(mixture: Mixture, out: str | Path, cap: int = 200_000) -> dict:
 
 
 def write(mixture: Mixture, out: str | Path, overlaps: "Overlaps | None" = None,
-          cap: int = 200_000, shard_bytes: int = 64 * 2**20) -> dict:
+          cap: int = 200_000, shard_bytes: int = 64 * 2**20,
+          expected: Mapping[str, Value] | None = None) -> dict:
     """Build and commit every enabled source directly to a filesystem URL."""
     for name, _ in mixture.sources():
-        write_source(mixture, name, out, overlaps, cap, shard_bytes)
-    return publish(mixture, out, cap)
+        write_source(mixture, name, out, overlaps, cap, shard_bytes,
+                     None if expected is None else expected["file_sha256"])
+    return publish(mixture, out, cap, expected)
 
 
 @dataclass(frozen=True)
@@ -1581,6 +1605,7 @@ class Conversion:
     shard_bytes: int = 64 * 2**20
     only: str | None = None
     publish: bool = False
+    verify: str | None = None
     mixture: Mixture = field(default_factory=Mixture)
 
 
@@ -1590,11 +1615,14 @@ if __name__ == "__main__":
 
     conversion = tyro.cli(Conversion)
     overlaps = None if conversion.decontaminate is None else Overlaps.load(conversion.decontaminate)
+    expected = None if conversion.verify is None else json.loads(Store(conversion.verify).read())
     if conversion.publish:
-        result = publish(conversion.mixture, conversion.out, conversion.cap)
+        result = publish(conversion.mixture, conversion.out, conversion.cap, expected)
     elif conversion.only is not None:
         result = write_source(conversion.mixture, conversion.only, conversion.out, overlaps,
-                              conversion.cap, conversion.shard_bytes)
+                              conversion.cap, conversion.shard_bytes,
+                              None if expected is None else expected["file_sha256"])
     else:
-        result = write(conversion.mixture, conversion.out, overlaps, conversion.cap, conversion.shard_bytes)
+        result = write(conversion.mixture, conversion.out, overlaps, conversion.cap,
+                       conversion.shard_bytes, expected)
     print(json.dumps(result.get("rows", result)))

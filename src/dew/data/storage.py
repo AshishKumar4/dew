@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Buffer, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import BinaryIO, TypedDict
 
@@ -29,6 +29,7 @@ from huggingface_hub import HfFileSystem
 from s3fs import S3FileSystem
 
 from dew.records import JSON, json_value
+from dew.data.retention import LocalRetention
 
 
 class PreconditionFailed(FileExistsError):
@@ -42,6 +43,18 @@ class ObjectInfo(TypedDict):
 
 class ObjectRef(ObjectInfo):
     path: str
+
+
+def _byte_size(value: int | str) -> int:
+    if isinstance(value, int):
+        return value
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*([KMGT]?i?B)?\s*", value, re.IGNORECASE)
+    if match is None:
+        raise ValueError(f"byte budget {value!r} needs an integer or a unit such as MiB or GB")
+    unit = (match[2] or "B").upper()
+    base = 1024 if "I" in unit else 1000
+    exponent = 0 if unit == "B" else "KMGT".index(unit[0]) + 1
+    return int(float(match[1]) * base**exponent)
 
 
 def _secret(value: object, profile: str) -> JSON:
@@ -176,6 +189,9 @@ class DewDataFileSystem(AbstractFileSystem):
             raise ValueError(f"dew-data object {path} must be between 1 byte and 100 MB; write shards")
         self._request("PUT", path, payload=value)
 
+    def rm_file(self, path: str) -> None:
+        self._request("DELETE", path)
+
     def makedirs(self, path: str, exist_ok: bool = False) -> None:
         self._key(path.rstrip("/"))
 
@@ -233,7 +249,8 @@ class BoundedFileCache(WholeFileCacheFileSystem):
 
     protocol = "dewcache"
 
-    def __init__(self, *, max_bytes: int = 8 * 2**30, **kwargs):
+    def __init__(self, *, max_bytes: int | str = 8 * 2**30, **kwargs):
+        max_bytes = _byte_size(max_bytes)
         if max_bytes <= 0:
             raise ValueError("dewcache max_bytes must be positive")
         super().__init__(**{"check_files": True, **kwargs})
@@ -324,13 +341,26 @@ class Store:
     """An object URL with compare-and-swap publication and verified uploads."""
 
     url: str
-    storage_options: Mapping[str, object] | None = None
+    storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    retention: LocalRetention | None = field(default=None, repr=False)
 
     def resolve(self) -> tuple[AbstractFileSystem, str]:
         return fsspec.core.url_to_fs(self.url, **(self.storage_options or {}))
 
     def child(self, path: str) -> Store:
-        return Store(self.url.rstrip("/") + "/" + path, self.storage_options)
+        return Store(self.url.rstrip("/") + "/" + path, self.storage_options, self.retention)
+
+    def describe(self) -> Mapping[str, object]:
+        fs, _ = self.resolve()
+        while isinstance(fs, WholeFileCacheFileSystem):
+            fs = fs.fs
+        settings = {"url": self.url, "protocol": fs.protocol}
+        if isinstance(fs, S3FileSystem):
+            settings.update(endpoint=fs.client_kwargs.get("endpoint_url") or fs.endpoint_url,
+                            region=fs.client_kwargs.get("region_name"))
+        elif isinstance(fs, DewDataFileSystem):
+            settings.update(endpoint=fs.endpoint)
+        return settings
 
     def read(self) -> bytes:
         fs, path = self.resolve()
@@ -424,7 +454,9 @@ class Store:
     def _put(self, payload: bytes, version: str | None) -> str:
         fs, path, scheme = self._backend()
         if scheme in ("file", "memory"):
-            with self._locked(path, scheme):
+            reservation = (self.retention.reserve(Path(path), len(payload)) if self.retention is not None
+                           else contextlib.nullcontext())
+            with reservation, self._locked(path, scheme):
                 previous = hashlib.sha256(fs.cat_file(path)).hexdigest() if fs.exists(path) else None
                 if previous != version:
                     raise PreconditionFailed(self.url)

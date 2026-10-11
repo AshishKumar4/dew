@@ -143,3 +143,37 @@ def test_webdataset_groups_members_and_restores_inside_shard():
     expected = list(iterator)
     iterator.set_state(state)
     assert list(iterator) == expected
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
+    from dew.data.steps.text import Tokenize
+
+    root = Store(f"memory://text-{uuid4().hex}/source.txt")
+    original = b"first\r\nsecond\n\nlast without newline"
+    root.write(original)
+    files = Files(root.url, shard_bytes=9)
+    if read == "indexed":
+        files.provision()
+    if read == "streamed":
+        records = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+    else:
+        indexed = files.records(read)
+        records = [indexed[index] for index in range(len(indexed))]
+    tokens = np.concatenate([Tokenize().map(row)["text"] for row in records])
+    assert bytes(tokens) != original
+    assert tokens.tolist() == list(original)
+
+
+def test_exported_token_lengths_support_indexed_spans_without_record_scan():
+    from dew.data.sources.files import TokenFiles
+
+    root = f"memory://token-export-{uuid4().hex}"
+    export([{"text": np.arange(start, start + 3, dtype=np.int32)} for start in (0, 3, 6)], root,
+           format="array_record", rows_per_shard=2, length_field="text",
+           metadata={"token_store": True, "dtype": "int32", "tokenizer": "byte", "vocab_size": 256,
+                     "eos_id": None})
+    source = TokenFiles(root)
+    assert len(source.tokens) == 9
+    assert source.tokens[2:8].tolist() == list(range(2, 8))
+    assert source.metadata()["tokenizer"] == "byte"

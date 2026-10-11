@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tempfile
 import uuid
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
+import numpy as np
 import pyarrow as pa
 import pyarrow.dataset as ds
 from array_record.python.array_record_module import ArrayRecordWriter
@@ -44,7 +46,9 @@ def _chunks(values: Iterable[Batch | bytes | None], rows: int) -> Iterator[list[
 def export(values: Source | grain.IterDataset | Iterable[Batch | bytes | None] | Pipeline, url: str, *,
            format: Literal["parquet", "array_record"] = "parquet", rows_per_shard: int = 100_000,
            partitioning: tuple[str, ...] | None = None,
-           storage_options: Mapping[str, object] | None = None) -> Mapping[str, object]:
+           storage_options: Mapping[str, object] | None = None,
+           metadata: Mapping[str, object] | None = None, length_field: str | None = None
+           ) -> Mapping[str, object]:
     """Write immutable shards, then conditionally commit their manifest and _SUCCESS.
 
     Arrow discovers and writes partition columns with Hive directory names.
@@ -73,6 +77,18 @@ def export(values: Source | grain.IterDataset | Iterable[Batch | bytes | None] |
     try:
         for number, batch in enumerate(_chunks(rows, rows_per_shard)):
             count += len(batch)
+            lengths = []
+            if length_field is not None:
+                for row in batch:
+                    if not isinstance(row, Mapping) or length_field not in row:
+                        raise ValueError(f"export row is missing length_field={length_field!r}")
+                    lengths.append(len(row[length_field]))
+            index = None
+            if lengths:
+                encoded = io.BytesIO()
+                np.save(encoded, np.asarray(lengths, np.int64), allow_pickle=False)
+                index_path = f"shards/{writer}/part-{number:06d}.lengths.npy"
+                index = {"path": index_path, **root.child(index_path).verified(encoded.getvalue())}
             if format == "array_record":
                 with tempfile.TemporaryDirectory(prefix="dew-export-") as temporary:
                     path = Path(temporary) / "part.array_record"
@@ -83,7 +99,7 @@ def export(values: Source | grain.IterDataset | Iterable[Batch | bytes | None] |
                     finally:
                         record_writer.close()
                     relative = f"shards/{writer}/part-{number:06d}.array_record"
-                    files.append({"path": relative, "rows": len(batch),
+                    files.append({"path": relative, "rows": len(batch), "lengths": index,
                                   **root.child(relative).verified(path.read_bytes())})
             else:
                 if any(not isinstance(row, Mapping) for row in batch):
@@ -99,11 +115,14 @@ def export(values: Source | grain.IterDataset | Iterable[Batch | bytes | None] |
         if format == "parquet":
             fs, directory = target.resolve()
             for path in sorted(fs.find(directory)) if fs.exists(directory) else []:
+                if not path.endswith(".parquet"):
+                    continue
                 payload = fs.cat_file(path)
                 relative = f"shards/{writer}/" + path[len(directory):].lstrip("/")
                 files.append({"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()})
         manifest = {"schema": 1, "format": format, "codec": 1 if format == "array_record" else None,
-                    "rows": count, "partitioning": partitioning, "files": files}
+                    "rows": count, "partitioning": partitioning, "files": files,
+                    "metadata": metadata or {}}
         encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
         root.child("_dew_manifest.json").put_if_absent(encoded)
         root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())

@@ -13,6 +13,8 @@ def streamed(manifest: ShardManifest, *, partition: DataPartition, seed: int | N
              cycle_length: int = 16, loading: Loading, epochs: int | None = 1) -> grain.IterDataset:
     if cycle_length < 1:
         raise ValueError("interleave cycle_length must be positive")
+    if not manifest.shards:
+        return grain.MapDataset.source(()).to_iter_dataset()
     workers = loading.workers if isinstance(loading.workers, int) else 1
     required = partition.count * max(workers, 1)
     if len(manifest.shards) < required:
@@ -25,5 +27,5 @@ def streamed(manifest: ShardManifest, *, partition: DataPartition, seed: int | N
         root = root.repeat(epochs)
     root = root[partition.index::partition.count].map(manifest.reader)
     return experimental.InterleaveIterDataset(root, cycle_length=cycle_length,
-                                               num_make_iter_threads=loading.threads,
+                                               num_make_iter_threads=max(loading.threads, 1),
                                                make_iter_buffer_size=loading.read_buffer)
