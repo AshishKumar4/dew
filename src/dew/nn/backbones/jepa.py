@@ -27,10 +27,12 @@ from typing import ClassVar, Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from ..attention import LayerNorm
 from ..dit import ROPE_THETA, ModulatedBlock, _JepaStackOptions, build_block_pattern, scan_ordered_pos_embed
+from ..flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 from ..sharding import constrain, down_projection, rows_like
@@ -41,6 +43,15 @@ class TokenStack(_JepaStackOptions):
     """A stack of unmodulated blocks over a token sequence."""
     features: int
     num_layers: int
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The stack's declared pattern, with real sequence lengths for each block."""
+        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
+        return sum(counted_flops(ModulatedBlock(
+            features=self.features, num_heads=self.num_heads, mixer='ssm' if kind == 'ssm' else 'attention',
+            modulated=False, ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
+            **self._block_options(), parent=None), lengths) for kind in pattern)
 
     def setup(self):
         pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
@@ -72,6 +83,24 @@ class FactorizedTokenStack(_JepaStackOptions):
     """
     features: int
     num_layers: int
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("FactorizedTokenStack requires spatiotemporal_flops(frames, patches)")
+
+    @nn.nowrap
+    def spatiotemporal_flops(self, frames, patches) -> float:
+        """Spatial rows per frame and temporal rows per spatial patch."""
+        real_lengths(frames)
+        real_lengths(patches)
+        if np.shape(frames) != np.shape(patches):
+            raise ValueError("factorized FLOPs need matching frame/patch row shapes")
+        options = self._stack_options()
+        spatial = TokenStack(self.features, self.num_layers, **options, parent=None)
+        temporal = TokenStack(self.features, self.num_layers,
+                              **{**options, 'ssm_attention_ratio': 'all-attn'}, parent=None)
+        return (spatial.model_flops(np.repeat(patches, frames))
+                + temporal.model_flops(np.repeat(frames, patches)))
 
     def setup(self):
         def stack(name, num_layers, ratio):
@@ -116,6 +145,12 @@ class JepaEncoder(_JepaStackOptions):
     clip's frames.
     """
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The selected patch tokens' stack; the embedding is excluded."""
+        stack = self.stack_type(self.emb_features, self.num_layers, **self._stack_options(), parent=None)
+        return counted_flops(stack, lengths)
+
     def setup(self):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
         self.stack = self.stack_type(
@@ -144,6 +179,12 @@ class JepaVideoEncoder(JepaEncoder):
     """
 
     stack_type = FactorizedTokenStack
+
+    @nn.nowrap
+    def spatiotemporal_flops(self, frames, patches) -> float:
+        """Frame and patch geometry supplied by the objective, not flattened into L."""
+        stack = FactorizedTokenStack(self.emb_features, self.num_layers, **self._stack_options(), parent=None)
+        return stack.spatiotemporal_flops(frames, patches)
 
     def __call__(self, x, token_idx=None, train: bool = False):
         B, T, H, W, C = x.shape
@@ -174,6 +215,23 @@ class JepaPredictor(_JepaStackOptions):
     num_heads: int = 6
     scan_order: str = 'raster'
     factorized: bool = False     # space-time blocks, for video
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("JepaPredictor requires multisequence_flops(context_lengths, target_lengths)")
+
+    @nn.nowrap
+    def multisequence_flops(self, context_lengths, target_lengths) -> float:
+        """Projected context plus target tokens, followed by the target-only head."""
+        if self.factorized:
+            raise MissingFlopsCount("JepaPredictor needs frames and spatial patch counts for factorized work")
+        context, target = real_lengths(context_lengths), real_lengths(target_lengths)
+        if context.shape != target.shape:
+            raise ValueError("JEPA FLOPs need matching context/target row shapes")
+        stack = TokenStack(self.predictor_features, self.num_layers, **self._stack_options(), parent=None)
+        return (stack.model_flops((context + target).astype(np.int64))
+                + projection_flops(context_lengths, self.emb_features, self.predictor_features)
+                + projection_flops(target_lengths, self.predictor_features, self.emb_features))
 
     def setup(self):
         self.proj_in = nn.Dense(features=self.predictor_features, dtype=self.dtype,

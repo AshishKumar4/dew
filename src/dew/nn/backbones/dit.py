@@ -3,8 +3,11 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from flax import linen as nn
 
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
+from ..flops import counted_flops, projection_flops, real_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
@@ -45,6 +48,25 @@ class SimpleDiT(_DiTStackOptions):
     patch_bottleneck: int | None = None
     interval: bool = False
     time_scale: float = 16
+
+    @nn.nowrap
+    def counted_blocks(self) -> list[ModulatedBlock]:
+        """The plain blocks without lifted remat, for host-side work accounting."""
+        return [ModulatedBlock(features=self.emb_features, num_heads=self.num_heads,
+                               **self._block_options(), parent=None) for _ in range(self.num_layers)]
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Real patch-token blocks and output map; embeddings and remat excluded."""
+        real_lengths(lengths)
+        total = 0.0
+        for index, block in enumerate(self.counted_blocks()):
+            active = np.asarray(lengths)
+            for ratio, start, end in self.checked_routes():
+                if start <= index <= end:
+                    active = active - np.floor(active * ratio).astype(np.int64)
+            total += counted_flops(block, active)
+        return total + projection_flops(lengths, self.emb_features, self.patch_size**2 * self.output_channels)
 
 
     def setup(self):

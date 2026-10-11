@@ -566,6 +566,11 @@ class ExpertLinear(nn.Module):
     features: int
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """One matrix per dispatched token, not one for every stored expert."""
+        return projection_flops(lengths, self.in_features, self.features)
+
     def setup(self):
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching nn.Dense of a dense MLP.

@@ -43,15 +43,30 @@ def projection_flops(lengths: np.ndarray, inputs: int, outputs: int) -> float:
     return float(2 * inputs * outputs * np.sum(real_lengths(lengths)))
 
 
-def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, causal: bool) -> float:
+def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, causal: bool,
+                    window: int | None = None, chunk: int | None = None) -> float:
     """QK and AV, two FLOPs per multiply-add, causal attention halved.
 
     The conventional model count uses L squared (not L*(L+1)) for causal
     triangles: 2*h*d*L^2 for equal key/value widths, 4*h*d*L^2 for full
     attention. Masking, softmaxes and fused-kernel padding are not matmuls.
     """
-    pairs = np.sum(np.square(real_lengths(lengths)))
-    return float((1 if causal else 2) * heads * (key + value) * pairs)
+    def pairs(length):
+        if window is None:
+            return np.square(length) * (0.5 if causal else 1)
+        if window < 1:
+            raise ValueError("an attention FLOP window must be positive")
+        visible = np.minimum(length, window)
+        return (length * visible - 0.5 * visible * visible) * (1 if causal else 2)
+
+    length = real_lengths(lengths)
+    if chunk is not None:
+        if chunk < 1:
+            raise ValueError("an attention FLOP chunk must be positive")
+        work = np.floor(length / chunk) * pairs(chunk) + pairs(np.remainder(length, chunk))
+    else:
+        work = pairs(length)
+    return float(2 * heads * (key + value) * np.sum(work))
 
 
 def delta_flops(lengths: np.ndarray, heads: int, key: int, value: int, chunk: int) -> float:

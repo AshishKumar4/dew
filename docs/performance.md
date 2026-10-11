@@ -48,7 +48,10 @@ The prefetch worker counts host rows before placement. Per-row counts travel
 with their batch, reduce globally in the device step and accumulate in the same
 logging record as the loss, including every microbatch in an accumulation window.
 No new device-to-host read is inserted between steps. `train/tokens` is the mean
-number of real tokens per attempted step in the reporting interval. Compilation
+number of real tokens per attempted step in the reporting interval. A step here
+is a microbatch (`state.step`); optimizer commits are `state.updates`.
+`train/tokens_per_s` is the interval's total real tokens over its non-compile
+time, independent of gradient accumulation and the rate used to compare runs. Compilation
 time is excluded from all throughput denominators. The peak in MFU is the sum
 over the training mesh; the compiler's FLOPs remain per-device.
 

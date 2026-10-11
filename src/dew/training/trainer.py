@@ -261,6 +261,7 @@ TRAINER_SHOWN = {"loss": Shown(better="lower"),
                  "hfu": Shown(better="higher", percent=True, group="throughput"),
                  "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
                  "tokens": Shown(group="throughput"),
+                 "tokens_per_s": Shown(better="higher", group="throughput"),
                  "rollout_seconds": Shown(better="lower", group="throughput")}
 
 
@@ -2430,6 +2431,7 @@ class Trainer(Generic[Loss, Effects]):
             scalars["train/compile_s"] = compiling
         if tokens is not None:
             scalars["train/tokens"] = float(tokens) / steps
+            scalars["train/tokens_per_s"] = float(tokens) / stepping
         if model_flops is not None:
             per_device = 3 * float(model_flops) / self.device_mesh.devices.size
             utilization = model_flops_utilization(per_device / steps, step_time)
