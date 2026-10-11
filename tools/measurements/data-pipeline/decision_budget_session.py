@@ -13,7 +13,7 @@ import time
 from pathlib import Path
 
 ATTRIBUTOR = "b420100f20856822ae19d7f314a9a22ba24e26df"
-BENCHMARK = Path(__file__).with_name("benchmark_decision_budgets.py")
+BENCHMARK = Path(__file__).resolve().parents[2] / "benchmark_decision_budgets.py"
 
 
 def run_arm(args: argparse.Namespace, arm: str, timeout: int, *, profile: bool = False) -> Path:

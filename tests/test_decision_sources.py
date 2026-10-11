@@ -128,7 +128,8 @@ def test_sparse_slot_descriptor_references_unchanged_raw_data(sources, monkeypat
     sources.write(mixture, tmp_path)
     original = (tmp_path / "manifest.json").read_bytes()
     raw = (tmp_path / "banking77.jsonl").read_bytes()
-    command = [sys.executable, "tools/decision_metadata.py", "--source", str(tmp_path)]
+    command = [sys.executable, "tools/measurements/data-pipeline/decision_metadata.py", "--source",
+               str(tmp_path)]
     subprocess.run([*command, "--set", "banking77"], check=True, capture_output=True, text=True)
     published = subprocess.run([*command, "--publish"], check=True, capture_output=True, text=True)
     metadata = json.loads(published.stdout)
