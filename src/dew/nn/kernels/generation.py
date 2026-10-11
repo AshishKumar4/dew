@@ -13,7 +13,7 @@ import contextlib
 import contextvars
 import dataclasses
 import logging
-from collections.abc import Callable, Iterable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -90,7 +90,7 @@ class GpuTarget:
 
 # CUDA datasheets give sparse tensor peaks; the dense figures below are half.
 # A100 bf16 624; H100 SXM bf16/FP8 1979/3958, PCIe 1513/3026, NVL 1671/3341;
-# H200 SXM and NVL 1979/3958; L4 242/485; RTX PRO 6000 Blackwell Server 1000/2000 TF/s.
+# H200 SXM 1979/3958, NVL 1671/3341; L4 242/485; RTX PRO 6000 Blackwell Server 1000/2000 TF/s.
 # Existing rounded bf16 rates remain the baseline; FP8 uses the stated dense half.
 # https://i.dell.com/sites/csdocuments/App-Merchandizing_Documents/en/us/h100-gpu.pdf
 # https://www.nvidia.com/en-us/data-center/h100/
@@ -124,7 +124,8 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
-        'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12}}),
+        'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
+        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
               aliases=('gpu:g4', 'g4')),
@@ -146,16 +147,21 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
 
     None is the default device's: its generation is `device_generation`'s, the
     one seam that `assumed` and tests set, and its device kind only picks the
-    SKU's peaks within that generation. SKU queries retain that SKU's peaks.
-    Unknown kinds have empty resources.
+    SKU's peaks within that generation; a real GPU the table names no SKU of
+    keeps its own kind, so its peaks stay unknown, while an assumed or patched
+    generation takes the generation's canonical device. SKU queries retain
+    that SKU's peaks. Unknown kinds have empty resources.
     """
     if identifier is None:
         import jax
-        generation, kind = device_generation(), jax.devices()[0].device_kind
+        device = jax.devices()[0]
+        generation, kind = device_generation(), device.device_kind
         target = gpu_target(kind)
         if target.generation == generation:
             return target
-        return TARGETS.get(generation, GpuTarget(generation, kind))
+        canonical = TARGETS.get(generation, GpuTarget(generation, kind))
+        real = device.platform == 'gpu' and ASSUMED.get() is None
+        return dataclasses.replace(canonical, device_kind=kind) if real else canonical
     if identifier in TARGETS:
         return TARGETS[identifier]
     for target in TARGETS.values():
@@ -166,20 +172,6 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     if matches:
         return dataclasses.replace(max(matches, key=lambda entry: entry[0])[1], device_kind=identifier)
     return GpuTarget(identifier, identifier)
-
-
-def derive_config(kernel: str, candidates: Iterable[Mapping[str, int]],
-                  shapes: Mapping[str, Mapping[str, int]],
-                  dtype: str, shared_bytes: Callable[[str, Mapping[str, int], Mapping[str, int], str], int],
-                  generation: str) -> dict[str, int]:
-    """The first candidate fitting every CONFIG_SHAPES case under the target's block limit."""
-    limit = gpu_target(generation).shared_limit
-    if limit is None:
-        raise ValueError(f"{generation} has no declared block shared-memory limit")
-    for config in candidates:
-        if all(shared_bytes(kernel, config, shape, dtype) <= limit for shape in shapes.values()):
-            return dict(config)
-    raise ValueError(f"{kernel} has no {dtype} config fitting {generation}'s {limit} shared bytes")
 
 
 def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
