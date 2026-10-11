@@ -158,11 +158,15 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, (variables, batch))
         truth, truth_gradient = jax.value_and_grad(loss)(*wide)
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
-    # Each tensor is held to float64 as the grid's is, within FACTOR, with the
-    # grid's own distance taken as at least one float32 unit of that tensor's
-    # size: one draw of rounding below an ulp is luck, not a bar. A gradient
-    # zero to float32's resolution of the step (a key bias's, which softmax
-    # cancels) holds only rounding on either path and stays at that resolution.
+    # Each tensor is held to float64 as the grid's is, within FACTOR. The
+    # compaction reorders the sums over the grid's option slots, whose float32
+    # rounding grows as the square root of their count in RMS, so the grid's
+    # own distance is taken as at least that many units of the tensor's size:
+    # one draw of rounding below it is luck, not a bar, and a gradient that
+    # vanished still fails by orders of magnitude. A gradient zero to
+    # float32's resolution of the step (a key bias's, which softmax cancels)
+    # holds only rounding on either path and stays at that resolution.
+    slots = options.shape[1] * options.shape[2]
     unit = float(np.finfo(np.float32).eps)
     floor = unit * max(distance(leaf, 0) for leaf in jax.tree.leaves(truth_gradient))
 
@@ -171,7 +175,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
         if distance(true, 0) <= floor:
             assert mine <= floor, (label, mine, floor)
             return
-        bar = FACTOR * max(distance(want, true), unit * distance(true, 0))
+        bar = FACTOR * max(distance(want, true), np.sqrt(slots) * unit * distance(true, 0))
         assert mine <= bar, f"{label}: {mine:.3e} from float64 (rms), allowed {bar:.3e}"
 
     exact((), float(fewer), float(grid), truth)
