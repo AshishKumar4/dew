@@ -852,7 +852,8 @@ def test_review_published_sources_do_not_upload_a_bundle(tmp_path, monkeypatch):
     repo, _, sha = fixture_repository(tmp_path)
     monkeypatch.setattr(batch, "STATE", tmp_path / "state")
     plan = batch.plan_jobs([request(sha)], "gpu", "gpu:T4", sha, repo)
-    batch.stage(plan, tmp_path / "staging", repo)
+    netrc_file = write(tmp_path / "netrc", b"machine api.wandb.ai login test password test-key\n")
+    batch.stage(plan, tmp_path / "staging", repo, netrc_file=netrc_file)
     assert not list((tmp_path / "staging").glob("bundle*"))
     assert plan["fetch_commits"] == [sha]
 
@@ -878,7 +879,8 @@ def test_review_unpushed_bundle_contains_only_the_new_range(tmp_path, monkeypatc
     )
     monkeypatch.setattr(batch, "STATE", tmp_path / "state")
     plan = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)
-    batch.stage(plan, tmp_path / "staging", repo)
+    netrc_file = write(tmp_path / "netrc", b"machine api.wandb.ai login test password test-key\n")
+    batch.stage(plan, tmp_path / "staging", repo, netrc_file=netrc_file)
     assert sum(file.stat().st_size for file in (tmp_path / "staging").glob("bundle*")) < 10000
     assert sha in plan["fetch_commits"]
 
@@ -974,7 +976,9 @@ def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, m
     monkeypatch.setattr(batch, "STATE", tmp_path / "state")
     plan = batch.plan_jobs([request()], "gpu", "gpu:T4", sha, repo)
     staging = tmp_path / "staging"
-    batch.stage(plan, staging, repo)
+    netrc_file = write(tmp_path / "netrc", b"machine api.wandb.ai login test password test-key\n")
+    batch.stage(plan, staging, repo, netrc_file=netrc_file)
+
     worker = vm.Batch(staging)
     worker.prepare()
     for expected in (sha, plan["jobs"][0]["commit"]):
@@ -1032,3 +1036,9 @@ def test_artifact_exclusions_match_incremental_and_final_without_losing_nested_l
     sync.pack_outputs(tmp_path, ["out/"], final, "measurements", excludes)
     assert read(Path(str(final) + ".manifest.json")) == current
     assert (tmp_path / "out/e1/mix/train.jsonl").exists()
+
+
+def test_input_paths_preserve_plus_in_experiment_directories(tmp_path):
+    source = write(tmp_path / "step+profile/entry.json", b"metrics")
+    found = batch.input_paths({"inputs": f"{source} to /content/reference+metadata/", "command": "run"})
+    assert found == [(source, "/content/reference+metadata/entry.json")]
