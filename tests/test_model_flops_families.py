@@ -1,5 +1,6 @@
 """Independent counts of input maps, mixed sequences and visible architectural slots."""
 
+from functools import partial
 from pathlib import Path
 
 import jax
@@ -15,6 +16,7 @@ from dew.inputs.encoders import CharTable, ConditionWork, T5Text
 from dew.nn.attention import Stage
 from dew.nn.attention_residuals import AttentionResiduals
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import BlockWiring, GatedMLP, MTPBlock
 from dew.nn.backbones.edm2 import EDM2UNet
 from dew.nn.backbones.flux import FluxSingleBlock, FluxTransformer
 from dew.nn.backbones.flux2 import Flux2SingleBlock, Flux2Transformer
@@ -33,6 +35,7 @@ from dew.nn.dit import TextContext
 from dew.nn.flops import MissingFlopsCount, patch_lengths
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
+from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, T5EncoderTransformer
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import TEXT_KEY, LMObjective
@@ -243,10 +246,13 @@ def diffusion_family(family):
 
 @pytest.mark.parametrize("fields", [
     {"altup": AltUp(num_inputs=2), "laurel_rank": 2},
+    {"altup": AltUp(num_inputs=3), "per_layer_input_dim": 4},
     {"hyper_connections": HyperConnections(hc_mult=2)},
     {"hyper_connections": HyperConnections(hc_mult=2, head="weighted")},
     {"hyper_connections": HyperConnections(hc_mult=2, head="carried", single_pass=True)},
     {"attention_residuals": AttentionResiduals(block_size=2)},
+    {"attention_residuals": AttentionResiduals(block_size=1)},
+    {"attention_residuals": AttentionResiduals(block_size=3)},
 ])
 def test_multistream_projection_and_mixing_counts_match_the_forward(fields):
     model = CausalTransformer(vocab_size=16, emb_features=8, num_heads=2, num_kv_heads=2,
@@ -378,7 +384,7 @@ def test_conditional_unet_counts_odd_resizing_pooled_time_ids_and_cross_only_att
 @pytest.mark.parametrize("depths", [1, 2])
 def test_prediction_depths_and_the_lm_objective_match_every_forward_product(depths):
     model = CausalTransformer(vocab_size=16, emb_features=8, num_heads=2, num_kv_heads=2,
-                              head_dim=4, num_layers=2, mlp_features=16, causal=False,
+                              head_dim=4, num_layers=2, mlp_features=16, causal=True,
                               num_nextn_predict_layers=depths, attention_impl="reference")
     tokens = jnp.ones((1, 6), jnp.int32)
     variables = model.init(jax.random.key(327), tokens)
@@ -391,5 +397,28 @@ def test_prediction_depths_and_the_lm_objective_match_every_forward_product(dept
     objective = LMObjective(model, seq_len=6, mtp_weight=1.0)
     batch = {TEXT_KEY: np.ones((1, 7), np.int32)}
     count = objective.model_flops(None, batch)
-    assert count == forward_products(forward, variables, tokens)
+    # The reference dots include the causal upper halves that model work excludes.
+    upper = 2 * model.num_heads * model.head_dim * (model.num_layers * 6**2
+                + sum((6 - depth)**2 for depth in range(1, depths + 1)))
+    assert count == forward_products(forward, variables, tokens) - upper
     assert objective.training_flops(None, batch) == 3 * count
+
+
+def test_multistream_prediction_projects_each_carried_stream_and_collapses_its_output():
+    attention = partial(CausalSelfAttention, emb_features=8, num_heads=2, num_kv_heads=2,
+                        head_dim=4, causal=False, nope=True, attention_impl="reference")
+    model = MTPBlock(attention, partial(GatedMLP, hidden_features=16, out_features=8), 8, BlockWiring(),
+                     hyper_connections=HyperConnections(hc_mult=2, head="weighted"))
+    streams, embeds = jnp.ones((1, 4, 2, 8)), jnp.ones((1, 4, 8))
+    variables = model.init(jax.random.key(328), streams, embeds)
+    assert model.model_flops(np.array([4])) == forward_products(model.apply, variables, streams, embeds)
+
+
+def test_uvit_counts_time_mlp_text_tokens_and_hilbert_skip_projections():
+    model = UViT(emb_features=8, num_heads=2, num_layers=2, patch_size=2, mlp_time_embed=True,
+                  scan_order="hilbert", conv=False, image_size=4, text_tokens=2, attention_impl="reference")
+    image, time = jnp.ones((1, 4, 4, 3)), jnp.ones((1,))
+    text = TextContext(jnp.ones((1, 2, 8)), jnp.ones((1, 2), bool))
+    variables = model.init(jax.random.key(329), image, time, text)
+    count = model.multimodal_flops(np.array([4]), np.array([2]), 3, 8)
+    assert count == forward_products(model.apply, variables, image, time, text)
