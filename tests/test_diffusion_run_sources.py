@@ -69,7 +69,8 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     directory = pipelines / family / "pipeline"
     size = 16 if family != "qwen_image" else 32
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                data=Images(source="tfds://oxford_flowers102", image_size=size), val_metrics=(),
+                                data=Images(source="tfds://oxford_flowers102", image_size=size),
+                                    val_metrics=(),
                                 objective=ObjectiveConfig("diffusion",
                                                           {"solver": Euler(), "guidance": None, "steps": 2,
                                                            "unconditional_prob": 0.0, "ema_decay": None}))
@@ -107,7 +108,8 @@ def test_a_run_config_builds_the_objective_the_python_api_builds(family, pipelin
     size = 16 if family != "qwen_image" else 32
     settings = {"guidance": None, "unconditional_prob": 0.25, "ema_decay": None}
     configured = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                    data=Images(source="tfds://oxford_flowers102", image_size=size), val_metrics=(),
+                                    data=Images(source="tfds://oxford_flowers102", image_size=size),
+                                        val_metrics=(),
                                     objective=ObjectiveConfig("diffusion", {
                                         "solver": Euler(), "steps": 2, **settings})).build()
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(size, size))
@@ -150,7 +152,8 @@ def test_a_pretrained_run_records_its_pipelines_sampling_and_builds_it_after_a_r
     release that defaults a denoiser's sampling otherwise builds the run as
     it sampled."""
     config = DiffusionRunConfig(pretrained=str(pipelines / "sd3" / "pipeline"), preset=None,
-                                model=precision(), data=Images(source="tfds://oxford_flowers102", image_size=16), val_metrics=(),
+                                model=precision(), data=Images(source="tfds://oxford_flowers102",
+                                    image_size=16), val_metrics=(),
                                 objective=ObjectiveConfig("diffusion", {"solver": Euler(),
                                                                         "ema_decay": None}))
     objective = config.build()
@@ -165,7 +168,8 @@ def test_a_pretrained_run_records_its_pipelines_sampling_and_builds_it_after_a_r
 
 def flow_run(family: str, size: int, pipelines) -> DiffusionRunConfig:
     return DiffusionRunConfig(pretrained=str(pipelines / family / "pipeline"), preset=None,
-                              model=precision(), data=Images(source="tfds://oxford_flowers102", image_size=size),
+                              model=precision(), data=Images(source="tfds://oxford_flowers102",
+                                  image_size=size),
                               val_metrics=(),
                               objective=ObjectiveConfig("diffusion",
                                                         {"solver": Euler(), "guidance": None, "steps": 2}))
@@ -286,7 +290,8 @@ def test_a_pretrained_run_stores_its_pipelines_weights_in_the_dtype_it_names(pip
     objective = ObjectiveConfig("diffusion", {"guidance": None, "ema_decay": None})
     configured = DiffusionRunConfig(pretrained=str(pipelines / "flux" / "pipeline"), preset=None,
                                     model=precision(), pretrained_param_dtype="bfloat16",
-                                    data=Images(source="tfds://oxford_flowers102", image_size=16), val_metrics=(),
+                                    data=Images(source="tfds://oxford_flowers102", image_size=16),
+                                        val_metrics=(),
                                     objective=objective).build()
     state = Trainer(configured, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
     floating = [leaf for leaf in jax.tree.leaves(state.variables["params"])

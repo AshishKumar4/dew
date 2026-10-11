@@ -1022,7 +1022,8 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=Images(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None, val_metrics=(),
+        data=Images(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
+            val_metrics=(),
         trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
                               steps=1, eval_every=None, checkpoint_every=None,
                               compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",

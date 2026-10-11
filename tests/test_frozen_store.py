@@ -145,7 +145,8 @@ def test_a_stored_collection_stays_while_a_kept_step_records_it_and_goes_with_th
     rows = [{"x": np.full(3, index, np.float32), "y": np.float32(index)} for index in range(8)]
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=1)
     trainer = Trainer(Counting(), optax.sgd(0.01), key=0, checkpoints=checkpoints)
-    trainer.fit(load(Records(source=rows), batch=8, loading=LOADING, read="memory"), steps=4, checkpoint_every=1,
+    trainer.fit(load(Records(source=rows), batch=8, loading=LOADING, read="memory"), steps=4,
+        checkpoint_every=1,
                 log_every=100)
     checkpoints.wait()
     store = epath.Path(checkpoints.directory) / FROZEN_STORE
@@ -197,7 +198,8 @@ def test_a_collection_saved_with_x64_on_restores_with_it_off(tmp_path):
     with jax.enable_x64(new_val=True):
         checkpoints = Checkpoints(str(tmp_path / "run"))
         Trainer(Wide(), optax.sgd(0.01), key=0, checkpoints=checkpoints).fit(
-            load(Records(source=rows), batch=8, loading=LOADING, read="memory"), steps=1, checkpoint_every=1, log_every=100)
+            load(Records(source=rows), batch=8, loading=LOADING, read="memory"), steps=1,
+                checkpoint_every=1, log_every=100)
         checkpoints.wait()
         table = np.asarray(Wide().init(None)["constants"]["table"])
     assert not jax.config.jax_enable_x64

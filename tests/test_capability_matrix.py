@@ -661,7 +661,8 @@ def decision(family: Family, directory: Path) -> None:
     layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
         max_len=48, head_max_len=32, option_tokens=4)
     objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout)
-    data = load(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=ROWS, read="memory", objective=objective.data())
+    data = load(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=ROWS, read="memory",
+        objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
     trained = assert_trains(objective, batch, directory, data=data)
     live = objective.pipeline(trained.state)

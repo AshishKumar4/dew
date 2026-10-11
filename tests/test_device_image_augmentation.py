@@ -22,7 +22,8 @@ def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=
     rows = [{"image": np.random.default_rng(index).integers(
         0, 256, (19, 23, 3), dtype=np.uint8), "label": index} for index in range(24)]
     return Images(source=Memory(rows), image_size=12, caption="a flower", staging_size=staging_size,
-                  augment=Augment(flip=True, jitter=True, crop_scale=crop_scale, backend=backend) if augment else None)
+                  augment=Augment(flip=True, jitter=True, crop_scale=crop_scale,
+                      backend=backend) if augment else None)
 
 
 def test_device_pipeline_returns_resident_uint8_and_resumes_exactly():
@@ -150,7 +151,8 @@ def test_model_float64_mode_changes_no_data_draw():
 
 def test_device_none_keeps_the_old_resize_bit_identical():
     host = load(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
-    device = load(spec(augment=False, backend="device"), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    device = load(spec(augment=False, backend="device"), batch=4, read="memory", seed=37,
+        loading=READ).train(DataPartition())
     try:
         np.testing.assert_array_equal(next(device)["image"], next(host)["image"])
     finally:
@@ -161,7 +163,8 @@ def test_device_none_keeps_the_old_resize_bit_identical():
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
     from dew.training.distributed import MeshSpec, shard_batch
 
-    stream = load(spec(backend="device"), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    stream = load(spec(backend="device"), batch=4, read="memory", seed=37,
+        loading=READ).train(DataPartition())
     try:
         batch = next(stream)
         mesh = MeshSpec().build([jax.devices()[0]])
@@ -178,7 +181,8 @@ def test_device_draws_follow_record_keys_across_threads_and_partitions():
     threaded = Loading(workers=0, threads=4, read_buffer=8)
     whole = load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
     parallel = load(original, batch=4, read="memory", seed=37, loading=threaded).train(DataPartition())
-    shares = [load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition(index=i, count=2)) for i in range(2)]
+    shares = [load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition(index=i,
+        count=2)) for i in range(2)]
     try:
         for _ in range(3):
             expected = next(whole)
@@ -226,7 +230,8 @@ def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_o
     from dew.training.distributed import DevicePrefetchIterator, MeshSpec
 
     mesh = MeshSpec().build([jax.devices()[0]])
-    stream = load(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    stream = load(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
+        loading=READ).train(DataPartition())
     with DevicePrefetchIterator(stream, mesh) as prefetch:
         for _ in range(3):
             jax.block_until_ready(next(prefetch))

@@ -292,7 +292,8 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
         archive.extractall(tmp_path, filter="data")
     pipeline = str(tmp_path / "pipeline")
     objective = DiffusionRunConfig(pretrained=pipeline, preset=Flow(), model=precision(),
-                                   data=Images(source="tfds://oxford_flowers102", image_size=16), val_metrics=(),
+                                   data=Images(source="tfds://oxford_flowers102", image_size=16),
+                                       val_metrics=(),
                                    objective=ObjectiveConfig("rcm", {"ema_decay": None})).build()
     source = load_diffusion_source(pipeline, dtype="float32", attention_impl="xla", size=(16, 16))
     expected = model_part(source.variables)

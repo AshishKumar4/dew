@@ -1020,7 +1020,8 @@ def _recipe_run(tmp_path, image_size, *args):
     config = DiffusionRunConfig.cli([
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "data:images", "--data.source", json.dumps({"class": "dew.data.sources.tfds:TFDS", "fields": {
-            "name": "dew_images", "path": str(IMAGES), "split": "all"}}), "--data.image-size", str(image_size),
+            "name": "dew_images", "path": str(IMAGES), "split": "all"}}), "--data.image-size",
+                str(image_size),
         "--data.augment", "None", "--data.validation", "None", "--objective.solver",
         '{"class": "euler"}', "--objective.guidance", "None", "--objective.steps", "2",
         "--objective.ema-decay", "None", "--val-metrics",

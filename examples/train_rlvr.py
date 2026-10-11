@@ -576,7 +576,8 @@ def main(config: Config) -> dict:
             lambda text: words.tokenizer.encode(text, add_special_tokens=False),
             config,
         )
-    data = load(Prompts(tokenizer=tokenizer, source=tuple(json.loads(row) for row in records(config.tasks, config.seed)),
+    data = load(Prompts(tokenizer=tokenizer,
+        source=tuple(json.loads(row) for row in records(config.tasks, config.seed)),
                         thinking=config.thinking, max_prompt_len=config.prompt_tokens,
                         pad_id=sampling.pad_token_id), batch=config.prompts, read="memory",
                 loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1), seed=config.seed)

@@ -566,7 +566,8 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     assert int(state.updates) == 2
     original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
     objective = config.masked_objective(original.model, original.model_config, None)
-    batch = next(iter(load(config.data, batch=8, read="memory", loading=Loading(workers=0)).val(DataPartition())))
+    batch = next(iter(load(config.data, batch=8, read="memory",
+        loading=Loading(workers=0)).val(DataPartition())))
     padding = np.asarray(batch["text_segment_ids"]) == 0
     assert padding.any() and not padding.all()
     scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))

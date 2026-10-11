@@ -99,7 +99,8 @@ def run(config: Comparison) -> Curve:
     vocab_size = int(meta["vocab_size"])
     # One worker and one read thread: the arms must see identical batches, and
     # a curve is not a throughput measurement.
-    data = load(Text(source=config.dataset, seq_len=config.sequence_length), batch=config.batch_size, read="memory", seed=config.seed, loading=Loading(workers=0, threads=1, read_buffer=1,
+    data = load(Text(source=config.dataset, seq_len=config.sequence_length), batch=config.batch_size,
+        read="memory", seed=config.seed, loading=Loading(workers=0, threads=1, read_buffer=1,
                                         worker_buffer=1), validation_records=4 * (config.batch_size))
     fields = dict(vocab_size=vocab_size, emb_features=config.emb_features, num_layers=config.num_layers,
                   num_heads=config.num_heads, max_seq_len=config.sequence_length, dtype="bfloat16")

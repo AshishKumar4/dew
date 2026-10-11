@@ -102,7 +102,8 @@ def test_what_a_run_writes_after_training_is_published_with_its_checkpoint(tmp_p
 
     batch = next(batches())
     rows = [{"x": x, "y": y} for x, y in zip(batch["x"], batch["y"], strict=True)]
-    config.train(Regression(), load(Records(source=rows), batch=8, loading=Loading(workers=0), read="memory"), name="after",
+    config.train(Regression(), load(Records(source=rows), batch=8, loading=Loading(workers=0),
+        read="memory"), name="after",
                  after=calibrate)
     ((artifact, _),) = run.logged
     assert sorted(name for _, name in artifact.files) == ["decide.json", RUN_FILE]
@@ -263,7 +264,8 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run))
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
-        load(Records(source=rows), batch=8, loading=Loading(workers=0, threads=1, read_buffer=1), read="memory"),
+        load(Records(source=rows), batch=8, loading=Loading(workers=0, threads=1, read_buffer=1),
+            read="memory"),
         steps=2, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     original, _ = checkpoints.restore()

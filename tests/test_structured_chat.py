@@ -120,9 +120,11 @@ def test_prompt_sources_keep_structured_chat(tmp_path, tokenizer_path, storage):
         pq.write_table(pa.Table.from_pylist([row]), path)
         source = Prompts(source=str(path), tokenizer=str(tokenizer_path), max_prompt_len=1024)
     else:
-        source = Prompts(source=tuple(json.loads(row) for row in (json.dumps(row),)), tokenizer=str(tokenizer_path), max_prompt_len=1024)
+        source = Prompts(source=tuple(json.loads(row) for row in (json.dumps(row),)),
+            tokenizer=str(tokenizer_path), max_prompt_len=1024)
 
-    batch = next(load(source, batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1)).train(DataPartition()))
+    batch = next(load(source, batch=1, read="memory", loading=Loading(workers=0),
+        validation_records=4 * (1)).train(DataPartition()))
 
     expected = tokenizer.apply_chat_template(
         reference_messages(), tools=[WEATHER], return_dict=False, add_generation_prompt=True)
@@ -137,9 +139,11 @@ def test_prompt_media_is_refused_before_truncation():
     row = {"prompt": [{"role": "user", "content": [
         {"type": "image", "url": "file:///map.png"},
         {"type": "text", "text": "Weather in Paris?"}]}]}
-    spec = Prompts(source=tuple(json.loads(row) for row in (json.dumps(row),)), tokenizer=str(TOOLS_TOKENIZER), max_prompt_len=4)
+    spec = Prompts(source=tuple(json.loads(row) for row in (json.dumps(row),)),
+        tokenizer=str(TOOLS_TOKENIZER), max_prompt_len=4)
     with pytest.raises(ValueError, match=r"row 0 message 0.*image.*processor"):
-        next(load(spec, batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1)).train(DataPartition()))
+        next(load(spec, batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1)).train(DataPartition()))
 
 
 def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_tokenizer):
@@ -170,7 +174,8 @@ def test_structured_packing_resumes_exact_tokens_and_masks(tmp_path, tools_token
                          hf["assistant_masks"]))
     path = tmp_path / "sft.parquet"
     pq.write_table(pa.Table.from_pylist(rows), path)
-    spec = Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1, validation=str(path), long="chunk")
+    spec = Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
+        validation=str(path), long="chunk")
     data = load(spec, batch=1, read="memory", loading=Loading(workers=0))
     assert data.val is not None
     stream = data.val(DataPartition())
@@ -419,7 +424,9 @@ def test_structured_rows_pack_with_their_tools(tmp_path, tools_tokenizer):
     ids, roles = render(tools_tokenizer, messages, [WEATHER])
     window = 512
 
-    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=window - 1, packing_bins=1, validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1))
+    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=window - 1,
+        packing_bins=1, validation=str(path), long="chunk"), batch=1, read="memory",
+            loading=Loading(workers=0), validation_records=4 * (1))
     assert data.val is not None
     batches = list(data.val(DataPartition()))
 
@@ -443,7 +450,9 @@ def test_rows_without_a_tools_column_render_plain(tmp_path, tools_tokenizer):
     pq.write_table(pa.table({"prompt": [messages]}), path)
     ids, roles = render(tools_tokenizer, messages)
 
-    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1, validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1))
+    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=511, packing_bins=1,
+        validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1))
     assert data.val is not None
     batch = next(iter(data.val(DataPartition())))
 
@@ -461,7 +470,9 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
         json.dumps({"messages": messages, "tools": [WEATHER]}) + "\n" for _ in range(2)))
     ids, roles = render(tools_tokenizer, messages, [WEATHER])
 
-    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1, validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1))
+    data = load(Chat(source=str(path), tokenizer=str(TOOLS_TOKENIZER), seq_len=1023, packing_bins=1,
+        validation=str(path), long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1))
 
     assert data.val is not None
     batch = next(iter(data.val(DataPartition())))
@@ -509,7 +520,8 @@ def test_a_source_that_holds_no_conversation_column_says_what_it_holds(tmp_path)
     path = tmp_path / "chat.jsonl"
     path.write_text(json.dumps({"conversation": [], "tools": None}) + "\n")
     with pytest.raises(ValueError, match="messages|prompt|conversation"):
-        load(Chat(source=str(path), tokenizer=str(CHAT_TOKENIZER)), batch=1, read="memory", loading=Loading(workers=0))
+        load(Chat(source=str(path), tokenizer=str(CHAT_TOKENIZER)), batch=1, read="memory",
+            loading=Loading(workers=0))
 
 
 # --- refusals ------------------------------------------------------------------

@@ -127,7 +127,8 @@ def pipeline_timing(config, backend, crop_scale):
                   image_size=config.image_size, caption_templates=("a photo of a {}",),
                   augment=Augment(flip=True, jitter=True, backend=backend, crop_scale=crop_scale))
     stream = load(spec, batch=config.batch, read="memory",
-                  loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch)).train(DataPartition())
+                  loading=Loading(workers=0, threads=config.threads,
+                      read_buffer=2 * config.batch)).train(DataPartition())
     consume = jax.jit(lambda pixels: jnp.mean(pixels.astype(jnp.float32)))
     durations, cpu_times = [], []
     try:

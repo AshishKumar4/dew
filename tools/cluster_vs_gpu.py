@@ -222,7 +222,8 @@ def main() -> None:
     target = shape["target"] if args.target is None else args.target
     tokens = corpus(args.cache)
     batch_size = shape["batch"] if args.batch is None else args.batch
-    data = load(Text(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory", validation_records=4 * (batch_size))
+    data = load(Text(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory",
+        validation_records=4 * (batch_size))
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
     mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))

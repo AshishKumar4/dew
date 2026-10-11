@@ -149,7 +149,8 @@ def decision():
     objective = DecisionObjective(decoder(), tokenizer=ByteTokenizer(),
                                   specials=Specials(None, 10, 0, "\x00", 255),
                                   layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
-    return objective, next(load(Decisions(source=examples), batch=2, read="memory", objective=objective.data()).train(DataPartition()))
+    return objective, next(load(Decisions(source=examples), batch=2, read="memory",
+        objective=objective.data()).train(DataPartition()))
 
 
 def cases(windows):
