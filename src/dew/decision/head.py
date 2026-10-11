@@ -236,6 +236,25 @@ def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
     return summed / counts.astype(values.dtype)
 
 
+def _gathered(values: jax.Array, indices: jax.Array) -> jax.Array:
+    """`values` `[B, N, ...]` at each row's `indices` `[B, P]`: `[B, P, ...]`."""
+    return jnp.take_along_axis(values, indices.reshape(*indices.shape, *(1,) * (values.ndim - 2)), axis=1)
+
+
+def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
+    """Per-slot `values` `[B, P, ...]` back on the `[B, Q, K, ...]` grid, zero
+    where no real option is: the grid itself where the inputs compact nothing."""
+    batch, count, width = inputs.options.shape
+    if inputs.option_slots is None:
+        grid = values.reshape(batch, count, width, *values.shape[2:])
+        return jnp.where(inputs.options.reshape(*inputs.options.shape, *(1,) * (grid.ndim - 3)), grid, 0)
+    assert inputs.slotted is not None
+    target = jnp.where(inputs.slotted, inputs.option_slots, count * width)
+    laid = jnp.zeros((batch, count * width, *values.shape[2:]), values.dtype)
+    laid = laid.at[jnp.arange(batch)[:, None], target].set(values, mode="drop")
+    return laid.reshape(batch, count, width, *values.shape[2:])
+
+
 class JointSchemaHead(Head):
     """Clef's joint schema head: decides every question of a row together.
 
@@ -252,7 +271,10 @@ class JointSchemaHead(Head):
     scales are learned in log space and held to 100 at most.
 
     It reads every question of a row (`JointLayout`), and the backbone's output
-    table.
+    table. Each option is computed on its own but for its weight in its
+    question's summary, so where the inputs compact each row's real options
+    (`DecisionInputs.option_slots`) it computes those alone, and lays their
+    routed states (for the summaries) and their logits back on the grid.
     """
 
     hidden_size: int
@@ -340,28 +362,33 @@ class JointSchemaHead(Head):
         last = jnp.maximum(jnp.sum(inputs.valid, axis=1) - 1, 0)
         last_state = hidden[jnp.arange(batch), last]
         questions = _span_means(hidden, inputs.spans)
-        contexts = _span_means(hidden, inputs.option_spans)
-        rows_of_tokens = jnp.take(table, inputs.tokens, axis=0).astype(hidden.dtype)
-        lexical = _span_means(rows_of_tokens, inputs.option_spans)
         count, width = inputs.options.shape[1:]
+        # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
+        slots = (jnp.broadcast_to(jnp.arange(count * width, dtype=jnp.int32), (batch, count * width))
+                 if inputs.option_slots is None else inputs.option_slots)
+        owners = slots // width
+        option_spans = _gathered(inputs.option_spans.reshape(batch, count * width, 2), slots)
+        contexts = _span_means(hidden, option_spans)
+        rows_of_tokens = jnp.take(table, inputs.tokens, axis=0).astype(hidden.dtype)
+        lexical = _span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
-                   + self.option_question_projection(questions)[:, :, None])
+                   + _gathered(self.option_question_projection(questions), owners))
         # A row's tokens and questions are right-padded, so each attention is told where its keys end
         # (at least one, for a padding row) rather than given a dense mask, which a fused kernel reads
         # as a bias per head, [B, H, Q*K, T]: 0.24 GiB of the step's temporaries at B=16 with 2,800
         # option queries over 3,072 tokens (c47).
         tokens = jnp.maximum(jnp.sum(inputs.valid, axis=1, dtype=jnp.int32), 1)
         asked = jnp.maximum(jnp.sum(inputs.questions, axis=1, dtype=jnp.int32), 1)
-        routed = queries.reshape(batch, count * width, self.width)
+        routed = queries
         for layer in self.evidence_layers:
             routed = layer(routed, memory, tokens)
-        routed = routed.reshape(batch, count, width, self.width)
+        grid = _laid_back(routed, inputs)
 
         fields = self.question_projection(questions)
-        affinity = jnp.einsum("bqkw,bqw->bqk", routed, fields) / math.sqrt(self.width)
+        affinity = jnp.einsum("bqkw,bqw->bqk", grid, fields) / math.sqrt(self.width)
         weights = jax.nn.softmax(jnp.where(inputs.options, affinity, -jnp.inf), axis=-1)
-        summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), routed)
+        summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), grid)
         rows = jnp.asarray(_CLEF_ROWS)[inputs.kinds]
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)[:, None]
                   + self.type_embedding(rows))
@@ -369,16 +396,16 @@ class JointSchemaHead(Head):
             fields = layer(fields, memory, asked, tokens)
         fields = self.field_norm(fields)
 
-        anchor = l2_normalized(questions + last_state[:, None], 1e-12)
+        anchor = _gathered(l2_normalized(questions + last_state[:, None], 1e-12), owners)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
-                 * jnp.einsum("bqkd,bqd->bqk", l2_normalized(lexical, 1e-12), anchor))
+                 * jnp.einsum("bpd,bpd->bp", l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
-        repeated = jnp.broadcast_to(fields[:, :, None], options.shape)
+        repeated = _gathered(fields, owners)
         cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
         features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + residual
-        return (prior + jax.nn.sigmoid(self.residual_gate) * joint).astype(jnp.float32)
+        return _laid_back((prior + jax.nn.sigmoid(self.residual_gate) * joint).astype(jnp.float32), inputs)
 
 
 def decision_geometry(lengths, questions, options):
