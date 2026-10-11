@@ -19,6 +19,10 @@ class TransportError(RuntimeError):
     """A control channel failed without evidence that the workload stopped."""
 
 
+class CollectionError(ValueError):
+    """Artifact state is invalid; bound retries independently of live work."""
+
+
 class Driver:
     def __init__(self, run_dir: Path, client: Colab, cli: str):
         self.run_dir = run_dir
@@ -47,9 +51,9 @@ class Driver:
                     names = [item.get("ename", "unknown") for item in errors]
                     benign = all(name in ("FileNotFoundError", "NotADirectoryError") for name in names)
                     self.record(collection_error_names=names, collection_needs_attention=not benign)
-                    raise TransportError(
-                        "live output collection failed; re-list on next cycle, not a workload exit"
-                    )
+                    if benign:
+                        raise TransportError("live output changed; re-list on next cycle, not a workload exit")
+                    raise CollectionError("artifact RPC failed: " + ",".join(names))
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)
         finally:
@@ -218,6 +222,10 @@ class Driver:
             failures[key] = {"count": 0, "needs_attention": False}
             self.record(collection_failures=failures)
         except (OSError, ValueError, RuntimeError) as error:
+            if isinstance(error, (TransportError, requests.RequestException)):
+                # Live prune races/outages are not deterministic bad artifacts.
+                # The independent supervisor owns their liveness/time limits.
+                raise
             count = failures.get(key, {}).get("count", 0) + 1
             failures[key] = {"count": count, "error": type(error).__name__, "needs_attention": count >= 3}
             self.record(collection_failures=failures)

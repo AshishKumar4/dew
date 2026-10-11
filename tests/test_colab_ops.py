@@ -1178,7 +1178,7 @@ def test_snapshot_storage_error_records_attention_without_declaring_workload_dea
     driver = Driver(
         tmp_path / "run", types.SimpleNamespace(kernel=lambda *args, **kwargs: Kernel()), "unused"
     )
-    with pytest.raises(ops_driver.TransportError):
+    with pytest.raises(ops_driver.CollectionError):
         driver.control(
             allocation.Session("owned", "https://fake.invalid/", "token"), "snapshot", live_read=True
         )
