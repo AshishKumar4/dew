@@ -79,9 +79,7 @@ class StepIdentity:
                         else _dependencies(step) if dataclasses.is_dataclass(step) and not isinstance(step, type)
                         else {})
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
-            config = json.dumps({field.name: dependencies[field.name] if field.name in dependencies
-                                  else repr(getattr(step, field.name)) for field in dataclasses.fields(step)
-                                  if field.repr}, sort_keys=True)
+            config = json.dumps(_configuration(step), sort_keys=True)
         return cls(name, config, exact, module_hash, declared, dependencies)
 
 
@@ -106,6 +104,21 @@ def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
             if nested:
                 dependencies[field.name] = nested
     return dependencies
+
+
+def _configuration(step: DataclassInstance) -> dict[str, JSON]:
+    configured: dict[str, JSON] = {"class": f"{type(step).__module__}.{type(step).__qualname__}"}
+    for field in dataclasses.fields(step):
+        if not field.repr:
+            continue
+        value = getattr(step, field.name)
+        if isinstance(value, _Dependencies):
+            configured[field.name] = json_value(value.dependencies(), field.name)
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            configured[field.name] = _configuration(value)
+        else:
+            configured[field.name] = re.sub(r" at 0x[0-9a-fA-F]+", "", repr(value))
+    return configured
 
 
 @dataclasses.dataclass(frozen=True)

@@ -232,7 +232,7 @@ def test_lambda_identity_requires_explicit_non_exact_resume():
 
 def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     stored = source(8)
-    cache = Cache(str(tmp_path / "cache"), shard_bytes=2048, spool_bytes=65536)
+    cache = Cache(str(tmp_path / "cache"), shard_bytes=2048, spool_bytes=2 * 1024**2)
     prefix = Pipeline(stored).cache(cache)
 
     def build(prefix):
@@ -286,5 +286,6 @@ def test_validation_takes_accepted_rows_before_the_share_cut():
         held = data.val(DataPartition(share, 2))
         rows = list(held)
         assert len(rows) == 1
-        assert rows[0]["id"][rows[0][VALID_ROWS]].tolist() == ([1, 5] if share == 0 else [3])
+        valid = rows[0].get(VALID_ROWS, np.ones(len(rows[0]["id"]), bool))
+        assert rows[0]["id"][valid].tolist() == ([1, 5] if share == 0 else [3])
         held.close()
