@@ -312,6 +312,8 @@ def test_adapted_decision_backbone_counts_training_work_without_claiming_an_lm_h
     assert not isinstance(adapter.model, CountedLogits)
     head = DecisionHead(8, layers=0)
     objective = DecisionObjective(adapter, head=head, tokenizer=ByteTokenizer(),
+                                  specials=Specials(begin=None, separator=10, marker=0,
+                                                    marker_text="\x00", pad=255),
                                   layout=StateFirstLayout(max_len=8))
     batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
              "questions": np.ones((2, 1), bool), "options": np.ones((2, 1, 2), bool)}
