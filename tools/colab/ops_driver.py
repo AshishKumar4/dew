@@ -43,7 +43,9 @@ class Driver:
                 raise TransportError(type(error).__name__) from error
             errors = [item for item in outputs if item.get("output_type") == "error"]
             if errors:
-                if live_read and all(item.get("ename") in ("FileNotFoundError", "NotADirectoryError") for item in errors):
+                if live_read and all(
+                    item.get("ename") in ("FileNotFoundError", "NotADirectoryError") for item in errors
+                ):
                     raise TransportError("live output changed during snapshot; re-list on next cycle")
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)

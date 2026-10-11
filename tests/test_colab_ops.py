@@ -1111,21 +1111,35 @@ def test_live_truncation_never_writes_a_partial_tar_member(tmp_path, monkeypatch
 
 def test_named_training_roots_keep_tracking_but_exclude_weight_stores(tmp_path):
     root = tmp_path / "out/timed/custom+experiment"
-    for name in ("run.json", "tracking/scalars.jsonl", "220/weights", "220/commit_success.txt",
-                 "220/_CHECKPOINT_METADATA", "221.tmp/weights", "frozen/weights"):
+    for name in (
+        "run.json",
+        "tracking/scalars.jsonl",
+        "220/weights",
+        "220/commit_success.txt",
+        "220/_CHECKPOINT_METADATA",
+        "221.tmp/weights",
+        "frozen/weights",
+    ):
         write(root / name)
     write(tmp_path / "out/train.log")
     found = sync.output_files(tmp_path, ["out/"], "measurements")
-    assert set(found) == {"out/timed/custom+experiment/run.json",
-                         "out/timed/custom+experiment/tracking/scalars.jsonl", "out/train.log"}
+    assert set(found) == {
+        "out/timed/custom+experiment/run.json",
+        "out/timed/custom+experiment/tracking/scalars.jsonl",
+        "out/train.log",
+    }
     complete = sync.output_files(tmp_path, ["out/"], "all")
     assert "out/timed/custom+experiment/220/weights" in complete
     assert not any("221.tmp" in name for name in complete)
 
 
 def test_named_checkpoint_with_a_missing_member_is_not_restored(tmp_path):
-    members = {"out/named/run.json": b"config", "out/named/220/weights": b"weight",
-               "out/named/220/commit_success.txt": b"ok", "out/named/220/_CHECKPOINT_METADATA": b"metadata"}
+    members = {
+        "out/named/run.json": b"config",
+        "out/named/220/weights": b"weight",
+        "out/named/220/commit_success.txt": b"ok",
+        "out/named/220/_CHECKPOINT_METADATA": b"metadata",
+    }
     for name, value in members.items():
         write(tmp_path / "outputs" / name, value)
     save(tmp_path / "manifest.json", digests(members))
@@ -1147,7 +1161,9 @@ def test_remote_snapshot_prune_error_is_retryable_not_a_session_failure(tmp_path
     client = types.SimpleNamespace(kernel=lambda *args, **kwargs: Kernel())
     driver = Driver(tmp_path / "run", client, "unused")
     with pytest.raises(ops_driver.TransportError, match="re-list"):
-        driver.control(allocation.Session("owned", "https://fake.invalid/", "token"), "snapshot", live_read=True)
+        driver.control(
+            allocation.Session("owned", "https://fake.invalid/", "token"), "snapshot", live_read=True
+        )
     assert driver.state["action"] == "poll" and driver.state["results"] == []
 
 
@@ -1169,7 +1185,9 @@ def test_emergency_out_measurements_survive_a_slow_batch_log(tmp_path, fake_vm, 
     receipt = metadata_capture.capture(tmp_path / "run", plan, session, "/content/batch", seconds=1)
     assert time.monotonic() - began < 3
     assert {file["remote"] for file in receipt["files"]} == {
-        "/content/out/result.json", "/content/out/analysis/attribution.json"}
+        "/content/out/result.json",
+        "/content/out/analysis/attribution.json",
+    }
     assert receipt["tiers"]["logs"]["timed_out"] and not receipt["tiers"]["measurements"]["timed_out"]
 
 
