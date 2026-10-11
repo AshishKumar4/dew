@@ -1,6 +1,7 @@
 """The Colab preflight: shell facts, Python symbol chains, arch-aware sources and the receipt gate."""
 
 import argparse
+import ast
 import hashlib
 import json
 import subprocess
@@ -36,6 +37,7 @@ def test_installs_need_exact_pins_and_redirections_are_not_packages():
     )
     assert found["pins"] == {"fla-core": "0.5.2", "flash-qla": "0.1.3"}
     assert found["failures"] == ["pip installs 'einops' without an exact version"]
+    assert found["interpreters"] == ["system", "venv"]
 
 
 def test_a_script_is_read_with_the_variables_its_command_sets():
@@ -71,17 +73,20 @@ def test_chains_follow_aliases_scopes_module_assignments_and_path_additions():
         "def shim():\n"
         "    import flash_qla.ops.gated_delta_rule.chunk as chunk\n"
         "    chunk.aggregate_card_state = None\n"
-        "def trace():\n"
+        "def trace(name):\n"
         "    sys.path.insert(0, str(Path.cwd() / 'tools'))\n"
         "    sys.path.append(__file__)\n"
+        "    import importlib\n"
+        "    return importlib.import_module(name)\n"
     )
-    chains, bound, paths = preflight.uses(source, "rules.py")
+    chains, bound, paths, unchecked = preflight.uses(source, "rules.py")
     found = {(chain["module"], tuple(chain["attrs"])) for chain in chains}
     assert ("dew.nn.kernels", ("fla_gdn", "chunk_gated_delta_rule")) in found
     assert ("jax.numpy", ("zeros",)) in found
     assert not any("not_a_module_attribute" in attrs for _, attrs in found)
     assert bound == {("flash_qla.ops.gated_delta_rule.chunk", "aggregate_card_state")}
     assert paths == {"recipes/decision", "tools"}
+    assert unchecked == ["rules.py:19: importlib.import_module of a computed name"]
 
 
 # FlashQLA 0.1.3's shape: the chunk package binds aggregate_card_state on sm90 only, and a function
@@ -120,6 +125,33 @@ def test_sources_follow_the_target_gpu_into_function_imports(tmp_path, arch, fai
     assert sources.check("fq.chunk", ["kernel"], set()) is None
     assert (sources.check("fq.chunk", ["aggregate"], set()) is not None) == failing
     assert sources.closure({"fq"}, {("fq.chunk", "aggregate")}) == []
+    assert set(sources.guarded) == {"fq.chunk.cp:2 imports fq.optional, which is not installed"}
+
+
+@pytest.mark.parametrize(
+    ("test", "value"),
+    [
+        ("torch.cuda.get_device_capability()[0] >= 9", True),
+        ("get_target_compute_version() in ('10.0', '10.3')", False),
+        ("sys.version_info[:2] >= (3, 13) and sys.platform == 'linux'", True),
+        ("torch.version.hip or IS_SM120", True),
+        ("torch.version.hip and IS_SM120", preflight.UNKNOWN),
+    ],
+)
+def test_conditions_are_known_only_from_the_vm(test, value):
+    constants = {"IS_SM120": True}
+    assert preflight.evaluate(ast.parse(test, mode="eval").body, constants, "12.0", (3, 13)) is value
+
+
+def test_an_accepted_failure_needs_a_match_and_a_reason():
+    failures = ["a:1: x unbound on sm12.0", "b:2: y unbound on sm12.0"]
+    accepted, kept = preflight.accept(failures, ["a:1::never on CUDA", "zzz::stale", "b:2"])
+    assert accepted == [{"failure": failures[0], "reason": "never on CUDA"}]
+    assert kept == [
+        failures[1],
+        "--accept 'zzz::stale' matches no failure or gives no reason",
+        "--accept 'b:2' matches no failure or gives no reason",
+    ]
 
 
 def test_runtime_resolution_names_missing_modules_attributes_and_import_errors(tmp_path):
@@ -140,17 +172,18 @@ def test_a_ref_without_the_called_module_fails_the_preflight(tmp_path, monkeypat
     tree = tmp_path / "dew"
     commit = repository(tree, {"src/dew/__init__.py": "", "src/dew/kernels.py": "rule = 1\n"})
     monkeypatch.setattr(preflight, "REPO", tree)
+    monkeypatch.setattr(preflight, "VENV_PYTHON", "{}.{}".format(*sys.version_info[:2]))
     script = tmp_path / "rules.py"
     script.write_text("def jax_rules():\n    from dew.kernels import rule, fla_gdn\n")
     args = argparse.Namespace(
         ref=commit, hardware="gpu:G4", command="python /content/c56/rules.py", inputs=[str(script)], pin=[]
     )
-    args.origin = "origin"
-    args.python, args.dew_python = preflight.PYTHON, sys.executable
+    args.origin, args.accept, args.dew_python = "origin", [], sys.executable
     receipt = preflight.preflight(args, tmp_path / "work")
     assert receipt["commit"] == commit and not receipt["ok"]
     assert receipt["failures"] == ["rules.py:2: dew.kernels.fla_gdn: dew.kernels has no fla_gdn"]
     assert receipt["inputs"] == {"rules.py": hashlib.sha256(script.read_bytes()).hexdigest()}
+    assert (receipt["interpreter"], receipt["tool"]) == ("system", preflight.TOOL)
 
 
 def receipt_for(tmp_path, head, **changes):
@@ -163,6 +196,11 @@ def receipt_for(tmp_path, head, **changes):
         "command": "python /content/c56/rules.py",
         "inputs": {"rules.py": hashlib.sha256(script.read_bytes()).hexdigest()},
         "failures": [],
+        "tool": preflight.TOOL,
+        "runtime": ["torch==2.11.0"],
+        "interpreter": "system",
+        "python": preflight.INTERPRETERS["system"],
+        "dew_python": preflight.VENV_PYTHON,
     }
     receipt.update(changes)
     path = tmp_path / "receipt.json"
@@ -182,6 +220,7 @@ def request(receipt: Path, script: Path) -> dict:
         "decision": "test",
         "memory_estimate": "1GiB",
         "preflight": str(receipt),
+        "runtime_pins": "torch==2.11.0",
     }
     return {"text": "- lane: test job\n", "fields": fields}
 
@@ -191,9 +230,12 @@ def request(receipt: Path, script: Path) -> dict:
     [
         ({}, None),
         ({"ok": False, "failures": ["dew.kernels has no fla_gdn"]}, "it failed: dew.kernels has no fla_gdn"),
-        ({"commit": "0" * 40}, "it checked 0000"),
-        ({"hardware": "gpu:G4"}, "it checked gpu:G4, not gpu:T4"),
-        ({"command": "python other.py"}, "a different command"),
+        ({"commit": "0" * 40}, "its commit is '0000"),
+        ({"hardware": "gpu:G4"}, "its hardware is 'gpu:G4', not 'gpu:T4'"),
+        ({"command": "python other.py"}, "its command is 'python other.py'"),
+        ({"tool": "0" * 64}, "its tool is"),
+        ({"runtime": []}, "its runtime is"),
+        ({"interpreter": "venv"}, "its python is '3.13', not '3.12'"),
         ({"inputs": {}}, "it did not check /content/c56/rules.py"),
     ],
 )

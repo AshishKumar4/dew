@@ -14,6 +14,8 @@ HERE = Path(__file__).resolve().parent
 REPO = HERE.parents[1]
 STATE = Path(os.environ.get("DEW_COLAB_STATE", Path.home() / ".cache/dew"))
 PART = 50 * 1024 * 1024
+# The Python of a job's venv on the VM.
+VENV_PYTHON = "3.12"
 
 
 def save(path: Path, value: dict) -> None:

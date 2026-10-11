@@ -23,11 +23,14 @@ import sys
 import tempfile
 from pathlib import Path
 
-from tools.colab.common import REPO, git
+from tools.colab.common import REPO, VENV_PYTHON, git
 
 ARCH = {"gpu:T4": "7.5", "gpu:L4": "8.9", "gpu:A100": "8.0", "gpu:G4": "12.0"}
-# Colab's Python; the pinned packages are installed for it.
-PYTHON = "3.13"
+# The VM's interpreters: Colab's /usr/bin/python3 (c56's tracebacks, /usr/local/lib/python3.13), and
+# the job's venv, which `python` and `pip` name (colab_batch_vm).
+INTERPRETERS = {"system": "3.13", "venv": VENV_PYTHON}
+# A receipt holds for the preflight that wrote it.
+TOOL = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
 LOCAL = ("dew", "tools")
 SCRIPTS = (".py", ".sh", ".bash")
 VALUED = {"-c", "--constraint", "-r", "--requirement", "-i", "--index-url", "--extra-index-url", "-t"}
@@ -36,7 +39,7 @@ UNKNOWN = object()
 
 
 def facts() -> dict:
-    keys = ("checkouts", "modules", "runs", "sources", "failures")
+    keys = ("checkouts", "modules", "runs", "sources", "failures", "interpreters")
     return {"pins": {}, "environments": {}, **{key: [] for key in keys}}
 
 
@@ -89,8 +92,9 @@ def program(words: list[str], env: dict[str, str], found: dict, depth: int) -> N
     if start is None:
         return
     head, rest = names[start], words[start + 1 :]
+    system = words[start].startswith("/usr/")
     if head.startswith("pip") or (head == "uv" and rest[:2] == ["pip", "install"]):
-        pins(rest[1:] if head == "uv" else rest, found)
+        pins(rest[1:] if head == "uv" else rest, found, system="--system" in rest)
     elif head == "uv" and rest[:1] == ["run"]:
         python = next((i for i, word in enumerate(rest) if Path(word).name.startswith("python")), None)
         if python is not None:
@@ -103,7 +107,7 @@ def program(words: list[str], env: dict[str, str], found: dict, depth: int) -> N
             elif word == "-m":
                 module = next(options, "")
                 if module == "pip":
-                    pins(list(options), found)
+                    pins(list(options), found, system)
                 else:
                     found["modules"].append(module)
                 return
@@ -125,9 +129,10 @@ def program(words: list[str], env: dict[str, str], found: dict, depth: int) -> N
         found["environments"][Path(rest[0]).name] = env
 
 
-def pins(words: list[str], found: dict) -> None:
+def pins(words: list[str], found: dict, system: bool) -> None:
     if words[:1] != ["install"]:
         return
+    found["interpreters"].append("system" if system else "venv")
     options = iter(words[1:])
     for word in options:
         if word in VALUED:
@@ -142,11 +147,12 @@ def pins(words: list[str], found: dict) -> None:
             found["failures"].append(f"pip installs {word!r} without an exact version")
 
 
-def uses(source: str, label: str) -> tuple[list[dict], set[tuple[str, str]], set[str]]:
-    """Every module attribute chain a Python source reads, the attributes it assigns on modules, and
-    the directories, relative to the Dew tree it runs in, it puts on sys.path."""
+def uses(source: str, label: str) -> tuple[list[dict], set[tuple[str, str]], set[str], list[str]]:
+    """Every module attribute chain a Python source reads, the attributes it assigns on modules, the
+    directories, relative to the Dew tree it runs in, it puts on sys.path, and the imports no parse
+    can name (a computed module name, a star import)."""
     found = Uses(ast.parse(source, label), label)
-    return found.chains, found.bound, found.paths
+    return found.chains, found.bound, found.paths, found.unchecked
 
 
 class Uses:
@@ -155,6 +161,7 @@ class Uses:
         self.chains: list[dict] = []
         self.bound: set[tuple[str, str]] = set()
         self.paths: set[str] = set()
+        self.unchecked: list[str] = []
         self.constants: dict[str, str] = {}
         for node in tree.body:
             if (
@@ -214,15 +221,19 @@ class Uses:
                 if attrs:
                     aliases[alias.asname or alias.name] = (node.module, (alias.name,))
                     names.add(alias.asname or alias.name)
+                else:
+                    self.unchecked.append(f"{self.label}:{node.lineno}: from {node.module} import *")
         elif isinstance(node, ast.Call) and node.args:
             name, argument = dotted(node.func), node.args[-1]
             if name in ("sys.path.insert", "sys.path.append"):
                 value = directory(argument, self.constants)
                 if value is not None:
                     self.paths.add(value)
-            elif name.endswith("import_module") and isinstance(node.args[0], ast.Constant):
-                if isinstance(node.args[0].value, str):
+            elif name.endswith("import_module") or name == "__import__":
+                if isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     self.chain(node.args[0].value, [], node)
+                else:
+                    self.unchecked.append(f"{self.label}:{node.lineno}: {name} of a computed name")
         return names
 
     def attribute(self, node: ast.Attribute, aliases: dict) -> None:
@@ -309,17 +320,20 @@ def resolve(python: str, chains: list[dict], bound: set, env: dict | None = None
         groups.setdefault(top(chain), []).append(index)
     found: list = [None] * len(chains)
     for name, members in groups.items():
-        result = subprocess.run(
-            [python, "-c", RESOLVE],
-            input=json.dumps([[chains[index] for index in members], sorted(bound)]),
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=cwd,
-            timeout=1200,
-        )
+        request = json.dumps([[chains[index] for index in members], sorted(bound)])
         try:
+            result = subprocess.run(
+                [python, "-c", RESOLVE],
+                input=request,
+                capture_output=True,
+                text=True,
+                env=env,
+                cwd=cwd,
+                timeout=300,
+            )
             answers = json.loads(result.stdout.splitlines()[-1])
+        except subprocess.TimeoutExpired:
+            answers = [["import", f"importing {name} took over 300 s"]] * len(members)
         except (IndexError, json.JSONDecodeError):
             lines = result.stderr.strip().splitlines() or ["no output"]
             last = next((line for line in lines if line.startswith("Fatal Python error")), lines[-1])
@@ -333,8 +347,10 @@ def resolve(python: str, chains: list[dict], bound: set, env: dict | None = None
 class Sources:
     """Static name resolution over installed sources, taking the target GPU's branches."""
 
-    def __init__(self, roots: list[Path], arch: str, scope: set[str]):
+    def __init__(self, roots: list[Path], arch: str, scope: set[str], python: str = INTERPRETERS["system"]):
         self.roots, self.arch, self.scope = roots, arch, scope
+        self.python = tuple(int(part) for part in python.split("."))
+        self.guarded: list[str] = []
         self.tables: dict[str, tuple[dict, bool] | None] = {}
         self.trees: dict[Path, ast.Module] = {}
 
@@ -433,9 +449,11 @@ class Sources:
             seen.add(module)
             package = module if path.name == "__init__.py" else module.rpartition(".")[0]
             for node, guarded in self.statements(path, functions=True):
-                if guarded or not isinstance(node, (ast.Import, ast.ImportFrom)):
+                if not isinstance(node, (ast.Import, ast.ImportFrom)):
                     continue
                 where = f"{module}:{node.lineno}"
+                # An ImportError handler expects its import may miss: noted, not failed.
+                found = self.guarded if guarded else failures
                 if isinstance(node, ast.Import):
                     targets = [(alias.name, []) for alias in node.names]
                 else:
@@ -445,13 +463,13 @@ class Sources:
                     if target.split(".")[0] not in self.scope:
                         continue
                     if not self.path(target):
-                        failures.append(f"{where} imports {target}, which is not installed")
+                        found.append(f"{where} imports {target}, which is not installed")
                         continue
                     pending.append(target)
                     for name in names:
                         binding = self.lookup(target, name)
                         if binding is None and (target, name) not in bound:
-                            failures.append(f"{where}: from {target} import {name}: unbound on sm{self.arch}")
+                            found.append(f"{where}: from {target} import {name}: unbound on sm{self.arch}")
                         elif binding and binding[0] == "module":
                             pending.append(binding[1])
         return failures
@@ -468,9 +486,9 @@ class Sources:
                 yield node, guarded
                 target = node.targets[0] if isinstance(node, ast.Assign) and len(node.targets) == 1 else None
                 if module and isinstance(target, ast.Name):
-                    constants[target.id] = evaluate(node.value, constants, self.arch)
+                    constants[target.id] = evaluate(node.value, constants, self.arch, self.python)
                 if isinstance(node, ast.If):
-                    taken = evaluate(node.test, constants, self.arch)
+                    taken = evaluate(node.test, constants, self.arch, self.python)
                     if taken is UNKNOWN or taken:
                         yield from walk(node.body, guarded, module)
                     if taken is UNKNOWN or not taken:
@@ -509,14 +527,22 @@ def catches_import(handler: ast.ExceptHandler) -> bool:
     return any(dotted(kind).split(".")[-1] in names for kind in kinds)
 
 
-def evaluate(node: ast.AST, constants: dict, arch: str):
-    """A condition's value on the target GPU, or UNKNOWN; only device queries and literals are known."""
+def evaluate(node: ast.AST, constants: dict, arch: str, python: tuple = (3, 13)):
+    """A condition's value on the target VM, or UNKNOWN: literals, the device's compute capability,
+    the platform and the Python version are known, nothing else."""
+
+    def value(item: ast.AST):
+        return evaluate(item, constants, arch, python)
+
+    known = {"sys.platform": "linux", "sys.version_info": (*python, 0)}
     if isinstance(node, ast.Constant):
         return node.value
     if isinstance(node, ast.Name):
         return constants.get(node.id, UNKNOWN)
+    if isinstance(node, ast.Attribute):
+        return known.get(dotted(node), UNKNOWN)
     if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
-        items = [evaluate(item, constants, arch) for item in node.elts]
+        items = [value(item) for item in node.elts]
         return UNKNOWN if any(item is UNKNOWN for item in items) else tuple(items)
     if isinstance(node, ast.Call):
         name = dotted(node.func)
@@ -524,28 +550,32 @@ def evaluate(node: ast.AST, constants: dict, arch: str):
             return arch
         if name.endswith("get_device_capability"):
             return tuple(int(part) for part in arch.split("."))
-        if name.endswith("cuda.is_available"):
-            return True
-        return UNKNOWN
-    if isinstance(node, ast.Subscript) and isinstance(node.slice, ast.Constant):
-        value = evaluate(node.value, constants, arch)
+        return True if name.endswith("cuda.is_available") else UNKNOWN
+    if isinstance(node, ast.Subscript):
+        index = node.slice
+        if isinstance(index, ast.Slice):
+            bounds = [None if part is None else value(part) for part in (index.lower, index.upper)]
+            index = UNKNOWN if UNKNOWN in bounds or index.step else slice(*bounds)
+        else:
+            index = value(index)
+        container = value(node.value)
         try:
-            return UNKNOWN if value is UNKNOWN else value[node.slice.value]
+            return UNKNOWN if UNKNOWN in (index, container) else container[index]
         except (IndexError, KeyError, TypeError):
             return UNKNOWN
     if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
-        value = evaluate(node.operand, constants, arch)
-        return UNKNOWN if value is UNKNOWN else not value
+        operand = value(node.operand)
+        return UNKNOWN if operand is UNKNOWN else not operand
     if isinstance(node, ast.BoolOp):
-        values = [evaluate(value, constants, arch) for value in node.values]
+        values = [value(item) for item in node.values]
         decisive = isinstance(node.op, ast.Or)
-        if any(value is not UNKNOWN and bool(value) == decisive for value in values):
+        if any(item is not UNKNOWN and bool(item) == decisive for item in values):
             return decisive
-        return UNKNOWN if any(value is UNKNOWN for value in values) else not decisive
+        return UNKNOWN if any(item is UNKNOWN for item in values) else not decisive
     if isinstance(node, ast.Compare):
-        left = evaluate(node.left, constants, arch)
+        left = value(node.left)
         for operator, comparator in zip(node.ops, node.comparators, strict=True):
-            right = evaluate(comparator, constants, arch)
+            right = value(comparator)
             if left is UNKNOWN or right is UNKNOWN:
                 return UNKNOWN
             try:
@@ -663,8 +693,7 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     arch = ARCH[args.hardware]
     commit, tree = checkout(args.ref, args.origin, work)
     receipt: dict = {"schema": 1, "commit": commit, "hardware": args.hardware, "arch": arch}
-    receipt["preflight"] = git(REPO, "rev-parse", "HEAD")
-    receipt.update(python=args.python, command=args.command, inputs={})
+    receipt.update(tool=TOOL, preflight=git(REPO, "rev-parse", "HEAD"), command=args.command, inputs={})
     texts: dict[str, str] = {}
     for item in map(Path, args.inputs):
         data = item.read_bytes()
@@ -680,6 +709,51 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             target = ref
         if target != commit:
             failures.append(f"a script checks out {ref}, not the preflighted {commit}")
+    targets = set(found["interpreters"]) or {"system"}
+    if len(targets) > 1:
+        failures.append("pins go to both the system Python and the job's venv; preflight one interpreter")
+    receipt["interpreter"] = interpreter = min(targets)
+    receipt["python"] = INTERPRETERS[interpreter]
+    receipt["dew_python"] = version(args.dew_python)
+    if receipt["dew_python"] != VENV_PYTHON:
+        failures.append(f"Dew resolved under Python {receipt['dew_python']}, not the VM venv's {VENV_PYTHON}")
+    chains, bound, unchecked = symbols(found, texts, (tree, commit, work), args.dew_python, failures)
+    receipt["unchecked"] = unchecked
+    runtime = sorted(pin.lower() for pin in args.pin)
+    pinned = {**found["pins"], **dict(pin.split("==", 1) for pin in runtime)}
+    receipt.update(runtime=runtime, pins=pinned)
+    interpreter, roots, versions, problems = install(pinned, work, receipt["python"])
+    failures += problems
+    receipt["installed"] = versions
+    other = [chain for chain in chains if not chain.get("local")]
+    results = resolve(interpreter, other, bound) if interpreter else [["absent", "no pins"]] * len(other)
+    absent = [chain for chain, result in zip(other, results, strict=True) if result[0] == "absent"]
+    retried = iter(resolve(args.dew_python, absent, bound))
+    results = [next(retried) if result[0] == "absent" else result for result in results]
+    # Only a pinned package that cannot import on CPU is read from its sources; the closure stays
+    # inside it, as what it imports from importable packages was proven by importing them.
+    failed = {top(chain): why for chain, (kind, why) in zip(other, results, strict=True) if kind == "import"}
+    static = Sources(roots, arch, set(failed) & top_levels(roots, set(pinned)), receipt["python"])
+    for chain, (kind, detail) in zip(other, results, strict=True):
+        if kind == "import" and top(chain) in static.scope:
+            problem = static.check(chain["module"], chain["attrs"], bound)
+            if problem:
+                failures.append(f"{label(chain)}: {problem} (from sources; on CPU: {detail})")
+        elif kind == "absent":
+            failures.append(f"{label(chain)}: no pin or Dew dependency provides it ({detail})")
+        elif kind != "ok":
+            failures.append(f"{label(chain)}: {detail}")
+    failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
+    receipt.update(static={name: failed[name] for name in sorted(static.scope)}, guarded=static.guarded)
+    receipt["accepted"], failures = accept(failures, args.accept)
+    receipt.update(checked=len(chains), failures=failures, ok=not failures)
+    return receipt
+
+
+def symbols(found: dict, texts: dict, where: tuple, python: str, failures: list) -> tuple:
+    """The chains the scripts read, Dew's and the scripts' own (marked local) already resolved at the
+    ref; the attributes they assign on modules; the imports no parse can name."""
+    tree, commit, work = where
     sources = [(name, text) for name, text in texts.items() if name.endswith(".py")] + found["sources"]
     for path in found["runs"]:
         if Path(path).name in texts:
@@ -691,14 +765,16 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     chains = [{"module": module, "attrs": [], "where": "<shell>"} for module in found["modules"]]
     bound: set = set()
     paths: set[Path] = set()
+    unchecked: list[str] = []
     for name, text in sources:
         try:
-            more, assigned, added = uses(text, name)
+            more, assigned, added, dynamic = uses(text, name)
         except SyntaxError as error:
             failures.append(f"{name} does not parse: {error}")
             continue
         chains += more
         bound |= assigned
+        unchecked += dynamic
         paths |= {tree / path for path in added if not os.path.isabs(path) and (tree / path).is_dir()}
     unique = {(chain["module"], tuple(chain["attrs"])): chain for chain in chains}
     chains = [chain for chain in unique.values() if top(chain) not in sys.stdlib_module_names]
@@ -712,41 +788,34 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     for folder in paths:
         ours |= {item.stem for item in folder.iterdir() if item.suffix == ".py" or item.is_dir()}
     local = [chain for chain in chains if top(chain) in ours]
-    other = [chain for chain in chains if top(chain) not in ours]
     path = [str(siblings), *map(str, sorted(paths)), str(tree / "src"), str(tree)]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join(path)}
-    found_local = resolve(args.dew_python, local, bound, environment, tree)
-    for chain, (kind, detail) in zip(local, found_local, strict=True):
+    for chain, (kind, detail) in zip(local, resolve(python, local, bound, environment, tree), strict=True):
+        chain["local"] = True
         if kind != "ok":
             failures.append(f"{label(chain)}: {detail}")
         elif top(chain) == "dew" and not str(detail).startswith(str(tree)):
             failures.append(f"dew resolved from {detail}, not from {tree}")
-    pinned = {**found["pins"], **dict(pin.lower().split("==", 1) for pin in args.pin)}
-    interpreter, roots, versions, problems = install(pinned, work, args.python)
-    failures += problems
-    receipt.update(pins=pinned, installed=versions)
-    results = resolve(interpreter, other, bound) if interpreter else [["absent", "no pins"]] * len(other)
-    absent = [chain for chain, result in zip(other, results, strict=True) if result[0] == "absent"]
-    retried = iter(resolve(args.dew_python, absent, bound))
-    results = [next(retried) if result[0] == "absent" else result for result in results]
-    # Only a pinned package that cannot import on CPU is read from its sources; the closure stays
-    # inside it, as what it imports from importable packages was proven by importing them.
-    failed = {top(chain) for chain, result in zip(other, results, strict=True) if result[0] == "import"}
-    static = Sources(roots, arch, failed & top_levels(roots, set(pinned)))
-    for chain, (kind, detail) in zip(other, results, strict=True):
-        if kind == "import" and top(chain) in static.scope:
-            problem = static.check(chain["module"], chain["attrs"], bound)
-            if problem:
-                failures.append(f"{label(chain)}: {problem} (from sources; on CPU: {detail})")
-        elif kind == "absent":
-            failures.append(f"{label(chain)}: no pin or Dew dependency provides it ({detail})")
-        elif kind != "ok":
-            failures.append(f"{label(chain)}: {detail}")
-    failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
-    reasons = {top(chain): why for chain, (kind, why) in zip(other, results, strict=True) if kind == "import"}
-    receipt.update(static={name: reasons[name] for name in sorted(static.scope)})
-    receipt.update(checked=len(chains), failures=failures, ok=not failures)
-    return receipt
+    return chains, bound, unchecked
+
+
+def accept(failures: list[str], accepted: list[str]) -> tuple[list[dict], list[str]]:
+    """Failures a request accepts as `TEXT::REASON`, each matching at least one; the rest stand."""
+    kept, recorded = list(failures), []
+    for item in accepted:
+        text, _, reason = item.partition("::")
+        matched = [failure for failure in kept if text in failure]
+        if not matched or not reason.strip():
+            kept.append(f"--accept {item!r} matches no failure or gives no reason")
+            continue
+        kept = [failure for failure in kept if failure not in matched]
+        recorded += [{"failure": failure, "reason": reason.strip()} for failure in matched]
+    return recorded, kept
+
+
+def version(python: str) -> str:
+    query = "import sys; print('%d.%d' % sys.version_info[:2])"
+    return subprocess.run([python, "-c", query], capture_output=True, text=True, check=True).stdout.strip()
 
 
 def top(chain: dict) -> str:
@@ -757,19 +826,22 @@ def label(chain: dict) -> str:
     return f"{chain['where']}: {'.'.join([chain['module'], *chain['attrs']])}"
 
 
-def verify(path: Path, commit: str, hardware: str, command: str, inputs: list[tuple[str, str]]) -> str:
-    """The receipt's digest, if it is a passing preflight of exactly this request."""
+def verify(path: Path, request: dict, inputs: list[tuple[str, str]]) -> str:
+    """The receipt's digest, if it is a passing preflight, by this preflight, of exactly this request:
+    its commit, hardware, verbatim command, runtime pins and every script it stages."""
     data = path.read_bytes()
     receipt = json.loads(data)
     problems = []
     if not receipt.get("ok"):
         problems.append("it failed: " + "; ".join(receipt.get("failures", ["no result"]))[:2000])
-    if receipt.get("commit") != commit:
-        problems.append(f"it checked {receipt.get('commit')}, not {commit}")
-    if receipt.get("hardware") != hardware:
-        problems.append(f"it checked {receipt.get('hardware')}, not {hardware}")
-    if receipt.get("command") != command:
-        problems.append("it checked a different command")
+    expected = {key: request[key] for key in ("commit", "hardware", "command")}
+    expected.update(
+        tool=TOOL, runtime=sorted(pin.lower() for pin in request["runtime"]), dew_python=VENV_PYTHON
+    )
+    expected["python"] = INTERPRETERS.get(receipt.get("interpreter", ""), "a known interpreter")
+    for key, value in expected.items():
+        if receipt.get(key) != value:
+            problems.append(f"its {key} is {str(receipt.get(key))[:80]!r}, not {str(value)[:80]!r}")
     covered = set(receipt.get("inputs", {}).values())
     for target, digest in inputs:
         if target.endswith(SCRIPTS) and digest not in covered:
@@ -786,8 +858,10 @@ def main() -> None:
     parser.add_argument("--hardware", choices=sorted(ARCH), required=True)
     parser.add_argument("--command", default="", help="the queue entry's command, verbatim")
     parser.add_argument("--pin", action="append", default=[], help="NAME==VERSION the runtime provides")
+    parser.add_argument(
+        "--accept", action="append", default=[], help="TEXT::REASON for a failure that stands"
+    )
     parser.add_argument("--origin", default="origin", help="where to fetch a ref this clone lacks")
-    parser.add_argument("--python", default=PYTHON)
     parser.add_argument("--dew-python", default=sys.executable)
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
