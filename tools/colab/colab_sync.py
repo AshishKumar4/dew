@@ -19,6 +19,11 @@ def is_run(path):
     return path.name == "run" or (path / "run.json").is_file()
 
 
+def committed_file(file):
+    return any(path.name.isdigit() and all((path / marker).is_file() for marker in COMMIT_MARKERS)
+               for path in file.parents)
+
+
 def retained_path(file, policy):
     for path in file.parents:
         parent = path.parent
@@ -110,6 +115,11 @@ def pack_files(files, archive):
                         info = packed.gettarinfo(arcname=name, fileobj=stream)
                         if info is None or not info.isfile():
                             raise ValueError(f"artifact is not a regular file: {name}")
+                        if committed_file(file):
+                            reader = HashedReader(stream)
+                            packed.addfile(info, reader)
+                            manifest[name] = reader.digest.hexdigest()
+                            continue
                         with tempfile.SpooledTemporaryFile(
                             max_size=8 * 1024 * 1024, dir=str(archive.parent)
                         ) as copy:
