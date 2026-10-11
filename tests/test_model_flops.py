@@ -25,6 +25,7 @@ from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
+from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
@@ -50,7 +51,7 @@ from dew.nn.mixers.mamba import Mamba, selective_scan
 from dew.nn.mixers.mamba2 import Mamba2, recurrent_ssd
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.moe import SparseMLP
-from dew.nn.protocols import Counted, CountedDecisions, CountedLogits
+from dew.nn.protocols import Counted, CountedDecisions, CountedLogits, CountedTraining
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer, _scanned_directions
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
@@ -281,6 +282,44 @@ def test_uncounted_decision_head_makes_work_unavailable_but_direct_counts_stay_s
     for count in (objective.model_flops, objective.training_flops):
         with pytest.raises(MissingFlopsCount, match=r"Head.*decision_flops"):
             count(None, batch)
+
+
+def test_adapted_decision_backbone_counts_training_work_without_claiming_an_lm_head():
+    class Trunk(nn.Module):
+        @nn.compact
+        def hidden_states(self, tokens, *, train=False, **fields):
+            return nn.Dense(8, use_bias=False)(nn.Embed(16, 8)(tokens))
+
+        def __call__(self, tokens, *, train=False):
+            return self.hidden_states(tokens, train=train)
+
+        @nn.nowrap
+        def model_flops(self, lengths):
+            return projection_flops(lengths, 8, 8)
+
+        @nn.nowrap
+        def parameter_flops(self, lengths):
+            return self.model_flops(lengths)
+
+        @nn.nowrap
+        def matrix_usage(self, path, lengths, *, logits=False):
+            return np.zeros_like(lengths) if logits else lengths
+
+    model = Trunk()
+    variables = model.init(jax.random.key(0), jnp.ones((2, 8), jnp.int32))
+    adapter = LoRA(1, ("Dense_0",)).apply(model, variables, key=1)
+    assert isinstance(adapter.model, CountedTraining)
+    assert not isinstance(adapter.model, CountedLogits)
+    head = DecisionHead(8, layers=0)
+    objective = DecisionObjective(adapter, head=head, tokenizer=ByteTokenizer(),
+                                  layout=StateFirstLayout(max_len=8))
+    batch = {"valid": np.arange(8)[None, :] < LENGTHS[:, None],
+             "questions": np.ones((2, 1), bool), "options": np.ones((2, 1, 2), bool)}
+    assert objective.counts_work
+    frozen = 4 * 8 * 8 * np.sum(LENGTHS)
+    factors = 6 * (8 + 8) * np.sum(LENGTHS)
+    head_work = head.decision_flops(LENGTHS, np.ones(2, np.int64), np.full(2, 2, np.int64))
+    assert objective.training_flops(None, batch) == frozen + factors + 3 * head_work
 
 
 @pytest.mark.parametrize("uncertainty", [None, 8])
