@@ -508,3 +508,17 @@ def test_record_steps_before_an_interleave_run_inside_each_shard():
     assert rows[0] == rows[1] and sorted(rows[0]) == [(index, 10 * index) for index in range(10)]
     with pytest.raises(ValueError, match="only record steps before it"):
         iterate(Pipeline(stored).shuffle(0, window=4).interleave(2), read="streamed", loading=READ)
+
+
+@dataclasses.dataclass(frozen=True)
+class Laid:
+    def __call__(self, element):
+        return {"image": np.resize(np.asarray(element["text"]), (2, 4))}
+
+
+def test_a_memory_read_counts_valid_targets_where_it_packs():
+    """Windows are kept by their own targets, however a later step lays them
+    out: the one-token document's window has none and is left out."""
+    documents = [{"text": np.arange(size, dtype=np.int32)} for size in (8, 1, 8)]
+    laid = Pipeline(Memory(documents)).pack(8, bins=1).map(Laid(), identity="laid@1").batch(1)
+    assert compile(laid, read="memory", loading=READ).records == 2
