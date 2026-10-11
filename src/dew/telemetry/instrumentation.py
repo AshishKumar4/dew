@@ -35,6 +35,7 @@ _NAME = re.compile(r'%([\w.\-]+)')
 _CALLS = re.compile(r'(?:calls|to_apply|select|scatter|condition|body)=%([\w.\-]+)')
 _BRANCHES = re.compile(r'branch_computations=\{([^}]*)\}')
 _TARGET = re.compile(r'custom_call_target="([^"]+)"')
+_TRACED = re.compile(r'op_name="([^"]*)"(?:[^}]*?source_file="([^"]*)"\s+source_line=(\d+))?')
 _CONTRACTING = re.compile(r'lhs_contracting_dims=\{([\d,]*)\}')
 _GEMM_CONTRACTING = re.compile(r'"lhs_contracting_dimensions":\s*\[([^\]]*)\]')
 _WINDOW = re.compile(r'window=\{([^}]*)\}')
@@ -262,6 +263,10 @@ class HloInstruction:
     fused: frozenset[str]
     """The ops of the computations it calls, theirs included: a fusion's body."""
     recomputed: bool
+    traced: frozenset[str]
+    """Where JAX traced it and what it fused: `op_name source_file:line` of
+    its own metadata and of each op in the computations it calls. A
+    multi-output fusion carries none of its own, its ops do."""
 
 
 def hlo_instructions(text: str) -> dict[str, HloInstruction]:
@@ -270,24 +275,33 @@ def hlo_instructions(text: str) -> dict[str, HloInstruction]:
     reads (`hlo_flops`)."""
     computations, _ = _parse(text)
 
-    def fused(name: str, seen: frozenset[str]) -> set[str]:
+    def traced(attributes: str) -> set[str]:
+        return {f"{op_name} {file}:{line}".strip() if file else op_name
+                for op_name, file, line in _TRACED.findall(attributes) if op_name}
+
+    def fused(name: str, seen: frozenset[str]) -> tuple[set[str], set[str]]:
         computation = computations.get(name)
         if computation is None or name in seen:
-            return set()
+            return set(), set()
         ops = {instruction.op for instruction in computation.instructions.values()}
+        names = set().union(*(traced(each.attributes) for each in computation.instructions.values()))
         for instruction in computation.instructions.values():
             for called in _CALLS.findall(instruction.attributes):
-                ops |= fused(called, seen | {name})
-        return ops
+                inner_ops, inner_names = fused(called, seen | {name})
+                ops |= inner_ops
+                names |= inner_names
+        return ops, names
 
     found = {}
     for computation in computations.values():
         for name, instruction in computation.instructions.items():
             target = _TARGET.search(instruction.attributes)
             calls = _CALLS.findall(instruction.attributes) if instruction.op == 'fusion' else []
+            bodies = [fused(called, frozenset()) for called in calls]
             found[name] = HloInstruction(
                 instruction.op, target.group(1) if target else '',
-                frozenset().union(*(fused(called, frozenset()) for called in calls)), instruction.recomputed)
+                frozenset().union(*(ops for ops, _ in bodies)), instruction.recomputed,
+                frozenset(traced(instruction.attributes).union(*(names for _, names in bodies))))
     return found
 
 

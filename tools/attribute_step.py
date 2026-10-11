@@ -146,6 +146,12 @@ def ms(times: dict) -> dict:
     return {key: round(us / 1e3, 3) for key, us in sorted(times.items(), key=lambda item: -item[1])}
 
 
+def by_majority(found: list[str], unknown: str) -> str:
+    """The most common of `found` other than `unknown`, or `unknown`."""
+    named = [each for each in found if each != unknown]
+    return max(set(named), key=named.count) if named else unknown
+
+
 def heaviest(groups: dict) -> list:
     """`groups` of times by key, the largest total first."""
     return sorted(groups.items(), key=lambda item: -sum(item[1].values()))
@@ -175,6 +181,11 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         us = float(row["total_self_time"]) / steps
         source = source_of(row)
         part, direction, kind = part_of(f"{name} {source}"), direction_of(name), kind_of(row, ops)
+        known = (ops or {}).get(str(row.get("hlo_op_name") or ""))
+        if not name and known is not None and known.traced:
+            # A multi-output fusion carries no name of its own; its ops say what it computes.
+            part = by_majority([part_of(each) for each in known.traced], "other")
+            direction = by_majority([direction_of(each) for each in known.traced], "neither")
         by_part[part][direction] += us
         by_kind[kind] += us
         by_part_kind[part][kind] += us
