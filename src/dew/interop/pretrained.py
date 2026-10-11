@@ -1307,7 +1307,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             # by going back over its source names (`weight_layouts`).
             export_adapter = _derived_weights
     model = _input_quantization(model, layouts, config, grid)
-    source = str(name_or_dir) if commit is None else f"{name_or_dir}@{commit}"
+    source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = _generation_config(directory)
 
