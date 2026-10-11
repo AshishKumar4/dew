@@ -30,6 +30,8 @@ from dew.nn.backbones.decoder_block import GatedMLP
 from dew.nn.moe import ExpertMLP, Router, SparseMLP, load_balance_update
 from dew.training import MeshSpec
 
+pytestmark = pytest.mark.kernel
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())
 

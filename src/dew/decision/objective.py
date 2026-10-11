@@ -28,7 +28,15 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.data import DecisionTable, Example, Weighted
 from dew.decision.head import DecisionHead, Head
-from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
+from dew.decision.layout import (
+    OPTION_TILE,
+    DecisionInputs,
+    Layout,
+    MarkerLayout,
+    Specials,
+    StateFirstLayout,
+    compacted,
+)
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
@@ -84,7 +92,9 @@ class Encoding:
     their right option, which makes "none of the above" the right answer. That
     teaches the model to say that no option fits instead of picking the nearest
     wrong one. Each scored slot's target is its gold distribution (`Example.distribution`)
-    in the order the row shows the options.
+    in the order the row shows the options. With `option_slots`, a row also
+    carries its real options compacted to that many slots (`compacted`), which
+    a joint head computes alone.
     """
 
     layout: Layout
@@ -94,6 +104,7 @@ class Encoding:
     questions: int = 1
     shuffle: bool = True
     none_of_the_above: float = 0.0
+    option_slots: int | None = None
 
     def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None) -> Batch:
         labels = example.labels()
@@ -148,6 +159,8 @@ class Encoding:
         if encoded.positions is not None and encoded.slots is not None:
             row["positions"] = _padded(encoded.positions, length, 0)
             row["slots"] = _padded(encoded.slots, length, 0)
+        if self.option_slots is not None:
+            row["option_slots"], row["slotted"] = compacted(row["options"], self.option_slots)
         return row
 
 
@@ -530,12 +543,22 @@ class DecisionObjective(Objective[Ratio]):
                           loading=Loading() if loading is None else loading)
 
     def _encoding(self, rows: Sequence[tuple[Example, tuple[str, ...]]]) -> Encoding:
-        """The layout of `rows`, with as many option and question slots as the widest row needs."""
-        width = max(len(example.questions[name].options) + (self.none_of_the_above > 0)
-                    for example, names in rows for name in names)
+        """The layout of `rows`, with as many option and question slots as the widest row needs.
+
+        A joint row also compacts its real options into as many slots as the
+        row of the most real options needs, rounded up to `OPTION_TILE`, where
+        that is fewer than its grid's (`DecisionInputs.option_slots`).
+        """
+        def options(example: Example, name: str) -> int:
+            return len(example.questions[name].options) + (self.none_of_the_above > 0)
+
+        width = max(options(example, name) for example, names in rows for name in names)
         questions = max(len(names) for _, names in rows)
+        most = max(sum(options(example, name) for name in names) for example, names in rows)
+        slots = -(-most // OPTION_TILE) * OPTION_TILE
         return Encoding(self.layout, self.tokenizer, self.specials, width, questions,
-                        self.shuffle_options, self.none_of_the_above)
+                        self.shuffle_options, self.none_of_the_above,
+                        slots if self.layout.joint and slots < questions * width else None)
 
     def inference_record(self):
         """Return what a saved run rebuilds its task from.
