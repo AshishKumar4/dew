@@ -68,4 +68,15 @@ def source(
     return resolved
 
 
-__all__ = ["TFDS", "Files", "Hub", "Memory", "Read", "Shard", "ShardManifest", "Source", "Torch"]
+__all__ = [
+    "TFDS",
+    "Files",
+    "Hub",
+    "Memory",
+    "Read",
+    "Shard",
+    "ShardManifest",
+    "Source",
+    "TokenFiles",
+    "Torch",
+]
