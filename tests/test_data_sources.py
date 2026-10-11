@@ -154,6 +154,16 @@ def test_csv_quoted_newlines_are_never_byte_split():
     assert indexed[1] == {"id": "1", "text": "last"}
 
 
+def test_file_catalog_keeps_distinct_nested_names_including_underscore_directories(tmp_path):
+    names = [f"speaker-{speaker}/{clip}/00001.mp4" for speaker in (1, 2) for clip in ("_clip", "other")]
+    for name in names:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"video")
+    rows = Files(str(tmp_path), format="files").records("indexed")
+    assert [row["path"] for row in rows] == [(tmp_path / name).as_uri() for name in sorted(names)]
+
+
 def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
     text = "a" * 140_000 + "\n" + "b" * 140_000
     root = Store(f"memory://csv-large-{uuid4().hex}/rows.csv")
