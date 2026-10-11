@@ -1462,12 +1462,13 @@ def compile(
                 leaf.source.snapshot() for leaf in _leaves(original) if not isinstance(leaf.source, (Mixture, Phases))
             ]
         },
-        tuple(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
+        (*(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
+         *(StepIdentity.of(step) for step in host)),
     )
     plan = Plan(
         "global" if global_order else "per-share",
         manifest,
-        _order(train),
+        {"read": read, "seed": seed, **_order(train)},
         _derived(train, seed, read),
         cache=(*generations, *_cache_references(original, read)),
         volatile=any(
@@ -1583,7 +1584,10 @@ def _training_reader(partition: DataPartition, *, pipeline: Pipeline, build: _Bu
                               plan=plan, resume=resume, endless=_endless(pipeline))
     else:
         own_plan = dataclasses.replace(plan, topology={"shares": partition.count, "share": partition.index,
-                                                       "workers": _workers(pipeline, build.loading)})
+                                                       "workers": _workers(pipeline, build.loading),
+                                                       "row_multiple": partition.row_multiple,
+                                                       "cycle_lengths": [stage.cycle_length for stage in _steps(pipeline)
+                                                                         if isinstance(stage, Interleave)]})
         opened = _PerShare(functools.partial(build.batches, pipeline, partition), own_plan, resume,
                            endless=_endless(pipeline))
         statistics.observe(opened)

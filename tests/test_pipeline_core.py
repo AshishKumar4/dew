@@ -257,6 +257,8 @@ def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     warm = build(Pipeline(stored).cache(generation)).train(DataPartition())
     warm_first, warm_second = take(warm, 2), take(warm, 2)
     assert by_id(warm_first) != by_id(warm_second)
+    assert warm_first == first_epoch
+    assert warm_second == second_epoch
     warm.close()
 
 

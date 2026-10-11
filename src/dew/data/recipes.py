@@ -153,7 +153,7 @@ class _HashSource:
         return {**self.source.snapshot(), "holdout": self.fraction, "held": self.held}
 
     def supports(self, read: Read) -> bool:
-        return self.source.supports(read)
+        return read != "indexed" and self.source.supports(read)
 
     def records(self, read: Read):
         import grain.python as grain
