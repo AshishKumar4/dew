@@ -226,9 +226,7 @@ class GatedMLP(nn.Module):
         maps = 2 if self.activation in UNGATED else 3
         return maps * projection_flops(lengths, self.out_features, self.hidden_features)
 
-    @nn.nowrap
-    def parameter_flops(self, lengths) -> float:
-        return self.model_flops(lengths)
+    parameter_flops = model_flops
 
     def setup(self):
         dense = functools.partial(
@@ -547,29 +545,22 @@ class DecoderBlock(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Compose the declared mixer and MLPs, independent of remat and storage."""
-        if any(value is not None for value in (self.altup, self.hyper_connections,
-                                               self.residual_site, self.engram)):
-            raise MissingFlopsCount("DecoderBlock needs its multi-stream or memory-extension geometry")
-        count = counted_flops(self.mixer(parent=None), lengths)
-        for factory in (self.feedforward, self.parallel):
-            if factory is not None:
-                count += counted_flops(factory(parent=None), lengths)
-        if self.per_layer_input_dim:
-            count += 2 * projection_flops(lengths, self.emb_features, self.per_layer_input_dim)
-        if self.laurel_rank is not None:
-            count += 2 * projection_flops(lengths, self.emb_features, self.laurel_rank)
-        return count
+        return self._submodule_flops(lengths, counted_flops)
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
-        """The block's learned matrices only, as PEFT's frozen base work."""
+        """The same submodules' learned matrices, as PEFT's frozen base work."""
+        return self._submodule_flops(lengths, parameter_flops)
+
+    @nn.nowrap
+    def _submodule_flops(self, lengths, counter) -> float:
         if any(value is not None for value in (self.altup, self.hyper_connections,
                                                self.residual_site, self.engram)):
-            raise MissingFlopsCount("DecoderBlock needs its multi-stream parameter geometry for PEFT")
-        count = parameter_flops(self.mixer(parent=None), lengths)
+            raise MissingFlopsCount("DecoderBlock needs its multi-stream or memory-extension geometry")
+        count = counter(self.mixer(parent=None), lengths)
         for factory in (self.feedforward, self.parallel):
             if factory is not None:
-                count += parameter_flops(factory(parent=None), lengths)
+                count += counter(factory(parent=None), lengths)
         if self.per_layer_input_dim:
             count += 2 * projection_flops(lengths, self.emb_features, self.per_layer_input_dim)
         if self.laurel_rank is not None:

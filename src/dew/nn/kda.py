@@ -33,7 +33,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from .flops import delta_flops, projection_flops, real_lengths
+from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import AttentionMetadata
 from .linear import (
     CHUNK_SIZE,
@@ -110,7 +110,8 @@ class KimiDeltaAttention(nn.Module):
             direct += self.head_dim
             low_rank += self.head_dim * inner
         return (projection_flops(lengths, self.emb_features, direct)
-                + float(real_lengths(lengths).sum()) * (2 * low_rank + 6 * inner * self.conv_kernel)
+                + projection_flops(lengths, 1, low_rank)
+                + 3 * conv_flops(lengths, inner, inner, self.conv_kernel, groups=inner)
                 + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):

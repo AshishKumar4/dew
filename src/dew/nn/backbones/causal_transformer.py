@@ -898,14 +898,20 @@ class CausalTransformer(nn.Module):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Hidden-state forward work: real rows, each loop pass, no embeddings or remat.
-
-        Factories are the same ones `setup` uses, so kind geometry, shared
-        K/V and dense/routed layer patterns cannot drift from the model.
-        The objective counts a vocabulary or decision head separately.
-        """
+        """Real-row hidden-state work, summing the same block factories as setup."""
         if self.altup is not None or self.hyper_connections is not None:
             raise MissingFlopsCount("CausalTransformer needs its multi-stream expansion geometry")
+        return self._layer_flops(lengths, counted_flops)
+
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Learned matrices, separately from nonparameter attention/state work."""
+        if any(value is not None for value in (self.altup, self.hyper_connections, self.attention_residuals)):
+            raise MissingFlopsCount("CausalTransformer needs its multi-stream parameter geometry for PEFT")
+        return self._layer_flops(lengths, parameter_flops)
+
+    @nn.nowrap
+    def _layer_flops(self, lengths, counter) -> float:
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
         mixer = self.mixer if self.mixer is not None else AttentionMixer(
@@ -918,7 +924,7 @@ class CausalTransformer(nn.Module):
         for index in range(self.num_layers):
             block = self._block(specs, mixer, factories, BlockWiring(), index, f'layers_{index}')
             passes = self.loop.steps if self.loop is not None and loop_start <= index < loop_end else 1
-            total += passes * counted_flops(block, lengths)
+            total += passes * counter(block, lengths)
         if self.per_layer_input_dim:
             total += projection_flops(lengths, self.emb_features, self.num_layers * self.per_layer_input_dim)
         if self.loop is not None and self.loop.exit_gate:
@@ -928,33 +934,8 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def logits_flops(self, lengths) -> float:
         """The vocabulary matrix and optional prediction transform, tied or untied."""
-        count = projection_flops(lengths, self.emb_features, self.vocab_size)
-        if self.head_transform is not None:
-            count += projection_flops(lengths, self.emb_features, self.emb_features)
-        return count
-
-    @nn.nowrap
-    def parameter_flops(self, lengths) -> float:
-        """Learned base matrices, separately from nonparameter attention/state work."""
-        if any(value is not None for value in (self.altup, self.hyper_connections, self.attention_residuals)):
-            raise MissingFlopsCount("CausalTransformer needs its multi-stream parameter geometry for PEFT")
-        types = self.per_layer_types
-        kinds = self.layer_kinds(types)
-        mixer = self.mixer if self.mixer is not None else AttentionMixer()
-        specs = self._layer_specs(types, kinds, mixer)
-        factories = self.feedforward_factories()
-        first, end = ((0, self.num_layers) if self.loop is None or self.loop.layers is None
-                      else self.loop.layers)
-        count = 0.0
-        for index in range(self.num_layers):
-            block = self._block(specs, mixer, factories, BlockWiring(), index, f'layers_{index}')
-            passes = self.loop.steps if self.loop is not None and first <= index < end else 1
-            count += passes * parameter_flops(block, lengths)
-        if self.per_layer_input_dim:
-            count += projection_flops(lengths, self.emb_features, self.num_layers * self.per_layer_input_dim)
-        if self.loop is not None and self.loop.exit_gate:
-            count += self.loop.steps * projection_flops(lengths, self.emb_features, 1)
-        return count
+        widths = self.vocab_size + (self.emb_features if self.head_transform is not None else 0)
+        return projection_flops(lengths, self.emb_features, widths)
 
     @nn.nowrap
     def matrix_usage(self, path: tuple[str, ...], lengths, *, logits: bool = False):

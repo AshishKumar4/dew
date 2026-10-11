@@ -50,6 +50,11 @@ def projection_flops(lengths: np.ndarray, inputs: int, outputs: int) -> float:
     return float(2 * inputs * outputs * np.sum(real_lengths(lengths)))
 
 
+def conv_flops(lengths: np.ndarray, inputs: int, outputs: int, taps: int, *, groups: int = 1) -> float:
+    """Convolution MACs per real output position, with grouped input width."""
+    return projection_flops(lengths, taps * inputs // groups, outputs)
+
+
 def dense_training_flops(lengths: np.ndarray, inputs: int, outputs: int, *,
                           trainable: bool = True, adapter_rank: int = 0) -> float:
     """Forward/backward work of a dense layer, separate from forward FLOPs.
