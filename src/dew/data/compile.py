@@ -1500,6 +1500,9 @@ def compile(
         metadata = _metadata(combined, read)
         if read == "memory":
             train = _materialize(_configured(train, metadata, read, "source"), counts)
+            if not any(len(leaf.source.records(read)) for leaf in _leaves(train)
+                       if not isinstance(leaf.source, (Mixture, Phases))):
+                raise ValueError(f"no accepted rows of {_name(train)}; raise the row budgets")
             validation = (
                 None
                 if validation is None
