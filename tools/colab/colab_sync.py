@@ -38,18 +38,26 @@ def missing_only(error):
         raise error
 
 
-def walk_files(root, policy):
+def raw_profile(file):
+    """Keep raw captures VM-side; only explicit requests may transfer them."""
+    return (file.name.endswith((".xplane.pb", ".pt.trace.json", "trace.json", "trace.json.gz", "hlo.tgz"))
+            or "hlo" in file.parts or "plugins" in file.parts
+            or any(path.name == "reports" and (path.parent / "manifest.json").is_file() for path in file.parents))
+
+
+def walk_files(root, policy, include_raw=True):
     if not root.is_dir():
         yield root
         return
     for directory, children, names in os.walk(root, followlinks=False, onerror=missing_only):
         current = Path(directory)
         # Prune checkpoint stores before descending, including named runs.
-        children[:] = [name for name in children if retained_path(current / name / "_probe", policy)]
+        children[:] = [name for name in children if retained_path(current / name / "_probe", policy)
+                       and (include_raw or not raw_profile(current / name / "_probe"))]
         yield from (current / name for name in names)
 
 
-def output_files(tree, patterns, policy="all", excludes=()):
+def output_files(tree, patterns, policy="all", excludes=(), *, include_raw=True):
     """One inventory for incremental and final collection, including nested logs.
 
     A measurements job declares OUT once, not a fragile list of log globs.
@@ -68,8 +76,10 @@ def output_files(tree, patterns, policy="all", excludes=()):
         for matched in glob.glob(str(tree / pattern), recursive=True):
             root = Path(matched)
             scope = root.resolve() if root.is_dir() else root.parent.resolve()
-            for file in walk_files(root, policy):
+            for file in walk_files(root, policy, include_raw):
                 if not file.is_file():
+                    continue
+                if not include_raw and raw_profile(file):
                     continue
                 relative = os.path.relpath(file, tree)
                 name = str(file).lstrip("/") if relative.startswith("..") else relative
@@ -136,9 +146,9 @@ def pack_files(files, archive):
     return manifest
 
 
-def pack_outputs(tree, patterns, archive, policy="all", excludes=()):
+def pack_outputs(tree, patterns, archive, policy="all", excludes=(), *, include_raw=True):
     """Final packaging uses exactly the same output policy as snapshots."""
-    files = output_files(tree, patterns, policy, excludes)
+    files = output_files(tree, patterns, policy, excludes, include_raw=include_raw)
     manifest = pack_files(files, archive)
     sidecar = Path(str(archive) + ".manifest.json")
     temporary = sidecar.with_name(sidecar.name + ".tmp")
@@ -147,10 +157,10 @@ def pack_outputs(tree, patterns, archive, policy="all", excludes=()):
     return list(manifest)
 
 
-def snapshot(tree, patterns, known, archive, policy="all", excludes=()):
+def snapshot(tree, patterns, known, archive, policy="all", excludes=(), *, include_raw=True):
     tree = Path(tree)
     files = {}
-    for name, file in output_files(tree, patterns, policy, excludes).items():
+    for name, file in output_files(tree, patterns, policy, excludes, include_raw=include_raw).items():
         try:
             before = file.stat()
             with file.open("rb") as stream:
