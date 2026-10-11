@@ -1167,6 +1167,21 @@ def test_remote_snapshot_prune_error_is_retryable_not_a_session_failure(tmp_path
     assert driver.state["action"] == "poll" and driver.state["results"] == []
 
 
+def test_snapshot_storage_error_records_attention_without_declaring_workload_dead(tmp_path):
+    class Kernel:
+        def execute_code(self, *args, **kwargs):
+            return [{"output_type": "error", "ename": "PermissionError", "evalue": "blocked storage"}]
+
+        def stop(self, **kwargs):
+            return None
+
+    driver = Driver(tmp_path / "run", types.SimpleNamespace(kernel=lambda *args, **kwargs: Kernel()), "unused")
+    with pytest.raises(ops_driver.TransportError):
+        driver.control(allocation.Session("owned", "https://fake.invalid/", "token"), "snapshot", live_read=True)
+    assert driver.state["collection_needs_attention"] and driver.state["collection_error_names"] == ["PermissionError"]
+    assert driver.state["results"] == []
+
+
 def test_emergency_out_measurements_survive_a_slow_batch_log(tmp_path, fake_vm, monkeypatch):
     remote, _, session = fake_vm
     write(remote / "content/out/result.json", b'{"exit":0}')
