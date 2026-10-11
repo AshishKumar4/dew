@@ -16,6 +16,7 @@ from jax.sharding import Mesh
 from dew.nn.kernels.generation import (
     KERNELS,
     assumed,
+    backend,
     bf16_dot_runs,
     device_generation,
     measured_kernel,
@@ -40,6 +41,31 @@ def test_an_assumed_generation_answers_for_the_device(generation, triton, bf16):
         with assumed(None):
             assert (device_generation(), triton_runs(), bf16_dot_runs()) == own
     assert (device_generation(), triton_runs(), bf16_dot_runs()) == own
+
+
+@pytest.mark.parametrize("generation, platform", [("sm75", "gpu"), ("sm120", "gpu"), ("v5e", "tpu"),
+                                                  ("cpu", "cpu")])
+def test_an_assumed_generation_names_its_platform(generation, platform):
+    own = backend()
+    with assumed(generation):
+        assert backend() == platform
+    assert backend() == own == jax.default_backend()
+
+
+def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
+    """On this CPU, jax.nn's xla attention sums a long fp32 value product in one chain, so 'auto' takes
+    the reference path, and an explicit Pallas RMSNorm interprets. Under an assumed T4 both act as
+    on the GPU: the xla path, and XLA's RMSNorm, as a T4 compiles no Triton kernel."""
+    from dew.nn.attention import VALUE_BLOCK, _xla_kernel_chains
+    from dew.nn.kernels import norm_swiglu
+
+    query, key = jnp.zeros((1, 8, 2, 64)), jnp.zeros((1, VALUE_BLOCK + 1, 2, 64))
+    x = jnp.zeros((4, 64))
+    assert _xla_kernel_chains(query, key)
+    assert norm_swiglu.rms_kernel('pallas', x, None, jnp.float32, fp32_statistics=True) == 'pallas'
+    with assumed('sm75'):
+        assert not _xla_kernel_chains(query, key)
+        assert norm_swiglu.rms_kernel('pallas', x, None, jnp.float32, fp32_statistics=True) == 'xla'
 
 
 def test_the_gpu_mesh_keeps_the_axes_over_the_generations_devices():
