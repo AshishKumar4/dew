@@ -36,6 +36,7 @@ from dew.nn.attention import (
     with_documents,
 )
 from dew.nn.blocks import normal_kernel
+from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import Admitted, AttentionMetadata
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -285,6 +286,18 @@ class CausalSelfAttention(nn.Module):
     def value_dim(self) -> int:
         """The width of one value head."""
         return self.head_dim if self.value_head_dim is None else self.value_head_dim
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Query/output maps and unshared K/V maps, plus QK and AV."""
+        query = self.num_heads * self.head_dim * (2 if self.output_gate else 1)
+        kv = 0 if self.kv_shared else self.num_kv_heads * (
+            self.head_dim + (0 if self.k_eq_v else self.value_dim))
+        output = self.num_heads * self.value_dim
+        window = self.sliding_window if self.causal or self.bidirectional_window else None
+        return (projection_flops(lengths, self.emb_features, query + kv + output)
+                + attention_flops(lengths, self.num_heads, self.head_dim, self.value_dim, causal=self.causal,
+                                  window=window, chunk=self.attention_chunk))
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its query, key and value projections packed as `qkv_proj`

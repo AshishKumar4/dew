@@ -43,10 +43,11 @@ from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import INTERMEDIATES, layer_output, layer_outputs
+from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import DecoderTraining, Logits, TokenModel
+from dew.nn.protocols import CountedLogits, DecoderTraining, Logits, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     OMITTED,
@@ -613,6 +614,54 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     frozen reference, as GRPO's and DPO's do, keeps the tiled head as its default,
     so the loss's temporaries stay one tile in size whatever the vocabulary.
     """
+
+    counts_tokens: ClassVar[bool] = True
+
+    def _counted_tokens(self, batch: Batch):
+        """Host token geometry, with the same padding/packing fields as the loss."""
+        raw = batch[TEXT_KEY]
+        prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
+        tokens = np.asarray(prepared.tokens)
+        fields = prepared.token_fields
+        documents = batch.get("text_segment_ids", fields.get("segment_ids"))
+        valid = np.ones(tokens.shape, bool) if self.pad_id is None else tokens != self.pad_id
+        if "attention_mask" in fields:
+            valid &= np.asarray(fields["attention_mask"], bool)
+        if documents is not None:
+            documents = np.asarray(documents)
+            valid &= documents != 0
+        return valid, documents
+
+    def real_lengths(self, batch: Batch) -> np.ndarray:
+        """Real input lengths, each packed document its own attention square.
+
+        The shifted LM model sees all but the last input column. Repeated
+        segment ids on different rows remain separate documents.
+        """
+        valid, documents = self._counted_tokens(batch)
+        if documents is None:
+            return np.sum(valid[:, :-1], axis=-1, dtype=np.int64)
+        lengths = []
+        for row, visible in zip(documents[:, :-1], valid[:, :-1], strict=True):
+            _, counts = np.unique(row[visible], return_counts=True)
+            lengths.extend(counts)
+        return np.asarray(lengths, np.int64)
+
+    def model_flops(self, model, batch: Batch) -> float:
+        """Hidden states plus predictions within real documents; never padded logits."""
+        model = self.model if model is None else model
+        if type(self) is not LMObjective:
+            raise MissingFlopsCount(f"{type(self).__name__} needs counts for its auxiliary model forwards")
+        if self.mtp_weight:
+            raise MissingFlopsCount("LMObjective needs the prediction-depth geometry when MTP is trained")
+        if not isinstance(model, CountedLogits):
+            raise MissingFlopsCount(f"{type(model).__name__} does not declare logits_flops for the LM head")
+        valid, documents = self._counted_tokens(batch)
+        predicted = valid[:, :-1] & valid[:, 1:]
+        if documents is not None:
+            predicted &= documents[:, :-1] == documents[:, 1:]
+        lengths = np.sum(predicted, axis=-1, dtype=np.int64)
+        return counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
 
     def __init__(
         self,

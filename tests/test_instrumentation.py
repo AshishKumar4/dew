@@ -4,14 +4,16 @@ None of the performance work is evaluable without these numbers, so they get
 the same treatment as the training maths.
 """
 
+import itertools
 import os
+import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, TimingRegression as Regression, batches as batches
+from affine_run import BATCH, FEATURES, TimingRegression as Regression, batches as batches
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
@@ -229,7 +231,41 @@ def test_throughput_metrics_are_consistent():
 
 
 def test_throughput_metrics_ignore_a_zero_interval():
-    assert make_trainer()._throughput(elapsed=0.0, steps=0, samples=0, flops=0.0) == {}
+    from dew.telemetry.instrumentation import NO_FLOPS
+
+    assert make_trainer()._throughput(elapsed=0.0, steps=0, samples=0, flops=NO_FLOPS) == {}
+
+
+def test_mfu_reads_analytical_work_and_keeps_both_hlo_utilizations(monkeypatch):
+    """MFU is the real-token forward/backward estimate; the two HLO counts
+    remain separate and never stand in for a missing analytical count."""
+    from dew.telemetry import peaks
+    from dew.telemetry.instrumentation import StepFlops
+
+    monkeypatch.setitem(peaks.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
+    trainer = make_trainer()
+    metrics = trainer._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0),
+                                   model_flops=80.0, tokens=700)
+    assert metrics["train/mfu"] == pytest.approx(3 * 80 / (2 * 100 * trainer.device_mesh.devices.size))
+    assert metrics["train/tokens"] == 70
+    assert metrics["train/tokens_per_s"] == 350
+    assert metrics["train/hlo_flops_util"] == pytest.approx(0.05)
+    assert metrics["train/hfu"] == pytest.approx(0.075)
+    missing = trainer._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0))
+    assert "train/mfu" not in missing and "train/hlo_flops_util" in missing
+
+
+def test_throughput_metrics_report_compiles_and_waits_apart_from_steps():
+    """An interval's rates are over its steps alone: a second spent compiling
+    a new shape is reported as train/compile_s, and the wait on input as
+    train/data_wait_ms a step."""
+    metrics = make_trainer()._throughput(elapsed=3.0, steps=10, samples=640, flops=None, waited=0.5,
+                                         compiling=1.0)
+    assert metrics["train/step_time_ms"] == pytest.approx(200.0)
+    assert metrics["train/samples_per_sec"] == pytest.approx(320.0)
+    assert metrics["train/data_wait_ms"] == pytest.approx(50.0)
+    assert metrics["train/compile_s"] == pytest.approx(1.0)
+    assert "train/compile_s" not in make_trainer()._throughput(elapsed=2.0, steps=10, samples=640, flops=None)
 
 
 def test_mfu_is_skipped_on_unknown_hardware():
@@ -345,6 +381,33 @@ def test_compiled_flops_counts_a_matmul_and_its_gradient():
     analytic = 2 * rows * contracted * columns
     assert compiled_flops(forward) == pytest.approx(analytic, rel=0.01)
     assert compiled_flops(with_gradient) == pytest.approx(2 * analytic, rel=0.01)
+
+
+def test_a_remats_recomputed_forward_counts_once_in_the_models_flops():
+    """A block under `jax.checkpoint` runs its forward again in the backward:
+    the hardware FLOPs count both runs, and the model's count the step as it
+    would run without the remat, matmul for matmul."""
+    from dew.telemetry.instrumentation import step_flops
+
+    def loss(weights, values, block):
+        hidden = values
+        for weight in weights:
+            hidden = block(hidden, weight)
+        return jnp.sum(hidden ** 2)
+
+    def layer(hidden, weight):
+        return jnp.tanh(hidden @ weight)
+
+    weights = [jnp.full((64, 64), 0.01) for _ in range(3)]
+    values = jnp.ones((32, 64))
+    plain = jax.jit(jax.grad(lambda w, x: loss(w, x, layer))).lower(weights, values).compile()
+    rematted = jax.jit(jax.grad(lambda w, x: loss(w, x, jax.checkpoint(layer)))).lower(
+        weights, values).compile()
+
+    once, twice = step_flops(plain), step_flops(rematted)
+    assert once.model == once.hardware
+    assert twice.model == pytest.approx(once.hardware)
+    assert twice.hardware > twice.model
 
 
 def test_compiled_flops_matches_the_transformer_flop_formula():
@@ -490,6 +553,30 @@ def test_fit_reports_throughput_to_the_tracker():
     assert len(ticks) == 3, "no throughput was logged"
     assert all(p["train/step_time_ms"] > 0 for p in ticks)
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
+
+
+def test_fit_reports_the_wait_on_input_and_a_later_compile():
+    """An input slower than the step shows as train/data_wait_ms once the
+    batches read ahead during the first compile are spent, and a batch of a
+    shape the loop has not met compiles inside its tick, which reports the
+    compile as train/compile_s; the ticks that compiled nothing report none."""
+    tracker = RecordingTracker()
+
+    def slow():
+        rng = np.random.default_rng(0)
+        for rows in itertools.chain([BATCH] * 2, itertools.repeat(2 * BATCH)):
+            time.sleep(0.1)
+            x = rng.normal(size=(rows, FEATURES)).astype(np.float32)
+            yield {"x": x, "y": 2 * x[:, :2]}
+
+    make_trainer(tracker=tracker).fit(Data(slow), steps=10, log_every=1)
+
+    ticks = [p for _, p in tracker.scalars if "train/step_time_ms" in p]
+    assert len(ticks) == 10
+    waits = [p["train/data_wait_ms"] for p in ticks]
+    assert min(waits[-4:]) >= 50, waits
+    assert [("train/compile_s" in p) for p in ticks] == [False, False, True] + [False] * 7
+    assert ticks[2]["train/compile_s"] > 0
 
 
 def test_compilation_cache_directory_is_configured(tmp_path):

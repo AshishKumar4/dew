@@ -99,18 +99,28 @@ COMMAND_BUFFERS = (
     "XLA_FLAGS=--xla_gpu_enable_command_buffer= for op-level reports, and time runs without it")
 
 
+def report_table(path: Path, index: int = 0) -> tuple[list[str], list[dict[str, JSON]]]:
+    """The `index`-th DataTable of an exported XProf report (`reports/hlo_stats.json`,
+    `framework_op_stats.json`, ...): its column ids, and its rows as values by column.
+    A report that is absent or holds no such table has neither."""
+    exported = json.loads(path.read_text()) if path.exists() else []
+    tables = exported if isinstance(exported, list) else [exported]
+    if index >= len(tables) or not isinstance(tables[index], dict) or "cols" not in tables[index]:
+        return [], []
+    columns = [column.get("id") for column in tables[index]["cols"]]
+    return columns, [{name: (cell.get("v") if isinstance(cell, dict) else cell)
+                      for name, cell in zip(columns, row["c"], strict=False)}
+                     for row in tables[index].get("rows", [])]
+
+
 def attributed_ops(reports: Path) -> int | None:
     """How many HLO ops XProf's hlo_stats in `reports` attributes device time
     to, not counting whole modules (`XlaModule`), as it reports kernels run as
     a command buffer; None where it has no hlo_op_name column to tell by."""
-    path = reports / "hlo_stats.json"
-    tables = json.loads(path.read_text()) if path.exists() else []
-    table: dict = (tables[0] if tables else {}) if isinstance(tables, list) else tables
-    columns = [column.get("id") for column in table.get("cols", [])]
+    columns, rows = report_table(reports / "hlo_stats.json")
     if "hlo_op_name" not in columns:
         return None
-    name = columns.index("hlo_op_name")
-    return sum(not str(row["c"][name].get("v", "")).startswith("XlaModule") for row in table.get("rows", []))
+    return sum(not str(row.get("hlo_op_name") or "").startswith("XlaModule") for row in rows)
 
 
 def _reports(directory: Path, converter: _Converter, metadata: dict[str, JSON]) -> None:

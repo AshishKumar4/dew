@@ -38,6 +38,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
+from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.protocols import TokenModel
 from dew.objectives.base import (
     OMITTED,
@@ -302,6 +303,23 @@ class DecisionObjective(Objective[Ratio]):
     artifact = Decisions
     saved_task = Decide
     _held_parts = True
+
+    counts_tokens = True
+
+    def real_lengths(self, batch: Batch) -> np.ndarray:
+        """The layout's unpadded row lengths, not its bucket or maximum length."""
+        return np.sum(np.asarray(batch["valid"], bool), axis=-1, dtype=np.int64)
+
+    def model_flops(self, model, batch: Batch) -> float:
+        """One backbone pass plus the head's real question/option geometry."""
+        model = self.model if model is None else model
+        if self.image_processor is not None:
+            raise MissingFlopsCount("DecisionObjective needs its image tower's multi-sequence geometry")
+        lengths = self.real_lengths(batch)
+        questions = np.sum(np.asarray(batch["questions"], bool), axis=-1, dtype=np.int64)
+        options = np.sum(np.asarray(batch["options"], bool), axis=(-2, -1), dtype=np.int64)
+        return (counted_flops(model.backbone, lengths)
+                + model.head.decision_flops(lengths, questions, options))
 
     def __init__(self, backbone: nn.Module | Source | Adapter | Decide, *,
                  loss: ScoringRule | None = None, tokenizer: Tokenizer | None = None,

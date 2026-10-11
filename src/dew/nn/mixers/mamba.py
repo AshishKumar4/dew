@@ -39,6 +39,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import normal_kernel
+from dew.nn.flops import projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
@@ -128,6 +129,19 @@ class Mamba(nn.Module):
     """Normal std of out_proj; None follows init_std."""
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Input/output maps, conv and the recurrent state write/read, 4*D*N.
+
+        The delta*B*x outer write and C*h read each cost 2*D*N per token.
+        Pointwise exp(delta*A)*h and gates are excluded, the same MAC
+        convention used for GDN/KDA and SSD, independent of chunk size.
+        """
+        inner = self.intermediate_size
+        return (projection_flops(lengths, self.emb_features, 3 * inner)
+                + projection_flops(lengths, inner, 2 * self.time_step_rank + 2 * self.state_size)
+                + float(real_lengths(lengths).sum()) * inner * (2 * self.conv_kernel + 4 * self.state_size))
 
     def setup(self):
         if self.conv_kernel < 2:

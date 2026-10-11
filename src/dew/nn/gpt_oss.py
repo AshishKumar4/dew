@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.moe import (
     Routes,
     chosen_experts,
@@ -45,6 +46,13 @@ class GptOssExperts(nn.Module):
     capacity_factor: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Three maps per expert assignment; lengths count dispatched rows."""
+        if self.capacity_factor is not None:
+            raise MissingFlopsCount("GptOssExperts needs admitted expert counts when capacity drops tokens")
+        return 3 * projection_flops(lengths, self.hidden_size, self.intermediate_size)
 
     @nn.compact
     def __call__(self, x: jax.Array, weights: jax.Array, indices: jax.Array) -> jax.Array:
@@ -106,6 +114,16 @@ class GptOssMLP(nn.Module):
     capacity_factor: float | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Router and only the selected experts' three projections."""
+        if self.capacity_factor is not None:
+            raise MissingFlopsCount("GptOssMLP needs admitted expert counts when capacity drops tokens")
+        return (projection_flops(lengths, self.hidden_size, self.num_local_experts)
+                + 3 * self.num_experts_per_tok * projection_flops(
+                    lengths, self.hidden_size, self.intermediate_size)
+                + projection_flops(lengths, self.num_experts_per_tok, self.hidden_size))
 
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:

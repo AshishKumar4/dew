@@ -35,6 +35,7 @@ from dew.nn.kernels import delta_chunks, delta_prep, delta_rule
 
 from .attention import FORWARD_MODE, unweighted_rmsnorm
 from .blocks import normal_kernel
+from .flops import delta_flops, projection_flops, real_lengths
 from .inputs import AttentionMetadata, valid_order
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
 from .precision import asks_default_precision, at_least_fp32
@@ -602,6 +603,14 @@ class GatedDeltaNet(nn.Module):
     @property
     def per_v(self) -> int:
         return self.num_v_heads // self.num_k_heads
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Learned maps, conv and algorithm-independent recurrent rule (`delta_flops`)."""
+        projected = 2 * self.key_features + 3 * self.value_features + 2 * self.num_v_heads
+        return (projection_flops(lengths, self.emb_features, projected)
+                + 2 * self.conv_features * self.conv_kernel * float(real_lengths(lengths).sum())
+                + delta_flops(lengths, self.num_v_heads, self.head_k_dim, self.head_v_dim))
 
     def setup(self):
         if self.num_v_heads % self.num_k_heads:

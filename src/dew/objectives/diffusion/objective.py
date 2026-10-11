@@ -39,8 +39,9 @@ from dew.inputs import InputSpec, unit_range
 from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
+from dew.nn.flops import MissingFlopsCount
 from dew.nn.mp import Uncertainty
-from dew.nn.protocols import RequiresText
+from dew.nn.protocols import CountedImages, RequiresText
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -271,6 +272,28 @@ class DiffusionObjective(Objective[Ratio]):
     saved_task = TextToImage
     # A pipeline's own sampling policy, else DDIM, CFG(3.0) and `_DEFAULT_STEPS`.
     resolved = ("solver", "guidance", "steps")
+
+    counts_tokens = False
+
+    def real_lengths(self, batch: Batch) -> np.ndarray:
+        """The denoiser's real patch-token lengths from the objective's latent shape."""
+        if not isinstance(self.model, CountedImages):
+            raise MissingFlopsCount(f"{type(self.model).__name__} has no declared image_lengths geometry")
+        rows = np.shape(batch[self.inputs.sample.key])[0]
+        return self.model.image_lengths(self.latent_shape, rows)
+
+    def model_flops(self, model, batch: Batch) -> float:
+        """Assemble the denoiser's patch/time/text projections and its layers."""
+        model = self.model if model is None else model
+        if not isinstance(model, CountedImages):
+            raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
+        if type(self) is not DiffusionObjective or self.alignment is not None or self.end_to_end is not None:
+            raise MissingFlopsCount(f"{type(self).__name__} needs counts for its "
+                                    "additional forwards and heads")
+        if self.autoencoder is not None or self.inputs.conditions or self.uncertainty is not None:
+            raise MissingFlopsCount("DiffusionObjective needs auxiliary "
+                                    "autoencoder/condition/uncertainty work")
+        return model.image_flops(self.real_lengths(batch), self.latent_shape[-1])
 
     @property
     def inputs(self) -> InputSpec:

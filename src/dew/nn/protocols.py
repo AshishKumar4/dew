@@ -41,6 +41,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
+import numpy as np
 from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
 
@@ -48,15 +49,17 @@ from dew.nn.inputs import ModelKwarg
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
+    from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.dit import TextContext
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "DecoderTraining", "DenoisingModel",
+__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedImages", "CountedLogits",
+           "DecoderTraining", "DenoisingModel",
            "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
-           "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RequiresText", "Serving",
-           "TimeScaled", "TokenModel", "TritonGemm"]
+           "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
+           "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
 
 
 @struct.dataclass
@@ -84,6 +87,47 @@ class Logits(Protocol):
     """A token model's `[B, S, vocab]` fp32 logits over the whole sequence."""
 
     def logits(self, tokens: jax.Array, *, train: bool = False, **fields: ModelKwarg) -> jax.Array: ...
+
+
+@runtime_checkable
+class Counted(Protocol):
+    """Analytical forward FLOPs summed over real row lengths, on the host.
+
+    A token backbone counts its hidden states, excluding the vocabulary
+    head, which an LM objective adds through `CountedLogits`; a decision
+    objective instead adds its decision head's work. Lookup embeddings,
+    rematerialization and padded tokens are excluded. Geometry beyond one
+    sequence is supplied by the objective through a family's named count.
+    A family that cannot count it raises `MissingFlopsCount`, never HLO.
+    """
+
+    def model_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedLogits(Counted, Protocol):
+    """A counted token backbone with separate vocabulary-head work.
+
+    `lengths` counts predicted real tokens. A plain head contributes
+    2*width*vocabulary per token, whether its matrix is tied or tiled.
+    """
+
+    def logits_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedImages(Protocol):
+    """A patch-token model's forward work with channel/conditioning geometry.
+
+    Models whose patch projection infers its channels at init cannot derive
+    that map's input width from token lengths alone. The objective supplies
+    `input_channels` and the pooled text width (None for no text).
+    """
+
+    def image_flops(self, lengths: np.ndarray, input_channels: int,
+                    text_features: int | None = None) -> float: ...
+
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
 
 
 @runtime_checkable
@@ -146,9 +190,26 @@ class CacheCapacity(Protocol):
 class Looping(Protocol):
     """A model whose layer stack can run a block of it several times over its own output,
     and the same model at `steps` passes of its block (None keeps its count), or of the block
-    `layers`, [first, end), which gives a model with no loop one; None where they cannot."""
+    `layers`, [first, end), which gives a model with no loop one; None where they cannot.
+    `backprop_steps` trains through the final passes and `remat` checkpoints each pass;
+    None keeps an existing loop's value, or a fresh loop's default."""
 
-    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None: ...
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
+                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None: ...
+
+
+@runtime_checkable
+class RematChoosing(Protocol):
+    """A decoder whose layers start at a chosen `RematPolicy`, or None for no remat.
+
+    CausalTransformer and the multimodal and DiffusionGemma models that wrap
+    it answer this capability. Image diffusion models choose a `RematChoice`
+    instead of named decoder residuals, so they do not. A policy outside
+    `DECODER_REMAT` is valid, but `Recomputing.recompute_more` cannot climb
+    from it.
+    """
+
+    def with_remat(self, policy: RematPolicy | None) -> Self: ...
 
 
 @runtime_checkable

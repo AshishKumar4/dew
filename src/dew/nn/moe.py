@@ -35,6 +35,7 @@ from jax.sharding import PartitionSpec as P
 
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
+from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import measured_kernel, ran_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
@@ -565,6 +566,11 @@ class ExpertLinear(nn.Module):
     features: int
     init_std: float | None = None  # normal std of every expert; None: per-expert lecun normal
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """One matrix per dispatched token, not one for every stored expert."""
+        return projection_flops(lengths, self.in_features, self.features)
+
     def setup(self):
         # With the expert dimension as a batch axis, fan_in is per expert and
         # every expert initialises like the matching nn.Dense of a dense MLP.
@@ -954,6 +960,14 @@ class ExpertMLP(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Maps for dispatched rows, one row per active expert assignment."""
+        if self.capacity_factor is not None:
+            raise MissingFlopsCount("ExpertMLP needs the admitted routing counts when capacity drops tokens")
+        maps = 2 if self.activation == 'relu2' else 3
+        return maps * projection_flops(lengths, self.out_features, self.hidden_features)
+
     def setup(self):
         if self.swiglu_limit is not None and self.swiglu_limit <= 0:
             raise ValueError(
@@ -1081,6 +1095,25 @@ class SparseMLP(nn.Module):
     latent_norm: Callable[..., nn.Module] | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Router, active expert assignments and the shared branch, never all experts."""
+        width = self.out_features if self.latent_features is None else self.latent_features
+        expert = ExpertMLP(num_experts=self.num_experts, hidden_features=self.hidden_features,
+                           out_features=width, activation=self.activation,
+                           capacity_factor=self.capacity_factor, parent=None)
+        count = (projection_flops(lengths, self.out_features, self.num_experts)
+                 + self.top_k * expert.model_flops(lengths))
+        if not self.scale_inputs:
+            count += projection_flops(lengths, self.top_k, self.out_features)
+        if self.latent_features is not None:
+            count += 2 * projection_flops(lengths, self.out_features, self.latent_features)
+        if self.shared is not None:
+            count += counted_flops(self.shared(parent=None), lengths)
+            if self.shared_gate:
+                count += projection_flops(lengths, self.out_features, 1)
+        return count
 
     def setup(self):
         self.gate = Router(num_experts=self.num_experts,

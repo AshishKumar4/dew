@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from flax import linen as nn
 
+from dew.nn.flops import counted_flops
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import ProjectionGroup, declared_groups
@@ -21,6 +22,11 @@ class _MLP(nn.Module):
     """Share the feed-forward's scope so the mixer boundary adds no parameter nesting."""
 
     feedforward: GatedMLP | SparseMLP
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The same MLP work when it occupies a mixer's slot."""
+        return counted_flops(self.feedforward, lengths)
 
     def setup(self):
         nn.share_scope(self, self.feedforward)
