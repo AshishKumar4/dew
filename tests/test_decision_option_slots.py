@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import FACTOR, distance, widened
+from reference_error import assert_leaves_as_exact, widened
 from safetensors.numpy import load_file
 
 from dew.data import DataPartition
@@ -156,25 +156,10 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     with jax.enable_x64(new_val=True):
         truth, truth_gradient = jax.value_and_grad(loss)(*widened((variables, batch)))
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
-    # The compaction reorders the sums over the grid's option slots, whose
-    # float32 rounding grows as the square root of their count in RMS, so the
-    # grid's own distance is taken as at least that many units of the
-    # tensor's size: one draw of rounding below it is luck, not a bar.
+    # The compaction reorders the sums over the grid's option slots.
     slots = options.shape[1] * options.shape[2]
-    unit = float(np.finfo(np.float32).eps)
-    rows = []
-
-    def exact(path, got, want, true):
-        bar = FACTOR * max(distance(want, true), np.sqrt(slots) * unit * distance(true, 0))
-        rows.append((jax.tree_util.keystr(path), distance(true, 0), distance(want, true),
-                     distance(got, true), bar))
-
-    exact((), float(fewer), float(grid), truth)
-    jax.tree_util.tree_map_with_path(exact, fewer_gradient, grid_gradient, truth_gradient)
-    for row in rows:
-        print("ROW %s truth=%.3e grid=%.3e fewer=%.3e bar=%.3e ratio=%.2f" % (*row, row[3] / row[4]))
-    over = [row for row in rows if row[3] > row[4]]
-    assert not over, over
+    for mine, theirs, true in ((fewer, grid, truth), (fewer_gradient, grid_gradient, truth_gradient)):
+        assert_leaves_as_exact(mine, theirs, true, reductions=slots)
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.
