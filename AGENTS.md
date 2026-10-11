@@ -23,7 +23,7 @@ Read `CONTRIBUTING.md` for design, reference parity, code, tests, and writing st
 - Deliver one head per area of work, landed when that piece is complete and gated; fold small fixes into it rather than landing them separately. Merge `main` into an active head at least daily and before landing.
 - Land complete work early. A change whose correctness the CPU suite proves lands without waiting on unrelated GPU measurements; a default changes only with the measurement that justifies it.
 - Give a finished large head two or three independent reviews in parallel, each with a different focus, instead of reviewing small pieces one by one.
-- Keep internal tooling (CI drivers, cloud runners, provisioning scripts, one-off session scripts) out of this repository.
+- Keep private development tooling (personal cloud runners and session drivers, provisioning scripts, one-off session scripts) out of this repository. Tooling that Dew's own CI, tests, docs or users need, such as the CI entry points and the profiling and attribution tools, stays here.
 
 ## Verification
 
