@@ -17,7 +17,12 @@ norm dx was 1.26e-3 RMS from float64 against the rounded VJP's 1.78e-3;
 SwiGLU's gate gradient was 1.00e-3 against 1.45e-3 (A100). No generation
 selects these kernels until c53 measures their physical GPU kernel times.
 
-The fp32 tests hold maximum relative differences from XLA below 1e-5.
+The fp32 activation/input-gradient tests hold relative differences below
+1e-5. Weight gradients use float64 as the judge: their RMS error may be
+no greater than XLA's, whose GPU column reduction is itself inexact. The
+A100 verify found a 24,576-row fp32 dscale at 4.91e-3 RMS from float64,
+against XLA's 1.22e-3. Both accumulation levels now retain separate fp32
+Neumaier sums/corrections, instead of a left fold followed by plain sum.
 The bf16 tests compare outputs and every gradient against float64, not
 bitwise against XLA's differently rounded autodiff. Forward midpoint flips
 can also differ by one ulp because reductions group differently. c53 keeps
@@ -43,6 +48,7 @@ DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
 ROW_ELEMENTS = 4096
 MAX_PROGRAMS = 256
 ELEMENT_BLOCK = 1024
+SCALE_BLOCK = 128
 
 
 def _row_block(width: int) -> int:
@@ -56,6 +62,18 @@ def _round(x, dtype, interpret: bool):
     """Triton's explicit narrowing casts survive widening, unlike XLA's
     excess-precision casts. Interpretation uses Dew's explicit rounding."""
     return rounded_to(x, dtype) if interpret else x.astype(dtype).astype(x.dtype)
+
+
+def _compensated_add(total, correction, value):
+    """Neumaier's fp32 sum: keep the lost low bits even under cancellation.
+
+    Backward and combine disable FP fusion so a product cannot become an
+    FMA here while the residual still reads its separately rounded value.
+    """
+    merged = total + value
+    lost = jnp.where(jnp.abs(total) >= jnp.abs(value),
+                     (total - merged) + value, (value - merged) + total)
+    return merged, correction + lost
 
 
 def _selected(choice: str, implementation: str, refusal: str | None) -> str:
@@ -135,7 +153,7 @@ def _rms_forward(x_ref, scale_ref, y_ref, inverse_ref, *, epsilon: float,
     plgpu.store(inverse_ref.at[row], inverse, mask=row < rows)
 
 
-def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
+def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, correction_ref, *,
                   offset: bool, after_cast: bool, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
@@ -156,16 +174,40 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
         dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
         plgpu.store(dx_ref.at[row[:, None], columns[None, :]], dx.astype(dx_ref.dtype), mask=mask)
         if scale_ref is not None:
-            normalized = x * inverse[:, None]
-            if after_cast:
-                normalized = _round(normalized, dy_ref.dtype, interpret)
-            accumulated = accumulated + jnp.sum(dy * normalized, axis=0)
+            # Reduce every term accurately, not a rounded row-block sum
+            # whose error compensation at the outer level cannot recover.
+            for lane in range(row_block):
+                at = (i * groups + group) * row_block + lane
+                valid = (at < rows) & (columns < width)
+                value = plgpu.load(x_ref.at[at, columns], mask=valid, other=0).astype(jnp.float32)
+                cotangent = plgpu.load(dy_ref.at[at, columns], mask=valid, other=0).astype(jnp.float32)
+                rstd = plgpu.load(inverse_ref.at[at], mask=at < rows, other=0)
+                normalized = value * rstd
+                if after_cast:
+                    normalized = _round(normalized, dy_ref.dtype, interpret)
+                accumulated = _compensated_add(*accumulated, cotangent * normalized)
         return accumulated
 
-    partial = jax.lax.fori_loop(0, pl.cdiv(rows, groups * row_block), block,
-                                jnp.zeros(columns.shape, jnp.float32))
+    partial, correction = jax.lax.fori_loop(0, pl.cdiv(rows, groups * row_block), block,
+                                           (jnp.zeros(columns.shape, jnp.float32),
+                                            jnp.zeros(columns.shape, jnp.float32)))
     if partial_ref is not None:
         plgpu.store(partial_ref.at[group, columns], partial, mask=columns < width)
+        plgpu.store(correction_ref.at[group, columns], correction, mask=columns < width)
+
+
+def _rms_scale_reduce(partial_ref, correction_ref, scale_ref):
+    """Combine both fp32 parts before the only final cast to the scale dtype."""
+    groups, width = partial_ref.shape
+    columns = pl.program_id(0) * SCALE_BLOCK + jnp.arange(SCALE_BLOCK)
+    def group(i, accumulated):
+        high = plgpu.load(partial_ref.at[i, columns], mask=columns < width, other=0)
+        low = plgpu.load(correction_ref.at[i, columns], mask=columns < width, other=0)
+        return _compensated_add(*_compensated_add(*accumulated, high), low)
+    total, correction = jax.lax.fori_loop(0, groups, group,
+                                         (jnp.zeros(columns.shape, jnp.float32),
+                                          jnp.zeros(columns.shape, jnp.float32)))
+    plgpu.store(scale_ref.at[columns], (total + correction).astype(scale_ref.dtype), mask=columns < width)
 
 
 def _rms_with_inverse(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool,
@@ -197,16 +239,20 @@ def _rms_bwd(epsilon: float, dtype, offset: bool, after_cast: bool, interpret: b
     x, scale, inverse = residual
     rows, width = math.prod(x.shape[:-1]), x.shape[-1]
     groups = min(MAX_PROGRAMS, pl.cdiv(rows, _row_block(width)))
-    dx, partial = pl.pallas_call(
+    partial_shape = None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)
+    dx, partial, correction = pl.pallas_call(
         functools.partial(_rms_backward, offset=offset, after_cast=after_cast, interpret=interpret),
         grid=(groups,),
-        out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype),
-                   None if scale is None else jax.ShapeDtypeStruct((groups, width), jnp.float32)),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
+        out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype), partial_shape, partial_shape),
+        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1, enable_fp_fusion=False),
         interpret=interpret, name="rms_norm_backward",
     )(x.reshape(rows, width), scale, inverse, dy.reshape(rows, width))
-    # Only the small per-program partials, never all rows, meet a column reduction.
-    dscale = None if scale is None else jnp.sum(partial, axis=0).astype(scale.dtype)
+    dscale = None if scale is None else pl.pallas_call(
+        _rms_scale_reduce, grid=(pl.cdiv(width, SCALE_BLOCK),),
+        out_shape=jax.ShapeDtypeStruct((width,), scale.dtype),
+        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1, enable_fp_fusion=False),
+        interpret=interpret, name="rms_norm_scale_backward",
+    )(partial, correction)
     return dx.reshape(x.shape), dscale
 
 
