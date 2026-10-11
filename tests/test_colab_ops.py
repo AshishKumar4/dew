@@ -1222,3 +1222,67 @@ def test_emergency_named_runs_exclude_checkpoints_and_capture_tracking_first(tmp
     assert any("tracking/scalars.jsonl" in file["remote"] for file in receipt["files"])
     assert not any("220/" in file["remote"] for file in receipt["files"])
     assert all(file["tier"] == "measurements" for file in receipt["files"])
+
+
+def test_committed_checkpoint_members_do_not_spool_twice(tmp_path, monkeypatch):
+    step = tmp_path / "out/named/220"
+    for name in ("weights", "commit_success.txt", "_CHECKPOINT_METADATA"):
+        write(step / name)
+    files = {str(file.relative_to(tmp_path)): file for file in step.iterdir()}
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("immutable checkpoint should stream directly")
+
+    monkeypatch.setattr(sync.tempfile, "SpooledTemporaryFile", refuse)
+    manifest = sync.pack_files(files, tmp_path / "checkpoint.tar.gz")
+    assert len(manifest) == 3
+
+
+def test_permanent_collection_error_is_bounded_and_done_vm_is_released(tmp_path, fake_vm, fake_colab, monkeypatch):
+    remote, _, session = fake_vm
+    status = {"exit": 0, "seconds": 1, "stage_seconds": 1, "artifact_manifest": "outputs.tar.gz.manifest.json"}
+    save(remote / "content/batch/progress.json", {"phase": "done", "jobs": {"1": status}})
+    queue = tmp_path / "queue.md"
+    queue.write_text("## Pending\n- lane: test job\n  device: gpu\n  ref: ref\n"
+                     "  command: run\n  outputs: out/\n\n## Done\n")
+    monkeypatch.setattr(batch, "QUEUE", queue)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+    client = types.SimpleNamespace(session=lambda endpoint: session)
+    driver = Driver(tmp_path / "attempt", client, "unused")
+    calls = []
+
+    def broken(*args):
+        calls.append(1)
+        raise ValueError("deterministic bad manifest")
+
+    monkeypatch.setattr(driver, "collect", broken)
+    job = {"index": 1, "lane": "test", "commit": "sha", "entry": batch.entries(batch.sections()[1])[0]}
+    plan = {"base": "base", "device": "gpu", "driver_sha": "driver", "jobs": [job]}
+    driver.poll("owned", "/content/batch", plan)
+    assert len(calls) == 3 and driver.state["progress"]["phase"] == "done"
+    assert driver.state["results"][0]["collection_failed"]
+    assert batch.entries(batch.sections()[2])[0]["fields"]["status"] == "collection failed: needs attention"
+    live, held, _, released, _ = fake_colab
+    held.append(types.SimpleNamespace(endpoint="owned"))
+    driver.record(endpoint="owned")
+    save(tmp_path / "attempt/run.json", {"session": "test", "driver_sha": "driver", "rate": 1, "started_at": 0})
+    save(tmp_path / "attempt/allocation.json", {"endpoint": "owned", "requested_at": 1, "assigned_at": 2})
+    receipt = ops_supervisor.finalize(tmp_path / "attempt", live, code=0)
+    assert receipt["release"] == "released" and released == ["owned"]
+
+
+def test_collection_success_resets_consecutive_failure_count(tmp_path):
+    driver = Driver(tmp_path / "run", None, "unused")
+    job = {"index": 1}
+
+    def broken():
+        raise ValueError("temporary")
+
+    for _ in range(2):
+        with pytest.raises(ops_driver.TransportError):
+            driver.collect_action(job, broken)
+    driver.collect_action(job, lambda: None)
+    assert driver.state["collection_failures"]["1"]["count"] == 0
+    with pytest.raises(ops_driver.TransportError):
+        driver.collect_action(job, broken)
+    assert driver.state["collection_failures"]["1"]["count"] == 1
