@@ -44,6 +44,7 @@ from dew.data.dataset import (
     Dataset,
     RampedStream,
     Reader,
+    Statistical,
     rows_of,
     stream_endless,
     stream_identity,
@@ -1653,7 +1654,9 @@ class Trainer(Generic[Loss, Effects]):
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
-            self._log_interval(current, loss, aux, accepted, state, interval)
+            self._log_interval(current, loss, aux, accepted, state, interval,
+                               statistics=plan.dataset.statistics if isinstance(plan.dataset, Statistical)
+                               else dict)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already
@@ -2219,7 +2222,8 @@ class Trainer(Generic[Loss, Effects]):
         return time.perf_counter() - paused
 
     def _log_interval(self, step: int, loss: jax.Array, aux: dict[str, jax.Array],
-                      accepted: jax.Array, state: TrainState, interval: _Interval) -> None:
+                      accepted: jax.Array, state: TrainState, interval: _Interval,
+                      *, statistics: Callable[[], Mapping[str, float]]) -> None:
         """Report one logging interval and start the next.
 
         Rank zero builds the row; every other rank has nothing to report.
@@ -2256,6 +2260,7 @@ class Trainer(Generic[Loss, Effects]):
             if self.rollout is not None:
                 scalars["train/rollout_seconds"] = interval.rollout_seconds
                 scalars.update({f"rollout/{name}": float(value) for name, value in read["rollout"].items()})
+            scalars.update(statistics())
             self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)

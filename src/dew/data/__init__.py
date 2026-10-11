@@ -1,57 +1,93 @@
-"""Data for a run: dataset specs, the `Dataset` value they load, and tokenizers.
+"""Typed recipes and composable record pipelines for training and validation.
 
-A dataset spec is a frozen dataclass, with an alias in `dew.registry.datasets`,
-and its `load(batch=)` returns a `Dataset` of batch iterators:
-
-    data = TFDSImages(path="data/oxford_flowers102/2.1.1", image_size=128).load(batch=32)
-    steps = epochs * data.steps_per_epoch
-
-Each spec here reads one kind of store: prepared TFDS, Hugging Face,
-ArrayRecord shards, url tables or video trees. Which corpus to read, with its
-name, bucket path and caption wording, is up to the recipe. For example,
-`recipes/diffusion/train.py` defines its own in `CORPORA`
-(`oxford-flowers102`, `cc12m`, the LAION sets and others).
-
-Importing this package defines every dataset without importing the heavy
-dependencies. A spec imports cv2, tensorflow_datasets, HF `datasets`, the AV
-readers or `transformers` only when it uses them, so a host that only needs
-the token loaders never loads the image stack, and the reverse.
+Recipes describe records and their transforms. ``load`` compiles a recipe
+into a ``Dataset``; a custom order uses ``Pipeline`` and ``compile`` directly.
+Storage is selected by the source URL, and ``read`` chooses memory, indexed
+or streamed access for every source in the run.
 """
 
-from .chat import ChatMessages, Role
+from .cache import Cache, Generation
+from .chat import Role
+from .compile import compile, iterate, publish, validation
 from .dataset import (
-                      Batch,
-                      Checkpointable,
-                      Corpus,
-                      DataPartition,
-                      DataPhase,
-                      Dataset,
-                      DatasetSpec,
-                      Loading,
-                      Ramp,
-                      Reader,
-                      Stage,
+    Batch,
+    Checkpointable,
+    Corpus,
+    DataPartition,
+    DataPhase,
+    Dataset,
+    Loading,
+    Ramp,
+    Reader,
+    Stage,
 )
-from .images import ArrayRecordImages, HFImages, ImageDataset, TFDSImages
-from .preferences import IDS_KEY, MASK_KEY, PreferencePairs
+from .pipeline import Configured, ObjectiveData, Pipeline, Rejected
+from .preferences import IDS_KEY, MASK_KEY
 from .processors import AutoAudioProcessor
-from .prompts import Prompts
-from .providers import HubDataset, PreparedTFDS, load
-from .sources.hf import HFOptions
-from .sources.text import HubText, TokenCorpus
-from .sources.tfds import TFDSOptions
-from .streaming import OnlineImages, OnlineVideos
+from .recipes import (
+    Augment,
+    Chat,
+    HoldOut,
+    Images,
+    Preferences,
+    Prompts,
+    Recipe,
+    Records,
+    Split,
+    Text,
+    Video,
+    load,
+)
+from .sinks import export
+from .sources import TFDS, Files, Hub, Memory, Read, Shard, ShardManifest, Source
 from .text import ByteTokenizer, HFTokenizer
-from .tokens import TokenWindows
-from .video import LocalVideos, VideoDataset
 
-__all__ = ["IDS_KEY", "MASK_KEY", "ArrayRecordImages",
-           "AutoAudioProcessor",
-           "Batch", "ByteTokenizer", "ChatMessages", "Checkpointable",
-           "Corpus", "DataPartition", "DataPhase", "Dataset",
-           "DatasetSpec",
-           "HFImages", "HFOptions", "HFTokenizer", "HubDataset", "HubText", "ImageDataset",
-           "Loading", "LocalVideos", "OnlineImages", "OnlineVideos",
-           "PreferencePairs", "PreparedTFDS", "Prompts", "Ramp", "Reader", "Role",
-           "Stage",
-           "TFDSImages", "TFDSOptions", "TokenCorpus", "TokenWindows", "VideoDataset", "load"]
+__all__ = [
+    "IDS_KEY",
+    "MASK_KEY",
+    "TFDS",
+    "Augment",
+    "AutoAudioProcessor",
+    "Batch",
+    "ByteTokenizer",
+    "Cache",
+    "Chat",
+    "Checkpointable",
+    "Configured",
+    "Corpus",
+    "DataPartition",
+    "DataPhase",
+    "Dataset",
+    "Files",
+    "Generation",
+    "HFTokenizer",
+    "HoldOut",
+    "Hub",
+    "Images",
+    "Loading",
+    "Memory",
+    "ObjectiveData",
+    "Pipeline",
+    "Preferences",
+    "Prompts",
+    "Ramp",
+    "Read",
+    "Reader",
+    "Recipe",
+    "Records",
+    "Rejected",
+    "Role",
+    "Shard",
+    "ShardManifest",
+    "Source",
+    "Split",
+    "Stage",
+    "Text",
+    "Video",
+    "compile",
+    "export",
+    "iterate",
+    "load",
+    "publish",
+    "validation",
+]

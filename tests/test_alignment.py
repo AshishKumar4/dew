@@ -292,7 +292,7 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     from test_diffusion_run_sources import batch_for, precision
 
     from dew.config import ObjectiveConfig
-    from dew.data import TFDSImages
+    from dew.data import Images
     from dew.objectives.diffusion import DiffusionRunConfig, EndToEnd
     from dew.training import Trainer
 
@@ -301,7 +301,8 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
             archive.extractall(tmp_path / name, filter="data")
     alignment = Alignment("x_embedder", source=str(tmp_path / "rae" / "dinov2_plain"), width=8, resolution=56)
     config = DiffusionRunConfig(pretrained=str(tmp_path / "flux_source" / "pipeline"), preset=None,
-                                model=precision(), data=TFDSImages(image_size=16), val_metrics=(),
+                                model=precision(), data=Images(source="tfds://oxford_flowers102",
+                                    image_size=16), val_metrics=(),
                                 objective=ObjectiveConfig("diffusion", {
                                     "alignment": alignment, "solver": Euler(), "guidance": None, "steps": 2,
                                     "ema_decay": None}))

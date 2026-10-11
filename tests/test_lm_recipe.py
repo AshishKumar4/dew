@@ -12,7 +12,7 @@ from token_support import write_token_corpus
 
 import dew
 from dew.config import ObjectiveConfig
-from dew.data import TokenWindows
+from dew.data import Loading, Text, load
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.objectives.lm.config import token_vocabulary
@@ -52,7 +52,7 @@ def model_flags(record):
 def run_config(tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'):
     # A dataset subcommand has to come before its flags, so `args` leads.
     return LMRunConfig.cli([
-        *args, "--data.path", str(tokens), "--data.seq-len", str(SEQ), "--data.loading.workers", "0",
+        *args, "--data.source", str(tokens), "--data.seq-len", str(SEQ), "--loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)])
@@ -68,10 +68,11 @@ def test_the_sampling_budget_decides_the_context_the_model_is_built_for(tmp_path
 
 
 def test_a_dataset_that_is_not_a_token_directory_says_so(tmp_path):
-    with pytest.raises(FileNotFoundError, match=r"meta.json"):
-        token_vocabulary(TokenWindows(path=str(tmp_path)))
-    with pytest.raises(ValueError, match=r"--data.path"):
-        token_vocabulary(TokenWindows())
+    (tmp_path / "train.bin").write_bytes(bytes(range(64)))
+    with pytest.raises(FileNotFoundError, match="producer metadata"):
+        token_vocabulary(Text(source=str(tmp_path)))
+    with pytest.raises(ValueError, match=r"--data.source"):
+        token_vocabulary(Text(source=""))
 
 
 def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path):
@@ -82,7 +83,7 @@ def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path):
 
 def test_a_corpus_too_small_for_one_batch_is_refused(tmp_path):
     tokens = write_token_files(tmp_path / "tokens", 2 * SEQ, 2 * SEQ)
-    with pytest.raises(ValueError, match="do not fill one batch"):
+    with pytest.raises(ValueError, match="fewer than one batch of 8"):
         run_config(tokens, "--trainer.epochs", "1").run()
 
 
@@ -95,13 +96,13 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     args = ["--trainer.epochs", "1", "--prompt", "the ", "--max-new-tokens", "4",
             "--trainer.name", "run"]
     if packed:
-        args = ["--data.pack", "--data.packing-bins", "2", *args]
+        args = ["--data.pack", "first-fit", "--data.packing-bins", "2", *args]
     config = run_config(tokens, *args)
-    assert config.data.pack == packed
+    assert config.data.pack == ('first-fit' if packed else None)
 
     state = config.run()
 
-    data = config.data.load(batch=8)
+    data = load(config.data, batch=8, read="memory", loading=Loading(workers=0))
     assert data.steps_per_epoch is not None and int(state.step) == data.steps_per_epoch > 0
     run = tmp_path / "runs" / "run"
     assert (run / str(int(state.step))).is_dir()
@@ -127,26 +128,26 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
 
 
 def test_the_recipe_trains_on_weighted_corpora(tmp_path):
-    """`--data.path a 0.7 b 0.3` parses to the weighted mapping and trains:
+    """`--data.source a 0.7 b 0.3` parses to the weighted mapping and trains:
     the vocabulary comes from the corpora's shared meta.json, and run.json
     records the mapping so the run reloads as configured."""
     first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
     config = LMRunConfig.cli([
-        "--data.pack", "--data.path", str(first), "0.7", str(second), "0.3",
-        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data.loading.workers", "0",
+        "--data.pack", "first-fit", "--data.source", json.dumps({str(first): 0.7, str(second): 0.3}),
+        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.steps", "2", "--trainer.name", "mixed", "--max-new-tokens", "0",
         "--model.dtype", "float32",
         "--model.emb_features", "16", "--model.num_layers", "1", "--model.num_heads", "2"])
-    assert config.data.path == {str(first): 0.7, str(second): 0.3}
+    assert config.data.source == {str(first): 0.7, str(second): 0.3}
 
     state = config.run()
 
     assert int(state.step) == 2
     recorded = LMRunConfig.load(str(tmp_path / "runs" / "mixed"))
-    assert recorded.data.path == config.data.path
+    assert recorded.data.source == config.data.source
     assert recorded.model.fields["vocab_size"] == 256
 
 
@@ -156,7 +157,7 @@ def test_weighted_corpora_from_different_vocabularies_are_refused(tmp_path):
     meta = json.loads((second / "meta.json").read_text())
     (second / "meta.json").write_text(json.dumps({**meta, "vocab_size": 512}))
     with pytest.raises(ValueError, match="vocab"):
-        token_vocabulary(TokenWindows(path={str(first): 0.5, str(second): 0.5}, pack=True))
+        token_vocabulary(Text(source={str(first): 0.5, str(second): 0.5}, pack="first-fit"))
 
 
 def test_the_recipe_trains_muonclip_with_the_clip_firing(tmp_path):
@@ -226,8 +227,8 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
 
 
 def recipe_args(tokens, *args, model_config="{}"):
-    return [*args, "--data.path", str(tokens), "--data.seq-len", str(SEQ),
-            "--data.loading.workers", "0", "--trainer.batch-size", "8",
+    return [*args, "--data.source", str(tokens), "--data.seq-len", str(SEQ),
+            "--loading.workers", "0", "--trainer.batch-size", "8",
             "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
             "--trainer.log-every", "1", "--model.dtype", "float32",
@@ -527,9 +528,9 @@ def test_the_recipe_trains_the_prediction_depths_on_request(tmp_path):
 
 def test_an_objective_the_recipe_does_not_train_is_refused():
     with pytest.raises(KeyError, match="no objective named 'ctc'"):
-        LMRunConfig(data=TokenWindows(seq_len=64), objective=ObjectiveConfig("ctc"))
+        LMRunConfig(data=Text(source="", seq_len=64), objective=ObjectiveConfig("ctc"))
     with pytest.raises(ValueError, match="--objective"):
-        LMRunConfig(data=TokenWindows(seq_len=64), objective=ObjectiveConfig("jepa"))
+        LMRunConfig(data=Text(source="", seq_len=64), objective=ObjectiveConfig("jepa"))
 
 
 def test_masked_diffusion_trains_on_packed_documents(tmp_path):
@@ -549,11 +550,12 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
         ids[6::7] = 1  # every seventh id ends a document
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
+         "train_tokens": 400, "val_tokens": 96}))
     config = LMRunConfig.cli([
-        "--data.pack", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
-        "--tokenizer", str(checkpoint), "--data.path", str(directory),
-        "--data.seq-len", "11", "--data.loading.workers", "0",
+        "--data.pack", "first-fit", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
+        "--tokenizer", str(checkpoint), "--data.source", str(directory),
+        "--data.seq-len", "11", "--loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
@@ -565,7 +567,8 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     assert int(state.updates) == 2
     original = Pretrained.load(str(checkpoint), dtype="float32", attention_impl="xla")
     objective = config.masked_objective(original.model, original.model_config, None)
-    batch = next(iter(config.data.load(batch=8).val(DataPartition())))
+    batch = next(iter(load(config.data, batch=8, read="memory",
+        loading=Loading(workers=0)).val(DataPartition())))
     padding = np.asarray(batch["text_segment_ids"]) == 0
     assert padding.any() and not padding.all()
     scored = objective.evaluate(state.variables, batch, Step(jnp.asarray(0), jax.random.key(0), None))
@@ -586,7 +589,7 @@ def test_masked_diffusion_without_a_mask_id_is_refused():
     model = models.build("causal_transformer", vocab_size=256, emb_features=16,
                          num_layers=1, num_heads=2, max_seq_len=SEQ, causal=False)
     with pytest.raises(ValueError, match="mask token id"):
-        LMRunConfig(data=TokenWindows(seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
+        LMRunConfig(data=Text(source="", seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
                     ).masked_objective(model, {}, None)
 
 
@@ -598,7 +601,7 @@ def test_masked_diffusion_on_a_causal_model_is_refused():
     model = models.build("causal_transformer", vocab_size=256, emb_features=16,
                          num_layers=1, num_heads=2, max_seq_len=SEQ)
     with pytest.raises(ValueError, match="causal=False"):
-        LMRunConfig(data=TokenWindows(seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
+        LMRunConfig(data=Text(source="", seq_len=SEQ), objective=ObjectiveConfig("masked_diffusion")
                     ).masked_objective(model, {"mask_token_id": 5}, None)
 
 
@@ -620,11 +623,12 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         ids = np.random.RandomState(count).randint(4, 100, count).astype(np.uint8)
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1}))
+        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
+         "train_tokens": 400, "val_tokens": 96}))
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
-        "--tokenizer", str(checkpoint), "--data.path", str(directory),
-        "--data.seq-len", "11", "--data.loading.workers", "0",
+        "--tokenizer", str(checkpoint), "--data.source", str(directory),
+        "--data.seq-len", "11", "--loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
@@ -660,8 +664,8 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "block_diffusion",
-        "--tokenizer", str(checkpoint), "--data.path", str(directory), "--data.seq-len", "11",
-        "--objective.prompt-length", "4", "--data.loading.workers", "0",
+        "--tokenizer", str(checkpoint), "--data.source", str(directory), "--data.seq-len", "11",
+        "--objective.prompt-length", "4", "--loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
@@ -731,9 +735,9 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     sampling policy survive `run.json` as the values they went in as. A chat
     spec is a record the class takes, and training it is refused: an LM
     run trains on token files."""
-    from dew.data import ChatMessages
+    from dew.data import Chat
 
-    chat = ChatMessages(tokenizer="byte", path="chat.parquet", seq_len=16)
+    chat = Chat(source="chat.parquet", tokenizer="byte", seq_len=16, long="chunk")
     config = LMRunConfig(data=chat, tokenizer="gpt2", max_new_tokens=8,
                          objective=ObjectiveConfig("lm", {"ema_decay": 0.99}),
                          sampling=Sampling(temperature=0.5, top_k=7))
@@ -746,5 +750,5 @@ def test_the_shipped_lm_run_config_round_trips_through_its_record():
     assert "ema_decay" not in record["objective"]["defaults"]
     assert record["sampling"]["temperature"] == 0.5 and record["sampling"]["top_k"] == 7
     assert LMRunConfig.from_dict(record) == config
-    with pytest.raises(ValueError, match="trains on token files"):
+    with pytest.raises(ValueError, match="trains on a Text recipe"):
         config.prepare()

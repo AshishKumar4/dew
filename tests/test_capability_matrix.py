@@ -57,8 +57,10 @@ from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
 from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
+from dew.data.recipes import load
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, MarkerLayout, Specials, StateFirstLayout
+from dew.decision.data import Decisions
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.inference.tasks import TextGeneration
@@ -659,7 +661,8 @@ def decision(family: Family, directory: Path) -> None:
     layout = (StateFirstLayout if CAUSAL in family.facts else MarkerLayout)(
         max_len=48, head_max_len=32, option_tokens=4)
     objective = DecisionObjective(held.given, tokenizer=tokenizer, specials=specials, layout=layout)
-    data = objective.dataset(EXAMPLES, batch=ROWS, validation=EXAMPLES)
+    data = load(Decisions(source=EXAMPLES, validation=EXAMPLES), batch=ROWS, read="memory",
+        objective=objective.data())
     batch = next(iter(data.train(DataPartition())))
     trained = assert_trains(objective, batch, directory, data=data)
     live = objective.pipeline(trained.state)

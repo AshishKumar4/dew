@@ -18,15 +18,16 @@ wrote, which decide the vocabulary.
 from __future__ import annotations
 
 import dataclasses
-import json
-from pathlib import Path
+from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
 
 from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.data import TokenWindows
+from dew.data import Text, load
+from dew.data.sources import source
 from dew.data.text import HFTokenizer, tokenizer_for
+from dew.records import integer, text
 from dew.registry import DtypeName, objectives, resolve_dtype
 from dew.sampling.text import Sampling
 
@@ -42,10 +43,9 @@ class LMRunConfig(RunConfig):
     block_diffusion (the official DiffusionGemma fine-tuning objective)."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
-    data: DataSpec = dataclasses.field(default_factory=TokenWindows)
-    """The token files a run trains on (data:token-windows, `--data.pack` to
-    pack whole documents), of one directory `dew tokenize` wrote or several
-    with their weights (`--data.path a 0.7 b 0.3`)."""
+    data: DataSpec = dataclasses.field(default_factory=lambda: Text(source=""))
+    """The produced token store a run trains on (data:text). First-fit packing
+    keeps document boundaries; weighted stores and phases share one vocabulary."""
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
             learning_rate=6e-4,
@@ -97,6 +97,7 @@ class LMRunConfig(RunConfig):
         run's key, so the objective trains its factors alone. Perplexity scores
         each validation pass.
         """
+        self = dataclasses.replace(self, trainer=self.trainer.derived())
         tokens = self.tokens()
         written, vocab_size = token_vocabulary(tokens)
         if self.tokenizer != written:
@@ -104,11 +105,6 @@ class LMRunConfig(RunConfig):
             # produces text that says nothing about the model.
             raise ValueError(f"--tokenizer {self.tokenizer} does not match the token files, which were "
                              f"written with {written}")
-        loaded = tokens.load(batch=self.trainer.batch_size)
-        if not loaded.steps_per_epoch:
-            raise ValueError(f"{loaded.records} training windows do not fill one batch of "
-                             f"{self.trainer.batch_size}, so an epoch is no steps at all: read more data "
-                             "or lower --trainer.batch-size")
         kind = objectives.label(self.objective.name)
         samples = None if kind == "block_diffusion" else self.samples()
         context = (tokens.seq_len + 1 if samples is None else
@@ -145,13 +141,23 @@ class LMRunConfig(RunConfig):
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
+        loaded = load(tokens, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+                      lengths=() if self.trainer.batch_tokens is None else (
+                          tokens.seq_len + (kind != "lm"),),
+                      read=self.data_read, provision=self.provision,
+                      seed=self.data_seed, loading=self.loading,
+                      validation_records=self.validation_records, objective=objective.data())
+        if not loaded.steps_per_epoch:
+            raise ValueError(f"{loaded.records} training windows do not fill one batch of "
+                             f"{self.trainer.batch_size}, so an epoch is no steps at all: read more data "
+                             "or lower --trainer.batch-size")
         validation = () if self.trainer.eval_interval(loaded) is None else (Perplexity(),)
         return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation))
 
-    def tokens(self) -> TokenWindows:
+    def tokens(self) -> Text:
         """The token files this run trains on; any other data is refused."""
-        if not isinstance(self.data, TokenWindows):
-            raise ValueError("an LM run trains on token files: data:token-windows")
+        if not isinstance(self.data, Text):
+            raise ValueError("an LM run trains on a Text recipe: data:text")
         return self.data
 
     def processor(self):
@@ -248,24 +254,25 @@ class LMRunConfig(RunConfig):
                                     processor=self.processor())
 
 
-def token_vocabulary(tokens: TokenWindows) -> tuple[str, int]:
-    """The tokenizer and vocabulary size the token files `data` reads were
-    written with: one directory's (a `hub` split's, tokenized here on first
-    use), or those of each corpus of a weighted mixture or of the phases,
-    which feed one embedding table and so have to agree."""
-    path = (tokens.hub.tokenized() if tokens.hub is not None
-            else tokens.corpora if tokens.phases else tokens.path)
-    if not path:
-        raise ValueError("--data.path is the token directory `dew tokenize` wrote")
-    directories = [Path(path)] if isinstance(path, str) else [Path(name) for name in sorted(path)]
-    for directory in directories:
-        if not (directory / "meta.json").is_file():
-            raise FileNotFoundError(f"{directory / 'meta.json'} is missing: --data.path is the token "
-                                    "directory that `dew tokenize` wrote, not a dataset name")
-    metas = [json.loads((directory / "meta.json").read_text()) for directory in directories]
-    recorded = {(str(meta["tokenizer"]), int(meta["vocab_size"])) for meta in metas}
+def token_vocabulary(tokens: Text) -> tuple[str, int]:
+    """One vocabulary shared by every source and phase of a text recipe."""
+    values = [phase.path for phase in tokens.phases] if tokens.phases else [tokens.source]
+    leaves = [leaf for value in values for leaf in (sorted(value) if isinstance(value, Mapping) else [value])]
+    if not leaves or any(leaf == "" for leaf in leaves):
+        raise ValueError("--data.source names the produced token store or text source")
+    recorded = set()
+    for leaf in leaves:
+        metadata = source(leaf).metadata()
+        if metadata.get("token_store"):
+            if "tokenizer" not in metadata or "vocab_size" not in metadata:
+                raise FileNotFoundError(
+                    f"{source(leaf).describe()} needs producer metadata (tokenizer and vocab_size)")
+            recorded.add((text(metadata["tokenizer"], "tokenizer"), integer(metadata["vocab_size"],
+                "vocab_size")))
+        else:
+            recorded.add((tokens.tokenizer, tokenizer_for(tokens.tokenizer).vocab_size))
     if len(recorded) > 1:
-        raise ValueError(f"the corpora of --data.path feed one embedding table, and record different "
+        raise ValueError(f"the corpora of --data.source feed one embedding table, and record different "
                          f"(tokenizer, vocab_size): {sorted(recorded)}")
     return recorded.pop()
 

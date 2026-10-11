@@ -7,7 +7,7 @@ import pytest
 from recording import RecordingTracker
 
 from dew.artifacts import Representations
-from dew.data import DataPartition, Dataset
+from dew.data import DataPartition, Memory, Pipeline, compile
 from dew.eval.common import Mean
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Objective, Ratio, Step
@@ -42,8 +42,8 @@ class ScalarRegression(Objective):
 
 def data(width=2):
     import grain.python as grain
-    return Dataset.from_grain(grain.MapDataset.source(
-        [{'x': np.ones(width, np.float32)}] * 32), batch=8)
+    return compile(Pipeline(Memory(grain.MapDataset.source(
+        [{'x': np.ones(width, np.float32)}] * 32))).repeat().batch(8), read="indexed")
 
 
 def trainer(auxiliary=False, tracker=None, statistics='ratio'):

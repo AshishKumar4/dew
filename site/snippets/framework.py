@@ -26,11 +26,13 @@ def lm():
     # Begin snippet: lm
     from dew import Trainer
     from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import HoldOut, Hub, Loading, Text, load
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+                     eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
+                provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0)
@@ -44,13 +46,15 @@ def diffusion():
     # Begin snippet: diffusion
     from dew import Field, InputSpec, Trainer
     from dew.config import OptimConfig
-    from dew.data import HFImages
+    from dew.data import Augment, HoldOut, Hub, Images, Loading, load
     from dew.diffusion.presets import Flow
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.sampling import Euler
 
-    data = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32).load(batch=64)
+    data = load(Images(source=Hub("uoft-cs/cifar10"), field="img", image_size=32,
+                       augment=Augment(flip=True, jitter=True), validation=HoldOut(records=256)),
+                batch=64, read="memory", provision=True, loading=Loading(workers=0))
     model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=2)
     objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (32, 32, 3))),
                                    solver=Euler(), steps=4)
@@ -64,10 +68,12 @@ def jepa():
     # Begin snippet: jepa
     from dew import Field, Trainer
     from dew.config import OptimConfig
-    from dew.data import HFImages
+    from dew.data import Augment, HoldOut, Hub, Images, Loading, load
     from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 
-    data = HFImages(name="uoft-cs/cifar10", image_column="img", image_size=32).load(batch=64)
+    data = load(Images(source=Hub("uoft-cs/cifar10"), field="img", image_size=32,
+                       augment=Augment(flip=True, jitter=True), validation=HoldOut(records=256)),
+                batch=64, read="memory", provision=True, loading=Loading(workers=0))
     encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=1, num_heads=2)
     predictor = JepaPredictor(grid=(8, 8), emb_features=32, predictor_features=16,
                               num_layers=1, num_heads=2)
@@ -88,7 +94,7 @@ def grpo():
 
     from dew import LocalTracker, Trainer
     from dew.config import OptimConfig
-    from dew.data import Prompts
+    from dew.data import Loading, Prompts, load
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.rl import GRPOObjective, SampledRollout
     from dew.sampling import Sampling
@@ -100,7 +106,8 @@ def grpo():
 
     rng = np.random.default_rng(0)
     records = tuple(json.dumps({"prompt": rng.integers(0, 13, 4).tolist()}) for _ in range(512))
-    data = Prompts(tokenizer="byte", records=records, max_prompt_len=4).load(batch=8)
+    data = load(Prompts(tokenizer="byte", source=tuple(json.loads(row) for row in records),
+                        max_prompt_len=4), batch=8, read="memory", loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=13, emb_features=64, num_layers=2, num_heads=4,
                               head_dim=16, mlp_features=128, max_seq_len=16)
     objective = GRPOObjective(model, seq_len=11, beta=0.02)
@@ -126,14 +133,16 @@ def finetune():
 
     from dew import Trainer
     from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import HoldOut, Hub, Loading, Text, load
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
     from dew.sampling import Sampling
 
     name = "HuggingFaceTB/SmolLM2-135M-Instruct"
     model = PretrainedDecoder.load(name, dtype="float32", max_seq_len=256)
-    data = load("hf/winglian/tiny-shakespeare", batch=1, tokenizer=name, seq_len=64)
+    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer=name, seq_len=64,
+                     eos=True, token_holdout=HoldOut(fraction=0.01)), batch=1, read="memory",
+                provision=True, loading=Loading(workers=0))
     state = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-4), key=0).fit(
         data, steps=20, log_every=5)
     before = model.text_generation(sampling=Sampling(temperature=0))
@@ -151,7 +160,7 @@ def pretrained():
 
     from dew import Trainer
     from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import HoldOut, Hub, Loading, Text, load
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
     from dew.sampling import Sampling
@@ -161,7 +170,9 @@ def pretrained():
     task = bundle.text_generation(sampling=Sampling(temperature=0))
     print(task("The capital of France is", 12, key=0).text[0])
 
-    data = load("hf/winglian/tiny-shakespeare", batch=1, tokenizer="Qwen/Qwen3-0.6B", seq_len=64)
+    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="Qwen/Qwen3-0.6B", seq_len=64,
+                     eos=True, token_holdout=HoldOut(fraction=0.01)), batch=1, read="memory",
+                provision=True, loading=Loading(workers=0))
     trainer = Trainer(LMObjective(bundle, seq_len=64), OptimConfig(learning_rate=1e-5), key=0)
     state = trainer.fit(data, steps=1)
     bundle.save("export", variables=state.variables)
@@ -240,11 +251,13 @@ def mesh():
 
     from dew import MeshSpec, Trainer
     from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import HoldOut, Hub, Loading, Text, load
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+                     eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
+                provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
@@ -260,13 +273,15 @@ def reliability():
     # Begin snippet: reliability
     from dew import Checkpoints, Trainer
     from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import HoldOut, Hub, Loading, Text, load
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import prepare_process
 
     prepare_process(multi_host=False, xla_flags="--xla_gpu_deterministic_ops=true")
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+                     eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
+                provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     objective = LMObjective(model, seq_len=64)
@@ -299,16 +314,18 @@ def profile():
     # Begin snippet: profile
     from dew import ProfileWindow, Trainer
     from dew.config import OptimConfig
-    from dew.data import load
+    from dew.data import HoldOut, Hub, Loading, Text, load
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    data = load("hf/winglian/tiny-shakespeare", batch=8, tokenizer="byte", seq_len=64)
+    data = load(Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=64,
+                     eos=True, token_holdout=HoldOut(fraction=0.01)), batch=8, read="memory",
+                provision=True, loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                               mlp_features=64, max_seq_len=128)
     trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                       profile=ProfileWindow("profile", steps=2))
-    state = trainer.fit(data, steps=5)
+    trainer.fit(data, steps=5)
     # End snippet: profile
     assert any(Path("profile").rglob("*.xplane.pb"))
     return {"profile": "profile"}
@@ -323,22 +340,36 @@ def offline(out):
     """Serve the Hub names the cells read from small fixtures, without the network."""
     import datasets
     from PIL import Image
+    from huggingface_hub import HfApi
+    from types import SimpleNamespace
 
     import dew.data.text
     import dew.interop.hub as hub
-    from dew.data import ByteTokenizer, HFOptions
+    from dew.data import ByteTokenizer
     from dew.decision import Decide
     from dew.diffusion.presets import Flow
     from dew.inference import RunProcessor
     from dew.interop import PretrainedDecoder
 
-    # The cells tokenize into dew's cache, which must not keep these fixtures.
     os.environ["XDG_CACHE_HOME"] = str(out / "cache")
-    # More images than the four validation batches HFImages holds out.
     images = [Image.new("RGB", (32, 32), (255, 0, 255))] * 320
     tables = {"winglian/tiny-shakespeare": {"text": ["dew trains jax models. " * 100] * 4},
               "uoft-cs/cifar10": {"img": images, "label": [0] * len(images)}}
-    HFOptions.load = lambda self, path, split, *, streaming: datasets.Dataset.from_dict(tables[path])
+    builder = datasets.load_dataset_builder
+    builders = {}
+    for repo, columns in tables.items():
+        directory = out / "data" / repo.replace("/", "--")
+        directory.mkdir(parents=True, exist_ok=True)
+        parquet = directory / "train.parquet"
+        datasets.Dataset.from_dict(columns).to_parquet(parquet)
+        prepared = builder("parquet", data_files={"train": str(parquet)}, cache_dir=str(directory / "arrow"))
+        prepared.download_and_prepare()
+        builders[repo] = prepared
+    info = HfApi.dataset_info
+    HfApi.dataset_info = lambda self, repo, **options: (
+        SimpleNamespace(sha="offline-fixture") if repo in builders else info(self, repo, **options))
+    datasets.load_dataset_builder = lambda repo, **options: (
+        builders[repo] if repo in builders else builder(repo, **options))
     # One tiny decoder, which reads bytes, stands in for each the cells load.
     decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
     tokenizer_for = dew.data.text.tokenizer_for
