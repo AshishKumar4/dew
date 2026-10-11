@@ -22,10 +22,10 @@ from rl_support import TinyHead
 from dew.data import DataPartition, Loading, Preferences
 from dew.data.compile import iterate
 from dew.data.preferences import IDS_KEY, MASK_KEY
+from dew.data.recipes import load
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
-from dew.data.recipes import load
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
 VOCAB = 8
@@ -274,7 +274,7 @@ def test_an_incomplete_row_is_refused():
         preference_rows(records(dict(PAIR, reward=1.0)), 0, 4)
     with pytest.raises(ValueError, match="an object"):
         preference_rows(records([1, 2]), 0, 4)[0]
-    with pytest.raises(ValueError, match="accepted|pairs|empty"):
+    with pytest.raises(ValueError, match=r"accepted|pairs|empty"):
         load(Preferences(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
 
 
@@ -288,7 +288,8 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
         "chosen_mask": [[0, 0, 1, 1]], "rejected_mask": [[0, 0, 1]],
     }), path)
 
-    data = load(Preferences(source=str(path), seq_len=4), batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1))
+    data = load(Preferences(source=str(path), seq_len=4), batch=1, read="memory",
+        loading=Loading(workers=0), validation_records=4 * (1))
 
     assert data.records == 1
     batch = next(data.train(DataPartition()))
@@ -304,7 +305,8 @@ def test_varied_rows_pad_to_one_window():
     rows = records(
         {"chosen": [1, 2, 3, 4], "rejected": [5]},
         {"chosen": [6], "rejected": [7, 8]})
-    data = load(Preferences(source=tuple(json.loads(row) for row in rows), seq_len=4), batch=2, read="memory", loading=Loading(workers=0), validation_records=4 * (2))
+    data = load(Preferences(source=tuple(json.loads(row) for row in rows), seq_len=4), batch=2,
+        read="memory", loading=Loading(workers=0), validation_records=4 * (2))
 
     batch = next(data.train(DataPartition()))
 

@@ -24,6 +24,7 @@ from absl import flags
 from token_support import write_token_corpus
 
 from dew.data import ByteTokenizer, DataPartition, Loading, Text
+from dew.data.recipes import load
 from dew.data.sources.files import TokenFiles
 from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
@@ -32,7 +33,6 @@ from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
-from dew.data.recipes import load
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -189,7 +189,8 @@ def test_an_epoch_reads_every_complete_window_stride_apart(tmp_path, seq_len, st
     left out; validation tiles the split `seq_len` apart, in file order."""
     body = np.arange(tokens)
     _stream_dir(tmp_path, body, dtype=np.uint32)
-    data = load(Text(source=str(tmp_path), seq_len=seq_len, stride=stride), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len, stride=stride), batch=1, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     starts = range(0, tokens - seq_len, stride or seq_len)
 
     epoch = _read(data.train(DataPartition()), data.records)
@@ -205,7 +206,8 @@ def test_a_window_needs_a_positive_stride_and_length_and_a_long_enough_split(tmp
     for fields, refusal in (({"seq_len": 2, "stride": 0}, "stride"), ({"seq_len": 2, "stride": -1}, "stride"),
                             ({"seq_len": 0}, "seq_len"), ({"seq_len": 4}, "too few for even one window")):
         with pytest.raises(ValueError, match=refusal):
-            load(Text(source=str(tmp_path)), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1), **fields)
+            load(Text(source=str(tmp_path)), batch=1, read="memory", loading=Loading(workers=0,
+                threads=1, read_buffer=1, worker_buffer=1), **fields)
 
 
 def test_the_ids_are_read_at_the_width_meta_json_records(tmp_path):
@@ -213,7 +215,8 @@ def test_the_ids_are_read_at_the_width_meta_json_records(tmp_path):
     seq_len = 4
     tokens = np.arange(70000, 70000 + 3 * seq_len + 1, dtype=np.uint32)
     _stream_dir(tmp_path, tokens, dtype=np.uint32)
-    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=1, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     assert _read(data.val(DataPartition()))[0]["text"].tolist() == tokens[:seq_len + 1].tolist()
 
     bare = tmp_path / "bare"
@@ -229,19 +232,6 @@ def test_the_ids_are_read_at_the_width_meta_json_records(tmp_path):
 # Text
 # ---------------------------------------------------------------------------------
 
-def _windows(tmp_path, **fields):
-    """The fixed-window spec over `tmp_path`, read in this process."""
-    fields = {"val_batches": None,
-              "loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
-              **fields}
-    return Text(source=str(tmp_path))
-
-
-def _packed_tokens(tmp_path, **fields):
-    """The packed spec over `tmp_path`, read in this process."""
-    fields = {"val_batches": None, "loading": Loading(workers=0, worker_buffer=1), **fields}
-    return Text(source=str(tmp_path), pack="first-fit")
-
 def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
     """Window k is tokens [k seq_len, k seq_len + seq_len], so consecutive
     windows share one token: the last of one is the first of the next, the
@@ -251,7 +241,8 @@ def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
     # (n - 1) // seq_len windows: 17*8 tokens -> 16 train, 5*8 -> 4 val.
     _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=5 * seq_len,
                body=np.arange(22 * seq_len))
-    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=batch, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=batch, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     assert data.records == 16 and data.batch == batch and data.steps_per_epoch == 4
 
@@ -271,11 +262,14 @@ def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
 def test_token_loader_stride_changes_training_windows_only(tmp_path):
     seq_len, batch = 4, 4
     _token_dir(tmp_path, train_tokens=17, val_tokens=17, body=np.arange(34))
-    default = load(Text(source=str(tmp_path), seq_len=seq_len), batch=batch, read="memory", seed=17, loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    default = load(Text(source=str(tmp_path), seq_len=seq_len), batch=batch, read="memory", seed=17,
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     positional = load(Text(str(tmp_path), seq_len=seq_len), batch=batch, read="memory", seed=17,
                       loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
-    explicit = load(Text(source=str(tmp_path), seq_len=seq_len, stride=seq_len), batch=batch, read="memory", seed=17, loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
-    overlap = load(Text(source=str(tmp_path), seq_len=seq_len, stride=1), batch=batch, read="memory", seed=17, loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    explicit = load(Text(source=str(tmp_path), seq_len=seq_len, stride=seq_len), batch=batch,
+        read="memory", seed=17, loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    overlap = load(Text(source=str(tmp_path), seq_len=seq_len, stride=1), batch=batch, read="memory",
+        seed=17, loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     assert overlap.records == 13 and overlap.steps_per_epoch == 3
     assert default.records == explicit.records == 4
     assert default.steps_per_epoch == explicit.steps_per_epoch == 1
@@ -317,7 +311,8 @@ def test_token_window_stride_round_trips_and_old_records_keep_the_default(tmp_pa
     restored = RunConfig.from_dict(older)
     assert restored.data.stride is None
     source = load(restored.data, batch=4, read="memory", loading=Loading(workers=0))
-    explicit = load(Text(source=str(tmp_path), seq_len=4, stride=4), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    explicit = load(Text(source=str(tmp_path), seq_len=4, stride=4), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     actual, expected = source.train(DataPartition()), explicit.train(DataPartition())
     try:
         assert source.records == explicit.records == 4
@@ -330,8 +325,10 @@ def test_token_window_stride_round_trips_and_old_records_keep_the_default(tmp_pa
 
 def test_token_window_resume_refuses_a_changed_stride(tmp_path):
     _token_dir(tmp_path, train_tokens=33, val_tokens=17, body=np.arange(50))
-    source = load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition())
-    different = load(Text(source=str(tmp_path), seq_len=4, stride=2), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition())
+    source = load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition())
+    different = load(Text(source=str(tmp_path), seq_len=4, stride=2), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition())
     try:
         next(source)
         with pytest.raises(ValueError, match="resume the corpus"):
@@ -351,7 +348,8 @@ def test_token_loader_val_is_unshuffled_and_disjoint_from_train(tmp_path):
     (tmp_path / "train.bin").write_bytes(train_tokens.astype("<u2").tobytes())
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
 
-    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     val_batches = [b["text"] for b in data.val(DataPartition())]
     assert len(val_batches) == 2  # 8 windows, batch 4, drop_remainder
@@ -379,7 +377,8 @@ def test_token_loader_validation_pass_reads_every_window_once(tmp_path, worker_c
     _token_dir(tmp_path, train_tokens=5 * seq_len, val_tokens=len(val_tokens))
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
 
-    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=0, loading=Loading(workers=worker_count))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=0,
+        loading=Loading(workers=worker_count))
 
     windows = [list(window) for batch in itertools.islice(data.val(DataPartition()), 12)
                for window in batch["text"]]
@@ -393,7 +392,8 @@ def test_token_loader_records_do_not_depend_on_worker_count(tmp_path):
     _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len)
 
     def by_record(worker_count):
-        data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=7, loading=Loading(workers=worker_count))
+        data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=7,
+            loading=Loading(workers=worker_count))
         out = {}
         for b in itertools.islice(data.train(DataPartition()), data.steps_per_epoch):
             for row in b["text"]:
@@ -414,7 +414,8 @@ def test_token_loader_seeds_its_train_sampler(tmp_path):
     _token_dir(tmp_path, train_tokens=(records + 1) * seq_len, val_tokens=2 * seq_len)
 
     def first_batch(seed):
-        data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=seed, loading=Loading(workers=0))
+        data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=seed,
+            loading=Loading(workers=0))
         return next(data.train(DataPartition()))["text"]
 
     assert np.array_equal(first_batch(0), first_batch(0))
@@ -428,9 +429,9 @@ def test_a_registered_token_spec_reads_the_directory(tmp_path):
     seq_len = 64
     # (41 * 64 - 1) // 64 == 40 train windows.
     _token_dir(tmp_path, train_tokens=41 * seq_len, val_tokens=8 * seq_len)
-    from dew.registry import datasets
 
-    data = load("text", source=str(tmp_path), seq_len=seq_len, batch=4, read="memory", loading=Loading(workers=0))
+    data = load("text", source=str(tmp_path), seq_len=seq_len, batch=4, read="memory",
+        loading=Loading(workers=0))
     batch = next(data.train(DataPartition()))
     assert batch["text"].shape == (4, seq_len + 1)
     assert batch["text"].dtype == np.int32
@@ -444,7 +445,8 @@ def test_a_token_spec_refuses_a_directory_without_a_val_split(tmp_path, pack):
     _token_dir(tmp_path, train_tokens=64, eos_id=0)
     with pytest.raises(FileNotFoundError, match=r"val\.bin"):
         load(Text(source=str(tmp_path), validation=TokenFiles(str(tmp_path), split="val"),
-                  seq_len=8, pack="first-fit" if pack else None), batch=4, read="memory", loading=Loading(workers=0))
+                  seq_len=8, pack="first-fit" if pack else None), batch=4, read="memory",
+                      loading=Loading(workers=0))
 
 
 @pytest.mark.parametrize("pack", [False, True])
@@ -453,8 +455,9 @@ def test_a_token_spec_needs_a_directory_with_a_train_split(tmp_path, pack):
     with pytest.raises(FileNotFoundError, match="train"):
         load(Text(source=TokenFiles(str(tmp_path)), pack="first-fit" if pack else None),
              batch=4, read="memory", loading=Loading(workers=0))
-    with pytest.raises(ValueError, match="source|format|files"):
-        load(Text(source="", pack="first-fit" if pack else None), batch=4, read="memory", loading=Loading(workers=0), validation_records=4 * (4))
+    with pytest.raises(ValueError, match=r"source|format|files"):
+        load(Text(source="", pack="first-fit" if pack else None), batch=4, read="memory",
+            loading=Loading(workers=0), validation_records=4 * (4))
 
 
 # ---------------------------------------------------------------------------------
@@ -551,7 +554,8 @@ def test_data_export_leaves_every_file_it_did_not_create(tmp_path, missing):
     assert (result.returncode == 0) == (not missing), result.stderr[-2000:]
     assert sentinel.read_bytes() == before
     if not missing:
-        np.testing.assert_array_equal(TokenFiles(str(destination)).tokens[:], ByteTokenizer().encode(raw.read_text()))
+        np.testing.assert_array_equal(TokenFiles(str(destination)).tokens[:],
+            ByteTokenizer().encode(raw.read_text()))
 
 
 def test_an_input_inside_the_export_directory_is_read_and_left_alone(tmp_path):
@@ -605,18 +609,21 @@ def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(t
     _stream_dir(tmp_path, stream)
     meta = json.loads((tmp_path / "meta.json").read_text())
     (tmp_path / "meta.json").write_text(json.dumps({**meta, "eos_id": 0}))
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=15, packing_bins=1), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=15, packing_bins=1), batch=1,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     (window,) = _read(data.val(DataPartition()))
     assert window["text"].tolist() == [*stream, *[0] * 7]
     assert window["text_segment_ids"].tolist() == [1, 1, 1, 1, 2, 2, 2, 3, 3, *[0] * 7]
 
     (tmp_path / "meta.json").write_text(json.dumps({**meta, "eos_id": 9}))
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=15, packing_bins=1), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=15, packing_bins=1), batch=1,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     assert _read(data.val(DataPartition()))[0]["text_segment_ids"].tolist() == [1] * 9 + [0] * 7
 
     (tmp_path / "meta.json").write_text(json.dumps(meta))
     with pytest.raises(ValueError, match="no eos_id"):
-        load(Text(source=str(tmp_path), pack="first-fit", seq_len=15), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+        load(Text(source=str(tmp_path), pack="first-fit", seq_len=15), batch=1, read="memory",
+            loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
 
 def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
@@ -624,7 +631,8 @@ def test_packed_loader_fills_windows_with_whole_documents(tmp_path):
     # 4, 6 and 5 ids once each eos is counted: first fit puts 4 + 5 in one
     # window and 6 in the next.
     _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23, 24], [30, 31, 32, 33]])
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=2), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=2), batch=2,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     # Two windows hold the three documents, and records is that pass exactly.
     assert data.records == 2 and data.batch == 2 and data.steps_per_epoch == 1
@@ -650,7 +658,8 @@ def test_packed_loader_cuts_documents_that_outgrow_the_window(tmp_path):
     each piece is its own segment and its positions start again at 0."""
     seq_len = 3  # windows of 4 ids
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=1), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=1), batch=1,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     rows = [batch["text"][0] for batch in data.val(DataPartition())]
     positions = [batch["text_positions"][0] for batch in data.val(DataPartition())]
@@ -665,7 +674,8 @@ def test_packed_loader_lengths_count_windows_not_documents(tmp_path):
     that fills three windows cannot report one."""
     seq_len = 3  # windows of 4 ids
     _document_dir(tmp_path, [list(range(10, 19))])  # one 10-id document
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=1), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=1), batch=1,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     assert data.records == 3
     assert len(list(data.val(DataPartition()))) == 3, "the length is not the pass it counts"
@@ -675,7 +685,8 @@ def test_packed_loader_state_restores_the_next_unseen_batch(tmp_path):
     """The trainer saves the iterator's position in the checkpoint, so a
     restored iterator has to carry on where the saved one had got to."""
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 60, 3)])
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     iterator = data.val(DataPartition())
     next(iterator)
@@ -692,7 +703,8 @@ def test_packed_loader_windows_do_not_depend_on_worker_count(tmp_path):
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 70, 3)])
 
     def windows(worker_count):
-        data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2, read="memory", loading=Loading(workers=worker_count, worker_buffer=1))
+        data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2,
+            read="memory", loading=Loading(workers=worker_count, worker_buffer=1))
         return sorted(row.tobytes() for batch in data.val(DataPartition())
                       for row in batch["text"])
 
@@ -705,7 +717,8 @@ def test_packed_train_stream_does_not_end_with_the_documents(tmp_path):
     """The trainer keeps asking for batches long after one pass over the
     documents."""
     _document_dir(tmp_path, [[i, i + 1] for i in range(10, 30, 2)])
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     iterator = data.train(DataPartition())
     assert len([next(iterator)["text"] for _ in range(20)]) == 20
@@ -717,7 +730,8 @@ def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
     once."""
     documents = [[i, i + 1] for i in range(10, 30, 2)]
     _document_dir(tmp_path, documents)
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     batches = list(itertools.islice(data.val(DataPartition()), 20))
     # Ten documents of three ids (the eos counts) pack three to a nine-id
@@ -732,10 +746,12 @@ def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
 def test_only_the_packed_spec_carries_segment_ids_and_positions(tmp_path):
     _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23], [30, 31]])
 
-    packed = next(load(Text(source=str(tmp_path), pack="first-fit", seq_len=8), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition()))
+    packed = next(load(Text(source=str(tmp_path), pack="first-fit", seq_len=8), batch=2, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition()))
     assert set(packed) == {"text", "text_segment_ids", "text_positions"}
 
-    fixed = next(load(Text(source=str(tmp_path), seq_len=8), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition()))
+    fixed = next(load(Text(source=str(tmp_path), seq_len=8), batch=2, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition()))
     assert set(fixed) == {"text"}, "the fixed-window loader grew packing keys"
 
 
@@ -755,7 +771,8 @@ def test_a_single_file_corpus_packs_when_its_val_split_holds_no_eos(tmp_path):
     assert ByteTokenizer().eos_id not in val_tokens, "the split kept a boundary"
 
     seq_len = 63
-    data = load(Text(source=str(out), pack="first-fit", seq_len=seq_len), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(out), pack="first-fit", seq_len=seq_len), batch=1, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
     row = next(data.val(DataPartition()))
 
     padding = seq_len + 1 - len(val_tokens)
@@ -796,7 +813,8 @@ def test_a_token_validation_pass_ends_when_the_split_runs_out(tmp_path):
     """Eight windows at batch four are two batches, then the end."""
     seq_len = 4
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len)
-    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     batches, ended = _bounded(data.val(DataPartition()), 3)
 
@@ -815,7 +833,8 @@ def test_a_token_validation_pass_reads_every_window_once(tmp_path):
     val_tokens = np.arange(900, 900 + 11 * seq_len, dtype=np.int64)
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=len(val_tokens))
     (tmp_path / "val.bin").write_bytes(val_tokens.astype("<u2").tobytes())
-    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     batches, ended = _bounded(data.val(DataPartition()), 4)
 
@@ -833,7 +852,8 @@ def test_a_packed_validation_pass_reads_each_window_once_and_stops(tmp_path):
     """
     documents = [[i, i + 1, i + 2] for i in range(10, 40, 3)]
     _document_dir(tmp_path, documents)
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     batches, ended = _bounded(data.val(DataPartition()), 2 + len(documents))
     heads = [int(t) for row in _rows(batches) for t in np.frombuffer(row, batches[0]["text"].dtype)
@@ -852,11 +872,14 @@ def test_val_batches_bounds_a_validation_pass(tmp_path):
     seq_len = 4
     _token_dir(tmp_path, train_tokens=13 * seq_len, val_tokens=9 * seq_len)
 
-    batches, ended = _bounded(load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).val(DataPartition()), 3)
+    batches, ended = _bounded(load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).val(DataPartition()), 3)
     assert len(batches) == 2 and ended, ENDLESS_VAL
 
     batches, ended = _bounded(
-        load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1), validation_records=(1) * (4)).val(DataPartition()), 3)
+        load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory",
+            loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
+                validation_records=(1) * (4)).val(DataPartition()), 3)
     assert len(batches) == 1 and ended
     np.testing.assert_array_equal(batches[0]["text"][0],
                                   np.fromfile(tmp_path / "val.bin", "<u2")[:seq_len + 1])
@@ -867,7 +890,8 @@ def test_the_token_training_stream_repeats_rather_than_ending(tmp_path):
     fixed-window loader is the one path that has no `repeat` of its own."""
     seq_len = 4
     _token_dir(tmp_path, train_tokens=9 * seq_len, val_tokens=5 * seq_len)
-    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory",
+        loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     epoch = data.records // 4
     batches, ended = _bounded(data.train(DataPartition()), 3 * epoch)
@@ -892,7 +916,9 @@ def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
     stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
-    return list(load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=bins), batch=batch, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).val(DataPartition()))
+    return list(load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=bins),
+        batch=batch, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1,
+            worker_buffer=1)).val(DataPartition()))
 
 
 def _tiny_backbone(seq_len):
@@ -1012,7 +1038,9 @@ def test_a_position_saved_under_other_packing_bins_is_refused(tmp_path):
     open. Two plans with as many windows were described alike, so a run
     resumed under another bin count read other windows at the same count."""
     _document_dir(tmp_path, [[5, 5], [6], [], []], eos_id=0)
-    one, two = (load(Text(source=str(tmp_path), pack="first-fit", seq_len=3, packing_bins=bins), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)) for bins in (1, 2))
+    one, two = (load(Text(source=str(tmp_path), pack="first-fit", seq_len=3, packing_bins=bins), batch=1,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1,
+            worker_buffer=1)) for bins in (1, 2))
     assert one.records == two.records == 2
     first = [_read(data.val(DataPartition()))[0]["text_segment_ids"].tolist() for data in (one, two)]
     assert first[0] != first[1], "the plans differ"
@@ -1034,7 +1062,8 @@ def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypat
     stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=7, packing_bins=2), batch=2, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=7, packing_bins=2), batch=2,
+        read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     spans = []
     read = np.memmap.__getitem__
@@ -1172,7 +1201,8 @@ def test_token_windows_are_the_same_records_at_every_worker_count(tmp_path,
     _token_dir(tmp_path, train_tokens=17 * seq_len, val_tokens=2 * seq_len)
 
     def windows(workers):
-        data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=7, loading=Loading(workers=workers))
+        data = load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=7,
+            loading=Loading(workers=workers))
         return sorted(row.tobytes()
                       for batch in itertools.islice(data.train(DataPartition()), data.steps_per_epoch)
                       for row in batch["text"])
@@ -1192,7 +1222,8 @@ def test_an_interrupted_token_epoch_resumes_through_real_workers(tmp_path):
     _token_dir(tmp_path, train_tokens=33 * seq_len, val_tokens=2 * seq_len)
 
     def loader():
-        return load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=7, loading=Loading(workers=2))
+        return load(Text(source=str(tmp_path), seq_len=seq_len), batch=4, read="memory", seed=7,
+            loading=Loading(workers=2))
 
     data = loader()
     epoch = data.steps_per_epoch  # 32 windows in eight batches
@@ -1221,7 +1252,8 @@ def test_an_interrupted_packed_epoch_resumes_through_mp_prefetch(tmp_path):
     _document_dir(tmp_path, [[i, i + 1, i + 2] for i in range(10, 100, 3)])
 
     def loader():
-        return load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2, read="memory", loading=Loading(workers=2, worker_buffer=1))
+        return load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=2,
+            read="memory", loading=Loading(workers=2, worker_buffer=1))
 
     interrupted = loader().val(DataPartition())
     seen = _rows([next(interrupted)])
@@ -1254,7 +1286,7 @@ def _as_records(directory, split, tokens, sizes, field=None):
     """`tokens` as arrayrecord shards, cut into records of `sizes`."""
     from array_record.python.array_record_module import ArrayRecordWriter
 
-    from dew.data.images import pack_dict_of_byte_arrays
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
 
     paths = []
     for shard, piece in enumerate(_chunks(tokens, sizes)):
@@ -1301,12 +1333,13 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
     root, fields = stores
 
     def validation(name, **spec):
-        data = load(Text(source=str(root / name), field=fields[name]["field"]), batch=1, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1), **spec)
+        data = load(Text(source=str(root / name), field=fields[name]["field"]), batch=1, read="memory",
+            loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1), **spec)
         rows = _read(data.val(DataPartition()))
         return [{key: value.tolist() for key, value in row.items()} for row in rows]
 
     windows = {name: validation(name, seq_len=4) for name in fields}
-    packed = {name: validation(name, seq_len=5, pack=True, packing_bins=2) for name in fields}
+    packed = {name: validation(name, seq_len=5, pack="first-fit", packing_bins=2) for name in fields}
     assert [row["text"] for row in windows["bin"]] == [
         CORPUS[start:start + 5].tolist() for start in range(0, len(CORPUS) - 4, 4)]
     lengths = [count for row in packed["bin"]

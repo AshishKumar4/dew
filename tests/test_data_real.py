@@ -20,7 +20,7 @@ import pytest
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.data import Augment, DataPartition, HoldOut, Images, Loading, TFDS, load
+from dew.data import TFDS, Augment, DataPartition, HoldOut, Images, Loading, load
 
 pytestmark = pytest.mark.network
 

@@ -20,9 +20,9 @@ import numpy as np
 from process_support import prepare_worker
 
 from dew.data import Loading
+from dew.data.recipes import load
 from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import Evaluation
-from dew.data.recipes import load
 
 RES = 8
 BATCH = 8
@@ -362,7 +362,8 @@ def mode_data(args) -> dict:
     from dew.data import DataPartition, Text
     from dew.training import MeshSpec
 
-    data = load(Text(source=args.tokens, seq_len=args.seq_len), batch=BATCH, read="memory", loading=Loading(workers=args.workers, threads=1,
+    data = load(Text(source=args.tokens, seq_len=args.seq_len), batch=BATCH, read="memory",
+        loading=Loading(workers=args.workers, threads=1,
                                         read_buffer=8, worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
@@ -388,7 +389,8 @@ def mode_packed(args) -> dict:
     from dew.data import DataPartition, Text
     from dew.training import MeshSpec
 
-    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH, read="memory", loading=Loading(workers=args.workers,
+    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+        read="memory", loading=Loading(workers=args.workers,
                                         worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
@@ -480,7 +482,8 @@ def mode_packed_fit(args) -> dict:
 
     trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
     restored_step, restored = restored_state(trainer)
-    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH, read="memory", loading=Loading(workers=args.workers,
+    data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+        read="memory", loading=Loading(workers=args.workers,
                                         worker_buffer=1), validation_records=(0) * (BATCH))
     seen: list = []
     state = trainer.fit(
@@ -612,7 +615,9 @@ def mode_fit(args) -> dict:
         # batch's contents, so the split only has to shard.
         from dew.data import DataPartition, Text
 
-        data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH, read="memory", loading=Loading(workers=args.workers), validation_records=(args.val_steps) * (BATCH))
+        data = load(Text(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
+            read="memory", loading=Loading(workers=args.workers),
+                validation_records=(args.val_steps) * (BATCH))
         val = data.val
         assert val is not None
         available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))

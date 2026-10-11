@@ -136,7 +136,7 @@ def main(config: Config) -> Path:
     # rebuild the checkpoint's own architecture at the precision it trained in.
     run = replace(run, model=ModelConfig.from_model(source.model))
 
-    data = load(run.data, batch=run.trainer.batch_size, read=run.read,
+    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read,
                 provision=run.provision, loading=run.loading,
                 validation_records=run.validation_records)
     name = config.out.name

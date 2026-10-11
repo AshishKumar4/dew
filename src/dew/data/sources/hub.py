@@ -38,7 +38,10 @@ class Hub:
 
     @cached_property
     def builder(self):
-        from datasets import load_dataset_builder
+        try:
+            from datasets import load_dataset_builder
+        except ImportError as error:
+            raise ImportError("HF Arrow reads need pip install 'dewml[streaming]'") from error
 
         return load_dataset_builder(
             self.repo, name=self.config, revision=self.commit, cache_dir=self.cache_dir
@@ -78,14 +81,28 @@ class Hub:
         return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
 
     def snapshot(self) -> Mapping[str, object]:
-        return {
+        identity = {
             "store": "hf",
             "repo": self.repo,
             "revision": self.commit,
             "config": self.config,
             "split": self.split,
-            "shards": self.parquet.snapshot(),
         }
+        builder = self.__dict__.get("builder")
+        if builder is not None and Path(builder.cache_dir, "dataset_info.json").is_file():
+            from dew.data.storage import Store
+
+            dataset = builder.as_dataset(split=self.split)
+            identity["shards"] = [
+                {
+                    "uri": entry["filename"],
+                    "version": Store(entry["filename"]).resolve()[0].ukey(entry["filename"]),
+                }
+                for entry in dataset.cache_files
+            ]
+        else:
+            identity["shards"] = self.parquet.snapshot()
+        return identity
 
     def supports(self, read: Read) -> bool:
         if read == "streamed":

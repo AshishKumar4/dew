@@ -5,10 +5,12 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
+import http.client
 import io
 import json
 import os
 import re
+import shutil
 import tempfile
 import threading
 import time
@@ -22,9 +24,10 @@ from pathlib import Path
 from typing import BinaryIO, TypedDict
 
 import fsspec
-from filelock import FileLock
-from fsspec.implementations.cached import WholeFileCacheFileSystem
+from filelock import FileLock, Timeout
+from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
+from gcsfs import GCSFileSystem
 from huggingface_hub import HfFileSystem
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
@@ -45,6 +48,13 @@ class ObjectInfo(TypedDict):
 
 class ObjectRef(ObjectInfo):
     path: str
+
+
+class TransportStats(TypedDict):
+    hits: int
+    misses: int
+    downloaded_bytes: int
+    wait_seconds: float
 
 
 def _byte_size(value: int | str) -> int:
@@ -138,7 +148,8 @@ class DewDataFileSystem(AbstractFileSystem):
             raise ValueError(f"invalid dew-data object key {key!r}")
         return key
 
-    def _request(
+    @contextlib.contextmanager
+    def _response(
         self,
         method: str,
         path: str,
@@ -146,7 +157,7 @@ class DewDataFileSystem(AbstractFileSystem):
         payload: bytes | None = None,
         headers: Mapping[str, str] | None = None,
         query: str = "",
-    ) -> tuple[bytes, dict[str, str]]:
+    ) -> Iterator[http.client.HTTPResponse]:
         token = self.token or os.environ.get("DEW_DATA_TOKEN")
         if not token and self.token_file:
             token = Path(self.token_file).expanduser().read_text().strip()
@@ -161,16 +172,39 @@ class DewDataFileSystem(AbstractFileSystem):
         )
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
-                body = response.read()
                 if headers and "Range" in headers and response.status != 206:
                     raise OSError(f"dew-data did not honour range read for {path}")
-                return body, dict(response.headers.items())
+                yield response
         except urllib.error.HTTPError as error:
             if error.code == 404:
                 raise FileNotFoundError(path) from error
             if error.code in (409, 412):
                 raise PreconditionFailed(path) from error
             raise OSError(f"dew-data {method} {path}: HTTP {error.code}") from error
+
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+        query: str = "",
+    ) -> tuple[bytes, dict[str, str]]:
+        with self._response(method, path, payload=payload, headers=headers, query=query) as response:
+            return response.read(), dict(response.headers.items())
+
+    def get_file(self, rpath: str, lpath: str, **kwargs) -> None:
+        self._get_versioned(rpath, lpath)
+
+    def _get_versioned(self, rpath: str, lpath: str, version: str | None = None) -> None:
+        with self._response("GET", rpath) as response, open(lpath, "wb") as target:
+            if version is not None and response.headers.get("ETag") != version:
+                raise OSError(f"dew-data source changed before downloading {rpath}")
+            shutil.copyfileobj(response, target, length=2**20)
+
+    def ukey(self, path: str) -> str:
+        return str(self.info(path)["etag"])
 
     def info(self, path: str, **kwargs) -> dict[str, str | int]:
         key = self._key(path)
@@ -191,13 +225,23 @@ class DewDataFileSystem(AbstractFileSystem):
         }
 
     def _keys(self, prefix: str) -> Iterator[str]:
+        for entry in self._listing(prefix):
+            yield str(entry["name"])[len(self.bucket) + 1 :]
+
+    def _listing(self, prefix: str) -> Iterator[dict[str, str | int]]:
         cursor = ""
         while True:
-            query = "?" + urllib.parse.urlencode({"list": prefix, "cursor": cursor})
+            options = {"list": prefix, "detail": "1", **({"cursor": cursor} if cursor else {})}
+            query = "?" + urllib.parse.urlencode(options)
             body, _ = self._request("GET", self.bucket, query=query)
             page = json.loads(body)
-            for suffix in page["keys"]:
-                yield prefix + suffix
+            for entry in page["objects"]:
+                yield {
+                    "name": self.bucket + "/" + prefix + entry["key"],
+                    "size": entry["size"],
+                    "etag": entry["etag"],
+                    "type": "file",
+                }
             if page["cursor"] is None:
                 break
             cursor = page["cursor"]
@@ -206,17 +250,11 @@ class DewDataFileSystem(AbstractFileSystem):
         prefix = self._key(path.rstrip("/"))
         prefix = prefix.rstrip("/") + "/" if prefix else ""
         entries: dict[str, dict[str, str | int]] = {}
-        for key in self._keys(prefix):
-            tail = key[len(prefix) :]
+        for entry in self._listing(prefix):
+            tail = str(entry["name"])[len(self.bucket) + 1 + len(prefix) :]
             first, slash, _ = tail.partition("/")
             name = f"{self.bucket}/{prefix}{first}"
-            entries[name] = (
-                {"name": name, "type": "directory", "size": 0}
-                if slash
-                else self.info(name)
-                if detail
-                else {"name": name, "type": "file", "size": 0}
-            )
+            entries[name] = {"name": name, "type": "directory", "size": 0} if slash else entry
         found = sorted(entries.values(), key=lambda entry: str(entry["name"]))
         return found if detail else [entry["name"] for entry in found]
 
@@ -329,58 +367,126 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         self._dew_wait = 0.0
 
     def __getattribute__(self, name: str):
-        if name.startswith("_dew_"):
+        if name.startswith("_dew_") or name == "metrics":
             return object.__getattribute__(self, name)
         return super().__getattribute__(name)
 
     def _open(self, path: str, mode: str = "rb", **kwargs):
         if mode != "rb":
             return self.fs.open(path, mode=mode, **kwargs)
+        snapshot = kwargs.pop("source_snapshot", None)
         started = time.monotonic()
         directory = Path(self.storage[-1])
-        with FileLock(str(directory / ".dew-lock")):
-            self.load_cache()
-            path = self._strip_protocol(path)
-            cached = self._check_file(path)
-            if not cached:
-                self._dew_misses += 1
-                previous = self._metadata.cached_files[-1].get(path)
-                if previous is not None:
-                    with (directory / (previous["fn"] + ".pin")).open("a+b") as pin:
-                        try:
-                            fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        except BlockingIOError:
-                            return self.fs.open(path, mode=mode, **kwargs)
-                        self.pop_from_cache(path)
-                size = self.fs.size(path)
-                if not isinstance(size, int):
-                    raise ValueError(f"dewcache source {path!r} does not declare its byte size")
-                if not self._dew_room(size):
-                    return self.fs.open(path, mode=mode, **kwargs)
-                self._dew_downloaded += size
+        path = self._strip_protocol(path)
+        name = self._mapper(path)
+        reservation = directory / (".reserve-" + name)
+        with FileLock(str(directory / (".fetch-" + name + ".lock"))):
+            with FileLock(str(directory / ".dew-lock")):
+                reservation.unlink(missing_ok=True)
+                for interrupted in directory.glob(".download-" + name + "-*"):
+                    interrupted.unlink()
+            size = None
+            if isinstance(self.fs, DewDataFileSystem):
+                metadata = self.fs.info(path) if snapshot is None else snapshot
+                version, size = str(metadata["etag"]), int(metadata["size"])
             else:
-                self._dew_hits += 1
-            opened = super()._open(path, mode=mode, **kwargs)
-            local = Path(opened.name)
-            pin = (directory / (local.name + ".pin")).open("a+b")
-            fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
-            os.utime(local, None)
-            self._dew_wait += time.monotonic() - started
-            raw = io.FileIO(str(local), "r")
-            opened.close()
-            return _PinnedReader(raw, pin)
+                version = self.fs.ukey(path)
+            with FileLock(str(directory / ".dew-lock")):
+                self.load_cache()
+                cached = self._metadata.check_file(path, cfs=None)
+                if cached and (
+                    cached[0]["uid"] == version
+                    and (not self.expiry or time.time() - cached[0]["time"] <= self.expiry)
+                ):
+                    self._dew_hits += 1
+                    return self._dew_pin(Path(cached[1]), started)
+            size = self.fs.size(path) if size is None else size
+            if not isinstance(size, int):
+                raise ValueError(f"dewcache source {path!r} does not declare its byte size")
+            with FileLock(str(directory / ".dew-lock")):
+                self.load_cache()
+                self._dew_misses += 1
+                if not self._dew_discard(path) or not self._dew_room(size):
+                    return self.fs.open(path, mode=mode, **kwargs)
+                reservation.write_text(str(size))
+            local = directory / name
+            try:
+                self._dew_download(path, local, size, version)
+                with FileLock(str(directory / ".dew-lock")):
+                    reservation.unlink()
+                    return self._dew_pin(local, started)
+            finally:
+                with FileLock(str(directory / ".dew-lock")):
+                    reservation.unlink(missing_ok=True)
+
+    def _dew_pin(self, local: Path, started: float) -> _PinnedReader:
+        pin = local.with_name(local.name + ".pin").open("a+b")
+        fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
+        os.utime(local, None)
+        self._dew_wait += time.monotonic() - started
+        return _PinnedReader(io.FileIO(str(local), "r"), pin)
+
+    def _dew_discard(self, path: str) -> bool:
+        previous = self._metadata.cached_files[-1].get(path)
+        if previous is None:
+            return True
+        pin_path = Path(self.storage[-1]) / (previous["fn"] + ".pin")
+        with pin_path.open("a+b") as pin:
+            try:
+                fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            self.pop_from_cache(path)
+        return True
+
+    def _dew_download(self, path: str, local: Path, size: int, version: str) -> None:
+        descriptor, temporary = tempfile.mkstemp(dir=local.parent, prefix=".download-" + local.name + "-")
+        os.close(descriptor)
+        pending = Path(temporary)
+        try:
+            if isinstance(self.fs, DewDataFileSystem):
+                self.fs._get_versioned(path, str(pending), version)
+                unchanged = True
+            else:
+                self.fs.get_file(path, str(pending))
+                unchanged = self.fs.ukey(path) == version
+            if pending.stat().st_size != size or not unchanged:
+                raise OSError(f"dewcache source changed while downloading {path}")
+            with FileLock(str(local.parent / ".dew-lock")):
+                self.load_cache()
+                os.replace(pending, local)
+                self._metadata.update_file(
+                    path,
+                    {"original": path, "fn": local.name, "blocks": True, "time": time.time(), "uid": version},
+                )
+                self.save_cache()
+            self._dew_downloaded += size
+        finally:
+            pending.unlink(missing_ok=True)
 
     def _dew_room(self, needed: int) -> bool:
         if needed > self._dew_max_bytes:
             return False
         directory = Path(self.storage[-1])
+        reserved = 0
+        active = set()
+        for reservation in directory.glob(".reserve-*"):
+            name = reservation.name.removeprefix(".reserve-")
+            try:
+                with FileLock(str(directory / (".fetch-" + name + ".lock")), timeout=0):
+                    reservation.unlink()
+                    for interrupted in directory.glob(".download-" + name + "-*"):
+                        interrupted.unlink()
+            except Timeout:
+                reserved += int(reservation.read_text())
+                active.add(name)
         candidates = []
         for path, detail in self._metadata.cached_files[-1].items():
             local = directory / detail["fn"]
-            if local.is_file():
+            if local.is_file() and local.name not in active:
                 stat = local.stat()
                 candidates.append((stat.st_mtime_ns, path, local, stat.st_size))
-        used = sum(entry[3] for entry in candidates)
+        used = sum(entry[3] for entry in candidates) + reserved
         for _, path, local, size in sorted(candidates):
             if used + needed <= self._dew_max_bytes:
                 break
@@ -404,6 +510,14 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 raise TypeError("dewcache binary read returned non-bytes")
             return payload
 
+    def metrics(self) -> TransportStats:
+        return {
+            "hits": self._dew_hits,
+            "misses": self._dew_misses,
+            "downloaded_bytes": self._dew_downloaded,
+            "wait_seconds": self._dew_wait,
+        }
+
 
 _MEMORY_LOCK = threading.RLock()
 
@@ -423,14 +537,32 @@ class Store:
     retention: LocalRetention | None = field(default=None, repr=False)
 
     def resolve(self) -> tuple[AbstractFileSystem, str]:
-        return fsspec.core.url_to_fs(self.url, **(self.storage_options or {}))
+        options = dict(self.storage_options or {})
+        layers = self.url.split("::")
+        for cache in ("dewcache", "filecache", "simplecache", "blockcache"):
+            if cache not in layers[:-1]:
+                options.pop(cache, None)
+        return fsspec.core.url_to_fs(self.url, **options)
+
+    def cached(self) -> Store:
+        if self.url.startswith("dewcache::"):
+            return self
+        scheme = self.url.split("::", 1)[0] if "::" in self.url else self.url.split("://", 1)[0]
+        if "://" not in self.url and "::" not in self.url:
+            scheme = "file"
+        options = dict(self.storage_options or {})
+        transport = options.pop("dewcache", {})
+        backend = options.pop(scheme, {})
+        if not isinstance(backend, Mapping):
+            raise ValueError(f"storage options for {scheme!r} must be a mapping")
+        return Store("dewcache::" + self.url, {scheme: {**backend, **options}, "dewcache": transport})
 
     def child(self, path: str) -> Store:
         return Store(self.url.rstrip("/") + "/" + path, self.storage_options, self.retention)
 
     def describe(self) -> Mapping[str, object]:
         fs, _ = self.resolve()
-        while isinstance(fs, WholeFileCacheFileSystem):
+        while isinstance(fs, CachingFileSystem):
             fs = fs.fs
         settings = {"url": self.url, "protocol": fs.protocol}
         if isinstance(fs, S3FileSystem):
@@ -468,7 +600,7 @@ class Store:
 
     def _backend(self) -> tuple[AbstractFileSystem, str, str]:
         fs, path = self.resolve()
-        while isinstance(fs, WholeFileCacheFileSystem):
+        while isinstance(fs, CachingFileSystem):
             fs = fs.fs
         protocol = fs.protocol
         schemes = (protocol,) if isinstance(protocol, str) else protocol
@@ -512,7 +644,7 @@ class Store:
         if scheme in ("gs", "gcs"):
             metadata = fs.info(path)
             version = str(metadata["generation"])
-            return Versioned(fs.cat_file(path, generation=version), version)
+            return Versioned(fs.cat_file(path, generation=version, concurrency=1), version)
         if not isinstance(fs, HfFileSystem):
             raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
@@ -585,11 +717,27 @@ class Store:
             loop = fs.loop
             if loop is None:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
-            return sync(loop, put_s3)
-        if scheme in ("gs", "gcs"):
-            fs.pipe_file(path, payload, if_generation_match=0 if version is None else int(version))
-            fs.invalidate_cache(path)
-            return str(fs.info(path)["generation"])
+            version = sync(loop, put_s3)
+            fs.invalidate_cache()
+            return version
+        if isinstance(fs, GCSFileSystem):
+            bucket, key, _ = fs.split_path(path)
+            endpoint = f"{fs._location}/upload/storage/v1/b/{urllib.parse.quote(bucket, safe='')}/o"
+            try:
+                outcome = fs.call(
+                    "POST",
+                    endpoint,
+                    uploadType="media",
+                    name=key,
+                    ifGenerationMatch="0" if version is None else version,
+                    data=payload,
+                    headers={"Content-Type": "application/octet-stream"},
+                    json_out=True,
+                )
+            except FileExistsError as error:
+                raise PreconditionFailed(self.url) from error
+            fs.invalidate_cache()
+            return str(outcome["generation"])
         from huggingface_hub import CommitOperationAdd, HfApi
         from huggingface_hub.errors import HfHubHTTPError
 
@@ -603,7 +751,10 @@ class Store:
             version
             or api.repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha
         )
-        if version is None and fs.exists(path):
+        if parent is None:
+            raise ValueError(f"HF publication has no parent commit at {self.url}")
+        pinned = f"{resolved.repo_type}s/{resolved.repo_id}@{parent}/{resolved.path_in_repo}"
+        if version is None and fs.exists(pinned):
             raise PreconditionFailed(self.url)
         try:
             outcome = api.create_commit(

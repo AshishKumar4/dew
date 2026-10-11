@@ -171,7 +171,8 @@ def test_recorded_hero_runs_offline(tmp_path, monkeypatch):
     text = "ROMEO: I love the moon.\nJULIET: The moon shines tonight.\n" * 1000
     tokens = encoded_token_fixture(tmp_path / "tokens", [text], val_fraction=0.5, eos=True)
     # The schedule warms up over 10 steps, so a run takes more.
-    finished = smoke("hero", tmp_path, "--steps", "11", "--tokens", str(tokens), script=script, smoke_args=False)
+    finished = smoke("hero", tmp_path, "--steps", "11", "--tokens", str(tokens), script=script,
+        smoke_args=False)
     assert "ROMEO:" in finished.stdout and "JULIET:" in finished.stdout
 
 

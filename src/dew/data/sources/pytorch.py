@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..dataset import Batch, Records, describe
-from ..steps.generic import Formatting
 from .base import Read, ShardManifest
 
 if TYPE_CHECKING:
@@ -56,6 +55,8 @@ class TorchRecords:
     def __getitem__(self, index: int) -> Batch:
         import torch
 
+        from ..steps.generic import Formatting
+
         sample = self.dataset[index]
         if isinstance(sample, Mapping) and self.names is None:
             named = dict(sample)
@@ -86,14 +87,14 @@ class Torch:
     facts: Mapping[str, object] | None = None
 
     def describe(self) -> str:
-        return f"torch:{self.identity or describe(self.dataset)}:{self.fields}"
+        return f"torch:{self.identity or repr(TorchRecords(self.dataset, self.fields))}:{self.fields}"
 
     def snapshot(self) -> Mapping[str, object]:
         return {
             "store": "torch",
             "identity_required": True,
             "identity": self.identity,
-            "dataset": describe(self.dataset),
+            "dataset": repr(TorchRecords(self.dataset, self.fields)),
             "rows": len(self.records("indexed")),
             "fields": self.fields,
         }
