@@ -31,6 +31,7 @@ from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops, r
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
+from dew.nn.scatter import DROPPED
 from dew.records import JSON
 
 
@@ -252,8 +253,9 @@ def _laid_back(values: jax.Array, inputs: DecisionInputs) -> jax.Array:
     # A padding slot indexes slot 0 (`compacted`) and so computes slot 0's own
     # values, and the scatter's gradient masks a duplicate index; dropping it
     # still keeps a padding slot from writing anywhere on the grid, a row of
-    # no real options' slot 0 included.
-    target = jnp.where(inputs.slotted, inputs.option_slots, count * width)
+    # no real options' slot 0 included. `DROPPED`, not the grid's size, which
+    # XLA's deterministic GPU scatter would land on the next row's slot 0.
+    target = jnp.where(inputs.slotted, inputs.option_slots, DROPPED)
     laid = jnp.zeros((batch, count * width, *values.shape[2:]), values.dtype)
     laid = laid.at[jnp.arange(batch)[:, None], target].set(values, mode="drop")
     return laid.reshape(batch, count, width, *values.shape[2:])

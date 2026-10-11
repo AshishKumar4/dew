@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact_as_the_reference, distance
 from safetensors.numpy import load_file
 
 from dew.data import DataPartition
@@ -149,14 +150,24 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
 
     (grid, grid_gradient), (fewer, fewer_gradient) = (jax.value_and_grad(loss)(variables, rows)
                                                       for rows in (batch, slotted))
-    assert float(fewer) == pytest.approx(float(grid), rel=1e-6)
-    scale = max(float(jnp.abs(leaf).max()) for leaf in jax.tree.leaves(grid_gradient))
+    # Float64 truth: the grid's step in float64. The compacted step is held
+    # to it as the grid is, per tensor (tests/reference_error.py): no looser
+    # rule for the head than for any other port.
+    with jax.enable_x64(True):
+        wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
+                            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, (variables, batch))
+        truth, truth_gradient = jax.value_and_grad(loss)(*wide)
+        truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
 
-    def close(path, got, want):
-        np.testing.assert_allclose(np.asarray(got), np.asarray(want), rtol=0, atol=1e-5 * scale,
-                                   err_msg=jax.tree_util.keystr(path))
+    def exact(path, got, want, true):
+        label = jax.tree_util.keystr(path)
+        if distance(want, true) == 0:
+            assert distance(got, true) == 0, label
+        else:
+            assert_as_exact_as_the_reference(got, want, true, label)
 
-    jax.tree_util.tree_map_with_path(close, fewer_gradient, grid_gradient)
+    exact((), float(fewer), float(grid), truth)
+    jax.tree_util.tree_map_with_path(exact, fewer_gradient, grid_gradient, truth_gradient)
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.
