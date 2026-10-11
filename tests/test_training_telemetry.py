@@ -33,6 +33,17 @@ class Squared(Objective):
         return jnp.mean((prediction - batch['target']) ** 2), Aux({'probe': prediction})
 
 
+class ComplexSquared(Objective):
+    """A real loss whose optimizer input has complex coordinates, as an SSM's can."""
+
+    def init(self, key, variables=None):
+        return {'params': {'weight': jnp.zeros(2, jnp.complex64)}}
+
+    def loss(self, variables, batch, step):
+        error = variables['params']['weight'] - batch['target']
+        return jnp.mean(jnp.sum(jnp.abs(error) ** 2, axis=-1)), Aux({})
+
+
 def targets(values):
     return Dataset(lambda partition: iter({'target': np.full(8, value, np.float32)}
                                           for value in values), None, None, 8)
@@ -57,6 +68,18 @@ def test_rejected_attempts_do_not_contribute_to_grad_norm():
     rows = {step: values['train/grad_norm'] for step, values in sink.scalars
             if 'train/grad_norm' in values}
     assert rows == pytest.approx({3: 4.})
+
+
+@pytest.mark.parametrize('accumulation', [1, 2])
+def test_complex_gradients_have_a_real_committed_norm(accumulation):
+    batch = {'target': np.broadcast_to(np.array([1 + 2j, 3 + 4j], np.complex64), (8, 2))}
+    data = Dataset(lambda partition: iter([batch] * accumulation), None, None, 8)
+    sink = RecordingTracker()
+    trainer = Trainer(ComplexSquared(), optax.sgd(.1), key=0, tracker=sink, accumulation=accumulation)
+    trainer.fit(data, steps=accumulation, log_every=1)
+    rows = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars
+            if 'train/grad_norm' in scalars}
+    assert rows == pytest.approx({accumulation: np.sqrt(120.)})
 
 
 def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatch):
