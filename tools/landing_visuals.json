@@ -1,6 +1,6 @@
 {
   "model": "dewml/hybrid-dit-176m",
-  "revision": "90d1717ac262e1b33a65ac602812ef442129c7ea",
+  "revision": "f9f06d778860501a257a900ca58faabf853f03cc",
   "checkpoint_step": 1350000,
   "prompts": {
     "aurora": "the northern lights over a frozen lake at night",

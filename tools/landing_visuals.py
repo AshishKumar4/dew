@@ -9,7 +9,10 @@ manifest entry reproduces with one call. `verify` checks that on a sample of row
 What is sampled, the model and its revision, the prompts, their variants, the
 negative prompts and the sampler settings, is an experiment file:
 `tools/landing_visuals.json` made the 176M gallery on the landing page
-(`site/public/gallery/dew-176m/manifest.json`). Everything a run writes goes
+(`site/public/gallery/dew-176m/manifest.json`). The gallery was sampled at the
+model's revision 90d1717a, whose run record today's Dew no longer reads; the
+file names f9f06d77, the revision the live sampler pins, which records the same
+checkpoint by class with its arrays unchanged. Everything a run writes goes
 under `--out`. Images are scored by CLIPScore against the subject prompt and by
 the LAION aesthetic predictor over CLIP's image features; `--aesthetic` names
 its weights, or they are fetched into `<out>/models` and checked by sha256.
