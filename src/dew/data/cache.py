@@ -178,7 +178,9 @@ class Cache:
         return options
 
     def reference(self, manifest: DependencyManifest) -> str:
-        return f"filling {self.url.rstrip('/')}/{manifest.key}"
+        """The cache a plan reads, by the key of the rows it serves: where the cache lives is no part
+        of the data, so a run resumes against the same rows cached anywhere."""
+        return f"filling {manifest.key}"
 
     def _root(self, manifest: DependencyManifest) -> Store:
         if not manifest.clean:
