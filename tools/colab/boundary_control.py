@@ -107,9 +107,11 @@ def control(
             if ack.get("request_id") == request_id and ack.get("generation") == generation:
                 break
         except FileNotFoundError:
-            save(run_dir / "boundary-requests" / (request_id + ".json"),
-                 {"request_id": request_id, "generation": generation, "status": "waiting for acknowledged boundary",
-                  "at": time.time()})
+            save(
+                run_dir / "boundary-requests" / (request_id + ".json"),
+                {"request_id": request_id, "generation": generation,
+                 "status": "waiting for acknowledged boundary", "at": time.time()},
+            )
         time.sleep(1)
     else:
         raise TimeoutError("boundary was not acknowledged; live work remains owned by its supervisor")
