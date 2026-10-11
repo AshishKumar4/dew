@@ -95,7 +95,7 @@ def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
     return next(
         (
             read
-            for read in reversed(READS[: preferred + 1])
+            for read in READS[preferred::-1]
             if all(isinstance(source, _Provisionable) for source in _unsupported(pipelines, read))
         ),
         READS[preferred],
