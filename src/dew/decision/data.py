@@ -279,104 +279,7 @@ class Decisions:
             fs, path = root.resolve()
             mixture = path.rstrip("/") + "/mixture.json"
             if fs.exists(mixture):
-                with fs.open(mixture, "rb") as handle:
-                    stated = record(json.load(handle), "mixture.json")
-                pinned: dict[str, JSON] = {}
-                if self.descriptor is not None:
-                    payload = Store(self.descriptor).read()
-                    replaced = record(json.loads(payload), "decision descriptor")
-                    provenance = record(replaced.get("provenance"), "descriptor provenance")
-                    root_manifest = root.child("manifest.sha256").read().decode().strip()
-                    if provenance.get("original_manifest_sha") != root_manifest:
-                        raise ValueError(
-                            "decision descriptor refers to a different canonical source manifest"
-                        )
-                    original_files = record(stated.get("files", {}), "original files")
-                    for name, value in record(replaced.get("files", {}), "descriptor files").items():
-                        old = record(original_files.get(name), f"original files.{name}")
-                        for partition, entry in record(value, name).items():
-                            if record(entry, partition).get("sha256") != record(
-                                old.get(partition), partition
-                            ).get("sha256"):
-                                raise ValueError(f"decision descriptor changes raw corpus {name}/{partition}")
-                    stated = replaced
-                    pinned = {"url": self.descriptor, "sha256": hashlib.sha256(payload).hexdigest()}
-                shares = {
-                    name: records.number(value, f"weights.{name}")
-                    for name, value in record(stated.get("weights", {}), "weights").items()
-                } | dict(self.weights)
-                slots = {
-                    name: records.integer(value, f"slots.{name}")
-                    for name, value in record(stated.get("slots", {}), "slots").items()
-                }
-                files = record(stated.get("files", {}), "mixture files")
-                training, held, weights = [], [], []
-                for name, weight in sorted(shares.items()):
-                    if weight <= 0:
-                        continue
-                    corpus = record(files.get(name, {}), f"files.{name}")
-                    for split, destination in (("train", training), ("held", held)):
-                        entry = record(corpus.get(split, {}), f"files.{name}.{split}")
-                        shards = entry.get("shards")
-                        if isinstance(shards, list):
-                            paths = tuple(
-                                self.source.rstrip("/")
-                                + "/"
-                                + records.text(record(shard, "shard")["path"], "shard.path")
-                                for shard in shards
-                            )
-                        else:
-                            url = (
-                                self.source.rstrip("/") + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
-                            )
-                            shard_fs, shard_path = Store(url).resolve()
-                            paths = (url,) if shard_fs.exists(shard_path) else ()
-                        if paths:
-                            index = record(entry.get("index", {}), "index").get("path")
-                            source_index = (
-                                None
-                                if index is None
-                                else self.source.rstrip("/") + "/" + records.text(index, "index.path")
-                            )
-                            declared = (
-                                {
-                                    self.source.rstrip("/")
-                                    + "/"
-                                    + records.text(record(shard, "shard")["path"], "shard.path"): record(
-                                        shard, "shard"
-                                    )
-                                    for shard in shards
-                                    if isinstance(shards, list)
-                                }
-                                if isinstance(shards, list)
-                                else None
-                            )
-                            if declared is not None and source_index is not None:
-                                declared[source_index] = record(entry["index"], "index")
-                            dataset = _DecisionSource(
-                                Files(paths, format="jsonl", index=source_index, file_info=declared),
-                                slots or None,
-                                descriptor=pinned,
-                            )
-                            destination.append(Pipeline(dataset, name=name).map(ParseExample()))
-                    weights.append(weight)
-                if not training:
-                    raise ValueError(f"no corpus of {self.source} has a positive weight")
-                train = training[0] if len(training) == 1 else training[0].mix(*training[1:], weights=weights)
-                evaluated = (
-                    None
-                    if not held
-                    else Pipeline(
-                        _DecisionSource(
-                            Concatenate(
-                                tuple(child.source for child in held if isinstance(child.source, Source))
-                            ),
-                            slots or None,
-                            descriptor=pinned,
-                        )
-                    ).map(ParseExample())
-                )
-                return train, evaluated, ()
+                return self._mixture(self.source)
         if isinstance(self.source, Sequence) and not isinstance(self.source, str):
             rows = tuple({"example": row} if isinstance(row, Example) else row for row in self.source)
             dataset = _DecisionSource(Memory(rows), table=table)
@@ -412,6 +315,122 @@ class Decisions:
                 Configured(_ParseConfigured(table), needs=())
             )
         return train, evaluated, ()
+
+
+    def _mixture(self, root_url: str) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
+        from dew.data.sources import Files
+        from dew.data.sources.concatenate import Concatenate
+        from dew.data.storage import Store
+
+        root = Store(root_url)
+        fs, path = root.resolve()
+        mixture = path.rstrip("/") + "/mixture.json"
+        with fs.open(mixture, "rb") as handle:
+            stated = record(json.load(handle), "mixture.json")
+        stated, pinned = self._descriptor(root_url, stated)
+        shares = {
+            name: records.number(value, f"weights.{name}")
+            for name, value in record(stated.get("weights", {}), "weights").items()
+        } | dict(self.weights)
+        slots = {
+            name: records.integer(value, f"slots.{name}")
+            for name, value in record(stated.get("slots", {}), "slots").items()
+        }
+        files = record(stated.get("files", {}), "mixture files")
+        training, held, weights = [], [], []
+        for name, weight in sorted(shares.items()):
+            if weight <= 0:
+                continue
+            corpus = record(files.get(name, {}), f"files.{name}")
+            for split, destination in (("train", training), ("held", held)):
+                entry = record(corpus.get(split, {}), f"files.{name}.{split}")
+                shards = entry.get("shards")
+                if isinstance(shards, list):
+                    paths = tuple(
+                        root_url.rstrip("/")
+                        + "/"
+                        + records.text(record(shard, "shard")["path"], "shard.path")
+                        for shard in shards
+                    )
+                else:
+                    url = (
+                        root_url.rstrip("/") + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
+                    )
+                    shard_fs, shard_path = Store(url).resolve()
+                    paths = (url,) if shard_fs.exists(shard_path) else ()
+                if paths:
+                    index = record(entry.get("index", {}), "index").get("path")
+                    source_index = (
+                        None
+                        if index is None
+                        else root_url.rstrip("/") + "/" + records.text(index, "index.path")
+                    )
+                    declared = (
+                        {
+                            root_url.rstrip("/")
+                            + "/"
+                            + records.text(record(shard, "shard")["path"], "shard.path"): record(
+                                shard, "shard"
+                            )
+                            for shard in shards
+                            if isinstance(shards, list)
+                        }
+                        if isinstance(shards, list)
+                        else None
+                    )
+                    if declared is not None and source_index is not None:
+                        declared[source_index] = record(entry["index"], "index")
+                    dataset = _DecisionSource(
+                        Files(paths, format="jsonl", index=source_index, file_info=declared),
+                        slots or None,
+                        descriptor=pinned,
+                    )
+                    destination.append(Pipeline(dataset, name=name).map(ParseExample()))
+            weights.append(weight)
+        if not training:
+            raise ValueError(f"no corpus of {self.source} has a positive weight")
+        train = training[0] if len(training) == 1 else training[0].mix(*training[1:], weights=weights)
+        evaluated = (
+            None
+            if not held
+            else Pipeline(
+                _DecisionSource(
+                    Concatenate(
+                        tuple(child.source for child in held if isinstance(child.source, Source))
+                    ),
+                    slots or None,
+                    descriptor=pinned,
+                )
+            ).map(ParseExample())
+        )
+        return train, evaluated, ()
+
+
+    def _descriptor(self, root_url: str, stated: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
+        from dew.data.storage import Store
+
+        root = Store(root_url)
+        pinned: dict[str, JSON] = {}
+        if self.descriptor is not None:
+            payload = Store(self.descriptor).read()
+            replaced = record(json.loads(payload), "decision descriptor")
+            provenance = record(replaced.get("provenance"), "descriptor provenance")
+            root_manifest = root.child("manifest.sha256").read().decode().strip()
+            if provenance.get("original_manifest_sha") != root_manifest:
+                raise ValueError(
+                    "decision descriptor refers to a different canonical source manifest"
+                )
+            original_files = record(stated.get("files", {}), "original files")
+            for name, value in record(replaced.get("files", {}), "descriptor files").items():
+                old = record(original_files.get(name), f"original files.{name}")
+                for partition, entry in record(value, name).items():
+                    if record(entry, partition).get("sha256") != record(
+                        old.get(partition), partition
+                    ).get("sha256"):
+                        raise ValueError(f"decision descriptor changes raw corpus {name}/{partition}")
+            stated = replaced
+            pinned = {"url": self.descriptor, "sha256": hashlib.sha256(payload).hexdigest()}
+        return stated, pinned
 
 
 @dataclass(frozen=True)

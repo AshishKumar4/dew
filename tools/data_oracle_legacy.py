@@ -134,7 +134,36 @@ def _videos(root: Path):
     return clips, audio
 
 
-def fixtures(root: Path):
+def token_store(root, name, shift):
+    directory = root / name
+    directory.mkdir()
+    train = np.asarray(
+        [
+            token
+            for index in range(100)
+            for token in [*((np.arange(5 + index % 15) + index + shift) % 200), 255]
+        ],
+        np.uint16,
+    )
+    held = train[:180]
+    (directory / "train.bin").write_bytes(train.tobytes())
+    (directory / "val.bin").write_bytes(held.tobytes())
+    (directory / "meta.json").write_text(
+        json.dumps(
+            {
+                "tokenizer": "byte",
+                "vocab_size": 256,
+                "dtype": "uint16",
+                "train_tokens": len(train),
+                "val_tokens": len(held),
+                "eos_id": 255,
+            }
+        )
+    )
+    return str(directory)
+
+
+def fixture_inputs(root: Path):
     from dew.data import (
         ArrayRecordImages,
         ChatMessages,
@@ -155,36 +184,8 @@ def fixtures(root: Path):
     from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout, Weighted
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
-    def token_store(name, shift):
-        directory = root / name
-        directory.mkdir()
-        train = np.asarray(
-            [
-                token
-                for index in range(100)
-                for token in [*((np.arange(5 + index % 15) + index + shift) % 200), 255]
-            ],
-            np.uint16,
-        )
-        held = train[:180]
-        (directory / "train.bin").write_bytes(train.tobytes())
-        (directory / "val.bin").write_bytes(held.tobytes())
-        (directory / "meta.json").write_text(
-            json.dumps(
-                {
-                    "tokenizer": "byte",
-                    "vocab_size": 256,
-                    "dtype": "uint16",
-                    "train_tokens": len(train),
-                    "val_tokens": len(held),
-                    "eos_id": 255,
-                }
-            )
-        )
-        return str(directory)
-
-    tokens = token_store("tokens", 0)
-    another = token_store("other", 10)
+    tokens = token_store(root, "tokens", 0)
+    another = token_store(root, "other", 10)
     tokenizer = "tests/fixtures/tokenizers/tiny-chat"
     messages = tuple(
         {
@@ -276,6 +277,14 @@ def fixtures(root: Path):
         Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
         for index in range(40)
     ]
+    return (tokens, another, tokenizer, chats, prompts, pairs, pixels, image_root, image_table, table, clips, audio, objective, examples)
+
+
+def fixtures(root: Path):
+    from dew.data import (ArrayRecordImages, ChatMessages, DataPhase, HFImages, HFOptions, HubDataset, LocalVideos, PreferencePairs, PreparedTFDS, Prompts, TFDSImages, TFDSOptions, TokenWindows)
+    from dew.decision import Weighted
+
+    tokens, another, tokenizer, chats, prompts, pairs, pixels, image_root, image_table, table, clips, audio, objective, examples = fixture_inputs(root)
     return {
         "text_windows": lambda loading: TokenWindows(path=tokens, seq_len=16, seed=7, loading=loading).load(
             batch=4
