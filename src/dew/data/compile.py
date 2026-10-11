@@ -867,6 +867,7 @@ def _memory_stages(
     training: bool,
 ) -> Pipeline:
     derived: dict[str, str] = {}
+    targets: Mapping[str, int] | None = None
     for stage in pipeline.stages[consumed:eager]:
         if isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
@@ -880,7 +881,7 @@ def _memory_stages(
             )
             windows = WindowRecords(tuple(record(value, "window document") for _, value in rows), stage)
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
-            rows = [((index,), windows[index]) for index in range(len(windows))]
+            rows, targets = _targeted([((index,), windows[index]) for index in range(len(windows))], counter)
         elif isinstance(stage, Pack):
             from dew.data.tokens import PackedWindows
 
@@ -899,7 +900,7 @@ def _memory_stages(
                 # own packer, run once over the corpus as an indexed read streams it.
                 packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
                 derived["packing"] = fingerprint(sizes)
-            rows = [((index,), packed[index]) for index in range(len(packed))]
+            rows, targets = _targeted([((index,), packed[index]) for index in range(len(packed))], counter)
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
             for identifier, value in rows:
@@ -912,10 +913,29 @@ def _memory_stages(
                         )
             rows = expanded
         consumed += 1
+    if targets is not None and targets["valid_targets"] == 0 and training:
+        raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
-    return _memory_order(
-        pipeline, rows, consumed, source, inputs, counter, derived, groups, training=training
-    )
+    return _memory_order(pipeline, rows, consumed, source, inputs, counter, derived, groups, targets)
+
+
+def _targeted(
+    rows: list[tuple[tuple[int, ...], Record]], counter: CorpusCounts
+) -> tuple[list[tuple[tuple[int, ...], Record]], Mapping[str, int]]:
+    """The windows a pack or windows stage made that hold a valid target, and
+    their count and targets, taken where the windows are made so later steps
+    cannot change them."""
+    from dew.data.steps.text import ValidTargets
+
+    kept, total = [], 0
+    for identifier, value in rows:
+        count = ValidTargets()(record(value, "packed window"))
+        if count:
+            kept.append((identifier, value))
+            total += count
+        else:
+            counter.rejected["zero_targets"] += 1
+    return kept, {"windows": len(kept), "valid_targets": total}
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -1007,8 +1027,7 @@ def _memory_order(
     counter: CorpusCounts,
     derived: dict[str, str],
     groups: LengthGroups | None,
-    *,
-    training: bool,
+    packed: Mapping[str, int] | None,
 ) -> Pipeline:
     rows = [
         (identifier, value if isinstance(value, bytes) else record(value, "materialized record"))
@@ -1036,27 +1055,9 @@ def _memory_order(
     facts: Batch = _measured_bounds(
         [record(value, "measured row") for _, value in rows if not isinstance(value, bytes)]
     )
-    if any(isinstance(stage, (Pack, Windows)) for stage in pipeline.stages[:consumed]):
-        from dew.data.steps.text import ValidTargets
-
-        targets = ValidTargets()
-        kept = []
-        for identifier, value in rows:
-            count = targets(record(value, "packed window"))
-            if count:
-                kept.append((identifier, value))
-            else:
-                counter.rejected["zero_targets"] += 1
-        rows = kept
-        facts = {
-            **facts,
-            "windows": len(rows),
-            "valid_targets": sum(targets(record(value, "packed window")) for _, value in rows),
-        }
-        if facts["valid_targets"] == 0 and training:
-            raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
+    if packed is not None:
+        facts = {**facts, **packed}
         derived["valid_targets"] = fingerprint(facts)
-        counter.accepted = len(rows)
     derived["accepted_ids"] = fingerprint([list(identifier) for identifier, _ in rows])
     return dataclasses.replace(
         pipeline,
