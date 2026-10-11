@@ -194,7 +194,8 @@ class ImageRecord(grain.RandomMapTransform):
 
     def __setstate__(self, state: Mapping[str, object]) -> None:
         import_opencv()
-        self.__dict__.update(state)
+        for name, value in state.items():
+            object.__setattr__(self, name, value)
 
     def random_map(self, element: Batch | bytes, rng: np.random.Generator) -> Batch:
         import_opencv()

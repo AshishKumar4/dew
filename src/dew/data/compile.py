@@ -1329,8 +1329,8 @@ class _Build:
             elif isinstance(stage, Limit):
                 stream = gx.LimitIterDataset(stream, stage.count)
             elif not isinstance(stage, MapBatch):
-                stream, _ = self.stage(stream, None, stage, pipeline, partition)
-                stream = _as_iter(stream, self.loading)
+                advanced, _ = self.stage(stream, None, stage, pipeline, partition)
+                stream = _as_iter(advanced, self.loading)
         if self.loading.workers and not explicit_workers:
             stream = stream.mp_prefetch(
                 pygrain.MultiprocessingOptions(
