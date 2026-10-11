@@ -670,14 +670,16 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     interpreter, roots, versions, problems = install(pinned, work, args.python)
     failures += problems
     receipt.update(pins=pinned, installed=versions)
-    scope = top_levels(roots, set(pinned))
-    static = Sources(roots, arch, scope)
     results = resolve(interpreter, other, bound) if interpreter else [["absent", "no pins"]] * len(other)
     absent = [chain for chain, result in zip(other, results, strict=True) if result[0] == "absent"]
     retried = iter(resolve(args.dew_python, absent, bound))
-    for chain, result in zip(other, results, strict=True):
-        kind, detail = next(retried) if result[0] == "absent" else result
-        if kind == "import" and top(chain) in scope:
+    results = [next(retried) if result[0] == "absent" else result for result in results]
+    # Only a pinned package that cannot import on CPU is read from its sources; the closure stays
+    # inside it, as what it imports from importable packages was proven by importing them.
+    failed = {top(chain) for chain, result in zip(other, results, strict=True) if result[0] == "import"}
+    static = Sources(roots, arch, failed & top_levels(roots, set(pinned)))
+    for chain, (kind, detail) in zip(other, results, strict=True):
+        if kind == "import" and top(chain) in static.scope:
             problem = static.check(chain["module"], chain["attrs"], bound)
             if problem:
                 failures.append(f"{label(chain)}: {problem} (from sources; on CPU: {detail})")
@@ -685,7 +687,8 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             failures.append(f"{label(chain)}: no pin or Dew dependency provides it ({detail})")
         elif kind != "ok":
             failures.append(f"{label(chain)}: {detail}")
-    failures += static.closure({chain["module"] for chain in other if top(chain) in scope}, bound)
+    failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
+    receipt.update(static=sorted(static.scope))
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
 
