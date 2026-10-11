@@ -53,9 +53,9 @@ def fresh_book(loss: jax.Array) -> Book:
     and `bookkeep` would compile again.
     """
     dtype = jnp.promote_types(loss.dtype, jnp.float32)
-    zeros = Book(np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
-                 np.zeros((), dtype), np.zeros((), dtype), np.zeros((), dtype), np.zeros((), np.int32))
-    return jax.device_put(zeros, loss.sharding)
+    zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
+             np.zeros((), dtype), np.zeros((), dtype), np.zeros((), dtype), np.zeros((), np.int32))
+    return Book(*jax.device_put(zeros, loss.sharding))
 
 
 @jax.jit
