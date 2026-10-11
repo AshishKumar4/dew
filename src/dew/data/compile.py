@@ -205,10 +205,10 @@ def _promoted(pipeline: Pipeline) -> tuple[Pipeline, tuple[str, ...]]:
     return dataclasses.replace(pipeline, source=source), references
 
 
-def _check(pipeline: Pipeline, read: Read, *, validation: bool = False) -> None:
+def _check(pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False) -> None:
     if isinstance(pipeline.source, (Mixture, Phases)):
         for child in pipeline.source.pipelines:
-            _check(child, read, validation=validation)
+            _check(child, read, validation=validation, promotion=promotion)
     ancestry = (
         tuple(stage for child in pipeline.source.pipelines for stage in _steps(child))
         if isinstance(pipeline.source, (Mixture, Phases))
@@ -239,7 +239,7 @@ def _check(pipeline: Pipeline, read: Read, *, validation: bool = False) -> None:
                 )
             for earlier in prefix:
                 _identity(earlier, cache=True)
-        if isinstance(stage, Shuffle) and stage.window is None and not indexed:
+        if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
         if isinstance(stage, (Interleave, Prefetch, Rebatch, Limit)) or (
             isinstance(stage, (Filter, FlatMap, Pack, Windows)) and (read != "memory" or random is not None)
@@ -1468,10 +1468,13 @@ def compile(
         )
     pipelines = (train,) if validation is None else (train, validation)
     for pipeline in pipelines:
-        _check(pipeline, read, validation=pipeline is validation)
+        _check(pipeline, read, validation=pipeline is validation, promotion=True)
     train, generations = _promoted(train)
     if validation is not None:
         validation, _ = _promoted(validation)
+    _check(train, read)
+    if validation is not None:
+        _check(validation, read, validation=True)
     pipelines = (train,) if validation is None else (train, validation)
     _capabilities(pipelines, read, provision)
     pinned = _pin_sources(pipelines, read)
