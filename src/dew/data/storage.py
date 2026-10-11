@@ -486,7 +486,11 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         pending = Path(temporary)
         try:
             if version.startswith("sha256:"):
-                self.fs.get_file(path, str(pending))
+                if isinstance(self.fs, DewDataFileSystem):
+                    self.fs.get_file(path, str(pending))
+                else:
+                    with self.fs.open(path, "rb", size=size) as source, pending.open("wb") as target:
+                        shutil.copyfileobj(source, target, length=2**20)
                 with pending.open("rb") as downloaded:
                     unchanged = hashlib.file_digest(downloaded, "sha256").hexdigest() == version[7:]
             elif isinstance(self.fs, DewDataFileSystem):
