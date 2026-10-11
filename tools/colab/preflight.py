@@ -264,7 +264,8 @@ def directory(node: ast.AST, constants: dict[str, str]) -> str | None:
             return "."
         if name in ("Path", "pathlib.Path", "str", "os.fspath", "os.path.join") and node.args:
             parts = [directory(argument, constants) for argument in node.args]
-            return None if None in parts else os.path.normpath(os.path.join(*parts))
+            known = [part for part in parts if part is not None]
+            return os.path.normpath(os.path.join(*known)) if len(known) == len(parts) else None
     return None
 
 
@@ -331,17 +332,23 @@ def resolve(python: str, chains: list[dict], bound: set, env: dict | None = None
                 cwd=cwd,
                 timeout=300,
             )
-            answers = json.loads(result.stdout.splitlines()[-1])
         except subprocess.TimeoutExpired:
             answers = [["import", f"importing {name} took over 300 s"]] * len(members)
-        except (IndexError, json.JSONDecodeError):
-            lines = result.stderr.strip().splitlines() or ["no output"]
-            last = next((line for line in lines if line.startswith("Fatal Python error")), lines[-1])
-            answers = [["import", f"importing {name} ended the interpreter ({result.returncode}): {last}"]]
-            answers *= len(members)
+        else:
+            answers = answered(result, name, len(members))
         for index, answer in zip(members, answers, strict=True):
             found[index] = answer
     return found
+
+
+def answered(result: subprocess.CompletedProcess[str], name: str, count: int) -> list:
+    """The resolver's answers, or, where importing `name` killed it, that for each of its chains."""
+    try:
+        return json.loads(result.stdout.splitlines()[-1])
+    except (IndexError, json.JSONDecodeError):
+        lines = result.stderr.strip().splitlines() or ["no output"]
+        last = next((line for line in lines if line.startswith("Fatal Python error")), lines[-1])
+        return [["import", f"importing {name} ended the interpreter ({result.returncode}): {last}"]] * count
 
 
 class Sources:
@@ -407,7 +414,7 @@ class Sources:
             self.tables[module] = (names, wildcard)
         return self.tables[module]
 
-    def lookup(self, module: str, name: str, seen: frozenset = frozenset()):
+    def lookup(self, module: str, name: str, seen: frozenset = frozenset()) -> tuple | None:
         if module.split(".")[0] not in self.scope:
             return ("value",)
         table = self.table(module)
@@ -852,7 +859,9 @@ def verify(path: Path, request: dict, inputs: list[tuple[str, str]]) -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(
+        description="Prove a Colab request's scripts on CPU before a GPU is paid for."
+    )
     parser.add_argument("inputs", nargs="*", help="the request's staged scripts")
     parser.add_argument("--ref", required=True)
     parser.add_argument("--hardware", choices=sorted(ARCH), required=True)
