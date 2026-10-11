@@ -1673,7 +1673,7 @@ def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
 
 
 def test_columns_of_different_lengths_are_refused_by_name():
-    with pytest.raises(ValueError, match="'x' holds 3 records and 'index' holds 4"):
+    with pytest.raises(ValueError, match=r"different row counts:.*'index': 4.*'x': 3"):
         load(Records(source={"index": np.arange(4), "x": np.zeros((3, 2))}), batch=2, read="memory")
 
 
@@ -1743,7 +1743,7 @@ def test_records_whose_field_lengths_differ_are_refused_with_the_remedy():
 def test_training_records_too_few_for_one_batch_are_refused():
     """An endless stream would fill a batch by repeating records inside it,
     and an epoch would be zero steps long."""
-    with pytest.raises(ValueError, match="3 training records, fewer than one batch of 4"):
+    with pytest.raises(ValueError, match="3 records, fewer than one batch of 4"):
         load(Records(source=_columns(3)), batch=4, read="memory")
 
 
