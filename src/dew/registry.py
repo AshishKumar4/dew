@@ -1146,6 +1146,7 @@ datasets: Aliases[type[Recipe], Recipe] = Aliases("dataset", {
     "prompts": "dew.data.recipes:Prompts",
     "records": "dew.data.recipes:Records",
     "text": "dew.data.recipes:Text",
+    "tiny_shakespeare": "dew.data.recipes:tiny_shakespeare",
     "video": "dew.data.recipes:Video",
 }, base="dew.data.recipes:Recipe")
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {

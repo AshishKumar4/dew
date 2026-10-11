@@ -303,6 +303,19 @@ class Phases:
 
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
+    """A source and the stages that read it, in the order they are written.
+
+    Every stage is one of `Stage`'s kinds, built by a method here, and the
+    compiler takes each where it stands or refuses it before a reader opens:
+    record steps (`map`, `random_map`, `map_with_index`, `filter`,
+    `flat_map`), order stages (`shuffle`, `repeat`, `slice`, `take`), layout
+    (`token_split` for a token holdout, `pack`, `windows`, `group`), a `cache`
+    (which reads a published generation in place of the steps it already ran),
+    batching (`batch`, `rebatch`) and host steps after the batch (`map_batch`;
+    a recipe's caption encoder, `EncodeCaptions`, binds there to the
+    objective's tokenizer).
+    """
+
     source: Source | Mixture | Phases
     stages: tuple[Stage, ...] = ()
     name: str | None = None
@@ -421,6 +434,10 @@ class Pipeline:
         return self.then(Windows(seq_len, stride, fields))
 
     def token_split(self, fraction: float, *, held: bool, fields: tuple[str, ...] = ("text",)) -> Pipeline:
+        """Keep the first `fraction` of the order's tokens (`held=True`) or the
+        rest, cutting at most one document in two, so a held branch and a
+        trained branch over one order are disjoint and together the corpus.
+        It reads a finite indexed order, before any repeat."""
         return self.then(TokenSplit(fraction, held, fields))
 
     def rebatch(self, size: int) -> Pipeline:
@@ -439,6 +456,9 @@ class Pipeline:
         return self.take(count)
 
     def cache(self, cache: str | Cache | Generation) -> Pipeline:
+        """Fill `cache` with the deterministic record steps before it, or read a
+        published `Generation` as the source in their place, with its published
+        packing in place of a `pack` that follows."""
         from dew.data.cache import Cache
 
         return self.then(Artifact(Cache(cache) if isinstance(cache, str) else cache))
