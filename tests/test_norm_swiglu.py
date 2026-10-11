@@ -3,10 +3,14 @@
 Every operand gradient is checked, including the fp32 weight's column sum
 and Liger's fp32-intermediate VJP contract. Ragged tiles and enough rows to make
 each norm program accumulate multiple blocks exercise the masked paths.
-The fp32 activation/input-gradient fixtures hold a 1e-5 maximum relative
-bound from XLA. For dscale, float64 is the judge: its RMS error must be no
-greater than XLA's, whose GPU column sum is itself inexact. The bf16 VJPs
-keep wider intermediates than XLA's autodiff,
+The fp32 activation/input-gradient fixtures retain a 1e-5 relative bound
+from XLA. Every output, including dscale, keeps the project's 2x-XLA RMS
+budget against the unrounded float64 function. A separate dscale check
+isolates accumulation: float64 sums dy times the identical rounded forward
+coefficient. Dew must be at least as close to that exact sum as XLA plus
+one final output rounding; at 24,576 rows it must also stay within 2 ulp.
+This does not reward XLA's lucky cancellation of coefficient-rounding
+error. The bf16 VJPs keep wider intermediates than XLA's autodiff,
 so their contract is distance from float64, not bitwise XLA agreement.
 Forwards retain each model's cast sites. Small-shape c53 fixtures also hold
 the fused VJPs to Liger's measured float64 distances.
@@ -61,7 +65,32 @@ def rounding_report(labels, actual, reference, truth):
     return "NORM_SWIGLU_FLOAT64_DIAGNOSTIC\n" + json.dumps(report, indent=2)
 
 
-def compare(functions, operands, seed, labels):
+def scale_coefficient(x, dtype, after_cast: bool):
+    """The fused forward's normalized coefficient, before its optional weight."""
+    output = dtype if after_cast else jnp.float32
+    return rms_normalized(x, None, 1e-5, output, scale_offset=False, scale_after_cast=False,
+                           fp32_statistics=True, implementation="pallas")
+
+
+def assert_scale_accumulation(mine, reference, coefficient, seed):
+    """Float64 exact sum of identical rounded factors, not the unrounded RMS function."""
+    terms = np.asarray(coefficient, np.float64) * np.asarray(seed, np.float64)
+    exact_sum = np.sum(terms.reshape(-1, terms.shape[-1]), axis=0, dtype=np.float64)
+    rounded = jnp.asarray(exact_sum, mine.dtype)
+    above = np.asarray(jnp.nextafter(rounded, jnp.full_like(rounded, jnp.inf)), np.float64)
+    below = np.asarray(jnp.nextafter(rounded, jnp.full_like(rounded, -jnp.inf)), np.float64)
+    nearest = np.asarray(rounded, np.float64)
+    ulp = np.maximum(above - nearest, nearest - below)
+    final_rounding = float(np.sqrt(np.mean(np.square(0.5 * ulp))))
+    actual_error, reference_error = distance(mine, exact_sum), distance(reference, exact_sum)
+    detail = (f"dscale accumulation: dew={actual_error:.12g}, xla={reference_error:.12g}, "
+              f"final rounding={final_rounding:.12g}, rows={terms.size // terms.shape[-1]}")
+    assert actual_error <= reference_error + final_rounding, detail
+    if terms.size // terms.shape[-1] >= 24576:
+        assert np.all(np.abs(np.asarray(mine, np.float64) - exact_sum) <= 2 * ulp), detail
+
+
+def compare(functions, operands, seed, labels, *, coefficient=None):
     xla, pallas, exact = functions
     graph = str(jax.make_jaxpr(pallas)(*operands))
     assert "rms_norm_forward" in graph or "swiglu_forward" in graph
@@ -80,7 +109,8 @@ def compare(functions, operands, seed, labels):
                 continue
             assert mine.dtype == theirs.dtype, label
             if label == "scale":
-                assert distance(mine, want) <= distance(theirs, want), label
+                assert coefficient is not None
+                assert_scale_accumulation(mine, theirs, coefficient, seed)
             elif mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
                 assert relative(mine, theirs) < 1e-5, label
             assert_as_exact_as_the_reference(mine, theirs, want, label)
@@ -114,14 +144,16 @@ def norm_operands(shape, dtype, scale_dtype):
 @pytest.mark.parametrize("after_cast", [False, True])
 def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast):
     operands, seed = norm_operands((2, 3, 31), dtype, scale_dtype)
-    compare(norm_functions(dtype, offset, after_cast), operands, seed, ("y", "x", "scale"))
+    compare(norm_functions(dtype, offset, after_cast), operands, seed, ("y", "x", "scale"),
+            coefficient=scale_coefficient(operands[0], dtype, after_cast))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
-    compare(norm_functions(dtype, offset=True, after_cast=True), operands, seed, ("y", "x", "scale"))
+    compare(norm_functions(dtype, offset=True, after_cast=True), operands, seed, ("y", "x", "scale"),
+            coefficient=scale_coefficient(operands[0], dtype, after_cast=True))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
@@ -131,12 +163,13 @@ def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     (row, scale), seed = norm_operands((1, 1000), dtype, jnp.float32)
     x = jnp.broadcast_to(row, (24576, 1000))
     seed = jnp.broadcast_to(seed, x.shape)
-    compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"))
+    compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"),
+            coefficient=scale_coefficient(x, dtype, after_cast=True))
 
 
 def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
     """The real-row stress holds every output and gradient to XLA's float64
-    RMS budget. dscale must be at least as close to float64 as XLA. BF16
+    RMS budget, plus the independent exact-sum accumulation check. BF16
     gradients deliberately do not reproduce XLA's intermediate roundings."""
     operands, seed = norm_operands((24576, 17), jnp.bfloat16, jnp.float32)
     xla, pallas, exact = norm_functions(jnp.bfloat16, offset=True, after_cast=True)
@@ -150,7 +183,8 @@ def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
         for label, mine, theirs, want in zip(("y", "x", "scale"), actual, reference, truth, strict=True):
             assert_as_exact_as_the_reference(mine, theirs, want, label)
             if label == "scale":
-                assert distance(mine, want) <= distance(theirs, want), label
+                assert_scale_accumulation(mine, theirs, scale_coefficient(
+                    operands[0], jnp.bfloat16, after_cast=True), seed)
     except AssertionError as error:
         report = rounding_report(("y", "x", "scale"), actual, reference, truth)
         print(report, flush=True)
@@ -164,7 +198,8 @@ def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
 def test_rms_output_dtype_is_independent_of_input(input_dtype, output_dtype, after_cast):
     operands, seed = norm_operands((5, 37), input_dtype, jnp.float32)
     compare(norm_functions(output_dtype, offset=False, after_cast=after_cast), operands,
-            seed.astype(output_dtype), ("y", "x", "scale"))
+            seed.astype(output_dtype), ("y", "x", "scale"),
+            coefficient=scale_coefficient(operands[0], output_dtype, after_cast))
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
