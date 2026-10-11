@@ -12,7 +12,6 @@ import threading
 import time
 import uuid
 import weakref
-from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, closing
@@ -316,7 +315,6 @@ class Cache:
         if all(count is not None for count in targets):
             metadata["valid_targets"] = sum(targets)
             metadata["zero_target_windows"] = targets.count(0)
-        source_shards = Counter(row[0] for row in expected if isinstance(row, tuple))
         referenced = {entry["shard"] for entry in completions.values()}
         definition = {
             "schema": 1,
@@ -331,7 +329,6 @@ class Cache:
             "generation": generation,
             "metadata": metadata,
             "plan": {},
-            "source_shards": dict(source_shards),
             "source_metadata": source.metadata(),
         }
         if plan is not None:
@@ -1105,26 +1102,6 @@ class Generation:
     def __len__(self) -> int:
         return self.manifest["rows"]
 
-    def mapped(
-        self,
-        parent: grain.MapDataset,
-        key: DependencyManifest,
-        source: Source,
-        *,
-        transform: Transform | None = None,
-    ) -> grain.MapDataset:
-        return grain.MapDataset.source(_GenerationInputs(self, len(parent), None, transform is not None))
-
-    def streamed(
-        self,
-        reader: Callable[[Shard], grain.IterDataset],
-        key: DependencyManifest,
-        manifest: ShardManifest,
-        *,
-        transform: Transform | None = None,
-    ) -> Callable[[Shard], grain.IterDataset]:
-        return _GenerationReader(self, transform is not None)
-
     def __getitem__(self, index: int) -> Batch | bytes | None:
         if not 0 <= index < len(self):
             raise IndexError(index)
@@ -1136,37 +1113,6 @@ class Generation:
         if value is None or isinstance(value, (Mapping, bytes)):
             return value
         raise TypeError("generation source records must be mappings or bytes")
-
-
-@dataclass(frozen=True)
-class _GenerationInputs:
-    generation: Generation
-    count: int
-    shard: str | None
-    expanded: bool
-
-    def __len__(self) -> int:
-        return self.count
-
-    def __getitem__(self, index: int):
-        values = self.generation.outputs(index if self.shard is None else (self.shard, index))
-        if self.expanded:
-            return values
-        if len(values) != 1:
-            raise ValueError("generation fanout differs from the pipeline's one-to-one cache stage")
-        return values[0]
-
-
-@dataclass(frozen=True)
-class _GenerationReader:
-    generation: Generation
-    expanded: bool
-
-    def __call__(self, shard: Shard) -> grain.IterDataset:
-        count = self.generation.manifest["source_shards"][shard.id]
-        return grain.MapDataset.source(
-            _GenerationInputs(self.generation, count, shard.id, self.expanded)
-        ).to_iter_dataset()
 
 
 @dataclass(frozen=True)

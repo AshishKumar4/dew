@@ -234,7 +234,7 @@ def test_cold_warm_and_resumed_caches_keep_per_epoch_randomness():
     assert [row["id"] for row in expected[:8]] == [row["id"] for row in expected[8:]]
     assert [row["draw"] for row in expected[:8]] != [row["draw"] for row in expected[8:]]
     generation = cache.publish(key, source)
-    warm = generation.mapped(parent, key, source)
+    warm = grain.MapDataset.source(generation.source().records("indexed"))
     assert list(epochs(warm)) == expected
     resumed = iter(epochs(warm))
     resumed.set_state(state)
@@ -249,6 +249,25 @@ def test_cache_refuses_stochastic_prefix_by_step_name():
     source = Memory([{"id": index} for index in range(8)])
     with pytest.raises(ValueError, match=r"cache prefix.*Draw"):
         compile(Pipeline(source).random_map(Draw()).cache(_cache()).batch(2))
+
+
+def test_iterate_and_validation_read_a_published_generation_as_its_accepted_rows():
+    from dew.data.compile import iterate, publish, validation
+    from dew.data.dataset import DataPartition
+    from dew.data.pipeline import Pipeline
+    from dew.objectives.base import VALID_ROWS
+
+    source = Memory([{"id": index} for index in range(8)])
+    even = Pipeline(source).filter(lambda row: row["id"] % 2 == 0, identity="even@1")
+    warm = Pipeline(source).cache(publish(even, _cache(), read="memory"))
+    assert [int(row["id"]) for row in iterate(warm, read="indexed")] == [0, 2, 4, 6]
+    scored = validation(warm.map(lambda row: {"id": row["id"] + 10}), batch=3)(DataPartition())
+    try:
+        batches = list(scored)
+    finally:
+        scored.close()
+    assert [batch["id"].tolist() for batch in batches] == [[10, 12, 14], [16, 16, 16]]
+    assert batches[-1][VALID_ROWS].tolist() == [True, False, False]
 
 
 def test_published_generation_exposes_only_declared_order_metadata_and_plan():

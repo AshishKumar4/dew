@@ -9,7 +9,7 @@ import logging
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.experimental as gx
 import grain.python as pygrain
@@ -84,6 +84,9 @@ from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _FillShare, _GroupedRows, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.records import JSON, integer, json_value, record
+
+if TYPE_CHECKING:
+    from dew.data.cache import Cache
 
 type Rows = pygrain.MapDataset | pygrain.IterDataset
 _log = logging.getLogger(__name__)
@@ -197,6 +200,16 @@ def _promoted(pipeline: Pipeline) -> tuple[Pipeline, tuple[str, ...]]:
                 (*references, f"generation {stage.cache.url}"),
             )
     return dataclasses.replace(pipeline, source=source), references
+
+
+def _filled(stage: Artifact) -> Cache:
+    """The cache an artifact stage fills. A generation is read as a source,
+    which `_promoted` puts in its place before anything opens."""
+    from dew.data.cache import Cache
+
+    if not isinstance(stage.cache, Cache):
+        raise ValueError(f"generation {stage.cache.url} must be promoted to a source before it is read")
+    return stage.cache
 
 
 def _check_batch(stage: Stage, *, batched: bool, budgeted: bool, name: str) -> tuple[bool, bool]:
@@ -608,7 +621,7 @@ def _memory_inputs(
             raise RuntimeError("cache stage changed in an immutable pipeline")
         prefix = pipeline.stages[:artifact_at]
         manifest = _cache_manifest(source, prefix, "memory")
-        cached = artifact.cache.mapped(
+        cached = _filled(artifact).mapped(
             pygrain.MapDataset.source(stored), manifest, source, transform=_Prefix(prefix)
         )
         try:
@@ -998,7 +1011,7 @@ class _Build:
                 from dew.data.shards import streamed
 
                 shards = source.manifest()
-                reader = artifact.cache.streamed(shards.reader, manifest, shards, transform=transform)
+                reader = _filled(artifact).streamed(shards.reader, manifest, shards, transform=transform)
                 shards = dataclasses.replace(shards, reader=reader)
                 cycle = next(
                     (stage.cycle_length for stage in pipeline.stages if isinstance(stage, Interleave)), 1
@@ -1012,7 +1025,7 @@ class _Build:
                     epochs=_epochs(pipeline) if self.training else 1,
                 ).seed(self.seed)
             else:
-                rows = artifact.cache.mapped(
+                rows = _filled(artifact).mapped(
                     pygrain.MapDataset.source(source.records(self.read)).seed(self.seed),
                     manifest,
                     source,
@@ -1152,7 +1165,7 @@ class _Build:
             manifest = _cache_manifest(pipeline.source, prefix, self.read)
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError("streamed cache must be applied to its shard reader before interleave")
-            rows = stage.cache.mapped(rows, manifest, pipeline.source)
+            rows = _filled(stage).mapped(rows, manifest, pipeline.source)
         elif isinstance(stage, Interleave):
             if self.read != "streamed":
                 raise ValueError("interleave needs a shard-manifest source")
@@ -2013,6 +2026,8 @@ def iterate(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
+    _check(pipeline, read, promotion=True)
+    pipeline, _ = _promoted(pipeline)
     _check(pipeline, read)
     _capabilities((pipeline,), read, provision)
     if any(isinstance(stage, Configured) for stage in _steps(pipeline)):
@@ -2040,7 +2055,8 @@ def validation(
     """Compile one finite evaluation branch without constructing a training stream."""
     if not any(isinstance(stage, BatchStage) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
-    _check(pipeline, read, validation=True)
+    _check(pipeline, read, validation=True, promotion=True)
+    pipeline, _ = _promoted(pipeline)
     _capabilities((pipeline,), read, provision)
     if objective is not None:
         pipeline = _objective_branch(pipeline, objective, train=False, read=read)
