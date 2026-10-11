@@ -42,7 +42,8 @@ KERNEL_CATEGORIES = (
     ("norm", ("layer_norm", "rms_norm", "group_norm", "batch_norm")),
     ("reduce", ("reduce",)),
     ("convert", ("convert",)),
-    ("copy", ("memcpy", "memset", "copy", "clone", "transpose", "concatenate", "cat", "gather", "scatter", "slice",
+    ("copy", ("memcpy", "memset", "copy", "clone", "transpose", "concatenate", "cat",
+              "gather", "scatter", "slice",
               "pad", "broadcast", "select", "dynamic", "index", "embedding", "catarraybatchedcopy")),
     ("elementwise", ("fusion", "elementwise", "triton")),
 )

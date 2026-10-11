@@ -61,7 +61,6 @@ def register_plain_causal_sdpa() -> str:
         if (attention_mask is not None or kv_offset != 0 or cache_position.shape[0] != kv_length
                 or not kwargs.get("allow_is_causal_skip", False)):
             raise ValueError("plain causal SDPA requires complete unpadded rows and no cache")
-        return None
 
     def attention(module, query, key, value, attention_mask, **kwargs):
         if attention_mask is not None or query.shape[-2] != key.shape[-2] or query.shape[-2] <= 1:
@@ -210,7 +209,8 @@ def sha256(path: str | Path) -> str:
 def trimmed_kernels(path: str | Path) -> list[tuple[str, int, int, int]]:
     """Read back the kernel rows `trim_trace` wrote."""
     with gzip.open(path, "rt") as handle:
-        return [(name, start, start + duration, device) for name, start, duration, device in json.load(handle)]
+        return [(name, start, start + duration, device)
+                for name, start, duration, device in json.load(handle)]
 
 
 def trim_trace(kernels: Sequence[tuple[str, int, int, int]], path: str | Path) -> Path:
@@ -306,12 +306,15 @@ class TorchTracedWindow:
     same steps, synchronized only at its boundaries. The last timing event
     is recorded before profiler startup, so startup cannot inflate its last
     sample. CPU timing exists for tiny remote runner checks, never for MFU.
+    reset_peak opts into a steady-window memory peak; the default preserves
+    global whole-run peak statistics for torch_lm's existing record.
     """
 
-    def __init__(self, device, total: int, warmup: int, profiled: int):
+    def __init__(self, device, total: int, warmup: int, profiled: int, *, reset_peak: bool = False):
         import torch
 
         self.device = device
+        self.reset_peak = reset_peak
         self.total, self.warmup, self.profile_from = total, warmup, total - profiled
         if not 0 <= warmup < self.profile_from <= total:
             raise ValueError("need at least one timed step before the profiled tail")
@@ -352,7 +355,7 @@ class TorchTracedWindow:
 
         if step == self.warmup:
             self.synchronize()
-            if self.device.type == "cuda":
+            if self.device.type == "cuda" and self.reset_peak:
                 torch.cuda.reset_peak_memory_stats(self.device)
             self.start = time.perf_counter()
         self._boundary(step)
