@@ -2,7 +2,7 @@
 
 import dataclasses
 import functools
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -13,21 +13,11 @@ import numpy as np
 from flax import linen as nn
 
 from dew.artifacts import Decisions
-from dew.data.dataset import (
-    Corpus,
-    Dataset,
-    LengthGroups,
-    Loading,
-    Reader,
-    mixed_records,
-    mixed_stream,
-    train_stream,
-    validation_pass,
-)
+from dew.data.dataset import LengthGroups
 from dew.data.pipeline import Configured, ObjectiveData, Rejected
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
-from dew.decision.data import DecisionTable, Example, Weighted
+from dew.decision.data import Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout
 from dew.decision.model import DecisionModel
@@ -63,8 +53,6 @@ if TYPE_CHECKING:
 
 NONE_OF_THE_ABOVE = "none of the above"
 
-type Labelled = Iterable[Example | Mapping[str, object]]
-"""Labelled examples: `Example`s, or rows `Example.of` reads."""
 _SCORE = KINDS.index(Score)
 
 
@@ -205,53 +193,6 @@ def _padded(values: Sequence[int | bool], length: int, fill: int | bool = 0) -> 
     return row
 
 
-class _Rows:
-    """The rows of a set of examples, each an example and the questions it lays
-    out, read by index as `{"corpus": c, "row": i}`, c naming the set in a mixture."""
-
-    def __init__(self, rows: Sequence[tuple[Example, tuple[str, ...]]], origin: str, corpus: int = 0):
-        self.rows = rows
-        self.origin = origin
-        self.corpus = corpus
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> Batch:
-        return {"corpus": np.int64(self.corpus), "row": np.int64(index)}
-
-    def __repr__(self) -> str:
-        return f"{type(self).__name__}({self.origin})"
-
-
-class _Tokens:
-    """A record's length as `LengthGroups` ranks it: the tokens of its row laid
-    out without augmentation, counted when the order first reads it and kept,
-    so a later pass does not lay it out twice."""
-
-    def __init__(self, encoding: Encoding, corpora: Sequence[_Rows]):
-        self.encoding, self.corpora = encoding, corpora
-        self.counted: dict[tuple[int, int], int] = {}
-
-    def __call__(self, record: Batch) -> int:
-        key = int(record["corpus"]), int(record["row"])
-        count = self.counted.get(key)
-        if count is None:
-            example, names = self.corpora[key[0]].rows[key[1]]
-            count = self.counted[key] = int(np.sum(self.encoding(example, names, None)["valid"]))
-        return count
-
-
-class _Encode(pygrain.RandomMapTransform):
-    """`Encoding` as the grain step that lays out each row inside the workers."""
-
-    def __init__(self, encoding: Encoding, corpora: Sequence[_Rows], *, augment: bool):
-        self.encoding, self.corpora, self.augment = encoding, corpora, augment
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        example, names = self.corpora[int(element["corpus"])].rows[int(element["row"])]
-        return self.encoding(example, names, rng if self.augment else None)
-
 
 def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
     """The tokenizer a loaded model's text processor encodes with: a run's
@@ -272,31 +213,6 @@ def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
         case _:
             return None
 
-
-def _held_pass(
-    held: Sequence[tuple[Example, tuple[str, ...]]],
-    encoding: Encoding,
-    *,
-    batch: int,
-    seed: int,
-    loading: Loading,
-) -> Reader:
-    """The validation pass over held-out rows: each once, laid out unaugmented."""
-    rows = _Rows(held, f"{len(held)} held-out rows")
-    return validation_pass(
-        rows, [_Encode(encoding, [rows], augment=False)], batch=batch, seed=seed, loading=loading
-    )
-
-
-def _laid_rows(
-    examples: Iterable[Example | Mapping[str, object]], *, joint: bool
-) -> list[tuple[Example, tuple[str, ...]]]:
-    """Each row an example lays out: one per answered question, or, for a joint
-    layout, one asking all its questions where any is answered."""
-    held = [Example.of(example) for example in examples]
-    if joint:
-        return [(example, tuple(example.questions)) for example in held if example.labels()]
-    return [(example, (name,)) for example in held for name in example.labels()]
 
 
 @dataclass(frozen=True)
@@ -616,108 +532,6 @@ class DecisionObjective(Objective[Ratio]):
             train_batch=() if self.bucket is None else (_Cut(self.bucket, self.layout.max_len),),
         )
 
-    def dataset(
-        self,
-        examples: Labelled | DecisionTable | Mapping[str, Weighted],
-        *,
-        batch: int,
-        validation: Labelled | None = None,
-        seed: int = 0,
-        loading: Loading | None = None,
-    ) -> Dataset:
-        """Return the training stream and validation pass over labelled questions.
-
-        The training stream holds one row for each answered question in `examples`,
-        augmented afresh on every read, and the validation pass holds `validation`'s
-        rows as they are. A `DecisionTable` provides both, with its held-out rows as
-        the second. A mapping of names to `Weighted` sets is a mixture: every step
-        takes each set's share of its rows, whatever the sets' lengths, and each set
-        comes round again at its own rate (`dew.data.dataset.mixed_stream`). The
-        option slots fit the widest question any of them holds.
-        """
-        match examples:
-            case DecisionTable():
-                if validation is not None:
-                    raise ValueError("a decision table holds out its own validation rows")
-                examples, validation = examples.examples()
-                weighted = {"examples": Weighted(examples, 1.0)}
-            case Mapping():
-                weighted: dict[str, Weighted] = {}
-                for name, entry in examples.items():
-                    match name, entry:
-                        case str(), Weighted():
-                            weighted[name] = entry
-                        case _:
-                            raise TypeError("a mixture maps names to Weighted example sets")
-            case _:
-                weighted = {"examples": Weighted(list(examples), 1.0)}
-        loading = Loading() if loading is None else loading
-        joint = self.layout.joint
-        names = sorted(weighted)
-        corpora = []
-        for corpus, name in enumerate(names):
-            laid = _laid_rows(weighted[name].examples, joint=joint)
-            corpora.append(_Rows(laid, f"{name}: {len(laid)} rows", corpus))
-        held = None if validation is None else _laid_rows(validation, joint=joint)
-        # One shape for the training and the held-out rows, so both compile once.
-        encoding = self._encoding([row for rows in corpora for row in rows.rows] + (held or []))
-        records = sum(len(rows) for rows in corpora)
-        if records < batch:
-            raise ValueError(f"{records} rows of answered questions, fewer than one batch of {batch}")
-        scoring = (
-            None if held is None else _held_pass(held, encoding, batch=batch, seed=seed, loading=loading)
-        )
-        encode = [_Encode(encoding, corpora, augment=True)]
-        bucketed = (
-            {}
-            if self.bucket is None
-            else {
-                "groups": LengthGroups(_Tokens(encoding, corpora)),
-                "cut": _Cut(self.bucket, self.layout.max_len),
-            }
-        )
-        if len(corpora) == 1:
-            return Dataset(
-                train=train_stream(corpora[0], encode, batch=batch, seed=seed, loading=loading, **bucketed),
-                val=scoring,
-                records=len(corpora[0]),
-                batch=batch,
-            )
-        mixed = [Corpus(name, rows, weighted[name].weight) for name, rows in zip(names, corpora, strict=True)]
-        return Dataset(
-            train=mixed_stream(mixed, encode, batch=batch, seed=seed, loading=loading, **bucketed),
-            val=scoring,
-            records=mixed_records(mixed),
-            batch=batch,
-        )
-
-    def held_out(self, examples: Labelled, *, batch: int, loading: Loading | None = None) -> Reader:
-        """Return the validation pass over the answered questions of `examples`,
-        each row once, as `dataset` holds out its `validation`, however few."""
-        held = _laid_rows(examples, joint=self.layout.joint)
-        if not held:
-            raise ValueError("scoring needs examples with answers")
-        return _held_pass(
-            held, self._encoding(held), batch=batch, seed=0, loading=Loading() if loading is None else loading
-        )
-
-    def _encoding(self, rows: Sequence[tuple[Example, tuple[str, ...]]]) -> Encoding:
-        """The layout of `rows`, with as many option and question slots as the widest row needs."""
-        width = max(
-            len(example.questions[name].options) + (self.none_of_the_above > 0)
-            for example, names in rows
-            for name in names
-        )
-        questions = max(len(names) for _, names in rows)
-        return Encoding(
-            self.layout,
-            self.tokenizer,
-            self.specials,
-            width,
-            questions,
-            self.shuffle_options,
-            self.none_of_the_above,
-        )
 
     def inference_record(self):
         """Return what a saved run rebuilds its task from.

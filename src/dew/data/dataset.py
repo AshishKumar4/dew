@@ -35,7 +35,6 @@ import os
 import sys
 import threading
 import typing
-from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
@@ -59,7 +58,6 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
-    from torch.utils.data import Dataset as TorchDataset
 
     from dew.data.plan import Plan
     from dew.data.mix import CorpusCounts
@@ -643,120 +641,6 @@ class Dataset:
     validation_counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     plan: Plan | None = None
 
-    @classmethod
-    def from_grain(cls, train: GrainPipeline, *, batch: int,
-                   validation: GrainPipeline | None = None,
-                   records: int | None = None,
-                   loading: Loading = _DEFAULT_LOADING) -> Dataset:
-        """Build a dataset from Grain pipelines the caller built.
-
-        The caller decides the order, the shuffle and what each record turns into.
-        This adds what every spec's `load` adds, with the same helpers: the reader's
-        share of the batch, whole training batches, a validation pass over every
-        record with its last batch padded (`VALID_ROWS`), and the state pair a
-        checkpoint saves.
-
-        A `MapDataset` is read by index, so it gets the same training stream as
-        every spec: repeated endlessly, cut into the reader's share, and saved as one
-        global record count. A pipeline read in sequence is sharded by whoever builds
-        it, so pass it as a function that takes the partition and builds that
-        share's `IterDataset`. It is batched as it is and reports Grain's own
-        iterator state, which `dew.checkpoints` restores only into a reader of the
-        same share.
-
-        `records` is the number of records in one pass, which `steps_per_epoch`
-        divides. It defaults to a `MapDataset`'s own length, so if you repeated your
-        dataset before passing it in, give the length of one pass instead. A Grain
-        pipeline has no description of its own, so the saved position names the
-        pipeline's type and length, not the corpus under it. If you swap the corpus
-        under one pipeline, Dew cannot detect it.
-        """
-        mapped = train if isinstance(train, pygrain.MapDataset) else None
-        for pipeline in (train, validation):
-            if isinstance(pipeline, pygrain.MapDataset):
-                _refuse_filters(pipeline)
-        if mapped is not None:
-            endless = mapped.repeat(None)
-            order = f"{describe(mapped)}, {len(mapped)} records"
-
-            def training(partition: DataPartition) -> Iterator[Batch]:
-                rows = partition.rows(batch)
-                return GlobalStream(
-                    lambda offset: _shared(endless, rows=rows, partition=partition,
-                                           loading=loading, offset=offset),
-                    batch, order, loading)
-        else:
-            def training(partition: DataPartition) -> Iterator[Batch]:
-                return _shared(train, rows=partition.rows(batch), partition=partition,
-                               loading=loading)
-
-        def validating(partition: DataPartition) -> Iterator[Batch]:
-            assert validation is not None
-            return _shared(validation, rows=partition.rows(batch), partition=partition,
-                           loading=loading, remainder=True)
-
-        return cls(
-            train=training,
-            val=None if validation is None else validating,
-            records=len(mapped) if records is None and mapped is not None else records,
-            batch=batch,
-        )
-
-    @classmethod
-    def from_records(cls, records: InMemory, *, batch: int, seed: int = 0,
-                     validation: InMemory | None = None,
-                     loading: Loading = _DEFAULT_LOADING) -> Dataset:
-        """Build a dataset from records the caller holds: columns, rows or a source.
-
-        `records` is a mapping of columns whose first axis is the record, such as
-        `{"x": x, "y": y}`, a sequence of per-record mappings, or any source read by
-        index. Training reshuffles the records from `seed` every epoch, with the same
-        stream every spec reads (`train_stream`), so the position a checkpoint saves
-        is a global record count and each process reads its own share of every
-        batch. `validation` is read once, in order, and every record is scored, with
-        the last batch padded (`VALID_ROWS`).
-        """
-        source = in_memory(records)
-        if len(source) < batch:
-            raise ValueError(
-                f"{len(source)} training records, fewer than one batch of {batch}: a "
-                f"batch would hold a record twice and an epoch would take no steps")
-        return cls(
-            train=train_stream(source, [], batch=batch, seed=seed, loading=loading),
-            val=None if validation is None else cls.validation(validation, batch=batch, loading=loading),
-            records=len(source),
-            batch=batch,
-        )
-
-    @staticmethod
-    def validation(records: InMemory, *, batch: int, loading: Loading = _DEFAULT_LOADING) -> Reader:
-        """A validation split over records the caller holds, as `from_records`
-        reads them: each record scored once, in order, the last batch padded
-        (`VALID_ROWS`), however few there are. `fit(validation=...)` and
-        `EvalSuite` take it beside the dataset's own."""
-        return validation_pass(in_memory(records), [], batch=batch, seed=0, loading=loading)
-
-    @classmethod
-    def from_torch(cls, dataset: TorchDataset, *, batch: int, fields: Sequence[str] | None = None,
-                   seed: int = 0, validation: TorchDataset | None = None,
-                   loading: Loading = _DEFAULT_LOADING) -> Dataset:
-        """Build a dataset from a map-style `torch.utils.data.Dataset`, read
-        by index as `from_records` reads a source.
-
-        A dict sample keeps its keys, and `fields` names the values of a
-        tuple sample, `("image", "label")` for torchvision's. Tensors and PIL
-        images arrive as numpy, an image as its own array: a grey one `[H, W]`
-        and a palette one its indices. A `DataLoader` and an `IterableDataset` are
-        refused, naming what to pass instead
-        (`dew.data.sources.pytorch.TorchRecords`). The first sample is read
-        here, so one `fields` does not name is refused before the run.
-        """
-        from .sources.pytorch import TorchRecords
-
-        records = TorchRecords(dataset, fields)
-        held = None if validation is None else TorchRecords(validation, fields)
-        records[0]
-        return cls.from_records(records, batch=batch, seed=seed, validation=held, loading=loading)
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -778,43 +662,6 @@ class Dataset:
                 "without one, so give the run length in steps")
         return epochs * self.steps_per_epoch
 
-
-@dataclasses.dataclass(frozen=True)
-class DatasetSpec(ABC):
-    """Describes a dataset and how to read it, with one frozen dataclass per kind.
-
-    `seed` and `loading` apply to every kind, so they are declared once here.
-    The seed sets the record order and keys the per-record rng; `loading` sets
-    how fast records are read, which changes neither the records nor their
-    order. Both are keyword-only, so a kind can still declare its own fields
-    without defaults.
-
-    Every kind's `load` takes `tokenize`, so a caller holding any
-    `DatasetSpec` can load it. A dataset that captions its records passes the
-    captions to `tokenize` and writes back what it returns. The dataset only
-    produces the captions; the run's condition decides which encoder reads
-    them and at which context length. A dataset without captions has nothing
-    for a reader and raises if given one (`uncaptioned`).
-    """
-
-    seed: int = dataclasses.field(default=0, kw_only=True)
-    loading: Loading = dataclasses.field(default=Loading(), kw_only=True)
-
-    @abstractmethod
-    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        """Return the dataset's batches, `batch` records a step across all processes."""
-
-    def uncaptioned(self, tokenize: Tokenize | None) -> None:
-        """Raise if a caption reader is given to a dataset that writes no captions.
-
-        The parameter is on every `load` so that one caller can load any spec.
-        Dropping it silently would train a conditional run on nothing without
-        saying why.
-        """
-        if tokenize is not None:
-            raise TypeError(
-                f"{type(self).__name__} writes no captions, so tokenize= has "
-                f"nothing to read; an image or video dataset takes one")
 
 
 CAPTION = "caption"
@@ -872,28 +719,6 @@ def stream_endless(stream: Iterator[Batch] | None) -> bool:
     global streams do."""
     return isinstance(stream, Identified) and stream.endless
 
-
-def tokenized(stream: Reader, tokenize: Tokenize | None) -> Reader:
-    """Return `stream` with each batch's captions replaced by the fields `tokenize` makes from them.
-
-    `tokenize` takes the batch's captions and returns the batch fields the
-    run's conditions need. The encoder then decides its own context length,
-    so `--text.encoder char_table` and `--text.encoder clip_text` read the
-    same dataset. It runs on the host, once per batch and outside the Grain
-    workers, so no encoder weights are pickled into the workers.
-
-    The captions themselves are dropped, since they are strings and a device
-    takes numbers. Pass None for an unconditional run, or a `tokenize` that
-    returns the words to keep them.
-    """
-    def stage(batch: Batch) -> Batch:
-        fields = dict(batch)
-        captions = [str(caption) for caption in fields.pop(CAPTION)]
-        if tokenize is not None:
-            fields.update(tokenize(captions))
-        return fields
-
-    return mapped(stream, stage)
 
 
 def tapped(stream: Reader, on_batch: Callable[[Batch], None]) -> Reader:
@@ -1962,7 +1787,6 @@ __all__ = [
     "DataPartition",
     "DataPhase",
     "Dataset",
-    "DatasetSpec",
     "Forwarding",
     "GlobalStream",
     "Identified",
@@ -1980,6 +1804,5 @@ __all__ = [
     "Tokenize",
     "mapped",
     "record_argument",
-    "tokenized",
     "train_stream",
 ]
