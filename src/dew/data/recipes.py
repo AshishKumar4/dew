@@ -618,11 +618,12 @@ class Preferences:
 TINY_SHAKESPEARE = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
 
 
-def tiny_shakespeare(**fields) -> Text:
+@dataclasses.dataclass(frozen=True)
+class TinyShakespeare(Text):
     """Karpathy's tiny Shakespeare corpus as a byte-level `Text` recipe, one
-    line a document, the corpus the language-model examples train on. Any
-    `Text` field overrides the defaults."""
-    return dataclasses.replace(Text(source=TINY_SHAKESPEARE), **fields)
+    line a document, the corpus the language-model examples train on."""
+
+    source: Annotated[SourceValue | Mapping[str, float], source_argument(SourceValue)] = TINY_SHAKESPEARE
 
 @dataclasses.dataclass(frozen=True)
 class Augment:
