@@ -70,6 +70,8 @@ def _pack_records(records):
 CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 """More than one, so a test can see which the record's rng drew."""
 
+FLIP_JITTER = images.Augment(flip=True, jitter=True)
+
 
 def _element_for(kind, seed=0):
     image = _synthetic_image(seed)
@@ -79,10 +81,9 @@ def _element_for(kind, seed=0):
     return _pack_records({"jpg": encoded, "txt": b"a yellow tulip"})
 
 
-def _spec(kind, labels_file, augmentation="flip_jitter"):
+def _spec(kind, labels_file, augment=FLIP_JITTER):
     """A prepared TFDS spec, or an arrayrecord one: `record` is what differs.
     Both augment on the host, the per-record path these tests read."""
-    augment = images.image_augmentations(augmentation)
     return ImageRecord(SCALE, SCALE, templates=CAPTION_TEMPLATES if kind == "tfds" else (),
                        classes=LABELS if kind == "tfds" else (),
                        flip=augment is not None and augment.flip,
@@ -123,15 +124,15 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
             "",
             "import numpy as np",
             "from dew.data import Images",
-            "from dew.data.images import augment_image, image_augmentations",
+            "from dew.data.images import Augment, augment_image",
             "from dew.data.steps.image import ImageRecord",
             "",
             "labels = sys.argv[1]",
             "image = np.zeros((9, 11, 3), dtype=np.uint8)",
-            "for mode in ('none', 'flip_only', 'flip_jitter'):",
+            "for augment in (None, Augment(flip=True, jitter=False), Augment(flip=True, jitter=True)):",
             "    Images(source=(), labels=labels)",
             "    ImageRecord(16, 16)",
-            "    out = augment_image(image_augmentations(mode), image, np.random.default_rng(0))",
+            "    out = augment_image(augment, image, np.random.default_rng(0))",
             "    assert out.dtype == np.uint8 and out.shape == image.shape",
             "print('ok')",
         ]
@@ -236,7 +237,7 @@ def test_a_spawned_worker_imports_opencv_before_its_readers_start(tmp_path):
 def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _spec(kind, labels_file, "none")
+    transform = _spec(kind, labels_file, None)
 
     out = transform.random_map(element, _record_rng(0))
 
@@ -252,7 +253,7 @@ def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
 def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _spec(kind, labels_file, "flip_only")
+    transform = _spec(kind, labels_file, images.Augment(flip=True, jitter=False))
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -271,7 +272,7 @@ def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path):
 def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = _spec(kind, labels_file, "flip_jitter")
+    transform = _spec(kind, labels_file)
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -335,7 +336,7 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path
 def test_the_caption_template_comes_from_the_record_rng(tmp_path):
     """A module-global random.choice picked the template, so a record's caption
     moved with the worker and process count while its image did not."""
-    spec = _spec("tfds", _write_labels(tmp_path), "none")
+    spec = _spec("tfds", _write_labels(tmp_path), None)
     element = {"image": _synthetic_image(), "label": 1}
 
     captions = [spec.random_map(element, _record_rng(draw))["caption"] for draw in range(DRAWS)]

@@ -84,11 +84,6 @@ def test_load_requires_a_recipe_instead_of_inferring_one_from_a_uri(uri):
         load(uri, batch=4)
 
 
-def test_an_unknown_augmentation_is_refused():
-    with pytest.raises(ValueError, match="not one of none, flip_only, flip_jitter"):
-        images.image_augmentations("jitter")
-
-
 def test_a_recipe_and_an_explicit_pipeline_read_the_same_records():
     rows = [{"index": np.int32(index)} for index in range(16)]
     recipe = load(Records(source=rows), batch=4, seed=9, read="memory", **WORKERS)
@@ -258,7 +253,7 @@ def test_a_named_validation_split_is_its_own_records_and_costs_training_none():
     """Held out of the head, validation was training records the run then
     never saw. A dataset that has a validation split of its own should be
     scored on it and trained on everything."""
-    spec = Augmenting(length=16, splits={"test": 8}, image_size=8, augmentation="none",
+    spec = Augmenting(length=16, splits={"test": 8}, image_size=8, augment=None,
                       val_split="test", val_batches=1, **WORKERS)
 
     data = load(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
@@ -276,7 +271,7 @@ def test_a_named_validation_split_is_its_own_records_and_costs_training_none():
 def test_val_batches_bounds_a_named_split_and_none_scores_all_of_it():
     """The two readings of val_batches: a bound on a split of its own, a
     hold-out count without one."""
-    fields = dict(length=16, splits={"test": 8}, image_size=8, augmentation="none",
+    fields = dict(length=16, splits={"test": 8}, image_size=8, augment=None,
                   val_split="test", **WORKERS)
 
     bounded_pass = load(Augmenting(val_batches=1, **fields, batch=4), batch=4, read="indexed", seed=0,
@@ -292,7 +287,7 @@ def test_val_batches_bounds_a_named_split_and_none_scores_all_of_it():
 def test_without_a_named_split_the_head_hold_out_is_unchanged():
     """The default path has to stay exactly what it was: the same records,
     the same pixels, the same training count."""
-    spec = Augmenting(length=16, image_size=8, augmentation="none", val_batches=1,
+    spec = Augmenting(length=16, image_size=8, augment=None, val_batches=1,
                       **WORKERS)
 
     data = load(dataclasses.replace(spec, batch=4), batch=4, read="indexed", seed=spec.seed,
@@ -842,6 +837,8 @@ def keep_captions(captions):
 
 CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 
+FLIP_JITTER = images.Augment(flip=True, jitter=True)
+
 
 # ---------------------------------------------------------------------------------
 # Determinism across worker counts, and a restart mid-epoch
@@ -857,7 +854,7 @@ class Augmenting:
 
     length: int = 16
     image_size: int = 128
-    augmentation: str = "flip_jitter"
+    augment: images.Augment | None = FLIP_JITTER
     augmentation_backend: str = "device"
     crop_scale: tuple[float, float] = (1.0, 1.0)
     augmentation_size: int | None = None
@@ -880,7 +877,7 @@ class Augmenting:
         return element["image"], template.format(name), element["index"]
 
     def transform(self, *, training=True):
-        mode = images.image_augmentations(self.augmentation) if training else None
+        mode = self.augment if training else None
         size = self.augmentation_size or self.image_size if mode else self.image_size
         return ImageRecord(self.image_size, size, templates=CAPTION_TEMPLATES,
                            classes=tuple(["rose", "tulip", "lotus", "orchid", "marigold"] *
@@ -905,7 +902,7 @@ class Augmenting:
                         range(min(len(held), self.val_batches * self.batch))]
         training = Pipeline(_Synthetic(train)).random_map(self.transform())
         if self.augmentation_backend == "device":
-            mode = images.image_augmentations(self.augmentation)
+            mode = self.augment
             training = training.map_batch(DeviceAugment(self.image_size,
                 self.crop_scale if mode else (1.0, 1.0),
                 False if mode is None else mode.flip, False if mode is None else mode.jitter))
@@ -1073,7 +1070,7 @@ def test_augmentation_really_moves_the_pixels():
 def test_augment_image_is_deterministic_for_one_seed():
     """A record's augmentation is keyed by its rng alone: the same seed
     reproduces it exactly, a different seed moves the pixels."""
-    augment = images.image_augmentations("flip_jitter")
+    augment = FLIP_JITTER
     image = _Images(1)[0]["image"]
 
     first = images.augment_image(augment, image, np.random.default_rng(7))
@@ -1087,7 +1084,7 @@ def test_augment_image_is_deterministic_for_one_seed():
 def test_flip_only_reorders_pixels_without_changing_them():
     """flip_only may mirror an image but never touches its values, so the
     sorted pixels are identical with and without it."""
-    augment = images.image_augmentations("flip_only")
+    augment = images.Augment(flip=True, jitter=False)
     image = _Images(1)[0]["image"]
 
     flipped = images.augment_image(augment, image, np.random.default_rng(0))
@@ -1100,7 +1097,7 @@ def test_the_jitter_stays_inside_the_brightness_envelope():
     """On a constant grey image the output ratio is bounded by the widest
     brightness*contrast product the draws allow, plus one uint8 of rounding;
     a factor outside [0.8, 1.2]x[0.95, 1.05] would show here."""
-    augment = images.image_augmentations("flip_jitter")
+    augment = FLIP_JITTER
     grey = np.full((8, 8, 3), 100, np.uint8)
     low, high = 0.8 * 0.95, 1.2 * 1.05
 
@@ -1196,7 +1193,7 @@ def test_a_validation_record_does_not_depend_on_the_share_count(shares):
 
 def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
     """Exported pixels, labels and captions equal the configured record stage."""
-    spec = Augmenting(length=16, image_size=8, augmentation="none", val_batches=None, **WORKERS)
+    spec = Augmenting(length=16, image_size=8, augment=None, val_batches=None, **WORKERS)
     live = _Images(16)
     rows = [spec.transform(training=False).random_map(live[index], np.random.default_rng(index))
             for index in range(16)]
@@ -1343,7 +1340,7 @@ def test_a_truncated_image_raises_rather_than_becoming_an_array():
 def test_the_image_transform_resizes_augments_and_captions_one_record():
     """What every image dataset hands the loader: the resized uint8 image,
     the caption text and, for a class-labelled record, its index."""
-    spec = Augmenting(image_size=8, augmentation="none")
+    spec = Augmenting(image_size=8, augment=None)
     element = _Images(16)[5]
 
     out = spec.transform().random_map(element, np.random.default_rng(0))

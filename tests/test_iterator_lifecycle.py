@@ -20,7 +20,7 @@ from affine_run import TimingRegression as Regression, batches
 from dew.artifacts import Representations
 from dew.data import DataPartition, Dataset
 from dew.data.dataset import mapped
-from dew.data.tokens import bounded
+from dew.data.readers import _Host
 from dew.training import Checkpoints, MeshSpec, ProfileWindow, Trainer
 from dew.training.distributed import DevicePrefetchIterator
 
@@ -283,7 +283,7 @@ def test_metric_failure_closes_owned_iterators_before_it_escapes(steps):
 
     trainer = Trainer(Evaluated(), optax.sgd(0.01), key=jax.random.key(0))
     with pytest.raises(np.linalg.LinAlgError):
-        trainer.fit(Dataset(lambda partition: training(), bounded(lambda partition: validation, 1), None, 8),
+        trainer.fit(Dataset(lambda partition: training(), lambda partition: validation, None, 8),
                     steps=steps, eval_every=1, metrics=(InvalidMetric(),))
     assert train.closed.is_set() == (steps > 0)
     assert validation.closed.is_set()
@@ -412,8 +412,8 @@ def test_sigint_during_fit_restoration_closes_only_after_restoration_returns(tmp
         sender.join(10)
 
 
-@pytest.mark.parametrize("limited", [False, True])
-def test_wrapped_cancellation_reaches_source_during_finalization(limited):
+@pytest.mark.parametrize("host", [False, True])
+def test_wrapped_cancellation_reaches_source_during_finalization(host):
     entered, stopped, closed = threading.Event(), threading.Event(), threading.Event()
 
     class Finalizing:
@@ -434,7 +434,7 @@ def test_wrapped_cancellation_reaches_source_during_finalization(limited):
     def opened(partition):
         return Finalizing()
 
-    wrapped = (bounded(opened, 1) if limited else mapped(opened, dict))(DataPartition())
+    wrapped = _Host(opened(DataPartition()), (dict,)) if host else mapped(opened, dict)(DataPartition())
     stream = DevicePrefetchIterator(wrapped, MeshSpec().build())
     consumer = threading.Thread(target=lambda: list(stream))
     consumer.start()
@@ -481,25 +481,6 @@ def test_failed_thread_creation_finalizes_the_unstarted_source(monkeypatch):
     assert caught.value is failure
     assert owners == [threading.get_ident()]
     stream.close()
-
-
-def test_bounded_validation_preserves_records_and_owned_close():
-    from contextlib import closing
-
-    source = Source()
-    reader = bounded(lambda partition: source, 2)(DataPartition())
-    with closing(reader):
-        values = [float(batch["x"][0, 0]) for batch in reader]
-    assert values == [1.0, 2.0]
-    assert source.closed.is_set()
-    reader.close()
-
-
-def test_zero_validation_bound_opens_no_source():
-    def unexpected(partition):
-        raise AssertionError("zero bound opened its source")
-
-    assert list(bounded(unexpected, 0)(DataPartition())) == []
 
 
 def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
