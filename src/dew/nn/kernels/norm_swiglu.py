@@ -67,7 +67,7 @@ def _round(x, dtype, interpret: bool):
     return rounded_to(x, dtype) if interpret else x.astype(dtype).astype(x.dtype)
 
 
-def _compensated_add(total, correction, value, *, interpret: bool):
+def _compensated_add(total, correction, value, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
     """Neumaier's fp32 sum: keep the lost low bits even under cancellation.
 
     Explicit add/sub rounding protects the residual from compiler fusion
@@ -75,7 +75,7 @@ def _compensated_add(total, correction, value, *, interpret: bool):
     Triton uses round-to-nearest instructions, not a compiler-only option.
     """
     if not interpret:
-        return plgpu.elementwise_inline_asm(
+        high, low = plgpu.elementwise_inline_asm(
             """{
             .reg .f32 a, b, e, f, s, c;
             .reg .pred p;
@@ -92,7 +92,9 @@ def _compensated_add(total, correction, value, *, interpret: bool):
             mov.f32 $0, s;
             mov.f32 $1, c;
             }""", constraints="=f,=f,f,f,f", args=(total, correction, value),
-            dtype=(jnp.float32, jnp.float32), is_pure=True, pack=1)
+            result_shape_dtypes=(jax.ShapeDtypeStruct(total.shape, jnp.float32),
+                                 jax.ShapeDtypeStruct(total.shape, jnp.float32)), pack=1)
+        return high, low
     value = jax.lax.optimization_barrier(value)
     merged = jax.lax.optimization_barrier(total + value)
     lost = jnp.where(jnp.abs(total) >= jnp.abs(value),
@@ -100,10 +102,10 @@ def _compensated_add(total, correction, value, *, interpret: bool):
     return merged, correction + lost
 
 
-def _product_parts(left, right, *, interpret: bool):
+def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
     """The rounded fp32 product and its lost bits, without a float64 dtype."""
     if not interpret:
-        return plgpu.elementwise_inline_asm(
+        high, low = plgpu.elementwise_inline_asm(
             """{
             .reg .f32 p, e;
             mul.rn.f32 p, $2, $3;
@@ -112,7 +114,9 @@ def _product_parts(left, right, *, interpret: bool):
             mov.f32 $0, p;
             mov.f32 $1, e;
             }""", constraints="=f,=f,f,f", args=(left, right),
-            dtype=(jnp.float32, jnp.float32), is_pure=True, pack=1)
+            result_shape_dtypes=(jax.ShapeDtypeStruct(left.shape, jnp.float32),
+                                 jax.ShapeDtypeStruct(left.shape, jnp.float32)), pack=1)
+        return high, low
     barrier = jax.lax.optimization_barrier
     # Split significands in half by bits, avoiding splitter*value overflow.
     def split(value):
