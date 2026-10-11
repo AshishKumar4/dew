@@ -173,7 +173,8 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
 def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
     objective = DecisionObjective(Decide.from_pretrained(TINY),
                                   layout=JointLayout(max_len=512, max_state_tokens=32))
-    short = [Example.of(row) for row in _requests(4, joint=True)]
+    small = Choice("Which?", ["first", "second"])
+    short = [Example(f"short {index}", {"team": small}, {"team": 0}) for index in range(4)]
     too_many = Choice("Which?", [f"option {index}" for index in range(200)])
     long = [Example(f"long {index}", {"team": too_many}, {"team": 0}) for index in range(3)]
     recipe = Decisions(source={"short": short, "long": long}, weights={"short": 1.0, "long": 2.0})
