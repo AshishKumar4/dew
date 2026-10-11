@@ -247,7 +247,6 @@ def test_rms_refusals_fall_back_and_log_once(monkeypatch, caplog, statistics, dt
                                            scale_shape, width, reason):
     from dew.nn.kernels import norm_swiglu
 
-    monkeypatch.setitem(kernels.KERNELS, "rms_norm", {"cpu": "pallas"})
     monkeypatch.setattr(kernels.generation, "_logged", set())
     with jax.enable_x64(new_val=True):
         x, scale = jnp.ones((2, width), dtype), jnp.ones(scale_shape, dtype)
@@ -297,8 +296,8 @@ def test_other_gates_keep_their_arithmetic(name):
 
 
 def test_selection_uses_the_generation_table(monkeypatch):
-    monkeypatch.setitem(kernels.KERNELS, "rms_norm", {"sm80": "pallas"})
-    monkeypatch.setitem(kernels.KERNELS, "swiglu", {"sm80": "pallas"})
+    monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "rms_norm", "pallas")
+    monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "swiglu", "pallas")
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
     x = jnp.ones((2, 17), jnp.float32)
@@ -318,7 +317,6 @@ def test_unknown_implementation_is_rejected():
 
 
 def test_inverse_cast_variant_refuses_the_normalized_activation_kernel(monkeypatch, caplog):
-    monkeypatch.setitem(kernels.KERNELS, "rms_norm", {"cpu": "pallas"})
     monkeypatch.setattr(kernels.generation, "_logged", set())
     x = jax.random.normal(jax.random.key(15), (3, 31)).astype(jnp.bfloat16)
     reference = evaluated(lambda x: unweighted_rmsnorm(x, 1e-5, implementation="xla"), (x,), x)
@@ -367,7 +365,7 @@ def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
         return expert.apply(params, x, weights, indices)
 
     reference = jax.jvp(function, (x,), (jnp.ones_like(x),))
-    monkeypatch.setitem(kernels.KERNELS, "swiglu", {"sm80": "pallas"})
+    monkeypatch.setitem(kernels.gpu_target("sm80").kernels, "swiglu", "pallas")
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
     monkeypatch.setattr(kernels.generation, "_logged", set())
