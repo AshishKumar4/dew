@@ -97,6 +97,34 @@ def _compensated_add(total, correction, value, *, interpret: bool):
     return merged, correction + lost
 
 
+def _product_parts(left, right, *, interpret: bool):
+    """The rounded fp32 product and its lost bits, without a float64 dtype."""
+    if not interpret:
+        return plgpu.elementwise_inline_asm(
+            """{
+            .reg .f32 p, e;
+            mul.rn.f32 p, $2, $3;
+            neg.f32 e, p;
+            fma.rn.f32 e, $2, $3, e;
+            mov.f32 $0, p;
+            mov.f32 $1, e;
+            }""", constraints="=f,=f,f,f", args=(left, right),
+            dtype=(jnp.float32, jnp.float32), is_pure=True, pack=1)
+    barrier = jax.lax.optimization_barrier
+    # Split significands in half by bits, avoiding splitter*value overflow.
+    def split(value):
+        bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
+        high = jax.lax.bitcast_convert_type(bits, jnp.float32)
+        return high, barrier(value - high)
+    lh, ll = split(left)
+    rh, rl = split(right)
+    product = barrier(left * right)
+    lost = barrier(barrier(lh * rh) - product)
+    lost = barrier(lost + barrier(lh * rl))
+    lost = barrier(lost + barrier(ll * rh))
+    return product, barrier(lost + barrier(ll * rl))
+
+
 def _selected(choice: str, implementation: str, refusal: str | None) -> str:
     from ..attention import FORWARD_MODE
 
@@ -206,7 +234,9 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, co
                 normalized = value * rstd
                 if after_cast:
                     normalized = _round(normalized, dy_ref.dtype, interpret)
-                accumulated = _compensated_add(*accumulated, cotangent * normalized, interpret=interpret)
+                product, low = _product_parts(cotangent, normalized, interpret=interpret)
+                accumulated = _compensated_add(*accumulated, product, interpret=interpret)
+                accumulated = _compensated_add(*accumulated, low, interpret=interpret)
         return accumulated
 
     partial, correction = jax.lax.fori_loop(0, pl.cdiv(rows, groups * row_block), block,
