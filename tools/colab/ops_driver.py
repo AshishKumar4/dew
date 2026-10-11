@@ -228,8 +228,9 @@ class Driver:
 
     def failed_collections(self, plan: dict, progress: dict) -> None:
         failures = self.state.get("collection_failures", {})
+        recorded = {result["index"] for result in self.state["results"]}
         for job in plan["jobs"]:
-            if not failures.get(str(job["index"]), {}).get("needs_attention"):
+            if job["index"] in recorded or not failures.get(str(job["index"]), {}).get("needs_attention"):
                 continue
             status = progress.get("jobs", {}).get(str(job["index"]), {})
             result = {"index": job["index"], "lane": job["lane"], "commit": job["commit"],
