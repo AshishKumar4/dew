@@ -327,6 +327,7 @@ class TorchTracedWindow:
         self.excluded = 0.0
         self.excluded_steps: set[int] = set()
         self.peak_allocated = self.peak_reserved = None
+        self.whole_peak_allocated = None
 
     def synchronize(self) -> None:
         import torch
@@ -349,6 +350,7 @@ class TorchTracedWindow:
         if self.device.type == "cuda":
             self.peak_allocated = torch.cuda.max_memory_allocated(self.device)
             self.peak_reserved = torch.cuda.max_memory_reserved(self.device)
+            self.whole_peak_allocated = max(self.whole_peak_allocated or 0, self.peak_allocated)
 
     def before(self, step: int) -> None:
         import torch
@@ -356,6 +358,7 @@ class TorchTracedWindow:
         if step == self.warmup:
             self.synchronize()
             if self.device.type == "cuda" and self.reset_peak:
+                self.whole_peak_allocated = torch.cuda.max_memory_allocated(self.device)
                 torch.cuda.reset_peak_memory_stats(self.device)
             self.start = time.perf_counter()
         self._boundary(step)

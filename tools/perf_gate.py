@@ -26,9 +26,11 @@ takes a commit.
 
 import argparse
 import contextlib
+import functools
 import json
 import math
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -108,6 +110,10 @@ class Row:
     """The tools/ file the row runs, or '' for a script of this file's."""
     gated: bool = True
     """Whether a regression of this row fails the gate, or is only shown."""
+    hardware: str | None = None
+    """Device-kind substring required to measure this row; an absent device is not a pass."""
+    head_only: bool = False
+    """Compare the head with an external reference, not with the base tree."""
 
 
 BATTERY = [
@@ -123,6 +129,8 @@ BATTERY = [
     Row("image pipeline flowers 128px, device crop+flip+jitter", "items/s", "benchmark_image_pipeline.py"),
     Row("checkpoint lm-dense save", "ms", ""),
     Row("checkpoint lm-dense restore", "ms", ""),
+    Row("reference qwen3.5-0.8b 8x3072 vs torch", "items/s", "reference_runs/qwen35_pair.py",
+        hardware="A100-SXM4-80GB", head_only=True),
 ]
 
 
@@ -135,14 +143,22 @@ def _tools(tree: Path, tool: str, newer: Path) -> Path:
     return newer
 
 
-def _run(tree: Path, tool: str, argv: list[str], newer: Path, timeout: float) -> str:
+def _run(tree: Path, tool: str, argv: list[str], newer: Path,
+         timeout: float) -> subprocess.CompletedProcess:
     tools = _tools(tree, tool or "benchmark_step.py", newer)
     env = {**os.environ, "PYTHONPATH": f"{tree / 'src'}:{tools}"}
     command = [sys.executable, *([str(tools / tool)] if tool else []), *argv]
-    done = subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
-    if done.returncode != 0:
-        raise RuntimeError(f"{' '.join(command[:3])} exited {done.returncode}: {done.stderr[-1500:]}")
-    return done.stdout
+    return subprocess.run(command, cwd=tree, env=env, capture_output=True, text=True, timeout=timeout)
+
+
+def _qwen35_comparison(out: Path) -> dict:
+    """Translate the paired tool's record into an external-reference row's result."""
+    record = json.loads(out.read_text())
+    comparison = record["comparison"]
+    value = ({"value": comparison["dew_tokens_per_s"], "ratio": comparison["dew_over_torch"],
+              "tolerance": comparison["tolerance"], "passed": comparison["performance_claim_passed"]}
+             if comparison is not None else {"error": record.get("error", "incomplete pair")})
+    return {"reference qwen3.5-0.8b 8x3072 vs torch": value}
 
 
 def _probes(args: argparse.Namespace, out: Path):
@@ -183,21 +199,62 @@ def _probes(args: argparse.Namespace, out: Path):
            lambda printed: {f"checkpoint lm-dense {kind}":
                             json.loads(printed.strip().splitlines()[-1])[f"{kind}_ms"]
                             for kind in ("save", "restore")})
+    yield (["reference qwen3.5-0.8b 8x3072 vs torch"], "reference_runs/qwen35_pair.py",
+           ["--torch-python", args.torch_python, "--out", str(out), "--claim"],
+           lambda _: _qwen35_comparison(out))
 
 
-def measure(tree: Path, args: argparse.Namespace, newer: Path) -> dict[str, float | str]:
+def hardware_status(row: Row, device_kind: str) -> str | None:
+    """A hardware-limited row is unmeasured off its named device, never silently passed."""
+    if row.hardware is not None and row.hardware not in device_kind:
+        return f"not measured on this hardware: requires {row.hardware}, found {device_kind}"
+    return None
+
+
+def measure(tree: Path, args: argparse.Namespace, newer: Path, is_head: bool = True) -> dict:
     """One sample of every row in `tree`: a number, or why the row could not run there."""
-    sample: dict[str, float | str] = {}
+    sample = {}
+    required = {row.name: row for row in BATTERY}
+
+    @functools.cache
+    def hardware() -> str:
+        """This machine's device kind, read once and only when a row names hardware."""
+        return subprocess.run([sys.executable, "-c", "import jax; print(jax.devices()[0].device_kind)"],
+                              capture_output=True, text=True, check=True).stdout.strip()
+
     with tempfile.TemporaryDirectory() as scratch:
         out = Path(scratch) / "out.json"
-        for names, tool, argv, read in _probes(args, out):
-            if args.only and not any(word in name for name in names for word in args.only):
+        for index, (names, tool, argv, read) in enumerate(_probes(args, out)):
+            external = all(required[name].head_only for name in names)
+            if external and not is_head:
                 continue
+            claiming = args.claim and any(required[name].hardware for name in names)
+            if args.only and not claiming and not any(word in name for name in names for word in args.only):
+                continue
+            unsupported = {name: hardware_status(required[name], hardware()) for name in names
+                           if required[name].hardware is not None}
+            if any(unsupported.values()):
+                sample.update({name: reason for name, reason in unsupported.items() if reason is not None})
+                continue
+            done = None
             try:
-                values = read(_run(tree, tool, argv, newer, 3600))
-                sample.update({name: float(values[name]) for name in names})
+                done = _run(tree, tool, argv, newer, 3600)
+                if done.returncode != 0 and not external:
+                    raise RuntimeError(f"{tool} exited {done.returncode}: {done.stderr[-1500:]}")
+                values = read(done.stdout)
+                sample.update({name: {**values[name], "exit_code": done.returncode} if external
+                                else float(values[name]) for name in names})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
-                sample.update(dict.fromkeys(names, f"not run: {str(error)[-400:]}"))
+                failure = ({"error": str(error)[-400:],
+                            "exit_code": None if done is None else done.returncode}
+                           if external else f"not run: {str(error)[-400:]}")
+                sample.update(dict.fromkeys(names, failure))
+            if out.is_file():
+                evidence = Path(args.out).resolve().with_suffix("")
+                evidence.mkdir(parents=True, exist_ok=True)
+                target = evidence / f"{tree.name}-{Path(scratch).name}-{index}.json"
+                shutil.copyfile(out, target)
+                sample.update({f"evidence {name}": str(target) for name in names})
             out.unlink(missing_ok=True)
     return sample
 
@@ -207,22 +264,55 @@ def run(args: argparse.Namespace) -> int:
 
     trees = dict(spec.split("=", 1) for spec in (args.base, args.head))
     (base, base_path), (head, head_path) = ((name, Path(path)) for name, path in trees.items())
-    rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)]
+    claiming = getattr(args, "claim", False)
+    rows = [row for row in BATTERY if not args.only or any(word in row.name for word in args.only)
+            or (claiming and row.hardware)]
     results = {"base": base, "head": head, "rounds": args.rounds, "rows": [row.__dict__ for row in rows],
-               "samples": {base: [], head: []}}
+               "samples": {base: [], head: []}, "claim": claiming}
     for round_ in range(args.rounds):
         order = [(base, base_path), (head, head_path)]
         for name, path in order if round_ % 2 == 0 else order[::-1]:
-            results["samples"][name].append(measure(path, args, head_path / "tools"))
+            results["samples"][name].append(measure(path, args, head_path / "tools", name == head))
             write_atomically(args.out, json.dumps(results, indent=2))
             print(f"round {round_ + 1}: {name} measured", flush=True)
-    return 0
+    return report(argparse.Namespace(results=args.out, table=None, claim=True)) if claiming else 0
 
 
 def measured(sample: object) -> bool:
     """Whether a round's sample of a row is a measurement: a finite positive number. A row a
     round could not run holds why (`not run: ...`), and a round that wrote no sample holds None."""
     return isinstance(sample, float) and math.isfinite(sample) and sample > 0
+
+
+def reference_verdict(head: list) -> tuple[str, dict]:
+    """A reference row keeps its own exit status and ratio, even when it fails.
+
+    No base sample is needed: a head that reaches the reference can qualify
+    while its parent still trails it. A nonzero child exit is a measured
+    failure, not an unmeasured row. Missing rounds never qualify a claim.
+    """
+    unmeasured = [isinstance(sample, str) and sample.startswith("not measured on this hardware")
+                  for sample in head]
+    taken = [sample for sample in head if isinstance(sample, dict)]
+    codes = [sample.get("exit_code") for sample in taken]
+    ratios = [sample.get("ratio") for sample in taken]
+    values = [sample.get("value") for sample in taken]
+    bands = [sample.get("tolerance") for sample in taken]
+    numbers = {"exit_codes": codes}
+    if taken and all(map(measured, ratios)):
+        numbers["ratio"] = statistics.median(ratios)
+    if taken and all(map(measured, values)):
+        numbers["head"] = statistics.median(values)
+    if taken and all(isinstance(band, float) and math.isfinite(band) and band >= 0 for band in bands):
+        numbers["band"] = max(bands)
+    if any(code != 0 for code in codes) or any(sample.get("passed") is False for sample in taken):
+        return "failed", numbers
+    if head and all(unmeasured):
+        return "not measured on this hardware", {}
+    if (not head or len(taken) != len(head) or not all(sample.get("passed") is True for sample in taken)
+            or not {"ratio", "head", "band"} <= numbers.keys()):
+        return "incomplete", numbers
+    return "passed", numbers
 
 
 def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
@@ -236,6 +326,11 @@ def verdict(row: Row, base: list, head: list) -> tuple[str, dict]:
     runs in no round is broken; one neither runs leaves the battery incomplete. A row either tree
     measured in some rounds and not in others, or measured as NaN, an infinity or zero, is
     partial: the rounds that ran would be judged as if they were all, so it is not judged."""
+    if row.head_only:
+        return reference_verdict(head)
+    if row.hardware and any(isinstance(x, str) and x.startswith("not measured on this hardware")
+                            for x in [*base, *head]):
+        return "not measured on this hardware", {}
     if not any(measured(x) for x in base) and not any(measured(x) for x in head):
         return "incomplete", {}
     if not any(measured(x) for x in base):
@@ -268,11 +363,18 @@ def report(args: argparse.Namespace) -> int:
     lines = [f"| row | unit | {base} | {head} | change | band | verdict |",
              "|---|---|---:|---:|---:|---:|---|"]
     failed = []
+    claiming = getattr(args, "claim", False) or results.get("claim", False)
+    if claiming:
+        included = {row["name"] for row in results["rows"]}
+        failed.extend(f"{row.name} (required hardware row omitted)" for row in BATTERY
+                      if row.hardware and row.name not in included)
     for spec in results["rows"]:
         row = Row(**spec)
         state, numbers = verdict(row, [s.get(row.name) for s in samples[base]],
                                  [s.get(row.name) for s in samples[head]])
-        if state in ("broken", "incomplete", "partial") or (state == "regressed" and row.gated):
+        if (state in ("broken", "incomplete", "partial", "failed") or (state == "regressed" and row.gated)
+                or (claiming and row.hardware and state in
+                    ("not measured on this hardware", "not compared"))):
             failed.append(f"{row.name} ({state})")
         if not row.gated:
             state = f"{state}, not gated"
@@ -282,6 +384,11 @@ def report(args: argparse.Namespace) -> int:
         cells = (["-"] * 4 if "base" not in numbers else
                  [f"{numbers['base']:.2f}", f"{numbers['head']:.2f}", f"{numbers['change']:+.1%}",
                   f"{numbers['band']:.1%}"])
+        if row.head_only and "exit_codes" in numbers:
+            state += " (exit codes " + ", ".join(str(code) for code in numbers["exit_codes"]) + ")"
+            cells = ["-", f"{numbers['head']:.2f}" if "head" in numbers else "-",
+                     f"{numbers['ratio']:.3f}x reference" if "ratio" in numbers else "-",
+                     f"{numbers['band']:.1%}" if "band" in numbers else "-"]
         lines.append(f"| {row.name} | {row.unit} | " + " | ".join(cells) + f" | {state} |")
     table = "\n".join(lines) + "\n"
     print(table)
@@ -302,11 +409,17 @@ def main() -> int:
     running.add_argument("--model", required=True, help="a local Qwen3-0.6B snapshot")
     running.add_argument("--flowers", required=True, help="the TFDS oxford_flowers102 directory")
     running.add_argument("--out", required=True)
+    running.add_argument("--torch-python", default="",
+                         help="pinned reference interpreter for the Qwen3.5 row")
+    running.add_argument("--claim", action="store_true",
+                         help="require every hardware row, including under --only")
     running.add_argument("--only", nargs="*", default=[],
                          help="measure only the rows whose names hold one of these words")
     reporting = operations.add_parser("report")
     reporting.add_argument("results")
     reporting.add_argument("--table")
+    reporting.add_argument("--claim", action="store_true",
+                           help="fail if a required hardware row was unmeasured")
     args = parser.parse_args()
     with contextlib.suppress(BrokenPipeError):
         return run(args) if args.operation == "run" else report(args)

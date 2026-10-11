@@ -22,10 +22,6 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-MODEL = "Qwen/Qwen3.5-0.8B"
-REVISION = "2fc06364715b967f1860aea9cf38778875588b17"
-E1_FLOPS_PER_STEP = 81_029_926_748_160
-E1_TOKENS = 3072 * 8
 BASE_PINS = {
     "annotated-doc": "0.0.5", "anyio": "4.15.1", "certifi": "2026.7.22", "click": "8.5.0",
     "filelock": "4.1.0", "fsspec": "2026.9.0", "h11": "0.16.0", "hf-xet": "1.7.0",
@@ -66,11 +62,16 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--steps", type=int, default=200)
     parser.add_argument("--profile-steps", type=int, default=5)
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--smoke-fixture", type=Path,
+                        help="export the untrained tiny CPU weights for Dew's loader proof")
+    parser.add_argument("--session", help="identity supplied by the same-session paired runner")
     parser.add_argument("--dew-attribution", type=Path)
     parser.add_argument("--dew-entry", type=Path)
     args = parser.parse_args()
     if args.warmup < 2 or args.steps < 1 or args.profile_steps < 1:
         parser.error("need at least two warmup steps, one timed step and one profiled step")
+    if args.smoke_fixture and not args.smoke:
+        parser.error("--smoke-fixture requires --smoke")
     if bool(args.dew_attribution) != bool(args.dew_entry):
         parser.error("pass both Dew attribution and entry for a comparison")
     if args.dew_attribution and "by_part_kind_ms" not in json.loads(args.dew_attribution.read_text())["time"]:
@@ -227,6 +228,8 @@ def smoke_attribution(path: Path) -> dict:
 
 
 def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
+    from qwen35 import FLOPS_PER_STEP, TOKENS_PER_STEP
+
     dew, timed = json.loads(attribution.read_text()), json.loads(entry.read_text())
     if "by_part_kind_ms" not in dew["time"]:
         raise ValueError("use corrected Qwen3.5-0.8B attribution with all-op by_part_kind_ms, not top_ops")
@@ -256,8 +259,8 @@ def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
                              "peak_metric": "Qwen3.5-0.8B XLA/device high-water mark; HF uses allocated bytes",
                              "by_kind_ms": dew["time"]["by_kind_ms"]},
             "dew_backbone_estimate": {"step_ms": estimated_ms,
-                                      "tokens_per_s": E1_TOKENS / (estimated_ms / 1000),
-                                      "mfu": E1_FLOPS_PER_STEP / (estimated_ms / 1000) / 312e12,
+                                      "tokens_per_s": TOKENS_PER_STEP / (estimated_ms / 1000),
+                                      "mfu": FLOPS_PER_STEP / (estimated_ms / 1000) / 312e12,
                                       "head_profile_ms_subtracted": head_ms, "by_kind_ms": adjusted,
                                       "categories_ms": dict(categories),
                                       "profile_idle_ms": dew["time"]["device_idle_ms_per_step"],
@@ -276,6 +279,7 @@ def load_backbone(smoke: bool):
     """A tiny CPU model or every released text-backbone parameter on CUDA."""
     import torch
     from common import register_plain_causal_sdpa
+    from qwen35 import MODEL, REVISION
     from transformers import Qwen3_5TextConfig
     from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
 
@@ -294,8 +298,9 @@ def load_backbone(smoke: bool):
         config._attn_implementation = attention_implementation
         backbone = qwen.Qwen3_5TextModel(config)
     else:
-        if not torch.cuda.is_available():
-            raise RuntimeError("full reference requires CUDA; CPU is only --smoke on armada")
+        if not torch.cuda.is_available() or torch.cuda.device_count() != 1:
+            raise RuntimeError("full reference requires one visible CUDA device; "
+                               "CPU requires --smoke on armada")
         device, batch, seq = torch.device("cuda", 0), 8, 3072
         name = torch.cuda.get_device_name(device)
         if "A100-SXM4-80GB" not in name:
@@ -338,6 +343,7 @@ def load_backbone(smoke: bool):
 def backbone_loss(backbone, device, batch: int, seq: int):
     """A fixed scalar projection gives every backbone parameter a gradient."""
     import torch
+    from qwen35 import inputs
 
     config = backbone.config
 
@@ -345,8 +351,8 @@ def backbone_loss(backbone, device, batch: int, seq: int):
         def __init__(self):
             super().__init__()
             self.backbone = backbone
-            self.register_buffer("projection", torch.linspace(-1, 1, config.hidden_size, device=device)
-                                 .reshape(1, -1) / config.hidden_size ** 0.5)
+            projection = inputs(0, config.vocab_size, config.hidden_size, batch, seq)[1]
+            self.register_buffer("projection", torch.from_numpy(projection).to(device).reshape(1, -1))
             # Three explicit identical mRoPE axes denote plain text. The
             # fourth HF axis is reserved for potentially packed-row positions.
             self.register_buffer("position_ids", torch.arange(seq, device=device).reshape(1, 1, -1)
@@ -399,9 +405,12 @@ def training_window(args: argparse.Namespace, model, network, optimizer, device,
     import numpy as np
     import torch
     from common import TorchTracedWindow, warmup_cosine
+    from qwen35 import inputs
     from torch._dynamo.utils import counters
 
-    tokens = torch.randint(0, model.backbone.config.vocab_size, (batch, seq), device=device)
+    config = model.backbone.config
+    rows = inputs(args.seed, config.vocab_size, config.hidden_size, batch, seq)[0]
+    tokens = torch.from_numpy(rows).to(device=device, dtype=torch.long)
     total = args.warmup + args.steps + args.profile_steps
     window = TorchTracedWindow(device, total, args.warmup, args.profile_steps, reset_peak=True)
     trace = Path(args.out).with_suffix(".trace.json")
@@ -457,6 +466,7 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
     """The unprofiled metrics and later launch evidence keep separate scopes."""
     import torch
     from common import chrome_trace_kernels, git_head, host, peak_flops, throughput, trim_trace
+    from qwen35 import FLOPS_PER_STEP, MODEL, REVISION, TOKENS_PER_STEP, WHOLE_PEAK_SCOPE, workload
     from torch._dynamo.utils import counters
 
     config = model.backbone.config
@@ -464,7 +474,7 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
     median_ms = statistics.median(window.step_seconds) * 1000
     device_name = "CPU smoke (no MFU)" if args.smoke else torch.cuda.get_device_name(device)
     peak = None if args.smoke else peak_flops(device_name)
-    flops = None if args.smoke else E1_FLOPS_PER_STEP
+    flops = None if args.smoke else FLOPS_PER_STEP
     timed = {**rates, "window_tokens_per_s": rates["tokens_per_s"],
              "step_ms": median_ms, "tokens_per_s": batch * seq / (median_ms / 1000),
              "mfu": None if peak is None else flops / (median_ms / 1000) / peak,
@@ -472,12 +482,12 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
                         + ("CPU clock" if args.smoke else "CUDA-event") + " step duration"),
              "step_ms_samples": [value * 1000 for value in window.step_seconds]}
     record = {"schema": "dew.attribution.torch-reference.v1", "framework": "torch", "smoke": args.smoke,
-              "commit": git_head(Path(__file__).resolve().parents[2]), "host": host(),
+              "commit": git_head(Path.cwd()),
+              "script_commit": git_head(Path(__file__).resolve().parents[2]), "host": host(),
               "environment": {"packages": package_versions, "cuda": torch.version.cuda,
                               "device": device_name},
               "config": {"model": MODEL, "revision": REVISION, "batch": batch, "sequence": seq,
                          "seed": args.seed,
-                         "tokens": "fixed torch.randint synthetic unpadded causal rows, resident on device",
                          "loss": "squared fixed scalar hidden-state projection; no vocabulary projection",
                          "parameters": "fp32",
                          "compute": "fp32 CPU smoke" if args.smoke else "bf16 autocast and residuals",
@@ -493,7 +503,7 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
                          "gdn": "HF CPU" if args.smoke else "FLA chunk + causal-conv1d + FLA gated RMSNorm",
                          "liger": [] if args.smoke else ["RMSNorm (offset=1)", "SwiGLU"],
                          "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
-                         "model_flops_per_token": None if args.smoke else E1_FLOPS_PER_STEP / E1_TOKENS,
+                         "model_flops_per_token": None if args.smoke else FLOPS_PER_STEP / TOKENS_PER_STEP,
                          "flops_formula": "Qwen3.5-0.8B: training=3*forward; mixer/MLP/causal-attention/GDN chunk64; "
                                           "embeddings/head/recompute excluded"},
               "steady": timed,
@@ -507,6 +517,16 @@ def result_record(args: argparse.Namespace, model, device, batch: int, seq: int,
                          "loss_first": float(loss_values[0]), "loss_last": float(loss_values[-1]),
                          "optimizer_state_dtypes": state_dtypes, "no_timing_window_compilation": True,
                          "dynamo_counters": {key: dict(value) for key, value in counters.items()}}}
+    record["session"] = args.session
+    record["config"].update(workload(args.seed, config.vocab_size, config.hidden_size, batch, seq,
+                                     args.smoke, args.warmup, args.steps))
+    record["steady"]["window_mfu"] = (None if peak is None else
+                                        flops / (window.seconds / window.timed_steps) / peak)
+    record["steady"]["samples_scope"] = (
+        "diagnostic per-step CUDA events (CPU clocks in smoke); not gate samples")
+    record["memory"].update(whole_peak_bytes=window.whole_peak_allocated,
+                             whole_peak_scope=WHOLE_PEAK_SCOPE,
+                             whole_peak_metric="torch.cuda.max_memory_allocated")
     record["time"].update(model_flops_per_step=flops, peak_gflops=None if peak is None else peak / 1e9)
     if not args.smoke:
         record["time"]["kernel_rows"] = str(trim_trace(chrome_trace_kernels(trace),
@@ -527,6 +547,15 @@ def run(args: argparse.Namespace) -> dict:
     package_versions = versions(args.smoke)
     torch.manual_seed(args.seed)
     backbone, device, batch, seq = load_backbone(args.smoke)
+    if args.smoke_fixture:
+        from safetensors.torch import save_file
+
+        args.smoke_fixture.mkdir(parents=True, exist_ok=True)
+        config = {**backbone.config.to_dict(), "tie_word_embeddings": True,
+                  "architectures": ["Qwen3_5ForCausalLM"]}
+        write_record(args.smoke_fixture / "config.json", config)
+        save_file({"model." + name: tensor.detach().contiguous() for name, tensor in
+                   backbone.state_dict().items()}, args.smoke_fixture / "model.safetensors")
     model = backbone_loss(backbone, device, batch, seq)
     network, observed_sdpa = compile_model(model, args.smoke)
     optimizer = optimizer_for(model, args.smoke)
