@@ -11,11 +11,24 @@ from typing import Literal
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import (Batch, Checkpointable, Closeable, DataPartition, FilledBatch, Forwarding, GlobalReader, LengthGroups, Position, Reader, rows_of)
+from dew.data.dataset import (
+    Batch,
+    Checkpointable,
+    Closeable,
+    DataPartition,
+    FilledBatch,
+    Forwarding,
+    GlobalReader,
+    LengthGroups,
+    Position,
+    Reader,
+    rows_of,
+)
 from dew.data.mix import CorpusCounts, state_counts
 from dew.data.pipeline import HostStep
 from dew.data.plan import Plan, fingerprint
 from dew.records import integer, record
+
 
 class _GroupedIterator(pygrain.DatasetIterator[Batch]):
     def __init__(self, parent: pygrain.DatasetIterator[Batch], groups: LengthGroups, rows: int, seed: int):
@@ -254,5 +267,3 @@ class _FillShare:
         if empty:
             mine = jax.tree.map(lambda value: value[:1], batch)
         return FilledBatch(self.partition.rows(self.batch), real=not empty).map(mine)
-
-

@@ -9,12 +9,7 @@ from typing import overload
 import grain.python as pygrain
 import numpy as np
 
-from .dataset import (
-    Batch,
-    DataPartition,
-    Forwarding,
-    Reader,
-)
+from .dataset import Batch, DataPartition, Forwarding, Reader
 
 
 class _BoundedIterator(Forwarding):

@@ -6,7 +6,6 @@ import dataclasses
 import functools
 import importlib
 import os
-import struct
 from typing import Literal
 
 import numpy as np
