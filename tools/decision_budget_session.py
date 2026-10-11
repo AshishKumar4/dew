@@ -16,7 +16,7 @@ ATTRIBUTOR = "b420100f20856822ae19d7f314a9a22ba24e26df"
 BENCHMARK = Path(__file__).with_name("benchmark_decision_budgets.py")
 
 
-def run_arm(args: argparse.Namespace, arm: str, *, profile: bool = False) -> Path:
+def run_arm(args: argparse.Namespace, arm: str, timeout: int, *, profile: bool = False) -> Path:
     output = args.output / (arm + ("-profile" if profile else ""))
     output.mkdir(parents=True, exist_ok=True)
     flags = [sys.executable, str(BENCHMARK), "--arm", arm, "--output", str(output / "entry.json")]
@@ -31,7 +31,7 @@ def run_arm(args: argparse.Namespace, arm: str, *, profile: bool = False) -> Pat
             "--xla_dump_hlo_as_text", "--xla_dump_hlo_module_re=jit_step")))
     with (output / "run.log").open("w") as log:
         subprocess.run(flags, check=True, env=env, stdout=log, stderr=subprocess.STDOUT,
-                       timeout=args.command_timeout)
+                       timeout=timeout)
     return output
 
 
@@ -41,6 +41,13 @@ def attribute(output: Path, side: Path, timeout: int) -> None:
                     "--trace", str(output / "trace"), "--hlo", str(output / "hlo"),
                     "--steps", "10", "--entry", str(output / "entry.json"),
                     "--out", str(output / "attribution.json")], check=True, env=env, timeout=timeout)
+
+
+def remaining(args: argparse.Namespace, started: float) -> int:
+    seconds = int(args.hard_cap_minutes * 60 - (time.monotonic() - started) - 180)
+    if seconds < 1:
+        raise TimeoutError("hard-cap guard leaves less than three minutes for cleanup")
+    return min(seconds, args.command_timeout)
 
 
 def main() -> None:
@@ -56,7 +63,7 @@ def main() -> None:
     sha = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
     reports = {}
     for arm in ("rows", "tokens"):
-        output = run_arm(args, arm)
+        output = run_arm(args, arm, remaining(args, started))
         report = json.loads((output / "entry.json").read_text())
         reports[arm] = {name: report[name] for name in (
             "windows", "compile_count", "whole_run_compile_seconds", "live_peak_bytes", "checks")}
@@ -67,11 +74,10 @@ def main() -> None:
             subprocess.run(["git", "worktree", "add", "--detach", str(side), ATTRIBUTOR], check=True)
             try:
                 for arm in ("rows", "tokens"):
-                    remaining = args.hard_cap_minutes * 60 - (time.monotonic() - started)
-                    if remaining < 600:
+                    if remaining(args, started) < 600:
                         raise TimeoutError("hard-cap guard leaves less than ten minutes for required attribution")
-                    output = run_arm(args, arm, profile=True)
-                    attribute(output, side, min(args.command_timeout, int(remaining)))
+                    output = run_arm(args, arm, remaining(args, started), profile=True)
+                    attribute(output, side, remaining(args, started))
                     reports[arm]["attribution"] = json.loads((output / "attribution.json").read_text())
             finally:
                 subprocess.run(["git", "worktree", "remove", str(side)], check=True)

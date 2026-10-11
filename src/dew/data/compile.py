@@ -897,6 +897,10 @@ def _per_share(pipeline: Pipeline, read: Read) -> bool:
         return True
     iterable = False
     for stage in pipeline.stages:
+        if isinstance(stage, (BatchStage, TokenBudget)):
+            break
+        if isinstance(stage, Workers):
+            return True
         if isinstance(stage, Prefetch):
             iterable = True
         elif iterable and isinstance(stage, (RandomMap, MapWithIndex, Group)):
@@ -912,7 +916,7 @@ def _per_share(pipeline: Pipeline, read: Read) -> bool:
         if any(_per_share(child, read) for child in pipeline.source.pipelines):
             return True
     return any(
-        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact, Rebatch, TokenBudget, Workers))
+        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact, Rebatch, TokenBudget))
         or (isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects)
         for stage in pipeline.stages
     )
