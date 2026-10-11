@@ -82,7 +82,8 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.readers import _CanonicalPass, _FillShare, _GroupedRows, _Host, _PerShare, _Statistics
-from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.base import READS, Read, Shard, ShardManifest, Source
+from dew.data.sources.memory import Memory
 from dew.data.tokens import _WrappingDataset
 from dew.records import JSON, integer, json_value, record
 
@@ -114,6 +115,28 @@ class _Locality(Protocol):
 @runtime_checkable
 class _OrderFacts(Protocol):
     def order_fingerprints(self) -> Mapping[str, str]: ...
+
+
+@runtime_checkable
+class _Wrapping(Protocol):
+    source: Source
+
+
+def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
+    """The read a run's sources choose when it states none: memory for records
+    held in memory (`Memory`, through any source that wraps one), indexed for
+    a store that reads by index, and streamed otherwise. A mixture takes the
+    least eager of its corpora's choices."""
+    chosen: list[Read] = []
+    for leaf in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
+        source = leaf.source
+        while isinstance(source, _Wrapping):
+            source = source.source
+        if isinstance(source, Memory):
+            chosen.append("memory")
+        else:
+            chosen.append("indexed" if leaf.source.supports("indexed") else "streamed")
+    return max(chosen, key=READS.index)
 
 
 def _leaves(pipeline: Pipeline) -> Iterator[Pipeline]:
@@ -1569,7 +1592,7 @@ def compile(
     validation: Pipeline | None = None,
     host: tuple[HostStep, ...] = (),
     objective: ObjectiveData | None = None,
-    read: Read = "indexed",
+    read: Read | None = "indexed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
     seed: int = 0,
@@ -1577,7 +1600,9 @@ def compile(
     budget: SearchBudget = _DEFAULT_BUDGET,
     resume: Literal["exact", "non-exact"] = "exact",
 ) -> Dataset:
-    """Check every leaf before opening readers, then build both branches."""
+    """Check every leaf before opening readers, then build both branches.
+    With no `read`, the sources choose it (`_preferred_read`)."""
+    read = read or _preferred_read((train,) if validation is None else (train, validation))
     if isinstance(train.source, Phases):
         return _compile_phases(
             train,
@@ -2131,13 +2156,15 @@ def validation(
     batch: int,
     objective: ObjectiveData | None = None,
     host: tuple[HostStep, ...] = (),
-    read: Read = "indexed",
+    read: Read | None = "indexed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
     seed: int = 0,
     budget: SearchBudget = _DEFAULT_BUDGET,
 ) -> Reader:
-    """Compile one finite evaluation branch without constructing a training stream."""
+    """Compile one finite evaluation branch without constructing a training
+    stream. With no `read`, the sources choose it (`_preferred_read`)."""
+    read = read or _preferred_read((pipeline,))
     if not any(isinstance(stage, BatchStage) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pipeline,), _ = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))

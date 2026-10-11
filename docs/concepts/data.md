@@ -64,6 +64,8 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 
 `read="indexed"` requires an index that already exists. `read="streamed"` reads physical shards without a whole-store pass. The chosen mode applies to every source, including validation and all mixture leaves. Unsupported modes are refused before a reader opens.
 
+A run that states no read (`--data-read`, `load(read=None)`) lets its sources choose: memory for records held in memory, indexed for a store that reads by index, streamed otherwise, and a mixture the least eager of its corpora's choices.
+
 Provisioning is explicit. `provision=True` can prepare TFDS, prepare a Hub Arrow cache or create an offset index. A missing artifact otherwise raises an error naming it. Creating an artifact can download data and take a long time; it does not happen implicitly at step zero.
 
 For example, a prepared image source is:

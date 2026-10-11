@@ -525,3 +525,27 @@ def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_p
     reopened = TokenFiles(str(tmp_path), field=field)
     assert reopened.supports("indexed")
     assert reopened.tokens[2:15].tolist() == list(range(2, 15))
+
+
+def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
+    """Records held in memory read from memory, a store that reads by index
+    reads by index and a stream streams, when the run states no read; a read
+    it states wins over each."""
+    import pyarrow.parquet as pq
+
+    from dew.config import RunConfig
+    from dew.data import Records, load
+
+    rows = [{"value": index} for index in range(8)]
+    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
+    (tmp_path / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    def read(source, stated=RunConfig.data_read):
+        loaded = load(Records(source=source), batch=2, read=stated, loading=Loading(workers=0))
+        assert loaded.plan is not None
+        return loaded.plan.order["read"]
+
+    listed, indexed, streamed = rows, str(tmp_path / "rows.parquet"), str(tmp_path / "rows.jsonl")
+    assert [read(listed), read(indexed), read(streamed)] == ["memory", "indexed", "streamed"]
+    assert [read(listed, "streamed"), read(indexed, "memory"), read(streamed, "memory")] == [
+        "streamed", "memory", "memory"]

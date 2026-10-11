@@ -883,7 +883,10 @@ class RunConfig:
     data: DataSpec = dataclasses.field(default_factory=lambda: Images(
         source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
         caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
-    data_read: Read = "memory"
+    data_read: Read | None = None
+    """How the data is read: 'memory', 'indexed' or 'streamed'. None leaves it
+    to the sources: memory for records held in memory, indexed for a store
+    that reads by index, streamed otherwise."""
     provision: bool = False
     data_seed: int = 0
     loading: Loading = dataclasses.field(default_factory=Loading)
