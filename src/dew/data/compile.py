@@ -1683,7 +1683,8 @@ def _compile_phases(
         )
         if loaded.plan is None or loaded.plan.lowering != "global":
             raise ValueError(
-                f"phase {index} needs a global order; streamed, rejecting and online-packed phases are refused"
+                f"phase {index} needs a global order; "
+                "streamed, rejecting and online-packed phases are refused"
             )
         end = None if until is None else until * loaded.batch
         built.append((loaded, end))

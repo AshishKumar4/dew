@@ -103,7 +103,8 @@ class _TokenBatches(grain.DatasetIterator[Batch]):
         super().__init__(parent)
         if partition.count > 1:
             raise ValueError(
-                "token-budget batching needs one share: independent per-share queues can choose different shapes"
+                "token-budget batching needs one share: "
+                "independent per-share queues can choose different shapes"
             )
         if budget.geometry is None:
             raise ValueError("token budget has no declared record geometry")
