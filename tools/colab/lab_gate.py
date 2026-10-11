@@ -15,19 +15,22 @@ import argparse
 import json
 from pathlib import Path
 
-from tools.colab.preflight import LAB_GPUS, STORE_CONFIG, lab_verified
+from dew.nn.kernels.generation import TARGETS
+from tools.colab.preflight import STORE_CONFIG, lab_verified
+
+# The lab's GPU names: each target's short alias (`a100`, `g4`), as its records are keyed.
+GPUS = sorted(alias for target in TARGETS.values() for alias in target.aliases if ":" not in alias)
 
 
 def gate(tree: Path, gpu: str, config: Path = STORE_CONFIG) -> tuple[dict, list[str]]:
     """What the preflight's lab check reads of `tree` on the lab's `gpu`, and why it fails, if it does."""
-    hardware = {name: label for label, name in LAB_GPUS.items()}[gpu]
     failures: list[str] = []
-    return lab_verified(tree.resolve(), hardware, failures, config=config), failures
+    return lab_verified(tree.resolve(), f"gpu:{gpu.upper()}", failures, config=config), failures
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=(__doc__ or "").split("\n")[0])
-    parser.add_argument("--gpu", required=True, choices=sorted(LAB_GPUS.values()))
+    parser.add_argument("--gpu", required=True, choices=GPUS)
     parser.add_argument("--tree", type=Path, default=Path("."), help="the Dew checkout the session trains")
     parser.add_argument("--store", type=Path, default=STORE_CONFIG, help="the store's JSON (provision.sh's)")
     args = parser.parse_args()
