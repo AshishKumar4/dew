@@ -49,7 +49,7 @@ from dew.data.dataset import (
     train_stream,
     validation_pass,
 )
-from dew.data.images import decode_image
+from dew.data.image_codec import decode_image
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
 from dew.data.sources.av_utils import choose_clip_start
