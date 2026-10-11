@@ -303,6 +303,21 @@ def test_pallas_kernel_choices_need_the_labs_record_of_their_exact_code(tmp_path
     assert preflight.lab_verified(tree, "gpu:A100", failures)["record"]["ref"] == "abc" and not failures
     assert preflight.lab_verified(tree, "gpu:G4", failures) == {"generation": "sm120", "pallas": []}
     assert not failures
+    # A script that names a Pallas implementation needs the record even where KERNELS names none.
+    script = {"ab.py": "rule(q, implementation='fla')\n"}
+    sites = preflight.explicit_pallas(script, "clef --delta-rule-impl pallas")
+    assert sites == ["<command>:1", "ab.py:1"]
+    preflight.lab_verified(tree, "gpu:G4", failures, sites)
+    assert failures and "not verified on g4" in failures[0]
+    # The pinned JAX is part of the digest: a JAX bump needs the lab again.
+    digest = preflight.kernel_digest(tree)
+    (tree / "constraints.txt").write_text("jax==0.11.2\njaxlib==0.11.2\nnumpy==2.0\n")
+    bumped = preflight.kernel_digest(tree)
+    (tree / "constraints.txt").write_text("jax==0.11.3\njaxlib==0.11.3\nnumpy==2.0\n")
+    newer = preflight.kernel_digest(tree)
+    assert len({digest, bumped, newer}) == 3
+    (tree / "constraints.txt").write_text("jax==0.11.3\njaxlib==0.11.3\nnumpy==2.1\n")
+    assert preflight.kernel_digest(tree) == newer
 
 
 def test_a_second_ref_is_checked_out_only_when_declared_and_fetched(tmp_path, monkeypatch):

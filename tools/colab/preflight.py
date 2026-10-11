@@ -630,7 +630,7 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             failures.append(f"{label(chain)}: {detail}")
     failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
     receipt.update(static={name: failed[name] for name in sorted(static.scope)}, guarded=static.guarded)
-    receipt["kernel_lab"] = lab_verified(tree, args.hardware, failures)
+    receipt["kernel_lab"] = lab_verified(tree, args.hardware, failures, explicit_pallas(texts, args.command))
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
@@ -728,7 +728,8 @@ LAB_GPUS = {"gpu:A100": "a100", "gpu:G4": "g4", "gpu:L4": "l4", "gpu:T4": "t4"}
 
 
 def kernel_digest(tree: Path) -> str:
-    """The content of Dew's kernels and of every source file that calls them, at `tree`: a ref's
+    """The content of Dew's kernels and of every source file that calls them, at `tree`, and the
+    jax and jaxlib its constraints pin, whose Triton lowering is half of a kernel's fate: a ref's
     kernels are the kernel lab's verified ones exactly when this matches the lab's record."""
     source = tree / "src" / "dew"
     calls = re.compile(r"(?:from|import)\s+(?:dew\.nn\.)?(?:\.+)?kernels\b|dew\.nn\.kernels")
@@ -737,15 +738,36 @@ def kernel_digest(tree: Path) -> str:
     digest = hashlib.sha256()
     for path in files:
         digest.update(str(path.relative_to(tree)).encode() + b"\0" + path.read_bytes() + b"\0")
+    constraints = tree / "constraints.txt"
+    pinned = constraints.read_text() if constraints.exists() else ""
+    pins = re.findall(r"^(?:jax|jaxlib|jax-cuda\d+-\w+)==\S+", pinned, re.M)
+    digest.update("\n".join(sorted(pins)).encode())
     return digest.hexdigest()
 
 
-def lab_verified(tree: Path, hardware: str, failures: list[str]) -> dict:
-    """Where the ref's measured kernel choices on `hardware` name Pallas kernels, the kernel lab's
-    record that it compiled and ran them on that GPU, kernels and their callers byte for byte: CPU
-    interpretation cannot catch a Triton lowering failure (c58, c57). None needed, none read."""
+# An explicit Pallas choice in a staged script or the command, which `auto`'s KERNELS row does not see.
+EXPLICIT = re.compile(r"""(?:implementation|_impl)["']?\s*[=:]\s*["'](pallas|fla|triton)["']"""
+                      r"""|--[\w.-]*impl[\w.-]*[= ](pallas|fla|triton)\b""")
+
+
+def explicit_pallas(texts: dict[str, str], command: str) -> list[str]:
+    """Each site that asks for a Pallas implementation by name, as `file:line`."""
+    sites = []
+    for name, text in [("<command>", command), *texts.items()]:
+        for number, line in enumerate(text.splitlines(), 1):
+            if EXPLICIT.search(line):
+                sites.append(f"{name}:{number}")
+    return sites
+
+
+def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: list[str] = ()) -> dict:
+    """Where the ref's measured kernel choices on `hardware` name Pallas kernels, or a script asks for
+    one by name (`explicit`), the kernel lab's record that it compiled and ran them on that GPU,
+    kernels, their callers and the pinned JAX byte for byte: CPU interpretation cannot catch a
+    Triton lowering failure (c58, c57). None needed, none read."""
     if not (tree / "src/dew/nn/kernels/generation.py").exists():
-        return {"generation": GENERATIONS[hardware], "pallas": []}
+        named = [f"explicit at {site}" for site in explicit]
+        return lab_record(tree, hardware, GENERATIONS[hardware], named, failures)
     choices = subprocess.run(
         [sys.executable, "-c", "import json; from dew.nn.kernels.generation import KERNELS; "
          "print(json.dumps(KERNELS))"],
@@ -757,7 +779,13 @@ def lab_verified(tree: Path, hardware: str, failures: list[str]) -> dict:
     generation = GENERATIONS[hardware]
     named = sorted(f"{choice}={row[generation]}" for choice, row in json.loads(choices.stdout).items()
                    if row.get(generation) in PALLAS_CHOICES)
-    found = {"generation": generation, "pallas": named}
+    named += [f"explicit at {site}" for site in explicit]
+    return lab_record(tree, hardware, generation, named, failures)
+
+
+def lab_record(tree: Path, hardware: str, generation: str, named: list[str], failures: list[str]) -> dict:
+    """The kernel lab's record for `tree`'s kernels on `hardware`, where `named` Pallas kernels run."""
+    found: dict = {"generation": generation, "pallas": named}
     if not named:
         return found
     found["digest"] = digest = kernel_digest(tree)
