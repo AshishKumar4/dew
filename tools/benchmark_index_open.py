@@ -17,6 +17,7 @@ from dew.data.storage import Store
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", default="r2://dew-data/decision/mix-v3")
+    parser.add_argument("--cache", help="a fresh local transport directory for a cold-open measurement")
     options = parser.parse_args()
     root = Store(options.source)
     manifest = json.loads(root.child("mixture.json").read())
@@ -33,6 +34,7 @@ def main() -> None:
             tuple(root.child(shard["path"]).url for shard in train["shards"]),
             format="jsonl",
             index=root.child(train["index"]["path"]).url,
+            storage_options=None if options.cache is None else {"dewcache": {"cache_storage": options.cache}},
         )
         rows = source.records("indexed")
         if len(rows) != train["rows"]:

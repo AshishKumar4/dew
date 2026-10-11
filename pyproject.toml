@@ -53,6 +53,7 @@ dependencies = [
     "fsspec>=2026.6.0",
     "gcsfs>=2026.6.0",
     "s3fs>=2026.6.0",
+    "urllib3>=2.5",
     "pyarrow>=25.0.1",
     "array-record>=0.8.3",
 ]

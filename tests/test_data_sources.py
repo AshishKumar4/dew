@@ -31,6 +31,44 @@ def test_memory_columns_snapshot_changes_with_content():
     assert Memory([{"x": np.int16(4)}]).snapshot() != Memory([{"x": np.int32(4)}]).snapshot()
 
 
+def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monkeypatch):
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi
+
+    from dew.data.sources import Hub
+
+    def metadata(self, repo, revision=None):
+        return SimpleNamespace(sha="converted" if revision == "refs/convert/parquet" else "original")
+
+    def listing(self, repo, *, repo_type, revision):
+        return ["data/train-00000.parquet"] if revision == "converted" else ["train.tar"]
+
+    monkeypatch.setattr(HfApi, "dataset_info", metadata)
+    monkeypatch.setattr(HfApi, "list_repo_files", listing)
+    with pytest.raises(FileNotFoundError, match=r"original.*converted branch.*provision=True"):
+        _ = Hub("owner/data", revision="original").files
+    latest = Hub("owner/data").files
+    assert latest.url == ("hf://datasets/owner/data@converted/data/train-00000.parquet",)
+
+
+@pytest.mark.parametrize("format", ["jsonl", "arrow", "parquet"])
+def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
+    from types import SimpleNamespace
+
+    from huggingface_hub import HfApi
+
+    from dew.data.sources import Hub
+
+    monkeypatch.setattr(
+        HfApi, "dataset_info", lambda self, repo, revision=None: SimpleNamespace(sha=revision)
+    )
+    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: [f"train.{format}"])
+    native = Hub("owner/data", revision="pinned").files
+    assert native.url == (f"hf://datasets/owner/data@pinned/train.{format}",)
+    assert native.format == format
+
+
 def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
     import tensorflow_datasets as tfds
 
@@ -114,6 +152,16 @@ def test_csv_quoted_newlines_are_never_byte_split():
     assert indexed[1] == {"id": "1", "text": "last"}
 
 
+def test_csv_large_quoted_fields_survive_streaming_and_offset_provisioning():
+    text = "a" * 140_000 + "\n" + "b" * 140_000
+    root = Store(f"memory://csv-large-{uuid4().hex}/rows.csv")
+    root.write(('id,text\n0,"' + text + '"\n').encode())
+    files = Files(root.url)
+    assert list(files.manifest().reader(files.manifest().shards[0])) == [{"id": "0", "text": text}]
+    files.provision()
+    assert files.records("indexed")[0] == {"id": "0", "text": text}
+
+
 def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     root = Store(f"memory://arrow-{uuid4().hex}/table")
     fs, path = root.resolve()
@@ -177,6 +225,8 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
     files = Files(root, format=format)
     actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
     assert actual == rows
+    with pytest.raises(ValueError, match="declares format"):
+        Files(root, format="jsonl").records("memory")
 
 
 def test_spark_directory_requires_success_marker(tmp_path):
@@ -186,6 +236,23 @@ def test_spark_directory_requires_success_marker(tmp_path):
         Files(str(tmp_path), format="parquet", spark=True).records("indexed")
     (tmp_path / "_SUCCESS").write_bytes(b"done")
     assert len(Files(str(tmp_path), format="parquet", spark=True).records("indexed")) == 2
+
+
+def test_corrupt_export_manifest_names_the_object_and_never_falls_back_to_raw_shards():
+    root = Store(f"memory://corrupt-export-{uuid4().hex}")
+    export(Memory([{"id": 1}]), root.url)
+    root.child("_dew_manifest.json").write(b"not-json")
+    with pytest.raises(ValueError, match=r"corrupt-export.*_dew_manifest.json"):
+        Files(root.url, format="parquet").records("indexed")
+
+
+def test_export_manifest_cannot_reference_an_object_outside_its_root():
+    root = Store(f"memory://escaping-export-{uuid4().hex}/dataset")
+    root.child("_dew_manifest.json").write(
+        json.dumps({"schema": 1, "format": "jsonl", "files": [{"path": "../outside.jsonl"}]}).encode()
+    )
+    with pytest.raises(ValueError, match="stay inside its root"):
+        Files(root.url).manifest()
 
 
 def test_webdataset_groups_members_and_restores_inside_shard():
@@ -337,6 +404,7 @@ def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
         "interval": datetime.timedelta(days=2, seconds=3),
         "features": [np.arange(4, dtype=np.uint16), {"nan": float("nan")}],
         "binary": b"\0\xff",
+        "messages": np.asarray([[{"role": "user", "content": "hello"}]], dtype=object),
     }
     actual = decode(encode(row))
     assert actual["when"] == row["when"]
@@ -345,6 +413,8 @@ def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
     assert np.array_equal(actual["features"][0], row["features"][0])
     assert np.isnan(actual["features"][1]["nan"])
     assert actual["binary"] == row["binary"]
+    assert actual["messages"].dtype == row["messages"].dtype
+    assert actual["messages"].tolist() == row["messages"].tolist()
 
 
 def test_empty_shard_cycles_exhaust_a_named_search_budget():

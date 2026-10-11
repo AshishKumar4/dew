@@ -1007,8 +1007,12 @@ class Generation:
         _ = self.pin
         if self._definition is not None:
             return dict(self._definition)
-        record = json.loads(Store(self.url, self.storage_options).child("manifest.json").read())
-        if record["schema"] != 1:
+        manifest = Store(self.url, self.storage_options).child("manifest.json")
+        try:
+            record = json.loads(manifest.read())
+        except ValueError as error:
+            raise ValueError(f"committed cache manifest is corrupt: {manifest.url}") from error
+        if not isinstance(record, dict) or record.get("schema") != 1:
             raise ValueError(f"unknown cache generation schema at {self.url}")
         _, path, scheme = Store(self.url, self.storage_options)._backend()
         if scheme == "file":
@@ -1225,6 +1229,16 @@ class _GenerationSource:
                 else {}
             ),
         }
+
+    def order_fingerprints(self) -> Mapping[str, str]:
+        manifest = self.generation.manifest
+        metadata = manifest["metadata"]
+        facts = {"accepted_ids": _hash(_json([entry["sha256"] for entry in manifest["row_pages"]]))}
+        if "lengths" in metadata:
+            facts["lengths"] = metadata["lengths"]["sha256"]
+        if "valid_targets" in metadata:
+            facts["valid_targets"] = _hash(_json(metadata["valid_targets"]))
+        return facts
 
     def lengths(self) -> np.ndarray | None:
         entry = self.generation.manifest["metadata"].get("lengths")
