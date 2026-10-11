@@ -164,7 +164,9 @@ def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
     try:
         with ThreadPoolExecutor(2) as pool:
             attempts = list(pool.map(lambda _: publish(), range(2)))
-        assert any(isinstance(attempt, Exception) is False for attempt in attempts)
+        from dew.data.cache import Generation
+
+        assert any(isinstance(attempt, Generation) for attempt in attempts)
         generation = cache.generation(key)
         assert [generation[index] for index in range(len(generation))] == [
             {"id": index} for index in range(8)
@@ -253,6 +255,9 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     assert generation.source().metadata()["valid_targets"] == 10
     assert generation.source().lengths().tolist() == [2, 3, 4, 5]
     assert generation.plan("offsets").tolist() == [0, 1, 2, 3, 4]
+    assert generation.plan_length("offsets") == 5
+    assert generation.plan_at("offsets", 3).item() == 3
+    assert len(generation.plan_hash("offsets")) == 64
 
 
 def test_transient_failures_never_certify_cache_coverage_but_permanent_rejections_do():

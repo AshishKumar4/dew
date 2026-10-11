@@ -47,6 +47,23 @@ def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
     assert isinstance(raw.records("indexed")[0]["image"], bytes)
 
 
+def test_remote_tfds_requires_explicit_provisioning_before_native_reads():
+    from dew.data.sources import TFDS
+
+    fixture = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    root = Store(f"memory://tfds-{uuid4().hex}/1.0.0")
+    for path in fixture.iterdir():
+        root.child(path.name).write(path.read_bytes())
+    source = TFDS("dew_images", path=root.url)
+    assert not source.supports("indexed")
+    with pytest.raises(FileNotFoundError, match=r"provision=True.*gs://"):
+        source.records("indexed")
+    source.provision()
+    assert source.supports("indexed")
+    assert len(source.records("indexed")) == 16
+    assert not Path(source.directory, "dew_images-test.array_record-00000-of-00001").exists()
+
+
 def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
     rows = [{"id": index, "text": "escaped\nline"} for index in range(30)]
     root = Store(f"memory://jsonl-{uuid4().hex}/rows.jsonl")

@@ -48,6 +48,13 @@ class ObjectRef(ObjectInfo):
     path: str
 
 
+class TransportStats(TypedDict):
+    hits: int
+    misses: int
+    downloaded_bytes: int
+    wait_seconds: float
+
+
 def _byte_size(value: int | str) -> int:
     if isinstance(value, int):
         return value
@@ -331,7 +338,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         self._dew_wait = 0.0
 
     def __getattribute__(self, name: str):
-        if name.startswith("_dew_"):
+        if name.startswith("_dew_") or name == "metrics":
             return object.__getattribute__(self, name)
         return super().__getattribute__(name)
 
@@ -405,6 +412,14 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             if not isinstance(payload, bytes):
                 raise TypeError("dewcache binary read returned non-bytes")
             return payload
+
+    def metrics(self) -> TransportStats:
+        return {
+            "hits": self._dew_hits,
+            "misses": self._dew_misses,
+            "downloaded_bytes": self._dew_downloaded,
+            "wait_seconds": self._dew_wait,
+        }
 
 
 _MEMORY_LOCK = threading.RLock()
