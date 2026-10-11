@@ -36,8 +36,8 @@ class TorchRecords:
         if isinstance(dataset, IterableDataset) or not isinstance(dataset, Sized):
             raise TypeError(
                 f"{type(dataset).__name__} has no length to read it by index; a run shuffles, "
-                f"shares and resumes a map-style dataset, so build a grain IterDataset over "
-                f"this one and pass it to Dataset.from_grain"
+                f"shares and resumes a map-style dataset, so expose unbatched records through "
+                f"an explicit Pipeline Source with a checkpointable reader"
             )
         self.dataset = dataset
         self.names = None if names is None else tuple(names)
