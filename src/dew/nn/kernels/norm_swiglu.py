@@ -242,8 +242,8 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, co
                 if after_cast:
                     normalized = _round(normalized, dy_ref.dtype, interpret)
                 product, low = _product_parts(cotangent, normalized, interpret=interpret)
-                accumulated = _compensated_add(*accumulated, product, interpret=interpret)
-                accumulated = _compensated_add(*accumulated, low, interpret=interpret)
+                accumulated = _compensated_add(accumulated[0], accumulated[1], product, interpret=interpret)
+                accumulated = _compensated_add(accumulated[0], accumulated[1], low, interpret=interpret)
         return accumulated
 
     partial, correction = jax.lax.fori_loop(0, pl.cdiv(rows, groups * row_block), block,
@@ -261,8 +261,8 @@ def _rms_scale_reduce(partial_ref, correction_ref, scale_ref, *, interpret: bool
     def group(i, accumulated):
         high = plgpu.load(partial_ref.at[i, columns], mask=columns < width, other=0)
         low = plgpu.load(correction_ref.at[i, columns], mask=columns < width, other=0)
-        added = _compensated_add(*accumulated, high, interpret=interpret)
-        return _compensated_add(*added, low, interpret=interpret)
+        added = _compensated_add(accumulated[0], accumulated[1], high, interpret=interpret)
+        return _compensated_add(added[0], added[1], low, interpret=interpret)
     total, correction = jax.lax.fori_loop(0, groups, group,
                                          (jnp.zeros(columns.shape, jnp.float32),
                                           jnp.zeros(columns.shape, jnp.float32)))
