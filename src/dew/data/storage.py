@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import BinaryIO, TypedDict
 
 import fsspec
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from gcsfs import GCSFileSystem
@@ -195,8 +195,16 @@ class DewDataFileSystem(AbstractFileSystem):
             return response.read(), dict(response.headers.items())
 
     def get_file(self, rpath: str, lpath: str, **kwargs) -> None:
+        self._get_versioned(rpath, lpath)
+
+    def _get_versioned(self, rpath: str, lpath: str, version: str | None = None) -> None:
         with self._response("GET", rpath) as response, open(lpath, "wb") as target:
+            if version is not None and response.headers.get("ETag") != version:
+                raise OSError(f"dew-data source changed before downloading {rpath}")
             shutil.copyfileobj(response, target, length=2**20)
+
+    def ukey(self, path: str) -> str:
+        return str(self.info(path)["etag"])
 
     def info(self, path: str, **kwargs) -> dict[str, str | int]:
         key = self._key(path)
@@ -365,56 +373,89 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             return self.fs.open(path, mode=mode, **kwargs)
         started = time.monotonic()
         directory = Path(self.storage[-1])
-        with FileLock(str(directory / ".dew-lock")):
-            self.load_cache()
-            path = self._strip_protocol(path)
-            cached = self._metadata.check_file(path)
-            version = self.fs.ukey(path)
-            if cached and (
-                cached[0]["uid"] != version or self.expiry and time.time() - cached[0]["time"] > self.expiry
-            ):
-                cached = False
-            if not cached:
-                self._dew_misses += 1
-                previous = self._metadata.cached_files[-1].get(path)
-                if previous is not None:
-                    with (directory / (previous["fn"] + ".pin")).open("a+b") as pin:
-                        try:
-                            fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        except BlockingIOError:
-                            return self.fs.open(path, mode=mode, **kwargs)
-                        self.pop_from_cache(path)
-                size = self.fs.size(path)
-                if not isinstance(size, int):
-                    raise ValueError(f"dewcache source {path!r} does not declare its byte size")
-                if not self._dew_room(size):
-                    return self.fs.open(path, mode=mode, **kwargs)
-                local = directory / self._mapper(path)
-                self._dew_download(path, local, size, version)
+        path = self._strip_protocol(path)
+        name = self._mapper(path)
+        reservation = directory / (".reserve-" + name)
+        with FileLock(str(directory / (".fetch-" + name + ".lock"))):
+            with FileLock(str(directory / ".dew-lock")):
+                reservation.unlink(missing_ok=True)
+                for interrupted in directory.glob(".download-" + name + "-*"):
+                    interrupted.unlink()
+            size = None
+            if isinstance(self.fs, DewDataFileSystem):
+                metadata = self.fs.info(path)
+                version, size = str(metadata["etag"]), int(metadata["size"])
             else:
-                self._dew_hits += 1
-                local = Path(cached[1])
-            pin = (directory / (local.name + ".pin")).open("a+b")
-            fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
-            os.utime(local, None)
-            self._dew_wait += time.monotonic() - started
-            raw = io.FileIO(str(local), "r")
-            return _PinnedReader(raw, pin)
+                version = self.fs.ukey(path)
+            with FileLock(str(directory / ".dew-lock")):
+                self.load_cache()
+                cached = self._metadata.check_file(path)
+                if cached and (
+                    cached[0]["uid"] == version
+                    and (not self.expiry or time.time() - cached[0]["time"] <= self.expiry)
+                ):
+                    self._dew_hits += 1
+                    return self._dew_pin(Path(cached[1]), started)
+            size = self.fs.size(path) if size is None else size
+            if not isinstance(size, int):
+                raise ValueError(f"dewcache source {path!r} does not declare its byte size")
+            with FileLock(str(directory / ".dew-lock")):
+                self.load_cache()
+                self._dew_misses += 1
+                if not self._dew_discard(path) or not self._dew_room(size):
+                    return self.fs.open(path, mode=mode, **kwargs)
+                reservation.write_text(str(size))
+            local = directory / name
+            try:
+                self._dew_download(path, local, size, version)
+                with FileLock(str(directory / ".dew-lock")):
+                    reservation.unlink()
+                    return self._dew_pin(local, started)
+            finally:
+                with FileLock(str(directory / ".dew-lock")):
+                    reservation.unlink(missing_ok=True)
+
+    def _dew_pin(self, local: Path, started: float) -> _PinnedReader:
+        pin = local.with_name(local.name + ".pin").open("a+b")
+        fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
+        os.utime(local, None)
+        self._dew_wait += time.monotonic() - started
+        return _PinnedReader(io.FileIO(str(local), "r"), pin)
+
+    def _dew_discard(self, path: str) -> bool:
+        previous = self._metadata.cached_files[-1].get(path)
+        if previous is None:
+            return True
+        pin_path = Path(self.storage[-1]) / (previous["fn"] + ".pin")
+        with pin_path.open("a+b") as pin:
+            try:
+                fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return False
+            self.pop_from_cache(path)
+        return True
 
     def _dew_download(self, path: str, local: Path, size: int, version: str) -> None:
-        descriptor, temporary = tempfile.mkstemp(dir=local.parent, prefix=".download-")
+        descriptor, temporary = tempfile.mkstemp(dir=local.parent, prefix=".download-" + local.name + "-")
         os.close(descriptor)
         pending = Path(temporary)
         try:
-            self.fs.get_file(path, str(pending))
-            if pending.stat().st_size != size or self.fs.ukey(path) != version:
+            if isinstance(self.fs, DewDataFileSystem):
+                self.fs._get_versioned(path, str(pending), version)
+                unchanged = True
+            else:
+                self.fs.get_file(path, str(pending))
+                unchanged = self.fs.ukey(path) == version
+            if pending.stat().st_size != size or not unchanged:
                 raise OSError(f"dewcache source changed while downloading {path}")
-            os.replace(pending, local)
-            self._metadata.update_file(
-                path,
-                {"original": path, "fn": local.name, "blocks": True, "time": time.time(), "uid": version},
-            )
-            self.save_cache()
+            with FileLock(str(local.parent / ".dew-lock")):
+                self.load_cache()
+                os.replace(pending, local)
+                self._metadata.update_file(
+                    path,
+                    {"original": path, "fn": local.name, "blocks": True, "time": time.time(), "uid": version},
+                )
+                self.save_cache()
             self._dew_downloaded += size
         finally:
             pending.unlink(missing_ok=True)
@@ -423,13 +464,25 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         if needed > self._dew_max_bytes:
             return False
         directory = Path(self.storage[-1])
+        reserved = 0
+        active = set()
+        for reservation in directory.glob(".reserve-*"):
+            name = reservation.name.removeprefix(".reserve-")
+            try:
+                with FileLock(str(directory / (".fetch-" + name + ".lock")), timeout=0):
+                    reservation.unlink()
+                    for interrupted in directory.glob(".download-" + name + "-*"):
+                        interrupted.unlink()
+            except Timeout:
+                reserved += int(reservation.read_text())
+                active.add(name)
         candidates = []
         for path, detail in self._metadata.cached_files[-1].items():
             local = directory / detail["fn"]
-            if local.is_file():
+            if local.is_file() and local.name not in active:
                 stat = local.stat()
                 candidates.append((stat.st_mtime_ns, path, local, stat.st_size))
-        used = sum(entry[3] for entry in candidates)
+        used = sum(entry[3] for entry in candidates) + reserved
         for _, path, local, size in sorted(candidates):
             if used + needed <= self._dew_max_bytes:
                 break

@@ -131,6 +131,31 @@ def test_concurrent_misses_download_once(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_distinct_transport_misses_download_concurrently_within_the_shared_budget(tmp_path, monkeypatch):
+    remote = fsspec.filesystem("memory")
+    prefix = f"parallel-cache-{uuid4().hex}"
+    paths = [prefix + "/a", prefix + "/b"]
+    for path in paths:
+        remote.pipe_file(path, path.encode())
+    waiting = threading.Barrier(2)
+    download = remote.get_file
+
+    def synchronize(*args, **kwargs):
+        waiting.wait(timeout=5)
+        return download(*args, **kwargs)
+
+    monkeypatch.setattr(remote, "get_file", synchronize)
+    cache = BoundedFileCache(fs=remote, cache_storage=str(tmp_path), max_bytes=1024)
+
+    def read(path):
+        with cache.open(path, "rb") as file:
+            return file.read()
+
+    with ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(read, paths)) == [path.encode() for path in paths]
+    assert cache.metrics()["downloaded_bytes"] == sum(len(path) for path in paths)
+
+
 def test_url_chain_reads_and_writes_memory(tmp_path):
     store = Store(
         f"dewcache::memory://chain-{uuid4().hex}/object",
