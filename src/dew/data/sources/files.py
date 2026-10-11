@@ -108,8 +108,11 @@ class Files:
 
     @cached_property
     def kind(self) -> Format:
-        if self.format is None and self.committed is not None:
-            return _format("data." + str(self.committed["format"]))
+        if self.committed is not None:
+            declared = _format("data." + str(self.committed["format"]))
+            if self.format is not None and self.format != declared:
+                raise ValueError(f"source {self.url!r} declares format={declared}, not {self.format}")
+            return declared
         return self.format or _format(self.url if isinstance(self.url, str) else self.url[0])
 
     @cached_property
@@ -118,7 +121,15 @@ class Files:
             return None
         store = Store(self.url, self.storage_options).child("_dew_manifest.json")
         fs, path = store.resolve()
-        return json.loads(fs.cat_file(path)) if fs.exists(path) else None
+        if not fs.exists(path):
+            return None
+        try:
+            manifest = json.loads(fs.cat_file(path))
+        except ValueError as error:
+            raise ValueError(f"committed export manifest is corrupt: {store.url}") from error
+        if not isinstance(manifest, dict) or manifest.get("schema") != 1:
+            raise ValueError(f"committed export manifest has an unknown schema: {store.url}")
+        return manifest
 
     @cached_property
     def paths(self) -> tuple[str, ...]:

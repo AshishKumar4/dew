@@ -1007,8 +1007,12 @@ class Generation:
         _ = self.pin
         if self._definition is not None:
             return dict(self._definition)
-        record = json.loads(Store(self.url, self.storage_options).child("manifest.json").read())
-        if record["schema"] != 1:
+        manifest = Store(self.url, self.storage_options).child("manifest.json")
+        try:
+            record = json.loads(manifest.read())
+        except ValueError as error:
+            raise ValueError(f"committed cache manifest is corrupt: {manifest.url}") from error
+        if not isinstance(record, dict) or record.get("schema") != 1:
             raise ValueError(f"unknown cache generation schema at {self.url}")
         _, path, scheme = Store(self.url, self.storage_options)._backend()
         if scheme == "file":

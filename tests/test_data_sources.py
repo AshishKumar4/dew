@@ -225,6 +225,8 @@ def test_exports_are_committed_and_readable_at_memory_urls(format):
     files = Files(root, format=format)
     actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
     assert actual == rows
+    with pytest.raises(ValueError, match="declares format"):
+        Files(root, format="jsonl").records("memory")
 
 
 def test_spark_directory_requires_success_marker(tmp_path):
@@ -234,6 +236,14 @@ def test_spark_directory_requires_success_marker(tmp_path):
         Files(str(tmp_path), format="parquet", spark=True).records("indexed")
     (tmp_path / "_SUCCESS").write_bytes(b"done")
     assert len(Files(str(tmp_path), format="parquet", spark=True).records("indexed")) == 2
+
+
+def test_corrupt_export_manifest_names_the_object_and_never_falls_back_to_raw_shards():
+    root = Store(f"memory://corrupt-export-{uuid4().hex}")
+    export(Memory([{"id": 1}]), root.url)
+    root.child("_dew_manifest.json").write(b"not-json")
+    with pytest.raises(ValueError, match=r"corrupt-export.*_dew_manifest.json"):
+        Files(root.url, format="parquet").records("indexed")
 
 
 def test_webdataset_groups_members_and_restores_inside_shard():
