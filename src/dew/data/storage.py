@@ -193,7 +193,8 @@ class DewDataFileSystem(AbstractFileSystem):
     def _keys(self, prefix: str) -> Iterator[str]:
         cursor = ""
         while True:
-            query = "?" + urllib.parse.urlencode({"list": prefix, "cursor": cursor})
+            options = {"list": prefix, **({"cursor": cursor} if cursor else {})}
+            query = "?" + urllib.parse.urlencode(options)
             body, _ = self._request("GET", self.bucket, query=query)
             page = json.loads(body)
             for suffix in page["keys"]:
@@ -585,7 +586,9 @@ class Store:
             loop = fs.loop
             if loop is None:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
-            return sync(loop, put_s3)
+            version = sync(loop, put_s3)
+            fs.invalidate_cache()
+            return version
         if scheme in ("gs", "gcs"):
             fs.pipe_file(path, payload, if_generation_match=0 if version is None else int(version))
             fs.invalidate_cache(path)
