@@ -14,7 +14,7 @@ import uuid
 import weakref
 from collections import Counter
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack, closing
 from dataclasses import dataclass, field
 from functools import cached_property, lru_cache
@@ -25,7 +25,7 @@ import grain.python as grain
 import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from dew.data.dataset import Batch
+from dew.data.dataset import Batch, _QUIET_STOP_SECONDS
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Shard, ShardManifest, Source
@@ -46,6 +46,7 @@ class CacheStats(TypedDict):
     spool_bytes: int
     uploaded_bytes: int
     upload_seconds: float
+    abandoned: int
 
 
 class DependencyManifest(Protocol):
@@ -479,6 +480,7 @@ class _Writer:
         self.closing = False
         self.uploaded_bytes = 0
         self.upload_seconds = 0.0
+        self.abandoned = 0
         self.volatile = volatile
         self.expected = expected
         self.seal_future: Future | None = None
@@ -668,6 +670,8 @@ class _Writer:
                         "volatile": self.volatile,
                     }
                 )
+                if self.closed:
+                    raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
                 try:
                     self.root.child(segment).verified(encoded)
                 except PreconditionFailed:
@@ -678,7 +682,7 @@ class _Writer:
                     self.uploaded_bytes += used
                     self.upload_seconds += time.monotonic() - started
                     self.lock.notify_all()
-                path.unlink()
+                path.unlink(missing_ok=True)
                 return {"path": segment, "bytes": len(encoded), "sha256": _hash(encoded)}
             except OSError:
                 if attempt == self.cache.retry:
@@ -693,6 +697,7 @@ class _Writer:
                 "spool_bytes": self.spool_bytes,
                 "uploaded_bytes": self.uploaded_bytes,
                 "upload_seconds": self.upload_seconds,
+                "abandoned": self.abandoned,
             }
 
     def seal(self) -> None:
@@ -714,13 +719,15 @@ class _Writer:
                 "sha256": chain.hex(),
             }
         )
+        if self.closed:
+            raise RuntimeError(f"cache writer was abandoned before its seal: {self.writer}")
         try:
             self.root.child(f"segments/{self.writer}/seal.json").put_if_absent(payload)
         except PreconditionFailed:
             if self.root.child(f"segments/{self.writer}/seal.json").read() != payload:
                 raise
 
-    def close(self) -> None:
+    def finish(self) -> None:
         with self.lock:
             if self.closing:
                 return
@@ -737,6 +744,44 @@ class _Writer:
             self.closed = True
             self.pool.shutdown(wait=True, cancel_futures=True)
             self.index.close()
+            self.directory.cleanup()
+            if self.pin is not None:
+                self.pin.close()
+
+    def close(self) -> None:
+        with self.lock:
+            if self.closing:
+                return
+            self.closing = True
+            pending = len(self.pending)
+            self.pending.clear()
+            self.spool_bytes -= self.pending_bytes
+            self.pending_bytes = 0
+        tasks = [*self.futures, *([self.seal_future] if self.seal_future is not None else [])]
+        _, unfinished = wait(tasks, timeout=_QUIET_STOP_SECONDS) if tasks else (set(), set())
+        with self.lock:
+            self.closed = True
+            self.abandoned += pending + len(unfinished)
+        for future in unfinished:
+            future.cancel()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.index.close()
+        if self.abandoned:
+            _log.warning("data/cache/abandoned=%d at %s", self.abandoned, self.root.url)
+        if unfinished:
+            remaining = set(unfinished)
+
+            def released(future: Future) -> None:
+                with self.lock:
+                    remaining.discard(future)
+                    if not remaining:
+                        self.directory.cleanup()
+                        if self.pin is not None:
+                            self.pin.close()
+
+            for future in unfinished:
+                future.add_done_callback(released)
+        else:
             self.directory.cleanup()
             if self.pin is not None:
                 self.pin.close()
@@ -791,6 +836,10 @@ class _CachedMap(grain.MapDataset[CachedValue]):
         if "_writer" in self.__dict__:
             self.writer.close()
 
+    def finish(self) -> None:
+        if "_writer" in self.__dict__:
+            self.writer.finish()
+
     def metrics(self) -> CacheStats:
         return self.writer.metrics()
 
@@ -822,7 +871,11 @@ class _ClosingCacheIterator(grain.DatasetIterator[CachedValue]):
         self.input_parent, self.owner = parent, owner
 
     def __next__(self) -> CachedValue:
-        return next(self.input_parent)
+        try:
+            return next(self.input_parent)
+        except StopIteration:
+            self.owner.finish()
+            raise
 
     def get_state(self) -> Mapping[str, object]:
         return self.input_parent.get_state()
@@ -881,7 +934,7 @@ class _CachedIterator(grain.DatasetIterator):
         try:
             value = next(self.parent)
         except StopIteration:
-            self.writer.close()
+            self.writer.finish()
             raise
         value = self.writer.process((self.shard.id, self.ordinal), self.ordinal, value, self.transform)
         self.ordinal += 1
