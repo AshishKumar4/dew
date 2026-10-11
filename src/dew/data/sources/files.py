@@ -328,6 +328,18 @@ class Files:
             return grain.MapDataset.source(_Paths((shard.uri,))).to_iter_dataset()
         return _Lines(self, shard)
 
+    def locality(self) -> tuple[tuple[int, ...], bool]:
+        remote = False
+        for url in self.paths:
+            fs, _ = Store(url, self.storage_options).resolve()
+            protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+            remote |= "file" not in protocols and "memory" not in protocols
+        if self.kind in ("parquet", "arrow") and self.filter is None:
+            return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
+        if self.kind == "files":
+            return tuple(1 for _ in self.paths), remote
+        return (), remote
+
     def metadata(self) -> Mapping[str, object]:
         if self.committed is not None:
             metadata = self.committed.get("metadata", {})
@@ -798,8 +810,7 @@ class TokenFiles:
             self.tokens.materialize_lengths()
         if read == "memory":
             return ({"text": self.tokens[:].astype(np.int32)},)
-        indexed = _TokenChunks(self.tokens, self.chunk_tokens)
-        return indexed
+        return _TokenChunks(self.tokens, self.chunk_tokens)
 
     def manifest(self) -> ShardManifest:
         count = len(self.records("indexed"))

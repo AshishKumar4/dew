@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import dataclasses
-import threading
 from collections.abc import Callable, Mapping
 
 import grain.experimental as experimental
@@ -48,23 +47,9 @@ def streamed(
     )
 
 
-class _EmptyBudget:
-    def __init__(self, name: str, limit: int):
-        self.name, self.limit = name, limit
-        self.lock = threading.Lock()
-        self.empty = 0
-
-    def rejected(self) -> None:
-        with self.lock:
-            self.empty += 1
-            if self.empty >= self.limit:
-                raise ValueError(
-                    f"source {self.name} exhausted its search budget of {self.limit} empty shards"
-                )
-
-    def accepted(self) -> None:
-        with self.lock:
-            self.empty = 0
+@dataclasses.dataclass(frozen=True)
+class _EmptyShard:
+    pass
 
 
 class _ShardPass(grain.IterDataset):
@@ -85,38 +70,36 @@ class _ShardPass(grain.IterDataset):
         self.root = self.root[selection]
 
     def __iter__(self) -> grain.DatasetIterator:
-        budget = _EmptyBudget(self.name, self.budget)
         parent = experimental.InterleaveIterDataset(
-            self.root.map(_GuardedReader(self.reader, budget)),
+            self.root.map(_GuardedReader(self.reader)),
             cycle_length=self.cycle,
             num_make_iter_threads=max(self.loading.threads, 1),
             make_iter_buffer_size=self.loading.read_buffer,
         )
-        return _BudgetIterator(parent.__iter__(), budget)
+        return _BudgetIterator(parent.__iter__(), self.name, self.budget)
 
 
 @dataclasses.dataclass(frozen=True)
 class _GuardedReader:
     reader: Callable[[Shard], grain.IterDataset]
-    budget: _EmptyBudget
 
     def __call__(self, shard: Shard) -> grain.IterDataset:
-        return _GuardedShard(self.reader(shard), self.budget)
+        return _GuardedShard(self.reader(shard))
 
 
 class _GuardedShard(grain.IterDataset):
-    def __init__(self, parent: grain.IterDataset, budget: _EmptyBudget):
+    def __init__(self, parent: grain.IterDataset):
         super().__init__(parent)
-        self.input_parent, self.budget = parent, budget
+        self.input_parent = parent
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _ShardIterator(self.input_parent.__iter__(), self.budget)
+        return _ShardIterator(self.input_parent.__iter__())
 
 
 class _ShardIterator(grain.DatasetIterator):
-    def __init__(self, parent: grain.DatasetIterator, budget: _EmptyBudget):
+    def __init__(self, parent: grain.DatasetIterator):
         super().__init__(parent)
-        self.input_parent, self.budget = parent, budget
+        self.input_parent = parent
         self.yielded = False
         self.reported = False
 
@@ -126,11 +109,9 @@ class _ShardIterator(grain.DatasetIterator):
         except StopIteration:
             if not self.yielded and not self.reported:
                 self.reported = True
-                self.budget.rejected()
+                return _EmptyShard()
             raise
-        if not self.yielded:
-            self.budget.accepted()
-            self.yielded = True
+        self.yielded = True
         return row
 
     def get_state(self) -> Mapping[str, object]:
@@ -148,25 +129,30 @@ class _ShardIterator(grain.DatasetIterator):
 
 
 class _BudgetIterator(grain.DatasetIterator):
-    def __init__(self, parent: grain.DatasetIterator, budget: _EmptyBudget):
+    def __init__(self, parent: grain.DatasetIterator, name: str, limit: int):
         super().__init__(parent)
-        self.input_parent, self.budget = parent, budget
+        self.input_parent, self.name, self.limit = parent, name, limit
+        self.empty = 0
 
     def __next__(self):
-        return next(self.input_parent)
+        while isinstance(row := next(self.input_parent), _EmptyShard):
+            self.empty += 1
+            if self.empty >= self.limit:
+                raise ValueError(
+                    f"source {self.name} exhausted its search budget of {self.limit} empty shards"
+                )
+        self.empty = 0
+        return row
 
     def get_state(self) -> Mapping[str, object]:
-        with self.budget.lock:
-            empty = self.budget.empty
-        return {"parent": self.input_parent.get_state(), "empty_shards": empty}
+        return {"parent": self.input_parent.get_state(), "empty_shards": self.empty}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         parent, empty = state["parent"], state["empty_shards"]
         if not isinstance(parent, Mapping) or not isinstance(empty, int) or empty < 0:
             raise ValueError("invalid empty-shard search state")
         self.input_parent.set_state(parent)
-        with self.budget.lock:
-            self.budget.empty = empty
+        self.empty = empty
 
     def close(self) -> None:
         self.input_parent.close()

@@ -25,7 +25,7 @@ import grain.python as grain
 import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from dew.data.dataset import Batch, _QUIET_STOP_SECONDS
+from dew.data.dataset import _QUIET_STOP_SECONDS, Batch
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Shard, ShardManifest, Source
@@ -509,8 +509,6 @@ class _Writer:
             )
         if existing is not None:
             values = _decode_outputs(existing)
-            if not isinstance(values, tuple):
-                raise ValueError(f"cache pending row {row_key} is not an input completion")
             return values if transform is not None else values[0]
         if completed is not None and self.futures[completed[0]].done():
             uploaded = self.futures[completed[0]]
@@ -519,8 +517,6 @@ class _Writer:
                 if not isinstance(payload, bytes) or _hash(payload) != completed[2]:
                     raise ValueError(f"cache writer record is corrupt for row {row_key}")
                 values = _decode_outputs(payload)
-                if not isinstance(values, tuple):
-                    raise ValueError(f"cache writer record is not a completion for row {row_key}")
                 return values if transform is not None else values[0]
         outputs = (value,) if transform is None else transform(ordinal, value)
         if not isinstance(outputs, tuple):

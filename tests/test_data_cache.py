@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
@@ -325,6 +326,65 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     retry.close()
     assert cache.publish(second_key, source)[0] == {"id": 0}
     assert cache.generation(first_key) is None
+
+
+def test_training_close_abandons_a_stalled_upload_without_publishing_a_segment():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    from dew.data.dataset import _QUIET_STOP_SECONDS
+
+    entered, release = threading.Event(), threading.Event()
+    stored = {}
+
+    class Worker(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def do_PUT(self):
+            payload = self.rfile.read(int(self.headers["Content-Length"]))
+            entered.set()
+            release.wait(15)
+            stored[self.path] = payload
+            self.send_response(204)
+            self.send_header("ETag", '"stored"')
+            self.end_headers()
+
+        def do_GET(self):
+            payload = stored[self.path]
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            self.send_header("ETag", '"stored"')
+            self.end_headers()
+            self.wfile.write(payload)
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Worker) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        source = Memory([{"id": 0}])
+        cache = Cache(
+            "dewdata://dew-data/stalled",
+            shard_bytes=1,
+            retry=0,
+            storage_options={"endpoint_url": f"http://127.0.0.1:{server.server_port}", "token": "test"},
+        )
+        rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), Manifest(), source)
+        try:
+            assert rows[0] == {"id": 0}
+            assert entered.wait(5)
+            started = time.monotonic()
+            rows.close()
+            assert time.monotonic() - started < _QUIET_STOP_SECONDS + 2
+            assert rows.metrics()["abandoned"] > 0
+        finally:
+            release.set()
+            for future in rows.writer.futures:
+                try:
+                    future.result(timeout=5)
+                except RuntimeError as error:
+                    assert "abandoned" in str(error) or "cancelled" in str(error)
+            server.shutdown()
+            thread.join()
+        assert not any("/segments/" in path for path in stored)
 
 
 @pytest.mark.network

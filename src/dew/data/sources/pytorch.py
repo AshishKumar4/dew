@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from ..dataset import Batch, Records, describe
-from ..steps.generic import Formatting
 from .base import Read, ShardManifest
 
 if TYPE_CHECKING:
@@ -55,6 +54,8 @@ class TorchRecords:
 
     def __getitem__(self, index: int) -> Batch:
         import torch
+
+        from ..steps.generic import Formatting
 
         sample = self.dataset[index]
         if isinstance(sample, Mapping) and self.names is None:
