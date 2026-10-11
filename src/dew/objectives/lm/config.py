@@ -97,6 +97,7 @@ class LMRunConfig(RunConfig):
         run's key, so the objective trains its factors alone. Perplexity scores
         each validation pass.
         """
+        self = dataclasses.replace(self, trainer=self.trainer.derived())
         tokens = self.tokens()
         written, vocab_size = token_vocabulary(tokens)
         if self.tokenizer != written:
@@ -140,7 +141,9 @@ class LMRunConfig(RunConfig):
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
-        loaded = load(tokens, batch=self.trainer.batch_size, read=self.data_read, provision=self.provision,
+        loaded = load(tokens, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+                      lengths=() if self.trainer.batch_tokens is None else (objective.seq_len,),
+                      read=self.data_read, provision=self.provision,
                       seed=self.data_seed, loading=self.loading,
                       validation_records=self.validation_records, objective=objective.data())
         if not loaded.steps_per_epoch:
