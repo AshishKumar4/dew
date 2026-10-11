@@ -84,7 +84,9 @@ adapter scope's usage, including looped layer passes and a separate vocabulary
 head. Adapter factor geometry comes from the actual bound two-axis layouts.
 Frozen base maps cost twice their forward work, trainable factors three times
 their forward work, and nonparameter attention/state MACs remain three-times
-forward. A decision objective adds its newly trained head separately; a text-only
+forward. Frozen matrices are charged 4N throughout, including the first layer's
+input projections, whose input gradient a frozen embedding never needs.
+A decision objective adds its newly trained head separately; a text-only
 multimodal wrapper counts its language model, not its unused media towers.
 Unsupported matrix scopes/geometry raise `MissingFlopsCount` by name.
 

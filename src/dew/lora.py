@@ -470,7 +470,12 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
 
         @nn.nowrap
         def training_flops(self, lengths) -> float:
-            """Frozen base maps get 4N, factors 6N; state/attention retain 3*forward."""
+            """Frozen base maps get 4N, factors 6N; state/attention retain 3*forward.
+
+            Frozen matrices are charged 4N throughout, including the first
+            layer's input projections, whose input gradient a frozen
+            embedding never needs.
+            """
             original = unadapted(self)
             forward = counted_flops(original, lengths)
             learned = parameter_flops(original, lengths)
