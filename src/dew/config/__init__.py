@@ -662,6 +662,16 @@ class TrainerConfig:
     the compute dtype. `dew.training.quantization` describes what the wrapper does
     and what it keeps.
     """
+    lower_for: str | None = None
+    """A CUDA generation ('sm80', 'sm120') to lower the first step for in place of training.
+
+    The run builds and places its state as it would, then traces its first
+    step as on that GPU and lowers it for one, every Pallas-Triton kernel
+    with it, on any host, a CPU too, and the program exits with status 0
+    (`dew.training.lowering`). A kernel whose Triton lowering fails fails
+    here, as it would fail the run's first compile on the GPU. The run
+    opens no W&B run.
+    """
 
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
@@ -1140,7 +1150,7 @@ class RunConfig:
         tracker = None
         try:
             wandb_tracker = None
-            if trainer.wandb is not None:
+            if trainer.wandb is not None and trainer.lower_for is None:
                 wandb_tracker = WandbTracker(
                     trainer.wandb.project, name, entity=trainer.wandb.entity,
                     offline=trainer.wandb.offline)
@@ -1165,7 +1175,7 @@ class RunConfig:
                 objective, self.optim, key=trainer.key,
                 mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
                 dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
-                rollout=rollout, profile=trainer.profile,
+                rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,

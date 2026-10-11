@@ -32,7 +32,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
@@ -48,7 +48,7 @@ from dew.data.dataset import (
     stream_endless,
     stream_identity,
 )
-from dew.nn.kernels.generation import measured_kernel
+from dew.nn.kernels.generation import assumed, measured_kernel
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -105,6 +105,7 @@ from dew.training.distributed import (
     shard_batch,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
+from dew.training.lowering import Lowered, gpu_mesh
 from dew.training.memory import (
     climb_to,
     compiled_if_it_fits,
@@ -569,6 +570,7 @@ class Trainer(Generic[Loss, Effects]):
         step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
         rollout: Rollout | None = None,
         profile: ProfileWindow | None = None,
+        lower_for: str | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -581,7 +583,9 @@ class Trainer(Generic[Loss, Effects]):
         it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
         scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter. `rollout` runs once per batch read, before the step and outside
-        replay. `layout` and `mesh` say where the state lives.
+        replay. `layout` and `mesh` say where the state lives. `lower_for` names a CUDA generation
+        ('sm80') to lower the first step for in place of compiling it, and `fit` then raises
+        `Lowered` (`dew.training.lowering`).
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
@@ -606,6 +610,7 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.profile = profile
+        self.lower_for = lower_for
         # Set by `compile`, for the batch shape it was called with. A ramped
         # run has one value per stage; `fit` keeps them beside each step. The
         # program is the step as handed to XLA, before GSPMD partitions it,
@@ -1131,13 +1136,15 @@ class Trainer(Generic[Loss, Effects]):
         return links
 
     @contextlib.contextmanager
-    def _traced_on(self, mesh: Mesh, links: Mapping[str, Link] | None = None) -> Iterator[Schedule]:
+    def _traced_on(self, mesh: Mesh | AbstractMesh,
+                   links: Mapping[str, Link] | None = None) -> Iterator[Schedule]:
         """What a traced step reads from context: the mesh, the pipeline's
         microbatch count, the layout's rules, which place the activations
         the model constrains (`dew.nn.sharding.constrain`) as they place the
         parameters, and the links of the axes the step measured, none by
         default."""
-        with (jax.set_mesh(mesh), pipeline_microbatches(self.mesh.microbatches) as schedule,
+        on = jax.sharding.use_abstract_mesh(mesh) if isinstance(mesh, AbstractMesh) else jax.set_mesh(mesh)
+        with (on, pipeline_microbatches(self.mesh.microbatches) as schedule,
               nn.logical_axis_rules(self.layout.axis_rules), measured_links({} if links is None else links)):
             yield schedule
 
@@ -1160,19 +1167,14 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("checkpoint dynamic-scaler configuration differs from this trainer")
         if self.host_master:
             return self._compile_host(state, batch)
+        if self.lower_for is not None:
+            raise Lowered(self.lower_for, self._lowered_for(state, batch, self.lower_for))
         mesh = self.device_mesh
         links = self._links(mesh)
         shaped = self._at_base_rung(batch)
         resumed, self._resumed_rung = self._resumed_rung if shaped is None else shaped, None
         with self._traced_on(mesh, links) as schedule:
-            shapes = None if self.step is not None else self._loss_shape(state, batch)
-            if shapes is not None:
-                self._refuse_unpipelined(schedule)
-            prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
-            copies = self._narrow_copies(state, batch)
-            if copies:
-                prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
-                    lambda variables: narrowed(variables, copies), prepared.variables))
+            shapes, copies, prepared = self._prepared(state, batch, schedule)
             shardings = self.shardings(prepared)
             replicated = NamedSharding(mesh, P())
             placement = batch_shardings(mesh, batch)
@@ -1188,22 +1190,7 @@ class Trainer(Generic[Loss, Effects]):
             refusals: list[RuntimeError] = []
             consulted, record_path, key = False, None, {}
             while True:
-                body = (self.step(self.objective, self.optimizer) if self.step is not None else
-                        Transaction(self.objective, self.optimizer, self.accumulation, shapes,
-                                    copies).step())
-
-                def step(current, batch, body=body):
-                    # The body sees every field on the device; the out shardings
-                    # return the host-resident ones to pinned host memory.
-                    advanced, loss, aux = body(self._fetched(current, shardings), model_batch(batch))
-                    return (dataclasses.replace(advanced, step=current.step + 1), loss,
-                            {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
-                            advanced.microstep > current.microstep)
-
-                jitted = jax.jit(step, in_shardings=(shardings, placement),
-                                 out_shardings=(shardings, replicated, replicated, replicated,
-                                                replicated),
-                                 donate_argnums=0)
+                jitted = self._jitted(self._step_body(shapes, copies), shardings, placement, replicated)
                 self.program = jitted.lower(prepared, batch)
                 if not consulted:
                     consulted, before = True, self._rung()
@@ -1258,6 +1245,61 @@ class Trainer(Generic[Loss, Effects]):
                             current.variables))
                 return executable(current, batch)
         return run
+
+    def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule):
+        """The loss's shapes (None under a custom step), the narrow copies and the state's shapes
+        with the accumulation and the copies the step builds, as the step traces them."""
+        shapes = None if self.step is not None else self._loss_shape(state, batch)
+        if shapes is not None:
+            self._refuse_unpipelined(schedule)
+        prepared = self._initialize_accumulation(state, batch, shapes, shape_only=True)
+        copies = self._narrow_copies(state, batch)
+        if copies:
+            prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
+                lambda variables: narrowed(variables, copies), prepared.variables))
+        return shapes, copies, prepared
+
+    def _step_body(self, shapes, copies: dict):
+        """The transaction's step, or the custom step's."""
+        if self.step is not None:
+            return self.step(self.objective, self.optimizer)
+        return Transaction(self.objective, self.optimizer, self.accumulation, shapes, copies).step()
+
+    def _jitted(self, body, shardings: Placement[TrainState], placement, replicated: NamedSharding):
+        """The step over `body`, which donates the state it is handed."""
+        def step(current, batch):
+            # The body sees every field on the device; the out shardings
+            # return the host-resident ones to pinned host memory.
+            advanced, loss, aux = body(self._fetched(current, shardings), model_batch(batch))
+            return (dataclasses.replace(advanced, step=current.step + 1), loss,
+                    {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss),
+                    advanced.microstep > current.microstep)
+
+        return jax.jit(step, in_shardings=(shardings, placement),
+                       out_shardings=(shardings, replicated, replicated, replicated, replicated),
+                       donate_argnums=0)
+
+    def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
+        """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
+        for one (`dew.training.lowering`), on whatever devices this process has.
+
+        The step traces on an abstract mesh of that GPU's devices, the device
+        mesh's axes over them, so JAX's Pallas lowering reads the GPU from each
+        kernel's trace and lowers it to Triton. Only shapes cross over: the
+        state and the batch on this process's devices sit on another mesh."""
+        mesh = gpu_mesh(self.device_mesh, generation)
+        self._at_base_rung(batch)
+        with assumed(generation), self._traced_on(mesh) as schedule:
+            state, batch = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), (state, batch))
+            shapes, copies, prepared = self._prepared(state, batch, schedule)
+            shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
+                                     self.shardings(prepared))
+            placement = batch_shardings(mesh, batch)
+            jitted = self._jitted(self._step_body(shapes, copies), shardings, placement,
+                                  NamedSharding(mesh, P()))
+            placed = [jax.tree.map(lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), tree, at)
+                      for tree, at in ((prepared, shardings), (batch, placement))]
+            return jitted.trace(*placed).lower(lowering_platforms=('cuda',))
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
         """The parameters the step reads through narrow copies
@@ -2292,7 +2334,8 @@ class Trainer(Generic[Loss, Effects]):
                 error = failure
         try:
             outcome = FitEnded.outcome(time.perf_counter() - run.started, error,
-                                       preempted=run.preempted is not None)
+                                       preempted=run.preempted is not None,
+                                       lowered=isinstance(error, Lowered))
             self._report(outcome, run.current)
         except BaseException as failure:
             if error is None:

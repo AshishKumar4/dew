@@ -7,11 +7,31 @@ and sends every other one to its portable path. The measurements are in
 docs/performance.md, "Kernel choices per generation".
 """
 
+import contextlib
+import contextvars
 import logging
+from collections.abc import Iterator
 
 import jax
 
 _log = logging.getLogger(__name__)
+
+ASSUMED: contextvars.ContextVar[str | None] = contextvars.ContextVar("assumed_generation", default=None)
+"""The generation `assumed` stands in for the default device's, None outside it."""
+
+
+@contextlib.contextmanager
+def assumed(generation: str | None) -> Iterator[None]:
+    """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
+    process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
+    `KERNELS` choice and kernel refusal acts as on that GPU while a step traces and lowers for one on
+    a CPU (`dew.training.lowering`). None assumes nothing."""
+    token = ASSUMED.set(generation)
+    try:
+        yield
+    finally:
+        ASSUMED.reset(token)
+
 
 # `device_kind` of the TPU generations Dew names.
 TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',
@@ -42,8 +62,12 @@ def device_generation() -> str:
     """Return the default device's hardware generation.
 
     The generation is 'sm89' for a GPU of compute capability 8.9, 'v6e' for a
-    TPU v6e, and the platform's name otherwise.
+    TPU v6e, and the platform's name otherwise; within `assumed`, the one it
+    names.
     """
+    generation = ASSUMED.get()
+    if generation is not None:
+        return generation
     device = jax.devices()[0]
     capability = _compute_capability() if device.platform == 'gpu' else None
     if capability:
@@ -133,7 +157,9 @@ def triton_runs() -> bool:
     This is the one eligibility rule for those kernels: a GPU of compute
     capability 8.0 or later, the same bound JAX's own Pallas lowerings apply.
     A T4 fails to compile them ("Triton support is only enabled for
-    cc>=8.0").
+    cc>=8.0"). Within `assumed`, the GPU is the assumed generation's.
     """
+    generation = ASSUMED.get()
+    gpu = jax.default_backend() == 'gpu' if generation is None else generation.startswith('sm')
     # JAX's bound is `_backend_supports_triton`.
-    return jax.default_backend() == 'gpu' and bf16_dot_runs()
+    return gpu and bf16_dot_runs()
