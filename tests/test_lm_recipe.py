@@ -96,7 +96,7 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     args = ["--trainer.epochs", "1", "--prompt", "the ", "--max-new-tokens", "4",
             "--trainer.name", "run"]
     if packed:
-        args = ["--data.pack", "first-fit", "--data.packing-bins", "2", *args]
+        args = ["--data.pack", "first-fit", "--data.packing-bins", "2", "--data-read", "memory", *args]
     config = run_config(tokens, *args)
     assert config.data.pack == ('first-fit' if packed else None)
 
@@ -135,7 +135,8 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
     config = LMRunConfig.cli([
         "--data.pack", "first-fit", "--data.source", json.dumps({str(first): 0.7, str(second): 0.3}),
-        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--loading.workers", "0",
+        "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--data-read", "memory",
+        "--loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.steps", "2", "--trainer.name", "mixed", "--max-new-tokens", "0",
@@ -555,7 +556,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     config = LMRunConfig.cli([
         "--data.pack", "first-fit", "--pretrained", str(checkpoint), "--objective", "masked_diffusion",
         "--tokenizer", str(checkpoint), "--data.source", str(directory),
-        "--data.seq-len", "11", "--loading.workers", "0",
+        "--data.seq-len", "11", "--data-read", "memory", "--loading.workers", "0",
         "--model.dtype", "float32", "--model.attention-impl", "xla",
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
