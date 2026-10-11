@@ -232,6 +232,11 @@ class TFDS:
 
         directory = str(self.builder.data_path)
         metadata = Store(directory.rstrip("/") + "/dataset_info.json").read()
+        fs, prefix = Store(directory).resolve()
+        definitions = {}
+        for path in fs.find(prefix):
+            if path.endswith((".json", ".labels.txt")):
+                definitions[path[len(prefix) :].lstrip("/")] = hashlib.sha256(fs.cat_file(path)).hexdigest()
         splits = self.builder.info.splits
         names = (
             tuple(splits)
@@ -259,6 +264,7 @@ class TFDS:
             "split": self.split,
             "directory": directory,
             "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
+            "definitions": definitions,
             "files": files,
             "decoders": _decoder_record(self.decoders),
             "original": self.path,

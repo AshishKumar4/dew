@@ -371,6 +371,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
     def _open(self, path: str, mode: str = "rb", **kwargs):
         if mode != "rb":
             return self.fs.open(path, mode=mode, **kwargs)
+        snapshot = kwargs.pop("source_snapshot", None)
         started = time.monotonic()
         directory = Path(self.storage[-1])
         path = self._strip_protocol(path)
@@ -383,7 +384,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                     interrupted.unlink()
             size = None
             if isinstance(self.fs, DewDataFileSystem):
-                metadata = self.fs.info(path)
+                metadata = self.fs.info(path) if snapshot is None else snapshot
                 version, size = str(metadata["etag"]), int(metadata["size"])
             else:
                 version = self.fs.ukey(path)

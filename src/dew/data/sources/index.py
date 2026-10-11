@@ -9,22 +9,26 @@ from functools import cached_property
 
 import numpy as np
 
-from dew.data.storage import Store
+from dew.data.storage import DewDataFileSystem, Store
 
 
 @dataclass(frozen=True)
 class ArrayIndex:
     url: str
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    metadata: Mapping[str, object] | None = field(default=None, repr=False)
 
     @cached_property
     def pin(self):
         store = Store(self.url, self.storage_options)
         fs, path = store.resolve()
+        snapshot = None
+        if isinstance(fs, DewDataFileSystem) and self.metadata is not None:
+            snapshot = self.metadata
         protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
         if "file" not in protocols:
             fs, path = store.cached().resolve()
-        opened = fs.open(path, "rb")
+        opened = fs.open(path, "rb", source_snapshot=snapshot)
         if not isinstance(opened.name, str):
             opened.close()
             raise ValueError(f"index {self.url} needs a mirror large enough to hold its NumPy file")
@@ -54,4 +58,4 @@ class ArrayIndex:
             pin.close()
 
     def __getstate__(self) -> Mapping[str, object]:
-        return {"url": self.url, "storage_options": self.storage_options}
+        return {"url": self.url, "storage_options": self.storage_options, "metadata": self.metadata}
