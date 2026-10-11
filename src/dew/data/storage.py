@@ -26,7 +26,7 @@ from filelock import FileLock
 from fsspec.implementations.cached import WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from huggingface_hub import HfFileSystem
-from huggingface_hub.hf_file_system import HfFileSystemResolvedPath
+from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
 from dew.records import JSON, json_value
@@ -96,7 +96,7 @@ class DewDataFileSystem(AbstractFileSystem):
 
     A deployment exposes one bucket, named by the URL's first component.
     The token is resolved on first use from DEW_DATA_TOKEN or its configured
-    file. A Worker has no delete permission; lifecycle rules own expiry.
+    file. Write-token holders can delete objects; lifecycle rules expire abandoned smokes.
     """
 
     protocol = ("dewdata", "r2")
@@ -129,7 +129,11 @@ class DewDataFileSystem(AbstractFileSystem):
         bucket, _, key = stripped.partition("/")
         if bucket != self.bucket:
             raise ValueError(f"dew-data profile serves bucket {self.bucket!r}, not {bucket!r}")
-        if key and (len(key) > 512 or not re.fullmatch(r"[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*", key)):
+        if key and (
+            len(key) > 512
+            or not re.fullmatch(r"[A-Za-z0-9._=-]+(?:/[A-Za-z0-9._=-]+)*", key)
+            or ".." in key.split("/")
+        ):
             raise ValueError(f"invalid dew-data object key {key!r}")
         return key
 
@@ -168,9 +172,15 @@ class DewDataFileSystem(AbstractFileSystem):
             raise OSError(f"dew-data {method} {path}: HTTP {error.code}") from error
 
     def info(self, path: str, **kwargs) -> dict[str, str | int]:
-        if not self._key(path):
+        key = self._key(path)
+        if not key:
             return {"name": self.bucket, "size": 0, "type": "directory"}
-        _, headers = self._request("HEAD", path)
+        try:
+            _, headers = self._request("HEAD", path)
+        except FileNotFoundError:
+            if next(self._keys(key.rstrip("/") + "/"), None) is None:
+                raise
+            return {"name": self._strip_protocol(path), "size": 0, "type": "directory"}
         normalized = {key.lower(): value for key, value in headers.items()}
         return {
             "name": self._strip_protocol(path),
@@ -179,27 +189,33 @@ class DewDataFileSystem(AbstractFileSystem):
             "etag": normalized["etag"],
         }
 
-    def ls(self, path: str, detail: bool = True, **kwargs):
-        prefix = self._key(path.rstrip("/"))
+    def _keys(self, prefix: str) -> Iterator[str]:
         cursor = ""
-        entries: dict[str, dict[str, str | int]] = {}
         while True:
             query = "?" + urllib.parse.urlencode({"list": prefix, "cursor": cursor})
             body, _ = self._request("GET", self.bucket, query=query)
             page = json.loads(body)
             for suffix in page["keys"]:
-                key = prefix + suffix
-                tail = key[len(prefix) :].lstrip("/")
-                first, slash, _ = tail.partition("/")
-                name = f"{self.bucket}/{prefix.rstrip('/') + '/' if prefix else ''}{first}"
-                entries[name] = (
-                    {"name": name, "type": "directory", "size": 0}
-                    if slash
-                    else self.info(f"{self.bucket}/{key}")
-                )
+                yield prefix + suffix
             if page["cursor"] is None:
                 break
             cursor = page["cursor"]
+
+    def ls(self, path: str, detail: bool = True, **kwargs):
+        prefix = self._key(path.rstrip("/"))
+        prefix = prefix.rstrip("/") + "/" if prefix else ""
+        entries: dict[str, dict[str, str | int]] = {}
+        for key in self._keys(prefix):
+            tail = key[len(prefix) :]
+            first, slash, _ = tail.partition("/")
+            name = f"{self.bucket}/{prefix}{first}"
+            entries[name] = (
+                {"name": name, "type": "directory", "size": 0}
+                if slash
+                else self.info(name)
+                if detail
+                else {"name": name, "type": "file", "size": 0}
+            )
         found = sorted(entries.values(), key=lambda entry: str(entry["name"]))
         return found if detail else [entry["name"] for entry in found]
 
@@ -325,6 +341,8 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                             return self.fs.open(path, mode=mode, **kwargs)
                         self.pop_from_cache(path)
                 size = self.fs.size(path)
+                if not isinstance(size, int):
+                    raise ValueError(f"dewcache source {path!r} does not declare its byte size")
                 if not self._dew_room(size):
                     return self.fs.open(path, mode=mode, **kwargs)
                 self._dew_downloaded += size
@@ -363,6 +381,13 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 used -= size
         self.save_cache()
         return used + needed <= self._dew_max_bytes
+
+    def cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs) -> bytes:
+        with self._open(path, "rb") as file:
+            if start is not None:
+                file.seek(start, 2 if start < 0 else 0)
+            size = -1 if end is None else max(0, end - file.tell())
+            return file.read(size)
 
 
 _MEMORY_LOCK = threading.RLock()
@@ -476,7 +501,7 @@ class Store:
         if not isinstance(fs, HfFileSystem):
             raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
-        if not isinstance(resolved, HfFileSystemResolvedPath):
+        if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
             raise ValueError(f"conditional HF publication needs a repository object URL: {self.url}")
         from huggingface_hub import HfApi
 
@@ -556,7 +581,7 @@ class Store:
         if not isinstance(fs, HfFileSystem):
             raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
-        if not isinstance(resolved, HfFileSystemResolvedPath):
+        if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
             raise ValueError(f"conditional HF publication needs a repository object URL: {self.url}")
         api = HfApi(token=fs.token)
         parent = (

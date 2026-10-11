@@ -21,7 +21,7 @@ from dew.data.dataset import Batch
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
-from dew.data.storage import Store
+from dew.data.storage import ObjectRef, Store
 
 if TYPE_CHECKING:
     from dew.data.pipeline import Pipeline
@@ -47,13 +47,13 @@ def _hub_export(
     values, url: str, *, format, rows_per_shard, partitioning, storage_options, metadata, length_field
 ) -> Mapping[str, object]:
     from huggingface_hub import CommitOperationAdd, HfApi, HfFileSystem
-    from huggingface_hub.hf_file_system import HfFileSystemResolvedPath
+    from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 
     fs, path = Store(url, storage_options).resolve()
     if not isinstance(fs, HfFileSystem):
         raise ValueError(f"HF export URL did not resolve to HfFileSystem: {url}")
     resolved = fs.resolve_path(path)
-    if not isinstance(resolved, HfFileSystemResolvedPath):
+    if not isinstance(resolved, HfFileSystemResolvedRepositoryPath):
         raise ValueError(f"HF export needs a repository URL, not a bucket URL: {url}")
     api = HfApi(token=fs.token)
     parent = api.repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha
@@ -87,6 +87,56 @@ def _hub_export(
             commit_message="Publish data export",
         )
         return manifest
+
+
+def _length_index(root: Store, writer: str, number: int, batch, field: str | None) -> ObjectRef | None:
+    if field is None:
+        return None
+    lengths = []
+    for row in batch:
+        if not isinstance(row, Mapping) or field not in row:
+            raise ValueError(f"export row is missing length_field={field!r}")
+        lengths.append(len(row[field]))
+    encoded = io.BytesIO()
+    np.save(encoded, np.asarray(lengths, np.int64), allow_pickle=False)
+    path = f"shards/{writer}/part-{number:06d}.lengths.npy"
+    return {"path": path, **root.child(path).verified(encoded.getvalue())}
+
+
+def _array_shard(root: Store, writer: str, number: int, batch, index: ObjectRef | None):
+    with tempfile.TemporaryDirectory(prefix="dew-export-") as temporary:
+        path = Path(temporary) / "part.array_record"
+        record_writer = ArrayRecordWriter(str(path), "group_size:1")
+        try:
+            for row in batch:
+                record_writer.write(encode(row))
+        finally:
+            record_writer.close()
+        relative = f"shards/{writer}/part-{number:06d}.array_record"
+        return {
+            "path": relative,
+            "rows": len(batch),
+            "lengths": index,
+            **root.child(relative).verified(path.read_bytes()),
+        }
+
+
+def _parquet_shard(target: Store, number: int, batch, partitioning: tuple[str, ...] | None) -> None:
+    if any(not isinstance(row, Mapping) for row in batch):
+        raise TypeError("Parquet export takes records with named fields")
+    table = pa.Table.from_pylist(batch)
+    fs, directory = target.resolve()
+    fs.makedirs(directory, exist_ok=True)
+    ds.write_dataset(
+        table,
+        directory,
+        format="parquet",
+        filesystem=_arrow_filesystem(fs),
+        partitioning=list(partitioning) if partitioning is not None else None,
+        partitioning_flavor="hive" if partitioning is not None else None,
+        basename_template=f"part-{number:06d}-{{i}}.parquet",
+        existing_data_behavior="overwrite_or_ignore",
+    )
 
 
 def export(
@@ -139,52 +189,11 @@ def export(
     try:
         for number, batch in enumerate(_chunks(rows, rows_per_shard)):
             count += len(batch)
-            lengths = []
-            if length_field is not None:
-                for row in batch:
-                    if not isinstance(row, Mapping) or length_field not in row:
-                        raise ValueError(f"export row is missing length_field={length_field!r}")
-                    lengths.append(len(row[length_field]))
-            index = None
-            if lengths:
-                encoded = io.BytesIO()
-                np.save(encoded, np.asarray(lengths, np.int64), allow_pickle=False)
-                index_path = f"shards/{writer}/part-{number:06d}.lengths.npy"
-                index = {"path": index_path, **root.child(index_path).verified(encoded.getvalue())}
+            index = _length_index(root, writer, number, batch, length_field)
             if format == "array_record":
-                with tempfile.TemporaryDirectory(prefix="dew-export-") as temporary:
-                    path = Path(temporary) / "part.array_record"
-                    record_writer = ArrayRecordWriter(str(path), "group_size:1")
-                    try:
-                        for row in batch:
-                            record_writer.write(encode(row))
-                    finally:
-                        record_writer.close()
-                    relative = f"shards/{writer}/part-{number:06d}.array_record"
-                    files.append(
-                        {
-                            "path": relative,
-                            "rows": len(batch),
-                            "lengths": index,
-                            **root.child(relative).verified(path.read_bytes()),
-                        }
-                    )
+                files.append(_array_shard(root, writer, number, batch, index))
             else:
-                if any(not isinstance(row, Mapping) for row in batch):
-                    raise TypeError("Parquet export takes records with named fields")
-                table = pa.Table.from_pylist(batch)
-                fs, directory = target.resolve()
-                fs.makedirs(directory, exist_ok=True)
-                ds.write_dataset(
-                    table,
-                    directory,
-                    format="parquet",
-                    filesystem=_arrow_filesystem(fs),
-                    partitioning=list(partitioning) if partitioning is not None else None,
-                    partitioning_flavor="hive" if partitioning is not None else None,
-                    basename_template=f"part-{number:06d}-{{i}}.parquet",
-                    existing_data_behavior="overwrite_or_ignore",
-                )
+                _parquet_shard(target, number, batch, partitioning)
         if format == "parquet":
             fs, directory = target.resolve()
             for path in sorted(fs.find(directory)) if fs.exists(directory) else []:
