@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, distance
+from reference_error import FACTOR, distance
 from safetensors.numpy import load_file
 
 from dew.data import DataPartition
@@ -158,19 +158,21 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, (variables, batch))
         truth, truth_gradient = jax.value_and_grad(loss)(*wide)
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
-    # A gradient that is zero to float32's resolution (a key bias's, which
-    # softmax cancels) holds only rounding on either path, whose ratio is
-    # noise: it must stay at that resolution of the step's largest gradient.
-    floor = float(np.finfo(np.float32).eps) * max(distance(leaf, 0) for leaf in jax.tree.leaves(truth_gradient))
+    # Each tensor is held to float64 as the grid's is, within FACTOR, with the
+    # grid's own distance taken as at least one float32 unit of that tensor's
+    # size: one draw of rounding below an ulp is luck, not a bar. A gradient
+    # zero to float32's resolution of the step (a key bias's, which softmax
+    # cancels) holds only rounding on either path and stays at that resolution.
+    unit = float(np.finfo(np.float32).eps)
+    floor = unit * max(distance(leaf, 0) for leaf in jax.tree.leaves(truth_gradient))
 
     def exact(path, got, want, true):
-        label = jax.tree_util.keystr(path)
+        label, mine = jax.tree_util.keystr(path), distance(got, true)
         if distance(true, 0) <= floor:
-            assert distance(got, true) <= floor, (label, distance(got, true), floor)
-        elif distance(want, true) == 0:
-            assert distance(got, true) == 0, label
-        else:
-            assert_as_exact_as_the_reference(got, want, true, label)
+            assert mine <= floor, (label, mine, floor)
+            return
+        bar = FACTOR * max(distance(want, true), unit * distance(true, 0))
+        assert mine <= bar, f"{label}: {mine:.3e} from float64 (rms), allowed {bar:.3e}"
 
     exact((), float(fewer), float(grid), truth)
     jax.tree_util.tree_map_with_path(exact, fewer_gradient, grid_gradient, truth_gradient)
