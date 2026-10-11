@@ -206,6 +206,15 @@ class Driver:
                 )
                 time.sleep(delay)
 
+    def collect_action(self, operation, *args) -> None:
+        try:
+            operation(*args)
+        except (OSError, ValueError, RuntimeError) as error:
+            if isinstance(error, TransportError):
+                raise
+            self.record(collection_error=type(error).__name__, collection_needs_attention=True)
+            raise TransportError("artifact collection failed; workload liveness is independent") from error
+
     def poll_once(self, endpoint: str, remote: str, plan: dict, collected: set, synced: dict) -> bool:
         progress: dict
         try:
@@ -226,22 +235,10 @@ class Driver:
             if index in collected:
                 continue
             if status.get("artifact_manifest"):
-                try:
-                    self.collect(session, remote, plan, job, status)
-                except (OSError, ValueError, RuntimeError) as error:
-                    if isinstance(error, TransportError):
-                        raise
-                    self.record(collection_error=type(error).__name__, collection_needs_attention=True)
-                    raise TransportError("local artifact collection failed; workload liveness is independent") from error
+                self.collect_action(self.collect, session, remote, plan, job, status)
                 collected.add(index)
             elif status and time.monotonic() - synced.get(index, 0) >= 600:
-                try:
-                    self.sync(session, remote, job)
-                except (OSError, ValueError, RuntimeError) as error:
-                    if isinstance(error, TransportError):
-                        raise
-                    self.record(collection_error=type(error).__name__, collection_needs_attention=True)
-                    raise TransportError("local snapshot collection failed; workload liveness is independent") from error
+                self.collect_action(self.sync, session, remote, job)
                 synced[index] = time.monotonic()
         if progress.get("phase") in ("done", "failed"):
             self.preamble(session, remote, plan, progress)
