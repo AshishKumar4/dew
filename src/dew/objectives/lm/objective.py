@@ -867,6 +867,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         self.head_tile = chunked_tile() if tile is None else tile
         return f"the head tiled {self.head_tile}"
 
+    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
+        self.head_tile = tile
+
     def _hidden_states(self, params, inputs, train, rngs, collections: list[str],
                        packing: dict[str, jax.Array | Mapping[str, jax.Array]],
                        layers: Sequence[int] = ()):
