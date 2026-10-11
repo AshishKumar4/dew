@@ -6,6 +6,7 @@ import bisect
 import csv
 import hashlib
 import io
+import itertools
 import json
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -475,9 +476,7 @@ class Files:
                 return tuple(len(table) for table in indexed.tables), remote
             shards = indexed.tables[0]["shard"]
             boundaries = [bisect.bisect_left(shards, shard) for shard in range(len(self.paths) + 1)]
-            return tuple(
-                right - left for left, right in zip(boundaries, boundaries[1:], strict=False)
-            ), remote
+            return tuple(right - left for left, right in itertools.pairwise(boundaries)), remote
         if self.kind == "array_record" and self.committed is not None:
             return self._declared_rows() or (), remote
         if self.kind == "files":
