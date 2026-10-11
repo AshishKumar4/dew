@@ -33,7 +33,7 @@ class Driver:
             self.state.update(fields, heartbeat=time.time())
             save(self.run_dir / "driver.json", self.state)
 
-    def control(self, session: Session, script: str, timeout: int = 300) -> str:
+    def control(self, session: Session, script: str, timeout: int = 300, *, live_read: bool = False) -> str:
         runtime = self.client.kernel(session)
         self.record(action="control", action_deadline=time.time() + timeout + 30)
         try:
@@ -43,6 +43,8 @@ class Driver:
                 raise TransportError(type(error).__name__) from error
             errors = [item for item in outputs if item.get("output_type") == "error"]
             if errors:
+                if live_read and all(item.get("ename") in ("FileNotFoundError", "NotADirectoryError") for item in errors):
+                    raise TransportError("live output changed during snapshot; re-list on next cycle")
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)
         finally:
@@ -141,7 +143,7 @@ class Driver:
             f"excludes={job.get('artifact_excludes', [])!r})\n"
             "print('SYNC',json.dumps([manifest,count]))\n"
         )
-        output = self.control(session, script, timeout=600)
+        output = self.control(session, script, timeout=600, live_read=True)
         row = next(line[5:] for line in output.splitlines() if line.startswith("SYNC "))
         current, changed = json.loads(row)
         if changed:
