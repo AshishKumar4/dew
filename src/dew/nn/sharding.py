@@ -253,7 +253,7 @@ class Link:
     name."""
     flops_per_second: float | None
     """One device's dense bf16 peak in FLOPs per second, or None for hardware
-    the peak table does not name (`dew.telemetry.instrumentation.peak_flops`)."""
+    Dew's target table does not name (`dew.nn.kernels.gpu_target(...).bf16_peak`)."""
     platform: str
     spread: bool = False
 

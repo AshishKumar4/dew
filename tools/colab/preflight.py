@@ -27,10 +27,14 @@ import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
+from dew.nn.kernels.generation import TARGETS
 from tools.colab.common import REPO, VENV_PYTHON, git
 from tools.python_uses import dotted, uses
 
-ARCH = {"gpu:T4": "7.5", "gpu:L4": "8.9", "gpu:A100": "8.0", "gpu:G4": "12.0"}
+# Each lab GPU's compute capability, from Dew's target table: sm89 is "8.9", sm120 "12.0".
+ARCH = {alias.upper().replace("GPU:", "gpu:"): f"{int(target.generation[2:-1])}.{target.generation[-1]}"
+        for target in TARGETS.values() if target.generation.startswith("sm")
+        for alias in target.aliases if alias.startswith("gpu:")}
 # The VM's interpreters: Colab's /usr/bin/python3 (c56's tracebacks, /usr/local/lib/python3.13), and
 # the job's venv, which `python` and `pip` name (colab_batch_vm).
 INTERPRETERS = {"system": "3.13", "venv": VENV_PYTHON}
@@ -803,18 +807,21 @@ def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: Seque
         from dew.nn.kernels.generation import gpu_target
         named = [f"explicit at {site}" for site in explicit]
         return lab_record(tree, hardware, gpu_target(hardware).generation, named, failures, config)
-    choices = subprocess.run(
-        [sys.executable, "-c", "import json; from dew.nn.kernels.generation import gpu_target; "
-         f"t=gpu_target({hardware!r}); print(json.dumps(dict(generation=t.generation, kernels=t.kernels)))"],
-        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(tree / "src")}, cwd=tree,
-        timeout=300)
-    if choices.returncode:
-        failures.append(f"cannot read the ref's GPU target: {choices.stderr[-300:]}")
-        return {}
-    from dew.nn.kernels.generation import PALLAS_CHOICES
+    from dew.nn.kernels.generation import PALLAS_CHOICES, gpu_target
 
-    target = json.loads(choices.stdout)
-    generation = target['generation']
+    # The ref's own kernel row for this tool's generation of `hardware`: a target table's, or an
+    # older ref's `KERNELS` mapping of choice to {generation: kernel}.
+    generation = gpu_target(hardware).generation
+    read = ("import json, dew.nn.kernels.generation as g\n"
+            f"rows = {{c: r.get({generation!r}) for c, r in g.KERNELS.items()}} if hasattr(g, 'KERNELS') "
+            f"else dict(g.gpu_target({generation!r}).kernels)\n"
+            "print(json.dumps({c: k for c, k in rows.items() if k}))")
+    choices = subprocess.run([sys.executable, "-c", read], capture_output=True, text=True,
+                             env={**os.environ, "PYTHONPATH": str(tree / "src")}, cwd=tree, timeout=300)
+    if choices.returncode:
+        failures.append(f"cannot read the ref's kernel row: {choices.stderr[-300:]}")
+        return {}
+    target = {"kernels": json.loads(choices.stdout)}
     named = sorted(f"{choice}={kernel}" for choice, kernel in target['kernels'].items()
                    if kernel in PALLAS_CHOICES)
     named += [f"explicit at {site}" for site in explicit]
