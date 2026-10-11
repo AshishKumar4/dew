@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import grain.python as grain
@@ -11,7 +11,7 @@ import numpy as np
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
-from dew.data.text import tokenizer_for
+from dew.data.text import tokenizer_for, tokenizer_snapshot
 
 
 @dataclasses.dataclass(frozen=True)
@@ -19,6 +19,9 @@ class Tokenize(grain.MapTransform):
     tokenizer: str = "byte"
     field: str = "text"
     eos: bool = False
+
+    def dependencies(self) -> Mapping[str, object]:
+        return tokenizer_snapshot(self.tokenizer)
 
     def map(self, element: Batch) -> Batch:
         value = element[self.field]
@@ -30,7 +33,7 @@ class Tokenize(grain.MapTransform):
             if tokenizer.eos_id is None:
                 raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
             ids.append(tokenizer.eos_id)
-        return {"text": np.asarray(ids, np.int32)}
+        return {"text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -49,8 +52,10 @@ class LengthPolicy(grain.MapTransform):
         if self.long == "drop":
             return Rejected("over_length")
         span = slice(count - self.length, None) if self.side == "left" else slice(self.length)
-        return {key: value[span] if key in (self.field, *self.aligned) else value
-                for key, value in element.items()}
+        return {
+            key: value[span] if key in (self.field, *self.aligned) else value
+            for key, value in element.items()
+        } | {"_dew_truncated": True, "_dew_length": self.length}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,8 +65,13 @@ class Chunks:
 
     def flat_map(self, element: Batch) -> Sequence[Batch]:
         count = len(element[self.fields[0]])
-        return tuple({key: value[start:start + self.length] if key in self.fields else value
-                      for key, value in element.items()} for start in range(0, count, self.length))
+        return tuple(
+            {
+                key: value[start : start + self.length] if key in self.fields else value
+                for key, value in element.items()
+            }
+            for start in range(0, count, self.length)
+        )
 
 
 @dataclasses.dataclass(frozen=True)

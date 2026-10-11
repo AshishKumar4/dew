@@ -43,6 +43,9 @@ from dew.records import JSON
 
 if TYPE_CHECKING:
     from flax import linen as nn
+
+    from dew.data.pipeline import ObjectiveData
+    from dew.data.text import Tokenizer
     from jax.typing import DTypeLike
 
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
@@ -424,7 +427,8 @@ def _ruled_jvp(primals, tangents):
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
-    def data(self, tokenizer=None, metadata: Mapping[str, object] | None = None):
+    def data(self, tokenizer: Tokenizer | None = None,
+             metadata: Mapping[str, object] | None = None) -> ObjectiveData:
         """Record and host-batch steps for the training and evaluation branches."""
         from dew.data.pipeline import ObjectiveData
 

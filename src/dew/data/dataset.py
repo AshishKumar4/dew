@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from torch.utils.data import Dataset as TorchDataset
 
     from dew.data.plan import Plan
+    from dew.data.mix import CorpusCounts
 
 
 # grain's worker processes read absl flags; a script that never runs absl.app
@@ -193,7 +194,7 @@ class Records(Protocol):
 
     def __len__(self) -> int: ...
 
-    def __getitem__(self, index: int) -> Batch | bytes | None: ...
+    def __getitem__(self, index: int, /) -> Batch | bytes | None: ...
 
 
 type Indexed = Records | Sequence[Batch]
@@ -638,6 +639,8 @@ class Dataset:
     batch: int
     ramp: Ramp | None = None
     held_out: int = 0
+    counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
+    plan: Plan | None = None
 
     @classmethod
     def from_grain(cls, train: GrainPipeline, *, batch: int,
@@ -1476,15 +1479,18 @@ class GlobalStream:
 
     def __init__(self, open_at: Callable[[int], pygrain.DatasetIterator[Batch]],
                  batch: int, order: str, loading: Loading, content: Callable[[], str] | None = None,
-                 *, plan: Plan | None = None, resume: Literal["exact", "non-exact"] = "exact"):
+                 *, plan: Plan | None = None, resume: Literal["exact", "non-exact"] = "exact",
+                 endless: bool = True):
         self._open = open_at
+        self.endless = endless
         self._batch = batch
         self._order = order
         self._content = content
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
-        self._plan, self._resume = plan, resume
+        self._plan = plan
+        self._resume: Literal["exact", "non-exact"] = resume
         self.manifest_changes: tuple[str, ...] = ()
         self.stop_seconds = loading.stop_seconds
 

@@ -1,5 +1,6 @@
 """Labelled requests: what a decision model trains and calibrates on."""
 
+import functools
 import json
 import random
 from collections.abc import Mapping, Sequence
@@ -10,6 +11,8 @@ import numpy as np
 
 from dew import records
 from dew.data.dataset import Dataset, DatasetSpec, Tokenize
+from dew.data.pipeline import HostStep, Pipeline
+from dew.data.sources.base import Read, ShardManifest, Source
 from dew.data.sources.hf import HFDatasetSource, HFOptions
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
@@ -43,8 +46,10 @@ class Example:
         for name, target in self.targets.items():
             count = len(self.questions[name].options)
             if len(target) != count or min(target) < 0 or abs(sum(target) - 1) > 1e-3:
-                raise ValueError(f"targets.{name} is a distribution over the question's {count} options, "
-                                 f"got {list(target)}")
+                raise ValueError(
+                    f"targets.{name} is a distribution over the question's {count} options, "
+                    f"got {list(target)}"
+                )
 
     @classmethod
     def of(cls, row: "Example | Mapping[str, object]") -> "Example":
@@ -56,8 +61,11 @@ class Example:
             return row
         questions = {}
         for name, question in record(row.get("questions"), "questions").items():
-            questions[name] = (question if isinstance(question, Question)
-                               else Question.from_wire(record(question, f"questions.{name}")))
+            questions[name] = (
+                question
+                if isinstance(question, Question)
+                else Question.from_wire(record(question, f"questions.{name}"))
+            )
         answers = {}
         for name, label in record(row.get("answers", {}), "answers").items():
             if isinstance(label, bool) or not isinstance(label, (str, int)):
@@ -125,8 +133,9 @@ class DecisionMixture:
         stated = {name: records.number(weight, f"weights.{name}") for name, weight in recorded.items()}
         shares = {name: float(weight) for name, weight in (stated | self.weights).items() if weight > 0}
         if not shares:
-            raise ValueError(f"no set has a weight: give --mixture.weights, or write "
-                             f"{self.root}/mixture.json")
+            raise ValueError(
+                f"no set has a weight: give --mixture.weights, or write {self.root}/mixture.json"
+            )
         return shares
 
     def read(self) -> tuple[dict[str, Weighted], list[Example]]:
@@ -197,8 +206,10 @@ class DecisionTable(DatasetSpec):
     """The Hub dataset's commit."""
 
     def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        raise TypeError("a decision table is laid out by its objective's tokenizer: "
-                        "DecisionObjective.dataset(table, batch=...)")
+        raise TypeError(
+            "a decision table is laid out by its objective's tokenizer: "
+            "DecisionObjective.dataset(table, batch=...)"
+        )
 
     def examples(self) -> tuple[list[Example], list[Example]]:
         """Return the training examples and the held-out ones."""
@@ -210,8 +221,10 @@ class DecisionTable(DatasetSpec):
         random.Random(self.seed).shuffle(order)
         count = min(self.held_out_most, int(len(examples) * self.held_out))
         held = set(order[:count])
-        return ([example for index, example in enumerate(examples) if index not in held],
-                [example for index, example in enumerate(examples) if index in held])
+        return (
+            [example for index, example in enumerate(examples) if index not in held],
+            [example for index, example in enumerate(examples) if index in held],
+        )
 
     def _rows(self, split: str) -> HFDatasetSource:
         suffix = Path(self.path).suffix.lower()
@@ -227,11 +240,20 @@ class DecisionTable(DatasetSpec):
         missing = {self.text, self.label} - set(source.columns)
         if missing:
             raise ValueError(f"{self.path} has no column {sorted(missing)}; its columns are {source.columns}")
-        names = self.options or _class_names(source, self.label) or tuple(
-            dict.fromkeys(str(row[self.label]) for row in rows))
+        names = (
+            self.options
+            or _class_names(source, self.label)
+            or tuple(dict.fromkeys(str(row[self.label]) for row in rows))
+        )
         question = Choice(self.instructions, list(names))
-        return [Example(json_value(row[self.text], self.text), {self.question: question},
-                        {self.question: _label(row[self.label])}) for row in rows]
+        return [
+            Example(
+                json_value(row[self.text], self.text),
+                {self.question: question},
+                {self.question: _label(row[self.label])},
+            )
+            for row in rows
+        ]
 
 
 def _class_names(source: HFDatasetSource, column: str) -> tuple[str, ...]:
@@ -249,3 +271,192 @@ def _label(value: str | int | float | bool) -> str | int:
             return str(value)
         case _:
             return value
+
+
+@dataclass(frozen=True)
+class ParseExample:
+    def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
+        return {"example": Example.of(row)}
+
+
+@dataclass(frozen=True)
+class ParseTable:
+    options: tuple[str, ...]
+    text: str = "text"
+    label: str = "label"
+    question: str = "label"
+    instructions: str = "Classify the input into the correct category."
+
+    def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
+        if "state" in row and "questions" in row:
+            return ParseExample()(row)
+        label = row[self.label]
+        if not isinstance(label, (str, int, float, bool)):
+            raise ValueError(f"decision label {self.label} must name an option")
+        question = Choice(self.instructions, list(self.options))
+        return {
+            "example": Example(
+                json_value(row[self.text], self.text),
+                {self.question: question},
+                {self.question: _label(label)},
+            )
+        }
+
+
+@dataclass(frozen=True)
+class _DecisionSource:
+    source: Source
+    slots: Mapping[str, int] | None = None
+
+    def describe(self) -> str:
+        return self.source.describe()
+
+    def snapshot(self) -> Mapping[str, object]:
+        return self.source.snapshot()
+
+    def supports(self, read: Read) -> bool:
+        return self.source.supports(read)
+
+    def records(self, read: Read):
+        records = self.source.records(read)
+        if read == "memory" and self.slots is None:
+            self._memory_slots(records)
+        return records
+
+    @functools.cached_property
+    def _facts(self) -> dict[str, int]:
+        return dict(self.slots or {})
+
+    def _memory_slots(self, rows) -> None:
+        for index in range(len(rows)):
+            row = rows[index]
+            if row is None:
+                continue
+            example = row.get("example")
+            example = Example.of(row) if example is None else Example.of(example)
+            self._facts["questions"] = max(self._facts.get("questions", 0), len(example.questions))
+            self._facts["options"] = max(
+                self._facts.get("options", 0),
+                max((len(question.options) for question in example.questions.values()), default=0),
+            )
+
+    def metadata(self) -> Mapping[str, object]:
+        stated = self.source.metadata()
+        return {**stated, "slots": self._facts} if self._facts else stated
+
+    def lengths(self) -> np.ndarray | None:
+        return self.source.lengths()
+
+    def manifest(self) -> ShardManifest:
+        return self.source.manifest()
+
+
+@dataclass(frozen=True)
+class Decisions:
+    """Decision rows and their corpus shares, with layout supplied by the objective."""
+
+    source: str | Source | Sequence[Example | Mapping[str, object]] = "tickets.csv"
+    validation: str | Source | Sequence[Example | Mapping[str, object]] | None = None
+    weights: Mapping[str, float] = field(default_factory=dict)
+    options: tuple[str, ...] = ()
+    text: str = "text"
+    label: str = "label"
+    question: str = "label"
+    instructions: str = "Classify the input into the correct category."
+    split: str = "train"
+
+    def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
+        from dew.data.sources import Files, Memory, source
+        from dew.data.sources.concatenate import Concatenate
+        from dew.data.storage import Store
+
+        if isinstance(self.source, str):
+            root = Store(self.source)
+            fs, path = root.resolve()
+            mixture = path.rstrip("/") + "/mixture.json"
+            if fs.exists(mixture):
+                with fs.open(mixture, "rb") as handle:
+                    stated = record(json.load(handle), "mixture.json")
+                shares = {
+                    name: records.number(value, f"weights.{name}")
+                    for name, value in record(stated.get("weights", {}), "weights").items()
+                } | dict(self.weights)
+                slots = {
+                    name: records.integer(value, f"slots.{name}")
+                    for name, value in record(stated.get("slots", {}), "slots").items()
+                }
+                files = record(stated.get("files", {}), "mixture files")
+                training, held, weights = [], [], []
+                for name, weight in sorted(shares.items()):
+                    if weight <= 0:
+                        continue
+                    corpus = record(files.get(name, {}), f"files.{name}")
+                    for split, destination in (("train", training), ("held", held)):
+                        entry = record(corpus.get(split, {}), f"files.{name}.{split}")
+                        shards = entry.get("shards")
+                        if isinstance(shards, list):
+                            paths = tuple(
+                                self.source.rstrip("/")
+                                + "/"
+                                + records.text(record(shard, "shard")["path"], "shard.path")
+                                for shard in shards
+                            )
+                        else:
+                            url = (
+                                self.source.rstrip("/") + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
+                            )
+                            shard_fs, shard_path = Store(url).resolve()
+                            paths = (url,) if shard_fs.exists(shard_path) else ()
+                        if paths:
+                            index = record(entry.get("index", {}), "index").get("path")
+                            source_index = (
+                                None
+                                if index is None
+                                else self.source.rstrip("/") + "/" + records.text(index, "index.path")
+                            )
+                            dataset = _DecisionSource(
+                                Files(paths, format="jsonl", index=source_index), slots or None
+                            )
+                            destination.append(Pipeline(dataset, name=name).map(ParseExample()))
+                    weights.append(weight)
+                if not training:
+                    raise ValueError(f"no corpus of {self.source} has a positive weight")
+                train = training[0] if len(training) == 1 else training[0].mix(*training[1:], weights=weights)
+                evaluated = (
+                    None
+                    if not held
+                    else Pipeline(
+                        _DecisionSource(
+                            Concatenate(
+                                tuple(child.source for child in held if isinstance(child.source, Source))
+                            ),
+                            slots or None,
+                        )
+                    ).map(ParseExample())
+                )
+                return train, evaluated, ()
+        if isinstance(self.source, Sequence) and not isinstance(self.source, str):
+            rows = tuple({"example": Example.of(row)} for row in self.source)
+            dataset = _DecisionSource(Memory(rows))
+            dataset._memory_slots(rows)
+            train = Pipeline(dataset)
+        else:
+            dataset = _DecisionSource(
+                source(self.source, split=self.split),
+                {"questions": 1, "options": len(self.options)} if self.options else None,
+            )
+            train = Pipeline(dataset).map(
+                ParseTable(self.options, self.text, self.label, self.question, self.instructions)
+                if self.options
+                else ParseExample()
+            )
+        if self.validation is None:
+            evaluated = None
+        elif isinstance(self.validation, Sequence) and not isinstance(self.validation, str):
+            rows = tuple({"example": Example.of(row)} for row in self.validation)
+            held_source = _DecisionSource(Memory(rows))
+            held_source._memory_slots(rows)
+            evaluated = Pipeline(held_source)
+        else:
+            evaluated = Pipeline(_DecisionSource(source(self.validation))).map(ParseExample())
+        return train, evaluated, ()
