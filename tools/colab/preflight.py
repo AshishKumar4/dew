@@ -663,6 +663,7 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     arch = ARCH[args.hardware]
     commit, tree = checkout(args.ref, args.origin, work)
     receipt: dict = {"schema": 1, "commit": commit, "hardware": args.hardware, "arch": arch}
+    receipt["preflight"] = git(REPO, "rev-parse", "HEAD")
     receipt.update(python=args.python, command=args.command, inputs={})
     texts: dict[str, str] = {}
     for item in map(Path, args.inputs):
