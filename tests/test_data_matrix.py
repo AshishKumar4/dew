@@ -42,7 +42,7 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, ce
         directory = tmp_path / f"resumed{processes}" / "run"
         shutil.copytree(saved, directory)
         if not elastic and processes != 2:
-            with pytest.raises(AssertionError, match="topology changed"):
+            with pytest.raises(AssertionError, match="cannot be translated to another share"):
                 run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
                          cell=cell, name="matrix", steps=2 * STEPS)
             continue
