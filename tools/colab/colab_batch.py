@@ -9,6 +9,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from tools.colab import colab_sync, preflight
+from tools.colab.profile_analysis import TOOL_REF
 from tools.colab.common import HERE, PART, REPO, STATE, driver_sha, git, lock, name, read, save
 
 QUEUE = STATE / "colab-queue.md"
@@ -192,7 +193,7 @@ def identity(plan: dict) -> dict:
                 "raw_profiles": job.get("raw_profiles", False),
                 "profile_steps": job.get("profile_steps"),
                 "profile_analysis_ref": job.get(
-                    "profile_analysis_ref", "b420100f20856822ae19d7f314a9a22ba24e26df"
+                    "profile_analysis_ref", TOOL_REF
                 ),
                 **{
                     key: job[key]
@@ -225,7 +226,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             raw_profiles=fields.get("raw_profiles", "off") == "on",
             profile_steps=int(fields["profile_steps"]) if fields.get("profile_steps") else None,
             profile_analysis_ref=fields.get(
-                "profile_analysis_ref", "b420100f20856822ae19d7f314a9a22ba24e26df"
+                "profile_analysis_ref", TOOL_REF
             ),
             entry=entry,
             economics={
