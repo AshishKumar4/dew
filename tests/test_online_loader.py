@@ -79,7 +79,8 @@ def test_an_all_rejected_catalog_exhausts_its_search_budget(tmp_path):
 @pytest.mark.parametrize("workers", [0, 2])
 def test_real_workers_fetch_pixels_without_losing_validation_rows(tmp_path, workers):
     prefix = catalog(tmp_path, 13)
-    data = compile(prefix.shuffle(3).repeat().batch(4), validation=prefix.batch(4),
+    data = compile(Pipeline(prefix.source).shuffle(3).repeat().map(*(
+                       stage.step for stage in prefix.stages)).batch(4), validation=prefix.batch(4),
                    read="indexed", loading=Loading(workers=workers, threads=1, read_buffer=2,
                                                    worker_buffer=1))
     assert data.val is not None

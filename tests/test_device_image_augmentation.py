@@ -218,7 +218,7 @@ def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
                                     {"staging_size": 0}, {"backend": "bad"}])
 def test_invalid_augmentation_configuration_is_rejected(options):
     with pytest.raises(ValueError):
-        spec(**options)
+        spec(**options).pipelines()
 
 
 def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_on_alone():
