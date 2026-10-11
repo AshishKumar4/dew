@@ -92,6 +92,9 @@ class _KeepAccepted:
                 reason = "zero_targets"
         if reason is None:
             self.counts.accepted += 1
+            if not isinstance(element, Rejected):
+                self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
+                self.counts.chunks += int(element.get("_dew_chunks", 0))
             self.consecutive, self.started = 0, None
             return True
         self.counts.rejected[reason] += 1

@@ -334,13 +334,16 @@ class Fit(pygrain.MapTransform):
             )
             for row in laid
         )
-        return {"decision": fitted[0]} if self.layout.joint else {"decision_rows": fitted}
+        return ({"decision": fitted[0], "_dew_length": fitted[0].length,
+                 "_dew_truncated": fitted[0].truncated}
+                if self.layout.joint else {"decision_rows": fitted})
 
 
 @dataclass(frozen=True)
 class QuestionRows:
     def flat_map(self, element: Batch) -> Sequence[Batch]:
-        return tuple({"decision": row} for row in element["decision_rows"])
+        return tuple({"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
+                     for row in element["decision_rows"])
 
 
 def _fitted(element: Batch) -> FittedRow:

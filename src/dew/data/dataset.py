@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     from torch.utils.data import Dataset as TorchDataset
 
     from dew.data.plan import Plan
+    from dew.data.mix import CorpusCounts
 
 
 # grain's worker processes read absl flags; a script that never runs absl.app
@@ -638,6 +639,8 @@ class Dataset:
     batch: int
     ramp: Ramp | None = None
     held_out: int = 0
+    counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
+    plan: Plan | None = None
 
     @classmethod
     def from_grain(cls, train: GrainPipeline, *, batch: int,

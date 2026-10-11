@@ -33,7 +33,7 @@ class Tokenize(grain.MapTransform):
             if tokenizer.eos_id is None:
                 raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
             ids.append(tokenizer.eos_id)
-        return {"text": np.asarray(ids, np.int32)}
+        return {"text": np.asarray(ids, np.int32), "_dew_length": len(ids)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -55,7 +55,7 @@ class LengthPolicy(grain.MapTransform):
         return {
             key: value[span] if key in (self.field, *self.aligned) else value
             for key, value in element.items()
-        }
+        } | {"_dew_truncated": True, "_dew_length": self.length}
 
 
 @dataclasses.dataclass(frozen=True)

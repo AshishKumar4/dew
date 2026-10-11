@@ -9,7 +9,7 @@ from typing import Protocol, runtime_checkable
 from dew.data.dataset import Batch
 
 from .base import Read, Shard, ShardManifest, Source
-from .files import Files, Format
+from .files import Files, Format, TokenFiles
 from .hub import Hub
 from .memory import Memory
 from .tfds import TFDS
@@ -33,7 +33,11 @@ def source(value: object, *, format: Format | None = None, split: str | None = N
             repo, _, revision = url.removeprefix("hf://").removeprefix("datasets/").partition("@")
             resolved = Hub(repo=repo, revision=revision or None, split=split or "train")
         else:
-            resolved = Files(url, format=format)
+            from dew.data.storage import Store
+
+            fs, path = Store(url).resolve()
+            token_file = path.rstrip("/") + f"/{split or 'train'}.bin"
+            resolved = TokenFiles(url, split or "train") if format is None and fs.exists(token_file) else Files(url, format=format)
     elif isinstance(value, _ArrowRows):
         resolved = Memory(value.to_pylist())
     elif isinstance(value, (Mapping, Sequence)):
