@@ -29,7 +29,10 @@ class Hub:
     def commit(self) -> str:
         from huggingface_hub import HfApi
 
-        return HfApi().dataset_info(self.repo, revision=self.revision).sha
+        commit = HfApi().dataset_info(self.repo, revision=self.revision).sha
+        if commit is None:
+            raise ValueError(f"HF {self.repo!r} did not resolve to a commit")
+        return commit
 
     @cached_property
     def builder(self):

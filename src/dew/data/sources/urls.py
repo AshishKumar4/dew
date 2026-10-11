@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import http.client
+import logging
 import time
 import urllib.error
 import urllib.request
@@ -12,6 +13,8 @@ from dataclasses import dataclass
 from typing import ClassVar
 
 from dew.data.dataset import Batch
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -35,11 +38,11 @@ class Fetch:
             try:
                 request = urllib.request.Request(url, headers={"User-Agent": "dew-data/1"})
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                    data = response.read(self.max_bytes + 1)
-                if len(data) > self.max_bytes:
+                    payload = response.read(self.max_bytes + 1)
+                if len(payload) > self.max_bytes:
                     return Rejected("too_large")
-                result: Batch = {**record, self.output: data, "content_sha256": hashlib.sha256(data).hexdigest()}
-                return result
+                outcome: Batch = {**record, self.output: payload, "content_sha256": hashlib.sha256(payload).hexdigest()}
+                return outcome
             except urllib.error.HTTPError as error:
                 if error.code in (404, 410):
                     return Rejected(f"http_{error.code}")
@@ -47,8 +50,8 @@ class Fetch:
                     return Rejected(f"http_{error.code}")
             except ValueError:
                 return Rejected("invalid_url")
-            except (OSError, http.client.HTTPException):
-                pass
+            except (OSError, http.client.HTTPException) as error:
+                _log.debug("fetch %s attempt %d failed: %s", url, attempt + 1, error)
             if attempt < self.retries:
                 time.sleep(0.1 * 2**attempt)
         return Rejected("transient", permanent=False)

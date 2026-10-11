@@ -16,7 +16,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections.abc import Buffer, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO, TypedDict
@@ -25,6 +25,10 @@ import fsspec
 from filelock import FileLock
 from fsspec.implementations.cached import WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
+from huggingface_hub import HfFileSystem
+from s3fs import S3FileSystem
+
+from dew.records import JSON, json_value
 
 
 class PreconditionFailed(FileExistsError):
@@ -40,7 +44,7 @@ class ObjectRef(ObjectInfo):
     path: str
 
 
-def _secret(value: object, profile: str) -> object:
+def _secret(value: object, profile: str) -> JSON:
     if isinstance(value, str) and value.startswith("env:"):
         name = value[4:]
         if name not in os.environ:
@@ -52,14 +56,14 @@ def _secret(value: object, profile: str) -> object:
             raise ValueError(f"storage profile {profile!r} needs credential file {path}")
         return path.read_text().strip()
     if isinstance(value, dict):
-        return {key: _secret(item, profile) for key, item in value.items()}
-    return value
+        return {key: _secret(entry, profile) for key, entry in value.items()}
+    return json_value(value, f"storage profile {profile}")
 
 
 def _profile(name: str, base: str, options: Mapping[str, object]) -> None:
     implementation = fsspec.get_filesystem_class(base)
 
-    def initialize(self, **kwargs: object):
+    def initialize(self, **kwargs):
         resolved = {key: _secret(value, name) for key, value in {**options, **kwargs}.items()}
         implementation.__init__(self, **resolved)
 
@@ -82,7 +86,7 @@ class DewDataFileSystem(AbstractFileSystem):
     cachable = False
 
     def __init__(self, *, endpoint_url: str | None = None, token: str | None = None,
-                 token_file: str | None = None, bucket: str = "dew-data", **kwargs: object):
+                 token_file: str | None = None, bucket: str = "dew-data", **kwargs):
         super().__init__(**kwargs)
         config = Path(os.environ.get("DEW_DATA_CONFIG", "~/.config/dew/dew-data.json")).expanduser()
         settings = json.loads(config.read_text()) if config.is_file() else {}
@@ -101,7 +105,7 @@ class DewDataFileSystem(AbstractFileSystem):
             raise ValueError(f"invalid dew-data object key {key!r}")
         return key
 
-    def _request(self, method: str, path: str, *, data: bytes | None = None,
+    def _request(self, method: str, path: str, *, payload: bytes | None = None,
                  headers: Mapping[str, str] | None = None, query: str = "") -> tuple[bytes, dict[str, str]]:
         token = self.token or os.environ.get("DEW_DATA_TOKEN")
         if not token and self.token_file:
@@ -110,7 +114,7 @@ class DewDataFileSystem(AbstractFileSystem):
             raise ValueError("storage profile 'r2' needs DEW_DATA_TOKEN or its configured token_file")
         key = self._key(path)
         request = urllib.request.Request(
-            f"{self.endpoint}/{key}{query}", data=data, method=method,
+            f"{self.endpoint}/{key}{query}", data=payload, method=method,
             headers={"Authorization": f"Bearer {token}", "User-Agent": "dew-data/1", **(headers or {})})
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
@@ -125,7 +129,7 @@ class DewDataFileSystem(AbstractFileSystem):
                 raise PreconditionFailed(path) from error
             raise OSError(f"dew-data {method} {path}: HTTP {error.code}") from error
 
-    def info(self, path: str, **kwargs: object) -> dict[str, str | int]:
+    def info(self, path: str, **kwargs) -> dict[str, str | int]:
         if not self._key(path):
             return {"name": self.bucket, "size": 0, "type": "directory"}
         _, headers = self._request("HEAD", path)
@@ -133,7 +137,7 @@ class DewDataFileSystem(AbstractFileSystem):
         return {"name": self._strip_protocol(path), "type": "file",
                 "size": int(normalized["content-length"]), "etag": normalized["etag"]}
 
-    def ls(self, path: str, detail: bool = True, **kwargs: object):
+    def ls(self, path: str, detail: bool = True, **kwargs):
         prefix = self._key(path.rstrip("/"))
         cursor = ""
         entries: dict[str, dict[str, str | int]] = {}
@@ -155,7 +159,7 @@ class DewDataFileSystem(AbstractFileSystem):
         return found if detail else [entry["name"] for entry in found]
 
     def cat_file(self, path: str, start: int | None = None, end: int | None = None,
-                 **kwargs: object) -> bytes:
+                 **kwargs) -> bytes:
         headers = {}
         if start is not None or end is not None:
             if start is not None and start < 0:
@@ -167,16 +171,16 @@ class DewDataFileSystem(AbstractFileSystem):
         body, _ = self._request("GET", path, headers=headers)
         return body
 
-    def pipe_file(self, path: str, value: bytes, **kwargs: object) -> None:
+    def pipe_file(self, path: str, value: bytes, mode: str = "overwrite", **kwargs) -> None:
         if not 0 < len(value) <= 100_000_000:
             raise ValueError(f"dew-data object {path} must be between 1 byte and 100 MB; write shards")
-        self._request("PUT", path, data=value)
+        self._request("PUT", path, payload=value)
 
     def makedirs(self, path: str, exist_ok: bool = False) -> None:
         self._key(path.rstrip("/"))
 
     def _open(self, path: str, mode: str = "rb", block_size: int | None = None,
-              **kwargs: object):
+              autocommit: bool = True, cache_options: Mapping[str, object] | None = None, **kwargs):
         if mode == "rb":
             return _WorkerReader(self, path, block_size=block_size or 2**20)
         if mode == "wb":
@@ -195,10 +199,10 @@ class _WorkerWriter(io.BytesIO):
         self.filesystem = filesystem
         self.path = path
 
-    def write(self, data: bytes) -> int:
-        if self.tell() + len(data) > 100_000_000:
+    def write(self, payload: Buffer) -> int:
+        if self.tell() + memoryview(payload).nbytes > 100_000_000:
             raise ValueError(f"dew-data object {self.path} exceeds 100 MB; write smaller shards")
-        return super().write(data)
+        return super().write(payload)
 
     def close(self) -> None:
         if not self.closed:
@@ -209,7 +213,7 @@ class _WorkerWriter(io.BytesIO):
 
 
 class _PinnedReader(io.BufferedReader):
-    def __init__(self, raw: BinaryIO, pin: BinaryIO):
+    def __init__(self, raw: io.FileIO, pin: BinaryIO):
         super().__init__(raw)
         self.pin = pin
 
@@ -229,7 +233,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
 
     protocol = "dewcache"
 
-    def __init__(self, *, max_bytes: int = 8 * 2**30, **kwargs: object):
+    def __init__(self, *, max_bytes: int = 8 * 2**30, **kwargs):
         if max_bytes <= 0:
             raise ValueError("dewcache max_bytes must be positive")
         super().__init__(**{"check_files": True, **kwargs})
@@ -246,7 +250,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             return object.__getattribute__(self, name)
         return super().__getattribute__(name)
 
-    def _open(self, path: str, mode: str = "rb", **kwargs: object):
+    def _open(self, path: str, mode: str = "rb", **kwargs):
         if mode != "rb":
             return self.fs.open(path, mode=mode, **kwargs)
         started = time.monotonic()
@@ -277,7 +281,9 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
             os.utime(local, None)
             self._dew_wait += time.monotonic() - started
-            return _PinnedReader(opened, pin)
+            raw = io.FileIO(local, "r")
+            opened.close()
+            return _PinnedReader(raw, pin)
 
     def _dew_room(self, needed: int) -> bool:
         if needed > self._dew_max_bytes:
@@ -330,18 +336,25 @@ class Store:
         fs, path = self.resolve()
         return fs.cat_file(path)
 
-    def write(self, data: bytes) -> None:
+    def size(self) -> int:
+        fs, path = self.resolve()
+        size = fs.size(path)
+        if not isinstance(size, int):
+            raise ValueError(f"source {self.url} does not declare its byte size")
+        return size
+
+    def write(self, payload: bytes) -> None:
         fs, path = self.resolve()
         fs.makedirs(fs._parent(path), exist_ok=True)
-        fs.pipe_file(path, data)
+        fs.pipe_file(path, payload)
 
-    def verified(self, data: bytes) -> ObjectInfo:
-        self.put_if_absent(data)
+    def verified(self, payload: bytes) -> ObjectInfo:
+        self.put_if_absent(payload)
         found = self.read()
-        digest = hashlib.sha256(data).hexdigest()
-        if len(found) != len(data) or hashlib.sha256(found).hexdigest() != digest:
+        digest = hashlib.sha256(payload).hexdigest()
+        if len(found) != len(payload) or hashlib.sha256(found).hexdigest() != digest:
             raise OSError(f"uploaded object did not verify: {self.url}")
-        return {"bytes": len(data), "sha256": digest}
+        return {"bytes": len(payload), "sha256": digest}
 
     def _backend(self) -> tuple[AbstractFileSystem, str, str]:
         fs, path = self.resolve()
@@ -368,13 +381,13 @@ class Store:
         fs, path, scheme = self._backend()
         if scheme in ("file", "memory"):
             with self._locked(path, scheme):
-                data = fs.cat_file(path)
-                return Versioned(data, hashlib.sha256(data).hexdigest())
+                payload = fs.cat_file(path)
+                return Versioned(payload, hashlib.sha256(payload).hexdigest())
         if isinstance(fs, DewDataFileSystem):
-            data, headers = fs._request("GET", path)
-            return Versioned(data, next(value for key, value in headers.items() if key.lower() == "etag"))
-        info = fs.info(path)
-        if scheme == "s3":
+            payload, headers = fs._request("GET", path)
+            return Versioned(payload, next(value for key, value in headers.items() if key.lower() == "etag"))
+        metadata = fs.info(path)
+        if isinstance(fs, S3FileSystem):
             from fsspec.asyn import sync
 
             async def read_s3() -> Versioned:
@@ -383,25 +396,32 @@ class Store:
                 async with response["Body"] as body:
                     return Versioned(await body.read(), response["ETag"])
 
-            return sync(fs.loop, read_s3)
+            loop = fs.loop
+            if loop is None:
+                raise ValueError("Dew storage needs synchronous S3 filesystem options")
+            return sync(loop, read_s3)
         if scheme in ("gs", "gcs"):
-            version = str(info["generation"])
+            version = str(metadata["generation"])
             return Versioned(fs.cat_file(path, generation=version), version)
+        if not isinstance(fs, HfFileSystem):
+            raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
         from huggingface_hub import HfApi
 
         version = HfApi(token=fs.token).repo_info(resolved.repo_id, repo_type=resolved.repo_type,
                                                 revision=resolved.revision).sha
+        if version is None:
+            raise ValueError(f"Hub source {self.url} did not resolve to a commit")
         pinned = f"{resolved.repo_type}s/{resolved.repo_id}@{version}/{resolved.path_in_repo}"
         return Versioned(fs.cat_file(pinned), version)
 
-    def put_if_absent(self, data: bytes) -> str:
-        return self._put(data, None)
+    def put_if_absent(self, payload: bytes) -> str:
+        return self._put(payload, None)
 
-    def put_if_match(self, data: bytes, version: str) -> str:
-        return self._put(data, version)
+    def put_if_match(self, payload: bytes, version: str) -> str:
+        return self._put(payload, version)
 
-    def _put(self, data: bytes, version: str | None) -> str:
+    def _put(self, payload: bytes, version: str | None) -> str:
         fs, path, scheme = self._backend()
         if scheme in ("file", "memory"):
             with self._locked(path, scheme):
@@ -410,36 +430,40 @@ class Store:
                     raise PreconditionFailed(self.url)
                 if scheme == "file":
                     with tempfile.NamedTemporaryFile(dir=str(Path(path).parent), delete=False) as pending:
-                        pending.write(data)
+                        pending.write(payload)
                         pending.flush()
                         os.fsync(pending.fileno())
                     os.replace(pending.name, path)
                 else:
-                    fs.pipe_file(path, data)
-                return hashlib.sha256(data).hexdigest()
+                    fs.pipe_file(path, payload)
+                return hashlib.sha256(payload).hexdigest()
         headers = {"If-None-Match": "*"} if version is None else {"If-Match": version}
         if isinstance(fs, DewDataFileSystem):
-            _, response = fs._request("PUT", path, data=data, headers=headers)
+            _, response = fs._request("PUT", path, payload=payload, headers=headers)
             return next(value for key, value in response.items() if key.lower() == "etag")
-        if scheme == "s3":
+        if isinstance(fs, S3FileSystem):
             from botocore.exceptions import ClientError
 
             bucket, key, _ = fs.split_path(path)
             try:
-                result = fs.call_s3("put_object", Bucket=bucket, Key=key, Body=data,
+                outcome = fs.call_s3("put_object", Bucket=bucket, Key=key, Body=payload,
                                     **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}))
+            except FileExistsError as error:
+                raise PreconditionFailed(self.url) from error
             except ClientError as error:
                 if error.response["ResponseMetadata"]["HTTPStatusCode"] in (409, 412):
                     raise PreconditionFailed(self.url) from error
                 raise
-            return result["ETag"]
+            return outcome["ETag"]
         if scheme in ("gs", "gcs"):
-            fs.pipe_file(path, data, if_generation_match=0 if version is None else int(version))
+            fs.pipe_file(path, payload, if_generation_match=0 if version is None else int(version))
             fs.invalidate_cache(path)
             return str(fs.info(path)["generation"])
         from huggingface_hub import CommitOperationAdd, HfApi
         from huggingface_hub.errors import HfHubHTTPError
 
+        if not isinstance(fs, HfFileSystem):
+            raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
         api = HfApi(token=fs.token)
         parent = version or api.repo_info(resolved.repo_id, repo_type=resolved.repo_type,
@@ -447,15 +471,15 @@ class Store:
         if version is None and fs.exists(path):
             raise PreconditionFailed(self.url)
         try:
-            result = api.create_commit(repo_id=resolved.repo_id, repo_type=resolved.repo_type,
+            outcome = api.create_commit(repo_id=resolved.repo_id, repo_type=resolved.repo_type,
                                        revision=resolved.revision, parent_commit=parent,
                                        commit_message="Publish data artifact",
-                                       operations=[CommitOperationAdd(resolved.path_in_repo, data)])
+                                       operations=[CommitOperationAdd(resolved.path_in_repo, payload)])
         except HfHubHTTPError as error:
             if error.response.status_code in (409, 412):
                 raise PreconditionFailed(self.url) from error
             raise
-        return result.oid
+        return outcome.oid
 
 
 def _register() -> None:

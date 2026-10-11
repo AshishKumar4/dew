@@ -314,7 +314,7 @@ class TFDS:
 
     def supports(self, read: Read) -> bool:
         try:
-            self.builder
+            _ = self.builder
         except FileNotFoundError:
             return False
         return True
