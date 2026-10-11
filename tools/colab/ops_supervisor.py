@@ -12,7 +12,7 @@ from urllib.parse import urljoin
 import requests
 
 from tools.colab import colab_batch, colab_io, metadata_capture
-from tools.colab.colab_new import Colab
+from tools.colab.colab_new import Colab, no_assignment_acquired
 from tools.colab.common import REPO, STATE, driver_sha, lock, name, read, save
 
 RELEASED = {"released", "already absent", "no assignment acquired"}
@@ -20,6 +20,15 @@ RELEASE_BACKOFF = (60, 180, 600)
 
 
 def accounting(run: dict, allocation: dict, driver: dict, released_at: float | None, now: float) -> dict:
+    if no_assignment_acquired(allocation, driver):
+        return {
+            "session_seconds": 0,
+            "cu_estimate": 0.0,
+            "cu_upper_bound": 0.0,
+            "cu_provisional": False,
+            "billing_finished_at": allocation["allocation_rejected_at"],
+            "accounting": "initial GET rejected before allocation; no VM acquired",
+        }
     end = released_at if released_at is not None else now
     assigned = allocation.get("assigned_at", driver.get("assigned_at", end))
     requested = allocation.get("requested_at", assigned)
@@ -73,8 +82,14 @@ def finalize(run_dir: Path, client: Colab, reason: str | None = None, code: int 
         return result
     released_at = None
     try:
-        endpoint = driver.get("endpoint") or client.recover_endpoint(run_dir / "allocation.json")
-        if not endpoint and allocation:
+        rejected = no_assignment_acquired(allocation, driver)
+        endpoint = driver.get("endpoint") or (
+            None if rejected else client.recover_endpoint(run_dir / "allocation.json")
+        )
+        if rejected:
+            result["release"] = "no assignment acquired"
+            released_at = allocation["allocation_rejected_at"]
+        elif not endpoint and allocation:
             # An absent reply can still provision later. Retain the UUID and
             # leave the account estimate open for the reconciler.
             result["release"] = (
