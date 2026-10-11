@@ -78,8 +78,11 @@ class SimpleDiT(_DiTStackOptions):
         if bottleneck is not None:
             total += projection_flops(lengths, bottleneck, hidden)
         rows = np.ones(np.shape(lengths), np.int64)
-        # Fourier signals have no matmul. Both time maps are width -> r*width -> width.
-        total += (1 + self.interval) * 2 * projection_flops(rows, hidden, self.mlp_ratio * hidden)
+        # Fourier signals have no matmul. TimeProjection has TWO maps,
+        # width -> r*width -> r*width, followed by the final r*width -> width.
+        expanded = self.mlp_ratio * hidden
+        total += (1 + self.interval) * (2 * projection_flops(rows, hidden, expanded)
+                                      + projection_flops(rows, expanded, expanded))
         if text_features is not None:
             total += projection_flops(rows, text_features, hidden)
         for index, block in enumerate(self.counted_blocks()):
