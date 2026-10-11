@@ -1,8 +1,10 @@
 """Measure CLIP metrics on generated images.
 
 `CLIPScore().score(images, prompts)` scores a set of images against the
-prompts they were sampled from, and the validation metrics take the same
-cosine over a validation pass.
+prompts they were sampled from, `CLIPScore().scores(...)` each image on its
+own, and the validation metrics take the same cosine over a validation pass.
+`clip_image_features` is the image tower's embedding, for heads that read it
+(an aesthetic predictor, say).
 
 Both metrics run the vendored towers in `dew.nn.text_encoders`, since
 transformers 5 ships no `FlaxCLIPModel`, and preprocess with the checkpoint's
@@ -13,7 +15,7 @@ what the reference computes for the same pixels and tokens;
 
 import functools
 import logging
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -52,22 +54,28 @@ def _equal_counts(images: int, prompts: int) -> None:
                          "equal counts are required")
 
 
-def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_mask: ArrayLike, *,
-                           modelname: str = DEFAULT_MODEL) -> jax.Array:
-    """Return the per-image cosine between uint8 [N, H, W, 3] images and prompts.
+def clip_image_features(images: ArrayLike, *, modelname: str = DEFAULT_MODEL) -> jax.Array:
+    """Return CLIP's image embedding [N, D] of uint8 [N, H, W, 3] images, unnormalized.
 
     The images go through the checkpoint's own processor, so the embeddings are
-    the ones the reference produces for these pixels and tokens.
+    the ones the reference produces for these pixels.
     """
     model, processor = _get_clip(modelname)
+    pixel_values = processor(images=np.asarray(images), return_tensors="np")["pixel_values"]
+    return model.get_image_features(pixel_values)
+
+
+def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_mask: ArrayLike, *,
+                           modelname: str = DEFAULT_MODEL) -> jax.Array:
+    """Return the per-image cosine between uint8 [N, H, W, 3] images and prompts."""
+    model, _ = _get_clip(modelname)
     pixels = np.asarray(images)
     tokenized = np.shape(input_ids)[0]
     _equal_counts(pixels.shape[0], tokenized)
     if np.shape(attention_mask)[0] != tokenized:
         raise ValueError(f"CLIP got {tokenized} prompts and "
                          f"{np.shape(attention_mask)[0]} attention masks")
-    pixel_values = processor(images=pixels, return_tensors="np")["pixel_values"]
-    image_embeds = model.get_image_features(pixel_values)
+    image_embeds = clip_image_features(pixels, modelname=modelname)
     text_embeds = model.get_text_features(input_ids, attention_mask)
     image_embeds = image_embeds / jnp.linalg.norm(image_embeds, axis=-1, keepdims=True)
     text_embeds = text_embeds / jnp.linalg.norm(text_embeds, axis=-1, keepdims=True)
@@ -118,6 +126,20 @@ class CLIPScore(ImageMetric):
         tokenized the way a run's batch holds them, truncated to CLIP's
         context.
         """
+        # Summed the way a pass sums it, batch by batch with `+`, so a whole set in
+        # one batch is the number the metric reports for the same images.
+        total = 0.0
+        for batch in self._batches(images, prompts, batch_size):
+            total += float(batch.sum())
+        return total / np.shape(images)[0]
+
+    def scores(self, images: ArrayLike, prompts: Sequence[str], *, batch_size: int = 64) -> np.ndarray:
+        """Return each image's CLIPScore against its own prompt, `100 * max(cos, 0)`, as float64 [N]:
+        `score`'s terms, for ranking samples one by one."""
+        return np.concatenate(list(self._batches(images, prompts, batch_size)))
+
+    def _batches(self, images: ArrayLike, prompts: Sequence[str], batch_size: int) -> Iterator[np.ndarray]:
+        """Each batch's per-image scores, float64, `batch_size` images at a time."""
         if batch_size < 1:
             raise ValueError(f"clip_score: a batch holds at least one image, got batch_size={batch_size}")
         pixels = np.asarray(images)
@@ -133,15 +155,11 @@ class CLIPScore(ImageMetric):
         tokenizer = load_tokenizer(self.modelname)
         tokens = tokenizer(list(prompts), padding="max_length", max_length=tokenizer.model_max_length,
                            truncation=True, return_tensors="np")
-        total = 0.0
         with metric_device():
             for start in range(0, pixels.shape[0], batch_size):
                 stop = start + batch_size
                 cosine = clip_image_text_cosine(pixels[start:stop], tokens["input_ids"][start:stop],
                                                 tokens["attention_mask"][start:stop],
                                                 modelname=self.modelname)
-                # Summed the way a pass sums it, so a whole set in one batch is
-                # the number the metric reports for the same images.
-                total += float(np.asarray(100.0 * jnp.maximum(cosine, 0.0), dtype=np.float64).sum())
-        return total / pixels.shape[0]
+                yield np.asarray(100.0 * jnp.maximum(cosine, 0.0), dtype=np.float64)
 
