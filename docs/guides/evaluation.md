@@ -86,6 +86,7 @@ artifact whose type `reads` names. This LM metric measures top-1 accuracy
 from the logits, and the run ranks its checkpoints by it:
 
 ```python
+from dew.data import Loading, Records, load
 from dew import Checkpoints, Mean
 from dew.artifacts import TokenScores
 
@@ -94,8 +95,7 @@ accuracy = Mean(
     reads=TokenScores, name="accuracy", better="higher",
 )
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
-accuracy_data = Dataset.from_records({"text": train_tokens}, batch=8,
-                                    validation={"text": val_tokens})
+accuracy_data = load(Records(source={"text": train_tokens}, validation={"text": val_tokens}), batch=8, read="memory", loading=Loading(workers=0))
 run = Trainer(language_model, OptimConfig(optimizer="adam", learning_rate=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
@@ -185,13 +185,13 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch
-from dew.data import TokenWindows
+from dew.data import Text
 
 config = RunConfig(
     # The run records the model it trains, and the batches above stand in
     # for the dataset this names.
     model=ModelConfig.from_model(objective.model),
-    data=TokenWindows(seq_len=8),
+    data=Text(source="", seq_len=8),
     optim=OptimConfig(optimizer="adam"),
     trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,
                           eval_every=None, checkpoint_every=None),
