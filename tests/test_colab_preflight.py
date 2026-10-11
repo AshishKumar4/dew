@@ -137,6 +137,7 @@ def test_a_ref_without_the_called_module_fails_the_preflight(tmp_path, monkeypat
     args = argparse.Namespace(
         ref=commit, hardware="gpu:G4", command="python /content/c56/rules.py", inputs=[str(script)], pin=[]
     )
+    args.origin = "origin"
     args.python, args.dew_python = preflight.PYTHON, sys.executable
     receipt = preflight.preflight(args, tmp_path / "work")
     assert receipt["commit"] == commit and not receipt["ok"]
@@ -144,12 +145,12 @@ def test_a_ref_without_the_called_module_fails_the_preflight(tmp_path, monkeypat
     assert receipt["inputs"] == {"rules.py": hashlib.sha256(script.read_bytes()).hexdigest()}
 
 
-def receipt_for(tmp_path, commit, **changes):
+def receipt_for(tmp_path, head, **changes):
     script = tmp_path / "rules.py"
     script.write_text("print(1)\n")
     receipt = {
         "ok": True,
-        "commit": commit,
+        "commit": head,
         "hardware": "gpu:T4",
         "command": "python /content/c56/rules.py",
         "inputs": {"rules.py": hashlib.sha256(script.read_bytes()).hexdigest()},
