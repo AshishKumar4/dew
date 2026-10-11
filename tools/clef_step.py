@@ -9,7 +9,7 @@ c58 (an A100) and c57 (a G4) passed every CPU test and the port's own GPU
 tests, then died in their first compile of the decision step, in a
 Pallas-Triton lowering. A CPU interprets Dew's Pallas kernels, so only a
 lowering for the GPU meets that failure, and `--trainer.lower-for` lowers
-the run's real step for one (`dew.training.lowering`). The step is
+the run's real step for one (`dew.training._lowering`). The step is
 recipes/decision/clef.py's own run at its defaults, bfloat16 compute, LoRA
 on every projection and Clef's joint head. The backbone is the size of a
 test fixture: the tiny Qwen 3.5's three Gated DeltaNet layers and one
@@ -20,7 +20,7 @@ delta rule's kernels take (`dew.nn.kernels.delta_chunks.refusal`), so
 kernel's choices and refusals read, and `--max-len` and `--batch` its rows.
 
 The last line printed is a JSON record: the Pallas-Triton kernels the
-lowered step calls, by name (`dew.training.lowering.triton_kernels`), or the
+lowered step calls, by name (`dew.training._lowering.triton_kernels`), or the
 loss of each trained step.
 """
 
@@ -153,7 +153,7 @@ def host_devices(count: int) -> None:
 
 def lowered(tree: Path, work: Path, generation: str, rows: Rows = TINY) -> dict:
     """The kernels the step calls once lowered for `generation`."""
-    from dew.training.lowering import Lowered
+    from dew.training._lowering import Lowered
 
     try:
         # Two steps: the schedule decays after its one warmup step.

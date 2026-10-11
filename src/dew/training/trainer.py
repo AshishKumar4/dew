@@ -91,6 +91,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
+from dew.training._lowering import Lowered, gpu_mesh
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
     DevicePrefetchIterator,
@@ -105,7 +106,6 @@ from dew.training.distributed import (
     shard_batch,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
-from dew.training.lowering import Lowered, gpu_mesh
 from dew.training.memory import (
     climb_to,
     compiled_if_it_fits,
@@ -584,7 +584,7 @@ class Trainer(Generic[Loss, Effects]):
         scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter. `rollout` runs once per batch read, before the step and outside
         replay. `layout` and `mesh` say where the state lives. `lower_for`, a CUDA generation, lowers
-        the first step for it in place of compiling it (`dew.training.lowering.Lowered`).
+        the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
@@ -1278,7 +1278,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
-        for one (`dew.training.lowering`), on whatever devices this process has.
+        for one (`dew.training._lowering`), on whatever devices this process has.
 
         It traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering reads the
         GPU, at the base rung: a run that does not fit climbs to heavier remat, no other kernel. A

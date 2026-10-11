@@ -128,7 +128,7 @@ class FitEnded:
     def outcome(cls, seconds: float, error: BaseException | None, *, preempted: bool = False,
                 lowered: bool = False) -> FitEnded:
         """A run's end: its first step lowered for another device in place of
-        training (`dew.training.lowering`), an error, else stopped at a
+        training (`TrainerConfig.lower_for`), an error, else stopped at a
         preemption notice with its checkpoint written, else completed."""
         if lowered:
             return cls('lowered', seconds)
