@@ -643,7 +643,8 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
         lab["gated_at_runtime"] = gate
     else:
         failures += unverified
-    receipt["lowered"] = lowered(tree, args.hardware, args.dew_python, trains(texts, args.command),
+    sites = trains(texts, args.command) or runs_dew(chains)
+    receipt["lowered"] = lowered(tree, args.hardware, args.dew_python, sites,
                                  lowering_env(texts, args.command), failures, geometry(texts, args.command))
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
@@ -886,6 +887,13 @@ def trains(texts: dict[str, str], command: str) -> list[str]:
             for number, line in enumerate(text.splitlines(), 1) if TRAINING.search(line)]
 
 
+def runs_dew(chains: list[dict]) -> list[str]:
+    """Each site where the request imports Dew or a tool of its tree (the kernel lab's verify, a kernel
+    bench), as `file:line`: code that compiles Dew's kernels on the GPU, whose step lowers here first
+    whatever the request calls itself (two short verifies launched on a kernel that did not lower)."""
+    return sorted({chain["where"] for chain in chains if top(chain) in LOCAL})
+
+
 def lowering_env(texts: dict[str, str], command: str) -> dict[str, str]:
     """The JAX_ and XLA_ settings the command and its shell scripts assign, which the run's step
     lowers under. A value read from another variable is unknown here, and left out."""
@@ -947,17 +955,18 @@ def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: d
     settings (tools/clef_step.py, `TrainerConfig.lower_for`): every Pallas-Triton lowering the step
     makes, which otherwise first runs in the GPU's own compile, where c58 and c57 died. The step
     takes the layer widths of the checkpoint the request trains, and its rows, where the request
-    names them (`geometry`), else the tiny model's (`model`). A request that trains nothing, such
-    as a kernel bench, has no step to lower."""
+    names them (`geometry`), else the tiny model's (`model`). Every request that runs Dew's code
+    lowers, a verify or a bench as much as a training run (`runs_dew`); only one that runs none, a
+    torch reference, has nothing to lower."""
     if not sites:
-        return {"skipped": "no training entry"}
+        return {"skipped": "the request runs no Dew code"}
     generation, script = GENERATIONS[hardware], tree / "tools" / "clef_step.py"
     shape = shape or {}
     found: dict = {"generation": generation, "devices": 1, "env": env, "sites": list(sites),
                    "model": shape.get("like", "tiny"), "geometry": shape}
     if not script.is_file():
-        failures.append(f"the request trains ({', '.join(sites[:3])}) at a ref that predates the lowering "
-                        "dry run (tools/clef_step.py), the check c58's failure needs")
+        failures.append(f"the request runs Dew's code ({', '.join(sites[:3])}) at a ref that predates the "
+                        "lowering dry run (tools/clef_step.py), the check c58's failure needs")
         return found
     found["script"] = hashlib.sha256(script.read_bytes()).hexdigest()
     environment = {**os.environ, **env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(tree / "src")}
