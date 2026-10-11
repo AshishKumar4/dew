@@ -347,3 +347,10 @@ def test_a_second_ref_is_checked_out_only_when_declared_and_fetched(tmp_path, mo
     with pytest.raises(ValueError, match="refs: does not fetch"):
         preflight.verify(path, request, [])
     assert preflight.verify(path, {**request, "refs": [fallback]}, [])
+
+
+def test_a_setting_known_to_break_gpu_runs_fails_the_preflight():
+    texts = {"drive.py": "env = {**os.environ, 'JAX_EXPLAIN_CACHE_MISSES': '1'}\n"}
+    found = preflight.hazards(texts, "python drive.py")
+    assert len(found) == 1 and found[0].startswith("drive.py:1 sets JAX_EXPLAIN_CACHE_MISSES")
+    assert preflight.hazards({"drive.py": "print(1)\n"}, "python drive.py") == []

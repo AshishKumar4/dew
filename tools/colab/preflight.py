@@ -630,6 +630,7 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             failures.append(f"{label(chain)}: {detail}")
     failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
     receipt.update(static={name: failed[name] for name in sorted(static.scope)}, guarded=static.guarded)
+    failures += hazards(texts, args.command)
     receipt["kernel_lab"] = lab_verified(tree, args.hardware, failures, explicit_pallas(texts, args.command))
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
@@ -758,6 +759,23 @@ def explicit_pallas(texts: dict[str, str], command: str) -> list[str]:
             if EXPLICIT.search(line):
                 sites.append(f"{name}:{number}")
     return sites
+
+
+# Settings that break a GPU run whatever the code: each with what it breaks.
+HAZARDS = {
+    re.compile(r"JAX_EXPLAIN_CACHE_MISSES|jax_explain_cache_misses"):
+        "JAX 0.11.2's cache-miss explainer crashes on Pallas-Triton lowerings that pass debug_info as "
+        "a keyword (partial_eval.explain -> diff_tracing_cache_keys): c58's and c57's runs died "
+        "before their first compile",
+}
+
+
+def hazards(texts: dict[str, str], command: str) -> list[str]:
+    """A failure for each known-bad setting a staged script or the command makes."""
+    return [f"{name}:{number} sets {match.group(0)}: {why}"
+            for name, text in [("<command>", command), *texts.items()]
+            for number, line in enumerate(text.splitlines(), 1)
+            for pattern, why in HAZARDS.items() if (match := pattern.search(line))]
 
 
 def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: list[str] = ()) -> dict:
