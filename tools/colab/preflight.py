@@ -911,6 +911,12 @@ GEOMETRY = {"like": r"pretrained", "revision": r"revision", "max-len": r"max[-_]
             "batch": r"trainer\.batch[-_]size"}
 
 
+# Flags of a request that change which kernel a step runs and that the lowered tiny step does not take:
+# the receipt names them, so a reader knows what the dry run did not cover.
+UNAPPLIED = re.compile(r"--(?:loop[-_](?:layers|steps|backprop[-_]steps|remat)|[\w.-]*impl(?:ementation)?"
+                       r"|[\w.-]*chunk[-_]size|remat)\b")
+
+
 def geometry(texts: dict[str, str], command: str) -> dict[str, str]:
     """The checkpoint, its commit, the row length and the batch the request's training names, as the
     first flag in the command or a staged script gives each (`--pretrained Qwen/Qwen3.5-0.8B`, or
@@ -928,6 +934,9 @@ def geometry(texts: dict[str, str], command: str) -> dict[str, str]:
     if found.get("like", "").startswith("/"):
         found["local"] = found.pop("like")
         found.pop("revision", None)
+    unread = sorted({match[0] for text in [command, *texts.values()] for match in UNAPPLIED.finditer(text)})
+    if unread:
+        found["not applied"] = ", ".join(unread)
     return found
 
 
@@ -954,7 +963,7 @@ def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: d
     environment = {**os.environ, **env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(tree / "src")}
     with tempfile.TemporaryDirectory(prefix="dew-lowered-") as work:
         try:
-            flags = [f"--{name}={value}" for name, value in shape.items() if name != "local"]
+            flags = [f"--{name}={value}" for name, value in shape.items() if name in GEOMETRY]
             done = subprocess.run([python, str(script), "--lower-for", generation, "--devices", "1", *flags,
                                    "--work", work], capture_output=True, text=True, cwd=tree, env=environment,
                                   timeout=LOWERING_TIMEOUT)

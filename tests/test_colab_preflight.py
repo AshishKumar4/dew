@@ -498,3 +498,5 @@ def test_the_lowered_step_takes_the_checkpoint_and_rows_the_request_trains():
     assert preflight.geometry({}, local) == {"local": "/content/ckpt"}
     computed = {"c50.py": 'run(["--pretrained", backbone[0], "--max-len", str(row)])\n'}
     assert preflight.geometry(computed, "python c50.py") == {}
+    looped = "python recipes/decision/clef.py --loop-layers 2 6 --model.attention-impl xla --remat minimal"
+    assert preflight.geometry({}, looped) == {"not applied": "--loop-layers, --model.attention-impl, --remat"}
