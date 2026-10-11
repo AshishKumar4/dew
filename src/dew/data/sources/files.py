@@ -213,12 +213,15 @@ class Files:
         if self.kind == "webdataset":
             return False
         indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
-        return all(
-            Store(url, self.storage_options)
-            .resolve()[0]
-            .exists(Store(url, self.storage_options).resolve()[1])
-            for url in indexes
-        )
+        headers = {}
+        for url in indexes:
+            fs, path = Store(url, self.storage_options).resolve()
+            try:
+                headers[url] = fs.info(path)
+            except FileNotFoundError:
+                return False
+        self.__dict__["index_headers"] = headers
+        return True
 
     @staticmethod
     def _index_url(url: str) -> str:
@@ -439,6 +442,10 @@ class Files:
                 else {}
             )
             return {"class_names": names, **counts}
+        if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
+            return {"rows": len(_IndexedLines(self))}
+        if self.kind == "files":
+            return {"rows": len(self.paths)}
         return {}
 
     def lengths(self) -> np.ndarray | None:
@@ -526,7 +533,10 @@ class _IndexedLines:
         self.indexes = (
             (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
         )
-        self.index_files = tuple(ArrayIndex(url, source.storage_options) for url in self.indexes)
+        headers = source.__dict__.get("index_headers", {})
+        self.index_files = tuple(
+            ArrayIndex(url, source.storage_options, headers.get(url)) for url in self.indexes
+        )
         self.tables = tuple(index.values for index in self.index_files)
         self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
 
