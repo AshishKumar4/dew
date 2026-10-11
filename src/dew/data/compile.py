@@ -519,41 +519,6 @@ class _CachedOutputs:
         return held if held else (Rejected("empty_expansion"),)
 
 
-class _CacheIterator(pygrain.DatasetIterator[Record]):
-    def __init__(self, parent: pygrain.DatasetIterator[Record], owner: Closeable):
-        super().__init__(parent)
-        self._read, self._owner = parent, owner
-
-    def __next__(self) -> Record:
-        try:
-            return next(self._read)
-        except StopIteration:
-            if isinstance(self._owner, _Finishable):
-                self._owner.finish()
-            raise
-
-    def get_state(self) -> Mapping[str, object]:
-        return self._read.get_state()
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self._read.set_state(state)
-
-    def close(self) -> None:
-        try:
-            self._read.close()
-        finally:
-            self._owner.close()
-
-
-class _CacheRows(pygrain.IterDataset[Record]):
-    def __init__(self, parent: pygrain.IterDataset[Record], owner: Closeable):
-        super().__init__(parent)
-        self._records, self._owner = parent, owner
-
-    def __iter__(self) -> pygrain.DatasetIterator[Record]:
-        return _CacheIterator(iter(self._records), self._owner)
-
-
 @dataclasses.dataclass(frozen=True)
 class _Memory:
     original: Source
@@ -1053,8 +1018,6 @@ class _Build:
                     source,
                     transform=transform,
                 )
-                if isinstance(rows, Closeable):
-                    rows = _CacheRows(_as_iter(rows, self.loading), rows)
             rows = Accepted(
                 gx.FlatMapIterDataset(_as_iter(rows, self.loading), _CachedOutputs()),
                 _name(pipeline),
@@ -1968,18 +1931,7 @@ def _objective_order(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
 
 
 def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
-    boundary = (
-        (Shuffle, Repeat, Group, BatchStage, TokenBudget)
-        if read == "memory"
-        else (Group, BatchStage, TokenBudget)
-    )
-    before = next(
-        (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, boundary)),
-        len(pipeline.stages),
-    )
-    prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:before])
-    prefix = objective_steps(prefix, objective, train=train, read=read)
-    branch = dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[before:]))
+    branch = objective_steps(pipeline, objective, train=train, read=read)
     if isinstance(branch.source, Mixture):
         children = branch.source.pipelines
         suffixes = [
