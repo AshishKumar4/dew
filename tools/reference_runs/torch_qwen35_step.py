@@ -115,7 +115,7 @@ def kernel_kind(name: str, launch: str, phase: str) -> tuple[str, str]:
 
 def attribute(path: Path, steps: int, intermediate: int) -> dict:
     """Join device kernels to host launches and keep the evidence for every name."""
-    from common import chrome_trace_kernels, kernel_summary, trim_trace
+    from common import chrome_trace_kernels, kernel_summary
     from trace_window import window_split
 
     events = json.loads(path.read_text())["traceEvents"]
@@ -145,7 +145,9 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
         if kind == "gemm":
             # The MLP's 3584 dimension is unique in this checkpoint. Other
             # GEMMs stay projections; equal attention/GDN shapes are not split.
-            part = "mlp" if any(intermediate in shape for shape in shapes if isinstance(shape, list)) else "projections"
+            matmul = re.search(r"aten::(?:mm|bmm|addmm)\b", operator)
+            part = ("mlp" if matmul and any(intermediate in shape for shape in shapes if isinstance(shape, list))
+                    else "projections")
         elif "swiglu" in name.lower():
             part = "mlp"
         elif re.search(r"rms.?norm|layer.?norm", name.lower()):
@@ -178,8 +180,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
             "top_ops": sorted(rows.values(), key=lambda row: -row["us"]),
             "accounting": "kernel sums by kind can overlap; device busy is interval union; idle is device window minus busy",
             "part_scope": "MLP GEMMs require observed input shapes; other GEMMs are projections. Unattributed is retained.",
-            "common_summary": kernel_summary(kernels, steps),
-            "kernel_rows": str(trim_trace(kernels, path.with_suffix(".kernels.json.gz")))}
+            "common_summary": kernel_summary(kernels, steps)}
 
 
 def smoke_attribution(path: Path) -> dict:
@@ -188,7 +189,7 @@ def smoke_attribution(path: Path) -> dict:
                "pid": 1, "tid": 1, "ts": 60, "dur": 9}]
     names = ["ampere_bf16_s16816gemm", "chunk_gated_delta_rule_fwd_kernel_h",
              "flash_fwd_kernel", "_rms_norm_forward_kernel", "triton_red_fused_sum_0",
-             "Memcpy DtoD", "vectorized_elementwise_kernel", "unrecognized_kernel"]
+             "triton_poi_fused_cat_view_5", "vectorized_elementwise_kernel", "unrecognized_kernel"]
     for index, name in enumerate(names):
         launch_time = index * 10
         events.extend([
@@ -202,10 +203,12 @@ def smoke_attribution(path: Path) -> dict:
         ])
     events.append({"ph": "X", "cat": "gpu_memcpy", "name": "Memcpy DtoD", "ts": 1, "dur": 3,
                    "args": {"device": 0, "correlation": 20}})
+    events.append({"ph": "X", "cat": "kernel", "name": "triton_poi_fused_as_strided_clone_0", "ts": 1, "dur": 2,
+                   "args": {"device": 0, "correlation": 21}})
     path.write_text(json.dumps({"traceEvents": events}))
     result = attribute(path, 1, 64)
     for kind in KINDS:
-        if abs(result["by_kind_ms"][kind] - (0.008 if kind == "layout" else 0.005)) > 1e-9:
+        if abs(result["by_kind_ms"][kind] - (0.010 if kind == "layout" else 0.005)) > 1e-9:
             raise AssertionError(f"incorrect kernel/launch classification for {kind}")
     if abs(result["device_ms_per_step"] - 0.040) > 1e-9:
         raise AssertionError("overlapping copy counted twice in device busy time")
@@ -262,8 +265,8 @@ def comparison(reference: dict, attribution: Path, entry: Path) -> dict:
 def run(args: argparse.Namespace) -> dict:
     import numpy as np
     import torch
-    from common import (TorchTracedWindow, git_head, host, peak_flops, register_plain_causal_sdpa,
-                        throughput, warmup_cosine, write_record)
+    from common import (TorchTracedWindow, chrome_trace_kernels, git_head, host, peak_flops,
+                        register_plain_causal_sdpa, throughput, trim_trace, warmup_cosine, write_record)
     from transformers import Qwen3_5TextConfig
     from transformers.models.qwen3_5 import modeling_qwen3_5 as qwen
 
@@ -447,6 +450,8 @@ def run(args: argparse.Namespace) -> dict:
                          "optimizer_state_dtypes": state_dtypes, "no_timing_window_compilation": True,
                          "dynamo_counters": {key: dict(value) for key, value in counters.items()}}}
     record["time"].update(model_flops_per_step=flops, peak_gflops=None if peak is None else peak / 1e9)
+    if not args.smoke:
+        record["time"]["kernel_rows"] = str(trim_trace(chrome_trace_kernels(trace), trace.with_suffix(".kernels.json.gz")))
     if args.smoke:
         record["checks"]["attribution_fixture"] = smoke_attribution(Path(args.out).with_suffix(".fixture.json"))
         record["checks"]["compiled_sdpa_calls"] = observed_sdpa
