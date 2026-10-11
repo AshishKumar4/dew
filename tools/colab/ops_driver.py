@@ -209,14 +209,38 @@ class Driver:
                 )
                 time.sleep(delay)
 
-    def collect_action(self, operation, *args) -> None:
+    def collect_action(self, job: dict, operation, *args) -> None:
+        failures = self.state.get("collection_failures", {})
+        key = str(job["index"])
+        if failures.get(key, {}).get("needs_attention"):
+            return
         try:
             operation(*args)
+            failures[key] = {"count": 0, "needs_attention": False}
+            self.record(collection_failures=failures)
         except (OSError, ValueError, RuntimeError) as error:
-            if isinstance(error, TransportError):
-                raise
+            count = failures.get(key, {}).get("count", 0) + 1
+            failures[key] = {"count": count, "error": type(error).__name__, "needs_attention": count >= 3}
+            self.record(collection_failures=failures)
             self.record(collection_error=type(error).__name__, collection_needs_attention=True)
+            if count >= 3:
+                return
             raise TransportError("artifact collection failed; workload liveness is independent") from error
+
+    def failed_collections(self, plan: dict, progress: dict) -> None:
+        failures = self.state.get("collection_failures", {})
+        recorded = {result["index"] for result in self.state["results"]}
+        for job in plan["jobs"]:
+            if job["index"] in recorded or not failures.get(str(job["index"]), {}).get("needs_attention"):
+                continue
+            status = progress.get("jobs", {}).get(str(job["index"]), {})
+            result = {"index": job["index"], "lane": job["lane"], "commit": job["commit"],
+                      "driver_sha": plan["driver_sha"], "status": "collection failed: needs attention",
+                      "observed_exit": status.get("exit"), "collection_failed": True,
+                      "results": str(self.run_dir), "seconds": status.get("seconds", 0),
+                      "stage_seconds": status.get("stage_seconds", 0), "finished_at": time.time()}
+            colab_batch.finish(job["entry"], result)
+            self.record(results=[*self.state["results"], result])
 
     def poll_once(self, endpoint: str, remote: str, plan: dict, collected: set, synced: dict) -> bool:
         progress: dict
@@ -238,12 +262,13 @@ class Driver:
             if index in collected:
                 continue
             if status.get("artifact_manifest"):
-                self.collect_action(self.collect, session, remote, plan, job, status)
+                self.collect_action(job, self.collect, session, remote, plan, job, status)
                 collected.add(index)
             elif status and time.monotonic() - synced.get(index, 0) >= 600:
-                self.collect_action(self.sync, session, remote, job)
+                self.collect_action(job, self.sync, session, remote, job)
                 synced[index] = time.monotonic()
         if progress.get("phase") in ("done", "failed"):
+            self.failed_collections(plan, progress)
             self.preamble(session, remote, plan, progress)
             if progress["phase"] == "failed":
                 raise RuntimeError("VM batch failed: " + progress.get("error", "unknown cause"))
