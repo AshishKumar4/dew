@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import hashlib
-import http.client
 import io
 import json
 import os
@@ -15,15 +14,16 @@ import tempfile
 import threading
 import time
 import tomllib
-import urllib.error
+
 import urllib.parse
-import urllib.request
 from collections.abc import Buffer, Iterator, Mapping
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import BinaryIO, TypedDict
 
 import fsspec
+import urllib3
 from filelock import FileLock, Timeout
 from fsspec.implementations.cached import CachingFileSystem, WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
@@ -31,10 +31,28 @@ from gcsfs import GCSFileSystem
 from huggingface_hub import HfFileSystem
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
+from urllib3.response import BaseHTTPResponse
+from urllib3.util import Retry, Timeout as HttpTimeout
 
 from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention
 from dew.records import JSON, json_value
+
+
+@lru_cache(maxsize=1)
+def _http_pool(process: int) -> urllib3.PoolManager:
+    return urllib3.PoolManager(
+        num_pools=16,
+        maxsize=64,
+        block=True,
+        retries=Retry(
+            total=2,
+            backoff_factor=0.1,
+            allowed_methods=frozenset(("GET", "HEAD")),
+            status_forcelist=(429, 500, 502, 503, 504),
+            raise_on_status=False,
+        ),
+    )
 
 
 class PreconditionFailed(FileExistsError):
@@ -157,30 +175,39 @@ class DewDataFileSystem(AbstractFileSystem):
         payload: bytes | None = None,
         headers: Mapping[str, str] | None = None,
         query: str = "",
-    ) -> Iterator[http.client.HTTPResponse]:
+    ) -> Iterator[BaseHTTPResponse]:
         token = self.token or os.environ.get("DEW_DATA_TOKEN")
         if not token and self.token_file:
             token = Path(self.token_file).expanduser().read_text().strip()
         if not token:
             raise ValueError("storage profile 'r2' needs DEW_DATA_TOKEN or its configured token_file")
         key = self._key(path)
-        request = urllib.request.Request(
-            f"{self.endpoint}/{key}{query}",
-            data=payload,
-            method=method,
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "dew-data/1", **(headers or {})},
-        )
+        response = None
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
-                if headers and "Range" in headers and response.status != 206:
-                    raise OSError(f"dew-data did not honour range read for {path}")
-                yield response
-        except urllib.error.HTTPError as error:
-            if error.code == 404:
-                raise FileNotFoundError(path) from error
-            if error.code in (409, 412):
-                raise PreconditionFailed(path) from error
-            raise OSError(f"dew-data {method} {path}: HTTP {error.code}") from error
+            response = _http_pool(os.getpid()).request(
+                method,
+                f"{self.endpoint}/{key}{query}",
+                body=payload,
+                headers={"Authorization": f"Bearer {token}", "User-Agent": "dew-data/1", **(headers or {})},
+                timeout=HttpTimeout(connect=10, read=120),
+                preload_content=False,
+                redirect=False,
+            )
+            if response.status == 404:
+                raise FileNotFoundError(path)
+            if response.status in (409, 412):
+                raise PreconditionFailed(path)
+            if response.status >= 300:
+                raise OSError(f"dew-data {method} {path}: HTTP {response.status}")
+            if headers and "Range" in headers and response.status != 206:
+                raise OSError(f"dew-data did not honour range read for {path}")
+            yield response
+        except urllib3.exceptions.HTTPError as error:
+            raise OSError(f"dew-data {method} {path}: {error}") from error
+        finally:
+            if response is not None:
+                response.close()
+                response.release_conn()
 
     def _request(
         self,
