@@ -26,7 +26,7 @@ import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Rejected
+from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Shard, ShardManifest, Source
 from dew.data.sources.codec import decode, encode
@@ -35,7 +35,6 @@ from dew.data.storage import PreconditionFailed, Store, _byte_size
 from dew.records import JSON
 
 _log = logging.getLogger(__name__)
-type Record = Batch | bytes | Rejected | None
 type Outputs = tuple[Record, ...]
 type Transform = Callable[[int, Record], Outputs]
 type CachedValue = Record | Outputs
@@ -54,11 +53,13 @@ class DependencyManifest(Protocol):
 
 
 def _json(value: JSON | Mapping[str, object]) -> bytes:
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode()
 
 
 def _row_key(value: RowId) -> str:
-    return _json(value).decode()
+    return _json(list(value) if isinstance(value, tuple) else value).decode()
 
 
 def _hash(value: bytes) -> str:
@@ -85,13 +86,7 @@ def _outputs_digest(outputs: Sequence[Record]) -> str:
 
 
 def _accepted(outputs: Sequence[Record]) -> Outputs:
-    return tuple(value for value in outputs if not isinstance(value, _Rejection))
-
-
-@runtime_checkable
-class _Rejection(Protocol):
-    reason: str
-    permanent: bool
+    return tuple(value for value in outputs if not isinstance(value, Rejected))
 
 
 @runtime_checkable
@@ -142,7 +137,9 @@ class Cache:
         if min(self.spool_limit, _byte_size(self.mirror_bytes), self.local_limit, self.shard_limit) < 1:
             raise ValueError("cache byte budgets must be positive")
         if self.shard_limit > self.spool_limit or self.upload_workers < 1 or self.retry < 0:
-            raise ValueError("cache shard_bytes must fit the spool; upload_workers positive and retry nonnegative")
+            raise ValueError(
+                "cache shard_bytes must fit the spool; upload_workers positive and retry nonnegative"
+            )
         if self.on_full not in ("stop", "block"):
             raise ValueError("cache on_full is 'stop' or 'block'")
 
@@ -177,18 +174,30 @@ class Cache:
         base = Store(self.url, self.storage_options)
         fs, path, scheme = base._backend()
         if scheme == "file":
-            base = Store(fs.unstrip_protocol(path), self.storage_options,
-                         LocalRetention(Path(path), self.local_limit))
+            base = Store(
+                fs.unstrip_protocol(path), self.storage_options, LocalRetention(Path(path), self.local_limit)
+            )
         return base.child(manifest.key)
 
-    def mapped(self, parent: grain.MapDataset, key: DependencyManifest, source: Source,
-               *, transform: Transform | None = None) -> grain.MapDataset:
+    def mapped(
+        self,
+        parent: grain.MapDataset,
+        key: DependencyManifest,
+        source: Source,
+        *,
+        transform: Transform | None = None,
+    ) -> grain.MapDataset:
         self._root(key)
         return _CachedMap(parent, self, key, source, transform)
 
-    def streamed(self, reader: Callable[[Shard], grain.IterDataset], key: DependencyManifest,
-                 manifest: ShardManifest, *, transform: Transform | None = None
-                 ) -> Callable[[Shard], grain.IterDataset]:
+    def streamed(
+        self,
+        reader: Callable[[Shard], grain.IterDataset],
+        key: DependencyManifest,
+        manifest: ShardManifest,
+        *,
+        transform: Transform | None = None,
+    ) -> Callable[[Shard], grain.IterDataset]:
         self._root(key)
         return _CachedReader(reader, self, key, transform)
 
@@ -202,17 +211,33 @@ class Cache:
         record = json.loads(current.data)
         if record["manifest"] != key.key:
             raise ValueError(f"cache CURRENT manifest differs at {root.url}")
-        _checked(root, {"path": f"generations/{record['generation']}/manifest.json",
-                        "bytes": record["bytes"], "sha256": record["sha256"]})
+        _checked(
+            root,
+            {
+                "path": f"generations/{record['generation']}/manifest.json",
+                "bytes": record["bytes"],
+                "sha256": record["sha256"],
+            },
+        )
         return Generation(root.child(f"generations/{record['generation']}").url, self._mirror_options())
 
-    def publish(self, key: DependencyManifest, source: Source, *,
-                plan: Callable[[Generation], Mapping[str, np.ndarray]] | None = None) -> Generation:
+    def publish(
+        self,
+        key: DependencyManifest,
+        source: Source,
+        *,
+        plan: Callable[[Generation], Mapping[str, np.ndarray]] | None = None,
+    ) -> Generation:
         with ExitStack() as pins:
             return self._publish(key, source, plan, pins)
 
-    def _publish(self, key: DependencyManifest, source: Source,
-                 plan: Callable[[Generation], Mapping[str, np.ndarray]] | None, pins: ExitStack) -> Generation:
+    def _publish(
+        self,
+        key: DependencyManifest,
+        source: Source,
+        plan: Callable[[Generation], Mapping[str, np.ndarray]] | None,
+        pins: ExitStack,
+    ) -> Generation:
         root = self._root(key)
         try:
             current = root.child("CURRENT").get_versioned()
@@ -224,8 +249,10 @@ class Cache:
         missing, extra = expected_keys - completions.keys(), completions.keys() - expected_keys
         if missing or extra:
             sample = next(iter(missing or extra))
-            raise ValueError(f"cache coverage is incomplete: {len(missing)} missing, {len(extra)} unexpected "
-                             f"source IDs; example {sample}")
+            raise ValueError(
+                f"cache coverage is incomplete: {len(missing)} missing, {len(extra)} unexpected "
+                f"source IDs; example {sample}"
+            )
         generation = uuid.uuid4().hex
         target = root.child(f"generations/{generation}")
         opened = Generation(target.url, self._mirror_options())
@@ -237,9 +264,15 @@ class Cache:
             entry = completions[row_key]
             page = hashlib.sha256(row_key.encode()).hexdigest()[:2]
             pages.setdefault(page, {})[row_key] = entry
-            dense.extend({**entry, "output": index, "length": entry["lengths"][index],
-                          "valid_targets": entry["valid_targets"][index]}
-                         for index in range(entry["fanout"]))
+            dense.extend(
+                {
+                    **entry,
+                    "output": index,
+                    "length": entry["lengths"][index],
+                    "valid_targets": entry["valid_targets"][index],
+                }
+                for index in range(entry["fanout"])
+            )
         indexes = {}
         for page, values in pages.items():
             payload = _json(values)
@@ -248,7 +281,7 @@ class Cache:
             indexes[page] = {"path": path, "bytes": len(payload), "sha256": _hash(payload)}
         row_pages = []
         for offset in range(0, len(dense), 4096):
-            payload = _json(dense[offset:offset + 4096])
+            payload = _json(dense[offset : offset + 4096])
             path = f"index/rows-{len(row_pages):06d}.json"
             target.child(path).verified(payload)
             row_pages.append({"path": path, "bytes": len(payload), "sha256": _hash(payload)})
@@ -265,12 +298,21 @@ class Cache:
             metadata["zero_target_windows"] = targets.count(0)
         source_shards = Counter(row[0] for row in expected if isinstance(row, tuple))
         referenced = {entry["shard"] for entry in completions.values()}
-        definition = {"schema": 1, "manifest": key.key, "dependency": json.loads(key.canonical),
-                      "root": root.url, "rows": len(dense), "inputs": len(expected), "pages": indexes,
-                      "row_pages": row_pages, "shards": {path: shards[path] for path in referenced},
-                      "generation": generation,
-                      "metadata": metadata, "plan": {},
-                      "source_shards": dict(source_shards)}
+        definition = {
+            "schema": 1,
+            "manifest": key.key,
+            "dependency": json.loads(key.canonical),
+            "root": root.url,
+            "rows": len(dense),
+            "inputs": len(expected),
+            "pages": indexes,
+            "row_pages": row_pages,
+            "shards": {path: shards[path] for path in referenced},
+            "generation": generation,
+            "metadata": metadata,
+            "plan": {},
+            "source_shards": dict(source_shards),
+        }
         if plan is not None:
             candidate = Generation(target.url, self._mirror_options(), definition)
             for name, array in plan(candidate).items():
@@ -282,8 +324,9 @@ class Cache:
                 definition["plan"][name] = {"path": path, **target.child(path).verified(encoded.getvalue())}
         payload = _json(definition)
         target.child("manifest.json").verified(payload)
-        reference = _json({"generation": generation, "manifest": key.key,
-                           "sha256": _hash(payload), "bytes": len(payload)})
+        reference = _json(
+            {"generation": generation, "manifest": key.key, "sha256": _hash(payload), "bytes": len(payload)}
+        )
         if current is None:
             root.child("CURRENT").put_if_absent(reference)
         else:
@@ -309,9 +352,13 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
             chain = hashlib.sha256(chain + payload).digest()
             record = json.loads(payload)
             _checked(root, record["shard"])
-            with closing(ArrayRecords((root.child(record["shard"]["path"]).url,), root.storage_options)) as rows:
+            with closing(
+                ArrayRecords((root.child(record["shard"]["path"]).url,), root.storage_options)
+            ) as rows:
                 if sorted(entry["record"] for entry in record["completions"]) != list(range(len(rows))):
-                    raise ValueError(f"cache shard has records without one completion: {record['shard']['path']}")
+                    raise ValueError(
+                        f"cache shard has records without one completion: {record['shard']['path']}"
+                    )
                 for entry in record["completions"]:
                     _completion(entry, rows[entry["record"]])
                     candidate = {**entry, "shard": record["shard"]["path"]}
@@ -319,8 +366,9 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
                     if existing is not None and existing["payload_sha256"] != entry["payload_sha256"]:
                         if not record["volatile"]:
                             raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
-                        _log.warning("volatile cache conflict for row %s; keeping the first sealed copy",
-                                     entry["id"])
+                        _log.warning(
+                            "volatile cache conflict for row %s; keeping the first sealed copy", entry["id"]
+                        )
                     completions.setdefault(entry["id"], candidate)
                     collected.append(entry["id"])
             shards[record["shard"]["path"]] = record["shard"]
@@ -344,8 +392,9 @@ def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> N
         raise ValueError(f"cache accepted-output checksum differs for {entry['id']}")
     if entry["outputs"] != [[entry["id"], index] for index in range(len(accepted))]:
         raise ValueError(f"cache completion output IDs differ for {entry['id']}")
-    if (entry["lengths"] != [_fact(value, "_dew_length") for value in accepted]
-            or entry["valid_targets"] != [_fact(value, "_dew_valid_targets") for value in accepted]):
+    if entry["lengths"] != [_fact(value, "_dew_length") for value in accepted] or entry["valid_targets"] != [
+        _fact(value, "_dew_valid_targets") for value in accepted
+    ]:
         raise ValueError(f"cache completion metadata differs for {entry['id']}")
 
 
@@ -367,20 +416,22 @@ def _source_ids(source: Source, *, streamed: bool = False) -> Iterator[RowId]:
 
 
 class _Writer:
-    def __init__(self, cache: Cache, key: DependencyManifest, *, volatile: bool = False,
-                 expected: int | None = None):
+    def __init__(
+        self, cache: Cache, key: DependencyManifest, *, volatile: bool = False, expected: int | None = None
+    ):
         self.cache, self.root = cache, cache._root(key)
         self.writer = uuid.uuid4().hex
-        fs, root_path, scheme = self.root._backend()
-        self.pin = (LocalRetention.pin(Path(root_path) / "shards" / self.writer)
-                    if scheme == "file" else None)
+        _, root_path, scheme = self.root._backend()
+        self.pin = LocalRetention.pin(Path(root_path) / "shards" / self.writer) if scheme == "file" else None
         self.directory = tempfile.TemporaryDirectory(prefix="dew-spool-")
         self.pool = ThreadPoolExecutor(cache.upload_workers, thread_name_prefix="dew-cache-upload")
         self.lock = threading.Condition(threading.RLock())
         self.futures: list[Future] = []
         self.segments: list[dict] = []
         self.index = sqlite3.connect(Path(self.directory.name) / "inputs.sqlite", check_same_thread=False)
-        self.index.execute("CREATE TABLE inputs (id TEXT PRIMARY KEY, shard INTEGER, offset INTEGER, digest TEXT)")
+        self.index.execute(
+            "CREATE TABLE inputs (id TEXT PRIMARY KEY, shard INTEGER, offset INTEGER, digest TEXT)"
+        )
         self.pending: dict[str, bytes] = {}
         self.pending_bytes = 0
         self.spool_bytes = 0
@@ -394,16 +445,20 @@ class _Writer:
     def _records(self):
         @lru_cache(maxsize=2)
         def opened(shard: int) -> ArrayRecords:
-            return ArrayRecords((self.root.child(f"shards/{self.writer}/{shard:06d}.array_record").url,),
-                                self.cache._mirror_options())
+            return ArrayRecords(
+                (self.root.child(f"shards/{self.writer}/{shard:06d}.array_record").url,),
+                self.cache._mirror_options(),
+            )
+
         return opened
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         row_key = _row_key(row_id)
         with self.lock:
             existing = self.pending.get(row_key)
-            completed = self.index.execute("SELECT shard, offset, digest FROM inputs WHERE id=?",
-                                           (row_key,)).fetchone()
+            completed = self.index.execute(
+                "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
+            ).fetchone()
         if existing is not None:
             values = _decode_outputs(existing)
             if not isinstance(values, tuple):
@@ -423,15 +478,16 @@ class _Writer:
         if not isinstance(outputs, tuple):
             raise TypeError("cache input transform must return a tuple of outputs")
         payload = encode(outputs)
-        transient = any(isinstance(output, _Rejection) and not output.permanent for output in outputs)
+        transient = any(isinstance(output, Rejected) and not output.permanent for output in outputs)
         with self.lock:
             existing = self.pending.get(row_key)
             if existing is not None:
                 if existing != payload:
                     raise ValueError(f"conflicting cache duplicate for row {row_key}")
                 return outputs if transform is not None else outputs[0]
-            completed = self.index.execute("SELECT shard, offset, digest FROM inputs WHERE id=?",
-                                           (row_key,)).fetchone()
+            completed = self.index.execute(
+                "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
+            ).fetchone()
             if completed is not None:
                 if _hash(payload) != completed[2]:
                     if not self.volatile:
@@ -463,7 +519,10 @@ class _Writer:
                     self.spool_bytes += len(payload)
                     if self.pending_bytes >= self.cache.shard_limit:
                         self._flush()
-                    if self.expected is not None and self.index.total_changes + len(self.pending) == self.expected:
+                    if (
+                        self.expected is not None
+                        and self.index.total_changes + len(self.pending) == self.expected
+                    ):
                         self._flush()
                         self.seal_future = self.pool.submit(self.seal)
         return outputs if transform is not None else outputs[0]
@@ -482,13 +541,22 @@ class _Writer:
                 raise ValueError(f"cache pending row {row_id} is not an input completion")
             writer.write(payload)
             accepted = _accepted(outputs)
-            entries.append({"id": row_id, "fanout": len(accepted), "record": offset,
-                            "outputs": [[row_id, index] for index in range(len(accepted))],
-                            "sha256": _outputs_digest(accepted), "payload_sha256": _outputs_digest(outputs),
-                            "lengths": [_fact(value, "_dew_length") for value in accepted],
-                            "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
-                            "rejections": [value.reason for value in outputs if isinstance(value, _Rejection)]})
-            self.index.execute("INSERT INTO inputs VALUES (?, ?, ?, ?)", (row_id, number, offset, _hash(payload)))
+            entries.append(
+                {
+                    "id": row_id,
+                    "fanout": len(accepted),
+                    "record": offset,
+                    "outputs": [[row_id, index] for index in range(len(accepted))],
+                    "sha256": _outputs_digest(accepted),
+                    "payload_sha256": _outputs_digest(outputs),
+                    "lengths": [_fact(value, "_dew_length") for value in accepted],
+                    "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
+                    "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
+                }
+            )
+            self.index.execute(
+                "INSERT INTO inputs VALUES (?, ?, ?, ?)", (row_id, number, offset, _hash(payload))
+            )
         writer.close()
         self.index.commit()
         self.pending.clear()
@@ -510,8 +578,14 @@ class _Writer:
                     if existing != payload:
                         raise ValueError(f"cache retry found conflicting shard {shard}") from None
                     verified = {"bytes": len(payload), "sha256": _hash(payload)}
-                encoded = _json({"schema": 1, "shard": {"path": shard, **verified},
-                                 "completions": entries, "volatile": self.volatile})
+                encoded = _json(
+                    {
+                        "schema": 1,
+                        "shard": {"path": shard, **verified},
+                        "completions": entries,
+                        "volatile": self.volatile,
+                    }
+                )
                 try:
                     self.root.child(segment).verified(encoded)
                 except PreconditionFailed:
@@ -538,9 +612,15 @@ class _Writer:
             payload = _checked(self.root, entry)
             chain = hashlib.sha256(chain + payload).digest()
             rows.extend(completion["id"] for completion in json.loads(payload)["completions"])
-        payload = _json({"count": len(self.segments), "segments": self.segments,
-                      "first": rows[0] if rows else None, "last": rows[-1] if rows else None,
-                      "sha256": chain.hex()})
+        payload = _json(
+            {
+                "count": len(self.segments),
+                "segments": self.segments,
+                "first": rows[0] if rows else None,
+                "last": rows[-1] if rows else None,
+                "sha256": chain.hex(),
+            }
+        )
         try:
             self.root.child(f"segments/{self.writer}/seal.json").put_if_absent(payload)
         except PreconditionFailed:
@@ -562,17 +642,26 @@ class _Writer:
 
 
 class _CachedMap(grain.MapDataset[CachedValue]):
-    def __init__(self, parent: grain.MapDataset, cache: Cache, key: DependencyManifest,
-                 source: Source, transform: Transform | None):
+    def __init__(
+        self,
+        parent: grain.MapDataset,
+        cache: Cache,
+        key: DependencyManifest,
+        source: Source,
+        transform: Transform | None,
+    ):
         super().__init__(parent)
         self.cache, self.key, self.input_source, self.transform = cache, key, source, transform
         self.input_parent = parent
 
     @cached_property
     def writer(self) -> _Writer:
-        writer = _Writer(self.cache, self.key,
-                         volatile=isinstance(self.transform, _Volatile) and self.transform.volatile,
-                         expected=len(self))
+        writer = _Writer(
+            self.cache,
+            self.key,
+            volatile=isinstance(self.transform, _Volatile) and self.transform.volatile,
+            expected=len(self),
+        )
         weakref.finalize(self, writer.close)
         return writer
 
@@ -588,7 +677,9 @@ class _CachedMap(grain.MapDataset[CachedValue]):
     def __getitem__(self, index):
         if isinstance(index, slice):
             return self.slice(index)
-        return self.writer.process(index % len(self), index % len(self), self.input_parent[index], self.transform)
+        return self.writer.process(
+            index % len(self), index % len(self), self.input_parent[index], self.transform
+        )
 
     def close(self) -> None:
         if "writer" in self.__dict__:
@@ -610,8 +701,14 @@ class _CachedReader:
 
 
 class _CachedIter(grain.IterDataset):
-    def __init__(self, parent: grain.IterDataset, cache: Cache, key: DependencyManifest,
-                 shard: Shard, transform: Transform | None):
+    def __init__(
+        self,
+        parent: grain.IterDataset,
+        cache: Cache,
+        key: DependencyManifest,
+        shard: Shard,
+        transform: Transform | None,
+    ):
         super().__init__(parent)
         self.cache, self.key, self.shard, self.transform = cache, key, shard, transform
         self.input_parent = parent
@@ -621,8 +718,14 @@ class _CachedIter(grain.IterDataset):
 
 
 class _CachedIterator(grain.DatasetIterator):
-    def __init__(self, parent: grain.DatasetIterator, cache: Cache, key: DependencyManifest,
-                 shard: Shard, transform: Transform | None):
+    def __init__(
+        self,
+        parent: grain.DatasetIterator,
+        cache: Cache,
+        key: DependencyManifest,
+        shard: Shard,
+        transform: Transform | None,
+    ):
         super().__init__(parent)
         self.parent, self.shard, self.transform = parent, shard, transform
         self.writer = _Writer(cache, key, volatile=isinstance(transform, _Volatile) and transform.volatile)
@@ -688,13 +791,17 @@ class Generation:
         @lru_cache(maxsize=4)
         def opened(page: str) -> dict:
             return json.loads(_checked(Store(self.url, self.storage_options), self.manifest["pages"][page]))
+
         return opened
 
     @cached_property
     def _rows(self):
         @lru_cache(maxsize=2)
         def opened(page: int) -> list[dict]:
-            return json.loads(_checked(Store(self.url, self.storage_options), self.manifest["row_pages"][page]))
+            return json.loads(
+                _checked(Store(self.url, self.storage_options), self.manifest["row_pages"][page])
+            )
+
         return opened
 
     @cached_property
@@ -702,10 +809,14 @@ class Generation:
         @lru_cache(maxsize=2)
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
-            mirrored = root if root.url.startswith("dewcache::") else Store("dewcache::" + root.url,
-                                                                             self.storage_options)
+            mirrored = (
+                root
+                if root.url.startswith("dewcache::")
+                else Store("dewcache::" + root.url, self.storage_options)
+            )
             _checked(mirrored, self.manifest["shards"][path])
             return ArrayRecords((root.child(path).url,), self.storage_options)
+
         return opened
 
     def __getstate__(self) -> Mapping[str, object]:
@@ -740,13 +851,24 @@ class Generation:
     def __len__(self) -> int:
         return self.manifest["rows"]
 
-    def mapped(self, parent: grain.MapDataset, key: DependencyManifest, source: Source,
-               *, transform: Transform | None = None) -> grain.MapDataset:
+    def mapped(
+        self,
+        parent: grain.MapDataset,
+        key: DependencyManifest,
+        source: Source,
+        *,
+        transform: Transform | None = None,
+    ) -> grain.MapDataset:
         return grain.MapDataset.source(_GenerationInputs(self, len(parent), None, transform is not None))
 
-    def streamed(self, reader: Callable[[Shard], grain.IterDataset], key: DependencyManifest,
-                 manifest: ShardManifest, *, transform: Transform | None = None
-                 ) -> Callable[[Shard], grain.IterDataset]:
+    def streamed(
+        self,
+        reader: Callable[[Shard], grain.IterDataset],
+        key: DependencyManifest,
+        manifest: ShardManifest,
+        *,
+        transform: Transform | None = None,
+    ) -> Callable[[Shard], grain.IterDataset]:
         return _GenerationReader(self, transform is not None)
 
     def __getitem__(self, index: int) -> Batch | bytes | None:
@@ -788,8 +910,9 @@ class _GenerationReader:
 
     def __call__(self, shard: Shard) -> grain.IterDataset:
         count = self.generation.manifest["source_shards"][shard.id]
-        return grain.MapDataset.source(_GenerationInputs(self.generation, count, shard.id,
-                                                         self.expanded)).to_iter_dataset()
+        return grain.MapDataset.source(
+            _GenerationInputs(self.generation, count, shard.id, self.expanded)
+        ).to_iter_dataset()
 
 
 @dataclass(frozen=True)
@@ -800,8 +923,11 @@ class _GenerationSource:
         return f"generation:{self.generation.url}"
 
     def snapshot(self) -> Mapping[str, object]:
-        return {"store": "generation", "uri": self.generation.url,
-                "manifest": _hash(_json(self.generation.manifest))}
+        return {
+            "store": "generation",
+            "uri": self.generation.url,
+            "manifest": _hash(_json(self.generation.manifest)),
+        }
 
     def supports(self, read) -> bool:
         return True
@@ -811,19 +937,37 @@ class _GenerationSource:
 
     def manifest(self) -> ShardManifest:
         count = len(self.generation)
-        return ShardManifest(tuple(Shard(f"{self.generation.url}:{start}", self.generation.url, start,
-                                         min(start + 4096, count), min(4096, count - start))
-                                   for start in range(0, count, 4096)), self._read_shard)
+        return ShardManifest(
+            tuple(
+                Shard(
+                    f"{self.generation.url}:{start}",
+                    self.generation.url,
+                    start,
+                    min(start + 4096, count),
+                    min(4096, count - start),
+                )
+                for start in range(0, count, 4096)
+            ),
+            self._read_shard,
+        )
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
-        return grain.MapDataset.source(self.generation)[shard.start:shard.stop].to_iter_dataset()
+        return grain.MapDataset.source(self.generation)[shard.start : shard.stop].to_iter_dataset()
 
     def metadata(self) -> Mapping[str, object]:
         metadata = self.generation.manifest["metadata"]
-        return {"rows": len(self.generation), "accepted_rows": len(self.generation),
-                **({"valid_targets": metadata["valid_targets"],
-                    "zero_target_windows": metadata["zero_target_windows"]}
-                   if "valid_targets" in metadata else {})}
+        return {
+            "rows": len(self.generation),
+            "accepted_rows": len(self.generation),
+            **(
+                {
+                    "valid_targets": metadata["valid_targets"],
+                    "zero_target_windows": metadata["zero_target_windows"],
+                }
+                if "valid_targets" in metadata
+                else {}
+            ),
+        }
 
     def lengths(self) -> np.ndarray | None:
         entry = self.generation.manifest["metadata"].get("lengths")

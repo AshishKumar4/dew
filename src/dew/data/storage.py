@@ -26,6 +26,7 @@ from filelock import FileLock
 from fsspec.implementations.cached import WholeFileCacheFileSystem
 from fsspec.spec import AbstractBufferedFile, AbstractFileSystem
 from huggingface_hub import HfFileSystem
+from huggingface_hub.hf_file_system import HfFileSystemResolvedPath
 from s3fs import S3FileSystem
 
 from dew.records import JSON, json_value
@@ -81,8 +82,11 @@ def _profile(name: str, base: str, options: Mapping[str, object]) -> None:
         implementation.__init__(self, **resolved)
 
     profile_name = f"{name.title()}FileSystem"
-    profile_type = type(profile_name, (implementation,), {"protocol": (name, base),
-                        "__init__": initialize, "__module__": __name__})
+    profile_type = type(
+        profile_name,
+        (implementation,),
+        {"protocol": (name, base), "__init__": initialize, "__module__": __name__},
+    )
     globals()[profile_name] = profile_type
     fsspec.register_implementation(name, profile_type, clobber=True)
 
@@ -98,13 +102,24 @@ class DewDataFileSystem(AbstractFileSystem):
     protocol = ("dewdata", "r2")
     cachable = False
 
-    def __init__(self, *, endpoint_url: str | None = None, token: str | None = None,
-                 token_file: str | None = None, bucket: str = "dew-data", **kwargs):
+    def __init__(
+        self,
+        *,
+        endpoint_url: str | None = None,
+        token: str | None = None,
+        token_file: str | None = None,
+        bucket: str = "dew-data",
+        **kwargs,
+    ):
         super().__init__(**kwargs)
         config = Path(os.environ.get("DEW_DATA_CONFIG", "~/.config/dew/dew-data.json")).expanduser()
         settings = json.loads(config.read_text()) if config.is_file() else {}
-        self.endpoint = (endpoint_url or os.environ.get("DEW_DATA_URL") or settings.get("url")
-                         or "https://dew-data.ashishkmr472.workers.dev").rstrip("/")
+        self.endpoint = (
+            endpoint_url
+            or os.environ.get("DEW_DATA_URL")
+            or settings.get("url")
+            or "https://dew-data.ashishkmr472.workers.dev"
+        ).rstrip("/")
         self.token_file = token_file or settings.get("token_file")
         self.token = token
         self.bucket = bucket
@@ -118,8 +133,15 @@ class DewDataFileSystem(AbstractFileSystem):
             raise ValueError(f"invalid dew-data object key {key!r}")
         return key
 
-    def _request(self, method: str, path: str, *, payload: bytes | None = None,
-                 headers: Mapping[str, str] | None = None, query: str = "") -> tuple[bytes, dict[str, str]]:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        payload: bytes | None = None,
+        headers: Mapping[str, str] | None = None,
+        query: str = "",
+    ) -> tuple[bytes, dict[str, str]]:
         token = self.token or os.environ.get("DEW_DATA_TOKEN")
         if not token and self.token_file:
             token = Path(self.token_file).expanduser().read_text().strip()
@@ -127,8 +149,11 @@ class DewDataFileSystem(AbstractFileSystem):
             raise ValueError("storage profile 'r2' needs DEW_DATA_TOKEN or its configured token_file")
         key = self._key(path)
         request = urllib.request.Request(
-            f"{self.endpoint}/{key}{query}", data=payload, method=method,
-            headers={"Authorization": f"Bearer {token}", "User-Agent": "dew-data/1", **(headers or {})})
+            f"{self.endpoint}/{key}{query}",
+            data=payload,
+            method=method,
+            headers={"Authorization": f"Bearer {token}", "User-Agent": "dew-data/1", **(headers or {})},
+        )
         try:
             with urllib.request.urlopen(request, timeout=120) as response:
                 body = response.read()
@@ -147,8 +172,12 @@ class DewDataFileSystem(AbstractFileSystem):
             return {"name": self.bucket, "size": 0, "type": "directory"}
         _, headers = self._request("HEAD", path)
         normalized = {key.lower(): value for key, value in headers.items()}
-        return {"name": self._strip_protocol(path), "type": "file",
-                "size": int(normalized["content-length"]), "etag": normalized["etag"]}
+        return {
+            "name": self._strip_protocol(path),
+            "type": "file",
+            "size": int(normalized["content-length"]),
+            "etag": normalized["etag"],
+        }
 
     def ls(self, path: str, detail: bool = True, **kwargs):
         prefix = self._key(path.rstrip("/"))
@@ -160,19 +189,21 @@ class DewDataFileSystem(AbstractFileSystem):
             page = json.loads(body)
             for suffix in page["keys"]:
                 key = prefix + suffix
-                tail = key[len(prefix):].lstrip("/")
+                tail = key[len(prefix) :].lstrip("/")
                 first, slash, _ = tail.partition("/")
                 name = f"{self.bucket}/{prefix.rstrip('/') + '/' if prefix else ''}{first}"
-                entries[name] = ({"name": name, "type": "directory", "size": 0} if slash
-                                 else self.info(f"{self.bucket}/{key}"))
+                entries[name] = (
+                    {"name": name, "type": "directory", "size": 0}
+                    if slash
+                    else self.info(f"{self.bucket}/{key}")
+                )
             if page["cursor"] is None:
                 break
             cursor = page["cursor"]
         found = sorted(entries.values(), key=lambda entry: str(entry["name"]))
         return found if detail else [entry["name"] for entry in found]
 
-    def cat_file(self, path: str, start: int | None = None, end: int | None = None,
-                 **kwargs) -> bytes:
+    def cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs) -> bytes:
         headers = {}
         if start is not None or end is not None:
             if start is not None and start < 0:
@@ -195,8 +226,15 @@ class DewDataFileSystem(AbstractFileSystem):
     def makedirs(self, path: str, exist_ok: bool = False) -> None:
         self._key(path.rstrip("/"))
 
-    def _open(self, path: str, mode: str = "rb", block_size: int | None = None,
-              autocommit: bool = True, cache_options: Mapping[str, object] | None = None, **kwargs):
+    def _open(
+        self,
+        path: str,
+        mode: str = "rb",
+        block_size: int | None = None,
+        autocommit: bool = True,
+        cache_options: Mapping[str, object] | None = None,
+        **kwargs,
+    ):
         if mode == "rb":
             return _WorkerReader(self, path, block_size=block_size or 2**20)
         if mode == "wb":
@@ -298,7 +336,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
             os.utime(local, None)
             self._dew_wait += time.monotonic() - started
-            raw = io.FileIO(local, "r")
+            raw = io.FileIO(str(local), "r")
             opened.close()
             return _PinnedReader(raw, pin)
 
@@ -356,8 +394,10 @@ class Store:
             fs = fs.fs
         settings = {"url": self.url, "protocol": fs.protocol}
         if isinstance(fs, S3FileSystem):
-            settings.update(endpoint=fs.client_kwargs.get("endpoint_url") or fs.endpoint_url,
-                            region=fs.client_kwargs.get("region_name"))
+            settings.update(
+                endpoint=fs.client_kwargs.get("endpoint_url") or fs.endpoint_url,
+                region=fs.client_kwargs.get("region_name"),
+            )
         elif isinstance(fs, DewDataFileSystem):
             settings.update(endpoint=fs.endpoint)
         return settings
@@ -416,7 +456,6 @@ class Store:
         if isinstance(fs, DewDataFileSystem):
             payload, headers = fs._request("GET", path)
             return Versioned(payload, next(value for key, value in headers.items() if key.lower() == "etag"))
-        metadata = fs.info(path)
         if isinstance(fs, S3FileSystem):
             from fsspec.asyn import sync
 
@@ -431,15 +470,21 @@ class Store:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
             return sync(loop, read_s3)
         if scheme in ("gs", "gcs"):
+            metadata = fs.info(path)
             version = str(metadata["generation"])
             return Versioned(fs.cat_file(path, generation=version), version)
         if not isinstance(fs, HfFileSystem):
             raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
+        if not isinstance(resolved, HfFileSystemResolvedPath):
+            raise ValueError(f"conditional HF publication needs a repository object URL: {self.url}")
         from huggingface_hub import HfApi
 
-        version = HfApi(token=fs.token).repo_info(resolved.repo_id, repo_type=resolved.repo_type,
-                                                revision=resolved.revision).sha
+        version = (
+            HfApi(token=fs.token)
+            .repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision)
+            .sha
+        )
         if version is None:
             raise ValueError(f"Hub source {self.url} did not resolve to a commit")
         pinned = f"{resolved.repo_type}s/{resolved.repo_id}@{version}/{resolved.path_in_repo}"
@@ -454,8 +499,11 @@ class Store:
     def _put(self, payload: bytes, version: str | None) -> str:
         fs, path, scheme = self._backend()
         if scheme in ("file", "memory"):
-            reservation = (self.retention.reserve(Path(path), len(payload)) if self.retention is not None
-                           else contextlib.nullcontext())
+            reservation = (
+                self.retention.reserve(Path(path), len(payload))
+                if self.retention is not None
+                else contextlib.nullcontext()
+            )
             with reservation, self._locked(path, scheme):
                 previous = hashlib.sha256(fs.cat_file(path)).hexdigest() if fs.exists(path) else None
                 if previous != version:
@@ -475,18 +523,29 @@ class Store:
             return next(value for key, value in response.items() if key.lower() == "etag")
         if isinstance(fs, S3FileSystem):
             from botocore.exceptions import ClientError
+            from fsspec.asyn import sync
 
             bucket, key, _ = fs.split_path(path)
-            try:
-                outcome = fs.call_s3("put_object", Bucket=bucket, Key=key, Body=payload,
-                                    **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}))
-            except FileExistsError as error:
-                raise PreconditionFailed(self.url) from error
-            except ClientError as error:
-                if error.response["ResponseMetadata"]["HTTPStatusCode"] in (409, 412):
-                    raise PreconditionFailed(self.url) from error
-                raise
-            return outcome["ETag"]
+
+            async def put_s3() -> str:
+                client = await fs.set_session()
+                try:
+                    outcome = await client.put_object(
+                        Bucket=bucket,
+                        Key=key,
+                        Body=payload,
+                        **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}),
+                    )
+                except ClientError as error:
+                    if error.response["ResponseMetadata"]["HTTPStatusCode"] in (409, 412):
+                        raise PreconditionFailed(self.url) from error
+                    raise
+                return outcome["ETag"]
+
+            loop = fs.loop
+            if loop is None:
+                raise ValueError("Dew storage needs synchronous S3 filesystem options")
+            return sync(loop, put_s3)
         if scheme in ("gs", "gcs"):
             fs.pipe_file(path, payload, if_generation_match=0 if version is None else int(version))
             fs.invalidate_cache(path)
@@ -497,16 +556,24 @@ class Store:
         if not isinstance(fs, HfFileSystem):
             raise ValueError(f"conditional publication is unavailable for {self.url}")
         resolved = fs.resolve_path(path)
+        if not isinstance(resolved, HfFileSystemResolvedPath):
+            raise ValueError(f"conditional HF publication needs a repository object URL: {self.url}")
         api = HfApi(token=fs.token)
-        parent = version or api.repo_info(resolved.repo_id, repo_type=resolved.repo_type,
-                                          revision=resolved.revision).sha
+        parent = (
+            version
+            or api.repo_info(resolved.repo_id, repo_type=resolved.repo_type, revision=resolved.revision).sha
+        )
         if version is None and fs.exists(path):
             raise PreconditionFailed(self.url)
         try:
-            outcome = api.create_commit(repo_id=resolved.repo_id, repo_type=resolved.repo_type,
-                                       revision=resolved.revision, parent_commit=parent,
-                                       commit_message="Publish data artifact",
-                                       operations=[CommitOperationAdd(resolved.path_in_repo, payload)])
+            outcome = api.create_commit(
+                repo_id=resolved.repo_id,
+                repo_type=resolved.repo_type,
+                revision=resolved.revision,
+                parent_commit=parent,
+                commit_message="Publish data artifact",
+                operations=[CommitOperationAdd(resolved.path_in_repo, payload)],
+            )
         except HfHubHTTPError as error:
             if error.response.status_code in (409, 412):
                 raise PreconditionFailed(self.url) from error

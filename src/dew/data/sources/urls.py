@@ -46,7 +46,11 @@ class Fetch:
                     payload = response.read(self.max_bytes + 1)
                 if len(payload) > self.max_bytes:
                     return Rejected("too_large")
-                outcome: Batch = {**record, self.output: payload, "content_sha256": hashlib.sha256(payload).hexdigest()}
+                outcome: Batch = {
+                    **record,
+                    self.output: payload,
+                    "content_sha256": hashlib.sha256(payload).hexdigest(),
+                }
                 return outcome
             except urllib.error.HTTPError as error:
                 if error.code in (404, 410):

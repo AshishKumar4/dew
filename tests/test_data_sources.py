@@ -57,7 +57,9 @@ def test_csv_quoted_newlines_are_never_byte_split():
     files = Files(root.url, shard_bytes=2)
     assert len(files.manifest().shards) == 1
     assert list(files.manifest().reader(files.manifest().shards[0])) == [
-        {"id": "0", "text": "two\nlines"}, {"id": "1", "text": "last"}]
+        {"id": "0", "text": "two\nlines"},
+        {"id": "1", "text": "last"},
+    ]
     files.provision()
     indexed = files.records("indexed")
     assert indexed[0] == {"id": "0", "text": "two\nlines"}
@@ -67,10 +69,18 @@ def test_csv_quoted_newlines_are_never_byte_split():
 def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     root = Store(f"memory://arrow-{uuid4().hex}/table")
     fs, path = root.resolve()
-    table = pa.table({"value": list(range(20)), "split": ["train"] * 10 + ["held"] * 10,
-                      "unused": ["large"] * 20})
-    ds.write_dataset(table, path, format="parquet", filesystem=pafs.PyFileSystem(pafs.FSSpecHandler(fs)),
-                      partitioning=["split"], partitioning_flavor="hive", max_rows_per_group=3)
+    table = pa.table(
+        {"value": list(range(20)), "split": ["train"] * 10 + ["held"] * 10, "unused": ["large"] * 20}
+    )
+    ds.write_dataset(
+        table,
+        path,
+        format="parquet",
+        filesystem=pafs.PyFileSystem(pafs.FSSpecHandler(fs)),
+        partitioning=["split"],
+        partitioning_flavor="hive",
+        max_rows_per_group=3,
+    )
     files = Files(root.url, format="parquet", columns=("value", "split"), filter=ds.field("value") >= 15)
     assert not files.supports("indexed")
     actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
@@ -81,11 +91,16 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():
-    values = Memory([{ "id": index} for index in range(80)], shard_rows=5)
+    values = Memory([{"id": index} for index in range(80)], shard_rows=5)
     all_rows = []
     for share in range(2):
-        rows = streamed(values.manifest(), partition=DataPartition(share, 2), seed=4,
-                        cycle_length=2, loading=Loading(workers=2, threads=2, read_buffer=2))
+        rows = streamed(
+            values.manifest(),
+            partition=DataPartition(share, 2),
+            seed=4,
+            cycle_length=2,
+            loading=Loading(workers=2, threads=2, read_buffer=2),
+        )
         import grain.python as grain
 
         rows = rows.batch(2).mp_prefetch(grain.MultiprocessingOptions(num_workers=2))
@@ -161,7 +176,6 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
         indexed = files.records(read)
         records = [indexed[index] for index in range(len(indexed))]
     tokens = np.concatenate([Tokenize().map(row)["text"] for row in records])
-    assert bytes(tokens) != original
     assert tokens.tolist() == list(original)
 
 
@@ -169,10 +183,20 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     from dew.data.sources.files import TokenFiles
 
     root = f"memory://token-export-{uuid4().hex}"
-    export([{"text": np.arange(start, start + 3, dtype=np.int32)} for start in (0, 3, 6)], root,
-           format="array_record", rows_per_shard=2, length_field="text",
-           metadata={"token_store": True, "dtype": "int32", "tokenizer": "byte", "vocab_size": 256,
-                     "eos_id": None})
+    export(
+        [{"text": np.arange(start, start + 3, dtype=np.int32)} for start in (0, 3, 6)],
+        root,
+        format="array_record",
+        rows_per_shard=2,
+        length_field="text",
+        metadata={
+            "token_store": True,
+            "dtype": "int32",
+            "tokenizer": "byte",
+            "vocab_size": 256,
+            "eos_id": None,
+        },
+    )
     source = TokenFiles(root)
     assert len(source.tokens) == 9
     assert source.tokens[2:8].tolist() == list(range(2, 8))

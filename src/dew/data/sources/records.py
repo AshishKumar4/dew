@@ -14,8 +14,13 @@ from .codec import decode
 
 
 class ArrayRecords:
-    def __init__(self, urls: Sequence[str], storage_options: Mapping[str, object] | None = None,
-                 *, record_codec: bool = False):
+    def __init__(
+        self,
+        urls: Sequence[str],
+        storage_options: Mapping[str, object] | None = None,
+        *,
+        record_codec: bool = False,
+    ):
         self.urls = tuple(urls)
         self.storage_options = storage_options
         self.record_codec = record_codec
@@ -33,7 +38,9 @@ class ArrayRecords:
                 paths.append("gs://" + path)
             else:
                 options = dict(self.storage_options or {})
-                fs, path = Store(url if url.startswith("dewcache::") else "dewcache::" + url, options).resolve()
+                fs, path = Store(
+                    url if url.startswith("dewcache::") else "dewcache::" + url, options
+                ).resolve()
                 pin = fs.open(path, "rb")
                 if not isinstance(pin.name, str):
                     pin.close()

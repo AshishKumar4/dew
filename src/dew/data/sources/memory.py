@@ -72,8 +72,12 @@ class Memory:
 
     def snapshot(self) -> Mapping[str, object]:
         rows = self.records("indexed")
-        return {"store": "memory", "identity": self.identity, "rows": len(rows),
-                "sha256": fingerprint(rows[index] for index in range(len(rows)))}
+        return {
+            "store": "memory",
+            "identity": self.identity,
+            "rows": len(rows),
+            "sha256": fingerprint(rows[index] for index in range(len(rows))),
+        }
 
     def supports(self, read: Read) -> bool:
         return True
@@ -85,13 +89,22 @@ class Memory:
 
     def manifest(self) -> ShardManifest:
         count = len(self.records("indexed"))
-        return ShardManifest(tuple(Shard(f"memory:{start}", "memory", start,
-                                         min(start + self.shard_rows, count),
-                                         min(self.shard_rows, count - start))
-                                   for start in range(0, count, self.shard_rows)), self._read_shard)
+        return ShardManifest(
+            tuple(
+                Shard(
+                    f"memory:{start}",
+                    "memory",
+                    start,
+                    min(start + self.shard_rows, count),
+                    min(self.shard_rows, count - start),
+                )
+                for start in range(0, count, self.shard_rows)
+            ),
+            self._read_shard,
+        )
 
     def _read_shard(self, shard: Shard) -> grain.IterDataset:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
+        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
 
     def metadata(self) -> Mapping[str, object]:
         return {"rows": len(self.records("indexed"))}
