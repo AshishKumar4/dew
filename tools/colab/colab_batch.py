@@ -224,7 +224,9 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
                 inputs.append((target, hashlib.file_digest(stream, "sha256").hexdigest()))
         if fields.get("preflight"):
             receipt = Path(fields["preflight"]).expanduser()
-            job["preflight"] = preflight.verify(receipt, job["commit"], hardware, job["command"], inputs)
+            request = {"commit": job["commit"], "hardware": hardware, "command": job["command"]}
+            request["runtime"] = fields.get("runtime_pins", "").split()
+            job["preflight"] = preflight.verify(receipt, request, inputs)
         job.update(data_inputs(fields))
         job["resume_key"] = colab_sync.retained_key(
             job["commit"],
