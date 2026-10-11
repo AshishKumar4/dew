@@ -16,7 +16,7 @@ The other is the item's content: its state, or, where the state is empty
 because the request carries its content in the question, as Decision
 Index's rows and half of the recipes' framed rows do, each question's
 instructions. A question and its options alone are never compared: they are
-a task's schema, which every row of a table shares (`DecisionTable` asks one
+a task's schema, which every row of a table shares (a `Decisions` recipe asks one
 question of every row) and a training split shares with its test split by
 design, so rows of different states asked the same question are all kept.
 
