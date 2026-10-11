@@ -933,7 +933,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
 
 
 def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module, gguf_path: Path | None = None
+                      model: nn.Module, gguf_path: Path | None = None, *, source: str
                       ) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
@@ -943,6 +943,10 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     processor files sit beside it (DiffusionGemma publishes a Gemma 4
     processor config beside a text-only model), and a tiny multimodal
     fixture without processor files tokenizes text only.
+
+    `source` names the local directory or the Hub repo at the commit the
+    loader resolved. Only the media branch keeps it: a task's recorded text
+    tokenizer already identifies its text preprocessing.
     """
     processor_files = any((directory / name).exists()
                           for name in ("processor_config.json", "preprocessor_config.json"))
@@ -950,7 +954,7 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
         from transformers import AutoProcessor
         options = {"backend": "pil"} if config.get("model_type") == "gemma3" else {}
         reference = AutoProcessor.from_pretrained(str(directory), local_files_only=True, **options)
-        return Processor(reference, config, record, model.vocab_size)
+        return Processor(reference, config, record, model.vocab_size, source=source)
     if (directory / "tokenizer_config.json").exists() or gguf_path is not None:
         from dew.data.text import load_tokenizer
         # A GGUF repo ships none; the file carries its tokenizer.
@@ -961,6 +965,22 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
             raise TypeError(f"the tokenizer in {directory} lacks a host processor operation")
         return Processor(tokenizer, config, record, model.vocab_size)
     return None
+
+
+def load_processor(source: str, model: nn.Module) -> Processor | None:
+    """Reload the recorded media processor from its source, beside `model`.
+
+    A saved task keeps the local directory or `repo@commit` the processor's
+    files came from, not its translated fields or the task's tokenizer.
+    Reading that source's config and translating its wrapper derives the
+    media geometry again without loading the model's weights.
+    """
+    name, revision = split_revision(source)
+    directory = (Path(name) if os.path.isdir(name) else
+                 sources.snapshot(name, revision, weights=False))
+    config, _ = _source_config(name, directory, revision, None)
+    record = decoders.translate_wrapper_config(config)
+    return source_processor(directory, config, record, model, source=source)
 
 
 def split_revision(source: str) -> tuple[str, str | None]:
@@ -1287,7 +1307,8 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
             # by going back over its source names (`weight_layouts`).
             export_adapter = _derived_weights
     model = _input_quantization(model, layouts, config, grid)
-    processor = source_processor(directory, config, record, model, gguf_path)
+    source = str(name_or_dir) if commit is None else f"{name_or_dir}@{commit}"
+    processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = _generation_config(directory)
 
     # Dew's byte vocabulary has no files: an export names it in

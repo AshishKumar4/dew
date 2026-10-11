@@ -337,7 +337,8 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, head_name, persistent)
     module = TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype))
-    processor = source_processor(directory, config, config, module)
+    source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
+    processor = source_processor(directory, config, config, module, source=source)
     generation_path = directory / "generation_config.json"
     generation_config = json.loads(generation_path.read_text()) if generation_path.exists() else {}
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}

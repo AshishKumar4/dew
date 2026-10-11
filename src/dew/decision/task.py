@@ -174,11 +174,12 @@ class Decide:
         run. `ema` selects the averaged weights, and None uses them when the run kept
         them. `mesh` and `layout` place the weights as the trainer does, `dtype`
         overrides the compute dtype and `param_dtype` the storage dtype.
+        The image processor reloads from its recorded source independently of
+        the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
         from dew.inference.tasks import run_record, saved_model
-        from dew.interop import sources, split_revision
-        from dew.interop.pretrained import source_processor
+        from dew.interop.pretrained import load_processor
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
@@ -195,12 +196,7 @@ class Decide:
         processor = None
         saved_processor = record.get("processor")
         if saved_processor is not None:
-            kept = records.record(saved_processor, "processor")
-            name, revision = split_revision(records.text(tokenizer, "tokenizer"))
-            processor = source_processor(
-                sources.snapshot(name, revision, weights=False),
-                records.record(kept["config"], "processor.config"),
-                records.record(kept["fields"], "processor.fields"), backbone)
+            processor = load_processor(records.text(saved_processor, "processor"), backbone)
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         averaged = Checkpoints(directory).stored(step).get("ema") is not None if ema is None else ema
