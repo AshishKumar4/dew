@@ -30,6 +30,7 @@ from dew.data.dataset import (
     Loading,
     Position,
     Reader,
+    Records,
     _Grouped,
     _WorkerBatches,
     weight_counts,
@@ -467,10 +468,16 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
         return _memory_mixture(pipeline, pipeline.source, counts, groups, training=training)
     source = pipeline.source
     stored = source.records("memory")
-    rows: list[tuple[tuple[int, ...], Record]] = []
     counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline)))
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
+    rows, consumed = _memory_inputs(pipeline, source, stored, counter)
+    return _memory_stages(pipeline, source, stored, rows, consumed, counter, groups, training=training)
+
+
+def _memory_inputs(pipeline: Pipeline, source: Source, stored: Records, counter: CorpusCounts
+                    ) -> tuple[list[tuple[tuple[int, ...], Record]], int]:
+    rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
     artifact_at = next(
         (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Artifact)), None
@@ -510,6 +517,12 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
             else:
                 identifier = source.identifiers[index] if isinstance(source, _Memory) else (index,)
                 rows.append((identifier, value))
+    return rows, consumed
+
+
+def _memory_stages(pipeline: Pipeline, source: Source, stored: Records,
+                    rows: list[tuple[tuple[int, ...], Record]], consumed: int,
+                    counter: CorpusCounts, groups: LengthGroups | None, *, training: bool) -> Pipeline:
     derived: dict[str, str] = {}
     for stage in pipeline.stages[consumed:]:
         if not isinstance(stage, (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)):
@@ -1064,19 +1077,7 @@ class _Build:
             return self.record_stage(rows, lengths, stage, pipeline)
         if isinstance(stage, Shuffle):
             if stage.block_shards is not None:
-                from dew.data.ordering import BlockShuffle, PermutedLengths
-
-                if not isinstance(rows, pygrain.MapDataset) or not isinstance(pipeline.source, _Locality):
-                    raise ValueError(f"block shuffle of {_name(pipeline)} needs an indexed source with physical shard counts")
-                sizes, _ = pipeline.source.locality()
-                if not self.global_order and self.training:
-                    starts = np.cumsum((0, *sizes[:-1]))
-                    sizes = tuple(max(0, math.ceil((int(start) + size - partition.index) / partition.count)
-                                         - math.ceil((int(start) - partition.index) / partition.count))
-                                  for start, size in zip(starts, sizes, strict=True))
-                blocked = BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
-                lengths = None if lengths is None else PermutedLengths(lengths, blocked.index)
-                return blocked, lengths
+                return self.block_shuffle(rows, lengths, stage, pipeline, partition)
             if isinstance(rows, pygrain.MapDataset):
                 rows = (
                     rows.shuffle(stage.seed)
@@ -1152,6 +1153,24 @@ class _Build:
             if self.read != "streamed":
                 raise ValueError("interleave needs a shard-manifest source")
         return rows, lengths
+
+    def block_shuffle(self, rows: Rows, lengths: pygrain.MapDataset | None, stage: Shuffle,
+                      pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
+        from dew.data.ordering import BlockShuffle, PermutedLengths
+
+        if not isinstance(rows, pygrain.MapDataset) or not isinstance(pipeline.source, _Locality):
+            raise ValueError(f"block shuffle of {_name(pipeline)} needs an indexed source with physical shard counts")
+        if stage.block_shards is None:
+            raise ValueError("block shuffle needs a block_shards size")
+        sizes, _ = pipeline.source.locality()
+        if not self.global_order and self.training:
+            starts = np.cumsum((0, *sizes[:-1]))
+            sizes = tuple(max(0, math.ceil((int(start) + size - partition.index) / partition.count)
+                                 - math.ceil((int(start) - partition.index) / partition.count))
+                          for start, size in zip(starts, sizes, strict=True))
+        blocked = BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
+        lengths = None if lengths is None else PermutedLengths(lengths, blocked.index)
+        return blocked, lengths
 
     def record_stage(self, rows: Rows, lengths: pygrain.MapDataset | None,
                      stage: Map | RandomMap | MapWithIndex | Filter | FlatMap,

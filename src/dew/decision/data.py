@@ -2,6 +2,7 @@
 
 import dataclasses
 import functools
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -152,12 +153,13 @@ class _DecisionSource:
     source: Source
     slots: Mapping[str, int] | None = None
     table: ParseTable | None = None
+    descriptor: Mapping[str, object] = field(default_factory=dict)
 
     def describe(self) -> str:
         return self.source.describe()
 
     def snapshot(self) -> Mapping[str, object]:
-        return self.source.snapshot()
+        return {**self.source.snapshot(), **({"descriptor": self.descriptor} if self.descriptor else {})}
 
     def supports(self, read: Read) -> bool:
         return self.source.supports(read)
@@ -234,6 +236,7 @@ class Decisions:
     question: str = "label"
     instructions: str = "Classify the input into the correct category."
     split: str = "train"
+    descriptor: str | None = None
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.sources import Files, Memory, source
@@ -257,6 +260,22 @@ class Decisions:
             if fs.exists(mixture):
                 with fs.open(mixture, "rb") as handle:
                     stated = record(json.load(handle), "mixture.json")
+                pinned: dict[str, JSON] = {}
+                if self.descriptor is not None:
+                    payload = Store(self.descriptor).read()
+                    replaced = record(json.loads(payload), "decision descriptor")
+                    provenance = record(replaced.get("provenance"), "descriptor provenance")
+                    root_manifest = root.child("manifest.sha256").read().decode().strip()
+                    if provenance.get("original_manifest_sha") != root_manifest:
+                        raise ValueError("decision descriptor refers to a different canonical source manifest")
+                    original_files = record(stated.get("files", {}), "original files")
+                    for name, value in record(replaced.get("files", {}), "descriptor files").items():
+                        old = record(original_files.get(name), f"original files.{name}")
+                        for partition, entry in record(value, name).items():
+                            if record(entry, partition).get("sha256") != record(old.get(partition), partition).get("sha256"):
+                                raise ValueError(f"decision descriptor changes raw corpus {name}/{partition}")
+                    stated = replaced
+                    pinned = {"url": self.descriptor, "sha256": hashlib.sha256(payload).hexdigest()}
                 shares = {
                     name: records.number(value, f"weights.{name}")
                     for name, value in record(stated.get("weights", {}), "weights").items()
@@ -295,7 +314,7 @@ class Decisions:
                                 else self.source.rstrip("/") + "/" + records.text(index, "index.path")
                             )
                             dataset = _DecisionSource(
-                                Files(paths, format="jsonl", index=source_index), slots or None
+                                Files(paths, format="jsonl", index=source_index), slots or None, descriptor=pinned
                             )
                             destination.append(Pipeline(dataset, name=name).map(ParseExample()))
                     weights.append(weight)
@@ -310,7 +329,7 @@ class Decisions:
                             Concatenate(
                                 tuple(child.source for child in held if isinstance(child.source, Source))
                             ),
-                            slots or None,
+                            slots or None, descriptor=pinned,
                         )
                     ).map(ParseExample())
                 )

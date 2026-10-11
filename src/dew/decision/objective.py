@@ -254,7 +254,9 @@ class Fit(pygrain.MapTransform):
         return ({"decision": fitted[0], "_dew_length": fitted[0].length,
                  "_dew_truncated": fitted[0].truncated,
                  "_dew_bounds": {"slots": {"questions": len(asked),
-                                             "options": max(len(question.options) for question in asked.values())}}}
+                                             "options": max(len(question.options) for question in asked.values()),
+                                             "total_options": sum(len(question.options) for question in asked.values()),
+                                             "choice_questions": sum(isinstance(question, Choice) for question in asked.values())}}}
                 if self.layout.joint else {"decision_rows": fitted})
 
 
@@ -263,7 +265,9 @@ class QuestionRows:
     def flat_map(self, element: Batch) -> Sequence[Batch]:
         return tuple({"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
                      | {"_dew_bounds": {"slots": {"questions": 1,
-                         "options": max(len(row.example.questions[name].options) for name in row.names)}}}
+                         "options": max(len(row.example.questions[name].options) for name in row.names),
+                         "total_options": sum(len(row.example.questions[name].options) for name in row.names),
+                         "choice_questions": sum(isinstance(row.example.questions[name], Choice) for name in row.names)}}}
                      for row in element["decision_rows"])
 
 
