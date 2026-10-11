@@ -339,6 +339,7 @@ SECTIONS = {function.__name__: function for function in
 def offline(out):
     """Serve the Hub names the cells read from small fixtures, without the network."""
     import datasets
+    import huggingface_hub
     from PIL import Image
     from huggingface_hub import HfApi
     from types import SimpleNamespace
@@ -370,10 +371,13 @@ def offline(out):
         SimpleNamespace(sha="offline-fixture") if repo in builders else info(self, repo, **options))
     datasets.load_dataset_builder = lambda repo, **options: (
         builders[repo] if repo in builders else builder(repo, **options))
-    # One tiny decoder, which reads bytes, stands in for each the cells load.
     decoders = {"Qwen/Qwen3-0.6B", "HuggingFaceTB/SmolLM2-135M-Instruct"}
-    tokenizer_for = dew.data.text.tokenizer_for
-    dew.data.text.tokenizer_for = lambda name: tokenizer_for("byte" if name in decoders else name)
+    tokenizer_files = ROOT / "tests/fixtures/tokenizers/tiny-tools"
+    model_info, snapshot = HfApi.model_info, huggingface_hub.snapshot_download
+    HfApi.model_info = lambda self, repo, **options: (
+        SimpleNamespace(sha="offline-fixture") if repo in decoders else model_info(self, repo, **options))
+    huggingface_hub.snapshot_download = lambda repo, **options: (
+        str(tokenizer_files) if repo in decoders else snapshot(repo, **options))
     load, generation = PretrainedDecoder.load.__func__, PretrainedDecoder.text_generation
 
     def tiny(cls, name, **options):
