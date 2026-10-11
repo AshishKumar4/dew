@@ -12,7 +12,7 @@ import tomllib
 from pathlib import Path
 
 from tools.colab import colab_sync
-from tools.colab.common import command, read, save
+from tools.colab.common import VENV_PYTHON, command, read, save
 
 
 def run_logged(args: list[str], log: Path, *, timeout: float, cwd: Path, env: dict) -> int | str:
@@ -94,7 +94,7 @@ def install(venv: Path, tree: Path, log: Path) -> None:
     extras.append(cuda)
     python = str(venv / "bin/python")
     commands = [
-        ["uv", "venv", "-q", "--seed", "--python", "3.12", str(venv)],
+        ["uv", "venv", "-q", "--seed", "--python", VENV_PYTHON, str(venv)],
         [
             "uv",
             "pip",
