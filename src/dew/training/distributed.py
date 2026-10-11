@@ -708,7 +708,7 @@ class DevicePrefetchIterator:
     """
 
     def __init__(self, iterator: Iterator, mesh: Mesh, depth: int = PREFETCH_DEPTH,
-                 source_state: bytes | None = None):
+                 source_state: bytes | None = None, *, prepare: Callable[[Batch], Batch] | None = None):
         if depth <= 0:
             raise ValueError("prefetch depth must be positive")
         self._iterator: Iterator | None = iter(iterator)
@@ -721,6 +721,7 @@ class DevicePrefetchIterator:
         self._error: BaseException | None = None
         self._cleanup_error: BaseException | None = None
         self.source_state = source_state
+        self._prepare = prepare
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         self._withdraw_exit: Callable[[], None] | None = None
         # No source work may start until the caller owns this object. In
@@ -790,6 +791,8 @@ class DevicePrefetchIterator:
                     if source is not None and not isinstance(state, bytes):
                         state = json.dumps(state).encode()
                 with region("data.place"):
+                    if self._prepare is not None:
+                        batch = self._prepare(batch)
                     placed = shard_batch(mesh, batch)
                 batch = None
                 with region("data.enqueue"):
@@ -815,7 +818,7 @@ class DevicePrefetchIterator:
             except BaseException as error:
                 self._cleanup_error = error
             finally:
-                self._iterator = self._mesh = None
+                self._iterator = self._mesh = self._prepare = None
                 # No bound close method or checkpointable alias may retain a
                 # Grain pipeline after the worker exits.
                 iterator = source = mesh = close = None

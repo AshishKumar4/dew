@@ -1920,7 +1920,7 @@ def test_a_new_steps_failure_on_the_devices_is_raised_as_the_steps(monkeypatch):
         trainer._await_first_run(SimpleNamespace(block_until_ready=refused), 1)
 
     interval = trainer_module._Interval(last_log_time=0.0, last_saved=None)
-    interval.book = interval.fresh = (0.0, 0, SimpleNamespace())
+    interval.book = interval.fresh = (0.0, 0, SimpleNamespace(), 0.0, 0.0)
     monkeypatch.setattr(jax, "device_get", lambda value: refused())
     with pytest.raises(RuntimeError, match="a training step before step 7 failed on the devices"):
         interval.check_finite(7, trainer._display)

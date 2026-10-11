@@ -41,6 +41,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
 
 import jax
+import numpy as np
 from flax import linen as nn, struct
 from flax.typing import PrecisionLike, VariableDict
 
@@ -54,7 +55,8 @@ if TYPE_CHECKING:
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "DecoderTraining", "DenoisingModel",
+__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedLogits",
+           "DecoderTraining", "DenoisingModel",
            "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
            "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
            "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
@@ -85,6 +87,32 @@ class Logits(Protocol):
     """A token model's `[B, S, vocab]` fp32 logits over the whole sequence."""
 
     def logits(self, tokens: jax.Array, *, train: bool = False, **fields: ModelKwarg) -> jax.Array: ...
+
+
+@runtime_checkable
+class Counted(Protocol):
+    """Analytical forward FLOPs summed over real row lengths, on the host.
+
+    A token backbone counts its hidden states, excluding the vocabulary
+    head, which an LM objective adds through `CountedLogits`; a decision
+    objective instead adds its decision head's work. Lookup embeddings,
+    rematerialization and padded tokens are excluded. Geometry beyond one
+    sequence is supplied by the objective through a family's named count.
+    A family that cannot count it raises `MissingFlopsCount`, never HLO.
+    """
+
+    def model_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedLogits(Protocol):
+    """The vocabulary head's forward work, separately from hidden states.
+
+    `lengths` counts predicted real tokens. A plain head contributes
+    2*width*vocabulary per token, whether its matrix is tied or tiled.
+    """
+
+    def logits_flops(self, lengths: np.ndarray) -> float: ...
 
 
 @runtime_checkable
