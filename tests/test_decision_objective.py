@@ -409,9 +409,9 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     second = reloaded("charged twice!", asked, images=images)["team"].probabilities
 
     assert reloaded.processor is not None
+    np.testing.assert_array_equal(second, first)
     assert reloaded.processor.source == str(directory)
     assert objective.inference_record()["processor"] == str(directory)
-    np.testing.assert_array_equal(second, first)
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
 
 
