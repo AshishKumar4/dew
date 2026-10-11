@@ -20,6 +20,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
+from jax.interpreters.ad import JVPTracer
 
 from ..precision import rounded_to
 from ..sharding import seen_whole
@@ -29,7 +30,7 @@ from .generation import first_refusal
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
 ROW_ELEMENTS = 4096
-MAX_PROGRAMS = 128
+MAX_PROGRAMS = 256
 ELEMENT_BLOCK = 1024
 
 
@@ -67,6 +68,8 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
     """Resolve RMSNorm without changing its arithmetic or collecting a split
     feature axis. Float64 and input-dtype statistics belong to XLA."""
     return _selected('rms_norm', implementation, first_refusal(
+        (not any(isinstance(operand, JVPTracer) for operand in (x, scale)),
+         "a JVP trace needs forward-mode derivatives; the RMSNorm kernel implements a VJP"),
         (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
         (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
         (x.dtype in DTYPES and jnp.dtype(dtype) in DTYPES,
@@ -84,6 +87,8 @@ def swiglu_kernel(implementation: str, gate, up) -> str:
     """Resolve the SiLU product only. GeGLU and SiTU keep their own XLA
     arithmetic; broadcasting or mixed operand dtypes also stay there."""
     return _selected('swiglu', implementation, first_refusal(
+        (not any(isinstance(operand, JVPTracer) for operand in (gate, up)),
+         "a JVP trace needs forward-mode derivatives; the SwiGLU kernel implements a VJP"),
         (gate.dtype in DTYPES and gate.dtype == up.dtype,
          "SwiGLU needs matching float32 or bfloat16 operands"),
         (gate.shape == up.shape and bool(gate.shape) and gate.size > 0,

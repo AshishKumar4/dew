@@ -16,7 +16,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn import attention, kernels
 from dew.nn.attention import RMSNorm, forward_mode_attention, rms_normalized, unweighted_rmsnorm
-from dew.nn.moe import gated_product
+from dew.nn.moe import ExpertMLP, gated_product
 
 
 def relative(got, want):
@@ -33,6 +33,8 @@ def compare(functions, operands, seed, labels):
     xla, pallas, exact = functions
     graph = str(jax.make_jaxpr(pallas)(*operands))
     assert "rms_norm_forward" in graph or "swiglu_forward" in graph
+    differentiated = str(jax.make_jaxpr(functools.partial(evaluated, pallas))(operands, seed))
+    assert "rms_norm_backward" in differentiated or "swiglu_backward" in differentiated
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
     actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
     cpu = jax.devices("cpu")[0]
@@ -252,3 +254,34 @@ def test_split_mesh_operands_refuse_both_local_kernels():
         assert norm_swiglu.swiglu_kernel("pallas", x, x) == "xla"
     assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "pallas"
     assert norm_swiglu.swiglu_kernel("pallas", x, x) == "pallas"
+
+
+def test_expert_jvp_refuses_swiglu_once_and_matches_xla(monkeypatch, caplog):
+    x = jax.random.normal(jax.random.key(73), (2, 3, 8))
+    indices = jnp.zeros((2, 3, 1), jnp.int32)
+    weights = jnp.ones((2, 3, 1), jnp.float32)
+    expert = ExpertMLP(num_experts=2, hidden_features=16, out_features=8, implementation="xla")
+    params = expert.init(jax.random.key(74), x, weights, indices)
+
+    def function(x):
+        return expert.apply(params, x, weights, indices)
+
+    reference = jax.jvp(function, (x,), (jnp.ones_like(x),))
+    monkeypatch.setitem(kernels.KERNELS, "swiglu", {"sm80": "pallas"})
+    monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
+    monkeypatch.setattr(kernels.generation, "triton_runs", lambda: True)
+    monkeypatch.setattr(kernels.generation, "_logged", set())
+    for _ in range(2):
+        actual = jax.jvp(function, (x,), (jnp.ones_like(x),))
+        for mine, theirs in zip(actual, reference, strict=True):
+            np.testing.assert_array_equal(mine, theirs)
+    logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
+    assert len(logged) == 1 and "JVP trace" in logged[0]
+
+
+def test_norm_jvp_without_a_context_uses_xla():
+    x = jax.random.normal(jax.random.key(75), (2, 31))
+    xla, pallas, _ = norm_functions(jnp.float32, offset=True, after_cast=True)
+    for mine, theirs in zip(jax.jvp(lambda x: pallas(x, None), (x,), (x,)),
+                            jax.jvp(lambda x: xla(x, None), (x,), (x,)), strict=True):
+        np.testing.assert_array_equal(mine, theirs)
