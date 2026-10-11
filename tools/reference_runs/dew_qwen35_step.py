@@ -86,6 +86,20 @@ def arguments() -> argparse.Namespace:
     return args
 
 
+def backbone(source, revision: str | None, dtype: str):
+    """The unrematerialized text backbone of `source` through the recipe's loader: what this
+    runner trains, and what work.py counts for the full workload."""
+    bundle = Pretrained.load(source, revision=revision, dtype=dtype, param_dtype="float32")
+    model, variables = bundle.model, bundle.variables
+    if isinstance(model, MultimodalTransformer):
+        model = model.language_model
+        variables = {collection: tree["language_model"] for collection, tree in variables.items()
+                     if "language_model" in tree}
+    if not isinstance(model, CausalTransformer) or not model.tie_embeddings:
+        raise RuntimeError("expected the tied-embedding Qwen3.5 text backbone")
+    return model.clone(remat=None), variables
+
+
 def build(args):
     """Load through the recipe's loader and compile the real, unrematted trainer step."""
     if jax.device_count() != 1:
@@ -97,17 +111,8 @@ def build(args):
         raise RuntimeError(f"full reference requires A100-SXM4-80GB, found {device.device_kind}")
     if args.smoke:
         jax.config.update("jax_default_matmul_precision", "highest")
-    bundle = Pretrained.load(args.smoke_fixture if args.smoke else MODEL,
-                             revision=None if args.smoke else REVISION,
-                             dtype="float32" if args.smoke else "bfloat16", param_dtype="float32")
-    model, variables = bundle.model, bundle.variables
-    if isinstance(model, MultimodalTransformer):
-        model = model.language_model
-        variables = {collection: tree["language_model"] for collection, tree in variables.items()
-                     if "language_model" in tree}
-    if not isinstance(model, CausalTransformer) or not model.tie_embeddings:
-        raise RuntimeError("expected the tied-embedding Qwen3.5 text backbone")
-    model = model.clone(remat=None)
+    model, variables = (backbone(args.smoke_fixture, None, "float32") if args.smoke
+                        else backbone(MODEL, REVISION, "bfloat16"))
     batch, sequence = (2, 16) if args.smoke else (8, 3072)
     rows, projection = inputs(args.seed, model.vocab_size, model.emb_features, batch, sequence)
     objective = BackboneLoss(model, variables, projection, sequence)
