@@ -64,13 +64,34 @@ def _round(x, dtype, interpret: bool):
     return rounded_to(x, dtype) if interpret else x.astype(dtype).astype(x.dtype)
 
 
-def _compensated_add(total, correction, value):
+def _compensated_add(total, correction, value, *, interpret: bool):
     """Neumaier's fp32 sum: keep the lost low bits even under cancellation.
 
-    Backward and combine disable FP fusion so a product cannot become an
-    FMA here while the residual still reads its separately rounded value.
+    Explicit add/sub rounding protects the residual from compiler fusion
+    and cancellation rewrites. CPU interpretation uses optimizer barriers;
+    Triton uses round-to-nearest instructions, not a compiler-only option.
     """
-    merged = total + value
+    if not interpret:
+        return plgpu.elementwise_inline_asm(
+            """{
+            .reg .f32 a, b, e, f, s, c;
+            .reg .pred p;
+            add.rn.f32 s, $2, $4;
+            abs.f32 a, $2;
+            abs.f32 b, $4;
+            setp.ge.f32 p, a, b;
+            sub.rn.f32 e, $2, s;
+            add.rn.f32 e, e, $4;
+            sub.rn.f32 f, $4, s;
+            add.rn.f32 f, f, $2;
+            selp.f32 e, e, f, p;
+            add.rn.f32 c, $3, e;
+            mov.f32 $0, s;
+            mov.f32 $1, c;
+            }""", constraints="=f,=f,f,f,f", args=(total, correction, value),
+            dtype=(jnp.float32, jnp.float32), is_pure=True, pack=1)
+    value = jax.lax.optimization_barrier(value)
+    merged = jax.lax.optimization_barrier(total + value)
     lost = jnp.where(jnp.abs(total) >= jnp.abs(value),
                      (total - merged) + value, (value - merged) + total)
     return merged, correction + lost
@@ -185,7 +206,7 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, co
                 normalized = value * rstd
                 if after_cast:
                     normalized = _round(normalized, dy_ref.dtype, interpret)
-                accumulated = _compensated_add(*accumulated, cotangent * normalized)
+                accumulated = _compensated_add(*accumulated, cotangent * normalized, interpret=interpret)
         return accumulated
 
     partial, correction = jax.lax.fori_loop(0, pl.cdiv(rows, groups * row_block), block,
@@ -196,14 +217,15 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, co
         plgpu.store(correction_ref.at[group, columns], correction, mask=columns < width)
 
 
-def _rms_scale_reduce(partial_ref, correction_ref, scale_ref):
+def _rms_scale_reduce(partial_ref, correction_ref, scale_ref, *, interpret: bool):
     """Combine both fp32 parts before the only final cast to the scale dtype."""
     groups, width = partial_ref.shape
     columns = pl.program_id(0) * SCALE_BLOCK + jnp.arange(SCALE_BLOCK)
     def group(i, accumulated):
         high = plgpu.load(partial_ref.at[i, columns], mask=columns < width, other=0)
         low = plgpu.load(correction_ref.at[i, columns], mask=columns < width, other=0)
-        return _compensated_add(*_compensated_add(*accumulated, high), low)
+        added = _compensated_add(*accumulated, high, interpret=interpret)
+        return _compensated_add(*added, low, interpret=interpret)
     total, correction = jax.lax.fori_loop(0, groups, group,
                                          (jnp.zeros(columns.shape, jnp.float32),
                                           jnp.zeros(columns.shape, jnp.float32)))
@@ -244,13 +266,13 @@ def _rms_bwd(epsilon: float, dtype, offset: bool, after_cast: bool, interpret: b
         functools.partial(_rms_backward, offset=offset, after_cast=after_cast, interpret=interpret),
         grid=(groups,),
         out_shape=(jax.ShapeDtypeStruct((rows, width), x.dtype), partial_shape, partial_shape),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1, enable_fp_fusion=False),
+        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
         interpret=interpret, name="rms_norm_backward",
     )(x.reshape(rows, width), scale, inverse, dy.reshape(rows, width))
     dscale = None if scale is None else pl.pallas_call(
-        _rms_scale_reduce, grid=(pl.cdiv(width, SCALE_BLOCK),),
+        functools.partial(_rms_scale_reduce, interpret=interpret), grid=(pl.cdiv(width, SCALE_BLOCK),),
         out_shape=jax.ShapeDtypeStruct((width,), scale.dtype),
-        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1, enable_fp_fusion=False),
+        compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
         interpret=interpret, name="rms_norm_scale_backward",
     )(partial, correction)
     return dx.reshape(x.shape), dscale
