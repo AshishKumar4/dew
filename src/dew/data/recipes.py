@@ -615,6 +615,15 @@ class Preferences:
         return train, held, ()
 
 
+TINY_SHAKESPEARE = "https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt"
+
+
+def tiny_shakespeare(**fields) -> Text:
+    """Karpathy's tiny Shakespeare corpus as a byte-level `Text` recipe, one
+    line a document, the corpus the language-model examples train on. Any
+    `Text` field overrides the defaults."""
+    return dataclasses.replace(Text(source=TINY_SHAKESPEARE), **fields)
+
 @dataclasses.dataclass(frozen=True)
 class Augment:
     flip: bool = True
