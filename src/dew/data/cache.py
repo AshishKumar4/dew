@@ -931,11 +931,7 @@ class Generation:
         @lru_cache(maxsize=2)
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
-            mirrored = (
-                root
-                if root.url.startswith("dewcache::")
-                else Store("dewcache::" + root.url, self.storage_options)
-            )
+            mirrored = root.cached()
             _checked(mirrored, self.manifest["shards"][path])
             return ArrayRecords((root.child(path).url,), self.storage_options)
 
