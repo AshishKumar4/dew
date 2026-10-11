@@ -50,22 +50,17 @@ def recipe(name: str):
 
 
 def backbone(directory: Path) -> Path:
-    """The tiny Qwen 3.5's decoder at the port's widths, freshly initialized, written in its Hugging
-    Face layout with its tokenizer. The text config is written as it is: Dew derives none for a
-    Gated DeltaNet hybrid (`refuse_lossy_export`)."""
-    import jax
-    import numpy as np
+    """The tiny Qwen 3.5's decoder at the port's widths, drawn by transformers' own initializer and
+    saved in its layout with the tiny model's tokenizer: Dew writes no Gated DeltaNet hybrid's
+    checkpoint of its own (`refuse_lossy_export`). The multi-token-prediction head stays off, as
+    transformers' causal LM builds none."""
+    import torch
+    from transformers.models.qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5TextConfig
 
-    from dew.interop.hf_decoders import export_decoder_weights, translate_config
-    from dew.interop.safetensors_io import save_hf_layout
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.registry import from_record
-
-    text = {**json.loads((QWEN / "config.json").read_text())["text_config"], **WIDTHS,
-            "architectures": ["Qwen3_5ForCausalLM"]}
-    model = from_record(CausalTransformer, {**translate_config(text), "dtype": "float32"})
-    variables = model.init(jax.random.key(0), np.zeros((1, 4), np.int32))
-    save_hf_layout(export_decoder_weights(model, variables, text), text, directory)
+    text = json.loads((QWEN / "config.json").read_text())["text_config"]
+    text = {name: value for name, value in text.items() if not name.startswith("mtp_")}
+    torch.manual_seed(0)
+    Qwen3_5ForCausalLM(Qwen3_5TextConfig.from_dict({**text, **WIDTHS})).save_pretrained(directory)
     for asset in [*QWEN.glob("tokenizer*"), QWEN / "chat_template.jinja"]:
         (directory / asset.name).write_bytes(asset.read_bytes())
     return directory
