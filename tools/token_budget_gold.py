@@ -5,10 +5,13 @@ from __future__ import annotations
 
 import argparse
 import collections
+import cProfile
 import hashlib
 import itertools
 import json
 import time
+import pstats
+import io
 from pathlib import Path
 
 import numpy as np
@@ -31,6 +34,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batches", type=int, default=64)
     parser.add_argument("--micro-tokens", type=int, default=24576)
+    parser.add_argument("--profile-open", type=Path)
     args = parser.parse_args()
     pinned = snapshot_download("Qwen/Qwen3.5-2B", revision="15852e8c16360a2fea060d615a32b45270f8a8fc",
                                allow_patterns=["*.json", "*.jinja", "*.model", "*.txt"])
@@ -40,8 +44,15 @@ def main() -> None:
                           mlp_features=16), tokenizer=tokenizer, specials=Specials.of(tokenizer),
         layout=JointLayout(max_len=3072, max_state_tokens=1024), shuffle_options=True)
     started = time.monotonic()
-    dataset = load(Decisions(args.root), tokens=args.micro_tokens, read="indexed", objective=objective.data(),
-                   seed=0, loading=Loading(workers=0, threads=4, read_buffer=16))
+    profiler = cProfile.Profile()
+    with profiler:
+        dataset = load(Decisions(args.root), tokens=args.micro_tokens, read="indexed", objective=objective.data(),
+                       seed=0, loading=Loading(workers=0, threads=4, read_buffer=16))
+    if args.profile_open is not None:
+        profiler.dump_stats(args.profile_open)
+        report = io.StringIO()
+        pstats.Stats(profiler, stream=report).sort_stats("cumulative").print_stats(20)
+        args.profile_open.with_suffix(".txt").write_text(report.getvalue())
     opened = time.monotonic()
     reader = dataset.train(DataPartition())
     shapes = collections.Counter()
