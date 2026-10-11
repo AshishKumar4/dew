@@ -38,6 +38,19 @@ type Value = (
 )
 
 
+def _dtype(value: np.ndarray) -> dict[str, str]:
+    if value.dtype.fields is None and np.dtype(value.dtype.str) != value.dtype:
+        return {"dtype": value.dtype.name}
+    return {}
+
+
+def _array(node: dict, leaves: Mapping[str, bytes], kind: str) -> np.ndarray:
+    value = np.load(io.BytesIO(leaves[str(node[kind])]), allow_pickle=False)
+    if "dtype" in node:
+        value = value.view(np.dtype(node["dtype"]))
+    return value
+
+
 def pack_dict_of_byte_arrays(values: Mapping[str, bytes]) -> bytes:
     packed = bytearray()
     for key, value in values.items():
@@ -74,9 +87,11 @@ def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
     if isinstance(value, np.generic):
         key = str(len(leaves))
         file = io.BytesIO()
-        np.save(file, np.asarray(value), allow_pickle=False)
+        array = np.asarray(value)
+        dtype = _dtype(array)
+        np.save(file, array.view(np.dtype(array.dtype.str)) if dtype else array, allow_pickle=False)
         leaves[key] = file.getvalue()
-        return {"scalar": key}
+        return {"scalar": key, **dtype}
     if isinstance(value, float) and not math.isfinite(value):
         return {"float": value.hex()}
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -96,9 +111,10 @@ def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
         if value.dtype.hasobject:
             return {"object_array": {"shape": list(value.shape), "values": _tree(value.tolist(), leaves)}}
         file = io.BytesIO()
-        np.save(file, value, allow_pickle=False)
+        dtype = _dtype(value)
+        np.save(file, value.view(np.dtype(value.dtype.str)) if dtype else value, allow_pickle=False)
         leaves[key] = file.getvalue()
-        return {"array": key}
+        return {"array": key, **dtype}
     if isinstance(value, Mapping):
         if not all(isinstance(key, str) for key in value):
             raise TypeError("artifact mappings need string keys")
@@ -135,11 +151,11 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
     if "float" in node:
         return float.fromhex(node["float"])
     if "scalar" in node:
-        return np.load(io.BytesIO(leaves[str(node["scalar"])]), allow_pickle=False)[()]
+        return _array(node, leaves, "scalar")[()]
     if "bytes" in node:
         return leaves[str(node["bytes"])]
     if "array" in node:
-        return np.load(io.BytesIO(leaves[str(node["array"])]), allow_pickle=False)
+        return _array(node, leaves, "array")
     if "object_array" in node:
         value = node["object_array"]
         if not isinstance(value, dict) or not isinstance(value.get("shape"), list):

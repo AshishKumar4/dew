@@ -451,6 +451,19 @@ def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
     assert actual["messages"].tolist() == row["messages"].tolist()
 
 
+def test_artifact_codec_preserves_extended_numpy_dtypes():
+    import ml_dtypes
+
+    from dew.data.sources.codec import decode, encode
+
+    values = {"array": np.asarray([1.0, 2.5], dtype=ml_dtypes.bfloat16), "scalar": ml_dtypes.bfloat16(3.0)}
+    restored = decode(encode(values))
+    assert restored["array"].dtype == values["array"].dtype
+    assert restored["scalar"].dtype == values["scalar"].dtype
+    assert np.array_equal(restored["array"], values["array"])
+    assert restored["scalar"] == values["scalar"]
+
+
 def test_empty_shard_cycles_exhaust_a_named_search_budget():
     root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
     root.write(b" \n\n")
