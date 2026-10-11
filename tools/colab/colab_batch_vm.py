@@ -298,12 +298,16 @@ class Batch:
         timeout = max(1800, 3 * 60 * job["minutes"])
         if job.get("boundary_control"):
             from tools.colab.boundary import run
+
             def update(**fields):
                 status.update(fields)
                 self.save_job(job, status)
+
             code = run(job, home, tree, env, timeout, run_logged, update)
         else:
-            code = run_logged(["bash", "-c", job["command"]], home / "run.log", cwd=tree, env=env, timeout=timeout)
+            code = run_logged(
+                ["bash", "-c", job["command"]], home / "run.log", cwd=tree, env=env, timeout=timeout
+            )
         status.update(exit=code, seconds=round(time.time() - began), command_finished_at=time.time())
         self.save_job(job, status)
         colab_sync.pack_outputs(
