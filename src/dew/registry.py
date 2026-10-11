@@ -337,7 +337,17 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT:
+@overload
+def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT: ...
+
+
+@overload
+def from_record(annotation: types.UnionType | types.TypeAliasType, value: Configured, *,
+                dtypes: bool = True) -> object: ...
+
+
+def from_record(annotation: type | types.UnionType | types.TypeAliasType, value: Configured, *,
+                dtypes: bool = True) -> object:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
@@ -351,7 +361,9 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     """
     with _reading(value):
         built = _rebuilt(annotation, value, dtypes=dtypes)
-    witness: type[ValueT] = typing.get_origin(annotation) or annotation
+    if isinstance(annotation, (types.UnionType, types.TypeAliasType)):
+        return built
+    witness = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
                          f"not the {witness.__name__} the field declares")
