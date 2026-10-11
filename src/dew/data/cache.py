@@ -86,7 +86,7 @@ def _outputs_digest(outputs: Sequence[Record]) -> str:
 
 
 def _accepted(outputs: Sequence[Record]) -> Outputs:
-    return tuple(value for value in outputs if not isinstance(value, Rejected))
+    return tuple(value for value in outputs if value is not None and not isinstance(value, Rejected))
 
 
 @runtime_checkable
@@ -106,7 +106,7 @@ def _decode_outputs(encoded: bytes) -> Outputs:
     return tuple(outputs)
 
 
-def _fact(value: Record, name: str) -> int | None:
+def _fact(value: Batch | bytes | Rejected | None, name: str) -> int | None:
     if not isinstance(value, Mapping) or name not in value:
         return None
     stated = value[name]
@@ -534,6 +534,7 @@ class _Writer:
         path = Path(self.directory.name) / f"{number}.array_record"
         writer = ArrayRecordWriter(str(path), "group_size:1")
         entries = []
+        positions = []
         used = self.pending_bytes
         for offset, (row_id, payload) in enumerate(self.pending.items()):
             outputs = _decode_outputs(payload)
@@ -554,14 +555,44 @@ class _Writer:
                     "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
                 }
             )
-            self.index.execute(
-                "INSERT INTO inputs VALUES (?, ?, ?, ?)", (row_id, number, offset, _hash(payload))
-            )
+            positions.append((row_id, number, offset, _hash(payload)))
         writer.close()
+        actual = path.stat().st_size
+        if not self._reserve_shard(actual, used, path):
+            self.pending.clear()
+            self.pending_bytes = 0
+            return
+        self.index.executemany("INSERT INTO inputs VALUES (?, ?, ?, ?)", positions)
         self.index.commit()
         self.pending.clear()
         self.pending_bytes = 0
-        self.futures.append(self.pool.submit(self._upload, number, path, entries, used))
+        self.futures.append(self.pool.submit(self._upload, number, path, entries, actual))
+
+    def _reserve_shard(self, actual: int, provisional: int, path: Path) -> bool:
+        if actual > self.cache.spool_limit:
+            path.unlink()
+            self.spool_bytes -= provisional
+            if self.cache.on_full == "block":
+                raise ValueError(
+                    f"closed cache shard requires {actual} bytes, exceeding "
+                    f"spool_bytes={self.cache.spool_limit}"
+                )
+            self.admitting = False
+            _log.warning("cache %s stopped admission: one shard exceeds its spool budget", self.root.url)
+            return False
+        while self.spool_bytes - provisional + actual > self.cache.spool_limit:
+            if self.cache.on_full == "stop":
+                path.unlink()
+                self.spool_bytes -= provisional
+                self.admitting = False
+                _log.warning("cache %s stopped admission at its spool budget", self.root.url)
+                return False
+            self.lock.wait(0.1)
+            for future in self.futures:
+                if future.done():
+                    future.result()
+        self.spool_bytes += actual - provisional
+        return True
 
     def _upload(self, number: int, path: Path, entries: list[dict], used: int) -> dict:
         payload = path.read_bytes()
