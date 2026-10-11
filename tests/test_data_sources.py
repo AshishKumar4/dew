@@ -3,6 +3,7 @@
 import io
 import json
 import tarfile
+from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
@@ -27,6 +28,23 @@ def test_memory_columns_snapshot_changes_with_content():
     assert [row["x"] for row in rows] == list(range(5))
     with pytest.raises(ValueError, match="different row counts"):
         len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
+    assert Memory([{"x": np.int16(4)}]).snapshot() != Memory([{"x": np.int32(4)}]).snapshot()
+
+
+def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
+    import tensorflow_datasets as tfds
+
+    from dew.data.sources import TFDS
+
+    root = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    decoded = TFDS("dew_images", path=str(root))
+    raw = TFDS("dew_images", path=str(root), decoders={"image": tfds.decode.SkipDecoding()})
+    assert decoded.metadata()["rows"] == 16
+    assert decoded.metadata()["class_names"]["label"] == tuple(
+        (root / "label.labels.txt").read_text().splitlines()
+    )
+    assert decoded.snapshot() != raw.snapshot()
+    assert isinstance(raw.records("indexed")[0]["image"], bytes)
 
 
 def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():

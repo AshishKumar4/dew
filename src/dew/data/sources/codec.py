@@ -71,6 +71,12 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
 
 
 def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
+    if isinstance(value, np.generic):
+        key = str(len(leaves))
+        file = io.BytesIO()
+        np.save(file, np.asarray(value), allow_pickle=False)
+        leaves[key] = file.getvalue()
+        return {"scalar": key}
     if isinstance(value, float) and not math.isfinite(value):
         return {"float": value.hex()}
     if value is None or isinstance(value, (bool, int, float, str)):
@@ -82,8 +88,6 @@ def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
         return {"timedelta": [value.days, value.seconds, value.microseconds]}
     if isinstance(value, Decimal):
         return {"decimal": str(value)}
-    if isinstance(value, np.generic):
-        return _tree(value.item(), leaves)
     if isinstance(value, (np.ndarray, bytes)):
         key = str(len(leaves))
         if isinstance(value, bytes):
@@ -128,6 +132,8 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
         return Decimal(node["decimal"])
     if "float" in node:
         return float.fromhex(node["float"])
+    if "scalar" in node:
+        return np.load(io.BytesIO(leaves[str(node["scalar"])]), allow_pickle=False)[()]
     if "bytes" in node:
         return leaves[str(node["bytes"])]
     if "array" in node:
