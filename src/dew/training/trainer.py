@@ -48,7 +48,7 @@ from dew.data.dataset import (
     stream_endless,
     stream_identity,
 )
-from dew.nn.kernels.generation import assumed, measured_kernel
+from dew.nn.kernels.generation import assumed, gpu_mesh, measured_kernel
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -91,7 +91,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
-from dew.training._lowering import Lowered, gpu_mesh
+from dew.training._lowering import Lowered
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import (
     DevicePrefetchIterator,
