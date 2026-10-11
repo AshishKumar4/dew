@@ -21,6 +21,8 @@ from dew.nn.kernels.generation import triton_runs
 from dew.nn.moe import ExpertMLP, exact_gelu, expert_dispatch, expert_projection
 from dew.training import MeshSpec
 
+pytestmark = pytest.mark.kernel
+
 # The multi-device layouts need the eight simulated CPU devices conftest
 # configures; a 1x1 mesh runs on the GPU lane's single device, where the
 # contract meets cuBLAS.
