@@ -10,11 +10,26 @@ from typing import Literal
 
 import grain.python as grain
 import numpy as np
+from numpy.typing import ArrayLike
 
 from dew.data.dataset import Batch
 from dew.data.image_codec import decode_image
 from dew.data.images import Augment, as_rgb, augment_image, import_opencv, resize_image
 from dew.data.pipeline import Rejected
+
+
+def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLike:
+    """An Arrow or Hugging Face image value's encoded bytes, read through
+    `Store` when it holds only a path, and any other value as it is."""
+    if not isinstance(image, Mapping):
+        return image
+    body = image.get("bytes")
+    if isinstance(body, bytes):
+        return body
+    from dew.data.storage import Store
+    from dew.records import text
+
+    return Store(text(image.get("path"), "image.path")).read()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -25,16 +40,7 @@ class DecodeImage(grain.MapTransform):
 
     def map(self, element: Batch) -> Batch | Rejected:
         import_opencv()
-        image = element[self.field]
-        if isinstance(image, Mapping):
-            body = image.get("bytes")
-            if isinstance(body, bytes):
-                image = body
-            else:
-                from dew.data.storage import Store
-                from dew.records import text
-
-                image = Store(text(image.get("path"), "image.path")).read()
+        image = _payload(element[self.field])
         if isinstance(image, bytes):
             try:
                 image = decode_image(image, at_least=self.at_least)
@@ -215,15 +221,7 @@ class ImageRecord(grain.RandomMapTransform):
         if self.classes and label is None:
             raise ValueError("caption classes need an image label")
         described = label if not self.classes else self.classes[int(element["label"])]
-        if isinstance(image, Mapping):
-            body = image.get("bytes")
-            if isinstance(body, bytes):
-                image = body
-            else:
-                from dew.data.storage import Store
-                from dew.records import text
-
-                image = Store(text(image.get("path"), "image.path")).read()
+        image = _payload(image)
         if self.templates:
             chosen = self.templates[int(rng.integers(len(self.templates)))]
             caption = chosen.format(described, label=described)
