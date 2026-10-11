@@ -199,3 +199,69 @@ def test_packed_jobs_cannot_restore_different_datasets_over_one_target(tmp_path,
     second = {**common, "data_sources": [{"target": "/content/data/sub", "manifest_sha256": "a" * 64}]}
     with pytest.raises(ValueError, match="overlapping"):
         colab_batch.stage_inputs({"jobs": [first, second], "uploads": {}}, tmp_path)
+
+
+def assembly_manifest(objects, *, bad_order=False, missing=False):
+    chunks = {"split=train/part.0": b"first\n", "split=train/part.1": b"second\n"}
+    for name, value in chunks.items():
+        objects["decision/mix-v3/" + name] = value
+    manifest = {"schema": 1, "name": "generic-dataset", "files": [
+        {"path": name, "bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+        for name, value in chunks.items()], "assemblies": [{"path": "logical.jsonl", "bytes": 13,
+        "sha256": hashlib.sha256(b"first\nsecond\n").hexdigest(),
+        "shards": ["missing"] if missing else list(reversed(chunks)) if bad_order else list(chunks)}]}
+    body = json.dumps(manifest).encode()
+    identity = hashlib.sha256(body).hexdigest()
+    key = "decision/mix-v3/manifests/" + identity + ".json"
+    objects[key] = body
+    return manifest, identity, key
+
+
+def test_create_only_manifest_and_ordered_shards_materialize_original_layout(tmp_path, service):
+    cache, objects, _, calls = service
+    manifest, identity, key = assembly_manifest(objects)
+    restored = cache.restore("decision/mix-v3", identity, tmp_path / "vm", manifest_key=key)
+    assert restored == manifest
+    assert (tmp_path / "vm/logical.jsonl").read_bytes() == b"first\nsecond\n"
+    assert calls[0] == key and all("/manifests/split=" not in call for call in calls)
+    assert (tmp_path / "vm/split=train/part.0").read_bytes() == b"first\n"
+
+
+def test_wrong_shard_order_never_overwrites_existing_logical_file(tmp_path, service):
+    cache, objects, _, _ = service
+    _, identity, key = assembly_manifest(objects, bad_order=True)
+    target = tmp_path / "vm"
+    target.mkdir()
+    (target / "logical.jsonl").write_bytes(b"old")
+    with pytest.raises(ValueError, match="checksum"):
+        cache.restore("decision/mix-v3", identity, target, manifest_key=key)
+    assert (target / "logical.jsonl").read_bytes() == b"old"
+    assert list(target.glob(".logical*")) == []
+
+
+def test_missing_shard_is_rejected_before_any_dataset_download(tmp_path, service):
+    cache, objects, _, calls = service
+    _, identity, key = assembly_manifest(objects, missing=True)
+    with pytest.raises(ValueError, match="declared physical"):
+        cache.restore("decision/mix-v3", identity, tmp_path / "vm", manifest_key=key)
+    assert calls == [key]
+
+
+def test_assembly_destination_cannot_replace_a_physical_shard(tmp_path, service):
+    cache, objects, _, calls = service
+    manifest, _, _ = assembly_manifest(objects)
+    manifest["assemblies"][0]["path"] = manifest["files"][0]["path"]
+    body = json.dumps(manifest).encode()
+    key = "decision/mix-v3/manifest.json"
+    objects[key] = body
+    with pytest.raises(ValueError, match="collides"):
+        cache.restore("decision/mix-v3", hashlib.sha256(body).hexdigest(), tmp_path / "vm")
+    assert calls == [key]
+
+
+def test_hive_key_matches_worker_grammar_without_allowing_parent_segments(tmp_path, service):
+    cache, objects, _, _ = service
+    objects["split=train/x..y"] = b"metadata"
+    assert cache.get("split=train/x..y").content == b"metadata"
+    with pytest.raises(ValueError, match="key"):
+        cache.get("split=train/../escape")
