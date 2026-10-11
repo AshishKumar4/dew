@@ -22,6 +22,7 @@ import numpy as np
 
 from dew.artifacts import Artifact, Decisions
 from dew.decision.metrics import Answered
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
 
 
@@ -67,8 +68,13 @@ class ScoringRule(ABC):
         return mean_of_totals(accumulated)
 
 
+def _masked(logits: jax.Array, options: jax.Array) -> jax.Array:
+    """The logits of the real options, at least float32, -inf elsewhere."""
+    return jnp.where(options, logits.astype(at_least_fp32(logits.dtype)), -jnp.inf)
+
+
 def _probabilities(logits: jax.Array, options: jax.Array) -> jax.Array:
-    return jax.nn.softmax(jnp.where(options, logits.astype(jnp.float32), -jnp.inf), axis=-1)
+    return jax.nn.softmax(_masked(logits, options), axis=-1)
 
 
 @dataclass(frozen=True)
@@ -78,7 +84,7 @@ class LogLoss(ScoringRule):
     name = "log_loss"
 
     def charge(self, logits, target, options, ordinal):
-        log_p = jax.nn.log_softmax(jnp.where(options, logits.astype(jnp.float32), -jnp.inf), axis=-1)
+        log_p = jax.nn.log_softmax(_masked(logits, options), axis=-1)
         return -jnp.sum(jnp.where(target > 0, target * log_p, 0.0), axis=-1)
 
 

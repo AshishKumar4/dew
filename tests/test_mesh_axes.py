@@ -710,7 +710,7 @@ def test_the_causal_convs_taps_gradient_under_a_partly_replicated_batch():
     from dew.nn.linear import causal_conv1d
 
     rng = np.random.default_rng(0)
-    x, cotangent = (rng.normal(size=(4, 16, 8)).astype(np.float32) for _ in range(2))
+    x, cotangent = (rng.normal(size=(4, 8, 16)).astype(np.float32) for _ in range(2))
     taps = rng.normal(size=(16, 4)).astype(np.float32)
 
     # The conv alone: its taps' gradient sums products of x and the
