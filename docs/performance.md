@@ -16,6 +16,71 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
     --learning-rate <lr> --out <json>
 ```
 
+## Model FLOPs, hardware FLOPs and real tokens
+
+`train/mfu` is `3 * sum(model_forward_flops) / (non_compile_seconds * aggregate_peak)`.
+The forward work is analytical, not inferred from HLO: `Counted.model_flops(lengths)`
+receives the real lengths of independent rows or packed segments. One multiply-add
+counts as two operations. A dense projection contributes `2 * in * out` per real
+token; QK and AV together contribute `2 * heads * head_dim * L²` for causal
+attention, twice that for non-causal attention. Lookups are excluded; every
+matmul is counted, including patch input projections and per-row timestep or
+conditioning MLPs. Padding and rematerialization are excluded. Every executed
+loop pass counts once.
+
+GDN and KDA contribute `6 * H * Dk * Dv` per token, in addition to their learned
+projections and convolution: the recurrent function has a stored-value
+correction read, an outer-product write and an output read, each `2 * H * Dk * Dv`
+(`nn.flops.delta_flops`). Prep/inversion, chunking and tiling belong to hardware
+FLOPs only. SSD/Mamba-2 has only the state write and output read, `4 * H * N * P`
+per token; its chunk size likewise changes no model count.
+Mamba-1 uses the same write/read convention, `4 * D * N` per token. Across
+all recurrent families, pointwise decay and gates are excluded; a state MAC
+counts as two FLOPs, including outer-product writes and multiply/reduce reads.
+MoE counts only active expert assignments plus the router and shared branch. A
+vocabulary head adds `2 * width * vocabulary` per predicted real token, tied or
+untied and tiled or not. A decision head uses the real question/option counts for
+its projections and evidence attention, including the `options * L` term.
+
+`Objective.real_lengths(batch)` owns validity and packing, and
+`Objective.model_flops(model, batch)` is the single place that composes the
+backbone and head. Geometry not represented by one sequence uses a named count,
+such as `decision_flops(lengths, questions, options)`. Missing capabilities or
+unavailable multi-sequence geometry raise `MissingFlopsCount` naming the family;
+no HLO estimate silently replaces the count. For example, an indexed attention
+layer needs its selection geometry, and a multimodal decision needs its tower's
+geometry as well as token lengths.
+
+The prefetch worker counts host rows before placement. Per-row counts travel
+with their batch, reduce globally in the device step and accumulate in the same
+logging record as the loss, including every microbatch in an accumulation window.
+No new device-to-host read is inserted between steps. `train/tokens` is the mean
+number of real tokens per attempted step in the reporting interval. A step here
+is a microbatch (`state.step`); optimizer commits are `state.updates`.
+`train/tokens_per_s` is the interval's total real tokens over its non-compile
+time, independent of gradient accumulation and the rate used to compare runs. Compilation
+time is excluded from all throughput denominators. The peak in MFU is the sum
+over the training mesh; the compiler's FLOPs remain per-device.
+
+`train/hfu` is still HLO hardware FLOPs utilization, including rematerialized work.
+The former HLO model count, with a recomputed forward counted once, is now
+`train/hlo_flops_util`; it is not MFU. Both HLO metrics keep their own compiler
+availability checks, independently of the analytical model count.
+
+MFU previously used the HLO model count. It now uses analytical real-token
+model work: old `train/mfu` and new `train/mfu` values are not directly comparable.
+The previous count remains available as `train/hlo_flops_util` for that comparison.
+
+For parameter-efficient runs, forward/backward work is assembled separately:
+`4 * N_frozen + 6 * N_trainable` per real token, plus the row-length attention and
+state terms. Frozen weights still perform a forward and an input-gradient
+product; trainable weights additionally perform their weight-gradient product.
+A frozen `in * out` dense layer with trainable rank-r LoRA factors therefore costs
+`4 * in * out + 6 * r * (in + out)` per token (`nn.flops.dense_training_flops`).
+`Objective.training_flops` is the named training-work assembly point; it is not
+`Objective.model_flops`, which counts only the forward. Core currently refuses
+adapter geometry by name, and never reports three-times-forward MFU for PEFT.
+
 ## A CPU cluster against one GPU, 2026-10-08
 
 Could a gang of Cloudflare containers train faster or more cheaply than one A100? `tools/cluster_vs_gpu.py` trains

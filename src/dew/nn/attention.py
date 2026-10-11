@@ -26,6 +26,7 @@ from jax.sharding import PartitionSpec as P
 from dew.telemetry.devices import deterministic_ops_requested
 
 from .attention_sinks import attention_with_sinks
+from .flops import attention_flops, projection_flops, real_lengths
 from .kernels import decode_attention
 from .kernels.generation import bf16_dot_runs, device_generation, first_refusal, measured_kernel, ran_kernel
 from .kv_cache import Append, KVCache, KVStore, filled_slots
@@ -2000,6 +2001,24 @@ class NormalAttention(nn.Module):
     qk_norm: bool = False  # RMSNorm on q/k per head (SD3-style bf16 logit safety)
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Self-attention maps and its full QK/AV products on real rows."""
+        inner = self.heads * self.dim_head
+        return (4 * projection_flops(lengths, self.query_dim, inner)
+                + attention_flops(lengths, self.heads, self.dim_head, self.dim_head, causal=False))
+
+    @nn.nowrap
+    def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
+        """Cross-attention with the context geometry supplied by its owner."""
+        query, context = real_lengths(lengths), real_lengths(context_lengths)
+        if query.shape != context.shape:
+            raise ValueError("cross-attention FLOPs need matching query/context rows")
+        inner = self.heads * self.dim_head
+        return (2 * projection_flops(lengths, self.query_dim, inner)
+                + 2 * projection_flops(context_lengths, context_features, inner)
+                + 4 * inner * float(np.sum(query * context)))
+
     def setup(self):
         dense = functools.partial(
             nn.DenseGeneral,
@@ -2095,6 +2114,11 @@ class FlaxFeedForward(nn.Module):
     precision: PrecisionLike = jax.lax.Precision.DEFAULT
     dropout: float = 0.0
     approximate_gelu: bool = True
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """GEGLU's gate/up and down projections, with its fourfold hidden width."""
+        return 3 * projection_flops(lengths, self.dim, 4 * self.dim)
 
     def setup(self):
         self.net_0 = FlaxGEGLU(

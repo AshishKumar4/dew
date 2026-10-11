@@ -35,6 +35,7 @@ from dew.nn.attention import (
     max_attention_logits,
     scaled_dot_product_attention,
 )
+from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kv_cache import KVCache, write_cache
 
@@ -378,6 +379,27 @@ class MultiHeadLatentAttention(nn.Module):
         """Whether each query attends a selection of the keys: this layer's
         indexer's, or the one it shares."""
         return self.index_topk is not None or self.index_shared
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The latent and expanded projections plus training's QK and AV."""
+        if self.indexed or self.index_shared:
+            raise MissingFlopsCount("MultiHeadLatentAttention needs indexer selection geometry for train/mfu")
+        query = self.num_heads * (self.qk_nope_head_dim + self.qk_rope_head_dim)
+        if self.q_lora_rank is None:
+            count = projection_flops(lengths, self.emb_features, query)
+        else:
+            count = (projection_flops(lengths, self.emb_features, self.q_lora_rank)
+                     + projection_flops(lengths, self.q_lora_rank, query))
+        count += projection_flops(lengths, self.emb_features, self.kv_lora_rank + self.qk_rope_head_dim)
+        count += projection_flops(lengths, self.kv_lora_rank,
+                                   self.num_heads * (self.qk_nope_head_dim + self.v_head_dim))
+        count += projection_flops(lengths, self.num_heads * self.v_head_dim, self.emb_features)
+        if self.output_gate:
+            count += projection_flops(lengths, self.emb_features, self.num_heads * self.v_head_dim)
+        return count + attention_flops(lengths, self.num_heads,
+                                       self.qk_nope_head_dim + self.qk_rope_head_dim,
+                                       self.v_head_dim, causal=self.causal)
 
     def _select(self, index_scores, keep, kv_store):
         """The keys each query attends among `keep`, as `top_k_selection`

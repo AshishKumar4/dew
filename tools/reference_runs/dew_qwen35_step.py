@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from common import git_head, host, peak_flops, throughput, write_record
-from qwen35 import FLOPS_PER_STEP, MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
+from qwen35 import FLOPS_FORMULA, FLOPS_PER_STEP, MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
 
 from dew.config import OptimConfig
 from dew.interop import Pretrained
@@ -193,7 +193,8 @@ def run(args) -> dict:
                    "peak_allocated_gib": None if peak_bytes is None else peak_bytes / 2**30,
                    "scope": WHOLE_PEAK_SCOPE},
         "time": {"compile_seconds": compile_seconds,
-                 "model_flops_per_step": None if args.smoke else FLOPS_PER_STEP},
+                 "model_flops_per_step": None if args.smoke else FLOPS_PER_STEP,
+                 "flops_formula": FLOPS_FORMULA},
         "checks": checks,
     }
     write_record(args.out, record)

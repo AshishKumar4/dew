@@ -37,6 +37,8 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import LogLoss
 from dew.decision.task import Decide
+from dew.nn.backbones.decoder_block import remat_policy
+from dew.nn.protocols import RematChoosing
 from dew.training.state import TrainState
 
 _log = logging.getLogger(__name__)
@@ -87,6 +89,17 @@ class DecisionRunConfig(RunConfig):
     """The block of layers [first, end) that `loop_steps` repeats: a pretrained
     decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
     repeated twice; None keeps a looped checkpoint's block."""
+    loop_backprop_steps: int | None = None
+    """Train through the last k passes of the loop alone, with earlier passes
+    cut from backpropagation; None keeps the loop's own choice."""
+    loop_remat: bool = False
+    """Checkpoint every pass of the loop, including the first, and recompute
+    it in the backward pass; requires a loop and leaves decoding unchanged.
+    False keeps a checkpoint's own choice."""
+    remat: str | None = None
+    """A `REMAT_POLICIES` name for the loaded backbone's layers, applied before
+    looping and LoRA. The trainer's fitting ladder starts here; a policy
+    outside `DECODER_REMAT` cannot climb. None keeps the checkpoint's policy."""
     head: JointShape | None = None
     """Clef's joint schema head over a fresh backbone, which then reads Clef's
     joint layout; None draws Laya's head."""
@@ -112,7 +125,8 @@ class DecisionRunConfig(RunConfig):
         or the mixture's rows, scored on the held-out ones, which calibrate the
         run after it trains. The checkpoint decides the backbone; the model
         flags choose only its compute dtype and attention kernel;
-        `param_dtype` chooses the loaded checkpoint's storage dtype."""
+        `param_dtype` chooses the loaded checkpoint's storage dtype. `remat`
+        chooses its layer recomputation before looping or attaching LoRA."""
         from dew.interop import Pretrained, sources
 
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
@@ -127,9 +141,10 @@ class DecisionRunConfig(RunConfig):
         derived = {}
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
             if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
-                                                    self.loop_layers)):
-                raise ValueError("--lora, --head and the loop shape a fresh backbone; a Laya checkpoint "
-                                 "trains whole under its own head")
+                                                    self.loop_layers, self.loop_backprop_steps,
+                                                    self.remat)) or self.loop_remat:
+                raise ValueError("--lora, --head, --remat and the loop shape a fresh backbone; "
+                                 "a Laya checkpoint trains whole under its own head")
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                            dtype=dtype, param_dtype=self.param_dtype,
                                            attention_impl=attention_impl)
@@ -137,8 +152,15 @@ class DecisionRunConfig(RunConfig):
         else:
             start = Pretrained.load(self.pretrained, revision=self.revision, dtype=dtype,
                                     param_dtype=self.param_dtype, attention_impl=attention_impl)
-            if self.loop_steps is not None or self.loop_layers is not None:
-                start = looping(start, self.loop_steps, self.loop_layers)
+            if self.remat is not None:
+                if not isinstance(start.model, RematChoosing):
+                    raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "
+                                     f"{type(start.model).__name__} does not support")
+                start = dataclasses.replace(start, model=start.model.with_remat(remat_policy(self.remat)))
+            if (self.loop_steps is not None or self.loop_layers is not None
+                    or self.loop_backprop_steps is not None or self.loop_remat):
+                start = looping(start, self.loop_steps, self.loop_layers,
+                                backprop_steps=self.loop_backprop_steps, remat=self.loop_remat or None)
             start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
             # The tokenizer of the commit the weights come from.
             root = sources.snapshot(self.pretrained, self.revision, weights=False)
@@ -186,13 +208,16 @@ class DecisionRunConfig(RunConfig):
                                                       summary=summary, after=fitted))
 
 
-def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None) -> Pretrained:
+def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None, *,
+            backprop_steps: int | None = None, remat: bool | None = None) -> Pretrained:
     """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
-    or a new block's passes are not stated."""
+    or a new block's passes are not stated. `backprop_steps` and `remat` choose
+    the loop's backward memory; None keeps a looped checkpoint's own value."""
     from dew.nn.protocols import Looping
 
-    looped = start.model.with_passes(steps, layers) if isinstance(start.model, Looping) else None
+    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
+              if isinstance(start.model, Looping) else None)
     if looped is None:
         raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
                          "its layers to repeat and --loop-steps how many times")

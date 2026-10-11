@@ -108,6 +108,14 @@ class Loop:
     sows into its `exits` collection; the decoder's output is always the
     last pass's.
 
+    `remat` checkpoints each pass of the block, the first included, with one
+    Flax lifted checkpoint. Backpropagation keeps each pass's input and
+    recomputes the pass instead of retaining every layer's residuals for
+    every pass. The prelude and coda keep their own policy, and decoding
+    never checkpoints. A layer's own remat policy still applies inside the
+    pass: with both enabled, the pass recomputes twice, once to recover the
+    layers' inputs and again inside the layers' backward passes.
+
     A decode cache holds one entry per pass and layer. The first pass keeps
     its layers' own names; pass t > 0's layer i is `layers_{L + (t - 1) n + i - first}`,
     L the decoder's layers and n the block's (`PassView`). Over the whole
@@ -118,6 +126,7 @@ class Loop:
     backprop_steps: int | None = None
     exit_gate: bool = False
     layers: tuple[int, int] | None = None
+    remat: bool = False
 
     def __post_init__(self):
         if self.steps < 1:
