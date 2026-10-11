@@ -15,9 +15,9 @@ reads its chunk of its head where it sits, as fla's pointer arithmetic does.
 
 CONFIGS keys the GPU generation and activation dtype: fla's own A100 choices on the generations
 whose blocks hold an A100's shared memory, and on the 99 KB ones fla's narrower picks for those
-devices. Each config compiles within its GPU's block at the training shapes (CONFIG_SHAPES,
-tests/test_kernel_configs.py), and the port takes keys and values no wider than those. Every public
-kernel accepts explicit block/warp/stage overrides for the lab.
+devices. Each config compiles within its GPU's block at the training shapes
+(tests/test_kernel_configs.py), and the port takes keys and values no wider than those (WIDEST).
+Every public kernel accepts explicit block/warp/stage overrides for the lab.
 """
 
 from __future__ import annotations
@@ -82,13 +82,9 @@ CONFIGS = {(name, dtype): _declared(name, target, dtype)
 """Each kernel's blocks, warps and stages by (generation, activation dtype), for every GPU that runs
 Triton: an A100's wherever a block holds as much shared memory, the 99 KB tables elsewhere."""
 
-CONFIG_SHAPES = {
-    "0.8b": {"batch": 8, "length": 3072, "key_heads": 16, "value_heads": 16,
-             "width": 128, "columns": 128, "chunk": 64},
-    "9b": {"batch": 4, "length": 3072, "key_heads": 16, "value_heads": 32,
-           "width": 128, "columns": 128, "chunk": 64},
-}
-"""The training shapes every config compiles at, the widest keys and values the port takes."""
+WIDEST = 128
+"""The widest keys and values the port takes: its configs compile for the 0.8B's and 9B's 128-wide
+heads (tests/fla_gdn_support.py's TRAINING_SHAPES)."""
 
 
 def _rule_shape(key, value, chunk):
@@ -113,18 +109,18 @@ def kernel_config(kernel: str, shape: Mapping[str, int], dtype, *, target: str |
             else value for key, value in config.items()}
 
 
-def rule_refusal(key, value, chunk):
+def rule_refusal(query, key, value, chunk):
     """Why the port does not run here for these keys and values: no configs for their dtype on this
     device, keys or values wider than the configs compile for, or a key head serving a number of value
     heads no Triton block holds."""
-    if key.dtype != value.dtype:
-        return f"the port needs matching key/value dtypes, got {key.dtype} and {value.dtype}"
+    if not query.dtype == key.dtype == value.dtype:
+        return (f"the port needs one dtype for queries, keys and values, got {query.dtype}, {key.dtype} "
+                f"and {value.dtype}")
     if _config_key(key.dtype) not in CONFIGS:
         return f"the port has no {jnp.dtype(key.dtype).name} configs for {generation.device_generation()}"
-    widest = max(shape["width"] for shape in CONFIG_SHAPES.values())
-    if key.shape[-1] > widest or value.shape[-1] > widest:
+    if key.shape[-1] > WIDEST or value.shape[-1] > WIDEST:
         return (f"keys {key.shape[-1]} and values {value.shape[-1]} wide; the port's configs compile for "
-                f"at most {widest}")
+                f"at most {WIDEST}")
     group = value.shape[2] // key.shape[2]
     if group & (group - 1):
         return f"{group} value heads a key head; dqkwg's block holds a power of two"
@@ -734,35 +730,39 @@ def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dk_ref,
     chunk of one head. With `X = (I + L)^-1` (fla's `A`), `w = X (k beta exp2(g))` and
     `u = X (v beta)`: their gradients through `X^T`, `dX = dw (k beta exp2 g)^T + du (v beta)^T`, then
     `dL = -X^T tril(dX, -1) X^T` gated by `exp2(g_s - g_t)`, and from it the keys', beta's and the
-    decay's gradients. `dk` is stored once from the first pass and read back, rounded to its dtype,
-    as fla's kernel reads its own store."""
+    decay's gradients. `dk`'s part through `w` is recomputed beside its part through `L` and the
+    two stored once, where fla stores the first, rounded, and reads it back behind a barrier
+    (wy_fast.py:223): one rounding, and no store that other threads must see before a later read."""
     inverse_t = a_ref[...].T
     beta = beta_ref[...]
     gate = g_ref[...].astype(jnp.float32)
     decay = jnp.exp2(gate)
     size, width = k_ref.shape
-    d_x = jnp.zeros((size, size), jnp.float32)
-    d_beta = jnp.zeros((size,), jnp.float32)
-    d_gate = jnp.zeros((size,), jnp.float32)
-    for block in range(width // bk):
+    def key_block(block, carried):
+        d_x, d_beta, d_gate = carried
         columns = pl.ds(block * bk, bk)
         key = k_ref[:, columns]
         scaled = key * (beta * decay)[:, None]
         w_grad = dw_ref[:, columns]
-        d_x += _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact)
         d_scaled = _dot(inverse_t, w_grad, exact=exact)
-        dk_ref[:, columns] = (d_scaled * (decay * beta)[:, None]).astype(dk_ref.dtype)
-        d_beta += jnp.sum(d_scaled * key * decay[:, None], axis=1)
-        d_gate += jnp.sum(d_scaled * scaled, axis=1)
-    for block in range(v_ref.shape[-1] // bv):
+        return (d_x + _dot(w_grad, scaled.T.astype(w_grad.dtype), exact=exact),
+                d_beta + jnp.sum(d_scaled * key * decay[:, None], axis=1),
+                d_gate + jnp.sum(d_scaled * scaled, axis=1))
+
+    def value_block(block, carried):
+        d_x, d_beta = carried
         columns = pl.ds(block * bv, bv)
         value = v_ref[:, columns]
         scaled = (value * beta[:, None]).astype(value.dtype)
         u_grad = du_ref[:, columns]
-        d_x += _dot(u_grad, scaled.T, exact=exact)
         d_scaled = _dot(inverse_t, u_grad, exact=exact)
         dv_ref[:, columns] = (d_scaled * beta[:, None]).astype(dv_ref.dtype)
-        d_beta += jnp.sum(d_scaled * value, axis=1)
+        return d_x + _dot(u_grad, scaled.T, exact=exact), d_beta + jnp.sum(d_scaled * value, axis=1)
+
+    row = jnp.zeros((size,), jnp.float32)
+    d_x, d_beta, d_gate = jax.lax.fori_loop(0, width // bk, key_block,
+                                            (jnp.zeros((size, size), jnp.float32), row, row))
+    d_x, d_beta = jax.lax.fori_loop(0, v_ref.shape[-1] // bv, value_block, (d_x, d_beta))
     index = jnp.arange(size)
     strict = index[:, None] > index[None, :]
     d_x = jnp.where(strict, d_x, 0.0)
@@ -770,16 +770,20 @@ def _wy_bwd_kernel(k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_ref, dk_ref,
     d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
     d_x = d_x * jnp.exp2(gate[:, None] - gate[None, :])
     d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
-    products = jnp.zeros((size, size), jnp.float32)
-    for block in range(width // bk):
+
+    def key_gradient(block, carried):
+        products, d_beta = carried
         columns = pl.ds(block * bk, bk)
         key = k_ref[:, columns]
         scaled = key * beta[:, None]
-        products += _dot(key, key.T, exact=exact)
         d_key = _dot(d_l, key, exact=exact)
-        d_beta += jnp.sum(d_key * key, axis=1)
+        through_w = _dot(inverse_t, dw_ref[:, columns], exact=exact) * (decay * beta)[:, None]
         full = d_key * beta[:, None] + _dot(scaled.T.astype(d_l.dtype), d_l, exact=exact).T
-        dk_ref[:, columns] = (full + dk_ref[:, columns].astype(jnp.float32)).astype(dk_ref.dtype)
+        dk_ref[:, columns] = (through_w + full).astype(dk_ref.dtype)
+        return products + _dot(key, key.T, exact=exact), d_beta + jnp.sum(d_key * key, axis=1)
+
+    products, d_beta = jax.lax.fori_loop(0, width // bk, key_gradient,
+                                         (jnp.zeros((size, size), jnp.float32), d_beta))
     db_ref[...] = d_beta.astype(db_ref.dtype)
     weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
     dg_ref[...] = _wy_gate_sum(d_gate, weighted).astype(dg_ref.dtype)
