@@ -12,9 +12,9 @@ from pathlib import Path
 import pytest
 
 from dew.data.text import HFTokenizer
-from dew.decision import Choice, Decide, DecisionTable, Example, Noul
-from dew.decision.config import DecisionRunConfig, _fitting
-from dew.decision.data import Weighted
+from dew.data import DataPartition, Loading, load
+from dew.decision import Choice, Decide, DecisionObjective, Decisions, Example, JointLayout, Noul
+from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
 
@@ -34,15 +34,15 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         writer.writerows(tickets)
     # The command line `laya-train --data tickets.csv` is, with this run's sizes.
     config = DecisionRunConfig.cli([
-        "--data.path", str(table), "--data.held-out", "0.5", "--data.question", "team",
-        "--data.loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
+        "--data.source", str(table), "--data.validation.fraction", "0.5", "--data.question", "team",
+        "--loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
             {"class": "dew.decision.scoring:Combined",
              "fields": {"terms": [[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}),
         "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
         "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"])
-    assert isinstance(config.data, DecisionTable)
+    assert isinstance(config.data, Decisions)
     assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
     config.run()
     run = tmp_path / "runs" / "tickets"
@@ -99,10 +99,10 @@ def _mixture(tmp_path: Path, rows: list[dict], evaluated: list[str], held: int) 
 
 
 def _flags(mixture: Path, runs: Path) -> list[str]:
-    return ["--mixture.root", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
+    return ["--data.source", str(mixture), "--trainer.name", "run", "--trainer.checkpoint-dir", str(runs),
             "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
             "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-            "--trainer.compilation-cache-dir", "None", "--data.loading.workers", "0",
+            "--trainer.compilation-cache-dir", "None", "--loading.workers", "0",
             "--model.dtype", "float32", "--optim.schedule.warmup-steps", "1", "--revision", "None"]
 
 
@@ -171,27 +171,24 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
 
 
 def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
-    """A set none of whose rows a joint row can hold has nothing to train on: the fit check leaves it out
-    of the mixture and counts its rows, rather than handing grain an empty set to mix, which it refuses;
-    a row budget no set fits is refused, naming it."""
-
-    class Layout:
-        joint, max_len = True, 64
-
-        def rows(self, tokenizer, specials, state, questions):
-            if state.startswith("long"):
-                raise ValueError("the questions alone pass max_len")
-            return []
-
-    objective = types.SimpleNamespace(layout=Layout(), tokenizer=None, specials=None)
+    objective = DecisionObjective(Decide.from_pretrained(TINY),
+                                  layout=JointLayout(max_len=128, max_state_tokens=32))
     short = [Example.of(row) for row in _requests(4, joint=True)]
-    long = [Example.of({**row, "state": "long " + row["state"]}) for row in _requests(3, joint=True)]
-    sets = {"short": Weighted(short, 1.0), "long": Weighted(long, 2.0)}
-    kept, held, unfit = _fitting(objective, sets, long)
-    assert list(kept) == ["short"] and kept["short"].examples == short and kept["short"].weight == 1.0
-    assert held == [] and unfit == {"short": 0, "long": 3, "held out": 3}
-    with pytest.raises(ValueError, match="64 tokens"):
-        _fitting(objective, {"long": Weighted(long, 1.0)}, [])
+    too_many = Choice("Which?", [f"option {index}" for index in range(200)])
+    long = [Example(f"long {index}", {"team": too_many}, {"team": 0}) for index in range(3)]
+    recipe = Decisions(source={"short": short, "long": long}, weights={"short": 1.0, "long": 2.0})
+    data = load(recipe, batch=2, read="memory", objective=objective.data(), loading=Loading(workers=0))
+    assert data.records == len(short)
+    assert data.counts["long"].accepted == 0 and data.counts["long"].rejected["unfit"] == len(long)
+    stream = data.train(DataPartition())
+    try:
+        assert next(stream)["tokens"].shape[0] == 2
+    finally:
+        stream.close()
+    with pytest.raises(ValueError, match="fit|accepted|empty"):
+        refused = load(Decisions(source={"long": long}, weights={"long": 1.0}), batch=2,
+                       read="memory", objective=objective.data(), loading=Loading(workers=0))
+        next(refused.train(DataPartition()))
 
 
 @pytest.mark.parametrize("param_dtype", ["float32", "bfloat16"])
@@ -275,7 +272,7 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
     for ours, theirs in zip(leaves(changed), leaves(unbroken), strict=True):
         np.testing.assert_allclose(ours, theirs, rtol=1e-4, atol=1e-6)
     with pytest.raises(ValueError, match="record count"):
-        run(tmp_path / "changed", 6, "--data.seed", "1")
+        run(tmp_path / "changed", 6, "--data-seed", "1")
 
 
 def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():

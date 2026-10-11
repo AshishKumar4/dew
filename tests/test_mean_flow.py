@@ -129,7 +129,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data import TFDSImages
+    from dew.data import Images
     from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
     from dew.sampling import TextToImage
     from dew.training import Trainer
@@ -140,7 +140,7 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
             {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
              "dtype": "float32", "attention_impl": "xla"},
         ),
-        data=TFDSImages(image_size=4),
+        data=Images(source="tfds://oxford_flowers102", image_size=4),
         preset=presets.MeanFlow(),
         val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
@@ -177,11 +177,11 @@ def test_meanflow_refuses_the_denoising_losss_extras_and_a_guidance():
 
 def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_one():
     from dew.config import ModelConfig, ObjectiveConfig
-    from dew.data import TFDSImages
+    from dew.data import Images
     from dew.objectives.diffusion import DiffusionRunConfig
 
     def built(config):
-        return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=TFDSImages(image_size=8),
+        return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=Images(source="tfds://oxford_flowers102", image_size=8),
                                   preset=presets.MeanFlow(), text=None,
                                   val_metrics=(),
                                   objective=ObjectiveConfig("mean_flow", {"solver": Euler()})).build().model

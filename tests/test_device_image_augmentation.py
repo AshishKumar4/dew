@@ -1,7 +1,6 @@
 """Batch augmentation agrees with OpenCV's resize and torchvision's
 ColorJitter, and follows the saved data position."""
 
-import dataclasses
 import itertools
 from pathlib import Path
 
@@ -11,29 +10,23 @@ import numpy as np
 import pytest
 from steady_state import guarded, steady_state
 
-from dew.data import DataPartition, Loading
-from dew.data.images import ImageDataset
+from dew.data import Augment, DataPartition, Images, Loading, Memory, load
 
 TORCHVISION = np.load(Path(__file__).resolve().parent / "fixtures" / "colour_jitter" / "torchvision.npz")
 
 
-@dataclasses.dataclass(frozen=True)
-class Images(ImageDataset):
-    def source(self, split=None):
-        return [{"image": np.random.default_rng(index).integers(
-            0, 256, (19, 23, 3), dtype=np.uint8), "label": index} for index in range(24)]
-
-    def record(self, element, rng):
-        return element["image"], "a flower", element["label"]
+READ = Loading(workers=0, threads=1, read_buffer=2)
 
 
-def spec(**kwargs):
-    return Images(image_size=12, val_batches=0, seed=37,
-                  loading=Loading(workers=0, threads=1, read_buffer=2), **kwargs)
+def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=None):
+    rows = [{"image": np.random.default_rng(index).integers(
+        0, 256, (19, 23, 3), dtype=np.uint8), "label": index} for index in range(24)]
+    return Images(source=Memory(rows), image_size=12, caption="a flower", staging_size=staging_size,
+                  augment=Augment(flip=True, jitter=True, crop_scale=crop_scale, backend=backend) if augment else None)
 
 
 def test_device_pipeline_returns_resident_uint8_and_resumes_exactly():
-    data = spec(augmentation_backend="device", crop_scale=(0.5, 0.9)).load(batch=4)
+    data = load(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37, loading=READ)
     stream = data.train(DataPartition())
     resumed = data.train(DataPartition())
     try:
@@ -156,8 +149,8 @@ def test_model_float64_mode_changes_no_data_draw():
 
 
 def test_device_none_keeps_the_old_resize_bit_identical():
-    host = spec(augmentation="none").load(batch=4).train(DataPartition())
-    device = spec(augmentation="none", augmentation_backend="device").load(batch=4).train(DataPartition())
+    host = load(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    device = load(spec(augment=False, backend="device"), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
     try:
         np.testing.assert_array_equal(next(device)["image"], next(host)["image"])
     finally:
@@ -168,7 +161,7 @@ def test_device_none_keeps_the_old_resize_bit_identical():
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
     from dew.training.distributed import MeshSpec, shard_batch
 
-    stream = spec(augmentation_backend="device").load(batch=4).train(DataPartition())
+    stream = load(spec(backend="device"), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
     try:
         batch = next(stream)
         mesh = MeshSpec().build([jax.devices()[0]])
@@ -181,11 +174,11 @@ def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
 
 
 def test_device_draws_follow_record_keys_across_threads_and_partitions():
-    original = spec(augmentation_backend="device", crop_scale=(0.6, 0.9))
-    threaded = dataclasses.replace(original, loading=Loading(workers=0, threads=4, read_buffer=8))
-    whole = original.load(batch=4).train(DataPartition())
-    parallel = threaded.load(batch=4).train(DataPartition())
-    shares = [original.load(batch=4).train(DataPartition(index=i, count=2)) for i in range(2)]
+    original = spec(backend="device", crop_scale=(0.6, 0.9))
+    threaded = Loading(workers=0, threads=4, read_buffer=8)
+    whole = load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    parallel = load(original, batch=4, read="memory", seed=37, loading=threaded).train(DataPartition())
+    shares = [load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition(index=i, count=2)) for i in range(2)]
     try:
         for _ in range(3):
             expected = next(whole)
@@ -202,10 +195,10 @@ def test_device_draws_follow_record_keys_across_threads_and_partitions():
 
 
 def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
-    original = spec(augmentation_backend="device", crop_scale=(0.6, 0.9))
-    worker_spec = dataclasses.replace(original, loading=Loading(workers=1, threads=1, read_buffer=2))
-    parent = original.load(batch=4).train(DataPartition())
-    worker = worker_spec.load(batch=4).train(DataPartition())
+    original = spec(backend="device", crop_scale=(0.6, 0.9))
+    worker_loading = Loading(workers=1, threads=1, read_buffer=2)
+    parent = load(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    worker = load(original, batch=4, read="memory", seed=37, loading=worker_loading).train(DataPartition())
     try:
         for _ in range(3):
             expected, actual = next(parent), next(worker)
@@ -218,7 +211,7 @@ def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
 
 
 @pytest.mark.parametrize("options", [{"crop_scale": (0, 1)}, {"crop_scale": (0.9, 0.5)},
-                                    {"augmentation_size": 0}, {"augmentation_backend": "bad"}])
+                                    {"staging_size": 0}, {"backend": "bad"}])
 def test_invalid_augmentation_configuration_is_rejected(options):
     with pytest.raises(ValueError):
         spec(**options)
@@ -233,7 +226,7 @@ def test_a_device_augmented_stream_steadies_into_compiled_reads_the_loop_waits_o
     from dew.training.distributed import DevicePrefetchIterator, MeshSpec
 
     mesh = MeshSpec().build([jax.devices()[0]])
-    stream = spec(augmentation_backend="device", crop_scale=(0.5, 0.9)).load(batch=4).train(DataPartition())
+    stream = load(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
     with DevicePrefetchIterator(stream, mesh) as prefetch:
         for _ in range(3):
             jax.block_until_ready(next(prefetch))
