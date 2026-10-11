@@ -617,7 +617,6 @@ class Preferences:
 
 @dataclasses.dataclass(frozen=True)
 class Augment:
-    crop: bool = False
     flip: bool = True
     jitter: bool = True
     crop_scale: tuple[float, float] = (1.0, 1.0)
