@@ -253,8 +253,7 @@ class Decisions:
     descriptor: str | None = None
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.sources import Files, Memory, source
-        from dew.data.sources.concatenate import Concatenate
+        from dew.data.sources import Memory, source
         from dew.data.storage import Store
 
         table = ParseTable(self.options, self.text, self.label, self.question, self.instructions)
@@ -316,7 +315,6 @@ class Decisions:
             )
         return train, evaluated, ()
 
-
     def _mixture(self, root_url: str) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.sources import Files
         from dew.data.sources.concatenate import Concatenate
@@ -353,9 +351,7 @@ class Decisions:
                         for shard in shards
                     )
                 else:
-                    url = (
-                        root_url.rstrip("/") + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
-                    )
+                    url = root_url.rstrip("/") + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
                     shard_fs, shard_path = Store(url).resolve()
                     paths = (url,) if shard_fs.exists(shard_path) else ()
                 if paths:
@@ -395,9 +391,7 @@ class Decisions:
             if not held
             else Pipeline(
                 _DecisionSource(
-                    Concatenate(
-                        tuple(child.source for child in held if isinstance(child.source, Source))
-                    ),
+                    Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
                     slots or None,
                     descriptor=pinned,
                 )
@@ -405,8 +399,9 @@ class Decisions:
         )
         return train, evaluated, ()
 
-
-    def _descriptor(self, root_url: str, stated: Mapping[str, object]) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    def _descriptor(
+        self, root_url: str, stated: Mapping[str, object]
+    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
         from dew.data.storage import Store
 
         root = Store(root_url)
@@ -417,16 +412,14 @@ class Decisions:
             provenance = record(replaced.get("provenance"), "descriptor provenance")
             root_manifest = root.child("manifest.sha256").read().decode().strip()
             if provenance.get("original_manifest_sha") != root_manifest:
-                raise ValueError(
-                    "decision descriptor refers to a different canonical source manifest"
-                )
+                raise ValueError("decision descriptor refers to a different canonical source manifest")
             original_files = record(stated.get("files", {}), "original files")
             for name, value in record(replaced.get("files", {}), "descriptor files").items():
                 old = record(original_files.get(name), f"original files.{name}")
                 for partition, entry in record(value, name).items():
-                    if record(entry, partition).get("sha256") != record(
-                        old.get(partition), partition
-                    ).get("sha256"):
+                    if record(entry, partition).get("sha256") != record(old.get(partition), partition).get(
+                        "sha256"
+                    ):
                         raise ValueError(f"decision descriptor changes raw corpus {name}/{partition}")
             stated = replaced
             pinned = {"url": self.descriptor, "sha256": hashlib.sha256(payload).hexdigest()}

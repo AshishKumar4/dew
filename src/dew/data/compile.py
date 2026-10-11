@@ -7,8 +7,7 @@ import functools
 import json
 import logging
 import math
-import weakref
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import Literal, Protocol, runtime_checkable
 
@@ -18,23 +17,19 @@ import numpy as np
 
 from dew.data.dataset import (
     Batch,
-    Checkpointable,
     Closeable,
     DataPartition,
     Dataset,
     FilledBatch,
-    Forwarding,
     GlobalReader,
     GlobalStream,
     LengthGroups,
     Loading,
     PhasedStream,
-    Position,
     Reader,
     Records,
     _Grouped,
     _WorkerBatches,
-    rows_of,
     weight_counts,
 )
 from dew.data.mix import (
@@ -44,7 +39,6 @@ from dew.data.mix import (
     SearchBudget,
     TokenDeficit,
     primed_maps,
-    state_counts,
     token_weights,
 )
 from dew.data.pipeline import (
@@ -86,8 +80,8 @@ from dew.data.pipeline import (
     Workers,
     _rejects,
 )
-from dew.data.readers import _CanonicalPass, _FillShare, _GroupedRows, _Host, _PerShare, _Statistics
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
+from dew.data.readers import _CanonicalPass, _FillShare, _GroupedRows, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.records import JSON, integer, json_value, record
 
@@ -1130,8 +1124,14 @@ class _Build:
             return self.layout_stage(rows, lengths, stage, pipeline, partition)
         return rows, lengths
 
-    def layout_stage(self, rows: Rows, lengths: pygrain.MapDataset | None, stage: Stage,
-                     pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
+    def layout_stage(
+        self,
+        rows: Rows,
+        lengths: pygrain.MapDataset | None,
+        stage: Stage,
+        pipeline: Pipeline,
+        partition: DataPartition,
+    ) -> tuple[Rows, pygrain.MapDataset | None]:
         if isinstance(stage, Pack):
             parent = _as_iter(rows, self.loading).map(_Payload())
             sizes = dict.fromkeys(stage.fields, stage.seq_len)
@@ -1491,8 +1491,11 @@ def compile(
         )
     combined = (train,) if validation is None else (train, validation)
     if any(isinstance(stage, Configured) for branch in combined for stage in _steps(branch)):
-        if read == "memory" and all(not len(leaf.source.records(read)) for leaf in _leaves(train)
-                                     if not isinstance(leaf.source, (Mixture, Phases))):
+        if read == "memory" and all(
+            not len(leaf.source.records(read))
+            for leaf in _leaves(train)
+            if not isinstance(leaf.source, (Mixture, Phases))
+        ):
             raise ValueError(f"no accepted rows of {_name(train)}; source is empty")
         metadata = _metadata(combined, read)
         if read == "memory":
@@ -1530,16 +1533,40 @@ def compile(
         if validation_counts and not any(count.accepted for count in validation_counts.values()):
             validation = None
     build = _Build(read, loading, seed, batch, budget, not _per_share(train, read), training=True)
-    return _compiled(train, validation, original, build, host=host, resume=resume,
-                     generations=generations, counts=counts, validation_counts=validation_counts,
-                     batch_tokens=batch_tokens)
+    return _compiled(
+        train,
+        validation,
+        original,
+        build,
+        host=host,
+        resume=resume,
+        generations=generations,
+        counts=counts,
+        validation_counts=validation_counts,
+        batch_tokens=batch_tokens,
+    )
 
 
-def _compiled(train: Pipeline, validation: Pipeline | None, original: Pipeline, build: _Build,
-               *, host: tuple[HostStep, ...], resume: Literal["exact", "non-exact"],
-               generations: tuple[str, ...], counts: Mapping[str, CorpusCounts],
-               validation_counts: Mapping[str, CorpusCounts], batch_tokens: int | None) -> Dataset:
-    read, seed, loading, batch, global_order = build.read, build.seed, build.loading, build.batch, build.global_order
+def _compiled(
+    train: Pipeline,
+    validation: Pipeline | None,
+    original: Pipeline,
+    build: _Build,
+    *,
+    host: tuple[HostStep, ...],
+    resume: Literal["exact", "non-exact"],
+    generations: tuple[str, ...],
+    counts: Mapping[str, CorpusCounts],
+    validation_counts: Mapping[str, CorpusCounts],
+    batch_tokens: int | None,
+) -> Dataset:
+    read, seed, loading, batch, global_order = (
+        build.read,
+        build.seed,
+        build.loading,
+        build.batch,
+        build.global_order,
+    )
     manifest = Manifest.of(
         {
             "sources": [

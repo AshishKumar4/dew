@@ -36,7 +36,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 from jinja2 import TemplateError
 
-
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 

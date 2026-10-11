@@ -10,8 +10,6 @@ ids; anything else fails naming the row.
 
 from __future__ import annotations
 
-
-
 IDS_KEY = "input_ids"
 """Batch key holding the `[B, 2, S]` pair ids, chosen at index 0."""
 

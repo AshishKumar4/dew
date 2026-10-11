@@ -164,24 +164,9 @@ def token_store(root, name, shift):
 
 
 def fixture_inputs(root: Path):
-    from dew.data import (
-        ArrayRecordImages,
-        ChatMessages,
-        DataPhase,
-        HFImages,
-        HFOptions,
-        HubDataset,
-        LocalVideos,
-        PreferencePairs,
-        PreparedTFDS,
-        Prompts,
-        TFDSImages,
-        TFDSOptions,
-        TokenWindows,
-    )
     from dew.data.images import pack_dict_of_byte_arrays
     from dew.data.text import ByteTokenizer
-    from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout, Weighted
+    from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     tokens = token_store(root, "tokens", 0)
@@ -277,14 +262,58 @@ def fixture_inputs(root: Path):
         Example(f"state {index}", {"class": Choice("Pick", ["yes", "no"])}, {"class": index % 2})
         for index in range(40)
     ]
-    return (tokens, another, tokenizer, chats, prompts, pairs, pixels, image_root, image_table, table, clips, audio, objective, examples)
+    return (
+        tokens,
+        another,
+        tokenizer,
+        chats,
+        prompts,
+        pairs,
+        pixels,
+        image_root,
+        image_table,
+        table,
+        clips,
+        audio,
+        objective,
+        examples,
+    )
 
 
 def fixtures(root: Path):
-    from dew.data import (ArrayRecordImages, ChatMessages, DataPhase, HFImages, HFOptions, HubDataset, LocalVideos, PreferencePairs, PreparedTFDS, Prompts, TFDSImages, TFDSOptions, TokenWindows)
+    from dew.data import (
+        ArrayRecordImages,
+        ChatMessages,
+        DataPhase,
+        HFImages,
+        HFOptions,
+        HubDataset,
+        LocalVideos,
+        PreferencePairs,
+        PreparedTFDS,
+        Prompts,
+        TFDSImages,
+        TFDSOptions,
+        TokenWindows,
+    )
     from dew.decision import Weighted
 
-    tokens, another, tokenizer, chats, prompts, pairs, pixels, image_root, image_table, table, clips, audio, objective, examples = fixture_inputs(root)
+    (
+        tokens,
+        another,
+        tokenizer,
+        chats,
+        prompts,
+        pairs,
+        pixels,
+        image_root,
+        image_table,
+        table,
+        clips,
+        audio,
+        objective,
+        examples,
+    ) = fixture_inputs(root)
     return {
         "text_windows": lambda loading: TokenWindows(path=tokens, seq_len=16, seed=7, loading=loading).load(
             batch=4
