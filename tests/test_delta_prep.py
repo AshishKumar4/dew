@@ -23,6 +23,8 @@ from dew.nn.linear import (
     strictly_lower_inverse,
 )
 
+pytestmark = pytest.mark.kernel
+
 
 def prep_operands(shape, *, aligned=False):
     batch, heads, chunks, size, width, columns = shape
