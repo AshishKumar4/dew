@@ -1,7 +1,6 @@
 """Shared VM-side profile finalization; return small breakdowns, not raw dumps."""
 
 import contextlib
-import os
 import subprocess
 import time
 import uuid
@@ -14,8 +13,11 @@ TOOL_REF = "b420100f20856822ae19d7f314a9a22ba24e26df"
 
 
 def memory_bound() -> int:
-    total = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
-                 if line.startswith("MemTotal:"))
+    total = next(
+        int(line.split()[1]) * 1024
+        for line in Path("/proc/meminfo").read_text().splitlines()
+        if line.startswith("MemTotal:")
+    )
     for file in (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")):
         if file.is_file():
             value = file.read_text().strip()
@@ -83,7 +85,9 @@ def discover(job: dict, tree: Path) -> list[dict]:
         ]
         hlo = max(archives, key=lambda file: len(file.parts), default=None)
         if hlo is None:
-            candidates = {file.parent for file in files.values() if file.name.endswith("after_optimizations.txt")}
+            candidates = {
+                file.parent for file in files.values() if file.name.endswith("after_optimizations.txt")
+            }
             matching = [path for path in candidates if capture.is_relative_to(path.parent.parent)]
             hlo = matching[0] if len(matching) == 1 else None
         matched = [
@@ -132,7 +136,11 @@ def analyze(
         output.mkdir(parents=True, exist_ok=True)
         receipt = {"capture": str(capture["capture"]), "output": str(output), "steps": capture["steps"]}
         receipt["hlo"] = str(capture["hlo"]) if capture["hlo"] else None
-        receipt.update(memory_limit_bytes=limit, memory_policy="cgroup resident memory, 25% of VM bound", module="jit_step")
+        receipt.update(
+            memory_limit_bytes=limit,
+            memory_policy="cgroup resident memory, 25% of VM bound",
+            module="jit_step",
+        )
         result["captures"].append(receipt)
         try:
             tools = tool_tree(tree, repo, root, origin, job.get("profile_analysis_ref", TOOL_REF))
@@ -160,8 +168,14 @@ def analyze(
             }
             args.extend(["--module", receipt["module"]])
             with memory_scope(limit) as group:
-                receipt["exit"] = run_logged(args, output / "analysis.log", timeout=180, cwd=tools,
-                                             env=analysis_env, memory_group=group)
+                receipt["exit"] = run_logged(
+                    args,
+                    output / "analysis.log",
+                    timeout=180,
+                    cwd=tools,
+                    env=analysis_env,
+                    memory_group=group,
+                )
                 events = dict(line.split() for line in (group / "memory.events").read_text().splitlines())
                 if int(events.get("oom_kill", "0")) or int(events.get("oom_group_kill", "0")):
                     receipt["state"] = "analysis exceeded its memory bound"
@@ -170,9 +184,13 @@ def analyze(
             ).stdout.strip()
             receipt["complete"] = receipt["exit"] == 0 and (output / "attribution.json").is_file()
             if receipt["complete"]:
-                receipt["module_number"] = read(output / "attribution.json").get("memory", {}).get("module_number")
+                receipt["module_number"] = (
+                    read(output / "attribution.json").get("memory", {}).get("module_number")
+                )
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            receipt.update(exit=type(error).__name__, complete=False, state="bounded analysis unavailable or failed")
+            receipt.update(
+                exit=type(error).__name__, complete=False, state="bounded analysis unavailable or failed"
+            )
         save(output / "receipt.json", receipt)
     result.update(
         seconds=time.time() - result["started_at"],
