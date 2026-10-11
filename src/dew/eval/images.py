@@ -126,9 +126,11 @@ class CLIPScore(ImageMetric):
         tokenized the way a run's batch holds them, truncated to CLIP's
         context.
         """
-        # Summed the way a pass sums it, batch by batch, so a whole set in one batch
-        # is the number the metric reports for the same images.
-        total = sum(float(batch.sum()) for batch in self._batches(images, prompts, batch_size))
+        # Summed the way a pass sums it, batch by batch with `+`, so a whole set in
+        # one batch is the number the metric reports for the same images.
+        total = 0.0
+        for batch in self._batches(images, prompts, batch_size):
+            total += float(batch.sum())
         return total / np.shape(images)[0]
 
     def scores(self, images: ArrayLike, prompts: Sequence[str], *, batch_size: int = 64) -> np.ndarray:
