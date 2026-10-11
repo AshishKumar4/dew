@@ -19,6 +19,10 @@ class TransportError(RuntimeError):
     """A control channel failed without evidence that the workload stopped."""
 
 
+class CollectionError(ValueError):
+    """Artifact state is invalid; bound retries independently of live work."""
+
+
 class Driver:
     def __init__(self, run_dir: Path, client: Colab, cli: str):
         self.run_dir = run_dir
@@ -33,7 +37,7 @@ class Driver:
             self.state.update(fields, heartbeat=time.time())
             save(self.run_dir / "driver.json", self.state)
 
-    def control(self, session: Session, script: str, timeout: int = 300) -> str:
+    def control(self, session: Session, script: str, timeout: int = 300, *, live_read: bool = False) -> str:
         runtime = self.client.kernel(session)
         self.record(action="control", action_deadline=time.time() + timeout + 30)
         try:
@@ -43,6 +47,15 @@ class Driver:
                 raise TransportError(type(error).__name__) from error
             errors = [item for item in outputs if item.get("output_type") == "error"]
             if errors:
+                if live_read:
+                    names = [item.get("ename", "unknown") for item in errors]
+                    benign = all(name in ("FileNotFoundError", "NotADirectoryError") for name in names)
+                    self.record(collection_error_names=names, collection_needs_attention=not benign)
+                    if benign:
+                        raise TransportError(
+                            "live output changed; re-list on next cycle, not a workload exit"
+                        )
+                    raise CollectionError("artifact RPC failed: " + ",".join(names))
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)
         finally:
@@ -141,7 +154,7 @@ class Driver:
             f"excludes={job.get('artifact_excludes', [])!r})\n"
             "print('SYNC',json.dumps([manifest,count]))\n"
         )
-        output = self.control(session, script, timeout=600)
+        output = self.control(session, script, timeout=600, live_read=True)
         row = next(line[5:] for line in output.splitlines() if line.startswith("SYNC "))
         current, changed = json.loads(row)
         if changed:
@@ -201,6 +214,51 @@ class Driver:
                 )
                 time.sleep(delay)
 
+    def collect_action(self, job: dict, operation, *args) -> None:
+        failures = self.state.get("collection_failures", {})
+        key = str(job["index"])
+        if failures.get(key, {}).get("needs_attention"):
+            return
+        try:
+            operation(*args)
+            failures[key] = {"count": 0, "needs_attention": False}
+            self.record(collection_failures=failures)
+        except (OSError, ValueError, RuntimeError) as error:
+            if isinstance(error, (TransportError, requests.RequestException)):
+                # Live prune races/outages are not deterministic bad artifacts.
+                # The independent supervisor owns their liveness/time limits.
+                raise
+            count = failures.get(key, {}).get("count", 0) + 1
+            failures[key] = {"count": count, "error": type(error).__name__, "needs_attention": count >= 3}
+            self.record(collection_failures=failures)
+            self.record(collection_error=type(error).__name__, collection_needs_attention=True)
+            if count >= 3:
+                return
+            raise TransportError("artifact collection failed; workload liveness is independent") from error
+
+    def failed_collections(self, plan: dict, progress: dict) -> None:
+        failures = self.state.get("collection_failures", {})
+        recorded = {result["index"] for result in self.state["results"]}
+        for job in plan["jobs"]:
+            if job["index"] in recorded or not failures.get(str(job["index"]), {}).get("needs_attention"):
+                continue
+            status = progress.get("jobs", {}).get(str(job["index"]), {})
+            result = {
+                "index": job["index"],
+                "lane": job["lane"],
+                "commit": job["commit"],
+                "driver_sha": plan["driver_sha"],
+                "status": "collection failed: needs attention",
+                "observed_exit": status.get("exit"),
+                "collection_failed": True,
+                "results": str(self.run_dir),
+                "seconds": status.get("seconds", 0),
+                "stage_seconds": status.get("stage_seconds", 0),
+                "finished_at": time.time(),
+            }
+            colab_batch.finish(job["entry"], result)
+            self.record(results=[*self.state["results"], result])
+
     def poll_once(self, endpoint: str, remote: str, plan: dict, collected: set, synced: dict) -> bool:
         progress: dict
         try:
@@ -221,12 +279,13 @@ class Driver:
             if index in collected:
                 continue
             if status.get("artifact_manifest"):
-                self.collect(session, remote, plan, job, status)
+                self.collect_action(job, self.collect, session, remote, plan, job, status)
                 collected.add(index)
             elif status and time.monotonic() - synced.get(index, 0) >= 600:
-                self.sync(session, remote, job)
+                self.collect_action(job, self.sync, session, remote, job)
                 synced[index] = time.monotonic()
         if progress.get("phase") in ("done", "failed"):
+            self.failed_collections(plan, progress)
             self.preamble(session, remote, plan, progress)
             if progress["phase"] == "failed":
                 raise RuntimeError("VM batch failed: " + progress.get("error", "unknown cause"))
