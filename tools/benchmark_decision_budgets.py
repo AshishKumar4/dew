@@ -264,8 +264,8 @@ class BenchmarkRun(DecisionRunConfig):
 
 def configuration(args: argparse.Namespace) -> BenchmarkRun:
     tokens = args.arm == "tokens"
-    micro = 512 if args.smoke else 24576
-    layout = 128 if args.smoke else 3072
+    micro = 2048 if args.smoke else 24576
+    layout = 512 if args.smoke else 3072
     rows = tuple({"state": "ticket " + "charged twice " * (index % 6 + 1), "questions": {
         "team": {"type": "choice", "instructions": "Which team?", "criteria": {
             "billing": "payments", "technical": "outages", "sales": "pricing"}}},
@@ -281,7 +281,7 @@ def configuration(args: argparse.Namespace) -> BenchmarkRun:
         model=ModelConfig("causal_transformer", {"dtype": "float32" if args.smoke else "bfloat16"}),
         objective=ObjectiveConfig("decision", {
             "loss": LogLoss() + 0.5 * Brier() + RankedProbability(), "label_smoothing": 0.05,
-            "bucket": None if tokens else (32 if args.smoke else 256), "shuffle_options": True}),
+            "bucket": None if tokens else (64 if args.smoke else 256), "shuffle_options": True}),
         data=Decisions(rows) if args.smoke else Decisions(ROOT, descriptor=DESCRIPTOR),
         data_read="memory" if args.smoke else "indexed", data_seed=0,
         loading=Loading(workers=args.workers, threads=4, read_buffer=16),
@@ -293,7 +293,7 @@ def configuration(args: argparse.Namespace) -> BenchmarkRun:
                               compilation_cache_dir=None),
         optim=OptimConfig(learning_rate=2.5e-5, state_dtype="float32"), calibrate=False,
         max_len=layout, max_state_tokens=64 if args.smoke else 1024,
-        bucket_lengths=(((32, 64, 128) if args.smoke else (512, 768, 1024, 1536, 2048, 3072))
+        bucket_lengths=(((128, 256, 512) if args.smoke else (512, 768, 1024, 1536, 2048, 3072))
                         if tokens else ()),
     )
 
