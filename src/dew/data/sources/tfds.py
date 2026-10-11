@@ -331,9 +331,12 @@ class TFDS:
             raise FileNotFoundError(f"{self.describe()} has no prepared ArrayRecord data; "
                                     "run dew data provision or set provision=True")
         rows = self.builder.as_data_source(self.split, decoders=self.decoders)
-        if not isinstance(rows, Records):
-            raise TypeError(f"TFDS split {self.split!r} did not return random-access records")
-        return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
+        import grain.python as grain
+
+        from .memory import _record
+
+        indexed = grain.MapDataset.source(rows).map(_record)
+        return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
         rows = self.records("indexed")

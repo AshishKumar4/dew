@@ -153,5 +153,5 @@ def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
         "cache_storage": str(tmp_path), "max_bytes": 1024}})
     assert cached.read() == first
     fs, path = store.resolve()
-    if "s3" in fs.protocol:
-        fs.rm(path)
+    fs.rm(path)
+    assert not fs.exists(path)
