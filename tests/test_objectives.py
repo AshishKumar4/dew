@@ -8,6 +8,9 @@ import optax
 import pytest
 
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio, Step, everything, merge, select, under
+from dew.data import Memory, Pipeline
+from dew.data.steps.generic import Formatting
+from dew.data.compile import validation
 
 
 def tree():
@@ -319,7 +322,7 @@ def test_row_weights_count_the_real_rows_of_a_pass_and_every_row_of_training():
     from dew.data import DataPartition, Dataset
 
     records = {"x": np.arange(5, dtype=np.float32)}
-    last = list(Dataset.validation(records, batch=4)(DataPartition()))[-1]
+    last = list(validation(Pipeline(Memory(records)).map(Formatting()).batch(4), batch=4, read="memory")(DataPartition()))[-1]
     np.testing.assert_array_equal(Objective.row_weights(last, 4), [1.0, 0.0, 0.0, 0.0])
     assert Objective.row_weights(last, 4).dtype == jnp.float32
     np.testing.assert_array_equal(Objective.row_weights({"x": last["x"]}, 4), np.ones(4, np.float32))

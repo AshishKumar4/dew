@@ -1,6 +1,7 @@
 """The binary schema shared by distinct token-corpus generators."""
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
@@ -20,3 +21,26 @@ def write_token_corpus(directory: Path, train: np.ndarray, val: np.ndarray | Non
         meta["eos_id"] = eos_id
     (directory / "meta.json").write_text(json.dumps(meta))
     return directory
+
+
+def encoded_token_fixture(directory: Path, documents: Iterable[str], *, tokenizer: str = "byte",
+                          val_fraction: float = 0.1, eos: bool = False) -> Path:
+    """The legacy token-store fixture format, encoded once per document."""
+    from dew.data.text import tokenizer_for
+
+    vocabulary = tokenizer_for(tokenizer)
+    pieces = []
+    for document in documents:
+        if not document:
+            continue
+        ids = vocabulary.encode(document)
+        if eos:
+            if vocabulary.eos_id is None:
+                raise ValueError("an EOS fixture needs a tokenizer with an EOS id")
+            ids.append(vocabulary.eos_id)
+        pieces.extend(ids)
+    dtype = np.uint8 if vocabulary.vocab_size <= 256 else np.uint16 if vocabulary.vocab_size <= 65536 else np.uint32
+    tokens = np.asarray(pieces, dtype=dtype)
+    held = int(len(tokens) * val_fraction)
+    return write_token_corpus(directory, tokens[held:], tokens[:held], tokenizer=tokenizer,
+                              vocab_size=vocabulary.vocab_size, eos_id=vocabulary.eos_id if eos else None)

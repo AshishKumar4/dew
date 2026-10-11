@@ -48,7 +48,7 @@ from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
-from dew.data import Dataset, DatasetSpec, Ramp
+from dew.data import Dataset, Images, Loading, Ramp, Read, Recipe, load
 from dew.data.dataset import Reader, ramped, record_argument
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
@@ -106,7 +106,7 @@ if TYPE_CHECKING:
     # tyro reads the runtime annotation, a Union of the aliased specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
-    type DataSpec = DatasetSpec
+    type DataSpec = Recipe
     type ScheduleSpec = ScheduleBase
 else:
     DataSpec = datasets.union
@@ -850,7 +850,12 @@ class RunConfig:
     subcommand its flags imply."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(default_factory=lambda: datasets["tfds_images"]())
+    data: DataSpec = dataclasses.field(default_factory=lambda: Images(source="tfds://oxford_flowers102"))
+    read: Read = "memory"
+    provision: bool = False
+    data_seed: int = 0
+    loading: Loading = dataclasses.field(default_factory=Loading)
+    validation_records: int | None = None
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: ObjectiveConfig | None = None
@@ -1044,7 +1049,9 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        dataset = self.data.load(batch=self.trainer.batch_size)
+        dataset = load(self.data, batch=self.trainer.batch_size, read=self.read,
+                       provision=self.provision, seed=self.data_seed, loading=self.loading,
+                       validation_records=self.validation_records, objective=objective.data())
         return Prepared(self, lambda name: self.train(objective, dataset, name=name))
 
     def run(self) -> TrainState:

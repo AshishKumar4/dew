@@ -248,7 +248,7 @@ def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     by_id = lambda epoch: {identifier: draw for batch in epoch for identifier, draw in
                           zip(batch["id"], batch["draw"], strict=True)}
     assert by_id(first_epoch) != by_id(second_epoch)
-    manifest = Manifest.of(stored.snapshot(), ())
+    manifest = Manifest.of(stored.snapshot(), (), fill={"read": "memory", "row_ids": "indexed"})
     generation = cache.publish(manifest, stored)
     resumed = build(prefix).train(DataPartition())
     resumed.set_state(saved)

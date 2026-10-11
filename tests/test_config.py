@@ -25,7 +25,7 @@ from dew.training import Layout, MeshSpec
 def test_to_dict_and_from_dict_round_trip_a_run():
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
-        data=datasets["tfds_images"](image_size=64),
+        data=datasets["images"](source="tfds://oxford_flowers102", image_size=64),
         optim=OptimConfig(optimizer="lamb", learning_rate=1e-3, weight_decay=0.1, b1=0.8, b2=0.99),
         trainer=TrainerConfig(name="run", steps=10, mesh=MeshSpec(fsdp=2),
                               layout=Layout(rules={"mlp": "fsdp"}, min_shard=8)),
@@ -39,7 +39,7 @@ def test_a_tuple_field_comes_back_a_tuple_from_a_record():
     """JSON has no tuple, so a record holds a list where the class declares
     one. The class gets its tuple back: with a list in its place the loaded
     config compares unequal to the saved one and its spec is unhashable."""
-    config = RunConfig(data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+    config = RunConfig(data=datasets["images"](source="data/cc12m", image_size=64),
                        trainer=TrainerConfig(steps=1))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
 
@@ -64,31 +64,31 @@ def test_a_field_a_record_lacks_takes_its_default():
 
 
 def test_a_registered_arrayrecord_spec_round_trips(tmp_path):
-    """The unregistered-base bug: data=ArrayRecordImages used to write bare
+    """A registered recipe records its concrete type and source, so the
     fields that from_dict could not rebuild. Registered, it records as
     {'name', 'fields'} like every other dataset and loads back."""
-    from dew.data.images import ArrayRecordImages
+    from dew.data import Images
 
     config = RunConfig(
-        data=ArrayRecordImages(path=str(tmp_path), image_size=8),
+        data=Images(source=str(tmp_path), image_size=8),
         trainer=TrainerConfig(steps=1))
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
 
     assert loaded == config
-    assert config.to_dict()["data"]["class"] == datasets.paths["array_record_images"]
+    assert config.to_dict()["data"]["class"] == datasets.paths["images"]
 
 
 def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
     """A spec the registry does not know cannot be written: to_dict raises
     now, instead of saving a record from_dict can never load back."""
-    from dew.data.images import ImageDataset
+    from dew.data import Images
 
     @dataclasses.dataclass(frozen=True)
-    class Unregistered(ImageDataset):
-        path: str | None = None
+    class Unregistered(Images):
+        pass
 
     config = RunConfig(
-        data=Unregistered(path=str(tmp_path), image_size=8),
+        data=Unregistered(source=str(tmp_path), image_size=8),
         trainer=TrainerConfig(steps=1))
     with pytest.raises(ValueError, match=r"Unregistered.*has no import path a record can name"):
         config.to_dict()
@@ -198,11 +198,11 @@ def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
     config = RunConfig.cli( [
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
         "--trainer.steps", "5", "--model", "uvit", "--model.emb_features", "32",
-        "data:token-windows", "--data.path", "tokens", "--data.seq-len", "8"])
+        "data:text", "--data.source", "tokens", "--data.seq-len", "8"])
     assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.trainer.layout.min_shard == 8
     assert config.model.fields == {"emb_features": 32}
-    assert type(config.data) is datasets["token_windows"]
+    assert type(config.data) is datasets["text"]
     assert config.data.seq_len == 8
     assert RunConfig.from_dict(config.to_dict()) == config
 
@@ -549,7 +549,7 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     groups included."""
     from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
@@ -564,7 +564,7 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
     momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
     config = RunConfig(
-        data=datasets["array_record_images"](image_size=64, shards=("cc12m",)),
+        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
             optimizer="adam", schedule=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),

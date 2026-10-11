@@ -3,7 +3,7 @@ import argparse
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, load
+from dew.data import ByteTokenizer, HoldOut, Hub, Loading, Text, load
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
@@ -11,9 +11,15 @@ from dew.training.optim import Cosine
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--steps", type=int, default=1000)
-steps = parser.parse_args().steps
+parser.add_argument("--tokens")
+args = parser.parse_args()
+steps = args.steps
 
-data = load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=256)
+recipe = (Text(source=args.tokens, seq_len=256) if args.tokens is not None else
+          Text(source=Hub("winglian/tiny-shakespeare"), tokenizer="byte", seq_len=256,
+               eos=True, token_holdout=HoldOut(fraction=0.01)))
+data = load(recipe, batch=64, read="memory", provision=args.tokens is None,
+            validation_records=256, loading=Loading(workers=0))
 model = CausalTransformer(vocab_size=256, emb_features=384, num_layers=6, num_heads=6,
                           mlp_features=1024, max_seq_len=256, dropout_rate=0.2)
 optimizer = OptimConfig(schedule=Cosine(peak=1e-3, warmup_steps=10, end=1e-4),

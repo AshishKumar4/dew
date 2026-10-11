@@ -30,7 +30,7 @@ import tyro
 
 import dew
 from dew.config import OptimConfig
-from dew.data import ChatMessages, Loading
+from dew.data import Chat, Loading, load
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective
@@ -105,10 +105,9 @@ def main(config: Config) -> Path:
 
     # A packed window is seq_len + 1 ids wide, and the objective reads rows of
     # exactly prompt + canvases: the spec is asked for one less.
-    data = ChatMessages(tokenizer=tokenizer, path=config.chat,
-                        seq_len=sequence_length - 1, val_batches=None,
-                        loading=Loading(workers=0, threads=1, read_buffer=2,
-                                        worker_buffer=1)).load(batch=config.batch_size)
+    data = load(Chat(tokenizer=tokenizer, source=config.chat, long="chunk",
+                     seq_len=sequence_length - 1), batch=config.batch_size, read="memory",
+                loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1))
 
     checkpoints = Checkpoints(str(config.out / "checkpoints"), keep=1)
     trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(1),

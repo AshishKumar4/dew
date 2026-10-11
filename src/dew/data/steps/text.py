@@ -29,7 +29,7 @@ class Tokenize(grain.MapTransform):
             raise ValueError(f"Tokenize field {self.field!r} must contain text")
         tokenizer = tokenizer_for(self.tokenizer)
         ids = tokenizer.encode(value)
-        if self.eos:
+        if self.eos and ids:
             if tokenizer.eos_id is None:
                 raise ValueError(f"tokenizer {self.tokenizer} has no EOS id")
             ids.append(tokenizer.eos_id)
@@ -78,8 +78,12 @@ class Chunks:
 class ValidTargets:
     field: str = "text"
     role: int | None = None
+    pad_id: int | None = None
+    measured: bool = True
 
     def __call__(self, element: Batch) -> int:
+        if self.measured and "_dew_valid_targets" in element:
+            return int(element["_dew_valid_targets"])
         segments = element.get(f"{self.field}_segment_ids")
         if segments is None:
             valid = np.ones(max(0, len(element[self.field]) - 1), bool)
@@ -88,4 +92,17 @@ class ValidTargets:
             valid = (segments[1:] > 0) & (segments[1:] == segments[:-1])
         if self.role is not None:
             valid &= np.asarray(element[f"{self.field}_roles"])[1:] == self.role
+        if self.pad_id is not None:
+            valid &= np.asarray(element[self.field])[1:] != self.pad_id
         return int(valid.sum())
+
+
+@dataclasses.dataclass(frozen=True)
+class CountTargets(grain.MapTransform):
+    role: int | None = None
+    pad_id: int | None = None
+    rejects = True
+
+    def map(self, element: Batch) -> Batch | Rejected:
+        count = ValidTargets(role=self.role, pad_id=self.pad_id, measured=False)(element)
+        return Rejected("zero_targets") if count == 0 else {**element, "_dew_valid_targets": count}

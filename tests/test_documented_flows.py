@@ -10,6 +10,7 @@ fixtures, under a hard limit on open files lower than a workstation's.
 """
 
 import os
+import json
 import resource
 import subprocess
 import sys
@@ -44,16 +45,17 @@ def step(directory: Path, *command: str, timeout: int = 900) -> str:
 @pytest.mark.mesh(devices=0)
 def test_the_language_model_flow_trains_exports_loads_and_generates(tmp_path):
     (tmp_path / "corpus.txt").write_text("the quick brown fox jumps over the lazy dog. " * 200)
-    step(tmp_path, "-m", "dew.cli.main", "tokenize", "--input", "corpus.txt", "--out", "tokens",
-         "--tokenizer", "byte", "--val-fraction", "0.1")
-    step(tmp_path, str(ROOT / "recipes" / "lm" / "train.py"), "data:token-windows",
-         "--data.path", "tokens", "--data.seq-len", "16", "--data.loading.workers", "0",
-         "--data.loading.threads", "1", "--data.loading.read-buffer", "2", "--data.val-batches", "2",
+    step(tmp_path, "-m", "dew.cli.main", "data", "export", "records", "tokens",
+         "--fields", '{"source": "corpus.txt"}', "--format", "array_record", "--tokenizer", "byte",
+         "--read", "memory")
+    step(tmp_path, str(ROOT / "recipes" / "lm" / "train.py"), "data:text",
+         "--data.source", "tokens", "--data.seq-len", "16", "--loading.workers", "0",
+         "--loading.threads", "1", "--loading.read-buffer", "2",
          "--model.dtype", "float32", "--model.attention-impl", "reference",
          "--model.emb_features", "16", "--model.num_layers", "1",
          "--model.num_heads", "2", "--model.mlp_features", "32",
          "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.log-every", "1",
-         "--trainer.eval-every", "2", "--trainer.checkpoint-every", "2", "--trainer.checkpoint-dir", "runs",
+         "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2", "--trainer.checkpoint-dir", "runs",
          "--trainer.name", "byte-demo", "--trainer.multi-host", "False", "--max-new-tokens", "0",
          "--sampling.temperature", "0.5", "--sampling.top-k", "7")
     step(tmp_path, "-m", "dew.cli.main", "export", "runs/byte-demo", "export")
@@ -69,11 +71,12 @@ def test_the_language_model_flow_trains_exports_loads_and_generates(tmp_path):
 
 @pytest.mark.mesh(devices=0)
 def test_the_diffusion_flow_trains_restores_and_samples(tmp_path):
-    step(tmp_path, str(ROOT / "recipes" / "diffusion" / "train.py"), "data:tfds-images",
-         "--data.path", str(IMAGES), "--data.name", "dew_images", "--data.image-size", "8",
-         "--data.augmentation", "none",
-         "--data.val-batches", "0", "--data.loading.workers", "0", "--data.loading.threads", "1",
-         "--data.loading.read-buffer", "2", "preset:flow", "--objective.solver", '{"class": "euler"}',
+    source = json.dumps({"class": "dew.data.sources.tfds:TFDS",
+                         "fields": {"name": "dew_images", "path": str(IMAGES), "split": "all"}})
+    step(tmp_path, str(ROOT / "recipes" / "diffusion" / "train.py"), "data:images",
+         "--data.source", source, "--data.image-size", "8", "--data.augment", "None",
+         "--data.validation", "None", "--loading.workers", "0", "--loading.threads", "1",
+         "--loading.read-buffer", "2", "preset:flow", "--objective.solver", '{"class": "euler"}',
          "--objective.guidance", "None",
          "--text.encoder", "char_table", "--text.checkpoint", "char_table",
          "--model", "simple_dit", "--model.patch_size", "2", "--model.emb_features", "16",
