@@ -48,3 +48,8 @@ def step_counts(batch: Batch) -> dict[str, jax.Array]:
     """Global device-side sums, returned with the step's other scalar metrics."""
     return {name: jnp.sum(batch[name], dtype=jnp.float32)
             for name in (FORWARD_FLOPS, TOKENS) if name in batch}
+
+
+def model_batch(batch: Batch) -> Batch:
+    """The objective sees only its own inputs, not the trainer's accounting columns."""
+    return {name: value for name, value in batch.items() if name not in (FORWARD_FLOPS, TOKENS)}
