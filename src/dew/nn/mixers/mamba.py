@@ -108,7 +108,7 @@ class Mamba(nn.Module):
     `intermediate_size` is the config's `expand * hidden_size`, `state_size`
     each channel's `N`, and `time_step_rank` the width of the raw step.
 
-    The decode state is `ssm_state` `[B, D, N]` and `conv_state` `[B, D, K-1]`
+    The decode state is `ssm_state` `[B, D, N]` and `conv_state` `[B, K-1, D]`
     in the `cache` collection (`held_scan`); a call holding it scans from
     the held state. Padded rows (`attention_metadata.valid`) are zeroed
     before the projection and take a zero step, and packed documents
@@ -200,11 +200,11 @@ class Mamba(nn.Module):
         return self.out_proj(gated.astype(gate.dtype))
 
     def _scan(self, convolved, *, starts, valid, held):
-        """The selective scan of the convolved `[B, D, S]` inner channels:
+        """The selective scan of the convolved `[B, S, D]` inner channels:
         the raw step, B and C from `x_proj`, then the step through
         `dt_proj`. Returns `[B, S, D]` before the gate and the state leaving
         it."""
-        xs = jnp.moveaxis(convolved, 2, 1)                              # [B, S, D]
+        xs = convolved
         if valid is not None:
             xs = jnp.where(valid[:, :, None], xs, 0)
         raw, B, C = jnp.split(self.x_proj(xs), [self.time_step_rank, self.time_step_rank + self.state_size],
