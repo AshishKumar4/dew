@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Capture loader behavior inside the pinned 66beb5305 reference checkout.
 
-Run from the baseline checkout with this script from the pipeline branch:
-git show feat/data-pipeline-core:tools/data_oracle.py | python - --output=ORACLE.json
+Run through data_oracle.py beside it, which downloads that checkout and runs
+this script inside it:
+python tools/measurements/data-pipeline/data_oracle.py --output=ORACLE.json
 Only synthetic records are used; real corpus equivalence is a separate gate.
 """
 
