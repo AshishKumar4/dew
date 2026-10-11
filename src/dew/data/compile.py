@@ -210,6 +210,7 @@ def _check(pipeline: Pipeline, read: Read, *, validation: bool = False, promotio
     )
     random = next((_identity(stage).name for stage in ancestry if isinstance(stage, RandomMap)), None)
     indexed, batched, workers, host = read != "streamed", False, False, False
+    budgeted = False
     canonical = True
     prefix = list(ancestry)
     for stage in pipeline.stages:
@@ -245,6 +246,12 @@ def _check(pipeline: Pipeline, read: Read, *, validation: bool = False, promotio
             if batched:
                 raise ValueError(f"pipeline {name} is already batched; use rebatch")
             batched, indexed = True, False
+            budgeted = isinstance(stage, TokenBudget)
+        if isinstance(stage, Rebatch):
+            if not batched:
+                raise ValueError(f"rebatch in {name} must follow batch")
+            if budgeted:
+                raise ValueError(f"rebatch in {name} changes the fixed token budget; use batch(tokens=)")
         if isinstance(stage, Workers):
             if workers:
                 raise ValueError(f"pipeline {name} contains workers more than once")
@@ -905,7 +912,7 @@ def _per_share(pipeline: Pipeline, read: Read) -> bool:
         if any(_per_share(child, read) for child in pipeline.source.pipelines):
             return True
     return any(
-        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact, Rebatch, TokenBudget))
+        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact, Rebatch, TokenBudget, Workers))
         or (isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects)
         for stage in pipeline.stages
     )
@@ -1048,7 +1055,7 @@ class _Build:
         else:
             rows, lengths = self.source(pipeline, partition)
         for stage in pipeline.stages[consumed:]:
-            if isinstance(stage, (BatchStage, TokenBudget, Workers, MapBatch, Rebatch)):
+            if isinstance(stage, (BatchStage, TokenBudget, MapBatch, Rebatch)):
                 break
             if self.read == "streamed" and isinstance(stage, Repeat) and _root_repeat(pipeline):
                 continue
@@ -1114,6 +1121,13 @@ class _Build:
             rows = gx.ThreadPrefetchIterDataset(
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
             )
+        elif isinstance(stage, Workers):
+            rows = _as_iter(rows, self.loading).mp_prefetch(
+                pygrain.MultiprocessingOptions(
+                    num_workers=stage.count, per_worker_buffer_size=stage.buffer
+                )
+            )
+            lengths = None
         elif isinstance(stage, Limit):
             if isinstance(rows, pygrain.MapDataset):
                 rows = rows[: min(stage.count, len(rows))]
@@ -1277,8 +1291,18 @@ class _Build:
             stream = stream.map(
                 _FillShare(partition, batch_stage.size) if canonical else FilledBatch(size, real=not empty)
             )
-        explicit_workers = False
-        for stage in pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]:
+        return iter(self.after_batch(stream, pipeline, partition, batch_stage))
+
+    def after_batch(
+        self,
+        stream: pygrain.IterDataset,
+        pipeline: Pipeline,
+        partition: DataPartition,
+        batch_stage: BatchStage | TokenBudget,
+    ) -> pygrain.IterDataset:
+        boundary = pipeline.stages.index(batch_stage)
+        explicit_workers = any(isinstance(stage, Workers) for stage in pipeline.stages[:boundary])
+        for stage in pipeline.stages[boundary + 1 :]:
             if isinstance(stage, Workers):
                 stream = stream.mp_prefetch(
                     pygrain.MultiprocessingOptions(
@@ -1303,7 +1327,7 @@ class _Build:
                     num_workers=self.loading.worker_count, per_worker_buffer_size=self.loading.worker_buffer
                 )
             )
-        return iter(stream)
+        return stream
 
     def token_batches(
         self, pipeline: Pipeline, partition: DataPartition, budget: TokenBudget
@@ -1316,14 +1340,7 @@ class _Build:
             )
         rows, _ = self.records(pipeline, partition)
         stream = TokenBatches(_as_iter(rows, self.loading), budget, partition, self.seed)
-        workers = _workers(pipeline, self.loading)
-        if workers:
-            stream = stream.mp_prefetch(
-                pygrain.MultiprocessingOptions(
-                    num_workers=workers, per_worker_buffer_size=self.loading.worker_buffer
-                )
-            )
-        return iter(stream)
+        return iter(self.after_batch(stream, pipeline, partition, budget))
 
 
 def _order(pipeline: Pipeline) -> Mapping[str, object]:
