@@ -43,6 +43,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from dew.telemetry.instrumentation import HloInstruction, custom_call_kind, hlo_instructions
+from dew.telemetry.peaks import peak_flops
 from dew.telemetry.profile import report_table
 
 PARTS = (
@@ -158,7 +159,7 @@ def heaviest(groups: dict) -> list:
 
 
 def attribute_time(trace: Path, steps: int, model_flops: float | None,
-                   ops: dict[str, HloInstruction] | None = None) -> dict:
+                   ops: dict[str, HloInstruction] | None = None, device: str | None = None) -> dict:
     capture = capture_of(trace)
     reports = capture / "reports"
     rows = report_table(reports / "hlo_stats.json")[1]
@@ -167,7 +168,11 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                 "XLA_FLAGS=--xla_gpu_enable_command_buffer= so XProf can attribute kernels"}
     roofline = json.loads((reports / "roofline_model.json").read_text())
     roofline = roofline[0] if isinstance(roofline, list) else roofline
-    peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0)
+    # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is the
+    # fallback only: on an RTX PRO 6000 it reports 3,742 TFLOP/s, a sparse low-precision figure.
+    known = peak_flops(device) if device else None
+    peak = known / 1e9 if known else float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0)
+    peak_source = f"dew.telemetry.peaks for {device}" if known else "xprof roofline"
     programs = defaultdict(float)
     for row in rows:
         programs[str(row.get("program_id"))] += float(row["total_self_time"])
@@ -206,7 +211,8 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     gemm_us = by_kind.get("gemm", 0.0)
     gemm_work = sum(record["us"] * record["gflops"] for record in gemms)
     result = {
-        "capture": str(capture), "steps": steps, "peak_gflops": peak, "step_program": step,
+        "capture": str(capture), "steps": steps, "peak_gflops": peak, "peak_source": peak_source,
+        "step_program": step,
         "programs_ms": {program: round(us / 1e3 / steps, 3)
                         for program, us in sorted(programs.items(), key=lambda item: -item[1])[:6]},
         "device_ms_per_step": round(device_us / 1e3, 3),
@@ -346,15 +352,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--steps", type=int, default=1)
     parser.add_argument("--entry", type=Path, help="entry.json carrying model_flops_per_step")
     parser.add_argument("--module", default="jit_step")
+    parser.add_argument("--device", help="the device kind, where --entry does not name it")
     args = parser.parse_args(argv)
-    flops = None
+    flops, device = None, args.device
     if args.entry and args.entry.exists():
-        flops = json.loads(args.entry.read_text()).get("model_flops_per_step")
+        entry = json.loads(args.entry.read_text())
+        flops, device = entry.get("model_flops_per_step"), device or entry.get("device")
     result = {}
     files = dump_files(args.hlo, args.module) if args.hlo else {}
     if args.trace:
         result["time"] = attribute_time(args.trace, args.steps, flops,
-                                        hlo_instructions(files[".txt"]) if ".txt" in files else None)
+                                        hlo_instructions(files[".txt"]) if ".txt" in files else None, device)
     if files:
         result["memory"] = attribute_memory(files)
     args.out.write_text(json.dumps(result, indent=1))
