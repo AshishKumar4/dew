@@ -125,6 +125,40 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str) -> None:
         f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
 
 
+
+def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1) -> None:
+    """Each leaf of the tree `dew` within FACTOR times the matching leaf of
+    `reference`'s RMS distance from float64 (`truth`), the three trees alike.
+
+    A port that sums `reductions` terms the reference sums in another order
+    rounds by up to sqrt(reductions) float32 units of a leaf's size in RMS,
+    so the reference's distance counts as at least that: one draw of
+    rounding below it is luck, not a bar, and a leaf that lost a term still
+    fails by orders of magnitude.
+
+    A leaf zero in float64 to its resolution of the tree (the gradient of a
+    parameter the loss is invariant to: a softmax's key bias, a bias every
+    option's logit shares) has no size of its own; both runs give it the
+    rounding of terms that cancel, and it is held to float32's resolution of
+    the tree, the same rule over the tree's largest leaf. A leaf float64
+    holds nonzero has no such floor, so a small true gradient that vanished
+    fails."""
+    unit, resolution = float(np.finfo(np.float32).eps), float(np.finfo(np.float64).eps)
+    spread = np.sqrt(reductions)
+    scale = max(distance(leaf, 0) for leaf in jax.tree.leaves(truth))
+    over = []
+    leaves = zip(jax.tree_util.tree_leaves_with_path(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                 strict=True)
+    for (path, mine), theirs, true in leaves:
+        size = distance(true, 0)
+        own = spread * unit * (size if size > spread * resolution * scale else scale)
+        bar = FACTOR * max(distance(theirs, true), own)
+        if distance(mine, true) > bar:
+            over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
+                        f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
+    assert not over, "\n".join(over)
+
+
 FALSE_FAILURE = 1e-6
 """The chance a port exactly as exact as its reference fails the K-order
 rule. The suite holds about 150 rules and CI runs it some tens of times a

@@ -528,7 +528,7 @@ def test_a_hybrid_decode_step_reads_the_conv_tail_it_left(rng):
     _, mutated = model.apply({**params, 'cache': cache}, ids[:, :4],
                              decode=True, mutable=['cache'])
     tail = mutated['cache']['layers_0']['self_attn']['conv_state']
-    assert tail.shape[-1] == 3 and jnp.any(tail)
+    assert tail.shape[1] == 3 and jnp.any(tail)
 
     kept, _ = model.apply({**params, 'cache': mutated['cache']}, ids[:, 4:5],
                           decode=True, mutable=['cache'])

@@ -460,7 +460,8 @@ def producer(producers, variable):
 
 
 def convolution_tap(equation, producers):
-    """The explicit depthwise conv's [D,K] column times a shifted [B,D,T].
+    """The explicit depthwise conv's [D,K] column times a window of the
+    activations shifted along time, [B,T,D] (the time-major layout) or [B,D,T].
 
     Dew avoids conv_general_dilated for this op; the two slices still expose
     its tap geometry independently of the model's declared kernel size.
@@ -472,13 +473,15 @@ def convolution_tap(equation, producers):
         if isinstance(variable, jaxpr_core.Literal):
             continue
         source = producer(producers, variable)
-        while source is not None and source.primitive.name in ("broadcast_in_dim", "convert_element_type"):
+        while source is not None and source.primitive.name in (
+                "broadcast_in_dim", "convert_element_type", "squeeze", "reshape"):
             source = producer(producers, source.invars[0])
         if source is not None and source.primitive.name == "slice":
             original, selected = source.invars[0].aval.shape, source.outvars[0].aval.shape
             if len(original) == 2 and original[1] > 1 and selected == (original[0], 1):
                 tapped = True
-            if len(original) == 3 and original[:2] == selected[:2] and original[-1] > selected[-1]:
+            narrowed = [axis for axis in range(len(original)) if original[axis] != selected[axis]]
+            if len(original) == 3 and len(narrowed) == 1 and narrowed[0] in (1, 2):
                 shifted = True
     return tapped and shifted
 
