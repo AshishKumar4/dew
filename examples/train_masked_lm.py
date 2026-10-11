@@ -81,7 +81,7 @@ def smoke_config(config: Config) -> tuple[Config, Files]:
     `json` builder `datasets` ships, so nothing is downloaded."""
     config.out.mkdir(parents=True, exist_ok=True)
     rows = config.out / "smoke.jsonl"
-    rows.write_text("".join(json.dumps({"text": line}) for line in SMOKE_TEXT * 160))
+    rows.write_text("".join(json.dumps({"text": line}) + "\n" for line in SMOKE_TEXT * 160))
     source = Files(str(rows), format="jsonl")
     return replace(config, dataset="json", tokenizer="byte", sequence_length=32, batch_size=8,
                    steps=4, warmup_steps=1, model={"emb_features": 32, "num_layers": 1, "num_heads": 2},
