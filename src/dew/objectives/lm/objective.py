@@ -657,11 +657,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             raise MissingFlopsCount("LMObjective needs the prediction-depth geometry when MTP is trained")
         if not isinstance(model, CountedLogits):
             raise MissingFlopsCount(f"{type(model).__name__} does not declare logits_flops for the LM head")
-        valid, documents = self._counted_tokens(batch)
-        predicted = valid[:, :-1] & valid[:, 1:]
-        if documents is not None:
-            predicted &= documents[:, :-1] == documents[:, 1:]
-        lengths = np.sum(predicted, axis=-1, dtype=np.int64)
+        lengths = self._prediction_lengths(batch)
         return counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
 
     def training_flops(self, model, batch: Batch) -> float:
@@ -674,11 +670,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             return super().training_flops(model, batch)
         if self.mtp_weight:
             raise MissingFlopsCount("adapted LMObjective needs prediction-depth parameter geometry")
-        valid, documents = self._counted_tokens(batch)
-        predicted = valid[:, :-1] & valid[:, 1:]
-        if documents is not None:
-            predicted &= documents[:, :-1] == documents[:, 1:]
-        targets = np.sum(predicted, axis=-1, dtype=np.int64)
+        targets = self._prediction_lengths(batch)
         return model.training_flops(self.real_lengths(batch)) + model.logits_training_flops(targets)
 
     def _check_flop_geometry(self, batch: Batch) -> None:
@@ -686,6 +678,13 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         raw = batch[TEXT_KEY]
         if isinstance(raw, ModelInputs) and raw.conditioning:
             raise MissingFlopsCount("LMObjective needs its conditioning tower's multi-sequence geometry")
+
+    def _prediction_lengths(self, batch: Batch) -> np.ndarray:
+        valid, documents = self._counted_tokens(batch)
+        predicted = valid[:, :-1] & valid[:, 1:]
+        if documents is not None:
+            predicted &= documents[:, :-1] == documents[:, 1:]
+        return np.sum(predicted, axis=-1, dtype=np.int64)
 
     def __init__(
         self,

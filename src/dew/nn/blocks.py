@@ -13,6 +13,7 @@ from jax.typing import DTypeLike
 
 from .attention import RMSNorm
 from .conv import Conv
+from .flops import projection_flops
 from .precision import at_least_fp32
 from .sharding import constrain, explicit_spec, whole_spec
 
@@ -160,6 +161,10 @@ class TimeProjection(nn.Module):
     activation: Callable = jax.nn.gelu
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return projection_flops(lengths, input_features + self.features, self.features)
 
     @nn.compact
     def __call__(self, x):

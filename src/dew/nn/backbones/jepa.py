@@ -47,15 +47,15 @@ class TokenStack(_JepaStackOptions):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The stack's declared pattern, with real sequence lengths for each block."""
-        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
-        return sum(counted_flops(ModulatedBlock(
-            features=self.features, num_heads=self.num_heads, mixer='ssm' if kind == 'ssm' else 'attention',
-            modulated=False, ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
-            **self._block_options(), parent=None), lengths) for kind in pattern)
+        return sum(counted_flops(block, lengths) for block in self._blocks())
 
     def setup(self):
+        self.blocks = self._blocks()
+
+    @nn.nowrap
+    def _blocks(self) -> list[ModulatedBlock]:
         pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
-        self.blocks = [
+        return [
             ModulatedBlock(
                 features=self.features,
                 num_heads=self.num_heads,
@@ -163,7 +163,7 @@ class JepaEncoder(_JepaStackOptions):
         if text_features is not None:
             raise MissingFlopsCount("JepaEncoder has no text conditioning projection")
         stack = self.stack_type(self.emb_features, self.num_layers, **self._stack_options(), parent=None)
-        return (projection_flops(lengths, self.patch_size**2 * input_channels, self.emb_features)
+        return (self._embedding(self.patch_size, self.emb_features).model_flops(lengths, input_channels)
                 + counted_flops(stack, lengths))
 
     def setup(self):
