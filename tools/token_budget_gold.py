@@ -5,15 +5,16 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import cProfile
 import hashlib
 import io
 import itertools
 import json
+import logging
 import pstats
 import time
 from pathlib import Path
-from types import CodeType
 
 import numpy as np
 
@@ -27,6 +28,33 @@ from dew.decision.objective import DecisionObjective
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
+class Requests(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.methods: collections.Counter[str] = collections.Counter()
+
+    def emit(self, entry: logging.LogRecord) -> None:
+        arguments = entry.args
+        if isinstance(arguments, tuple) and len(arguments) > 3:
+            method = arguments[3]
+            if isinstance(method, str) and method in ("GET", "HEAD", "PUT", "POST", "DELETE"):
+                self.methods[method] += 1
+
+
+@contextlib.contextmanager
+def count_requests():
+    logger = logging.getLogger("urllib3.connectionpool")
+    level, handlers, propagate = logger.level, logger.handlers, logger.propagate
+    counter = Requests()
+    logger.setLevel(logging.DEBUG)
+    logger.handlers, logger.propagate = [counter], False
+    try:
+        yield counter
+    finally:
+        logger.setLevel(level)
+        logger.handlers, logger.propagate = handlers, propagate
+
+
 def main() -> None:
     from huggingface_hub import snapshot_download
 
@@ -35,6 +63,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--batches", type=int, default=64)
     parser.add_argument("--micro-tokens", type=int, default=24576)
+    parser.add_argument("--batch-rows", type=int)
     parser.add_argument("--profile-open", type=Path)
     parser.add_argument("--descriptor")
     args = parser.parse_args()
@@ -52,13 +81,15 @@ def main() -> None:
         specials=Specials.of(tokenizer),
         layout=JointLayout(max_len=3072, max_state_tokens=1024),
         shuffle_options=True,
+        bucket=256 if args.batch_rows is not None else None,
     )
     started = time.monotonic()
     profiler = cProfile.Profile()
-    with profiler:
+    with count_requests() as requests, profiler:
         dataset = load(
             Decisions(args.root, descriptor=args.descriptor),
-            tokens=args.micro_tokens,
+            batch=args.batch_rows,
+            tokens=args.micro_tokens if args.batch_rows is None else None,
             read="indexed",
             objective=objective.data(),
             seed=0,
@@ -70,17 +101,6 @@ def main() -> None:
         pstats.Stats(profiler, stream=report).sort_stats("cumulative").print_stats(20)
         args.profile_open.with_suffix(".txt").write_text(report.getvalue())
     opened = time.monotonic()
-    profiled = profiler.getstats()
-    head_requests = sum(
-        entry.callcount for entry in profiled
-        if isinstance(entry.code, CodeType) and entry.code.co_name == "info"
-        and entry.code.co_filename.endswith("/data/storage.py")
-    )
-    requests = sum(
-        entry.callcount for entry in profiled
-        if isinstance(entry.code, CodeType) and entry.code.co_name == "request"
-        and "urllib3" in entry.code.co_filename
-    )
     reader = dataset.train(DataPartition())
     shapes = collections.Counter()
     real_tokens = rows = 0
@@ -89,10 +109,12 @@ def main() -> None:
         for batch in itertools.islice(reader, args.batches):
             shape = tuple(batch["tokens"].shape)
             shapes[str(shape)] += 1
-            if shape[0] * shape[1] != args.micro_tokens:
+            if args.batch_rows is None and shape[0] * shape[1] != args.micro_tokens:
                 raise ValueError(f"token budget {args.micro_tokens} emitted {shape}")
-            np.testing.assert_array_equal(batch[TOKEN_COUNTS], np.sum(batch["valid"], axis=1))
-            real_tokens += int(np.sum(batch[TOKEN_COUNTS]))
+            counts = np.sum(batch["valid"], axis=1)
+            if args.batch_rows is None:
+                np.testing.assert_array_equal(batch[TOKEN_COUNTS], counts)
+            real_tokens += int(np.sum(counts))
             rows += shape[0]
             if first_seconds is None:
                 first_seconds = time.monotonic() - started
@@ -108,18 +130,20 @@ def main() -> None:
             np.testing.assert_array_equal(after[field], expected[field], err_msg=field)
     finally:
         resumed.close()
-    if not shapes or len(shapes) > 6:
+    if not shapes or (args.batch_rows is None and len(shapes) > 6):
         raise ValueError(f"the budget path emitted {len(shapes)} shapes, expected at most six")
     result = {
         "root": args.root,
         "micro_tokens": args.micro_tokens,
+        "batch_rows": args.batch_rows,
         "rows": rows,
         "batches": sum(shapes.values()),
         "real_tokens": real_tokens,
         "observed_shapes": dict(shapes),
         "open_seconds": opened - started,
-        "open_http_requests": requests,
-        "open_head_requests": head_requests,
+        "open_http_requests": sum(requests.methods.values()),
+        "open_http_methods": dict(requests.methods),
+        "open_head_requests": requests.methods["HEAD"],
         "descriptor": args.descriptor,
         "first_batch_seconds": first_seconds,
         "elapsed_seconds": time.monotonic() - started,
