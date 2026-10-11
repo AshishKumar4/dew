@@ -18,6 +18,8 @@ def _write(store: Store, record: Mapping[str, object]) -> str:
     except PreconditionFailed:
         if store.read() != payload:
             raise ValueError(f"metadata descriptor already differs at {store.url}") from None
+    if store.read() != payload:
+        raise ValueError(f"metadata descriptor did not verify at {store.url}")
     return digest
 
 
