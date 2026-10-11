@@ -7,8 +7,9 @@ import functools
 import hashlib
 import json
 import random
+from types import UnionType
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Annotated, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, runtime_checkable
 
 import numpy as np
 import tyro
@@ -46,7 +47,7 @@ type Validation = HoldOut | Split | Pipeline | Source | str | Sequence[Batch] | 
 _DEFAULT_LOADING = Loading(workers="auto")
 
 
-def source_argument[Value](annotation: type[Value]):
+def source_argument(annotation: type | UnionType | TypeAliasType):
     def read(words):
         from dew.registry import from_record
 
@@ -322,6 +323,12 @@ class Text:
     phases: Annotated[tuple[DataPhase, ...], record_argument(tuple[DataPhase, ...])] = ()
     token_holdout: HoldOut | None = None
 
+    def __post_init__(self) -> None:
+        if self.seq_len < 1 or self.stride is not None and self.stride < 1:
+            raise ValueError("text seq_len and stride must be positive")
+        if self.packing_bins < 1:
+            raise ValueError("packing_bins must be positive")
+
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.sources.files import TokenFiles
 
@@ -394,7 +401,7 @@ class Text:
             return Pipeline(source).flat_map(Documents(source.tokens.eos_id)).pack(
                 self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
 
-        return (windows(sources[0], self.stride or self.seq_len),
+        return (windows(sources[0], self.seq_len if self.stride is None else self.stride),
                 held if isinstance(held, Pipeline) else None if sources[1] is None else windows(sources[1], self.seq_len), ())
 
 
@@ -511,6 +518,12 @@ class Augment:
     crop_scale: tuple[float, float] = (1.0, 1.0)
     backend: Literal["host", "device"] = "device"
 
+    def __post_init__(self) -> None:
+        if self.backend not in ("host", "device"):
+            raise ValueError("image augmentation backend must be host or device")
+        if len(self.crop_scale) != 2 or not 0 < self.crop_scale[0] <= self.crop_scale[1] <= 1:
+            raise ValueError("crop_scale must satisfy 0 < low <= high <= 1")
+
 
 @dataclasses.dataclass(frozen=True)
 class Images:
@@ -527,10 +540,14 @@ class Images:
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
 
+    def __post_init__(self) -> None:
+        if self.image_size < 1 or self.staging_size is not None and self.staging_size < self.image_size:
+            raise ValueError("image_size must be positive and staging_size must be at least image_size")
+
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.sources.tfds import TFDS
 
-        size = self.staging_size or self.image_size
+        size = self.image_size if self.staging_size is None else self.staging_size
         source = _source(self.source, split=self.split)
         if isinstance(source, TFDS):
             import tensorflow_datasets as tfds
