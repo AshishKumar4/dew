@@ -247,12 +247,19 @@ class Upsample(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def _convolution(self, **scope):
+        return Conv(self.features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return self._convolution(parent=None).model_flops(lengths, input_features)
+
     @nn.compact
     def __call__(self, x):
         B, H, W, C = x.shape
         out = jax.image.resize(x, (B, H * self.scale, W * self.scale, C), method="nearest")
-        return Conv(features=self.features, kernel_size=(3, 3), strides=(1, 1),
-                    dtype=self.dtype, precision=self.precision)(out)
+        return self._convolution()(out)
 
 
 class Downsample(nn.Module):
@@ -261,10 +268,18 @@ class Downsample(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
+    @nn.nowrap
+    def _convolution(self, **scope):
+        return Conv(self.features, (3, 3), strides=(2, 2), dtype=self.dtype,
+                    precision=self.precision, **scope)
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        return self._convolution(parent=None).model_flops(lengths, input_features)
+
     @nn.compact
     def __call__(self, x):
-        return Conv(features=self.features, kernel_size=(3, 3), strides=(2, 2),
-                    dtype=self.dtype, precision=self.precision)(x)
+        return self._convolution()(x)
 
 
 class ResidualBlock(nn.Module):
@@ -280,6 +295,16 @@ class ResidualBlock(nn.Module):
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-4
     dropout: float = 0.0
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int, time_features: int) -> float:
+        """The declared convolutions, one time map per row and any learned skip."""
+        conv = Conv(self.features, self.kernel_size, parent=None)
+        count = conv.model_flops(lengths, input_features) + conv.model_flops(lengths, self.features)
+        count += projection_flops(np.ones(np.shape(lengths), np.int64), time_features, self.features)
+        if input_features != self.features:
+            count += Conv(self.features, (1, 1), parent=None).model_flops(lengths, input_features)
+        return count
 
     def setup(self):
         if self.norm_groups > 0:

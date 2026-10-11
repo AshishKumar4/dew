@@ -6,12 +6,14 @@ from functools import partial
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from ..attention import RMSNorm, Stage, stage_attention
 from ..blocks import Downsample, FourierEmbedding, ResidualBlock, TimeProjection, Upsample
 from ..conv import Conv
+from ..flops import MissingFlopsCount, patch_lengths
 
 
 def unet_body(model: "Unet", x, temb, text, temporal=None):
@@ -37,9 +39,8 @@ def unet_body(model: "Unet", x, temb, text, temporal=None):
             "attention_configs names one stage per feature depth; got "
             f"{len(attention_configs)} stages for {len(feature_depths)} depths")
 
-    conv = partial(Conv, kernel_size=(3, 3), strides=(1, 1),
-                   dtype=model.dtype, precision=model.precision)
-    residual = partial(ResidualBlock, kernel_size=(3, 3), activation=model.activation,
+    conv = model._convolution
+    residual = partial(ResidualBlock, activation=model.activation,
                        norm_groups=model.norm_groups, dtype=model.dtype,
                        precision=model.precision)
     attention = partial(stage_attention, attention_impl=model.attention_impl, dtype=model.dtype,
@@ -122,6 +123,70 @@ class Unet(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
+
+    @nn.nowrap
+    def _convolution(self, features: int, **scope):
+        return Conv(features, (3, 3), dtype=self.dtype, precision=self.precision, **scope)
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount(f"{type(self).__name__} needs spatial_flops with image and text geometry")
+
+    @nn.nowrap
+    def spatial_flops(self, sample_shape: tuple[int, ...], rows: int, context_lengths=None,
+                       text_features: int | None = None) -> float:
+        """The same stage walk as unet_body, with convolution output areas explicit."""
+        divisor = 2**(len(self.feature_depths) - 1)
+        patch_lengths(sample_shape, (divisor, divisor), rows)
+        height, width, channels = sample_shape
+        area = np.full((rows,), height * width, np.int64)
+        row = np.ones((rows,), np.int64)
+        first = self.feature_depths[0]
+        count = TimeProjection(self.emb_features, parent=None).model_flops(row, self.emb_features)
+        count += self._convolution(first, parent=None).model_flops(area, channels)
+        channels, skips = first, [first]
+
+        def attention(stage, features, positions):
+            if stage is None:
+                return 0.0
+            block = stage_attention(stage, features, self.attention_impl, self.dtype,
+                                    self.precision, name="counted_attention")
+            return block.cross_flops(positions, features, context_lengths, text_features)
+
+        for level, (features, stage) in enumerate(zip(
+                self.feature_depths, self.attention_configs, strict=True)):
+            for index in range(self.num_res_blocks):
+                count += ResidualBlock(channels, parent=None).model_flops(area, channels, self.emb_features)
+                skips.append(channels)
+                if index == self.num_res_blocks - 1:
+                    count += attention(stage, channels, area)
+            if level < len(self.feature_depths) - 1:
+                area = area // 4
+                count += Downsample(features, parent=None).model_flops(area, channels)
+                channels = features
+        for _ in range(self.num_middle_res_blocks):
+            features = self.feature_depths[-1]
+            count += ResidualBlock(features, parent=None).model_flops(area, channels, self.emb_features)
+            channels = features
+            count += ResidualBlock(channels, parent=None).model_flops(area, channels, self.emb_features)
+        if self.num_middle_res_blocks and self.attention_configs[-1] is not None:
+            stage = dataclasses.replace(self.attention_configs[-1], use_self_and_cross=False)
+            count += attention(stage, channels, area)
+        for level in range(len(self.feature_depths) - 1, -1, -1):
+            features = self.feature_depths[level]
+            for index in range(self.num_res_blocks):
+                count += ResidualBlock(features, parent=None).model_flops(
+                    area, channels + skips.pop(), self.emb_features)
+                channels = features
+                if index == self.num_res_blocks - 1:
+                    count += attention(self.attention_configs[level], channels, area)
+            if level:
+                area = area * 4
+                count += Upsample(self.feature_depths[level - 1], 2, parent=None).model_flops(area, channels)
+                channels = self.feature_depths[level - 1]
+        count += self._convolution(first, parent=None).model_flops(area, channels)
+        count += ResidualBlock(first, parent=None).model_flops(area, first + skips.pop(), self.emb_features)
+        return count + self._convolution(self.output_channels, parent=None).model_flops(area, first)
 
     def setup(self):
         if self.norm_groups > 0:

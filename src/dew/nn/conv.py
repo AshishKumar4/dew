@@ -43,6 +43,7 @@ from jax.interpreters import ad, batching, mlir
 from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
+from .flops import conv_flops
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -239,6 +240,12 @@ class Conv(nn.Conv):
 
     promote_dtype: PromoteDtypeFn = _promoted_whole
     conv_general_dilated: ConvGeneralDilatedT | None = _conv_general_dilated
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_channels: int) -> float:
+        """Learned convolution products at the caller's real output positions."""
+        taps = self.kernel_size if isinstance(self.kernel_size, int) else math.prod(self.kernel_size)
+        return conv_flops(lengths, input_channels, self.features, taps, groups=self.feature_group_count)
 
     def __call__(self, inputs: jax.Array) -> jax.Array:
         spatial = 1 if isinstance(self.kernel_size, int) else len(self.kernel_size)

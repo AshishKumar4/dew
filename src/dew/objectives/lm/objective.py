@@ -47,7 +47,14 @@ from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import CountedLogits, CountedLogitsTraining, DecoderTraining, Logits, TokenModel
+from dew.nn.protocols import (
+    CountedLogits,
+    CountedLogitsTraining,
+    CountedPredictions,
+    DecoderTraining,
+    Logits,
+    TokenModel,
+)
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     OMITTED,
@@ -620,16 +627,22 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
     @property
     def counts_work(self) -> bool:
         """The LM head and every forward the configured loss executes need a count."""
-        return self._missing_flops(self.model) is None
+        try:
+            self.training_flops(None, {TEXT_KEY: np.zeros((1, 2), np.int32)})
+        except MissingFlopsCount:
+            return False
+        return True
 
     def _missing_flops(self, model) -> str | None:
         """Keep telemetry availability and an explicit count's refusal in agreement."""
         if type(self) is not LMObjective:
             return f"{type(self).__name__} needs counts for its auxiliary model forwards"
-        if self.mtp_weight:
-            return "LMObjective needs the prediction-depth geometry when MTP is trained"
         if not isinstance(model, CountedLogits):
             return f"{type(model).__name__} does not declare logits_flops for the LM head"
+        if self.mtp_weight and not isinstance(model, CountedPredictions):
+            return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
+        if self.mtp_weight and isinstance(model, CountedLogitsTraining):
+            return "LMObjective needs its adapted prediction depths' matrix usage"
         return None
 
     def _counted_tokens(self, batch: Batch):
@@ -670,7 +683,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             raise MissingFlopsCount(missing)
         self._check_flop_geometry(batch)
         lengths = self._prediction_lengths(batch)
-        return counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
+        count = counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
+        return count + (model.prediction_flops(self.real_lengths(batch)) if self.mtp_weight else 0)
 
     def training_flops(self, model, batch: Batch) -> float:
         """The adapted trunk and prediction head on actual token geometry."""

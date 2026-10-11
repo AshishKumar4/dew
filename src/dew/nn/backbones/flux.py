@@ -25,12 +25,23 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.blocks import sinusoidal_time
+from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import pixel_shuffle, pixel_unshuffle
 from dew.nn.sharding import logical_axes
 
-from .joint import DoubleStreamBlock, JointAttention, Modulation, embedding, guided_time, layer_norm, modulate
+from .joint import (
+    TIME_FEATURES,
+    DoubleStreamBlock,
+    JointAttention,
+    Modulation,
+    embedding,
+    embedding_flops,
+    guided_time,
+    layer_norm,
+    modulate,
+)
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
@@ -63,12 +74,30 @@ class FluxSingleBlock(nn.Module):
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        hidden, inner = int(self.features * self.mlp_ratio), self.heads * self.head_dim
+        return {'proj_mlp': (self.features, hidden), 'proj_fused': (inner + hidden, self.features)}
+
+    @nn.nowrap
+    def _modulation(self):
+        return Modulation(self.features, 3, dtype=self.dtype, precision=self.precision, name="norm")
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """QKV, the MLP input, the joined output and per-row modulation."""
+        length, = matching_lengths(lengths)
+        attention = JointAttention(self.heads, self.head_dim, project=False, parent=None)
+        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
+                + self._modulation().model_flops(np.ones(length.shape, np.int64))
+                + attention.stream_flops(lengths, None, self.features))
+
     @nn.compact
     def __call__(self, x, conditioning, rotation):
-        shift, scale, gate = Modulation(self.features, 3, dtype=self.dtype,
-                                        precision=self.precision, name="norm")(conditioning)
+        shift, scale, gate = self._modulation()(conditioning)
         normalized = modulate(layer_norm(self.dtype)(x), shift, scale)
-        hidden = nn.gelu(nn.Dense(int(self.features * self.mlp_ratio), dtype=self.dtype,
+        maps = self.projections()
+        hidden = nn.gelu(nn.Dense(maps['proj_mlp'][1], dtype=self.dtype,
                                   precision=self.precision, name="proj_mlp")(normalized),
                          approximate=True)
         attended, _ = JointAttention(
@@ -78,7 +107,7 @@ class FluxSingleBlock(nn.Module):
         # The source calls this `proj_out` inside its own block; the tree
         # names it apart from the model's own output projection, whose two
         # sides are the other way round.
-        return x + gate[:, None] * nn.Dense(self.features, dtype=self.dtype,
+        return x + gate[:, None] * nn.Dense(maps['proj_fused'][1], dtype=self.dtype,
                                             precision=self.precision, name="proj_fused")(joined)
 
 
@@ -127,6 +156,31 @@ class FluxTransformer(nn.Module):
         """Every call takes the text as `conditioning`, run beside the image in the double-stream blocks."""
         return "conditioning"
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("FluxTransformer needs multisequence_flops(image_lengths, text_lengths)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        return patch_lengths(sample_shape, (2, 2), rows)
+
+    @nn.nowrap
+    def multisequence_flops(self, lengths, context_lengths) -> float:
+        """Every packed image/text map, joint block, time/pooled map and output."""
+        image, context = matching_lengths(lengths, context_lengths)
+        rows = np.ones(image.shape, np.int64)
+        count = (projection_flops(lengths, self.in_channels, self.features)
+                 + projection_flops(context_lengths, self.joint_attention_dim, self.features))
+        time = embedding_flops(rows, TIME_FEATURES, self.features)
+        count += (1 + self.guidance_embeds) * time
+        count += embedding_flops(rows, self.pooled_projection_dim, self.features)
+        block = DoubleStreamBlock(self.features, self.heads, self.head_dim, parent=None)
+        count += self.num_layers * block.multisequence_flops(lengths, context_lengths)
+        single = FluxSingleBlock(self.features, self.heads, self.head_dim, parent=None)
+        count += self.num_single_layers * single.model_flops((image + context).astype(np.int64))
+        return (count + self._output_modulation().model_flops(rows)
+                + projection_flops(lengths, self.features, self.patch_size**2 * self.out_channels))
+
     def _conditioning(self, time, guidance, pooled):
         """`CombinedTimestepGuidanceTextProjEmbeddings`: the time, the
         distilled guidance where the checkpoint embeds it, and the pooled text.
@@ -139,11 +193,16 @@ class FluxTransformer(nn.Module):
         dense = {"dtype": self.dtype, "precision": self.precision}
 
         def embed(values, name: str):
-            features = sinusoidal_time(values, 256, dtype=at_least_fp32(self.dtype)).astype(pooled.dtype)
+            features = sinusoidal_time(values, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
+            features = features.astype(pooled.dtype)
             return embedding(features, self.features, name, **dense)
 
         return (guided_time(embed, time, guidance, guidance_embeds=self.guidance_embeds)
                 + embedding(pooled, self.features, "text_embedder", **dense))
+
+    @nn.nowrap
+    def _output_modulation(self):
+        return Modulation(self.features, 2, dtype=self.dtype, precision=self.precision, name="norm_out")
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -182,7 +241,7 @@ class FluxTransformer(nn.Module):
                                      name=f"single_transformer_blocks_{index}", **block)(
                 joined, conditioned, rotation)
         image = joined[:, context.shape[1]:]
-        scale, shift = Modulation(self.features, 2, name="norm_out", **dense)(conditioned)
+        scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
         packed = nn.Dense(self.patch_size ** 2 * self.out_channels, name="proj_out", **dense)(image)
         return pixel_shuffle(packed.reshape(packed.shape[0], rows, columns, -1))

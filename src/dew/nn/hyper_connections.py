@@ -43,6 +43,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from .attention import unweighted_rmsnorm
+from .flops import projection_flops
 from .precision import at_least_fp32
 
 HEADS = ('mean', 'weighted', 'carried')
@@ -131,6 +132,18 @@ class HyperConnection(nn.Module):
     emb_features: int
     norm_eps: float = 1e-5
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        copies = self.spec.hc_mult
+        return {'fn': (copies * self.emb_features, (2 + copies) * copies)}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The learned mapping and the comb contraction used to write the streams."""
+        copies = self.spec.hc_mult
+        return (projection_flops(lengths, *self.projections()['fn'])
+                + projection_flops(lengths, copies, copies * self.emb_features))
+
     def __call__(self, streams):
         pre, post, comb = self.mapping(streams)
         return post, comb, collapse_by(pre, streams)
@@ -139,8 +152,8 @@ class HyperConnection(nn.Module):
     def mapping(self, streams):
         """The site's `(pre, post, comb)` over the streams, all fp32 (`at_least_fp32`)."""
         hc = self.spec.hc_mult
-        mix = (2 + hc) * hc
-        fn = self.param('fn', nn.initializers.normal(0.02), (mix, hc * self.emb_features), jnp.float32)
+        inputs, mix = self.projections()['fn']
+        fn = self.param('fn', nn.initializers.normal(0.02), (mix, inputs), jnp.float32)
         base = self.param('base', nn.initializers.zeros, (mix,), jnp.float32)
         scale = self.param('scale', nn.initializers.ones, (3,), jnp.float32)
         flat = unweighted_rmsnorm(
@@ -182,10 +195,20 @@ class HyperHead(nn.Module):
     emb_features: int
     norm_eps: float = 1e-5
 
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        return {'hc_fn': (self.spec.hc_mult * self.emb_features, self.spec.hc_mult)}
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The learned collapse's flattened projection; sums are pointwise work."""
+        return projection_flops(lengths, *self.projections()['hc_fn'])
+
     @nn.compact
     def __call__(self, streams):
         hc = self.spec.hc_mult
-        fn = self.param('hc_fn', nn.initializers.normal(0.02), (hc, hc * self.emb_features), jnp.float32)
+        inputs, outputs = self.projections()['hc_fn']
+        fn = self.param('hc_fn', nn.initializers.normal(0.02), (outputs, inputs), jnp.float32)
         base = self.param('hc_base', nn.initializers.zeros, (hc,), jnp.float32)
         scale = self.param('hc_scale', nn.initializers.ones, (1,), jnp.float32)
         flat = unweighted_rmsnorm(

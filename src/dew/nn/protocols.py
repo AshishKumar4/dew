@@ -50,18 +50,51 @@ from dew.nn.inputs import ModelKwarg
 
 if TYPE_CHECKING:
     from dew.diffusion.process import DenoisingCondition
+    from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.dit import TextContext
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedDecisions", "CountedImages",
-           "CountedLogits", "CountedLogitsTraining", "CountedMatrixUsage", "CountedParameters",
-           "CountedTraining", "DecoderTraining", "DenoisingModel",
-           "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
-           "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
-           "Serving", "TimeScaled", "TokenModel", "TritonGemm"]
+__all__ = [
+    "AffineHead",
+    "BlockDenoiser",
+    "CacheCapacity",
+    "Counted",
+    "CountedCondition",
+    "CountedConditionedSpatial",
+    "CountedDecisions",
+    "CountedImages",
+    "CountedLogits",
+    "CountedLogitsTraining",
+    "CountedMatrixUsage",
+    "CountedMultimodal",
+    "CountedParameters",
+    "CountedPredictions",
+    "CountedSequences",
+    "CountedSpatial",
+    "CountedTraining",
+    "CountedVideo",
+    "DecoderTraining",
+    "DenoisingModel",
+    "HiddenStates",
+    "IntervalModel",
+    "LayerScalars",
+    "Logits",
+    "LogitsFromHidden",
+    "Looping",
+    "ModelKwarg",
+    "OutputTable",
+    "ProjectionGroup",
+    "Recomputing",
+    "RematChoosing",
+    "RequiresText",
+    "Serving",
+    "TimeScaled",
+    "TokenModel",
+    "TritonGemm",
+]
 
 
 @struct.dataclass
@@ -152,6 +185,20 @@ class CountedLogits(Counted, Protocol):
 
 
 @runtime_checkable
+class CountedCondition(Protocol):
+    """A condition encoder owns its work and the geometry its denoiser reads."""
+
+    def conditioning_flops(self, tokens: Mapping[str, np.ndarray]) -> ConditionWork: ...
+
+
+@runtime_checkable
+class CountedPredictions(Protocol):
+    """The extra decoder depths and heads trained beside a language model's trunk."""
+
+    def prediction_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
 class CountedImages(Protocol):
     """A patch-token model's forward work with channel/conditioning geometry.
 
@@ -164,6 +211,56 @@ class CountedImages(Protocol):
                     text_features: int | None = None) -> float: ...
 
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
+
+
+@runtime_checkable
+class CountedSequences(Protocol):
+    """A joint/cross-attention backbone with separate image and text geometry.
+
+    Image channels and text feature width are the module's own configuration;
+    the objective supplies independent real lengths and the known sample shape.
+    """
+
+    def multisequence_flops(self, lengths: np.ndarray, context_lengths: np.ndarray) -> float: ...
+
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
+
+
+@runtime_checkable
+class CountedMultimodal(Protocol):
+    """A joint-stream model whose input maps infer their widths at init."""
+
+    def multimodal_flops(self, lengths: np.ndarray, context_lengths: np.ndarray,
+                         input_channels: int, text_features: int) -> float: ...
+
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
+
+
+@runtime_checkable
+class CountedSpatial(Protocol):
+    """A convolutional denoiser with a resolution-specific stage walk."""
+
+    def spatial_flops(self, sample_shape: tuple[int, ...], rows: int,
+                       context_lengths: np.ndarray | None = None,
+                       text_features: int | None = None) -> float: ...
+
+
+@runtime_checkable
+class CountedConditionedSpatial(Protocol):
+    """A spatial model also consumes the encoder's pooled and time-id geometry."""
+
+    def conditioned_spatial_flops(self, sample_shape: tuple[int, ...], rows: int,
+                                   condition: ConditionWork) -> float: ...
+
+
+@runtime_checkable
+class CountedVideo(Protocol):
+    """A factorized video model with independent frame and spatial axes."""
+
+    def video_lengths(self, sample_shape: tuple[int, ...], rows: int) -> tuple[np.ndarray, np.ndarray]: ...
+
+    def spatiotemporal_flops(self, frames: np.ndarray, patches: np.ndarray, input_channels: int,
+                             text_features: int | None = None) -> float: ...
 
 
 @runtime_checkable

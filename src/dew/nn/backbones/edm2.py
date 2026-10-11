@@ -16,11 +16,13 @@ from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.dit import TextContext, masked_mean
+from dew.nn.flops import MissingFlopsCount, attention_flops, patch_lengths, projection_flops
 from dew.nn.mp import MPConv, MPFourier, mp_cat, mp_silu, mp_sum, normalize
 
 
@@ -49,6 +51,28 @@ class Block(nn.Module):
     clip_act: float | None = 256.0
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @nn.nowrap
+    def _residual_conv(self, **scope):
+        return MPConv(self.features, (3, 3), **scope)
+
+    @nn.nowrap
+    def spatial_flops(self, lengths, input_features: int, emb_features: int) -> float:
+        """The block's residual, time and skip maps and optional spatial attention."""
+        residual_in = self.features if self.flavor == "enc" else input_features
+        conv = self._residual_conv(parent=None)
+        count = conv.model_flops(lengths, residual_in) + conv.model_flops(lengths, self.features)
+        count += MPConv(self.features, parent=None).model_flops(
+            np.ones(np.shape(lengths), np.int64), emb_features)
+        if input_features != self.features:
+            count += MPConv(self.features, (1, 1), parent=None).model_flops(lengths, input_features)
+        if self.attention:
+            heads = self.features // self.channels_per_head
+            count += MPConv(3 * self.features, (1, 1), parent=None).model_flops(lengths, self.features)
+            count += MPConv(self.features, (1, 1), parent=None).model_flops(lengths, self.features)
+            count += attention_flops(lengths, heads, self.features // heads,
+                                     self.features // heads, causal=False)
+        return count
+
     @nn.compact
     def __call__(self, x: jax.Array, emb: jax.Array, train: bool) -> jax.Array:
         skip = x.shape[-1] != self.features
@@ -57,12 +81,12 @@ class Block(nn.Module):
             if skip:
                 x = MPConv(self.features, (1, 1), name="conv_skip")(x)
             x = normalize(x, axes=(-1,))
-        y = MPConv(self.features, (3, 3), name="conv_res0")(mp_silu(x))
+        y = self._residual_conv(name="conv_res0")(mp_silu(x))
         gain = self.param("emb_gain", nn.initializers.zeros, ())
         scale = MPConv(self.features, name="emb_linear")(emb, gain=gain) + 1
         y = mp_silu(y * scale[:, None, None, :].astype(y.dtype))
         y = nn.Dropout(self.dropout)(y, deterministic=not train)
-        y = MPConv(self.features, (3, 3), name="conv_res1")(y)
+        y = self._residual_conv(name="conv_res1")(y)
         if self.flavor == "dec" and skip:
             x = MPConv(self.features, (1, 1), name="conv_skip")(x)
         x = mp_sum(x, y, t=self.res_balance)
@@ -107,12 +131,77 @@ class EDM2UNet(nn.Module):
     dtype: Dtype | None = None
     attention_impl: str = "auto"  # an AttentionImpl
 
+    @property
+    def channels(self) -> list[int]:
+        return [self.model_channels * mult for mult in self.channel_mult]
+
+    @property
+    def noise_features(self) -> int:
+        return self.model_channels * (self.channel_mult_noise or self.channel_mult[0])
+
+    @property
+    def embedding_features(self) -> int:
+        return self.model_channels * (self.channel_mult_emb or max(self.channel_mult))
+
+    @nn.nowrap
+    def _convolution(self, features: int, **scope):
+        return MPConv(features, (3, 3), **scope)
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        raise MissingFlopsCount("EDM2UNet requires spatial_flops with image shape and optional label width")
+
+    @nn.nowrap
+    def spatial_flops(self, sample_shape: tuple[int, ...], rows: int, context_lengths=None,
+                       text_features: int | None = None) -> float:
+        """Magnitude-preserving convolutions, skip projections and resolution-specific attention."""
+        del context_lengths  # The text is mean-pooled before its one label projection.
+        divisor = 2**(len(self.channel_mult) - 1)
+        patch_lengths(sample_shape, (divisor, divisor), rows)
+        height, width, input_channels = sample_shape
+        depths, noise, emb = self.channels, self.noise_features, self.embedding_features
+        row = np.ones((rows,), np.int64)
+        count = projection_flops(row, noise, emb)
+        if text_features is not None:
+            count += projection_flops(row, text_features, emb)
+
+        def block(area, inputs, outputs, *, encoder: bool, attend: bool):
+            counted = Block(outputs, "enc" if encoder else "dec", attention=attend,
+                            channels_per_head=self.channels_per_head, parent=None)
+            return counted.spatial_flops(area, inputs, emb)
+
+        area = np.full((rows,), height * width, np.int64)
+        channels, skips = input_channels + 1, []
+        for level, features in enumerate(depths):
+            if level == 0:
+                count += self._convolution(features, parent=None).model_flops(area, channels)
+                channels = features
+            else:
+                area = area // 4
+                count += block(area, channels, channels, encoder=True, attend=False)
+            skips.append(channels)
+            for _ in range(self.num_blocks):
+                count += block(area, channels, features, encoder=True,
+                                attend=height // 2**level in self.attn_resolutions)
+                channels = features
+                skips.append(channels)
+        for level in range(len(depths) - 1, -1, -1):
+            if level == len(depths) - 1:
+                count += block(area, channels, channels, encoder=False, attend=True)
+                count += block(area, channels, channels, encoder=False, attend=False)
+            else:
+                area = area * 4
+                count += block(area, channels, channels, encoder=False, attend=False)
+            for _ in range(self.num_blocks + 1):
+                count += block(area, channels + skips.pop(), depths[level], encoder=False,
+                                attend=height // 2**level in self.attn_resolutions)
+                channels = depths[level]
+        return count + self._convolution(self.output_channels, parent=None).model_flops(area, channels)
+
     @nn.compact
     def __call__(self, x: jax.Array, time: jax.Array, textcontext: TextContext | None = None,
                  train: bool = False) -> jax.Array:
-        channels = [self.model_channels * mult for mult in self.channel_mult]
-        noise = self.model_channels * (self.channel_mult_noise or self.channel_mult[0])
-        width = self.model_channels * (self.channel_mult_emb or max(self.channel_mult))
+        channels, noise, width = self.channels, self.noise_features, self.embedding_features
         block = {"channels_per_head": self.channels_per_head, "dropout": self.dropout,
                  "res_balance": self.res_balance, "attn_balance": self.attn_balance,
                  "clip_act": self.clip_act, "attention_impl": self.attention_impl}
@@ -131,7 +220,7 @@ class EDM2UNet(nn.Module):
         for level, features in enumerate(channels):
             size = x.shape[1] if level == 0 else skips[-1].shape[1] // 2
             if level == 0:
-                x = MPConv(features, (3, 3), name=f"enc_{size}x{size}_conv")(x)
+                x = self._convolution(features, name=f"enc_{size}x{size}_conv")(x)
             else:
                 x = Block(x.shape[-1], "enc", "down", name=f"enc_{size}x{size}_down",
                           **block)(x, emb, train)
@@ -156,7 +245,7 @@ class EDM2UNet(nn.Module):
                 x = Block(features, "dec", attention=size in self.attn_resolutions,
                           name=f"dec_{size}x{size}_block{index}", **block)(x, emb, train)
         gain = self.param("out_gain", nn.initializers.zeros, ())
-        return MPConv(self.output_channels, (3, 3), name="out_conv")(x, gain=gain)
+        return self._convolution(self.output_channels, name="out_conv")(x, gain=gain)
 
 
 __all__ = ["Block", "EDM2UNet"]

@@ -339,10 +339,12 @@ def test_diffusion_work_availability_uses_the_same_auxiliary_geometry_as_direct_
 @pytest.mark.parametrize("mtp_weight", [None, 1.0])
 def test_lm_work_availability_uses_the_same_prediction_depth_geometry_as_direct_counts(mtp_weight):
     objective = LMObjective(decoder(num_nextn_predict_layers=1), seq_len=6, mtp_weight=mtp_weight)
-    assert objective.counts_work is (mtp_weight is None)
-    if mtp_weight is not None:
-        with pytest.raises(MissingFlopsCount, match="prediction-depth geometry"):
-            objective.training_flops(None, packed_batch())
+    assert objective.counts_work
+    batch = packed_batch()
+    trunk = (objective.model.model_flops(objective.real_lengths(batch))
+             + objective.model.logits_flops(objective._prediction_lengths(batch)))
+    depths = objective.model.prediction_flops(objective.real_lengths(batch)) if mtp_weight else 0
+    assert objective.training_flops(None, batch) == 3 * (trunk + depths)
 
 
 @pytest.mark.mesh(devices=2)

@@ -31,6 +31,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
+from .flops import projection_flops
 from .precision import at_least_fp32
 
 
@@ -76,6 +77,11 @@ class DepthAttention(nn.Module):
 
     emb_features: int
     norm_eps: float = 1e-5
+
+    @nn.nowrap
+    def depth_flops(self, lengths, num_sources: int) -> float:
+        """The pseudo-query score and weighted-value contraction for each source."""
+        return 2 * projection_flops(lengths, self.emb_features, num_sources)
 
     @nn.compact
     def __call__(self, values):
