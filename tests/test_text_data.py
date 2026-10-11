@@ -33,6 +33,7 @@ from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
+from dew.data import Memory, Pipeline, compile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1006,20 +1007,17 @@ def test_documents_packed_online_by_grain_keep_attention_inside_each_document(mo
     """The online route `docs/concepts/data.md` shows under Packing: grain's
     concat-then-split packer names its fields the way the decoder reads
     them, so a row it packs masks attention at document boundaries."""
-    from grain.experimental import ConcatThenSplitIterDataset
-
-    from dew.data import Dataset
-
     seq_len = 16
     documents = [{"text": np.full(length, value, np.int32)}
                  for value, length in enumerate((5, 9, 3, 12, 7, 4, 11, 6), start=1)]
 
-    def packed(partition):
-        rows = pygrain.MapDataset.source(documents).repeat(None)
-        share = rows[partition.index::partition.count].to_iter_dataset()
-        return ConcatThenSplitIterDataset(share, length_struct={"text": seq_len + 1})
-
-    batch = next(Dataset.from_grain(packed, batch=4).train(DataPartition()))
+    data = compile(Pipeline(Memory(documents)).repeat().pack(seq_len + 1, policy="concat").batch(4),
+                   read="indexed", loading=Loading(workers=0))
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
 
     assert set(batch) == {"text", "text_segment_ids", "text_positions"}
     mask = _attention_mask(batch, monkeypatch)

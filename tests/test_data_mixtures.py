@@ -36,10 +36,10 @@ from dew.data.dataset import (
     mixed_stream,
     mixture,
     ramped,
-    tokenized,
     train_stream,
 )
 from dew.data.recipes import load
+from dew.data.steps.image import EncodeCaptions
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -804,9 +804,8 @@ def test_a_ramp_reads_through_a_captioned_datasets_tokenized_stream():
         return {"length": np.asarray([len(caption) for caption in captions], np.int32)}
 
     def captioned(batch: int) -> Dataset:
-        return Dataset(train=tokenized(train_stream(Captioned(1, 64), [], batch=batch,
-                                                    seed=0, loading=READ), lengths),
-                       val=None, records=64, batch=batch)
+        return compile(Pipeline(Memory(Captioned(1, 64))).shuffle(0).repeat().batch(batch).map_batch(
+                           EncodeCaptions(lengths)), read="memory", seed=0, loading=READ)
 
     flat = [value for step in taken(captioned(4).train(DataPartition()), 12) for value in step]
     schedule = Ramp(start=2, increment=1, samples=6)
