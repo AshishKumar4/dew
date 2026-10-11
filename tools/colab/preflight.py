@@ -21,6 +21,8 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from tools.colab.common import REPO, VENV_PYTHON, git
@@ -582,13 +584,16 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             texts[item.name] = data.decode()
     found = shell(args.command, texts)
     failures = list(found["failures"])
+    # A ref beside the job's own reaches the VM only through the entry's `refs:` (colab_batch adds
+    # them to the commits it fetches): a checkout of any other one fails there, and silently in a
+    # script that runs on (c58's fallback).
+    declared = {resolved(ref, args.origin): ref for ref in args.also}
+    receipt["refs"] = sorted(declared)
     for ref in found["checkouts"]:
-        try:
-            target = git(REPO, "rev-parse", f"{ref}^{{commit}}")
-        except RuntimeError:
-            target = ref
-        if target != commit:
-            failures.append(f"a script checks out {ref}, not the preflighted {commit}")
+        target = resolved(ref, args.origin)
+        if target != commit and target not in declared:
+            failures.append(f"a script checks out {ref}, which is neither the preflighted {commit} "
+                            "nor a declared --also ref")
     targets = set(found["interpreters"]) or {"system"}
     if len(targets) > 1:
         failures.append("pins go to both the system Python and the job's venv; preflight one interpreter")
@@ -625,6 +630,7 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             failures.append(f"{label(chain)}: {detail}")
     failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
     receipt.update(static={name: failed[name] for name in sorted(static.scope)}, guarded=static.guarded)
+    receipt["kernel_lab"] = lab_verified(tree, args.hardware, failures)
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
@@ -702,6 +708,93 @@ def top(chain: dict) -> str:
     return chain["module"].split(".")[0]
 
 
+def resolved(ref: str, origin: str) -> str:
+    """`ref` as a commit of this clone, fetched from `origin` if it lacks it; `ref` itself if it
+    names none."""
+    try:
+        return git(REPO, "rev-parse", f"{ref}^{{commit}}")
+    except RuntimeError:
+        pass
+    try:
+        git(REPO, "fetch", "-q", origin, ref)
+        return git(REPO, "rev-parse", f"{ref}^{{commit}}")
+    except RuntimeError:
+        return ref
+
+
+# Kernel choices that run Dew's own Pallas (Triton) kernels, whose lowering only a GPU proves.
+PALLAS_CHOICES = {"pallas", "fla", "triton"}
+GENERATIONS = {"gpu:T4": "sm75", "gpu:L4": "sm89", "gpu:A100": "sm80", "gpu:G4": "sm120"}
+LAB_GPUS = {"gpu:A100": "a100", "gpu:G4": "g4", "gpu:L4": "l4", "gpu:T4": "t4"}
+
+
+def kernel_digest(tree: Path) -> str:
+    """The content of Dew's kernels and of every source file that calls them, at `tree`: a ref's
+    kernels are the kernel lab's verified ones exactly when this matches the lab's record."""
+    source = tree / "src" / "dew"
+    calls = re.compile(r"(?:from|import)\s+(?:dew\.nn\.)?(?:\.+)?kernels\b|dew\.nn\.kernels")
+    files = sorted(path for path in source.rglob("*.py")
+                   if "kernels" in path.relative_to(source).parts or calls.search(path.read_text()))
+    digest = hashlib.sha256()
+    for path in files:
+        digest.update(str(path.relative_to(tree)).encode() + b"\0" + path.read_bytes() + b"\0")
+    return digest.hexdigest()
+
+
+def lab_verified(tree: Path, hardware: str, failures: list[str]) -> dict:
+    """Where the ref's measured kernel choices on `hardware` name Pallas kernels, the kernel lab's
+    record that it compiled and ran them on that GPU, kernels and their callers byte for byte: CPU
+    interpretation cannot catch a Triton lowering failure (c58, c57). None needed, none read."""
+    if not (tree / "src/dew/nn/kernels/generation.py").exists():
+        return {"generation": GENERATIONS[hardware], "pallas": []}
+    choices = subprocess.run(
+        [sys.executable, "-c", "import json; from dew.nn.kernels.generation import KERNELS; "
+         "print(json.dumps(KERNELS))"],
+        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(tree / "src")}, cwd=tree,
+        timeout=300)
+    if choices.returncode:
+        failures.append(f"cannot read the ref's KERNELS: {choices.stderr[-300:]}")
+        return {}
+    generation = GENERATIONS[hardware]
+    named = sorted(f"{choice}={row[generation]}" for choice, row in json.loads(choices.stdout).items()
+                   if row.get(generation) in PALLAS_CHOICES)
+    found = {"generation": generation, "pallas": named}
+    if not named:
+        return found
+    found["digest"] = digest = kernel_digest(tree)
+    key = f"lab/verified/{LAB_GPUS[hardware]}/{digest}.json"
+    record = store_read(key)
+    if record is None or not record.get("ok"):
+        failures.append(f"KERNELS on {generation} names Pallas kernels ({', '.join(named)}) whose code "
+                        f"the kernel lab has not verified on {LAB_GPUS[hardware]} ({key})")
+        return found
+    found["record"] = {k: record.get(k) for k in ("ref", "gpu", "versions", "at")}
+    return found
+
+
+def store_read(key: str) -> dict | None:
+    """A JSON object from Dew's R2 store (dew-data) with the read token in DEW_DATA_READ_TOKEN or
+    ~/.config/dew/dew-data.json's read_token_file; None where it is absent or unreadable."""
+    config = Path.home() / ".config/dew/dew-data.json"
+    url = "https://dew-data.ashishkmr472.workers.dev"
+    token = os.environ.get("DEW_DATA_READ_TOKEN")
+    if config.exists():
+        settings = json.loads(config.read_text())
+        url = settings.get("url", url)
+        if token is None and settings.get("read_token_file"):
+            token = Path(settings["read_token_file"]).expanduser().read_text().strip()
+    if not token:
+        return None
+    request = urllib.request.Request(f"{url.rstrip('/')}/{key}", headers={
+        "Authorization": f"Bearer {token}", "User-Agent": "dew-preflight"})
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            value = json.loads(response.read())
+    except (urllib.error.URLError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
 def label(chain: dict) -> str:
     return f"{chain['where']}: {'.'.join([chain['module'], *chain['attrs']])}"
 
@@ -715,6 +808,9 @@ def verify(path: Path, request: dict, inputs: list[tuple[str, str]]) -> str:
     if not receipt.get("ok"):
         problems.append("it failed: " + "; ".join(receipt.get("failures", ["no result"]))[:2000])
     expected = {key: request[key] for key in ("commit", "hardware", "command")}
+    fetched = set(request.get("refs", ()))
+    problems.extend(f"its scripts check out {ref[:12]}, which the entry's refs: does not fetch"
+                    for ref in receipt.get("refs", []) if ref not in fetched)
     expected.update(
         tool=TOOL, runtime=sorted(pin.lower() for pin in request["runtime"]), dew_python=VENV_PYTHON
     )
@@ -743,6 +839,8 @@ def main() -> None:
     parser.add_argument(
         "--accept", action="append", default=[], help="TEXT::REASON for a failure that stands"
     )
+    parser.add_argument("--also", action="append", default=[],
+                        help="another ref the scripts check out, which the entry's refs: names")
     parser.add_argument("--origin", default="origin", help="where to fetch a ref this clone lacks")
     parser.add_argument("--dew-python", default=sys.executable)
     parser.add_argument("--out", type=Path)

@@ -226,6 +226,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             receipt = Path(fields["preflight"]).expanduser()
             request = {"commit": job["commit"], "hardware": hardware, "command": job["command"]}
             request["runtime"] = fields.get("runtime_pins", "").split()
+            request["refs"] = [exact_ref(repo, ref) for ref in fields.get("refs", "").split()]
             job["preflight"] = preflight.verify(receipt, request, inputs)
         job.update(data_inputs(fields))
         job["resume_key"] = colab_sync.retained_key(
