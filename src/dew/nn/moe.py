@@ -36,7 +36,7 @@ from jax.sharding import PartitionSpec as P
 from .activations import gelu_exact, gelu_tanh, relu2, silu
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels.generation import measured_kernel, ran_kernel, triton_runs
+from .kernels.generation import backend, measured_kernel, ran_kernel, triton_runs
 from .kernels.grouped_matmul import grouped_projection, ragged_dot_refusal, xla_ragged_dot
 from .precision import at_least_fp32, rounded_operand, rounded_to
 from .protocols import ProjectionGroup, declared_groups
@@ -353,7 +353,7 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
     chosen = measured_kernel('grouped_matmul', 'xla') if implementation == 'auto' else implementation
     if chosen != 'pallas':
         return chosen
-    placed = triton_runs() or (implementation == 'pallas' and jax.default_backend() == 'cpu')
+    placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
     refusal = ragged_dot_refusal(compute, operands, precision) or (
         None if placed else "the Pallas kernels need a GPU of sm80 or later")
     return 'pallas' if refusal is None else ran_kernel('grouped_matmul', 'xla', refusal)

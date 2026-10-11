@@ -662,6 +662,17 @@ class TrainerConfig:
     the compute dtype. `dew.training.quantization` describes what the wrapper does
     and what it keeps.
     """
+    lower_for: str | None = None
+    """Check the run's step for a GPU on any host, a CPU too, then exit without training.
+
+    `--trainer.lower-for sm80` (or sm75, sm86, sm89, sm90, sm120) builds the run
+    as it would, traces its first step as on a GPU of that CUDA generation, with
+    every kernel choice and refusal that GPU makes, and lowers it for CUDA,
+    each of its Pallas kernels to Triton. A kernel that would fail the GPU's
+    first compile there fails here, in seconds and without the GPU; XLA's
+    compile of the whole step still needs one. The program exits with status
+    0 once the step lowers, and opens no W&B run.
+    """
 
     def __post_init__(self):
         if self.steps is not None and self.epochs is not None:
@@ -1140,7 +1151,7 @@ class RunConfig:
         tracker = None
         try:
             wandb_tracker = None
-            if trainer.wandb is not None:
+            if trainer.wandb is not None and trainer.lower_for is None:
                 wandb_tracker = WandbTracker(
                     trainer.wandb.project, name, entity=trainer.wandb.entity,
                     offline=trainer.wandb.offline)
@@ -1165,7 +1176,7 @@ class RunConfig:
                 objective, self.optim, key=trainer.key,
                 mesh=trainer.mesh, layout=trainer.layout, accumulation=trainer.accumulation,
                 dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints, tracker=tracker,
-                rollout=rollout, profile=trainer.profile,
+                rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
             ).fit(
                 dataset, steps=steps,
                 log_every=trainer.log_every,

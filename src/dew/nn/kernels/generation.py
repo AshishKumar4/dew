@@ -7,11 +7,37 @@ and sends every other one to its portable path. The measurements are in
 docs/performance.md, "Kernel choices per generation".
 """
 
+import contextlib
+import contextvars
 import logging
+from collections.abc import Iterator
 
 import jax
 
 _log = logging.getLogger(__name__)
+
+ASSUMED: contextvars.ContextVar[str | None] = contextvars.ContextVar("assumed_generation", default=None)
+"""The generation `assumed` stands in for the default device's, None outside it."""
+
+
+@contextlib.contextmanager
+def assumed(generation: str | None) -> Iterator[None]:
+    """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
+    process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
+    `KERNELS` choice and kernel refusal acts as on that GPU while a step traces and lowers for one on
+    a CPU (`dew.training._lowering`). None assumes nothing."""
+    token = ASSUMED.set(generation)
+    try:
+        yield
+    finally:
+        ASSUMED.reset(token)
+
+
+PALLAS_CHOICES = frozenset({'pallas', 'fla', 'triton'})
+"""The `KERNELS` values that run Dew's Pallas or Triton kernels, which lower through JAX's Pallas
+Triton backend for a GPU only: what the CPU dry run lowers (`dew.training._lowering`) and the kernel
+lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
+
 
 # `device_kind` of the TPU generations Dew names.
 TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',
@@ -42,8 +68,12 @@ def device_generation() -> str:
     """Return the default device's hardware generation.
 
     The generation is 'sm89' for a GPU of compute capability 8.9, 'v6e' for a
-    TPU v6e, and the platform's name otherwise.
+    TPU v6e, and the platform's name otherwise; within `assumed`, the one it
+    names.
     """
+    generation = ASSUMED.get()
+    if generation is not None:
+        return generation
     device = jax.devices()[0]
     capability = _compute_capability() if device.platform == 'gpu' else None
     if capability:
@@ -127,13 +157,25 @@ def bf16_dot_runs() -> bool:
     return not generation.startswith('sm') or int(generation[2:]) >= BF16_GPU
 
 
+def backend() -> str:
+    """The platform a call's code is chosen for: `jax.default_backend()`, or within `assumed` the
+    assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
+    platform acts as on that device while a step traces for it on another."""
+    generation = ASSUMED.get()
+    if generation is None:
+        return jax.default_backend()
+    if generation.startswith('sm'):
+        return 'gpu'
+    return 'tpu' if generation in TPU_GENERATIONS.values() else generation
+
+
 def triton_runs() -> bool:
     """Return whether Dew's Pallas GPU (Triton) kernels can run here.
 
     This is the one eligibility rule for those kernels: a GPU of compute
     capability 8.0 or later, the same bound JAX's own Pallas lowerings apply.
     A T4 fails to compile them ("Triton support is only enabled for
-    cc>=8.0").
+    cc>=8.0"). Within `assumed`, the GPU is the assumed generation's.
     """
     # JAX's bound is `_backend_supports_triton`.
-    return jax.default_backend() == 'gpu' and bf16_dot_runs()
+    return backend() == 'gpu' and bf16_dot_runs()

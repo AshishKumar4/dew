@@ -646,6 +646,8 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     sites = trains(texts, args.command) or runs_dew(chains)
     receipt["lowered"] = lowered(tree, args.hardware, args.dew_python, sites,
                                  lowering_env(texts, args.command), failures, geometry(texts, args.command))
+
+    receipt["lowered"].update(unlowered(lab.get("pallas", [])))
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
@@ -736,8 +738,6 @@ def resolved(ref: str, origin: str) -> str:
     return git(REPO, "rev-parse", f"{ref}^{{commit}}") if known() else ref
 
 
-# Kernel choices that run Dew's own Pallas (Triton) kernels, whose lowering only a GPU proves.
-PALLAS_CHOICES = {"pallas", "fla", "triton"}
 GENERATIONS = {"gpu:T4": "sm75", "gpu:L4": "sm89", "gpu:A100": "sm80", "gpu:G4": "sm120"}
 LAB_GPUS = {"gpu:A100": "a100", "gpu:G4": "g4", "gpu:L4": "l4", "gpu:T4": "t4"}
 STORE_CONFIG = Path.home() / ".config/dew/dew-data.json"
@@ -812,6 +812,8 @@ def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: Seque
     if choices.returncode:
         failures.append(f"cannot read the ref's KERNELS: {choices.stderr[-300:]}")
         return {}
+    from dew.nn.kernels.generation import PALLAS_CHOICES
+
     generation = GENERATIONS[hardware]
     named = sorted(f"{choice}={row[generation]}" for choice, row in json.loads(choices.stdout).items()
                    if row.get(generation) in PALLAS_CHOICES)
@@ -988,6 +990,17 @@ def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: d
         failures.append(f"the Clef step does not lower for {generation} at this ref (tools/clef_step.py "
                         f"exited {done.returncode}): {done.stderr.strip()[-1500:]}")
     return found
+
+
+def unlowered(pallas: Sequence[str]) -> dict:
+    """The kernels the ref's KERNELS row names for the GPU (`lab_verified`'s `pallas`) that no CPU
+    lowers (`dew.training._lowering.UNLOWERABLE`), each with why, so a receipt never passes them as
+    lowered: the kernel lab's record is their only check."""
+    from dew.training._lowering import UNLOWERABLE
+
+    unseen = {f"{choice}={kernel}": why for (choice, kernel), why in UNLOWERABLE.items()
+              if f"{choice}={kernel}" in pallas}
+    return {"not lowered": unseen} if unseen else {}
 
 
 def store_read(key: str, config: Path = STORE_CONFIG) -> tuple[dict | None, str]:
