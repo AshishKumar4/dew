@@ -169,7 +169,8 @@ def kernel_config(kernel: str, shape: Mapping[str, int], dtype, *, target: str |
 
 def rule_refusal(key, value, chunk):
     """Why the port does not run on this device for these keys and values: a GPU without its configs,
-    or keys or values wider than the configs compile for."""
+    keys or values wider than the configs compile for, or a key head serving a number of value heads
+    no Triton block holds."""
     if key.dtype != value.dtype:
         return f"the port needs matching key/value dtypes, got {key.dtype} and {value.dtype}"
     target = generation.device_generation()
@@ -181,6 +182,9 @@ def rule_refusal(key, value, chunk):
     if key.shape[-1] > widest or value.shape[-1] > widest:
         return (f"keys {key.shape[-1]} and values {value.shape[-1]} wide; the port's configs compile for "
                 f"at most {widest}")
+    group = value.shape[2] // key.shape[2]
+    if group & (group - 1):
+        return f"{group} value heads a key head; dqkwg's block holds a power of two"
     return None
 
 
@@ -638,45 +642,53 @@ def _state_inner_product(memory, memory_grad):
 
 def _dqkwg_kernel(q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, dv_ref, dq_ref, dk_ref, dw_ref,
                   dg_ref, *, scale: float, bv: int, exact: bool):
-    """fla's `chunk_bwd_kernel_dqkwg` (fla/ops/common/chunk_o.py:159-331) for one chunk of one head
-    and `BK` key columns: over the value columns `bv` at a time, `ds = do v^T`, `dq = do h^T`,
-    `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; then the gates, `ds`'s causal mask, `dq += ds k`,
-    `dk += ds^T q` and the decay's gradient, its last row taking the memory's."""
+    """fla's `chunk_bwd_kernel_dqkwg` (fla/ops/common/chunk_o.py:159-331) for one chunk of one key
+    head and `BK` key columns, over the value heads it serves in turn and their value columns `bv` at
+    a time: `ds = do v^T`, `dq = do h^T`, `dk = v dh^T`, `dw = -dv h^T` and `sum(h dh)`; the gates,
+    `ds`'s causal mask, `dq += ds k`, `dk += ds^T q` and the decay's gradient, its last row taking the
+    memory's. Each product is gated as it lands, so `dq` and `dk` accumulate over the value heads in
+    fp32 and round to their dtype once, where fla rounds each value head's and sums them after."""
     size = q_ref.shape[0]
-    width = q_ref.shape[1]
-    ds = jnp.zeros((size, size), jnp.float32)
-    dq = jnp.zeros((size, width), jnp.float32)
-    dk = jnp.zeros((size, width), jnp.float32)
-    dw = jnp.zeros((size, width), jnp.float32)
-    dg_last = jnp.zeros((), jnp.float32)
-    for block in range(v_ref.shape[-1] // bv):
-        columns = pl.ds(block * bv, bv)
-        value, out_grad, local = v_ref[:, columns], do_ref[:, columns], dv_ref[:, columns]
-        memory, memory_grad = h_ref[:, columns], dh_ref[:, columns]
-        dg_last += _state_inner_product(memory, memory_grad)
-        ds += _dot(out_grad, value.T, exact=exact)
-        dq += _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact)
-        dk += _dot(value, memory_grad.T.astype(value.dtype), exact=exact)
-        dw += _dot(local.astype(value.dtype), memory.T.astype(value.dtype), exact=exact)
-    dw_ref[...] = (-dw).astype(dw_ref.dtype)
     queries, keys = q_ref[...], k_ref[...]
-    gate = g_ref[...].astype(jnp.float32)
-    last = g_ref[size - 1].astype(jnp.float32)
-    dg_last = dg_last * jnp.exp2(last)
-    dq = dq * jnp.exp2(gate)[:, None] * scale
-    dk = dk * jnp.exp2(last - gate)[:, None]
-    dg_last += jnp.sum(dk * keys.astype(jnp.float32))
+    wide_queries, wide_keys = queries.astype(jnp.float32), keys.astype(jnp.float32)
     index = jnp.arange(size)
     causal = index[:, None] >= index[None, :]
-    ds = jnp.where(causal, ds * jnp.exp2(gate[:, None] - gate[None, :]), 0.0) * scale
-    ds = ds.astype(keys.dtype)
-    dq += _dot(ds, keys, exact=exact)
-    dk += _dot(ds.T, queries, exact=exact)
-    dg = jnp.sum(dq * queries.astype(jnp.float32), axis=1) - jnp.sum(dk * keys.astype(jnp.float32), axis=1)
-    dg = jnp.where(index < size - 1, dg, dg + dg_last)
+    dq = jnp.zeros(queries.shape, jnp.float32)
+    dk = jnp.zeros(keys.shape, jnp.float32)
+    for head in range(v_ref.shape[1]):
+        gate = g_ref[:, head].astype(jnp.float32)
+        last = g_ref[size - 1, head].astype(jnp.float32)
+        read = jnp.exp2(gate)[:, None] * scale
+        kept = jnp.exp2(last - gate)[:, None]
+        ds = jnp.zeros((size, size), jnp.float32)
+        dw = jnp.zeros(queries.shape, jnp.float32)
+        dg = jnp.zeros((size,), jnp.float32)
+        dg_last = jnp.zeros((), jnp.float32)
+        for block in range(v_ref.shape[-1] // bv):
+            columns = pl.ds(block * bv, bv)
+            value, out_grad = v_ref[:, head, columns], do_ref[:, head, columns]
+            local = dv_ref[:, head, columns]
+            memory, memory_grad = h_ref[head, :, columns], dh_ref[head, :, columns]
+            dg_last += _state_inner_product(memory, memory_grad) * jnp.exp2(last)
+            ds += _dot(out_grad, value.T, exact=exact)
+            from_memory = _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact) * read
+            to_memory = _dot(value, memory_grad.T.astype(value.dtype), exact=exact) * kept
+            dg_last += jnp.sum(to_memory * wide_keys)
+            dg += jnp.sum(from_memory * wide_queries, axis=1) - jnp.sum(to_memory * wide_keys, axis=1)
+            dq += from_memory
+            dk += to_memory
+            dw += _dot(local.astype(value.dtype), memory.T.astype(value.dtype), exact=exact)
+        dw_ref[:, head, :] = (-dw).astype(dw_ref.dtype)
+        ds = jnp.where(causal, ds * jnp.exp2(gate[:, None] - gate[None, :]), 0.0) * scale
+        ds = ds.astype(keys.dtype)
+        from_scores = _dot(ds, keys, exact=exact)
+        to_scores = _dot(ds.T, queries, exact=exact)
+        dg += jnp.sum(from_scores * wide_queries, axis=1) - jnp.sum(to_scores * wide_keys, axis=1)
+        dq += from_scores
+        dk += to_scores
+        dg_ref[:, head] = jnp.where(index < size - 1, dg, dg + dg_last)
     dq_ref[...] = dq.astype(dq_ref.dtype)
     dk_ref[...] = dk.astype(dk_ref.dtype)
-    dg_ref[...] = dg
 
 
 def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 64,
@@ -685,9 +697,10 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     """`(dq, dk, dw, dg)`: fla's `chunk_bwd_dqkwg` (chunk_o.py:696-743). `q`, `k` `[B, T, H, K]`, `v`
     the corrected values and `do` `[B, T, HV, V]`, `w` `[B, T, HV, K]` (its shape and dtype for `dw`),
     `g` the base-2 cumulated decay, `h` and `dh` per chunk `[B, T // chunk, HV, K, V]`, `dv` the
-    corrected values' full gradient. `dq` and `dk` come per value head and are summed over each key
-    head's group, and `dg` per key block, summed, as fla does. fla tiles `BK`, `BV` at 64 on an A100
-    and chose 4 warps, 2 stages (c53)."""
+    corrected values' full gradient. One program per key head sums its value heads' `dq` and `dk` in
+    fp32 and stores them once, `[B, T, H, K]` in `q`'s and `k`'s dtypes; `dw` per value head, and `dg`
+    per key block, summed, as fla does. fla tiles `BK`, `BV` at 64 on an A100 and chose 4 warps, 2
+    stages (c53)."""
     from jax.experimental.pallas import triton as plgpu
 
     config = kernel_config("chunk_bwd_dqkwg", _rule_shape(k, v, chunk), k.dtype,
@@ -697,46 +710,39 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     batch, length, key_heads, width = q.shape
     value_heads, columns = v.shape[2:]
     group = value_heads // key_heads
-    bk = min(bk, width)
 
     def keyed(i_k, i_t, bh):
-        return bh // value_heads, i_t, (bh % value_heads) // group, i_k
+        return bh // key_heads, i_t, bh % key_heads, i_k
 
-    def headed(i_k, i_t, bh):
-        return bh // value_heads, i_t, bh % value_heads, i_k
-
-    def valued(i_k, i_t, bh):
-        return bh // value_heads, i_t, bh % value_heads, 0
+    def served(i_k, i_t, bh):
+        return bh // key_heads, i_t, bh % key_heads, 0
 
     def gated(i_k, i_t, bh):
-        return bh // value_heads, i_t, bh % value_heads
+        return bh // key_heads, i_t, bh % key_heads
 
     def state(i_k, i_t, bh):
-        return bh // value_heads, i_t, bh % value_heads, i_k, 0
+        return bh // key_heads, i_t, bh % key_heads, i_k, 0
 
     def partial(i_k, i_t, bh):
-        return i_k, bh // value_heads, i_t, bh % value_heads
+        return i_k, bh // key_heads, i_t, bh % key_heads
 
     keys = pl.BlockSpec((None, chunk, None, bk), keyed)
-    values = pl.BlockSpec((None, chunk, None, columns), valued)
-    memory = pl.BlockSpec((None, None, None, bk, columns), state)
-    per_head = pl.BlockSpec((None, chunk, None, bk), headed)
+    values = pl.BlockSpec((None, chunk, group, columns), served)
+    memory = pl.BlockSpec((None, None, group, bk, columns), state)
     dq, dk, dw, dg = pl.pallas_call(
-        functools.partial(_dqkwg_kernel, scale=scale, bv=min(bv, columns), exact=interpret),
-        grid=(width // bk, length // chunk, batch * value_heads),
-        in_specs=[keys, keys, values, pl.BlockSpec((None, chunk, None), gated), memory, values, memory,
+        functools.partial(_dqkwg_kernel, scale=scale, bv=bv, exact=interpret),
+        grid=(width // bk, length // chunk, batch * key_heads),
+        in_specs=[keys, keys, values, pl.BlockSpec((None, chunk, group), gated), memory, values, memory,
                   values],
-        out_specs=[per_head, per_head, per_head, pl.BlockSpec((None, None, chunk, None), partial)],
-        out_shape=[jax.ShapeDtypeStruct((batch, length, value_heads, width), q.dtype),
-                   jax.ShapeDtypeStruct((batch, length, value_heads, width), k.dtype),
+        out_specs=[keys, keys, pl.BlockSpec((None, chunk, group, bk), keyed),
+                   pl.BlockSpec((None, None, chunk, group), partial)],
+        out_shape=[jax.ShapeDtypeStruct(q.shape, q.dtype),
+                   jax.ShapeDtypeStruct(k.shape, k.dtype),
                    jax.ShapeDtypeStruct(w.shape, w.dtype),
                    jax.ShapeDtypeStruct((width // bk, batch, length, value_heads), jnp.float32)],
         compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
         interpret=interpret, name="fla_chunk_bwd_dqkwg",
     )(q, k, v, g, h, do, dh, dv)
-    if group > 1:
-        dq = dq.reshape(batch, length, key_heads, group, width).sum(3).astype(q.dtype)
-        dk = dk.reshape(batch, length, key_heads, group, width).sum(3).astype(k.dtype)
     return dq, dk, dw, dg.sum(0)
 
 
@@ -1072,7 +1078,8 @@ def reference_dv_local(q, k, g, do, *, scale: float, chunk: int = 64):
 
 
 def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 64):
-    """`chunk_bwd_dqkwg`'s math in XLA, per chunk, with the same casts, products widened."""
+    """`chunk_bwd_dqkwg`'s math in XLA, per chunk, with the same casts, products widened, and a key
+    head's value heads summed in fp32 before `dq` and `dk` round."""
     key_heads = q.shape[2]
     group = v.shape[2] // key_heads
     q_dtype, k_dtype = q.dtype, k.dtype
@@ -1105,11 +1112,8 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     dk = dk + jnp.einsum('bnhst,bnshk->bnthk', ds, qc.astype(f32), precision=exact)
     dg = jnp.sum(dq * qc.astype(f32), -1) - jnp.sum(dk * kc.astype(f32), -1)
     dg = dg.at[:, :, -1].add(dg_last)
-    shape = (batch, length, heads, q.shape[-1])
-    dq, dk = dq.reshape(shape).astype(q_dtype), dk.reshape(shape).astype(k_dtype)
-    if group > 1:
-        dq = dq.reshape(batch, length, key_heads, group, -1).sum(3).astype(q_dtype)
-        dk = dk.reshape(batch, length, key_heads, group, -1).sum(3).astype(k_dtype)
+    shape = (batch, length, key_heads, group, q.shape[-1])
+    dq, dk = dq.reshape(shape).sum(3).astype(q_dtype), dk.reshape(shape).sum(3).astype(k_dtype)
     return dq, dk, dw.reshape(w.shape).astype(w.dtype), dg.reshape(batch, length, heads)
 
 
