@@ -617,13 +617,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     counts_tokens: ClassVar[bool] = True
 
-    @property
-    def counts_work(self) -> bool:
-        """The LM head and every forward the configured loss executes need a count."""
-        return self._missing_flops(self.model) is None
-
     def _missing_flops(self, model) -> str | None:
-        """Keep telemetry availability and an explicit count's refusal in agreement."""
+        """What the forward and training counts both lack, or None."""
         if type(self) is not LMObjective:
             return f"{type(self).__name__} needs counts for its auxiliary model forwards"
         if self.mtp_weight:
