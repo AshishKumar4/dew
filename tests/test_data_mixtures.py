@@ -375,7 +375,7 @@ def document_dir(root: Path, documents, eos: int = 0) -> str:
     """A token directory whose stream is `documents`, each closed by eos."""
     stream = np.concatenate([np.asarray([*list(document), eos], np.uint16)
                              for document in documents])
-    return str(write_token_corpus(root, stream, stream, vocab_size=int(stream.max()) + 1, eos_id=eos))
+    return str(write_token_corpus(root, stream, stream, vocab_size=256, eos_id=eos))
 
 
 def packed_corpus(root: Path, documents: int = 40, length: int = 3) -> str:
@@ -504,7 +504,7 @@ def test_corpora_from_different_tokenizers_are_not_mixed(tmp_path):
     spec, _, second = weighted_packed(tmp_path, (1.0, 1.0))
     meta = json.loads((Path(second) / "meta.json").read_text())
     (Path(second) / "meta.json").write_text(json.dumps({**meta, "tokenizer": "gpt2"}))
-    with pytest.raises(ValueError, match="one vocabulary"):
+    with pytest.raises(ValueError, match="mixed corpora must share the tokenizer contract"):
         load(spec, batch=4, read="memory", loading=READ)
 
 
@@ -1031,8 +1031,7 @@ def test_a_batch_the_row_shards_cannot_split_is_refused_before_it_is_placed():
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
                       layout=Layout(min_shard=1, tolerance=1.0))
 
-    with pytest.raises(LayoutRefused, match=r"6 rows over the 8 row shards of data 8.*multiple of 8 rows, "
-                                            r"8 the nearest above 6"):
+    with pytest.raises(ValueError, match="batch 6 must divide across 8 row shards"):
         trainer.fit(indexed_data(256, 6), steps=2, log_every=100)
     assert trainer.executable is None
 
