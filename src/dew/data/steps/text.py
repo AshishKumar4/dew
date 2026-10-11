@@ -10,7 +10,7 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Rejected
+from dew.data.pipeline import Rejected, TokenField
 from dew.data.text import tokenizer_for, tokenizer_snapshot
 
 
@@ -106,3 +106,24 @@ class CountTargets(grain.MapTransform):
     def map(self, element: Batch) -> Batch | Rejected:
         count = ValidTargets(role=self.role, pad_id=self.pad_id, measured=False)(element)
         return Rejected("zero_targets") if count == 0 else {**element, "_dew_valid_targets": count}
+
+
+@dataclasses.dataclass(frozen=True)
+class FixedTokens(grain.MapTransform):
+    max_length: int
+    extra: int = 0
+    field: str = "text"
+    pad_id: int = 0
+    length_field: str = "_dew_length"
+
+    @property
+    def token_fields(self) -> tuple[TokenField, ...]:
+        return (TokenField(self.field, self.extra, pad=self.pad_id),
+                *(TokenField(name, self.extra) for name in (
+                    f"{self.field}_segment_ids", f"{self.field}_positions", f"{self.field}_roles")))
+
+    def map(self, row: Batch) -> Batch:
+        size = len(row[self.field])
+        if size != self.max_length + self.extra:
+            raise ValueError(f"fixed tokens need {self.max_length + self.extra} values, got {size}")
+        return {**row, self.length_field: np.int32(self.max_length)}

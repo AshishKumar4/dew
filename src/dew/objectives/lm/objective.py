@@ -819,12 +819,13 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
 
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData
-        from dew.data.steps.text import CountTargets
+        from dew.data.steps.text import CountTargets, FixedTokens
 
+        geometry = FixedTokens(self.seq_len, extra=1, pad_id=0 if self.pad_id is None else self.pad_id)
         if self.loss_role is None and self.pad_id is None:
-            return ObjectiveData()
+            return ObjectiveData(train=(geometry,), evaluate=(geometry,))
         counted = CountTargets(role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id)
-        return ObjectiveData(train=(counted,), evaluate=(counted,))
+        return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
 
     def _row_weights(self, prepared, targets, roles, dtype):
         """Weight the targets the row itself scores.

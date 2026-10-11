@@ -127,6 +127,13 @@ class MaskedDiffusionObjective(Objective[Ratio]):
     def _sample(self):
         return self._compiled_program('sample', self._sample_impl, static_argnames=("count",))
 
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import FixedTokens
+
+        geometry = FixedTokens(self.seq_len)
+        return ObjectiveData(train=(geometry,), evaluate=(geometry,))
+
     def task_record(self) -> Mapping[str, JSON]:
         """The row length, tokenizer, process, solver and sampling steps."""
         from dew.inference.tasks import recorded_tokenizer
