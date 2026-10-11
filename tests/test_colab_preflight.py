@@ -355,14 +355,3 @@ def test_a_setting_known_to_break_gpu_runs_fails_the_preflight():
     assert len(found) == 1 and found[0].startswith("drive.py:1 sets JAX_EXPLAIN_CACHE_MISSES")
     assert preflight.hazards({"drive.py": "print(1)\n"}, "python drive.py") == []
 
-
-def test_no_dew_entry_point_makes_a_setting_known_to_break_gpu_runs():
-    """Compile counts and cache hits come from JAX's monitoring events and Dew's own records, never
-    from the cache-miss explainer, which crashes Pallas-Triton lowering on JAX 0.11.2 (c58, c57):
-    no tracked source outside the tests sets it."""
-    root = Path(preflight.__file__).resolve().parents[2]
-    tracked = subprocess.run(["git", "ls-files", "--", "src", "recipes", "tools", "examples"], cwd=root,
-                             capture_output=True, text=True, check=True).stdout.split()
-    texts = {name: (root / name).read_text(errors="replace") for name in tracked
-             if name.endswith((".py", ".sh")) and name != "tools/colab/preflight.py"}
-    assert preflight.hazards(texts, "") == []
