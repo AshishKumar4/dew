@@ -1,17 +1,16 @@
-"""The labelled sets the decision recipes train on, each read at a pinned commit and written as JSON lines.
+"""Licensed decision sets, read at pinned commits and written as indexed JSON lines.
 
     python recipes/decision/sources.py --out data/mixture --decontaminate eval-index.npz
 
-Every source turns its rows into `dew.decision.Example`s: a state, typed
-questions, and each question's gold, an answer or a distribution. `Mixture`
-holds one of each at its weight, and this writes each set's training
-examples to `<out>/<name>.jsonl` and the ones it holds back to
-`<out>/<name>.held.jsonl`, in the rows `Example.of` reads, and records the
-weights, every source's settings and what decontamination dropped in
-`<out>/mixture.json`. A run reads the directory as a
-`dew.decision.DecisionMixture` (`encoder.py`, `clef.py`). `--decontaminate`
-names an evaluation index `contamination.py` built: every example whose
-content an evaluation item shares is dropped before it is written.
+Each source produces `dew.decision.Example`s with typed questions and gold
+answers or distributions. Training and held JSONL files split at row
+boundaries under the byte budget; their indexes record shard, byte offset,
+length and slot bounds. `mixture.json` records shares, ordered shards,
+checksums and decontamination counts. `manifest.json` is published last.
+`dew.decision.Decisions(source=out)` reads that manifest from any storage URL.
+`--only` builds one source, and `--publish` verifies all sources before it
+commits the mixture. `--decontaminate` names the local or remote evaluation
+index built by `contamination.py`.
 
 Sources whose rows are benchmark-style items (a passage and a question, a
 request and its intents) are framed two ways, half of the rows each, chosen

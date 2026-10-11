@@ -991,7 +991,8 @@ def test_sgd_emits_only_user_frames_and_no_future_or_hidden_state(sources, monke
     assert [row.answers for row in examples] == [{"intent": "Book"}, {"intent": "NONE"}]
     assert examples[0].questions["intent"].wire() == {
         "type": "choice",
-        "instructions": "Using the dialogue history and service schema in state, choose the active intent for this service. "
+        "instructions": "Using the dialogue history and service schema in state, "
+        "choose the active intent for this service. "
         "Choose NONE when no service intent is active. Do not use future turns or hidden labels.",
         "criteria": {"Book": "Book", "NONE": "NONE"},
     }
