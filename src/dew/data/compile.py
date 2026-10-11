@@ -129,10 +129,12 @@ def _preferred_read(pipelines: Sequence[Pipeline]) -> Read:
     least eager of its corpora's choices."""
     chosen: list[Read] = []
     for leaf in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
-        source = leaf.source
-        while isinstance(source, _Wrapping):
-            source = source.source
-        if isinstance(source, Memory):
+        if isinstance(leaf.source, (Mixture, Phases)):
+            continue
+        held = leaf.source
+        while isinstance(held, _Wrapping):
+            held = held.source
+        if isinstance(held, Memory):
             chosen.append("memory")
         else:
             chosen.append("indexed" if leaf.source.supports("indexed") else "streamed")
@@ -1213,15 +1215,17 @@ class _Build:
             return self.block_shuffle(rows, lengths, stage, pipeline, partition)
         if isinstance(stage, (Shuffle, Repeat, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows), None if lengths is None else _reordered(stage, lengths)
-        if isinstance(stage, (Slice, ShardByHost)) or (isinstance(stage, Shuffle) and stage.window is None):
+        if isinstance(stage, Shuffle) and stage.window is not None:
+            rows = gx.WindowShuffleIterDataset(
+                _as_iter(rows, self.loading), window_size=stage.window, seed=stage.seed
+            )
+        elif isinstance(stage, (Shuffle, Slice, ShardByHost)):
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"{type(stage).__name__} in {_name(pipeline)} needs an indexed pipeline")
-        elif isinstance(stage, Shuffle):
-            rows = gx.WindowShuffleIterDataset(rows, window_size=stage.window, seed=stage.seed)
         elif isinstance(stage, Repeat):
-            rows = gx.RepeatIterDataset(rows, stage.epochs)
+            rows = gx.RepeatIterDataset(_as_iter(rows, self.loading), stage.epochs)
         elif isinstance(stage, Limit):
-            rows = gx.LimitIterDataset(rows, stage.count)
+            rows = gx.LimitIterDataset(_as_iter(rows, self.loading), stage.count)
         elif isinstance(stage, Prefetch):
             rows = gx.ThreadPrefetchIterDataset(
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
