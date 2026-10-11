@@ -18,9 +18,9 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 from test_objective_inputs import cases, corpus_windows
 
-from dew import Dataset, Evaluation
+from dew import Evaluation
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import DataPartition, Loading, Images
+from dew.data import DataPartition, Images, Loading, Records, load
 from dew.data.chat import Role
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Flow
@@ -30,7 +30,6 @@ from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObj
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives
 from dew.sampling import Euler
-from dew.data import Records, load
 
 ROWS = 8
 """A batch's rows: one per device of the lane's eight."""

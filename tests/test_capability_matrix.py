@@ -57,8 +57,10 @@ from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
 from dew.data.preferences import IDS_KEY as PAIR_IDS_KEY, MASK_KEY as PAIR_MASK_KEY
 from dew.data.prompts import LENGTH_KEY, PROMPT_KEY
+from dew.data.recipes import load
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, MarkerLayout, Specials, StateFirstLayout
+from dew.decision.data import Decisions
 from dew.diffusion import presets
 from dew.diffusion.discrete import MDLM
 from dew.inference.tasks import TextGeneration
@@ -99,8 +101,6 @@ from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
 from dew.registry import models, objectives
 from dew.sampling import Euler, Sampling
 from dew.training import Trainer
-from dew.data.recipes import load
-from dew.decision.data import Decisions
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 

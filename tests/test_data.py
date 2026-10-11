@@ -10,11 +10,9 @@ Record factories, holdout hashes and batch shares are Dew policies; Grain oracle
 
 import atexit
 import dataclasses
-import inspect
 import itertools
 import json
 import os
-import sys
 import threading
 import time
 
@@ -25,8 +23,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-import dew.data
-from dew.data.sources import Torch
 from dew.data import (
     Checkpointable,
     DataPartition,
@@ -40,24 +36,21 @@ from dew.data import (
     Text,
     Video,
     compile,
-    load,
     images,
-    video,
+    load,
 )
+from dew.data.compile import validation
 from dew.data.dataset import Forwarding, GlobalStream, _batches, hold_out, train_stream, validation_pass
 from dew.data.images import decode_image
+from dew.data.sinks import export
+from dew.data.sources import Torch, av_utils, source as stored_source
+from dew.data.sources.av_utils import choose_clip_start
+from dew.data.steps.generic import Formatting
 from dew.data.steps.image import DeviceAugment, EncodeCaptions, ImageRecord
 from dew.data.steps.video import Audio, DecodeClip
-from dew.data.sinks import export
-from dew.data.sources import source as stored_source
-from dew.data.sources import av_utils
-from dew.data.sources.av_utils import choose_clip_start
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
 from dew.registry import datasets
-from dew.data import Memory, Pipeline, Records, load
-from dew.data.steps.generic import Formatting
-from dew.data.compile import validation
 
 WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 

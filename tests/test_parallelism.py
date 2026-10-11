@@ -20,6 +20,7 @@ from sharded import assert_sharded
 
 from dew.artifacts import Representations
 from dew.data import DataPartition, Loading
+from dew.data.recipes import load
 from dew.inputs import unit_range
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -28,7 +29,6 @@ from dew.objectives.base import Aux, EMASpec, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import DEFAULT_RULES, DevicePrefetchIterator, parameter_spec, shard_batch
 from dew.training.optim import OPTIMIZER_MAP
-from dew.data.recipes import load
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh

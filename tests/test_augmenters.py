@@ -11,7 +11,6 @@ These tests run in the bare venv: a subprocess test proves nothing in the
 module's import or construction path reaches torchvision.
 """
 
-import dataclasses
 import itertools
 import os
 import random

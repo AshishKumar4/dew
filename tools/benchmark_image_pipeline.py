@@ -31,7 +31,7 @@ import tensorflow_datasets as tfds
 import tyro
 from PIL import Image
 
-from dew.data import Augment, DataPartition, Images, Loading, TFDS, load
+from dew.data import TFDS, Augment, DataPartition, Images, Loading, load
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.images import decode_image, resize_image
 

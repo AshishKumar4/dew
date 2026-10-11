@@ -1,6 +1,5 @@
 """Hub sources pin revisions and open prepared Arrow only when requested."""
 
-import builtins
 import os
 import subprocess
 import sys

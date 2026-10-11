@@ -16,10 +16,10 @@ import tyro
 from dew.config import OptimConfig
 from dew.data import ByteTokenizer, Loading, Text, load
 from dew.data.sources import source
-from dew.records import integer
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
+from dew.records import integer
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer
 

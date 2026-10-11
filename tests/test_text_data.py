@@ -24,6 +24,7 @@ from absl import flags
 from token_support import write_token_corpus
 
 from dew.data import ByteTokenizer, DataPartition, Loading, Text
+from dew.data.recipes import load
 from dew.data.sources.files import TokenFiles
 from dew.nn import attention
 from dew.nn.backbones import causal_transformer as backbone
@@ -32,7 +33,6 @@ from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
-from dew.data.recipes import load
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -429,7 +429,6 @@ def test_a_registered_token_spec_reads_the_directory(tmp_path):
     seq_len = 64
     # (41 * 64 - 1) // 64 == 40 train windows.
     _token_dir(tmp_path, train_tokens=41 * seq_len, val_tokens=8 * seq_len)
-    from dew.registry import datasets
 
     data = load("text", source=str(tmp_path), seq_len=seq_len, batch=4, read="memory",
         loading=Loading(workers=0))

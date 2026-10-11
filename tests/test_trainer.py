@@ -41,6 +41,7 @@ from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
 from dew.config import OptimConfig
 from dew.data import DataPartition
+from dew.data.recipes import load
 from dew.objectives.base import Aux, EMASpec, Objective, freeze, merge, select, under
 from dew.training import (
     Checkpoints,
@@ -55,7 +56,6 @@ from dew.training import (
 )
 from dew.training.optim import Cosine
 from dew.training.transaction import write_back
-from dew.data.recipes import load
 
 
 def endless():

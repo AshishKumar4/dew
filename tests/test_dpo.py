@@ -22,10 +22,10 @@ from rl_support import TinyHead
 from dew.data import DataPartition, Loading, Preferences
 from dew.data.compile import iterate
 from dew.data.preferences import IDS_KEY, MASK_KEY
+from dew.data.recipes import load
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
-from dew.data.recipes import load
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
 VOCAB = 8
