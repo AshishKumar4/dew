@@ -32,5 +32,11 @@ class Delta(Files):
         return self.table.to_pyarrow_dataset()
 
     def snapshot(self) -> Mapping[str, object]:
-        return {"store": "delta", "uri": self.url, "version": self.table.version(),
-                "files": self.table.file_uris(), "columns": self.columns, "filter": str(self.filter)}
+        return {
+            "store": "delta",
+            "uri": self.url,
+            "version": self.table.version(),
+            "files": self.table.file_uris(),
+            "columns": self.columns,
+            "filter": str(self.filter),
+        }

@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import importlib
 import io
 import json
+import math
 import struct
 from collections.abc import Iterable, Mapping
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -18,7 +21,21 @@ from dew.records import JSON
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
-type Value = JSON | bytes | np.ndarray | np.generic | DataclassInstance | tuple[Value, ...] | Mapping[str, Value]
+type Value = (
+    JSON
+    | bytes
+    | np.ndarray
+    | np.generic
+    | DataclassInstance
+    | list[Value]
+    | tuple[Value, ...]
+    | Mapping[str, Value]
+    | datetime.datetime
+    | datetime.date
+    | datetime.time
+    | datetime.timedelta
+    | Decimal
+)
 
 
 def pack_dict_of_byte_arrays(values: Mapping[str, bytes]) -> bytes:
@@ -40,7 +57,7 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
             raise ValueError("truncated ArrayRecord key length")
         length = struct.unpack_from("<I", payload, offset)[0]
         offset += 4
-        key = payload[offset:offset + length].decode()
+        key = payload[offset : offset + length].decode()
         offset += length
         if offset + 4 > len(payload):
             raise ValueError(f"truncated ArrayRecord value length for {key!r}")
@@ -48,14 +65,23 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
         offset += 4
         if offset + length > len(payload) or key in values:
             raise ValueError(f"invalid ArrayRecord value for {key!r}")
-        values[key] = payload[offset:offset + length]
+        values[key] = payload[offset : offset + length]
         offset += length
     return values
 
 
 def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"float": value.hex()}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    for kind in (datetime.datetime, datetime.date, datetime.time):
+        if isinstance(value, kind):
+            return {kind.__name__: value.isoformat()}
+    if isinstance(value, datetime.timedelta):
+        return {"timedelta": [value.days, value.seconds, value.microseconds]}
+    if isinstance(value, Decimal):
+        return {"decimal": str(value)}
     if isinstance(value, np.generic):
         return _tree(value.item(), leaves)
     if isinstance(value, (np.ndarray, bytes)):
@@ -77,9 +103,14 @@ def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
         cls = type(value)
         if not cls.__module__.startswith("dew."):
             raise TypeError(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
-        return {"dataclass": [cls.__module__, cls.__qualname__],
-                "fields": {field.name: _tree(getattr(value, field.name), leaves)
-                           for field in dataclasses.fields(value) if field.init}}
+        return {
+            "dataclass": [cls.__module__, cls.__qualname__],
+            "fields": {
+                field.name: _tree(getattr(value, field.name), leaves)
+                for field in dataclasses.fields(value)
+                if field.init
+            },
+        }
     raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
 
 
@@ -88,6 +119,15 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
         return node
     if not isinstance(node, dict):
         raise ValueError("artifact node is not a scalar or tagged object")
+    for kind in (datetime.datetime, datetime.date, datetime.time):
+        if kind.__name__ in node:
+            return kind.fromisoformat(node[kind.__name__])
+    if "timedelta" in node:
+        return datetime.timedelta(*node["timedelta"])
+    if "decimal" in node:
+        return Decimal(node["decimal"])
+    if "float" in node:
+        return float.fromhex(node["float"])
     if "bytes" in node:
         return leaves[str(node["bytes"])]
     if "array" in node:

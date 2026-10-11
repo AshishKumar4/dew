@@ -57,7 +57,9 @@ def test_csv_quoted_newlines_are_never_byte_split():
     files = Files(root.url, shard_bytes=2)
     assert len(files.manifest().shards) == 1
     assert list(files.manifest().reader(files.manifest().shards[0])) == [
-        {"id": "0", "text": "two\nlines"}, {"id": "1", "text": "last"}]
+        {"id": "0", "text": "two\nlines"},
+        {"id": "1", "text": "last"},
+    ]
     files.provision()
     indexed = files.records("indexed")
     assert indexed[0] == {"id": "0", "text": "two\nlines"}
@@ -67,10 +69,18 @@ def test_csv_quoted_newlines_are_never_byte_split():
 def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
     root = Store(f"memory://arrow-{uuid4().hex}/table")
     fs, path = root.resolve()
-    table = pa.table({"value": list(range(20)), "split": ["train"] * 10 + ["held"] * 10,
-                      "unused": ["large"] * 20})
-    ds.write_dataset(table, path, format="parquet", filesystem=pafs.PyFileSystem(pafs.FSSpecHandler(fs)),
-                      partitioning=["split"], partitioning_flavor="hive", max_rows_per_group=3)
+    table = pa.table(
+        {"value": list(range(20)), "split": ["train"] * 10 + ["held"] * 10, "unused": ["large"] * 20}
+    )
+    ds.write_dataset(
+        table,
+        path,
+        format="parquet",
+        filesystem=pafs.PyFileSystem(pafs.FSSpecHandler(fs)),
+        partitioning=["split"],
+        partitioning_flavor="hive",
+        max_rows_per_group=3,
+    )
     files = Files(root.url, format="parquet", columns=("value", "split"), filter=ds.field("value") >= 15)
     assert not files.supports("indexed")
     actual = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
@@ -81,11 +91,16 @@ def test_arrow_discovers_hive_partitions_and_pushes_projection_and_predicate():
 
 
 def test_shard_root_is_disjoint_across_real_workers_and_shares():
-    values = Memory([{ "id": index} for index in range(80)], shard_rows=5)
+    values = Memory([{"id": index} for index in range(80)], shard_rows=5)
     all_rows = []
     for share in range(2):
-        rows = streamed(values.manifest(), partition=DataPartition(share, 2), seed=4,
-                        cycle_length=2, loading=Loading(workers=2, threads=2, read_buffer=2))
+        rows = streamed(
+            values.manifest(),
+            partition=DataPartition(share, 2),
+            seed=4,
+            cycle_length=2,
+            loading=Loading(workers=2, threads=2, read_buffer=2),
+        )
         import grain.python as grain
 
         rows = rows.batch(2).mp_prefetch(grain.MultiprocessingOptions(num_workers=2))
@@ -143,3 +158,167 @@ def test_webdataset_groups_members_and_restores_inside_shard():
     expected = list(iterator)
     iterator.set_state(state)
     assert list(iterator) == expected
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
+    from dew.data.steps.text import Tokenize
+
+    root = Store(f"memory://text-{uuid4().hex}/source.txt")
+    original = b"first\r\nsecond\n\nlast without newline"
+    root.write(original)
+    files = Files(root.url, shard_bytes=9)
+    if read == "indexed":
+        files.provision()
+    if read == "streamed":
+        records = [row for shard in files.manifest().shards for row in files.manifest().reader(shard)]
+    else:
+        indexed = files.records(read)
+        records = [indexed[index] for index in range(len(indexed))]
+    tokens = np.concatenate([Tokenize().map(row)["text"] for row in records])
+    assert tokens.tolist() == list(original)
+
+
+def test_exported_token_lengths_support_indexed_spans_without_record_scan():
+    from dew.data.sources.files import TokenFiles
+
+    root = f"memory://token-export-{uuid4().hex}"
+    export(
+        [{"text": np.arange(start, start + 3, dtype=np.int32)} for start in (0, 3, 6)],
+        root,
+        format="array_record",
+        rows_per_shard=2,
+        length_field="text",
+        metadata={
+            "token_store": True,
+            "dtype": "int32",
+            "tokenizer": "byte",
+            "vocab_size": 256,
+            "eos_id": None,
+        },
+    )
+    source = TokenFiles(root)
+    assert len(source.tokens) == 9
+    assert source.tokens[2:8].tolist() == list(range(2, 8))
+    assert source.metadata()["tokenizer"] == "byte"
+    from dew.data.sources import source as resolve
+
+    assert isinstance(resolve(root), TokenFiles)
+
+
+def test_torch_source_refuses_streaming_and_cache_without_content_identity():
+    import torch
+    from torch.utils.data import TensorDataset
+
+    from dew.data.cache import Cache
+    from dew.data.plan import Manifest
+    from dew.data.sources import Torch
+
+    rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
+    assert not rows.supports("streamed")
+    assert int(rows.records("indexed")[2]["id"]) == 2
+    with pytest.raises(ValueError, match="cannot read streamed"):
+        rows.records("streamed")
+    import grain.python as grain
+
+    with pytest.raises(ValueError, match="explicit content identity"):
+        Cache(f"memory://torch-cache-{uuid4().hex}").mapped(
+            grain.MapDataset.source(rows.records("indexed")), Manifest(rows.snapshot()), rows
+        )
+
+
+def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
+    from deltalake import write_deltalake
+
+    from dew.data.sources.delta import Delta
+
+    root = str(tmp_path / "delta")
+    write_deltalake(root, pa.table({"value": [1, 2], "split": ["train", "held"]}), partition_by=["split"])
+    first = Delta(root)
+    snapshot = first.snapshot()
+    write_deltalake(root, pa.table({"value": [3], "split": ["train"]}), mode="append")
+    rows = Delta(root, version=snapshot["version"]).records("indexed")
+    assert sorted(rows[index]["value"] for index in range(len(rows))) == [1, 2]
+    assert {rows[index]["split"] for index in range(len(rows))} == {"train", "held"}
+
+
+def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
+    import datetime
+    from decimal import Decimal
+
+    from dew.data.sources.codec import decode, encode
+
+    row = {
+        "when": datetime.datetime(2026, 1, 2, 3, 4, tzinfo=datetime.UTC),
+        "price": Decimal("12.340"),
+        "interval": datetime.timedelta(days=2, seconds=3),
+        "features": [np.arange(4, dtype=np.uint16), {"nan": float("nan")}],
+        "binary": b"\0\xff",
+    }
+    actual = decode(encode(row))
+    assert actual["when"] == row["when"]
+    assert actual["price"].as_tuple() == row["price"].as_tuple()
+    assert actual["interval"] == row["interval"]
+    assert np.array_equal(actual["features"][0], row["features"][0])
+    assert np.isnan(actual["features"][1]["nan"])
+    assert actual["binary"] == row["binary"]
+
+
+def test_empty_shard_cycles_exhaust_a_named_search_budget():
+    root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
+    root.write(b" \n\n")
+    files = Files(root.url)
+    dataset = streamed(
+        files.manifest(),
+        partition=DataPartition(),
+        epochs=None,
+        empty_shard_budget=3,
+        name="empty-corpus",
+        cycle_length=1,
+        loading=Loading(workers=0, threads=1, read_buffer=1),
+    )
+    reader = iter(dataset)
+    with pytest.raises(ValueError, match=r"empty-corpus.*search budget"):
+        next(reader)
+    reader.close()
+
+
+@pytest.mark.parametrize("field", [None, "ids"])
+def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_path, field):
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources import source as resolve
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+    from dew.data.sources.files import TokenFiles
+
+    root = Store(str(tmp_path))
+    root.child("meta.json").write(
+        json.dumps(
+            {
+                "tokenizer": "byte",
+                "dtype": "uint16",
+                "vocab_size": 256,
+                "train_tokens": 15,
+                "val_tokens": 4,
+                "eos_id": None,
+            }
+        ).encode()
+    )
+    for split, count in (("train", 15), ("val", 4)):
+        writer = ArrayRecordWriter(str(tmp_path / f"{split}-0.array_record"), "group_size:1")
+        for start, stop in zip((0, 2, 4), (2, 4, count), strict=True):
+            raw = np.arange(start, stop, dtype=np.uint16).tobytes()
+            writer.write(raw if field is None else pack_dict_of_byte_arrays({field: raw}))
+        writer.close()
+    source = TokenFiles(str(tmp_path), field=field)
+    assert isinstance(resolve(str(tmp_path)), TokenFiles)
+    assert source.metadata()["train_tokens"] == 15
+    assert not source.supports("indexed")
+    with pytest.raises(FileNotFoundError, match="length index"):
+        source.records("indexed")
+    source.records("memory")
+    assert source.tokens[1:14].tolist() == list(range(1, 14))
+    source.provision()
+    reopened = TokenFiles(str(tmp_path), field=field)
+    assert reopened.supports("indexed")
+    assert reopened.tokens[2:15].tolist() == list(range(2, 15))

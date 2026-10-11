@@ -45,15 +45,29 @@ def _index(work: Path, url: str) -> None:
         _run(["git", "clone", "--quiet", KIT[0], str(kit)])
     _run(["git", "-C", str(kit), "checkout", "--quiet", KIT[1]])
     _run(["uv", "pip", "install", "--python", sys.executable, "-e", f"{kit}[rebuild]"])
-    _run([sys.executable, "-m", "decision_index", "suite", "rebuild", "--work", str(work)],
-         environment={"HF_HUB_DISABLE_XET": "1"})
+    _run(
+        [sys.executable, "-m", "decision_index", "suite", "rebuild", "--work", str(work)],
+        environment={"HF_HUB_DISABLE_XET": "1"},
+    )
     rebuilt = work / "artifacts" / "benchmark-suite"
-    files = [rebuilt / "release-v2-rebuilt" / "selected-rows.jsonl.gz",
-             rebuilt / "release-v2-rebuilt" / "added-rows.jsonl.gz",
-             rebuilt / "release-v3-rebuilt" / "gsm8k-rows.jsonl.gz"]
+    files = [
+        rebuilt / "release-v2-rebuilt" / "selected-rows.jsonl.gz",
+        rebuilt / "release-v2-rebuilt" / "added-rows.jsonl.gz",
+        rebuilt / "release-v3-rebuilt" / "gsm8k-rows.jsonl.gz",
+    ]
     index = work / "eval-index.npz"
-    _run([sys.executable, "recipes/decision/contamination.py", "--out", str(index),
-          "--jsonl", *(str(path) for path in files), "--hub", *HUB])
+    _run(
+        [
+            sys.executable,
+            "recipes/decision/contamination.py",
+            "--out",
+            str(index),
+            "--jsonl",
+            *(str(path) for path in files),
+            "--hub",
+            *HUB,
+        ]
+    )
     data = index.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
     if digest != INDEX_SHA256:
@@ -61,7 +75,7 @@ def _index(work: Path, url: str) -> None:
     root = Store(url)
     files = []
     for offset in range(0, len(data), 64 * 2**20):
-        part = data[offset:offset + 64 * 2**20]
+        part = data[offset : offset + 64 * 2**20]
         path = f"eval-index.npz.{len(files):05d}"
         target = root.child(path)
         with contextlib.suppress(PreconditionFailed):
@@ -71,8 +85,21 @@ def _index(work: Path, url: str) -> None:
             raise ValueError(f"published evaluation index shard differs: {path}")
         files.append({"path": path, "sha256": checksum, "bytes": len(part)})
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
-    manifest = {"schema": 1, "name": "decision-eval-index-v1", "dew": revision,
-                "sha256": digest, "files": files}
+    manifest = {
+        "schema": 1,
+        "name": "decision-eval-index-v1",
+        "dew": revision,
+        "sha256": digest,
+        "files": files,
+        "assemblies": [
+            {
+                "path": "eval-index.npz",
+                "bytes": len(data),
+                "sha256": digest,
+                "shards": [entry["path"] for entry in files],
+            }
+        ],
+    }
     encoded = (json.dumps(manifest, indent=1) + "\n").encode()
     root.child("manifest.json").put_if_absent(encoded)
     root.child("manifest.sha256").put_if_absent((hashlib.sha256(encoded).hexdigest() + "\n").encode())
