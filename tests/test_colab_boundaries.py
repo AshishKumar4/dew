@@ -172,11 +172,17 @@ def test_cooperating_child_continues_after_its_decision_deadline(tmp_path):
     directory = tmp_path / "boundary"
     directory.mkdir()
     script = tmp_path / "child.py"
-    script.write_text("from pathlib import Path\nfrom tools.colab.boundary import checkpoint\n"
-                      "checkpoint('E5')\n" + f"Path({str(tmp_path / 'continued')!r}).touch()\n")
-    boundary.request(directory, "E5", 0, "no-controller", decision_seconds=.2)
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-           "DEW_COLAB_BOUNDARY_DIR": str(directory), "DEW_COLAB_GENERATION": "0"}
+    script.write_text(
+        "from pathlib import Path\nfrom tools.colab.boundary import checkpoint\n"
+        "checkpoint('E5')\n" + f"Path({str(tmp_path / 'continued')!r}).touch()\n"
+    )
+    boundary.request(directory, "E5", 0, "no-controller", decision_seconds=0.2)
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "DEW_COLAB_BOUNDARY_DIR": str(directory),
+        "DEW_COLAB_GENERATION": "0",
+    }
     code = run_logged([sys.executable, str(script)], tmp_path / "run.log", cwd=tmp_path, env=env, timeout=3)
     assert code == 0 and (tmp_path / "continued").exists()
     assert read(directory / "ready.json")["state"] == "boundary decision timed out; continued"
@@ -194,8 +200,15 @@ def test_expired_request_never_pauses_a_later_boundary(tmp_path, monkeypatch):
 
 def test_late_decision_is_refused_before_publishing(tmp_path):
     save(tmp_path / "request.json", {"expires_at": time.time() - 1})
-    save(tmp_path / "ready.json", {"request_id": "request", "generation": 0, "state": "quiescent",
-                                   "decision_deadline": time.time() - 1})
+    save(
+        tmp_path / "ready.json",
+        {
+            "request_id": "request",
+            "generation": 0,
+            "state": "quiescent",
+            "decision_deadline": time.time() - 1,
+        },
+    )
     with pytest.raises(ValueError, match="expired"):
         boundary.decide(tmp_path, {"request_id": "request", "generation": 0, "action": "replace"})
     assert not (tmp_path / "decision.json").exists()
