@@ -18,8 +18,8 @@ from dew.data import Dataset
 from dew.objectives import Aux, Objective
 from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts
 from dew.training import Trainer, WandbTracker
+from dew.training.interval import Interval
 from dew.training.optim import Cosine
-from dew.training.trainer import _Interval
 
 
 class Squared(Objective):
@@ -132,7 +132,7 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
     monkeypatch.setattr(jax, 'local_devices', lambda: devices)
     monkeypatch.setattr(jax, 'devices', lambda: [SimpleNamespace(device_kind='NVIDIA A100-SXM4-80GB')])
     monkeypatch.setattr(jax, 'device_count', lambda: 1)
-    interval = _Interval(time.time() - 2, last_saved=None, since_log=2, samples=16,
+    interval = Interval(time.time() - 2, last_saved=None, since_log=2, samples=16,
                          flops=StepFlops(model=312e12, hardware=624e12), waited=.02, compiling=.1, compiles=1)
     loss = jnp.asarray(1.)
     accepted = jnp.asarray(a=True)

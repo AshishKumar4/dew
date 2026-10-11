@@ -44,7 +44,6 @@ from dew.data.dataset import (
     Dataset,
     RampedStream,
     Reader,
-    rows_of,
     stream_endless,
     stream_identity,
 )
@@ -81,7 +80,6 @@ from dew.objectives.base import (
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
-    NO_FLOPS,
     StepFlops,
     compilation_cache_counts,
     model_flops_utilization,
@@ -112,6 +110,7 @@ from dew.training.distributed import (
     shard_batch,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
+from dew.training.interval import Interval
 from dew.training.memory import (
     climb_to,
     compiled_if_it_fits,
@@ -141,9 +140,6 @@ _log = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from dew.config import OptimConfig
     from dew.telemetry.profile import Profiler
-
-# Consecutive non-finite losses that stop a run.
-BAD_LOSS_STEPS = 5
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
 """A compiled step's body: the state and the global batch in, the new state,
@@ -210,42 +206,6 @@ class ProfileWindow:
     directory: str
     steps: int
     warmup: int = 2
-
-
-Book = tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]
-"""The loop's device-side counters: the interval's summed loss, the current
-streak of non-finite losses, the longest streak since the last check,
-analytical forward FLOPs and real tokens since the last log, and the sum of
-committed gradient norms and number of commits since the last log."""
-
-
-def fresh_book(loss: jax.Array) -> Book:
-    """Return the counters a fresh logging interval starts from, on the device the step returns `loss` on.
-
-    Counters on any other device would move to the step's devices at every count,
-    and `bookkeep` would compile again.
-    """
-    dtype = jnp.promote_types(loss.dtype, jnp.float32)
-    zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
-             np.zeros((), dtype), np.zeros((), dtype), np.zeros((), dtype), np.zeros((), np.int32))
-    return jax.device_put(zeros, loss.sharding)
-
-
-@jax.jit
-def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committed | None, forward=0.0,
-             tokens=0.0) -> Book:
-    """Advance the loop's counters for one step in a single dispatch.
-
-    Loss counters and commit telemetry advance together, without reading
-    either on the host between logging ticks.
-    """
-    interval_loss, bad_run, worst_bad_run, interval_flops, interval_tokens, norms, commits = book
-    bad_run = jnp.where(finite, 0, bad_run + 1)
-    dtype = jnp.promote_types(loss.dtype, jnp.float32)
-    if committed is not None:
-        norms, commits = norms + committed.norm.astype(dtype), commits + committed.count
-    return (interval_loss + loss.astype(dtype), bad_run, jnp.maximum(worst_bad_run, bad_run),
-            interval_flops + forward, interval_tokens + tokens, norms, commits)
 
 
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
@@ -463,97 +423,6 @@ class _FitRun:
         run's traceback."""
         assert self.train is not None
         return next(self.train)
-
-
-@dataclasses.dataclass
-class _Interval:
-    """What `fit` sums between logs and between checkpoints.
-
-    `book` is the loss summed since the last checkpoint, both bad-loss
-    counters, and the gradient-norm sum and commit count since the last log.
-    They stay on device and move together in one dispatch; the host reads
-    them at the logging cadence, never blocking the step loop on a result.
-    The first step places them where its loss is, and `fresh` keeps them at
-    zero there, for a counter's restart to reuse rather than build again.
-    `steps` counts since the last checkpoint, the rest since the last log.
-    The records and FLOPs are summed per step rather than taken off the
-    dataset's batch, so a ramped interval reports the records it read and
-    their FLOPs. `rollout_seconds` is the time spent sampling, logged under
-    train/rollout_seconds when a rollout is set. `waited` is the time the
-    loop spent waiting on its next batch and `compiling` the time it spent
-    compiling the step for a shape it had not met, both in seconds, since
-    the last log. `compiles` counts StepCompiled records over the whole fit,
-    so logging and checkpointing never reset it."""
-
-    last_log_time: float
-    last_saved: int | None
-    book: Book | None = None
-    fresh: Book | None = None
-    steps: int = 0
-    since_log: int = 0
-    samples: int = 0
-    flops: StepFlops | None = NO_FLOPS
-    model_counted: bool = False
-    tokens_counted: bool = False
-    rollout_seconds: float = 0.0
-    waited: float = 0.0
-    compiling: float = 0.0
-    compiles: int = 0
-
-    def count(self, batch: Batch, flops: StepFlops | None, loss: jax.Array, finite: jax.Array,
-              committed: Committed | None, aux: Mapping[str, jax.Array] | None = None) -> None:
-        """Add one step: its records, its FLOPs and its loss."""
-        self.since_log += 1
-        self.steps += 1
-        self.samples += rows_of(batch)
-        self.flops = None if self.flops is None or flops is None else self.flops + flops
-        if self.book is None:
-            self.book = self.fresh = fresh_book(loss)
-        aux = {} if aux is None else aux
-        self.model_counted |= FORWARD_FLOPS in aux
-        self.tokens_counted |= TOKENS in aux
-        assert self.fresh is not None
-        self.book = bookkeep(self.book, loss, finite, committed,
-                             aux.get(FORWARD_FLOPS, self.fresh[3]), aux.get(TOKENS, self.fresh[4]))
-
-    def check_finite(self, step: int, display: TrainingDisplay) -> None:
-        """Raise RuntimeError once the loss has been non-finite for
-        BAD_LOSS_STEPS steps, and start the longest streak over.
-
-        Deferred to the logging cadence so the step loop never synchronises;
-        detection is late by at most that many steps, never missed.
-        """
-        if self.book is None or self.fresh is None:
-            return
-        loss, bad_run, worst_bad_run, forward, tokens, norms, commits = self.book
-        try:
-            streak = int(jax.device_get(worst_bad_run))
-        except jax.errors.JaxRuntimeError as error:
-            # The counters read every step's loss, so a step that failed on
-            # the devices surfaces here, under the counters' program.
-            raise RuntimeError(f"a training step before step {step} failed on the devices; JAX reports it "
-                               "at the loss counters that read its loss (jit_bookkeep)") from error
-        if streak >= BAD_LOSS_STEPS:
-            raise RuntimeError(
-                f"Loss has been non-finite for {streak} consecutive steps "
-                f"ending near step {step}, stopping")
-        if streak:
-            display.note(f"Non-finite loss for {streak} step(s) before {step}", style="red")
-        self.book = (loss, bad_run, self.fresh[2], forward, tokens, norms, commits)
-
-    def logged(self, now: float) -> None:
-        """Start the next logging interval at `now`."""
-        self.last_log_time, self.since_log, self.samples = now, 0, 0
-        self.flops, self.rollout_seconds, self.waited, self.compiling = NO_FLOPS, 0.0, 0.0, 0.0
-        self.model_counted = self.tokens_counted = False
-        if self.book is not None and self.fresh is not None:
-            self.book = (*self.book[:3], *self.fresh[3:])
-
-    def saved(self, step: int) -> None:
-        """Start the next checkpoint interval after the one saved at `step`."""
-        self.last_saved, self.steps = step, 0
-        if self.book is not None and self.fresh is not None:
-            self.book = (self.fresh[0], *self.book[1:])
 
 
 _DEFAULT_MESH = MeshSpec()
@@ -1469,7 +1338,7 @@ class Trainer(Generic[Loss, Effects]):
         if self._opened(plan, run, state, position):
             return state, True
         compiled: dict[Shapes, tuple[CompiledStep, StepFlops | None]] = {}
-        interval = _Interval(time.time(), last_saved=(
+        interval = Interval(time.time(), last_saved=(
             run.current if checkpoints is not None and checkpoints.latest is not None else None))
         seen = 0
         run.notice = PreemptionNotice()
@@ -1666,7 +1535,7 @@ class Trainer(Generic[Loss, Effects]):
                 f"the training step compiled for step {step} failed on its first run. It was checked to "
                 f"fit: {json.dumps(self.memory)}; the devices now hold {json.dumps(now)}") from error
 
-    def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,
+    def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
                        shardings: Placement[TrainState], position, loss: jax.Array,
                        aux: dict[str, jax.Array], accepted: jax.Array) -> bool:
         """The cadenced work after one step of `fit`: the log, the validation,
@@ -1757,7 +1626,7 @@ class Trainer(Generic[Loss, Effects]):
             return True
         return False
 
-    def _wind_down(self, plan: _FitPlan, run: _FitRun, interval: _Interval, state: TrainState,
+    def _wind_down(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
                    shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
         """`fit` after its last step: the stream closed, a preemption
         announced, the trace window stopped, the final validation (skipped on
@@ -2191,7 +2060,7 @@ class Trainer(Generic[Loss, Effects]):
         step: int,
         state: TrainState,
         position: bytes | None,
-        interval: _Interval,
+        interval: Interval,
         *,
         scores: Mapping[str, float] | None = None,
         ranking: Sequence[Ranking] = (),
@@ -2209,7 +2078,7 @@ class Trainer(Generic[Loss, Effects]):
         self._display.status("writing a checkpoint")
         metadata = dict(scores or {})
         if interval.steps and interval.book is not None:
-            metadata.setdefault('train/loss', float(jax.device_get(interval.book[0]) / interval.steps))
+            metadata.setdefault('train/loss', float(jax.device_get(interval.book.loss) / interval.steps))
             if not ranking and training_best:
                 ranking = (Ranking('train/loss', metadata['train/loss']),)
         checkpoints.save(step, state, position, metadata, share=DataPartition.of(self.device_mesh),
@@ -2243,7 +2112,7 @@ class Trainer(Generic[Loss, Effects]):
         return time.perf_counter() - paused
 
     def _log_interval(self, step: int, loss: jax.Array, aux: dict[str, jax.Array],
-                      accepted: jax.Array, state: TrainState, interval: _Interval) -> None:
+                      accepted: jax.Array, state: TrainState, interval: Interval) -> None:
         """Report one logging interval and start the next.
 
         Rank zero builds the row; every other rank has nothing to report.
@@ -2281,11 +2150,12 @@ class Trainer(Generic[Loss, Effects]):
             # array is a copy of its own.
             read = jax.device_get({
                 "loss": loss, "aux": aux, "accepted": accepted, "rate": rate,
-                "committed": None if interval.book is None else interval.book[5:],
+                "committed": None if interval.book is None else (interval.book.norms, interval.book.commits),
                 "scale": None if state.scale is None else state.scale.scale,
-                "model_flops": (interval.book[3] if interval.model_counted and interval.book is not None
+                "model_flops": (interval.book.forward if interval.model_counted and interval.book is not None
                                 else None),
-                "tokens": interval.book[4] if interval.tokens_counted and interval.book is not None else None,
+                "tokens": (interval.book.tokens if interval.tokens_counted and interval.book is not None
+                           else None),
                 "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
             scalars = {"train/loss": float(read["loss"]),
                        **{f"train/{k}": float(v) for k, v in read["aux"].items()},
