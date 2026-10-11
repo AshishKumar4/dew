@@ -93,6 +93,8 @@ def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
         if isinstance(value, bytes):
             leaves[key] = value
             return {"bytes": key}
+        if value.dtype.hasobject:
+            return {"object_array": {"shape": list(value.shape), "values": _tree(value.tolist(), leaves)}}
         file = io.BytesIO()
         np.save(file, value, allow_pickle=False)
         leaves[key] = file.getvalue()
@@ -138,6 +140,11 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
         return leaves[str(node["bytes"])]
     if "array" in node:
         return np.load(io.BytesIO(leaves[str(node["array"])]), allow_pickle=False)
+    if "object_array" in node:
+        value = node["object_array"]
+        if not isinstance(value, dict) or not isinstance(value.get("shape"), list):
+            raise ValueError("artifact object array has no shape")
+        return np.asarray(_restore(value["values"], leaves), dtype=object).reshape(value["shape"])
     for kind in ("list", "tuple"):
         values = node.get(kind)
         if isinstance(values, list):

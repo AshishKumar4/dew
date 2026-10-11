@@ -337,6 +337,7 @@ def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
         "interval": datetime.timedelta(days=2, seconds=3),
         "features": [np.arange(4, dtype=np.uint16), {"nan": float("nan")}],
         "binary": b"\0\xff",
+        "messages": np.asarray([[{"role": "user", "content": "hello"}]], dtype=object),
     }
     actual = decode(encode(row))
     assert actual["when"] == row["when"]
@@ -345,6 +346,8 @@ def test_artifact_codec_preserves_arrow_scalars_and_nested_arrays():
     assert np.array_equal(actual["features"][0], row["features"][0])
     assert np.isnan(actual["features"][1]["nan"])
     assert actual["binary"] == row["binary"]
+    assert actual["messages"].dtype == row["messages"].dtype
+    assert actual["messages"].tolist() == row["messages"].tolist()
 
 
 def test_empty_shard_cycles_exhaust_a_named_search_budget():
