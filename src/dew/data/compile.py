@@ -199,6 +199,19 @@ def _promoted(pipeline: Pipeline) -> tuple[Pipeline, tuple[str, ...]]:
     return dataclasses.replace(pipeline, source=source), references
 
 
+def _check_batch(stage: Stage, *, batched: bool, budgeted: bool, name: str) -> tuple[bool, bool]:
+    if isinstance(stage, (BatchStage, TokenBudget)):
+        if batched:
+            raise ValueError(f"pipeline {name} is already batched; use rebatch")
+        return True, isinstance(stage, TokenBudget)
+    if isinstance(stage, Rebatch):
+        if not batched:
+            raise ValueError(f"rebatch in {name} must follow batch")
+        if budgeted:
+            raise ValueError(f"rebatch in {name} changes the fixed token budget; use batch(tokens=)")
+    return batched, budgeted
+
+
 def _check(pipeline: Pipeline, read: Read, *, validation: bool = False, promotion: bool = False) -> None:
     if isinstance(pipeline.source, (Mixture, Phases)):
         for child in pipeline.source.pipelines:
@@ -243,15 +256,8 @@ def _check(pipeline: Pipeline, read: Read, *, validation: bool = False, promotio
         if isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects and read != "memory":
             indexed = False
         if isinstance(stage, (BatchStage, TokenBudget)):
-            if batched:
-                raise ValueError(f"pipeline {name} is already batched; use rebatch")
-            batched, indexed = True, False
-            budgeted = isinstance(stage, TokenBudget)
-        if isinstance(stage, Rebatch):
-            if not batched:
-                raise ValueError(f"rebatch in {name} must follow batch")
-            if budgeted:
-                raise ValueError(f"rebatch in {name} changes the fixed token budget; use batch(tokens=)")
+            indexed = False
+        batched, budgeted = _check_batch(stage, batched=batched, budgeted=budgeted, name=name)
         if isinstance(stage, Workers):
             if workers:
                 raise ValueError(f"pipeline {name} contains workers more than once")

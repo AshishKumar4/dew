@@ -43,11 +43,10 @@ from dew.records import JSON
 
 if TYPE_CHECKING:
     from flax import linen as nn
+    from jax.typing import DTypeLike
 
     from dew.data.pipeline import ObjectiveData
     from dew.data.text import Tokenizer
-    from jax.typing import DTypeLike
-
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.backbones.decoder_stack import DecoderBank
