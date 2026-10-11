@@ -105,6 +105,11 @@ class Split:
     name: str = "validation"
 
 
+@runtime_checkable
+class _SplitSource(Protocol):
+    def with_split(self, name: str) -> Source: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class _SliceRecords:
     source: Source
@@ -296,7 +301,9 @@ def _branches(
             train = Pipeline(_SliceRecords(source, count), prefix)
             held = _SliceRecords(source, 0, count) if count else None
     elif isinstance(validation, Split):
-        held = _source(value, split=validation.name, format=format)
+        if not isinstance(source, _SplitSource):
+            raise ValueError(f"source {source.describe()} has no native split {validation.name!r}")
+        held = source.with_split(validation.name)
     elif validation is not None:
         held = _source(validation, format=format)
     evaluated = None if held is None else Pipeline(held, prefix)
