@@ -108,28 +108,33 @@ def ragged() -> list[Example]:
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """A batch of 100, 17 x 3 and 24 real options in a 17 x 100 grid: the
-    loss and every parameter's gradient, backbone's and head's, as over the
-    grid to float32 rounding, and the loss reads only the real options."""
+    """A batch of 100, 17 x 3 and 24 real options in a 17 x 100 grid, which
+    the encoding compacts into 128 slots: the loss and every parameter's
+    gradient, backbone's and head's, as over the grid to float32 rounding,
+    and the loss reads only the real options."""
     tokenizer = ByteTokenizer()
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-    objective = DecisionObjective(
-        CausalTransformer(vocab_size=256, emb_features=32, num_layers=2, num_heads=2, mlp_features=48,
-                          max_seq_len=16384, attention_impl="xla"),
-        tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=16384),
-        head=JointSchemaHead(hidden_size=32, width=24, routing_layers=2, layers=1, heads=2, feedforward=40,
-                             attention_impl="xla"), shuffle_options=False)
     examples = ragged()
+    # Rows as long as the longest needs, since each attention here holds its
+    # whole [rows, heads, queries, keys] score on the CPU.
+    layout = JointLayout(max_len=16384)
+    length = max(len(row.tokens) for example in examples
+                 for row in layout.rows(tokenizer, specials, example.state, example.questions))
+    objective = DecisionObjective(
+        CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=1, mlp_features=24,
+                          max_seq_len=length, attention_impl="xla"),
+        tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=length),
+        head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
+                             attention_impl="xla"), shuffle_options=False)
     data = objective.dataset(examples, batch=len(examples), validation=examples)
-    (batch,) = list(data.val(DataPartition()))
-    batch = {name: value for name, value in batch.items() if name != VALID_ROWS}
-    options = np.asarray(batch["options"])
+    (slotted,) = list(data.val(DataPartition()))
+    slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
+    options = np.asarray(slotted["options"])
     assert options.shape[1:] == (17, 100)
     assert sorted(options.reshape(len(examples), -1).sum(axis=1).tolist()) == [24, 51, 100]
-    indexed = [compacted(row, 128) for row in options]
-    slotted = {**batch, "option_slots": np.stack([index for index, _ in indexed]),
-               "slotted": np.stack([real for _, real in indexed])}
+    # The encoding compacts the 100 real options of its widest row into 128 slots.
     assert laid_out(slotted).option_slots.shape == (3, 128)
+    batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
     variables = objective.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 
