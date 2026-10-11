@@ -229,3 +229,16 @@ def test_fused_residuals_keep_no_full_width_fp32_activation(operation, capsys):
     print_saved_residuals(function, *operands)
     saved = capsys.readouterr().out
     assert "bf16[2,3,31]" in saved and "f32[2,3,31]" not in saved, saved
+
+
+@pytest.mark.mesh(devices=2)
+def test_split_mesh_operands_refuse_both_local_kernels():
+    from dew.nn.kernels import norm_swiglu
+    from dew.training import MeshSpec
+
+    x = jnp.ones((2, 31), jnp.float32)
+    with jax.set_mesh(MeshSpec(fsdp=2).build(jax.devices()[:2])):
+        assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "xla"
+        assert norm_swiglu.swiglu_kernel("pallas", x, x) == "xla"
+    assert norm_swiglu.rms_kernel("pallas", x, None, x.dtype, fp32_statistics=True) == "pallas"
+    assert norm_swiglu.swiglu_kernel("pallas", x, x) == "pallas"
