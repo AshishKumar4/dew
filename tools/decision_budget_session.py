@@ -75,14 +75,14 @@ def main() -> None:
             try:
                 for arm in ("rows", "tokens"):
                     if remaining(args, started) < 600:
-                        raise TimeoutError("hard-cap guard leaves less than ten minutes for required attribution")
+                        raise TimeoutError("less than ten minutes remain for required attribution")
                     output = run_arm(args, arm, remaining(args, started), profile=True)
                     attribute(output, side, remaining(args, started))
                     reports[arm]["attribution"] = json.loads((output / "attribution.json").read_text())
             finally:
                 subprocess.run(["git", "worktree", "remove", str(side)], check=True)
     summary = {"commit": sha, "smoke": args.smoke, "elapsed_seconds": time.monotonic() - started,
-               "arms": reports, "artifact_policy": "retain raw profiles/HLO on this VM; export summary JSON only"}
+               "arms": reports, "artifact_policy": "retain raw profiles/HLO on this VM; export summary only"}
     (args.output / "summary.json").write_text(json.dumps(summary, sort_keys=True, indent=2) + "\n")
     print(json.dumps({"commit": sha, "smoke": args.smoke,
                       "seconds": summary["elapsed_seconds"], "checks": {arm: reports[arm]["checks"]

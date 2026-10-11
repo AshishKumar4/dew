@@ -20,13 +20,21 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data.dataset import Batch, Checkpointable, Closeable, DataPartition, Dataset, Loading, Reader, Stoppable
+from dew.data.dataset import (
+    Batch,
+    Checkpointable,
+    Closeable,
+    DataPartition,
+    Dataset,
+    Loading,
+    Reader,
+    Stoppable,
+)
 from dew.decision.config import DecisionRunConfig, JointShape
 from dew.decision.data import Decisions
 from dew.decision.scoring import Brier, LogLoss, RankedProbability
 from dew.interop import sources
-from dew.metrics import Metric
-from dew.objectives.base import Objective
+from dew.objectives.base import Metric, Objective
 from dew.telemetry.profile import Profiler
 from dew.training import Trainer
 from dew.training.distributed import DevicePrefetchIterator
@@ -185,13 +193,15 @@ class Measurement:
             raise ValueError("nonfinite final parameters or optimizer state")
         return {
             "arm": self.config.arm, "smoke": self.config.smoke,
-            "loss_normalization": "per real token" if self.config.trainer.batch_tokens else "per scored question",
-            "analytic_mfu_scope": "C50 trunk model work, real lengths, causal attention; head and remat excluded",
+            "loss_normalization": (
+                "per real token" if self.config.trainer.batch_tokens else "per scored question"),
+            "analytic_mfu_scope": "C50 trunk work at real lengths, causal attention; head and remat excluded",
             "model_flops_per_step": statistics.mean(row["model_flops"] for row in self.rows),
             "whole_run_compile_seconds": sum(float(row["seconds"]) for row in self.compiles),
             "compile_count": len(self.compiles), "compiles": self.compiles,
             "first_step_seconds": self.first_step_seconds, "windows": self.windows(), "microsteps": self.rows,
-            "live_peak_bytes": peak, "live_peak_scope": "process through timed end; excludes finite-state diagnostics",
+            "live_peak_bytes": peak,
+            "live_peak_scope": "process through timed end; excludes finite-state diagnostics",
             "checks": {"finite_losses_and_final_state": True, "fp32_parameters_and_moments": True,
                        "optimizer_updates": expected},
         }
@@ -252,7 +262,8 @@ def configuration(args: argparse.Namespace) -> BenchmarkRun:
         profile_directory=args.profile_directory,
         pretrained="tests/fixtures/hf/qwen38-dense-tiny" if args.smoke else MODEL,
         revision=None if args.smoke else REVISION, param_dtype="float32", lora=None,
-        head=JointShape(width=16, routing_layers=1, layers=1, heads=2, feedforward=32) if args.smoke else JointShape(),
+        head=(JointShape(width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+              if args.smoke else JointShape()),
         model=ModelConfig("causal_transformer", {"dtype": "float32" if args.smoke else "bfloat16"}),
         objective=ObjectiveConfig("decision", {
             "loss": LogLoss() + 0.5 * Brier() + RankedProbability(), "label_smoothing": 0.05,
@@ -268,7 +279,8 @@ def configuration(args: argparse.Namespace) -> BenchmarkRun:
                               compilation_cache_dir=None),
         optim=OptimConfig(learning_rate=2.5e-5, state_dtype="float32"), calibrate=False,
         max_len=layout, max_state_tokens=64 if args.smoke else 1024,
-        bucket_lengths=((32, 64, 128) if args.smoke else (512, 768, 1024, 1536, 2048, 3072)) if tokens else (),
+        bucket_lengths=(((32, 64, 128) if args.smoke else (512, 768, 1024, 1536, 2048, 3072))
+                        if tokens else ()),
     )
 
 

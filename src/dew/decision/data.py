@@ -174,10 +174,10 @@ class _DecisionSource:
                 elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
                     if self.table.label not in first:
                         raise ValueError(f"decision table needs column {self.table.label!r}")
-                    self._classes[:] = sorted(set(
+                    self._classes[:] = sorted({
                             str(record(records[index], "decision row")[self.table.label])
                             for index in range(len(records))
-                    ))
+                    })
             self._memory_slots(records)
         return records
 

@@ -824,7 +824,9 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         geometry = FixedTokens(self.seq_len, extra=1, pad_id=0 if self.pad_id is None else self.pad_id)
         if self.loss_role is None and self.pad_id is None:
             return ObjectiveData(train=(geometry,), evaluate=(geometry,))
-        counted = CountTargets(role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id)
+        counted = CountTargets(
+            role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
+        )
         return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
 
     def _row_weights(self, prepared, targets, roles, dtype):
