@@ -258,11 +258,14 @@ class TFDS:
                         "copy the complete split or provision it again"
                     ) from error
                 files.append({"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
+        if self.remote:
+            mirrored = json.loads(Path(self.directory, "READY").read_text())
+            files = mirrored["files"]
         return {
             "store": "tfds",
             "name": self.name,
             "split": self.split,
-            "directory": directory,
+            "directory": self.path if self.remote else directory,
             "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
             "definitions": definitions,
             "files": files,
@@ -306,13 +309,28 @@ class TFDS:
             with tempfile.TemporaryDirectory(dir=destination.parent, prefix="tfds-") as temporary:
                 staged = Path(temporary) / "dataset"
                 staged.mkdir()
+                copied = []
+
+                def download(key: str, target: Path) -> None:
+                    version = fs.ukey(key)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    fs.get_file(key, str(target))
+                    if fs.ukey(key) != version or fs.size(key) != target.stat().st_size:
+                        raise OSError(f"TFDS shard changed while provisioning {key}")
+                    copied.append(
+                        {
+                            "uri": root.child(key[len(path) :].lstrip("/")).url,
+                            "bytes": target.stat().st_size,
+                            "version": version,
+                        }
+                    )
+
                 for key in fs.find(path):
                     if "array_record" in key:
                         continue
                     relative = key[len(path) :].lstrip("/")
                     target = staged / relative
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    fs.get_file(key, str(target))
+                    download(key, target)
                 builder = read_only_builder(
                     str(staged), name=self.name, config=self.config, version=self.version
                 )
@@ -326,8 +344,10 @@ class TFDS:
                         raise ValueError(f"TFDS {self.name!r} has no split {name!r}")
                     for instruction in builder.info.splits[name].file_instructions:
                         filename = Path(instruction.filename).name
-                        fs.get_file(path.rstrip("/") + "/" + filename, str(staged / filename))
-                (staged / "READY").write_text(json.dumps({"source": self.path, "split": self.split}))
+                        download(path.rstrip("/") + "/" + filename, staged / filename)
+                (staged / "READY").write_text(
+                    json.dumps({"source": self.path, "split": self.split, "files": copied})
+                )
                 shutil.move(staged, destination)
 
     def records(self, read: Read) -> Records:
