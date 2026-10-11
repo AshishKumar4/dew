@@ -266,6 +266,7 @@ def data_inputs(fields: dict) -> dict:
                 "target": str(destination),
                 "prefix": source["prefix"],
                 "manifest_sha256": source["manifest_sha256"],
+                "manifest_key": source.get("manifest_key", source["prefix"].rstrip("/") + "/manifest.json"),
             }
         )
     return result
