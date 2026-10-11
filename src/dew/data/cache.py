@@ -1250,7 +1250,9 @@ class _GenerationSource:
     def _length_index(self) -> ArrayIndex:
         entry = self.generation.manifest["metadata"]["lengths"]
         index = ArrayIndex(
-            self.generation.url.rstrip("/") + "/" + entry["path"], self.generation.storage_options
+            self.generation.url.rstrip("/") + "/" + entry["path"],
+            self.generation.storage_options,
+            metadata=entry,
         )
         index.verify(entry)
         return index
