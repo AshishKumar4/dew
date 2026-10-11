@@ -11,6 +11,7 @@ the fused VJPs to Liger's measured float64 distances.
 """
 
 import functools
+import json
 
 import jax
 import jax.numpy as jnp
@@ -34,6 +35,30 @@ def evaluated(function, operands, seed):
     return (output, *backward(seed))
 
 
+def rounding_report(labels, actual, reference, truth):
+    """On failure, compare every output's error to the same float64 truth.
+
+    A GPU reference's column reduction can be less accurate than the fused
+    reduction. Reporting both, not just relative-vs-XLA, distinguishes that
+    from a kernel regression in one paid verify; assertion bounds stay unchanged.
+    """
+    report = {"backend": jax.default_backend(), "outputs": {}}
+    names = {"x": "dx", "scale": "dscale", "gate": "dgate", "up": "dup"}
+    for label, mine, theirs, exact in zip(labels, actual, reference, truth, strict=True):
+        if mine is None:
+            continue
+        mine64, reference64, exact64 = (np.asarray(value, np.float64) for value in (mine, theirs, exact))
+        report["outputs"][names.get(label, label)] = {
+            "shape": list(mine.shape), "dtype": str(mine.dtype),
+            "dew_rms_from_float64": distance(mine64, exact64),
+            "xla_rms_from_float64": distance(reference64, exact64),
+            "dew_max_from_float64": float(np.max(np.abs(mine64 - exact64))),
+            "xla_max_from_float64": float(np.max(np.abs(reference64 - exact64))),
+            "relative_vs_xla": float(relative(mine64, reference64)),
+        }
+    return "NORM_SWIGLU_FLOAT64_DIAGNOSTIC\n" + json.dumps(report, indent=2)
+
+
 def compare(functions, operands, seed, labels):
     xla, pallas, exact = functions
     graph = str(jax.make_jaxpr(pallas)(*operands))
@@ -46,14 +71,20 @@ def compare(functions, operands, seed, labels):
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
         truth = evaluated(exact, wide, jnp.asarray(np.asarray(seed, np.float64)))
-    for label, mine, theirs, want in zip(labels, actual, reference, truth, strict=True):
-        if mine is None:
-            assert theirs is None and want is None
-            continue
-        assert mine.dtype == theirs.dtype, label
-        if mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
-            assert relative(mine, theirs) < 1e-5, label
-        assert_as_exact_as_the_reference(mine, theirs, want, label)
+    try:
+        for label, mine, theirs, want in zip(labels, actual, reference, truth, strict=True):
+            if mine is None:
+                assert theirs is None and want is None
+                continue
+            assert mine.dtype == theirs.dtype, label
+            if mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
+                assert relative(mine, theirs) < 1e-5, label
+            assert_as_exact_as_the_reference(mine, theirs, want, label)
+    except AssertionError as error:
+        report = rounding_report(labels, actual, reference, truth)
+        print(report, flush=True)
+        error.add_note(report)
+        raise
 
 
 def norm_functions(dtype, offset, after_cast):
@@ -111,10 +142,16 @@ def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
     with jax.enable_x64(new_val=True), jax.default_device(cpu):
         wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
         truth = evaluated(exact, wide, jnp.asarray(np.asarray(seed, np.float64)))
-    for label, mine, theirs, want in zip(("y", "x", "scale"), actual, reference, truth, strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, want, label)
-        if mine.dtype == jnp.float32:
-            assert relative(mine, theirs) < 1e-5, label
+    try:
+        for label, mine, theirs, want in zip(("y", "x", "scale"), actual, reference, truth, strict=True):
+            assert_as_exact_as_the_reference(mine, theirs, want, label)
+            if mine.dtype == jnp.float32:
+                assert relative(mine, theirs) < 1e-5, label
+    except AssertionError as error:
+        report = rounding_report(("y", "x", "scale"), actual, reference, truth)
+        print(report, flush=True)
+        error.add_note(report)
+        raise
 
 
 @pytest.mark.parametrize("input_dtype,output_dtype", [(jnp.bfloat16, jnp.float32),
