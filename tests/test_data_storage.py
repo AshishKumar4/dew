@@ -268,5 +268,9 @@ def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
     )
     assert cached.read() == first
     fs, path = store.resolve()
+    version = store.get_versioned().version
+    assert fs.cat_file(path, start=0, end=8, version=version) == first[:8]
+    with pytest.raises(PreconditionFailed):
+        fs.cat_file(path, start=0, end=8, version='"incorrect-version"')
     fs.rm(path)
     assert not fs.exists(path)
