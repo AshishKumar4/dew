@@ -79,7 +79,11 @@ class Colab:
             except self.types.ColabRequestError as error:
                 # Only the very first, read-only GET can prove that no POST
                 # provisioned a VM. A timeout on any earlier attempt is ambiguous.
-                if attempt == 0 and error.request.method == "GET" and error.response.status_code == 400:
+                if (
+                    attempt == 0
+                    and getattr(error.request, "method", None) == "GET"
+                    and getattr(error.response, "status_code", None) == 400
+                ):
                     request["allocation_rejected_at"] = time.time()
                     request["allocation_rejection"] = {"method": "GET", "http_status": 400}
                 raise
@@ -141,8 +145,8 @@ def no_assignment_acquired(allocation: dict, driver: dict) -> bool:
     rejected = allocation.get("allocation_rejected_at")
     return (
         allocation.get("allocation_rejection") == {"method": "GET", "http_status": 400}
-        and type(rejected) in (float, int)
+        and isinstance(rejected, (float, int))
+        and not isinstance(rejected, bool)
         and 0 < rejected < float("inf")
         and not any(key in record for record in (allocation, driver) for key in ("endpoint", "assigned_at"))
     )
-

@@ -470,6 +470,16 @@ def test_a_session_that_trains_only_after_the_lab_gate_stops_it_is_gated_at_runt
         assert preflight.runtime_gate({"run.sh": unsafe, **driver}, "bash run.sh") is None, unsafe
 
 
+def test_lab_gate_help_works_when_docstrings_are_stripped(monkeypatch):
+    from tools.colab import lab_gate
+
+    monkeypatch.setattr(lab_gate, "__doc__", None)
+    monkeypatch.setattr(sys, "argv", ["gate", "--help"])
+    with pytest.raises(SystemExit) as stopped:
+        lab_gate.main()
+    assert stopped.value.code == 0
+
+
 def test_the_lab_gate_reads_what_the_preflight_reads(tmp_path, monkeypatch):
     """The gate fails a ref whose KERNELS row names Pallas kernels on the GPU and whose digest has no
     ok record, passes one that has it, and passes a GPU whose row names none."""
