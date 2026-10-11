@@ -243,9 +243,10 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     mixture = _mixture(tmp_path, rows, ["nothing these rows share at all"], held=8)
     clef = _module("clef")
     storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
-    config = DecisionRunConfig.cli([*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
-                                    "--trainer.batch-size", "None", "--trainer.batch-tokens", "8192",
-                                    "--trainer.update-tokens", "8192",
+    flags = _flags(mixture, tmp_path / "runs")
+    flags[flags.index("--trainer.batch-size") + 1] = "None"
+    flags[:0] = ["--trainer.batch-tokens", "8192", "--trainer.update-tokens", "8192"]
+    config = DecisionRunConfig.cli([*flags, "--pretrained", str(QWEN),
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                                     "--head.feedforward", "40", "--head.layers", "1",
                                     "--head.routing-layers", "1", "--max-len", "1024", *storage],
