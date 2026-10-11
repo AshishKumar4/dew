@@ -142,7 +142,8 @@ class LMRunConfig(RunConfig):
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
         loaded = load(tokens, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
-                      lengths=() if self.trainer.batch_tokens is None else (objective.seq_len,),
+                      lengths=() if self.trainer.batch_tokens is None else (
+                          tokens.seq_len + (kind != "lm"),),
                       read=self.data_read, provision=self.provision,
                       seed=self.data_seed, loading=self.loading,
                       validation_records=self.validation_records, objective=objective.data())
