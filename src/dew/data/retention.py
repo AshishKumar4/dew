@@ -88,6 +88,8 @@ class LocalRetention:
                         continue
                     key = generation.parent.parent
                     current = key / "CURRENT"
+                    if target == current:
+                        continue
                     if (
                         current.is_file()
                         and json.loads(current.read_bytes())["generation"] == generation.name
