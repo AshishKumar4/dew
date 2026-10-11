@@ -209,7 +209,8 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         everything.append(record)
         if kind == "gemm":
             record["precision"] = gemm_precision(row, known)
-            if record["precision"] == "fp8":
+            # Model FLOPs exclude remat's recompute, so an FP8 GEMM's recomputed copy is not charged.
+            if record["precision"] == "fp8" and not (known is not None and known.recomputed):
                 fp8_gflop += gflops * us * 1e-6
         if kind == "gemm" and peak:
             record["lost_us"] = round(us * max(0.0, 1 - gflops / peak), 1)
@@ -253,7 +254,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         result["mfu_bf16_of_device_time"] = round(model_flops / seconds / (peak * 1e9), 4) if peak else None
         if peak and not fp8:
             result["mfu_mixed_of_device_time"] = result["mfu_bf16_of_device_time"]
-        elif peak and fp8_peak:
+        elif peak and fp8_peak and fp8 <= model_flops:
             share = ((model_flops - fp8) / (peak * 1e9) + fp8 / fp8_peak) / seconds
             result["mfu_mixed_of_device_time"] = round(share, 4)
         else:
