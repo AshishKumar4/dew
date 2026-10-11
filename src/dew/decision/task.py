@@ -416,11 +416,11 @@ class Decide:
         and the log loss. The pass agrees its result across a process pool, so
         there every process calls it.
         """
+        from dew.data.compile import validation
+        from dew.decision.data import Decisions as DecisionRecipe
         from dew.decision.metrics import AURC, ECE, Accuracy
         from dew.decision.objective import DecisionObjective
         from dew.decision.scoring import LogLoss
-        from dew.data.compile import validation
-        from dew.decision.data import Decisions as DecisionRecipe
         from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 

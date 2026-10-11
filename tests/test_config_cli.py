@@ -2,7 +2,6 @@
 that rebuilds from what it logged."""
 
 import dataclasses
-import itertools
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -14,7 +13,7 @@ from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
 from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Memory, Text
-from dew.data.dataset import record_argument, tokenized
+from dew.data.dataset import record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig
@@ -40,7 +39,8 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model", "simple_dit", "--model.scan_order", "hilbert"])
 
-    assert config.data == Images(source="tfds://oxford_flowers102", image_size=64, augment=Augment(crop_scale=(0.8, 1.0)))
+    assert config.data == Images(source="tfds://oxford_flowers102", image_size=64,
+        augment=Augment(crop_scale=(0.8, 1.0)))
     assert config.preset == Flow(shift=3.0)
     assert config.objective.fields["solver"]["class"] == import_path(Heun)
     assert config.objective.fields["guidance"]["fields"]["scale"] == 2.5
@@ -50,7 +50,8 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
 
 def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
     config = parse(RunConfig, ["--data.image-size", "96", "--trainer.epochs", "3"])
-    assert config.data == Images(source="tfds://oxford_flowers102", image_size=96) and config.trainer.epochs == 3
+    assert config.data == Images(source="tfds://oxford_flowers102",
+        image_size=96) and config.trainer.epochs == 3
 
 
 def test_another_dataset_is_its_subcommand():
@@ -84,7 +85,8 @@ def test_a_run_config_round_trips_through_its_json_record(name):
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
     name the sources, so the run and its solvers rebuild from run.json."""
-    config = DiffusionRunConfig(data=Images(source=Files("hf://datasets/user/images/train.parquet", format="parquet"), image_size=64))
+    config = DiffusionRunConfig(data=Images(source=Files("hf://datasets/user/images/train.parquet",
+        format="parquet"), image_size=64))
 
     record = json.loads(json.dumps(config.to_dict()))
 

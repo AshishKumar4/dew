@@ -11,7 +11,6 @@ These tests run in the bare venv: a subprocess test proves nothing in the
 module's import or construction path reaches torchvision.
 """
 
-import dataclasses
 import itertools
 import os
 import random
@@ -31,6 +30,7 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 from dew.data import DataPartition, Images, Loading, images, load
+from dew.data.sources.codec import unpack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions, ImageRecord
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -85,7 +85,8 @@ def _spec(kind, labels_file, augmentation="flip_jitter"):
     augment = images.image_augmentations(augmentation)
     return ImageRecord(SCALE, SCALE, templates=CAPTION_TEMPLATES if kind == "tfds" else (),
                        classes=LABELS if kind == "tfds" else (),
-                       flip=augment is not None and augment.flip, jitter=augment is not None and augment.jitter)
+                       flip=augment is not None and augment.flip,
+                           jitter=augment is not None and augment.jitter)
 
 
 def _resized(kind, element):
@@ -94,7 +95,7 @@ def _resized(kind, element):
     if kind == "tfds":
         image = element["image"]
     else:
-        records = images.unpack_dict_of_byte_arrays(element)
+        records = unpack_dict_of_byte_arrays(element)
         decoded = cv2.imdecode(
             np.frombuffer(records["jpg"], dtype=np.uint8), cv2.IMREAD_UNCHANGED
         )
@@ -219,7 +220,8 @@ def test_a_spawned_worker_imports_opencv_before_its_readers_start(tmp_path):
         "    transform = pickle.load(handle)",
         "assert 'cv2' in sys.modules",
         "with ThreadPoolExecutor(32) as pool:",
-        "    records = list(pool.map(lambda seed: transform.random_map({'image': PNG}, np.random.default_rng(seed)),",
+        "    records = list(pool.map(lambda seed: transform.random_map(",
+        "        {'image': PNG}, np.random.default_rng(seed)),",
         "                            range(64)))",
         "assert all(record['image'].shape == (16, 16, 3) for record in records)",
         "print('ok')",
@@ -347,14 +349,13 @@ def test_the_caption_template_comes_from_the_record_rng(tmp_path):
 @pytest.mark.parametrize("column", ["caption", "text"])
 def test_a_record_caption_is_taken_as_it_is(column):
     """Hub datasets carry their own text, under either of two column names."""
-    assert images.record_caption({column: "a yellow tulip"}) == "a yellow tulip"
+    row = {column: "a yellow tulip", "image": _synthetic_image()}
+    assert ImageRecord(SCALE, SCALE).random_map(row, _record_rng(0))["caption"] == "a yellow tulip"
 
 
-def test_a_record_with_no_caption_column_says_what_it_has():
-    with pytest.raises(
-        KeyError, match=r"one of the columns \['caption', 'text'\], this one has \['image', 'url'\]"
-    ):
-        images.record_caption({"image": None, "url": "x"})
+def test_a_record_with_no_caption_keeps_an_empty_host_caption():
+    row = {"image": _synthetic_image(), "url": "x"}
+    assert ImageRecord(SCALE, SCALE).random_map(row, _record_rng(0))["caption"] == ""
 
 
 def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():

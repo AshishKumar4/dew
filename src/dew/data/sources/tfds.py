@@ -1,18 +1,4 @@
-"""Prepared TFDS ArrayRecords as a grain source.
-
-Preparation downloads, generates and writes the shards, and needs
-TensorFlow. Reading them needs neither: TFDS's read-only builder opens what
-preparation left behind. `prepared` alone prepares, into dew's own TFDS
-directory, in a separate process.
-
-`read_only_builder` resolves the version directory, the directory itself
-when it holds the metadata and otherwise through TFDS's own
-`builder_from_files` from the names a caller gave, then compares the builder,
-config and version asked for with what the metadata reports and refuses a
-file format other than ArrayRecord.
-`prepared_source` is the builder's own data source behind those checks and a
-check that every shard of the split is present.
-"""
+"""Prepared TFDS data sources, with explicit preparation and remote mirrors."""
 
 from __future__ import annotations
 
@@ -25,17 +11,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated
+from typing import TYPE_CHECKING
 
 from etils import epath
 from filelock import FileLock
 
 from dew.cache import dew_cache_dir
 
-from ..dataset import Batch, Records, json_argument
+from ..dataset import Records
 from .base import Read, Shard, ShardManifest
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
@@ -199,129 +185,7 @@ def read_only_builder(path: str, *, name: str | None, config: str | None, versio
     return reader
 
 
-def check_shards(builder, split: str, directory: epath.Path) -> None:
-    """Raise unless every prepared shard the split reads is present.
 
-    A plain name that is not a prepared split is named here, where the
-    alternatives can be listed. An expression -- a union, a slice, or TFDS's
-    own "all" -- is left to TFDS, and every prepared split's shards are
-    checked instead, since any of them may be read.
-
-    The check runs before the run rather than in a grain worker on the first
-    record that needed a missing shard, steps into training.
-    """
-    splits = builder.info.splits
-    plain = not any(character in split for character in "+[")
-    if plain and split != "all" and split not in splits:
-        raise ValueError(f"{directory} holds no split {split!r}; it holds {sorted(splits)}")
-    wanted = [split] if plain and split in splits else sorted(splits)
-    for name in wanted:
-        for instruction in splits[name].file_instructions:
-            if not epath.Path(instruction.filename).is_file():
-                raise FileNotFoundError(
-                    f"Missing prepared ArrayRecord shard {instruction.filename!r}. "
-                    f"Copy the complete prepared dataset or prepare it again."
-                )
-
-
-def prepared_source(
-    path: str,
-    split: str,
-    *,
-    name: str | None = None,
-    config: str | None = None,
-    version: str | None = None,
-    decoders: DecoderTree | None = None,
-) -> Records:
-    """Reads one split of a prepared TFDS dataset by index.
-
-    The builder's own `as_data_source` is already grain's protocol. What this
-    adds is the resolution of the directory, the checks against its metadata,
-    and the refusals a half-prepared or wrongly formatted directory earns.
-
-    `split` takes TFDS's own syntax, slicing included, and `decoders` reaches
-    the builder unchanged, so a caller can hand it `SkipDecoding()` for a
-    feature it wants as the bytes on disk. A record is whatever the prepared
-    features and those decoders make it: a mapping for a features dict, a
-    bare array for a single feature. The run's own `preprocess` is where it
-    becomes batch fields.
-    """
-    reader = read_only_builder(path, name=name, config=config, version=version)
-    check_shards(reader, split, epath.Path(reader.data_path))
-    return Prepared(reader.as_data_source(split, decoders=decoders), str(reader.data_path), split)
-
-
-class Prepared:
-    """Reads one prepared split by index.
-
-    TFDS's features and the caller's decoders decide what a record is: a
-    mapping of features, or the bytes of a single feature a decoder skipped.
-    A record is narrowed here, on the way out, so one that is neither is
-    named where the split is known rather than inside a grain worker.
-
-    The repr is the directory and the split, which is what a saved position
-    compares against (`describe`). The builder's own source describes itself
-    by its address in this process, and two addresses refuse every resume.
-    """
-
-    def __init__(self, records: Sequence[object], directory: str, split: str):
-        self.directory = directory
-        self.split = split
-        self._records = records
-
-    def __repr__(self) -> str:
-        return f"Prepared(directory={self.directory!r}, split={self.split!r})"
-
-    def __len__(self) -> int:
-        return len(self._records)
-
-    def __getitem__(self, index: int) -> Batch | bytes | None:
-        held = self._records[index]
-        if isinstance(held, bytes):
-            return held
-        if isinstance(held, Mapping):
-            return dict(held)
-        raise TypeError(
-            f"record {index} of {self.directory} split {self.split!r} is "
-            f"{type(held).__name__}; a prepared record is its features or the "
-            f"bytes of the one feature a decoder skipped"
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class TFDSOptions:
-    """Where a prepared TFDS dataset is, and which part of it to read.
-
-    `path` is what a preparation run wrote, either the version directory or
-    the `data_dir` above it, and is only read. None reads dew's own TFDS
-    directory instead, where a missing builder is prepared first
-    (`prepared`). `config` and `version` pick the directory inside a
-    data_dir, and both are checked against the prepared metadata.
-    `decoders` is TFDS's own decoder tree, passed to the builder unchanged,
-    so a caller can ask for the bytes on disk with `SkipDecoding()`.
-
-    The builder's name and the split expression are not options here,
-    because a mixture reads several builders through one set of these
-    options.
-    """
-
-    path: str | None = None
-    config: str | None = None
-    version: str | None = None
-    decoders: DecoderTree | None = None
-
-    def source(self, name: str, split: str) -> Records:
-        """Open `split` of the prepared builder `name` for reading by index."""
-        path = self.path or prepared(name, config=self.config, version=self.version)
-        return prepared_source(
-            path, split, name=name, config=self.config, version=self.version, decoders=self.decoders
-        )
-
-
-PreparedOptions = Annotated[TFDSOptions, json_argument(TFDSOptions)]
-"""`TFDSOptions` as a dataset spec declares it: one JSON object on the
-command line, because a decoder tree is a tree of TFDS objects with no
-command-line spelling."""
 
 
 @dataclasses.dataclass(frozen=True)

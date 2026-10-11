@@ -39,8 +39,8 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import LogLoss
 from dew.decision.task import Decide
-from dew.training.state import TrainState
 from dew.records import number, record
+from dew.training.state import TrainState
 
 if TYPE_CHECKING:
     from dew.interop import Pretrained
@@ -160,13 +160,14 @@ class DecisionRunConfig(RunConfig):
                            record(made.get("weights", {}), "weights").items()} | dict(self.data.weights)
                 summary["mixture"] = {name: value for name, value in weights.items() if value > 0}
                 summary["made"] = made
-        dataset = load(self.data, batch=self.trainer.batch_size, read=self.read,
+        dataset = load(self.data, batch=self.trainer.batch_size, read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
                        validation_records=self.validation_records,
                        objective=objective.data())
         summary["records"] = dataset.records
         unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
-        unfit["held out"] = sum(counter.rejected.get("unfit", 0) for counter in dataset.validation_counts.values())
+        unfit["held out"] = sum(counter.rejected.get("unfit",
+            0) for counter in dataset.validation_counts.values())
         if any(unfit.values()):
             summary["unfit"] = unfit
 

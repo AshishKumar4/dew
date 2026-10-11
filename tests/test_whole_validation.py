@@ -18,9 +18,9 @@ from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 from test_objective_inputs import cases, corpus_windows
 
-from dew import Dataset, Evaluation
+from dew import Evaluation
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import DataPartition, Loading, Images
+from dew.data import DataPartition, Images, Loading, Records, load
 from dew.data.chat import Role
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Flow
@@ -30,7 +30,6 @@ from dew.objectives.diffusion import DiffusionRunConfig, GuidanceDistillationObj
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.registry import objectives
 from dew.sampling import Euler
-from dew.data import Records, load
 
 ROWS = 8
 """A batch's rows: one per device of the lane's eight."""
@@ -53,7 +52,8 @@ def runnable(name: str, windows, tmp_path):
         archive.extractall(tmp_path / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=Images(source="tfds://oxford_flowers102", split="all", image_size=8), preset=Flow(), val_metrics=(),
+        data=Images(source="tfds://oxford_flowers102", split="all", image_size=8), preset=Flow(),
+            val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2,
@@ -103,7 +103,8 @@ def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
     one to validate. The pass reads each record once, on one process or two,
     and the repeats that fill the last batch out are marked; with one record,
     process 1's share is empty and reads one batch of repeats alone."""
-    data = load(Records(source={"id": np.arange(8)}, validation={"id": np.arange(held)}), batch=4, loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    data = load(Records(source={"id": np.arange(8)}, validation={"id": np.arange(held)}), batch=4,
+        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
     for count in (1, 2):
         seen = []
         for index in range(count):
@@ -133,7 +134,8 @@ def evaluated(name: str, windows, tmp_path) -> dict:
         drawn = objective.init(jax.random.key(0))
         variables, averaged = moved(drawn, 1), moved(drawn, 2)
         records = wide(records)
-        data = load(Records(source=records, validation=records), batch=ROWS, loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+        data = load(Records(source=records, validation=records), batch=ROWS, loading=Loading(workers=0,
+            threads=1, read_buffer=1), read="memory")
         tail = len(records) - ROWS
         batches = [{**stacked(records[:ROWS]), VALID_ROWS: np.ones(ROWS, bool)},
                    {**stacked(records[ROWS:] + [records[0]] * (ROWS - tail)),
@@ -267,7 +269,8 @@ def perplexity(windows, count: int = RECORDS) -> dict:
     records = records_of(batch, count)
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 1)
-        data = load(Records(source=records_of(batch, ROWS), validation=records), batch=ROWS, loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+        data = load(Records(source=records_of(batch, ROWS), validation=records), batch=ROWS,
+            loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
         result = Evaluation.run(objective, variables, data.val, key=3, metrics=(Perplexity(),))
         whole = stacked(records)
         step = Step(jnp.asarray(0), jax.random.key(1), None)
