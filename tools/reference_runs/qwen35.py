@@ -28,6 +28,7 @@ def config(smoke: bool) -> dict:
             "intermediate_size": 64, "num_hidden_layers": 2, "num_attention_heads": 2,
             "num_key_value_heads": 1, "head_dim": 16, "linear_key_head_dim": 8,
             "linear_value_head_dim": 8, "linear_num_key_heads": 2, "linear_num_value_heads": 2,
+            "linear_conv_kernel_dim": 4,
             "layer_types": ["linear_attention", "full_attention"], "use_cache": False,
             "tie_word_embeddings": True,
             "rope_parameters": {"rope_type": "default", "rope_theta": 1e6, "partial_rotary_factor": 0.5,
