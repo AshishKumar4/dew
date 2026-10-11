@@ -685,10 +685,16 @@ def _memory_stages(
             )
             documents = tuple(_Payload()(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
-            packed = PackedWindows(
-                pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe()
-            )
-            derived["packing"] = fingerprint([packed.order.tolist(), packed.starts.tolist()])
+            if stage.policy == "first-fit":
+                packed = PackedWindows(
+                    pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe()
+                )
+                derived["packing"] = fingerprint([packed.order.tolist(), packed.starts.tolist()])
+            else:
+                # Only first-fit has an indexed plan; the other policies are Grain's
+                # own packer, run once over the corpus as an indexed read streams it.
+                packed = list(_packed(pygrain.MapDataset.source(documents).to_iter_dataset(), stage))
+                derived["packing"] = fingerprint(sizes)
             rows = [((index,), packed[index]) for index in range(len(packed))]
         else:
             expanded: list[tuple[tuple[int, ...], Record]] = []
@@ -913,6 +919,15 @@ def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
     )
 
 
+def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
+    """`documents` packed by Grain's own packer for the stage's policy."""
+    sizes = dict.fromkeys(stage.fields, stage.seq_len)
+    if stage.policy == "concat":
+        return gx.ConcatThenSplitIterDataset(documents, length_struct=sizes)
+    packer = gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
+    return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False)
+
+
 @dataclasses.dataclass(frozen=True)
 class _Build:
     read: Read
@@ -1132,15 +1147,7 @@ class _Build:
         partition: DataPartition,
     ) -> tuple[Rows, pygrain.MapDataset | None]:
         if isinstance(stage, Pack):
-            parent = _as_iter(rows, self.loading).map(_Payload())
-            sizes = dict.fromkeys(stage.fields, stage.seq_len)
-            if stage.policy == "concat":
-                rows = gx.ConcatThenSplitIterDataset(parent, length_struct=sizes)
-            else:
-                packer = (
-                    gx.FirstFitPackIterDataset if stage.policy == "first-fit" else gx.BestFitPackIterDataset
-                )
-                rows = packer(parent, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False)
+            rows = _packed(_as_iter(rows, self.loading).map(_Payload()), stage)
             lengths = None
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import CausalWindows
