@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from dew.data.cache import Cache
-from dew.data.compile import compile, iterate
+from dew.data.compile import compile, iterate, publish
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
@@ -417,3 +417,94 @@ def test_shares_agree_on_one_identity_and_resume_only_their_own_rows():
     finally:
         first.close()
         second.close()
+
+
+def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
+    """Each share of a cached indexed read takes its own rows of the source,
+    and a training read with no repeat stage goes on past one pass."""
+    cached = Pipeline(source(8)).map(Shift(1), identity="shift@1").cache(Cache(f"memory://{uuid4().hex}"))
+    data = compile(cached.batch(2), loading=READ)
+    shares = [data.train(DataPartition(index, 2)) for index in range(2)]
+    try:
+        read = [[value for batch in take(reader, 8) for value in batch["id"]] for reader in shares]
+    finally:
+        for reader in shares:
+            reader.close()
+    assert not set(read[0]) & set(read[1])
+    assert sorted(set(read[0]) | set(read[1])) == list(range(1, 9))
+    assert all(sorted(rows) == sorted(list(set(rows)) * 2) for rows in read)
+
+
+def test_a_limit_counts_the_whole_order_and_a_prefetch_never_moves_the_share_cut():
+    """24 records with prefetch(4).take(12) train on the same 12 records on one
+    share or two."""
+    data = compile(Pipeline(source()).prefetch(4).take(12).batch(4), loading=READ)
+
+    def read(count):
+        readers = [data.train(DataPartition(index, count)) for index in range(count)]
+        try:
+            return sorted(value for reader in readers for batch in take(reader, 10) for value in batch["id"])
+        finally:
+            for reader in readers:
+                reader.close()
+
+    assert read(1) == read(2) and len(read(1)) == 12
+
+
+def test_a_token_split_is_part_of_the_order_a_resume_checks():
+    """Four 4-token documents split at a quarter train on documents 1-3 and
+    at a half on 2-3, so a position saved under one split is refused under
+    the other."""
+    documents = [{"text": np.arange(4 * index, 4 * index + 4, dtype=np.int32)} for index in range(4)]
+
+    def reader(fraction):
+        split = Pipeline(Memory(documents)).token_split(fraction, held=False).batch(1)
+        return compile(split, read="indexed", loading=READ).train(DataPartition())
+
+    quarter = reader(0.25)
+    try:
+        next(quarter)
+        state = quarter.get_state()
+    finally:
+        quarter.close()
+    half = reader(0.5)
+    try:
+        with pytest.raises(ValueError, match="order changed"):
+            half.set_state(state)
+    finally:
+        half.close()
+
+
+def test_a_recipe_reads_a_published_packing_before_its_default_order(tmp_path):
+    """A typed recipe given a generation with a published packing plan reads
+    that plan, and shuffles its windows, instead of packing again online."""
+    from dew.data import Text, load
+    from dew.data.steps.text import Chunks, Tokenize
+
+    stored = Memory(tuple({"text": "x" * size} for size in (3, 7, 18, 2, 4, 12, 8, 1, 15, 6)))
+    published = publish(Pipeline(stored).map(Tokenize()).flat_map(Chunks(9)).pack(9, bins=3),
+                        Cache(str(tmp_path / "cache")), read="indexed", loading=READ)
+    data = load(Text(source=stored, seq_len=8, pack="first-fit", packing_bins=3), batch=2, cache=published,
+                read="indexed", loading=READ)
+    assert data.plan is not None
+    assert "packing" in data.plan.manifest.source["sources"][0]
+
+
+@dataclasses.dataclass(frozen=True)
+class Tagged:
+    def __call__(self, element):
+        return {**element, "tag": element["id"] * 10}
+
+
+def test_record_steps_before_an_interleave_run_inside_each_shard():
+    """The steps written before an interleave run on each shard's rows and the
+    interleave flattens them where it stands; anything but a record step
+    there is refused."""
+    stored = Memory(source(10).values, shard_rows=3)
+    before = Pipeline(stored).map(Tagged(), identity="tagged@1").interleave(2)
+    after = Pipeline(stored).interleave(2).map(Tagged(), identity="tagged@1")
+    rows = [[(int(row["id"]), int(row["tag"])) for row in iterate(pipeline, read="streamed", loading=READ)]
+            for pipeline in (before, after)]
+    assert rows[0] == rows[1] and sorted(rows[0]) == [(index, 10 * index) for index in range(10)]
+    with pytest.raises(ValueError, match="only record steps before it"):
+        iterate(Pipeline(stored).shuffle(0, window=4).interleave(2), read="streamed", loading=READ)

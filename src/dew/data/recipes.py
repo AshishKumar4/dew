@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, r
 import numpy as np
 import tyro
 
-from dew.data.compile import _preferred_read, compile
+from dew.data.compile import _preferred_read, _promoted, compile
 from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
 from dew.data.pipeline import (
     Artifact,
@@ -783,6 +783,7 @@ def load(
     if cache is not None:
         train = _cached(train, cache)
         held = None if held is None else _cached(held, cache)
+    train, held = _promoted(train), None if held is None else _promoted(held)
     train = _batched(_ordered(train, read, seed), batch, train=True, tokens=tokens, lengths=lengths)
     held = None if held is None else _batched(held, batch, train=False, tokens=tokens, lengths=lengths)
     return compile(
