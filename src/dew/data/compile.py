@@ -1295,6 +1295,10 @@ class _Build:
                 )
             )
             lengths = None
+        elif isinstance(stage, Rebatch):
+            rows = gx.RebatchIterDataset(
+                _as_iter(rows, self.loading), partition.rows(stage.size), drop_remainder=self.training
+            )
         else:
             return self.layout_stage(rows, lengths, stage, pipeline, partition)
         return rows, lengths
@@ -1417,7 +1421,8 @@ class _Build:
         if self.global_order:
             for stage in pipeline.stages[: pipeline.stages.index(batch_stage)]:
                 if isinstance(stage, Prefetch):
-                    stream = gx.ThreadPrefetchIterDataset(stream, prefetch_buffer_size=stage.buffer)
+                    advanced, _ = self.stage(stream, None, stage, pipeline, partition)
+                    stream = _as_iter(advanced, self.loading)
         stream = (
             stream
             .map(_Payload())
@@ -1440,33 +1445,16 @@ class _Build:
         partition: DataPartition,
         batch_stage: BatchStage | TokenBudget,
     ) -> pygrain.IterDataset:
-        boundary = pipeline.stages.index(batch_stage)
-        explicit_workers = any(isinstance(stage, Workers) for stage in pipeline.stages[:boundary])
-        for stage in pipeline.stages[boundary + 1 :]:
-            if isinstance(stage, Workers):
-                stream = stream.mp_prefetch(
-                    pygrain.MultiprocessingOptions(
-                        num_workers=stage.count, per_worker_buffer_size=stage.buffer
-                    )
-                )
-                explicit_workers = True
-            elif isinstance(stage, Prefetch):
-                stream = gx.ThreadPrefetchIterDataset(stream, prefetch_buffer_size=stage.buffer)
-            elif isinstance(stage, Rebatch):
-                stream = gx.RebatchIterDataset(
-                    stream, partition.rows(stage.size), drop_remainder=self.training
-                )
-            elif isinstance(stage, Limit):
-                stream = gx.LimitIterDataset(stream, stage.count)
-            elif not isinstance(stage, MapBatch):
+        """The stages after the batch, each as `stage` lowers it, with the
+        loading's own workers last when the pipeline names none. Host steps
+        run in the reader that wraps this stream."""
+        stages = pipeline.stages[pipeline.stages.index(batch_stage) + 1 :]
+        if self.loading.workers and _at(pipeline.stages, Workers) is None:
+            stages = (*stages, Workers(self.loading.worker_count, self.loading.worker_buffer))
+        for stage in stages:
+            if not isinstance(stage, MapBatch):
                 advanced, _ = self.stage(stream, None, stage, pipeline, partition)
                 stream = _as_iter(advanced, self.loading)
-        if self.loading.workers and not explicit_workers:
-            stream = stream.mp_prefetch(
-                pygrain.MultiprocessingOptions(
-                    num_workers=self.loading.worker_count, per_worker_buffer_size=self.loading.worker_buffer
-                )
-            )
         return stream
 
     def token_batches(
