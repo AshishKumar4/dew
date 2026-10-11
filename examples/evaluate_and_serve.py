@@ -121,7 +121,7 @@ def smoke_run(out: Path) -> tuple[Path, Path]:
                               multi_host=False, compilation_cache_dir=None))
     objective = LMObjective(model, run.data.seq_len, ema_decay=0.9,
                             processor=RunProcessor(ByteTokenizer()))
-    run.train(objective, load(run.data, batch=run.trainer.batch_size, read=run.read, loading=run.loading), name="smoke")
+    run.train(objective, load(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading), name="smoke")
     return Path(run.trainer.checkpoint_dir) / "smoke", tokens
 
 

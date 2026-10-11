@@ -160,7 +160,7 @@ class DecisionRunConfig(RunConfig):
                            record(made.get("weights", {}), "weights").items()} | dict(self.data.weights)
                 summary["mixture"] = {name: value for name, value in weights.items() if value > 0}
                 summary["made"] = made
-        dataset = load(self.data, batch=self.trainer.batch_size, read=self.read,
+        dataset = load(self.data, batch=self.trainer.batch_size, read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
                        validation_records=self.validation_records,
                        objective=objective.data())
