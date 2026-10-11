@@ -219,7 +219,11 @@ class _PerShare(Forwarding):
         self._saved = saved
 
     def identity(self) -> str:
-        return fingerprint(self._plan.record())
+        """What every share of the pool reads, which the pool agrees before it
+        reads: the plan without this share's index, which only the position it
+        saves keeps, so a share resumes only its own rows."""
+        topology = {name: value for name, value in self._plan.topology.items() if name != "share"}
+        return fingerprint(dataclasses.replace(self._plan, topology=topology).record())
 
     def statistics(self) -> Mapping[str, float]:
         if self._read is None:
