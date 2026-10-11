@@ -11,6 +11,8 @@ from kernel_compile import compile_kernels
 from dew.nn.kernels import fla_gdn, generation
 from dew.nn.linear import chunk_gated_delta_rule, fla_refusal, l2norm
 
+pytestmark = pytest.mark.kernel
+
 
 def test_the_training_shapes_reach_the_ports_widest_heads():
     assert max(shape[side] for shape in support.TRAINING_SHAPES.values()
