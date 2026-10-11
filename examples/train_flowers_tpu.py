@@ -35,7 +35,7 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import TFDS, DataPartition, HoldOut, Images, Loading, load
+from dew.data import TFDS, Augment, DataPartition, Files, HoldOut, Images, Loading, load
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions
 from dew.diffusion.presets import EDM
@@ -109,7 +109,8 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
                                                dtype=jnp.float32)),
-        data=Images(source=str(out / "data"), image_size=16, augment=None,
+        data=Images(source=Files(str(out / "data" / "*.array_record"), format="array_record"),
+                    image_size=16, augment=None,
                     validation=HoldOut(records=4)),
         validation_records=4,
         loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1),
@@ -133,8 +134,11 @@ def slice_config(config: Config) -> DiffusionRunConfig:
     if config.data is None:
         raise ValueError("--data is the prepared record directory; --smoke writes its own")
     path = str(config.data.expanduser())
-    prepared = Images(source=path if (config.data / "manifest.json").is_file()
-                      else TFDS("oxford_flowers102", path=path))
+    records = (config.data / "manifest.json").is_file() or (config.data / "_dew_manifest.json").is_file()
+    prepared = Images(source=Files(path, format="array_record") if records else
+                      TFDS("oxford_flowers102", split="all", path=path),
+                      caption_templates=() if records else ("a photo of a {}",),
+                      augment=Augment(flip=True, jitter=True))
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(**config.model, dtype=jnp.bfloat16)),
         data=replace(prepared, image_size=config.image_size,

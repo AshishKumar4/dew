@@ -98,7 +98,7 @@ def test_explicit_caption_names_override_the_prepared_metadata(tmp_path):
 
 
 def test_an_unprepared_directory_requests_external_preparation(tmp_path):
-    with pytest.raises(FileNotFoundError, match="separate environment"):
+    with pytest.raises(FileNotFoundError, match="has no prepared ArrayRecord data"):
         TFDS("dew_images", path=str(tmp_path), split="all").records("indexed")
     assert list(tmp_path.iterdir()) == []
 

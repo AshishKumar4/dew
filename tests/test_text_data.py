@@ -33,6 +33,7 @@ from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
+from dew.data import Memory, Pipeline, compile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -331,7 +332,7 @@ def test_token_window_resume_refuses_a_changed_stride(tmp_path):
         loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition())
     try:
         next(source)
-        with pytest.raises(ValueError, match="resume the corpus"):
+        with pytest.raises(ValueError, match="saved data plan order changed"):
             different.set_state(source.get_state())
     finally:
         source.close()
@@ -621,7 +622,7 @@ def test_a_document_runs_through_its_eos_and_the_tail_past_the_last_is_one_too(t
     assert _read(data.val(DataPartition()))[0]["text_segment_ids"].tolist() == [1] * 9 + [0] * 7
 
     (tmp_path / "meta.json").write_text(json.dumps(meta))
-    with pytest.raises(ValueError, match="no eos_id"):
+    with pytest.raises(ValueError, match="producer document boundaries or EOS"):
         load(Text(source=str(tmp_path), pack="first-fit", seq_len=15), batch=1, read="memory",
             loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
@@ -916,7 +917,8 @@ def _packed(tmp_path, documents, seq_len, batch=1, bins=4):
     stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
-    return list(load(Text(source=str(tmp_path), pack="first-fit", seq_len=seq_len, packing_bins=bins),
+    return list(load(Text(source=str(tmp_path), validation=TokenFiles(str(tmp_path), split="val"),
+        pack="first-fit", seq_len=seq_len, packing_bins=bins),
         batch=batch, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1,
             worker_buffer=1)).val(DataPartition()))
 
@@ -1006,20 +1008,17 @@ def test_documents_packed_online_by_grain_keep_attention_inside_each_document(mo
     """The online route `docs/concepts/data.md` shows under Packing: grain's
     concat-then-split packer names its fields the way the decoder reads
     them, so a row it packs masks attention at document boundaries."""
-    from grain.experimental import ConcatThenSplitIterDataset
-
-    from dew.data import Dataset
-
     seq_len = 16
     documents = [{"text": np.full(length, value, np.int32)}
                  for value, length in enumerate((5, 9, 3, 12, 7, 4, 11, 6), start=1)]
 
-    def packed(partition):
-        rows = pygrain.MapDataset.source(documents).repeat(None)
-        share = rows[partition.index::partition.count].to_iter_dataset()
-        return ConcatThenSplitIterDataset(share, length_struct={"text": seq_len + 1})
-
-    batch = next(Dataset.from_grain(packed, batch=4).train(DataPartition()))
+    data = compile(Pipeline(Memory(documents)).repeat().pack(seq_len + 1, policy="concat").batch(4),
+                   read="indexed", loading=Loading(workers=0))
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
 
     assert set(batch) == {"text", "text_segment_ids", "text_positions"}
     mask = _attention_mask(batch, monkeypatch)
@@ -1047,23 +1046,23 @@ def test_a_position_saved_under_other_packing_bins_is_refused(tmp_path):
     source, other = one.train(DataPartition()), two.train(DataPartition())
     try:
         next(source)
-        with pytest.raises(ValueError, match="resume the corpus"):
+        with pytest.raises(ValueError, match="saved data plan derived order"):
             other.set_state(source.get_state())
     finally:
         source.close()
         other.close()
 
 
-def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypatch):
-    """Each chunk of a document longer than the window read the whole
-    document and kept a slice: a D-token document cost D tokens per chunk,
-    D * ceil(D / window) a pass."""
+def test_windows_read_only_their_span_and_memory_packing_never_rereads_the_store(tmp_path, monkeypatch):
+    """An indexed window reads its span; materialized packing keeps its rows in memory."""
     documents = [list(range(1, 40)), [2, 3], list(range(5, 30))]
     stream = np.concatenate([np.asarray([*d, PACK_EOS], np.int64) for d in documents])
     _token_dir(tmp_path, train_tokens=0, body=stream, eos_id=PACK_EOS)
     (tmp_path / "val.bin").write_bytes(stream.astype(np.uint16).tobytes())
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=7, packing_bins=2), batch=2,
+    packed = load(Text(source=str(tmp_path), pack="first-fit", seq_len=7, packing_bins=2), batch=2,
         read="memory", loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
+    indexed = load(Text(source=str(tmp_path), seq_len=7), batch=2, read="indexed",
+                   loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1))
 
     spans = []
     read = np.memmap.__getitem__
@@ -1073,9 +1072,19 @@ def test_a_window_of_a_long_document_reads_only_its_own_span(tmp_path, monkeypat
         return read(self, span)
 
     monkeypatch.setattr(np.memmap, "__getitem__", recording)
-    windows = list(itertools.islice(data.train(DataPartition()), 10))
-
+    stream = indexed.train(DataPartition())
+    try:
+        windows = list(itertools.islice(stream, 10))
+    finally:
+        stream.close()
     assert spans and max(spans) <= 8
+    before = len(spans)
+    stream = packed.train(DataPartition())
+    try:
+        windows.extend(itertools.islice(stream, 10))
+    finally:
+        stream.close()
+    assert len(spans) == before
     assert all(batch["text"].shape == (2, 8) for batch in windows)
 
 
@@ -1333,7 +1342,7 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
     root, fields = stores
 
     def validation(name, **spec):
-        data = load(Text(source=str(root / name), field=fields[name]["field"]), batch=1, read="memory",
+        data = load(Text(source=TokenFiles(str(root / name), field=fields[name]["field"])), batch=1, read="memory",
             loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1), **spec)
         rows = _read(data.val(DataPartition()))
         return [{key: value.tolist() for key, value in row.items()} for row in rows]

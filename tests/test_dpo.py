@@ -319,7 +319,7 @@ def test_varied_rows_pad_to_one_window():
 
 def test_an_overlong_row_is_refused():
     row = {"chosen": [1, 2, 3, 4, 5], "rejected": [1]}
-    with pytest.raises(ValueError, match="shorten the row"):
+    with pytest.raises(ValueError, match="5 tokens for seq_len=4"):
         preference_rows(records(row), 0, 4)
     with pytest.raises(ValueError, match="seq_len"):
         preference_rows(records(PAIR), 0, 0)
@@ -331,7 +331,7 @@ def test_parquet_without_sides_is_refused(tmp_path):
 
     path = tmp_path / "nopairs.parquet"
     pq.write_table(pa.table({"chosen": [[1]]}), path)
-    with pytest.raises(ValueError, match="rejected column is required"):
+    with pytest.raises(ValueError, match="both chosen and rejected"):
         load(Preferences(source=str(path)), batch=1, read="memory", validation_records=4 * (1))
 
 

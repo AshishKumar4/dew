@@ -560,7 +560,7 @@ import numpy as np
 import optax
 
 from dew.checkpoints import Checkpoints
-from dew.data import ByteTokenizer, Dataset, Loading
+from dew.data import ByteTokenizer, Loading, Memory, Pipeline, compile
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.{module} import {objective}
@@ -570,7 +570,7 @@ model = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_hea
                           max_seq_len=16, dtype=jnp.float32, attention_impl="xla")
 objective = {objective}(model, 8, ema_decay=None, processor=RunProcessor(ByteTokenizer()))
 rows = [{{"text": np.arange(9, dtype=np.int32)}} for _ in range(8)]
-data = Dataset.from_grain(grain.MapDataset.source(rows), batch=8, loading=Loading(workers=0))
+data = compile(Pipeline(Memory(rows)).repeat().batch(8), read="memory", loading=Loading(workers=0))
 checkpoints = Checkpoints(sys.argv[1])
 Trainer(objective, optax.sgd(.01), key=0, checkpoints=checkpoints).fit(data, steps=1, checkpoint_every=1)
 checkpoints.wait()

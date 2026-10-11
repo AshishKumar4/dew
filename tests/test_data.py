@@ -40,7 +40,9 @@ from dew.data import (
     load,
 )
 from dew.data.compile import validation
-from dew.data.dataset import Forwarding, GlobalStream, _batches, describe, hold_out, train_stream, validation_pass
+from dew.data.dataset import (
+    Forwarding, GlobalStream, _batches, describe, hold_out, train_stream, validation_pass,
+)
 from dew.data.dataset import Records as IndexedRows
 from dew.data.images import decode_image
 from dew.data.sinks import export
@@ -52,6 +54,7 @@ from dew.data.steps.video import Audio, DecodeClip
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
 from dew.registry import datasets
+from dew.data import Memory, Pipeline, compile
 
 WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 
@@ -661,19 +664,24 @@ def test_records_listed_in_memory_are_described_by_their_count_not_their_content
     stream.close()
 
 
-def test_a_filtering_grain_dataset_is_refused_for_a_global_position():
-    """A filter yields fewer records than the indices it reads, so a record
-    count no longer says where a resumed run starts: one resumed on records
-    it had already read. Grain's own ElasticIterator refuses it the same way."""
-    filtered = pygrain.MapDataset.source(_Points(16)).filter(lambda point: point["index"] % 3)
-
-    shuffled = filtered.seed(0).shuffle()
-    mixed = pygrain.MapDataset.mix([_grain_points(), filtered.repeat(2)])
-    for pipeline in (filtered, shuffled, mixed):
-        with pytest.raises(ValueError, match="filter"):
-            Dataset.from_grain(pipeline, batch=4, **WORKERS)
-    with pytest.raises(ValueError, match="filter"):
-        Dataset.from_grain(_grain_points(), validation=filtered, batch=4, **WORKERS)
+def test_an_indexed_filter_resumes_the_exact_accepted_record_order():
+    pipeline = Pipeline(Memory(_Points(16))).shuffle(0).repeat().filter(
+        lambda row: int(row["index"]) % 3 != 0).batch(4)
+    data = compile(pipeline, read="indexed", **WORKERS)
+    stream = data.train(DataPartition())
+    try:
+        _indices(stream, 2)
+        state = stream.get_state()
+        expected = _indices(stream, 5)
+    finally:
+        stream.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(state)
+        assert _indices(resumed, 5) == expected
+    finally:
+        resumed.close()
+    assert all(index % 3 != 0 for batch in expected for index in batch)
 
 
 # ---------------------------------------------------------------------------------
@@ -1440,7 +1448,7 @@ def _grain_points(length=16):
 
 
 def test_from_grain_batches_a_map_dataset_per_process_and_counts_its_records():
-    data = Dataset.from_grain(_grain_points(), batch=4, **WORKERS)
+    data = compile(Pipeline(Memory(_grain_points())).repeat().batch(4), read="indexed", **WORKERS)
 
     assert data.records == 16 and data.batch == 4 and data.steps_per_epoch == 4
     batch = next(data.train(DataPartition()))
@@ -1450,7 +1458,7 @@ def test_from_grain_batches_a_map_dataset_per_process_and_counts_its_records():
 def test_from_grain_repeats_a_map_dataset_so_a_run_outlasts_the_corpus():
     """`Dataset.train` is endless; a caller's finite pipeline would otherwise
     stop the run one pass in."""
-    stream = Dataset.from_grain(_grain_points(8), batch=4, **WORKERS).train(DataPartition())
+    stream = compile(Pipeline(Memory(_grain_points(8))).repeat().batch(4), read="indexed", **WORKERS).train(DataPartition())
 
     assert len(_indices(stream, 6)) == 6
 
@@ -1462,7 +1470,7 @@ def test_a_map_dataset_streams_and_resumes_as_grains_own_pipeline_reads_it():
     pipeline = _grain_points(10)
     reference = pipeline.repeat(None).batch(4)
     expected = [[int(i) for i in reference[index]["index"]] for index in range(6)]
-    data = Dataset.from_grain(pipeline, batch=4, **WORKERS)
+    data = compile(Pipeline(Memory(pipeline)).repeat().batch(4), read="indexed", **WORKERS)
 
     stream = data.train(DataPartition())
     assert _indices(stream, 3) == expected[:3]
@@ -1476,11 +1484,7 @@ def test_from_grain_takes_a_streamed_pipeline_and_carries_grains_own_state():
     """An IterDataset has no index, so the caller builds the one a share
     reads, it is batched where it is and it reports the position grain keeps
     for it."""
-    def rows(partition):
-        return pygrain.MapDataset.source(_Points(8))[partition.index::partition.count].repeat(
-            None).to_iter_dataset()
-
-    data = Dataset.from_grain(rows, batch=4, records=8, **WORKERS)
+    data = compile(Pipeline(Memory(_Points(8))).repeat().batch(4), read="streamed", **WORKERS)
 
     stream = data.train(DataPartition())
     assert isinstance(stream, Checkpointable)
@@ -1494,9 +1498,7 @@ def test_from_grain_takes_a_streamed_pipeline_and_carries_grains_own_state():
 
 
 def test_from_grain_scores_a_validation_pass_that_ends():
-    data = Dataset.from_grain(_grain_points(16), batch=4,
-                              validation=pygrain.MapDataset.source(_Points(8)),
-                              **WORKERS)
+    data = compile(Pipeline(Memory(_grain_points(16))).repeat().batch(4), validation=Pipeline(Memory(pygrain.MapDataset.source(_Points(8)))).batch(4), read="indexed", **WORKERS)
 
     assert data.val is not None
     assert _indices(data.val(DataPartition()), 5) == [[0, 1, 2, 3], [4, 5, 6, 7]]
@@ -1530,7 +1532,7 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
             layout=Layout(min_shard=1, tolerance=1.0),
             checkpoints=None if directory is None else Checkpoints(str(directory)))
         # The simulated mesh is eight devices wide, so a step is eight records.
-        return trainer.fit(Dataset.from_grain(_grain_points(), batch=8, **WORKERS),
+        return trainer.fit(compile(Pipeline(Memory(_grain_points())).repeat().batch(8), read="indexed", **WORKERS),
                            steps=steps, log_every=1,
                            checkpoint_every=None if directory is None else 2)
 
@@ -1557,7 +1559,7 @@ def test_a_default_loading_reads_in_the_training_process():
     started 32 worker processes took 17.8 s and 7.07 GiB to the first batch
     of a 100-record pipeline, and a script without a __main__ guard re-ran
     itself in every worker."""
-    data = Dataset.from_grain(pygrain.MapDataset.range(16).map(_pid_of), batch=4)
+    data = compile(Pipeline(Memory(pygrain.MapDataset.range(16).map(_pid_of))).repeat().batch(4), read="indexed")
 
     stream = data.train(DataPartition())
     try:
