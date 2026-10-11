@@ -1235,6 +1235,9 @@ class _Build:
         ).seed(self.seed)
 
     def records(self, pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
+        """The rows before the batch, with their lengths where known. A global
+        order comes back indexed, whole, for `batches` to cut into shares; a
+        per-share order comes back as this share's stream of accepted rows."""
         source = pipeline.source
         placed = [index for index, stage in enumerate(pipeline.stages) if isinstance(stage, MapWithIndex)]
         last = max(placed, default=-1)
@@ -1407,14 +1410,13 @@ class _Build:
         if isinstance(rows, pygrain.MapDataset):
             if self.training and not any(isinstance(stage, (Repeat, Limit)) for stage in _steps(pipeline)):
                 rows = rows.repeat(None)
-            elif self.training and self.global_order and not self.lowering.endless:
+            elif self.training and not self.lowering.endless:
                 rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
-            if self.global_order or not self.training:
-                whole = rows
-                rows = rows[offset + partition.index :: partition.count]
-                empty = not self.training and not len(rows) and bool(len(whole))
-                if empty:
-                    rows = whole[:1]
+            whole = rows
+            rows = rows[offset + partition.index :: partition.count]
+            empty = not self.training and not len(rows) and bool(len(whole))
+            if empty:
+                rows = whole[:1]
             if workers:
                 rows = _WorkerBatches(rows, size, workers, remainder=not self.training)
         stream = _as_iter(rows, self.loading)
@@ -1651,10 +1653,9 @@ def compile(
     train = _token_geometry(train)
     if validation is not None:
         validation = _token_geometry(validation, _geometry(train))
-    batches = [stage for stage in train.stages if isinstance(stage, (BatchStage, TokenBudget))]
-    if len(batches) != 1:
+    batching = next((stage for stage in train.stages if isinstance(stage, (BatchStage, TokenBudget))), None)
+    if batching is None:
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    batching = batches[0]
     batch = batching.size if isinstance(batching, BatchStage) else _budget_rows(batching)
     batch_tokens = None if isinstance(batching, BatchStage) else batching.tokens
     original = train
@@ -1740,7 +1741,7 @@ def _compiled(
         else functools.partial(
             _validation_reader,
             pipeline=validation,
-            build=dataclasses.replace(build, training=False),
+            build=dataclasses.replace(build, lowering=_analyzed(validation, read), training=False),
             host=tuple(stage.step for stage in validation.stages if isinstance(stage, MapBatch)) + host,
         )
     )
@@ -1910,12 +1911,10 @@ def _training_reader(
 def _validation_reader(
     partition: DataPartition, *, pipeline: Pipeline, build: _Build, host: tuple[HostStep, ...]
 ) -> Iterator[Batch]:
-    build = dataclasses.replace(build, lowering=_analyzed(pipeline, build.read))
     opened: Iterator[Batch]
     if not build.global_order:
         build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
     if build.read == "streamed":
-        build = dataclasses.replace(build, loading=dataclasses.replace(build.loading, workers=0))
         opened = _CanonicalPass(
             functools.partial(build.batches, pipeline, fill=False), partition, build.batch
         )
@@ -1933,7 +1932,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         return None
 
     def counted(leaf: Pipeline) -> int | None:
-        at = _until(leaf.stages, (Repeat, Workers, Group, BatchStage, TokenBudget, MapBatch, Rebatch))
+        at = _until(leaf.stages, (Repeat, Group))
         rows, _ = build.records(dataclasses.replace(leaf, stages=leaf.stages[:at]), DataPartition())
         return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
