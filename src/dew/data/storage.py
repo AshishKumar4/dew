@@ -425,7 +425,25 @@ class Store:
     retention: LocalRetention | None = field(default=None, repr=False)
 
     def resolve(self) -> tuple[AbstractFileSystem, str]:
-        return fsspec.core.url_to_fs(self.url, **(self.storage_options or {}))
+        options = dict(self.storage_options or {})
+        layers = self.url.split("::")
+        for cache in ("dewcache", "filecache", "simplecache", "blockcache"):
+            if cache not in layers[:-1]:
+                options.pop(cache, None)
+        return fsspec.core.url_to_fs(self.url, **options)
+
+    def cached(self) -> Store:
+        if self.url.startswith("dewcache::"):
+            return self
+        scheme = self.url.split("::", 1)[0] if "::" in self.url else self.url.split("://", 1)[0]
+        if "://" not in self.url and "::" not in self.url:
+            scheme = "file"
+        options = dict(self.storage_options or {})
+        transport = options.pop("dewcache", {})
+        backend = options.pop(scheme, {})
+        if not isinstance(backend, Mapping):
+            raise ValueError(f"storage options for {scheme!r} must be a mapping")
+        return Store("dewcache::" + self.url, {scheme: {**backend, **options}, "dewcache": transport})
 
     def child(self, path: str) -> Store:
         return Store(self.url.rstrip("/") + "/" + path, self.storage_options, self.retention)

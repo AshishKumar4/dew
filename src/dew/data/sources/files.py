@@ -396,6 +396,13 @@ class _ArrowFragment:
     def __getitem__(self, index: int) -> Batch:
         return self.table.slice(index, 1).to_pylist()[0]
 
+    def __getstate__(self) -> Mapping[str, object]:
+        return {"source": self.source, "index": self.index}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        self.__dict__.update(state)
+        self.__dict__["lock"] = threading.RLock()
+
 
 class _ArrowRecords:
     def __init__(self, source: Files):

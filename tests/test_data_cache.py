@@ -3,6 +3,8 @@
 import hashlib
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from uuid import uuid4
 
@@ -129,6 +131,51 @@ def test_cache_identity_and_clean_revision_are_required():
     with pytest.raises(ValueError, match="stable identity"):
         _cache().mapped(rows, Manifest(exact=False), source)
     assert Manifest().key != Manifest(b'{"revision":"changed"}').key
+
+
+def test_moto_generation_publication_checks_shards_and_concurrent_finalizers():
+    import fsspec
+    from moto.server import ThreadedMotoServer
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    _, port = server.get_host_and_port()
+    options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
+    fs = fsspec.filesystem("s3", **options)
+    bucket = "cache-" + uuid4().hex
+    fs.mkdir(bucket)
+    cache, key = Cache(f"s3://{bucket}/cache", storage_options=options), Manifest()
+    source = Memory([{"id": index} for index in range(8)])
+    rows = cache.mapped(grain.MapDataset.source(source.records("indexed")), key, source)
+    for index in range(len(rows)):
+        rows[index]
+    rows.close()
+    start = threading.Barrier(2)
+
+    def publish():
+        from dew.data.storage import PreconditionFailed
+
+        start.wait()
+        try:
+            return cache.publish(key, source)
+        except PreconditionFailed as error:
+            return error
+
+    try:
+        with ThreadPoolExecutor(2) as pool:
+            attempts = list(pool.map(lambda _: publish(), range(2)))
+        assert any(isinstance(attempt, Exception) is False for attempt in attempts)
+        generation = cache.generation(key)
+        assert [generation[index] for index in range(len(generation))] == [
+            {"id": index} for index in range(8)
+        ]
+        fs.pipe_file(
+            bucket + "/cache/" + key.key + "/" + next(iter(generation.manifest["shards"])), b"broken"
+        )
+        with pytest.raises(OSError, match="corrupt"):
+            cache.publish(key, source)
+    finally:
+        server.stop()
 
 
 def test_stream_completions_use_physical_shards_and_resume_without_rekeying():
