@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from affine_run import BATCH, FEATURES, TimingRegression as Regression, batches as batches
+from affine_run import BATCH, FEATURES, Affine, TimingRegression as Regression, batches as batches
 from flax import linen as nn
 from jax.sharding import NamedSharding, PartitionSpec as P
 from recording import RecordingTracker
@@ -21,7 +21,12 @@ from recording import RecordingTracker
 import dew
 import dew.nn.backbones  # registers the decoder the FLOP formula test builds
 from dew.cache import default_compilation_cache_dir, enable_compilation_cache
+from dew.data.preferences import IDS_KEY, MASK_KEY
+from dew.lora import LoRA
+from dew.nn.flops import MissingFlopsCount
+from dew.nn.protocols import Counted
 from dew.objectives.lm import LMObjective
+from dew.objectives.rl.preference import DPOObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import compiled_flops, hlo_flops, model_flops_utilization
 from dew.training import ProfileWindow, Trainer
@@ -58,6 +63,31 @@ def lm_trainer(*, vocab, width, layers, heads, ratio, seq):
                          num_layers=layers, num_heads=heads, mlp_features=ratio * width,
                          max_seq_len=seq)
     return Trainer(LMObjective(model, seq), optax.adam(1e-3), key=jax.random.key(0))
+
+
+class TokenRegression(Regression):
+    counts_tokens = True
+
+    def real_lengths(self, batch):
+        return np.ones(len(batch["x"]), np.int64)
+
+
+class CountedAffine(Affine):
+    @nn.nowrap
+    def model_flops(self, lengths):
+        return float(2 * FEATURES * 2 * np.sum(lengths))
+
+
+class CountedRegression(TokenRegression):
+    def __init__(self):
+        super().__init__()
+        self.model = CountedAffine()
+        self.resolutions = 0
+
+    @property
+    def counts_work(self):
+        self.resolutions += 1
+        return super().counts_work
 
 
 def hlo_module(*instructions: str) -> str:
@@ -556,6 +586,90 @@ def test_fit_reports_throughput_to_the_tracker():
     assert len(ticks) == 3, "no throughput was logged"
     assert all(p["train/step_time_ms"] > 0 for p in ticks)
     assert all(p["train/samples_per_sec"] > 0 for p in ticks)
+
+
+@pytest.mark.parametrize("kind", ["custom", "tokens", "lora", "dpo"])
+def test_fit_without_analytical_work_trains_on_known_peak_hardware(monkeypatch, capsys, kind):
+    from dew.nn.kernels import TARGETS, GpuTarget
+
+    device = jax.devices()[0].device_kind
+    monkeypatch.setitem(TARGETS, device, GpuTarget(device, device, dense_peaks={device: {"bf16": 100.0}}))
+    objective = Regression() if kind == "custom" else TokenRegression()
+    data = Data(batches)
+    if kind == "lora":
+        variables = objective.init(jax.random.key(0))
+        adapter = LoRA(1, ("Dense_0",)).apply(objective.model, variables, key=1)
+        objective.model, objective.variables = adapter.model, adapter.variables
+        assert not isinstance(objective.model, Counted)
+    elif kind == "dpo":
+        model = lm_trainer(vocab=16, width=8, layers=1, heads=1, ratio=2, seq=4).objective.model
+        objective = DPOObjective(model, seq_len=4)
+
+        def pairs():
+            for batch in token_batches(BATCH, 4, 16):
+                tokens = batch["text"]
+                ids = np.stack((tokens, np.roll(tokens, 1, axis=-1)), axis=1)
+                yield {IDS_KEY: ids, MASK_KEY: np.ones_like(ids, bool)}
+
+        data = Data(pairs)
+    tracker = RecordingTracker()
+    trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
+    state = trainer.fit(data, steps=3, log_every=1)
+    ticks = [values for _, values in tracker.scalars if "train/step_time_ms" in values]
+    assert int(state.step) == int(state.updates) == 3
+    assert len(ticks) == 3
+    assert all("train/mfu" not in values for values in ticks)
+    message = f"train/mfu is unavailable: {type(objective).__name__}"
+    assert capsys.readouterr().out.count(message) == 1
+    if kind in ("tokens", "lora"):
+        assert all(values["train/tokens"] == BATCH for values in ticks)
+
+
+@pytest.mark.parametrize("kind", ["custom", "lm", "lora"])
+def test_fit_with_analytical_work_reports_mfu_on_known_peak_hardware(monkeypatch, capsys, kind):
+    from dew.nn.kernels import TARGETS, GpuTarget
+
+    device = jax.devices()[0].device_kind
+    peak = 100.0
+    monkeypatch.setitem(TARGETS, device, GpuTarget(device, device, dense_peaks={device: {"bf16": peak}}))
+    tracker = RecordingTracker()
+    if kind == "custom":
+        objective = CountedRegression()
+        trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
+        data = Data(batches)
+        batch = next(batches())
+    else:
+        trainer = lm_trainer(vocab=16, width=8, layers=1, heads=1, ratio=2, seq=4)
+        objective = trainer.objective
+        if kind == "lora":
+            adapter = LoRA(1, ("q_proj",)).apply(objective.model, objective.init(jax.random.key(0)), key=1)
+            objective.model, objective.variables = adapter.model, adapter.variables
+        trainer.tracker = tracker
+        data = Data(lambda: token_batches(BATCH, 4, 16))
+        batch = next(token_batches(BATCH, 4, 16))
+    work = objective.training_flops(None, batch)
+    state = trainer.fit(data, steps=3, log_every=1)
+    ticks = [values for _, values in tracker.scalars if "train/mfu" in values]
+    assert int(state.step) == 3
+    assert len(ticks) == 3
+    for values in ticks:
+        seconds = values["train/step_time_ms"] / 1000
+        expected = work / (seconds * peak * trainer.device_mesh.devices.size)
+        assert values["train/mfu"] == pytest.approx(expected)
+    assert "train/mfu is unavailable" not in capsys.readouterr().out
+    if kind == "custom":
+        assert objective.resolutions == 1
+
+
+@pytest.mark.parametrize("count", ["model_flops", "training_flops", "real_lengths"])
+def test_explicit_count_without_geometry_stays_strict(count):
+    objective = Regression()
+    batch = next(batches())
+    with pytest.raises(MissingFlopsCount, match=type(objective).__name__):
+        if count == "real_lengths":
+            objective.real_lengths(batch)
+        else:
+            getattr(objective, count)(None, batch)
 
 
 def test_fit_reports_the_wait_on_input_and_a_later_compile():

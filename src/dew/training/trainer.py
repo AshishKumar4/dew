@@ -514,6 +514,7 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
+        self._count_work = False
         # The fit ladder's rung beyond the objective's own head and remat: a
         # step that fit only under XLA's default options keeps them for later
         # compiles. A resumed run starts at its checkpoint's rung, and says so
@@ -1519,6 +1520,12 @@ class Trainer(Generic[Loss, Effects]):
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
             seed=self.seed)
+        known_peak = gpu_target(started.device_kind).bf16_peak is not None
+        counts_work = self.objective.counts_work
+        self._count_work = known_peak and counts_work
+        if known_peak and not counts_work:
+            self._display.note(f"train/mfu is unavailable: {type(self.objective).__name__} "
+                               "does not declare complete analytical work")
         self._report(started, current)
         # Read through the type that declares it: fit takes any object with a
         # Dataset's readers, and a held-out count is not one of them.
@@ -2062,7 +2069,7 @@ class Trainer(Generic[Loss, Effects]):
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it."""
         return prepare_counts(self.objective, batch,
-                              count_model=gpu_target(jax.devices()[0].device_kind).bf16_peak is not None)
+                              count_model=self._count_work)
 
     def _rolled_out(self, state: TrainState, batch: Batch) -> tuple[Batch, float]:
         """Sample one batch through the rollout, with the seconds it took.

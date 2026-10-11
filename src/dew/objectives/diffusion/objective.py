@@ -275,6 +275,21 @@ class DiffusionObjective(Objective[Ratio]):
 
     counts_tokens = False
 
+    @property
+    def counts_work(self) -> bool:
+        """Only a denoiser whose complete configured work is declared supplies MFU."""
+        return self._missing_flops(self.model) is None
+
+    def _missing_flops(self, model) -> str | None:
+        """Keep telemetry availability and an explicit count's refusal in agreement."""
+        if not isinstance(model, CountedImages):
+            return f"{type(model).__name__} has no declared image_flops geometry"
+        if type(self) is not DiffusionObjective or self.alignment is not None or self.end_to_end is not None:
+            return f"{type(self).__name__} needs counts for its additional forwards and heads"
+        if self.autoencoder is not None or self.inputs.conditions or self.uncertainty is not None:
+            return "DiffusionObjective needs auxiliary autoencoder/condition/uncertainty work"
+        return None
+
     def real_lengths(self, batch: Batch) -> np.ndarray:
         """The denoiser's real patch-token lengths from the objective's latent shape."""
         if not isinstance(self.model, CountedImages):
@@ -285,14 +300,9 @@ class DiffusionObjective(Objective[Ratio]):
     def model_flops(self, model, batch: Batch) -> float:
         """Assemble the denoiser's patch/time/text projections and its layers."""
         model = self.model if model is None else model
-        if not isinstance(model, CountedImages):
-            raise MissingFlopsCount(f"{type(model).__name__} has no declared image_flops geometry")
-        if type(self) is not DiffusionObjective or self.alignment is not None or self.end_to_end is not None:
-            raise MissingFlopsCount(f"{type(self).__name__} needs counts for its "
-                                    "additional forwards and heads")
-        if self.autoencoder is not None or self.inputs.conditions or self.uncertainty is not None:
-            raise MissingFlopsCount("DiffusionObjective needs auxiliary "
-                                    "autoencoder/condition/uncertainty work")
+        missing = self._missing_flops(model)
+        if missing is not None:
+            raise MissingFlopsCount(missing)
         return model.image_flops(self.real_lengths(batch), self.latent_shape[-1])
 
     @property

@@ -161,6 +161,13 @@ class CountedImages(Protocol):
 
 
 @runtime_checkable
+class CountedDecisions(Protocol):
+    """A decision head counts the layout's real questions and options with its rows."""
+
+    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray) -> float: ...
+
+
+@runtime_checkable
 class HiddenStates(Protocol):
     """A token model's `[B, S, features]` final states, the head's input."""
 
