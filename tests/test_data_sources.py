@@ -1,7 +1,7 @@
 """Read-mode capabilities, range splits, partition discovery and shard resume."""
 
-import io
 import hashlib
+import io
 import json
 import tarfile
 from pathlib import Path
