@@ -14,14 +14,13 @@ import pytest
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig
-from dew.data import Dataset, Loading
+from dew.data import Dataset, Loading, Memory, Pipeline, compile
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.registry import from_record, to_record
 from dew.training import Trainer
-from dew.data import Memory, Pipeline, compile
 
 
 def model():
