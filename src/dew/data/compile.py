@@ -928,7 +928,7 @@ def _per_share(pipeline: Pipeline, read: Read) -> bool:
         if any(_per_share(child, read) for child in pipeline.source.pipelines):
             return True
     return any(
-        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact, Limit, Rebatch, TokenBudget))
+        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact, Rebatch, TokenBudget))
         or (isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects)
         for stage in pipeline.stages
     )
@@ -1131,7 +1131,11 @@ class _Build:
                 _as_iter(rows, self.loading), prefetch_buffer_size=stage.buffer
             )
         elif isinstance(stage, Limit):
-            rows = gx.LimitIterDataset(_as_iter(rows, self.loading), stage.count)
+            if isinstance(rows, pygrain.MapDataset):
+                rows = rows[:min(stage.count, len(rows))]
+                lengths = None if lengths is None else lengths[:min(stage.count, len(lengths))]
+            else:
+                rows = gx.LimitIterDataset(rows, stage.count)
         elif isinstance(stage, Pack):
             parent = _as_iter(rows, self.loading).map(_Payload())
             sizes = dict.fromkeys(stage.fields, stage.seq_len)
@@ -1231,7 +1235,7 @@ class _Build:
         workers = _workers(pipeline, self.loading)
         empty = False
         if isinstance(rows, pygrain.MapDataset):
-            if self.training and not any(isinstance(stage, Repeat) for stage in _steps(pipeline)):
+            if self.training and not any(isinstance(stage, (Repeat, Limit)) for stage in _steps(pipeline)):
                 rows = rows.repeat(None)
             elif self.training and self.global_order and not _endless(pipeline):
                 rows = rows[:len(rows) // batch_stage.size * batch_stage.size]
