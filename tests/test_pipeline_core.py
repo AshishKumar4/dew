@@ -176,6 +176,25 @@ def test_map_batch_before_batch_and_random_validation_are_named_refusals():
                 validation=Pipeline(source()).shuffle(0).random_map(Draw()).batch(4), loading=READ)
 
 
+@pytest.mark.parametrize("workers", [0, 2])
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_worker_boundary_keeps_downstream_record_steps_and_exact_positions(workers, read):
+    pipeline = Pipeline(source()).repeat().workers(workers).map(Shift(100)).limit(12).batch(4)
+    data = compile(pipeline, read=read, loading=READ)
+    for share in range(2):
+        reader = data.train(DataPartition(share, 2))
+        first = next(reader)
+        state = reader.get_state()
+        expected = take(reader, 8)
+        reader.close()
+        ids = [*first["id"].tolist(), *(value for row in expected for value in row["id"])]
+        assert ids == [100 + share + 2 * index for index in range(12)]
+        resumed = data.train(DataPartition(share, 2))
+        resumed.set_state(state)
+        assert take(resumed, 8) == expected
+        resumed.close()
+
+
 def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
     corpora = [grain.MapDataset.source([{"id": tag, "targets": targets}]).repeat().to_iter_dataset()
                for tag, targets in [(0, 2), (1, 7)]]

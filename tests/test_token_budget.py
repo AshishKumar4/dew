@@ -105,3 +105,18 @@ def test_token_budget_refuses_unsynchronized_share_shapes():
     with pytest.raises(ValueError, match="synchronized shape"):
         next(reader)
     reader.close()
+
+
+@pytest.mark.parametrize("workers", [0, 2])
+def test_token_budget_keeps_post_batch_limit_and_workers(workers):
+    data = compile(batches().workers(workers).limit(3), read="memory", loading=READ)
+    reader = data.train(DataPartition())
+    try:
+        assert len(list(reader)) == 3
+    finally:
+        reader.close()
+
+
+def test_token_budget_refuses_row_rebatching():
+    with pytest.raises(ValueError, match="rebatch.*fixed token budget"):
+        compile(batches().rebatch(8), read="memory", loading=READ)

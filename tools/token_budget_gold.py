@@ -13,6 +13,7 @@ import json
 import pstats
 import time
 from pathlib import Path
+from types import CodeType
 
 import numpy as np
 
@@ -70,10 +71,16 @@ def main() -> None:
         args.profile_open.with_suffix(".txt").write_text(report.getvalue())
     opened = time.monotonic()
     profiled = profiler.getstats()
-    head_requests = sum(entry.callcount for entry in profiled if hasattr(entry.code, "co_name")
-                        and entry.code.co_name == "info" and entry.code.co_filename.endswith("/data/storage.py"))
-    requests = sum(entry.callcount for entry in profiled if hasattr(entry.code, "co_name")
-                   and entry.code.co_name == "request" and "urllib3" in entry.code.co_filename)
+    head_requests = sum(
+        entry.callcount for entry in profiled
+        if isinstance(entry.code, CodeType) and entry.code.co_name == "info"
+        and entry.code.co_filename.endswith("/data/storage.py")
+    )
+    requests = sum(
+        entry.callcount for entry in profiled
+        if isinstance(entry.code, CodeType) and entry.code.co_name == "request"
+        and "urllib3" in entry.code.co_filename
+    )
     reader = dataset.train(DataPartition())
     shapes = collections.Counter()
     real_tokens = rows = 0
