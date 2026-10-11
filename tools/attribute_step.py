@@ -168,11 +168,14 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
                 "XLA_FLAGS=--xla_gpu_enable_command_buffer= so XProf can attribute kernels"}
     roofline = json.loads((reports / "roofline_model.json").read_text())
     roofline = roofline[0] if isinstance(roofline, list) else roofline
-    # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is the
-    # fallback only: on an RTX PRO 6000 it reports 3,742 TFLOP/s, a sparse low-precision figure.
+    # Dew's dense bf16 peak, the MFU denominator every run reports. XProf's roofline peak is a
+    # different kind of figure (on an RTX PRO 6000, 3,742 TFLOP/s, sparse low precision), kept for
+    # reference only: a device Dew's table does not name gets no peak-derived field at all.
     known = peak_flops(device) if device else None
-    peak = known / 1e9 if known else float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0)
-    peak_source = f"dew.telemetry.peaks for {device}" if known else "xprof roofline"
+    peak = known / 1e9 if known else None
+    peak_source = (f"dew.telemetry.peaks for {device}" if known
+                   else f"unknown device: {device}" if device else "no device named")
+    xprof_peak = float(roofline.get("p", {}).get("peak_flop_rate", 0) or 0) or None
     programs = defaultdict(float)
     for row in rows:
         programs[str(row.get("program_id"))] += float(row["total_self_time"])
@@ -212,7 +215,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
     gemm_work = sum(record["us"] * record["gflops"] for record in gemms)
     result = {
         "capture": str(capture), "steps": steps, "peak_gflops": peak, "peak_source": peak_source,
-        "step_program": step,
+        "xprof_peak_gflops": xprof_peak, "step_program": step,
         "programs_ms": {program: round(us / 1e3 / steps, 3)
                         for program, us in sorted(programs.items(), key=lambda item: -item[1])[:6]},
         "device_ms_per_step": round(device_us / 1e3, 3),
@@ -222,7 +225,7 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         "by_kind_ms": ms(by_kind),
         "by_part_kind_ms": {part: ms(kinds) for part, kinds in heaviest(by_part_kind)},
         "gemm_fraction_of_peak": round(gemm_work / gemm_us / peak, 3) if gemm_us and peak else None,
-        "gemm_lost_ms": round(sum(record["lost_us"] for record in gemms) / 1e3, 3),
+        "gemm_lost_ms": round(sum(record["lost_us"] for record in gemms) / 1e3, 3) if peak else None,
         "gemms_by_lost_time": sorted(gemms, key=lambda record: -record["lost_us"])[:25],
         "layout_moves": sorted(layouts, key=lambda record: -record["us"])[:25],
         "top_ops": sorted(everything, key=lambda record: -record["us"])[:40],

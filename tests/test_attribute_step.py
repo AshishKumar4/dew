@@ -220,8 +220,8 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
 
 def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     """XProf's roofline gives an RTX PRO 6000 a 3,742 TFLOP/s peak, a sparse low-precision figure:
-    every MFU field reads Dew's dense bf16 table where the entry names the device, and XProf's
-    roofline only where it does not."""
+    every MFU field reads Dew's dense bf16 table where the entry names the device, and none is
+    written where it does not, XProf's figure kept beside for reference."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
     columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
@@ -242,4 +242,8 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     assert time["mfu_of_device_time"] == 0.5
     entry.write_text(json.dumps({"model_flops_per_step": 2.5e11}))
     assert attribute.main(command) == 0
-    assert json.loads(out.read_text())["time"]["peak_source"] == "xprof roofline"
+    time = json.loads(out.read_text())["time"]
+    assert time["peak_source"] == "no device named" and time["xprof_peak_gflops"] == 3742430.0
+    assert (time["peak_gflops"], time.get("mfu_of_device_time"), time["gemm_lost_ms"],
+            time["gemm_fraction_of_peak"]) == (None, None, None, None)
+    assert time["device_ms_per_step"] == 1.0
