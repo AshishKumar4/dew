@@ -26,7 +26,6 @@ import pytest
 from dew.data import (
     Checkpointable,
     DataPartition,
-    Dataset,
     Images,
     Loading,
     Memory,
@@ -41,9 +40,15 @@ from dew.data import (
 )
 from dew.data.compile import validation
 from dew.data.dataset import (
-    Forwarding, GlobalStream, _batches, describe, hold_out, train_stream, validation_pass,
+    Forwarding,
+    GlobalStream,
+    Records as IndexedRows,
+    _batches,
+    describe,
+    hold_out,
+    train_stream,
+    validation_pass,
 )
-from dew.data.dataset import Records as IndexedRows
 from dew.data.images import decode_image
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
@@ -54,7 +59,6 @@ from dew.data.steps.video import Audio, DecodeClip
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
 from dew.registry import datasets
-from dew.data import Memory, Pipeline, compile
 
 WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 

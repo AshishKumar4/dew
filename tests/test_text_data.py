@@ -14,7 +14,6 @@ import threading
 from collections import Counter
 from pathlib import Path
 
-import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,7 +22,7 @@ import pytest
 from absl import flags
 from token_support import write_token_corpus
 
-from dew.data import ByteTokenizer, DataPartition, Loading, Text
+from dew.data import ByteTokenizer, DataPartition, Loading, Memory, Pipeline, Text, compile
 from dew.data.recipes import load
 from dew.data.sources.files import TokenFiles
 from dew.nn import attention
@@ -33,7 +32,6 @@ from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
-from dew.data import Memory, Pipeline, compile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
