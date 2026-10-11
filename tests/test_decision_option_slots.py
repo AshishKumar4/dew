@@ -153,15 +153,21 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     # Float64 truth: the grid's step in float64. The compacted step is held
     # to it as the grid is, per tensor (tests/reference_error.py): no looser
     # rule for the head than for any other port.
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         wide = jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, (variables, batch))
         truth, truth_gradient = jax.value_and_grad(loss)(*wide)
         truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
+    # A gradient that is zero to float32's resolution (a key bias's, which
+    # softmax cancels) holds only rounding on either path, whose ratio is
+    # noise: it must stay at that resolution of the step's largest gradient.
+    floor = float(np.finfo(np.float32).eps) * max(distance(leaf, 0) for leaf in jax.tree.leaves(truth_gradient))
 
     def exact(path, got, want, true):
         label = jax.tree_util.keystr(path)
-        if distance(want, true) == 0:
+        if distance(true, 0) <= floor:
+            assert distance(got, true) <= floor, (label, distance(got, true), floor)
+        elif distance(want, true) == 0:
             assert distance(got, true) == 0, label
         else:
             assert_as_exact_as_the_reference(got, want, true, label)
