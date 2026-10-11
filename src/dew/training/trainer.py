@@ -515,7 +515,7 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
-        self._count_work: bool | None = False
+        self._count_work = False
         # The fit ladder's rung beyond the objective's own head and remat: a
         # step that fit only under XLA's default options keeps them for later
         # compiles. A resumed run starts at its checkpoint's rung, and says so
@@ -1521,9 +1521,9 @@ class Trainer(Generic[Loss, Effects]):
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
             seed=self.seed)
-        # On a device with a known peak, the first batch's count decides
-        # whether the run reports train/mfu (`_counted_batch`).
-        self._count_work = None if gpu_target(started.device_kind).bf16_peak is not None else False
+        # On a device with a known peak, the run counts its batches' work
+        # for train/mfu while they can be counted (`_counted_batch`).
+        self._count_work = gpu_target(started.device_kind).bf16_peak is not None
         self._report(started, current)
         # Read through the type that declares it: fit takes any object with a
         # Dataset's readers, and a held-out count is not one of them.
@@ -2067,23 +2067,20 @@ class Trainer(Generic[Loss, Effects]):
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
-        The run's first batch resolves whether analytical work is available:
-        its count is the capability, so a model or objective that cannot
-        declare its work (`MissingFlopsCount`) leaves train/mfu unavailable
-        for the run, noted once with the count's own reason, and trains. One
-        thread prepares batches, the prefetch worker or a rollout's caller.
-        A count asked of the objective directly stays strict.
+        The count is the capability: the first batch whose work the model or
+        objective cannot declare (`MissingFlopsCount`, as a media row's
+        tower) ends train/mfu for the rest of the run, noted once with the
+        count's own reason, and the run trains on. One thread prepares
+        batches, the prefetch worker or a rollout's caller. A count asked of
+        the objective directly stays strict.
         """
-        if self._count_work is None:
+        if self._count_work:
             try:
-                counted = prepare_counts(self.objective, batch, count_model=True)
+                return prepare_counts(self.objective, batch, count_model=True)
             except MissingFlopsCount as missing:
                 self._count_work = False
                 self._display.note(f"train/mfu is unavailable for {type(self.objective).__name__}: {missing}")
-            else:
-                self._count_work = True
-                return counted
-        return prepare_counts(self.objective, batch, count_model=self._count_work)
+        return prepare_counts(self.objective, batch, count_model=False)
 
     def _rolled_out(self, state: TrainState, batch: Batch) -> tuple[Batch, float]:
         """Sample one batch through the rollout, with the seconds it took.
@@ -2220,8 +2217,8 @@ class Trainer(Generic[Loss, Effects]):
                 "loss": loss, "aux": aux, "accepted": accepted, "rate": rate,
                 "committed": None if interval.book is None else (interval.book.norms, interval.book.commits),
                 "scale": None if state.scale is None else state.scale.scale,
-                "training_flops": (interval.book.training
-                                   if interval.model_counted and interval.book is not None else None),
+                "training_flops": (interval.book.training if interval.book is not None
+                                   and interval.counted_steps == interval.since_log else None),
                 "tokens": (interval.book.tokens if interval.tokens_counted and interval.book is not None
                            else None),
                 "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
