@@ -10,6 +10,7 @@ from urllib.parse import urlparse
 
 from tools.colab import colab_sync, preflight
 from tools.colab.common import HERE, PART, REPO, STATE, driver_sha, git, lock, name, read, save
+from tools.colab.profile_analysis import TOOL_REF
 
 QUEUE = STATE / "colab-queue.md"
 FIELD = re.compile(r"^(?:- |  )([a-z_]+):\s?(.*)$")
@@ -168,6 +169,10 @@ def select(device: str, selector: str, hardware: str, order: list[str]) -> list[
             raise ValueError("wandb must be on or off")
         if fields.get("boundary_control", "off") not in ("on", "off"):
             raise ValueError("boundary_control must be on or off")
+        if fields.get("raw_profiles", "off") not in ("on", "off"):
+            raise ValueError("raw_profiles must be on or off")
+        if fields.get("profile_steps") and int(fields["profile_steps"]) <= 0:
+            raise ValueError("profile_steps must be positive")
     return sorted(
         chosen,
         key=lambda entry: next(
@@ -188,6 +193,9 @@ def identity(plan: dict) -> dict:
                 "data_sources": job.get("data_sources", []),
                 "wandb": job.get("wandb", False),
                 "boundary_control": job.get("boundary_control", False),
+                "raw_profiles": job.get("raw_profiles", False),
+                "profile_steps": job.get("profile_steps"),
+                "profile_analysis_ref": job.get("profile_analysis_ref", TOOL_REF),
                 **{
                     key: job[key]
                     for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
@@ -217,6 +225,9 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             compile_cache=fields.get("compile_cache", "off"),
             wandb=fields.get("wandb", "off") == "on",
             boundary_control=fields.get("boundary_control", "off") == "on",
+            raw_profiles=fields.get("raw_profiles", "off") == "on",
+            profile_steps=int(fields["profile_steps"]) if fields.get("profile_steps") else None,
+            profile_analysis_ref=fields.get("profile_analysis_ref", TOOL_REF),
             entry=entry,
             economics={
                 key: fields[key] for key in ("gpu_reason", "expected_cu", "decision", "memory_estimate")
@@ -230,6 +241,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             receipt = Path(fields["preflight"]).expanduser()
             request = {"commit": job["commit"], "hardware": hardware, "command": job["command"]}
             request["runtime"] = fields.get("runtime_pins", "").split()
+            request["refs"] = [exact_ref(repo, ref) for ref in fields.get("refs", "").split()]
             job["preflight"] = preflight.verify(receipt, request, inputs)
         job.update(data_inputs(fields))
         job["resume_key"] = colab_sync.retained_key(

@@ -44,6 +44,7 @@ from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
+from ..flops import MissingFlopsCount, counted_flops, projection_flops
 from ..gemma3n import AltUp, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
@@ -894,6 +895,43 @@ class CausalTransformer(nn.Module):
                 precision=self.precision)
         return gated_mlp, routed, parallel
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Hidden-state forward work: real rows, each loop pass, no embeddings or remat.
+
+        Factories are the same ones `setup` uses, so kind geometry, shared
+        K/V and dense/routed layer patterns cannot drift from the model.
+        The objective counts a vocabulary or decision head separately.
+        """
+        if self.altup is not None or self.hyper_connections is not None:
+            raise MissingFlopsCount("CausalTransformer needs its multi-stream expansion geometry")
+        types = self.per_layer_types
+        kinds = self.layer_kinds(types)
+        mixer = self.mixer if self.mixer is not None else AttentionMixer(
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        specs = self._layer_specs(types, kinds, mixer)
+        factories = self.feedforward_factories()
+        loop_start, loop_end = (0, self.num_layers) if self.loop is None or self.loop.layers is None else (
+            self.loop.layers)
+        total = 0.0
+        for index in range(self.num_layers):
+            block = self._block(specs, mixer, factories, BlockWiring(), index, f'layers_{index}')
+            passes = self.loop.steps if self.loop is not None and loop_start <= index < loop_end else 1
+            total += passes * counted_flops(block, lengths)
+        if self.per_layer_input_dim:
+            total += projection_flops(lengths, self.emb_features, self.num_layers * self.per_layer_input_dim)
+        if self.loop is not None and self.loop.exit_gate:
+            total += self.loop.steps * projection_flops(lengths, self.emb_features, 1)
+        return total
+
+    @nn.nowrap
+    def logits_flops(self, lengths) -> float:
+        """The vocabulary matrix and optional prediction transform, tied or untied."""
+        count = projection_flops(lengths, self.emb_features, self.vocab_size)
+        if self.head_transform is not None:
+            count += projection_flops(lengths, self.emb_features, self.emb_features)
+        return count
+
     def setup(self):
         """Build the embeddings, the layers, the prediction depths `mtp`, the final
         `norm`, and `lm_head` when the embeddings are not tied.
@@ -1583,15 +1621,24 @@ class CausalTransformer(nn.Module):
         its block once, the block `steps` times, each pass after the first
         reading the last one's output, normed under `step_norm`, and the layers
         after it once; the passes before the last `backprop_steps` pass no
-        gradient back."""
+        gradient back. `remat` checkpoints each block pass outside decode,
+        leaving its span and the train/decode choices static in the closure;
+        the per-pass collection view stays outside that checkpoint."""
         loop = self.loop
         if loop is None:
             return self.stack(x, **stack)
         first, end = loop.layers or (0, self.num_layers)
         block = None if loop.layers is None else (first, end)
+        train, decode = stack['train'], stack['decode']
+        dynamic = {name: value for name, value in stack.items() if name not in ('train', 'decode')}
+
+        def pass_block(module, x, **inputs):
+            return module.stack(x, span=block, train=train, decode=decode, **inputs)
+
+        run_block = nn.remat(pass_block) if loop.remat and not decode else pass_block
         if first:
             x = self.stack(x, span=(0, first), **stack)
-        x = self.stack(x, span=block, **stack)
+        x = run_block(self, x, **dynamic)
         for step in range(1, loop.steps):
             normed = self.norm(x)
             self._gate_exit(normed)
@@ -1599,9 +1646,9 @@ class CausalTransformer(nn.Module):
             if loop.backprop_steps is not None and step == loop.steps - loop.backprop_steps:
                 x = jax.lax.stop_gradient(x)
             view = PassView(self.num_layers + (step - 1) * (end - first), first, end - first)
-            run = nn.map_variables(type(self).stack, mapped_collections=WRITTEN, trans_in_fn=view.inside,
+            run = nn.map_variables(run_block, mapped_collections=WRITTEN, trans_in_fn=view.inside,
                                    trans_out_fn=view.outside, mutable=True)
-            x = run(self, x, span=block, **stack)
+            x = run(self, x, **dynamic)
         if end < self.num_layers:
             x = self.stack(x, span=(end, self.num_layers), **stack)
         return x
@@ -1957,9 +2004,12 @@ class CausalTransformer(nn.Module):
         return self.clone(max_seq_len=capacity)
 
     @nn.nowrap
-    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None:
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
+                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None:
         """This model with its loop run `steps` times (None keeps its count), over the
-        block `layers` where given (None keeps its block).
+        block `layers` where given (None keeps its block). `backprop_steps`
+        sets how many final passes train through, and `remat` checkpoints
+        each pass; None keeps the loop's own value for either.
 
         A model with no loop gains one over `layers`, with no norm between its
         passes, so one pass computes the model as it was; None when it has no
@@ -1967,9 +2017,23 @@ class CausalTransformer(nn.Module):
         if self.loop is None:
             if steps is None or layers is None:
                 return None
-            return self.clone(loop=Loop(steps, step_norm=False, layers=layers))
+            return self.clone(loop=Loop(steps, step_norm=False, layers=layers,
+                                        backprop_steps=backprop_steps, remat=remat or False))
         return self.clone(loop=dataclasses.replace(self.loop, steps=steps or self.loop.steps,
-                                                   layers=layers or self.loop.layers))
+                                                   layers=layers or self.loop.layers,
+                                                   backprop_steps=(self.loop.backprop_steps
+                                                                   if backprop_steps is None
+                                                                   else backprop_steps),
+                                                   remat=self.loop.remat if remat is None else remat))
+
+    @nn.nowrap
+    def with_remat(self, policy: RematPolicy | None) -> Self:
+        """Start at `policy`, including policies outside `DECODER_REMAT`.
+
+        `recompute_more` stays at a policy off that ladder, so the trainer
+        cannot climb from it; None keeps every layer's residuals.
+        """
+        return self.clone(remat=policy)
 
     @nn.nowrap
     def recompute_record(self) -> JSON:

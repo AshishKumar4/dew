@@ -1,0 +1,168 @@
+{
+  "model": "dewml/hybrid-dit-176m",
+  "revision": "f9f06d778860501a257a900ca58faabf853f03cc",
+  "checkpoint_step": 1350000,
+  "prompts": {
+    "aurora": "the northern lights over a frozen lake at night",
+    "aurora2": "green and purple northern lights reflected in a frozen lake, snowy mountains at night",
+    "lake": "a mountain lake reflecting snowy peaks",
+    "waterfall": "a waterfall in a lush green forest",
+    "alpine": "a turquoise alpine lake surrounded by pine trees and rugged mountains",
+    "roerich": "a red and gold mountain landscape, a painting in the style of Nicholas Roerich",
+    "turner": "a misty mountain valley at dawn, a watercolor painting by J. M. W. Turner",
+    "autumn-oil": "an oil painting of a forest in autumn, golden leaves and a winding stream",
+    "lavender": "a lavender field at sunset with distant mountains and a pink sky",
+    "lighthouse": "a lighthouse on a rocky coast at sunset, dramatic waves and golden light",
+    "castle": "a castle on a rocky hill above a misty valley at sunrise",
+    "dunes": "rolling sand dunes in the desert at sunset, deep orange sand and purple sky",
+    "milkyway": "the milky way above snowy mountains, a clear starry night sky",
+    "cathedral": "a Gothic cathedral interior with glowing stained glass windows and stone arches",
+    "vangogh": "a swirling starry night over a quiet village, an oil painting by Vincent van Gogh",
+    "hokusai": "a Japanese woodblock print of ocean waves with Mount Fuji, in the style of Hokusai",
+    "canyon": "a canyon with towering red rock cliffs and a winding river at sunset",
+    "balloons": "colorful hot air balloons floating above a green valley at sunrise",
+    "village": "a snowy mountain village at dusk, warm glowing windows and blue snow",
+    "bridge": "an old stone bridge crossing a river in autumn, golden trees and mist",
+    "poppies": "a field of red poppies under a dramatic blue sky with white clouds",
+    "bamboo": "a bamboo forest with golden sunlight streaming between tall green stalks",
+    "lagoon": "a tropical lagoon with turquoise water and palm trees, aerial view",
+    "volcano": "a volcano erupting at night, glowing red lava beneath a starry sky",
+    "sunset": "a dramatic sunset over the ocean, fiery orange and pink clouds",
+    "temple": "a Japanese temple beside a cherry blossom tree on a spring morning",
+    "santorini": "white houses with blue domes above the sea in Santorini at sunset",
+    "cabin": "a cozy wooden cabin in a snowy forest at night, warm light in the windows",
+    "ship": "a tall ship sailing on a stormy sea, an oil painting",
+    "skycastle": "a fantasy castle on a cliff above the clouds, digital painting",
+    "venice": "a canal in Venice at sunset with gondolas and old buildings",
+    "ghibli": "a lush green valley with a winding river and white clouds, Studio Ghibli style landscape",
+    "jungle-temple": "an ancient temple in the jungle covered with vines, golden light",
+    "icecave": "a glowing blue ice cave with sunlight shining through the ice",
+    "terraces": "green rice terraces on the hills at sunrise with morning mist",
+    "meadow": "the Swiss Alps in summer, a green meadow with wildflowers below snowy peaks",
+    "autumn-road": "a road through an autumn forest with red and orange trees",
+    "inkwash": "a Chinese ink wash painting of misty mountains and pine trees",
+    "monet": "a garden with water lilies and a wooden bridge, an impressionist painting by Claude Monet",
+    "sunflowers": "a field of sunflowers in southern France, an oil painting by Vincent van Gogh",
+    "maple": "a red maple tree beside a calm lake in autumn, mountains in the background",
+    "cloudsea": "a snowy mountain peak at sunrise above a sea of clouds",
+    "tulips": "a field of colorful tulips with a windmill in the Netherlands under a blue sky",
+    "lanterns": "a medieval town square at night lit by warm lanterns, cobblestone streets",
+    "iceland": "a waterfall in Iceland at sunset, green hills and a golden sky",
+    "pagoda": "a pagoda on a misty mountain surrounded by pine trees, a Chinese landscape painting",
+    "fireworks": "colorful fireworks over a harbor city at night, reflections in the water",
+    "cottage": "a stone cottage with a flower garden in the English countryside on a summer afternoon",
+    "glacier": "a turquoise glacier lagoon with floating icebergs under a pink sky",
+    "fjord": "a Norwegian fjord with steep green cliffs and a small red village in summer"
+  },
+  "suffix": {
+    "plain": "",
+    "vivid": ", vivid colors, dramatic lighting, highly detailed"
+  },
+  "negatives": {
+    "negA": "letterbox, white border, black border, border, frame, blurry, text, watermark, lowres, collage",
+    "negB": "letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, low quality, dull colors, washed out, low contrast, grainy",
+    "negP": "white border, frame, text, watermark, collage, blurry, low quality"
+  },
+  "configs": {
+    "dpm40_cfg6i_negA": {
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 6.0,
+      "interval": [
+        0.15,
+        0.9
+      ],
+      "negative": "negA"
+    },
+    "dpm40_cfg6i_negB": {
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 6.0,
+      "interval": [
+        0.15,
+        0.9
+      ],
+      "negative": "negB"
+    },
+    "dpm40_cfg7.5i_negB": {
+      "solver": "DPMSolverMultistep",
+      "steps": 40,
+      "cfg": 7.5,
+      "interval": [
+        0.15,
+        0.9
+      ],
+      "negative": "negB"
+    },
+    "unipc30_cfg6i2_negB": {
+      "solver": "UniPC",
+      "steps": 30,
+      "cfg": 6.0,
+      "interval": [
+        0.2,
+        0.9
+      ],
+      "negative": "negB"
+    },
+    "dpm60_cfg5i_negB": {
+      "solver": "DPMSolverMultistep",
+      "steps": 60,
+      "cfg": 5.0,
+      "interval": [
+        0.15,
+        0.9
+      ],
+      "negative": "negB"
+    },
+    "dpm15_cfg5": {
+      "solver": "DPMSolverMultistep",
+      "steps": 15,
+      "cfg": 5.0,
+      "interval": [
+        0.0,
+        1.0
+      ],
+      "negative": null
+    },
+    "dpm15_cfg6i_negB": {
+      "solver": "DPMSolverMultistep",
+      "steps": 15,
+      "cfg": 6.0,
+      "interval": [
+        0.15,
+        0.9
+      ],
+      "negative": "negB"
+    },
+    "dpm20_cfg6i_negB": {
+      "solver": "DPMSolverMultistep",
+      "steps": 20,
+      "cfg": 6.0,
+      "interval": [
+        0.15,
+        0.9
+      ],
+      "negative": "negB"
+    },
+    "dpm20_cfg7.5i_negB": {
+      "solver": "DPMSolverMultistep",
+      "steps": 20,
+      "cfg": 7.5,
+      "interval": [
+        0.15,
+        0.9
+      ],
+      "negative": "negB"
+    },
+    "unipc15_cfg6i2_negB": {
+      "solver": "UniPC",
+      "steps": 15,
+      "cfg": 6.0,
+      "interval": [
+        0.2,
+        0.9
+      ],
+      "negative": "negB"
+    }
+  }
+}

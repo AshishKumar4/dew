@@ -14,6 +14,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from .conv import Conv
+from .flops import projection_flops, real_lengths
 from .precision import at_least_fp32
 
 
@@ -127,6 +128,16 @@ class S5Layer(nn.Module):
     state_dim: int = 64
     dtype: Dtype | None = None
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The real-form input/state write and output read, 8*F*N per token.
+
+        The complex state occupies 2*N real channels. Each of the write/read
+        maps is 2*F*(2*N). Diagonal complex decay, skips and discretization
+        are pointwise work, excluded as in the other recurrent families.
+        """
+        return 2 * projection_flops(lengths, self.features, 2 * self.state_dim)
+
     def setup(self):
         # A: diagonal complex state matrix, S4D-Lin init, parameterized as
         # log of the negative real part for stability: A_real_n = -1/2 for
@@ -232,6 +243,12 @@ class BidirectionalS5Layer(nn.Module):
     state_dim: int = 64
     dtype: Dtype | None = None
 
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Both directional scans and the concatenated output's projection."""
+        scan = S5Layer(self.features, self.state_dim, parent=None)
+        return 2 * scan.model_flops(lengths) + projection_flops(lengths, 2 * self.features, self.features)
+
     @nn.compact
     def __call__(self, u):
         # The input u has shape [B, S, F].
@@ -253,6 +270,12 @@ class SpatialFusionConv(nn.Module):
     kernel_size: int = 3
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Each depthwise filter has the same taps per real spatial position."""
+        taps = self.kernel_size**2 * len(self.dilations)
+        return float(real_lengths(lengths).sum()) * 2 * self.features * taps
 
     @nn.compact
     def __call__(self, y_2d):

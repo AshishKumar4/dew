@@ -3,8 +3,11 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
+from flax import linen as nn
 
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
+from ..flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
@@ -45,6 +48,50 @@ class SimpleDiT(_DiTStackOptions):
     patch_bottleneck: int | None = None
     interval: bool = False
     time_scale: float = 16
+
+    @nn.nowrap
+    def counted_blocks(self) -> list[ModulatedBlock]:
+        """The plain blocks without lifted remat, for host-side work accounting."""
+        return [ModulatedBlock(features=self.emb_features, num_heads=self.num_heads,
+                               **self._block_options(), parent=None) for _ in range(self.num_layers)]
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Input channels and conditioning width belong to the objective's geometry."""
+        raise MissingFlopsCount("SimpleDiT requires image_flops(lengths, input_channels, text_features)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        """Patch-token lengths from the actual latent/image shape, never a guessed channel count."""
+        if len(sample_shape) != 3 or any(side % self.patch_size for side in sample_shape[:2]):
+            raise MissingFlopsCount("SimpleDiT needs a divisible [height, width, channels] sample shape")
+        height, width, _ = sample_shape
+        return np.full((rows,), (height // self.patch_size) * (width // self.patch_size), np.int64)
+
+    @nn.nowrap
+    def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:
+        """Every matmul, including patch/time/text input maps; only lookups excluded."""
+        real_lengths(lengths)
+        channels, hidden = self.patch_size**2 * input_channels, self.emb_features
+        bottleneck = self.patch_bottleneck
+        total = projection_flops(lengths, channels, bottleneck or hidden)
+        if bottleneck is not None:
+            total += projection_flops(lengths, bottleneck, hidden)
+        rows = np.ones(np.shape(lengths), np.int64)
+        # Fourier signals have no matmul. TimeProjection has TWO maps,
+        # width -> r*width -> r*width, followed by the final r*width -> width.
+        expanded = self.mlp_ratio * hidden
+        total += (1 + self.interval) * (2 * projection_flops(rows, hidden, expanded)
+                                      + projection_flops(rows, expanded, expanded))
+        if text_features is not None:
+            total += projection_flops(rows, text_features, hidden)
+        for index, block in enumerate(self.counted_blocks()):
+            active = np.asarray(lengths)
+            for ratio, start, end in self.checked_routes():
+                if start <= index <= end:
+                    active = active - np.floor(active * ratio).astype(np.int64)
+            total += counted_flops(block, active)
+        return total + projection_flops(lengths, self.emb_features, self.patch_size**2 * self.output_channels)
 
 
     def setup(self):

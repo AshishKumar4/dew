@@ -15,11 +15,24 @@ from tools.colab import colab_sync
 from tools.colab.common import VENV_PYTHON, command, read, save
 
 
-def run_logged(args: list[str], log: Path, *, timeout: float, cwd: Path, env: dict) -> int | str:
+def run_logged(
+    args: list[str], log: Path, *, timeout: float, cwd: Path, env: dict, memory_group: Path | None = None
+) -> int | str:
     """Bound the whole child process group, including profiling grandchildren."""
     with log.open("a") as output:
+
+        def bound_memory():
+            if memory_group is not None:
+                (memory_group / "cgroup.procs").write_text(str(os.getpid()))
+
         process = subprocess.Popen(
-            args, cwd=cwd, env=env, stdout=output, stderr=subprocess.STDOUT, start_new_session=True
+            args,
+            cwd=cwd,
+            env=env,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            preexec_fn=bound_memory if memory_group is not None else None,
         )
         try:
             return process.wait(timeout=timeout)
@@ -34,7 +47,9 @@ def run_logged(args: list[str], log: Path, *, timeout: float, cwd: Path, env: di
 
 
 def public_environment() -> dict[str, str]:
-    private = {"MPLBACKEND", "WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT"}
+    # JAX 0.11.2's cache-miss explainer crashes Pallas/Triton lowerings.
+    # Explicit script usage is refused by preflight; don't inherit it either.
+    private = {"MPLBACKEND", "WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT", "JAX_EXPLAIN_CACHE_MISSES"}
     return {key: value for key, value in os.environ.items() if key not in private}
 
 
@@ -310,16 +325,39 @@ class Batch:
             )
         status.update(exit=code, seconds=round(time.time() - began), command_finished_at=time.time())
         self.save_job(job, status)
+        # Durable measurements precede parser execution. A parser failure never
+        # invalidates this pack or changes the observed training exit.
         colab_sync.pack_outputs(
             tree,
             job["outputs"],
             home / "outputs.tar.gz",
             job["artifact_policy"],
             job.get("artifact_excludes", []),
+            include_raw=job.get("raw_profiles", False),
         )
+        status["pre_analysis_manifest"] = "outputs.tar.gz.manifest.json"
+        self.save_job(job, status)
+        from tools.colab.profile_analysis import analyze
+
+        status["profile_analysis"] = analyze(
+            job,
+            tree,
+            venv,
+            self.repo,
+            self.root,
+            self.plan.get("origin", ""),
+            public_environment(),
+            run_logged,
+        )
+        self.save_job(job, status)
+        analyses = [
+            capture["output"].rstrip("/") + "/" for capture in status["profile_analysis"].get("captures", [])
+        ]
+        colab_sync.pack_outputs(tree, analyses, home / "analysis.tar.gz", "measurements", include_raw=False)
         status.update(
             stage_seconds=round(time.time() - started), artifact_manifest="outputs.tar.gz.manifest.json"
         )
+        status["analysis_manifest"] = "analysis.tar.gz.manifest.json"
         self.save_job(job, status)
         return status
 

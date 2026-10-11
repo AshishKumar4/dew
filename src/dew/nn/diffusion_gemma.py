@@ -32,6 +32,7 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import OutputTable
 
 if TYPE_CHECKING:
+    from dew.nn.backbones.decoder_block import RematPolicy
     from dew.records import JSON
 
 
@@ -210,6 +211,11 @@ class DiffusionGemma(nn.Module):
     @nn.nowrap
     def with_cache_capacity(self, capacity: int) -> Self:
         return self.clone(text=self.text.with_cache_capacity(capacity))
+
+    @nn.nowrap
+    def with_remat(self, policy: RematPolicy | None) -> Self:
+        """Choose the shared text decoder's layer policy."""
+        return self.clone(text=self.text.with_remat(policy))
 
     @nn.nowrap
     def recompute_record(self) -> JSON:

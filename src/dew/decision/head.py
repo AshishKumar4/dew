@@ -17,6 +17,7 @@ from typing import ClassVar, Self
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
@@ -26,6 +27,7 @@ from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock, GatedMLP, decoder_norm
+from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops, real_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
@@ -49,6 +51,16 @@ class Head(nn.Module):
     reads_table: ClassVar[bool] = False
     width_field: ClassVar[str] = "features"
     """The field holding the width of the states the head reads."""
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """A decision head needs question/option counts, not just row lengths."""
+        raise MissingFlopsCount(f"{type(self).__name__} requires decision_flops(lengths, questions, options)")
+
+    @nn.nowrap
+    def decision_flops(self, lengths, questions, options) -> float:
+        """Forward work with the layout's real question and option counts."""
+        raise MissingFlopsCount(f"{type(self).__name__} has no declared decision_flops")
 
     def record(self) -> JSON:
         """Return the head's name and the fields a run records."""
@@ -100,6 +112,15 @@ class DecisionHead(Head):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"
+
+    @nn.nowrap
+    def decision_flops(self, lengths, questions, options) -> float:
+        """Full-row encoder layers and the scorer at real option markers."""
+        decision_geometry(lengths, questions, options)
+        per_layer = (12 * projection_flops(lengths, self.features, self.features)
+                     + attention_flops(lengths, 1, self.features, self.features, causal=False))
+        return (self.layers * per_layer + projection_flops(options, self.features, self.features)
+                + projection_flops(options, self.features, 1))
 
     @classmethod
     def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
@@ -246,6 +267,32 @@ class JointSchemaHead(Head):
     reads_table: ClassVar[bool] = True
     width_field: ClassVar[str] = "hidden_size"
 
+    @nn.nowrap
+    def decision_flops(self, lengths, questions, options) -> float:
+        """Memory/option projections, evidence O-by-L and field Q-by-L attention.
+
+        Each attention has query/output maps on its queries and key/value
+        maps on memory. The field layers also have Q-by-Q self-attention.
+        The residual scorer reads four width-sized features per option.
+        Span pooling is a masked matrix product and is counted. Lookup
+        embeddings and pointwise normalization/gates are excluded.
+        """
+        length, question, option = decision_geometry(lengths, questions, options)
+        width, hidden = self.width, self.hidden_size
+        projected = np.sum(length + 2 * question + 2 * option) + np.count_nonzero(length)
+        count = 2 * hidden * width * projected
+        evidence = (4 * width * width * np.sum(length + option)
+                    + 4 * width * np.sum(length * option)
+                    + 4 * width * self.feedforward * np.sum(option))
+        fields = (12 * width * width * np.sum(question) + 4 * width * width * np.sum(length)
+                  + 4 * width * np.sum(question * question + length * question)
+                  + 4 * width * self.feedforward * np.sum(question))
+        scorer = (8 * width * width + 2 * width) * np.sum(option)
+        summaries = (6 * width + 2 * hidden) * np.sum(option)
+        pooling = 2 * hidden * np.sum(length * (question + 2 * option))
+        return float(count + pooling + self.routing_layers * evidence
+                     + self.layers * fields + scorer + summaries)
+
     @classmethod
     def rebuilt(cls, width: int, fields: Mapping[str, object], *, dtype: Dtype | None,
                 attention_impl: str) -> Self:
@@ -332,6 +379,14 @@ class JointSchemaHead(Head):
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + residual
         return (prior + jax.nn.sigmoid(self.residual_gate) * joint).astype(jnp.float32)
+
+
+def decision_geometry(lengths, questions, options):
+    """One nonnegative integer geometry per row, widened before products."""
+    geometry = tuple(real_lengths(column) for column in (lengths, questions, options))
+    if any(column.shape != geometry[0].shape for column in geometry[1:]):
+        raise ValueError("decision FLOPs need lengths, questions and options of the same [rows] shape")
+    return geometry
 
 
 HEADS: Mapping[str, type[Head]] = {head.__name__: head for head in (DecisionHead, JointSchemaHead)}

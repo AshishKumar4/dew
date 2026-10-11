@@ -6,6 +6,8 @@ the patchify/conditioning/output machinery live in dit.py.
 
 from collections.abc import Sequence
 
+from flax import linen as nn
+
 from ..dit import ModulatedBlock, build_block_pattern, remat_block
 from .dit import SimpleDiT
 
@@ -25,6 +27,16 @@ class HybridSSMAttentionDiT(SimpleDiT):
     ssm_attention_ratio: str = DEFAULT_SSM_RATIO  # "3:1", "1:1", "all-ssm", "all-attn"
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False  # 2D state fusion in SSM blocks (see SpatialFusionConv)
+
+    @nn.nowrap
+    def counted_blocks(self) -> list[ModulatedBlock]:
+        """The configured hybrid pattern, without lifting its counting methods."""
+        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio, self.block_pattern)
+        return [ModulatedBlock(features=self.emb_features, num_heads=self.num_heads,
+                               mixer='ssm' if kind == 'ssm' else 'attention',
+                               ssm_state_dim=self.ssm_state_dim, bidirectional_ssm=self.bidirectional_ssm,
+                               use_2d_fusion=self.use_2d_fusion, **self._block_options(), parent=None)
+                for kind in pattern]
 
     def block(self, index: int, block_type: str) -> ModulatedBlock:
         """Build layer `index`'s block, with an SSM mixer or an attention mixer.

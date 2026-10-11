@@ -111,6 +111,98 @@ def test_backprop_steps_train_through_the_last_passes_alone(rng):
     assert np.any(last['params']['layers_0']['mlp']['down_proj']['kernel'])
 
 
+@pytest.mark.parametrize("backprop_steps", [None, 1])
+@pytest.mark.parametrize("scan_layers", [False, True])
+def test_checkpointed_passes_preserve_loss_and_gradients(rng, backprop_steps, scan_layers):
+    """Three passes over layers [1, 3) of four share fp32 loss and gradients,
+    including the cut before the last pass. The tolerance allows different
+    backward fusions when residuals are recomputed instead of retained.
+    """
+    loop = Loop(3, layers=(1, 3), backprop_steps=backprop_steps, remat=False)
+    plain = tiny(num_layers=4, loop=loop, scan_layers=scan_layers, dtype="float32")
+    checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
+    ids = tokens(rng)
+    params = plain.init(rng, ids)
+
+    def result(model):
+        return jax.jit(jax.value_and_grad(lambda tree: jnp.mean(
+            model.apply(tree, ids, train=True) ** 2)))(params)
+
+    expected, actual = result(plain), result(checkpointed)
+    gradient_error = max(float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+                         for a, b in zip(jax.tree.leaves(actual[1]), jax.tree.leaves(expected[1]),
+                                         strict=True))
+    print(f"loop fp32: scan={scan_layers}, backprop_steps={backprop_steps}, "
+          f"loss_error={float(jnp.abs(actual[0] - expected[0]))}, gradient_error={gradient_error}")
+    jax.tree.map(lambda a, b: np.testing.assert_allclose(a, b, rtol=2e-5, atol=2e-6), actual, expected)
+    assert bool(jnp.any(actual[1]['params']['embed_tokens']['embedding'])) == (backprop_steps is None)
+    assert bool(jnp.any(actual[1]['params']['layers_1']['mlp']['down_proj']['kernel']))
+
+
+def test_checkpointed_passes_reduce_the_backward_storage(rng):
+    """CPU's compiled temporary storage compares the same fp32 backward at
+    two rows of 64 tokens, width 128 and MLP width 512. Every pass, including
+    the first, also has one checkpoint containing its matrix products in
+    the forward jaxpr. Norm and activation checkpoints contain no products.
+    JAX 0.11.2 on armada measured 14,778,368 bytes without pass checkpoints
+    and 8,732,160 with them.
+    """
+    loop = Loop(3, layers=(1, 3), step_norm=False, remat=False)
+    plain = tiny(num_layers=4, emb_features=128, mlp_features=512, max_seq_len=64,
+                 loop=loop, dtype="float32")
+    checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
+    ids = tokens(rng, length=64)
+    params = plain.init(rng, ids)
+    sizes, boundaries = [], []
+    for model in (plain, checkpointed):
+        def loss(tree, model=model):
+            return jnp.mean(model.apply(tree, ids, train=True) ** 2)
+
+        executable = jax.jit(jax.value_and_grad(loss)).lower(params).compile()
+        sizes.append(executable.memory_analysis().temp_size_in_bytes)
+        program = jax.make_jaxpr(loss)(params).jaxpr
+        boundaries.append(sum(
+            equation.primitive.name == "remat2" and any(
+                body.primitive.name == "dot_general" for body in equation.params['jaxpr'].eqns)
+            for equation in program.eqns))
+    print(f"loop temp bytes: plain={sizes[0]}, remat={sizes[1]}; checkpoints={boundaries}")
+    assert boundaries == [0, loop.steps]
+    assert sizes[1] < sizes[0]
+
+
+@pytest.mark.parametrize("scan_layers", [False, True])
+def test_checkpointed_passes_leave_decode_and_its_collections_unchanged(rng, scan_layers):
+    """Decode bypasses the pass checkpoints and retains each pass's cache
+    names and values, under both the plain stack and its scanned runs.
+    """
+    loop = Loop(3, layers=(1, 3), remat=False)
+    plain = tiny(num_layers=4, loop=loop, scan_layers=scan_layers)
+    checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
+    ids = tokens(rng)
+    params = plain.init(rng, ids)
+    expected, actual = decoded(plain, params, ids), decoded(checkpointed, params, ids)
+    jax.tree.map(np.testing.assert_array_equal, actual, expected)
+    assert sorted(actual[1]) == [f'layers_{index}' for index in range(8)]
+    boundaries = []
+    for model in (plain, checkpointed):
+        program = jax.make_jaxpr(lambda tree, model=model: model.apply(
+            tree, ids[:, :1], decode=True, mutable=['cache']))(params).jaxpr
+        boundaries.append(sum(equation.primitive.name == "remat2" for equation in program.eqns))
+    assert boundaries[0] == boundaries[1]
+
+
+def test_with_passes_sets_memory_options_and_keeps_unspecified_ones():
+    """A fresh block takes the requested memory options; changing its pass
+    count leaves them alone, and an explicit False disables checkpointing.
+    """
+    plain = tiny(num_layers=4, loop=None)
+    added = plain.with_passes(3, (1, 3), backprop_steps=1, remat=True)
+    assert added.loop == Loop(3, step_norm=False, layers=(1, 3), backprop_steps=1, remat=True)
+    assert added.with_passes(4).loop == dataclasses.replace(added.loop, steps=4)
+    changed = added.with_passes(backprop_steps=2, remat=False)
+    assert changed.loop == dataclasses.replace(added.loop, backprop_steps=2, remat=False)
+
+
 def test_a_pass_sees_its_own_layers_under_the_names_of_one_pass():
     view = PassView(offset=2, first=0, count=2)
     stored = {'cache': {'layers_0': 'a', 'layers_2': 'b', 'layers_3': 'c', 'layers_4_5': 'd', 'index': 'e'}}
