@@ -141,8 +141,10 @@ def test_native_multimodal_qwen_adapter_counts_text_without_its_unused_image_tow
 
 
 def test_trainer_reads_training_work_once_from_the_existing_interval_record(monkeypatch):
+    import dew.telemetry.instrumentation as instrumentation
     import dew.training.trainer as trainer_module
 
+    monkeypatch.setattr(instrumentation, "peak_flops", lambda device: 1e12)
     monkeypatch.setattr(trainer_module, "peak_flops", lambda device: 1e12)
     model = decoder().clone(num_layers=1)
     variables = model.init(jax.random.key(406), jnp.ones((8, 6), jnp.int32))
