@@ -75,7 +75,8 @@ def refusal(key: jax.Array, out_vals: jax.Array) -> str | None:
         (all(side >= MIN_WIDTH and side & (side - 1) == 0 for side in (chunk, width)),
          f"chunks of {chunk} and keys {width} wide; Triton multiplies powers of two from {MIN_WIDTH}"),
         (target.shared_limit is None or target.shared_limit >= 112 * 1024 or chunk * width <= 64 * 128,
-         f"chunks of {chunk} and keys {width} wide outgrow {target.generation}'s block shared memory"),
+         f"chunks of {chunk} and keys {width} wide outgrow {target.generation}'s "
+         f"{(target.shared_limit or 0) // 1024} KB of block shared memory"),
         (columns % BLOCK == 0, f"values {columns} wide, not a multiple of the {BLOCK}-column block"),
         (seen_whole(key), "a mesh axis splits the rule's operands, and the kernels see whole arrays"),
     )
