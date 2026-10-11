@@ -52,7 +52,9 @@ dependencies = [
     "huggingface_hub",
 ]
 license = "MIT"
-license-files = ["LICENSE"]
+# Third-party code Dew carries keeps its notice: each file translated or
+# vendored from another project names its licence under licenses/.
+license-files = ["LICENSE", "licenses/*"]
 keywords = ["jax", "flax", "diffusion", "language-models", "jepa", "training"]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -98,6 +100,9 @@ profile = ["xprof>=2.23.1,!=2.23.2,<3"]
 quantization = ["qwix==0.1.8"]
 test = [
     "pytest",
+    # tests/test_kernel_configs.py compiles every declared Pallas kernel config with Triton's own
+    # compiler for each GPU generation on a CPU: the release the kernel lab's GPU sessions run.
+    "triton==3.6.0; sys_platform == 'linux' and platform_machine == 'x86_64'",
     # The gate's behavior tests run the same linter and rule set as CI.
     "ruff==0.14.3",
     # The legacy decoder graph test deserializes jax.export; JAX does not
