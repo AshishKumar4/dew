@@ -679,28 +679,18 @@ class _Writer:
             if self.closed:
                 raise RuntimeError("cache upload was cancelled")
             try:
-                try:
-                    verified = self.root.child(shard).verified(payload)
-                except PreconditionFailed:
-                    existing = self.root.child(shard).read()
-                    if existing != payload:
-                        raise ValueError(f"cache retry found conflicting shard {shard}") from None
-                    verified = {"bytes": len(payload), "sha256": _hash(payload)}
+                self.root.child(shard).put_immutable(payload)
                 encoded = _json(
                     {
                         "schema": 1,
-                        "shard": {"path": shard, **verified},
+                        "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
                         "completions": entries,
                         "volatile": self.volatile,
                     }
                 )
                 if self.closed:
                     raise RuntimeError(f"cache upload abandoned before segment publication: {shard}")
-                try:
-                    self.root.child(segment).verified(encoded)
-                except PreconditionFailed:
-                    if self.root.child(segment).read() != encoded:
-                        raise ValueError(f"cache retry found conflicting segment {segment}") from None
+                self.root.child(segment).put_immutable(encoded)
                 with self.lock:
                     self.spool_bytes -= used
                     self.uploaded_bytes += used

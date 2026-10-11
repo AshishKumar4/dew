@@ -27,7 +27,6 @@ are computed from the written training counts with temperature 3, a
 configurable 200,000-row cap and at most ten epochs per mixture pass.
 """
 
-import contextlib
 import csv
 import dataclasses
 import gzip
@@ -42,7 +41,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar
 
-from dew.data.storage import PreconditionFailed, Store
+from dew.data.storage import Store
 from dew.decision import Choice, Example, Noul, Question, Score
 
 if TYPE_CHECKING:
@@ -1671,13 +1670,7 @@ def shares(counts: dict[str, int], cap: int = 200_000) -> dict[str, float]:
 
 
 def _publish(store: Store, data: bytes) -> dict:
-    digest = hashlib.sha256(data).hexdigest()
-    with contextlib.suppress(PreconditionFailed):
-        store.put_if_absent(data)
-    found = store.get_versioned()
-    if len(found.data) != len(data) or hashlib.sha256(found.data).hexdigest() != digest:
-        raise ValueError(f"immutable decision artifact differs: {store.url}")
-    return {"bytes": len(data), "sha256": digest, "etag": found.version}
+    return {"bytes": len(data), "sha256": hashlib.sha256(data).hexdigest(), "etag": store.put_immutable(data)}
 
 
 def _json(store: Store, value: dict) -> dict:

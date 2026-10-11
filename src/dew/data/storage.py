@@ -655,6 +655,27 @@ class Store:
             raise OSError(f"uploaded object did not verify: {self.url}")
         return {"bytes": len(payload), "sha256": digest}
 
+    def put_immutable(self, payload: bytes) -> str:
+        """Create this object from `payload`, or accept the byte-identical
+        object an earlier attempt created, and return the stored version.
+
+        Other bytes already at the URL are refused with a ValueError. An
+        object this call created that reads back otherwise is an OSError, so
+        a caller that retries uploads tries it again.
+        """
+        try:
+            self.put_if_absent(payload)
+        except PreconditionFailed:
+            created = False
+        else:
+            created = True
+        found = self.get_versioned()
+        if found.data == payload:
+            return found.version
+        if created:
+            raise OSError(f"uploaded object did not verify: {self.url}")
+        raise ValueError(f"an immutable object already holds other bytes: {self.url}")
+
     def _backend(self) -> tuple[AbstractFileSystem, str, str]:
         fs, path = self.resolve()
         while isinstance(fs, CachingFileSystem):

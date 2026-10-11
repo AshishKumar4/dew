@@ -44,6 +44,14 @@ def test_compare_and_swap_rejects_stale_and_duplicate_publication(store):
     assert store.get_versioned().data == b"second"
 
 
+def test_an_immutable_put_accepts_its_own_retry_and_refuses_other_bytes(store):
+    version = store.put_immutable(b"payload")
+    assert store.put_immutable(b"payload") == version == store.get_versioned().version
+    with pytest.raises(ValueError, match="other bytes"):
+        store.put_immutable(b"different")
+    assert store.read() == b"payload"
+
+
 def test_two_finalizers_publish_only_one_snapshot(store):
     start = threading.Barrier(2)
 
