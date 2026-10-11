@@ -81,6 +81,9 @@ class _ShardPass(grain.IterDataset):
         self.root, self.reader = root, reader
         self.cycle, self.loading, self.budget, self.name = cycle, loading, budget, name
 
+    def set_slice(self, selection: slice, sequential_slice: bool = False) -> None:
+        self.root = self.root[selection]
+
     def __iter__(self) -> grain.DatasetIterator:
         budget = _EmptyBudget(self.name, self.budget)
         parent = experimental.InterleaveIterDataset(

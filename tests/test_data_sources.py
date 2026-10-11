@@ -281,3 +281,44 @@ def test_empty_shard_cycles_exhaust_a_named_search_budget():
     with pytest.raises(ValueError, match=r"empty-corpus.*search budget"):
         next(reader)
     reader.close()
+
+
+@pytest.mark.parametrize("field", [None, "ids"])
+def test_raw_token_arrayrecords_require_explicit_lengths_for_indexed_reads(tmp_path, field):
+    from array_record.python.array_record_module import ArrayRecordWriter
+
+    from dew.data.sources import source as resolve
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
+    from dew.data.sources.files import TokenFiles
+
+    root = Store(str(tmp_path))
+    root.child("meta.json").write(
+        json.dumps(
+            {
+                "tokenizer": "byte",
+                "dtype": "uint16",
+                "vocab_size": 256,
+                "train_tokens": 15,
+                "val_tokens": 4,
+                "eos_id": None,
+            }
+        ).encode()
+    )
+    for split, count in (("train", 15), ("val", 4)):
+        writer = ArrayRecordWriter(str(tmp_path / f"{split}-0.array_record"), "group_size:1")
+        for start, stop in zip((0, 2, 4), (2, 4, count), strict=True):
+            raw = np.arange(start, stop, dtype=np.uint16).tobytes()
+            writer.write(raw if field is None else pack_dict_of_byte_arrays({field: raw}))
+        writer.close()
+    source = TokenFiles(str(tmp_path), field=field)
+    assert isinstance(resolve(str(tmp_path)), TokenFiles)
+    assert source.metadata()["train_tokens"] == 15
+    assert not source.supports("indexed")
+    with pytest.raises(FileNotFoundError, match="length index"):
+        source.records("indexed")
+    source.records("memory")
+    assert source.tokens[1:14].tolist() == list(range(1, 14))
+    source.provision()
+    reopened = TokenFiles(str(tmp_path), field=field)
+    assert reopened.supports("indexed")
+    assert reopened.tokens[2:15].tolist() == list(range(2, 15))
