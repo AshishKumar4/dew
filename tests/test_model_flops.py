@@ -330,6 +330,8 @@ def jaxpr_products(graph, *, state_mac=False):
             if np.issubdtype(equation.outvars[0].aval.dtype, np.complexfloating):
                 factor = 8
                 for operand in equation.invars:
+                    if np.issubdtype(operand.aval.dtype, np.floating):
+                        factor = 4
                     source = producers.get(operand)
                     if source is not None and source.primitive.name == "convert_element_type" and (
                             np.issubdtype(source.invars[0].aval.dtype, np.floating)):
@@ -337,7 +339,7 @@ def jaxpr_products(graph, *, state_mac=False):
                 if all(user.primitive.name == "real" for user in consumers.get(equation.outvars[0], [])):
                     factor = 4  # Only the real component of a complex read is returned.
             total += factor * np.prod(equation.outvars[0].aval.shape, dtype=np.int64) * terms
-        elif primitive == "ragged_dot":
+        elif primitive in ("ragged_dot", "ragged_dot_general"):
             terms = equation.invars[0].aval.shape[-1]
             total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64) * terms
         elif primitive == "conv_general_dilated":
@@ -349,6 +351,8 @@ def jaxpr_products(graph, *, state_mac=False):
             product = producers.get(equation.invars[0])
             if product is not None and product.primitive.name == "mul":
                 total += 2 * np.prod(product.outvars[0].aval.shape, dtype=np.int64)
+        elif primitive == "mul" and convolution_tap(equation, producers):
+            total += 2 * np.prod(equation.outvars[0].aval.shape, dtype=np.int64)
         elif state_mac and primitive == "mul":
             left, right = (var.aval.shape for var in equation.invars)
             if (len(left) >= 2 and len(right) >= 2 and left[-1] == 1 and right[-2] == 1
@@ -359,6 +363,25 @@ def jaxpr_products(graph, *, state_mac=False):
         for variable in equation.outvars:
             producers[variable] = equation
     return total
+
+
+def convolution_tap(equation, producers):
+    """The explicit depthwise conv's [D,K] column times a shifted [B,D,T].
+
+    Dew avoids conv_general_dilated for this op; the two slices still expose
+    its tap geometry independently of the model's declared kernel size.
+    """
+    if len(equation.outvars[0].aval.shape) != 3:
+        return False
+    for variable in equation.invars:
+        source = producers.get(variable)
+        while source is not None and source.primitive.name in ("broadcast_in_dim", "convert_element_type"):
+            source = producers.get(source.invars[0])
+        if source is not None and source.primitive.name == "slice":
+            original, selected = source.invars[0].aval.shape, source.outvars[0].aval.shape
+            if len(original) == 2 and original[1] > 1 and selected == (original[0], 1):
+                return True
+    return False
 
 
 @pytest.mark.parametrize("family", ["decoder", "loop", "mlp", "attention", "dit", "jepa"])
@@ -494,7 +517,9 @@ def test_decision_heads_match_every_forward_product_including_pooling(kind):
     table = jnp.ones((16, 8)) if kind == "clef" else None
     variables = model.init(jax.random.key(205), states, inputs, table)
     count = model.decision_flops(np.array([4]), np.array([1]), np.array([2]))
-    assert count == forward_products(model.apply, variables, states, inputs, table, state_mac=True)
+    # Clef writes its field/option cosine as multiply+reduce, not dot_general.
+    scalar_cosine = 2 * 8 * 2 if kind == "clef" else 0
+    assert count == forward_products(model.apply, variables, states, inputs, table) + scalar_cosine
 
 
 def test_chunked_ssm_dit_forward_equals_model_maps_plus_known_pole_products():
