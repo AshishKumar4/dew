@@ -1,4 +1,4 @@
-"""A training step lowered for a CUDA GPU on a host without one (`dew.training.lowering`)."""
+"""A training step lowered for a CUDA GPU on a host without one (`dew.training._lowering`)."""
 
 import json
 import os
@@ -23,7 +23,7 @@ from dew.nn.kernels.generation import (
     measured_kernel,
     triton_runs,
 )
-from dew.training.lowering import DEVICE_KINDS, UNLOWERABLE, gpu_mesh, triton_kernels
+from dew.training._lowering import DEVICE_KINDS, UNLOWERABLE, gpu_mesh, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -105,7 +105,7 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 # The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
 # and the probe that runs them: the Clef recipe's step (tools/clef_step.py), or an expert layer's
 # forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering no CPU reaches
-# (`dew.training.lowering.UNLOWERABLE`).
+# (`dew.training._lowering.UNLOWERABLE`).
 FAMILIES = {
     ('gated_delta_rule', 'pallas'): ("step", {"gated_delta_states", "gated_delta_states_backward",
                                               "gated_delta_prep", "gated_delta_prep_backward"}),

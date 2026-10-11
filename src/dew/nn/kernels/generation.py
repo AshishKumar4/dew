@@ -25,7 +25,7 @@ def assumed(generation: str | None) -> Iterator[None]:
     """Within the block, choose kernels as on a device of `generation` ('sm80'), whatever device this
     process has: `device_generation`, `bf16_dot_runs` and `triton_runs` answer for it, so every
     `KERNELS` choice and kernel refusal acts as on that GPU while a step traces and lowers for one on
-    a CPU (`dew.training.lowering`). None assumes nothing."""
+    a CPU (`dew.training._lowering`). None assumes nothing."""
     token = ASSUMED.set(generation)
     try:
         yield
@@ -35,7 +35,7 @@ def assumed(generation: str | None) -> Iterator[None]:
 
 PALLAS_CHOICES = frozenset({'pallas', 'fla', 'triton'})
 """The `KERNELS` values that run Dew's Pallas or Triton kernels, which lower through JAX's Pallas
-Triton backend for a GPU only: what the CPU dry run lowers (`dew.training.lowering`) and the kernel
+Triton backend for a GPU only: what the CPU dry run lowers (`dew.training._lowering`) and the kernel
 lab verifies on the GPU. 'flash' and 'cudnn' name CUDA libraries."""
 
 

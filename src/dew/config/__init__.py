@@ -663,14 +663,15 @@ class TrainerConfig:
     and what it keeps.
     """
     lower_for: str | None = None
-    """A CUDA generation ('sm80', 'sm120') to lower the first step for in place of training.
+    """Check the run's step for a GPU on any host, a CPU too, then exit without training.
 
-    The run builds and places its state as it would, then traces its first
-    step as on that GPU and lowers it for one, every Pallas-Triton kernel
-    with it, on any host, a CPU too, and the program exits with status 0
-    (`dew.training.lowering`). A kernel whose Triton lowering fails fails
-    here, as it would fail the run's first compile on the GPU. The run
-    opens no W&B run.
+    `--trainer.lower-for sm80` (or sm75, sm86, sm89, sm90, sm120) builds the run
+    as it would, traces its first step as on a GPU of that CUDA generation, with
+    every kernel choice and refusal that GPU makes, and lowers it for CUDA,
+    each of its Pallas kernels to Triton. A kernel that would fail the GPU's
+    first compile there fails here, in seconds and without the GPU; XLA's
+    compile of the whole step still needs one. The program exits with status
+    0 once the step lowers, and opens no W&B run.
     """
 
     def __post_init__(self):
