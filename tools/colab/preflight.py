@@ -564,11 +564,11 @@ def top_levels(roots: list[Path], names: set[str]) -> set[str]:
     return found
 
 
-def checkout(ref: str, work: Path) -> tuple[str, Path]:
+def checkout(ref: str, origin: str, work: Path) -> tuple[str, Path]:
     try:
         commit = git(REPO, "rev-parse", f"{ref}^{{commit}}")
     except RuntimeError:
-        git(REPO, "fetch", "-q", "origin", ref)
+        git(REPO, "fetch", "-q", origin, ref)
         commit = git(REPO, "rev-parse", f"{ref}^{{commit}}")
     clean = not git(REPO, "status", "--porcelain", "--untracked-files=no")
     if clean and git(REPO, "rev-parse", "HEAD") == commit:
@@ -600,7 +600,7 @@ def shell(command: str, texts: dict[str, str]) -> dict:
 
 def preflight(args: argparse.Namespace, work: Path) -> dict:
     arch = ARCH[args.hardware]
-    commit, tree = checkout(args.ref, work)
+    commit, tree = checkout(args.ref, args.origin, work)
     receipt: dict = {"schema": 1, "commit": commit, "hardware": args.hardware, "arch": arch}
     receipt.update(python=args.python, command=args.command, inputs={})
     texts: dict[str, str] = {}
@@ -716,6 +716,7 @@ def main() -> None:
     parser.add_argument("--hardware", choices=sorted(ARCH), required=True)
     parser.add_argument("--command", default="", help="the queue entry's command, verbatim")
     parser.add_argument("--pin", action="append", default=[], help="NAME==VERSION the runtime provides")
+    parser.add_argument("--origin", default="origin", help="where to fetch a ref this clone lacks")
     parser.add_argument("--python", default=PYTHON)
     parser.add_argument("--dew-python", default=sys.executable)
     parser.add_argument("--out", type=Path)
