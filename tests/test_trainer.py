@@ -41,6 +41,7 @@ from dew.artifacts import Representations
 from dew.checkpoints import STATE_LEAVES, Ranking
 from dew.config import OptimConfig
 from dew.data import DataPartition
+from dew.data.recipes import load
 from dew.objectives.base import Aux, EMASpec, Objective, freeze, merge, select, under
 from dew.training import (
     Checkpoints,
@@ -55,7 +56,6 @@ from dew.training import (
 )
 from dew.training.optim import Cosine
 from dew.training.transaction import write_back
-from dew.data.recipes import load
 
 
 def endless():
@@ -468,7 +468,8 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
             self._source.set_state(state)
 
     def dataset(seen):
-        data = load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=BATCH, read="memory", seed=7, loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (BATCH))
+        data = load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=BATCH, read="memory", seed=7,
+            loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (BATCH))
         return dataclasses.replace(data, train=lambda partition: Observed(data.train(partition), seen))
 
     def trainer(directory):
@@ -528,7 +529,8 @@ def lm_windows(tmp_path):
     tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
     tokens.tofile(tmp_path / "train.bin")
     tokens.tofile(tmp_path / "val.bin")
-    return load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=8, read="memory", seed=7, loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (8))
+    return load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=8, read="memory", seed=7,
+        loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (8))
 
 
 def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, monkeypatch):
@@ -591,7 +593,8 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
         "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
         "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
     }))
-    data = load(Text(source=str(tmp_path), seq_len=16), batch=8, read="memory", loading=Loading(workers=0), validation_records=4 * (8))
+    data = load(Text(source=str(tmp_path), seq_len=16), batch=8, read="memory",
+        loading=Loading(workers=0), validation_records=4 * (8))
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32, dtype=dtype)
     objective = LMObjective(model, seq_len=16, ema_decay=None)

@@ -38,6 +38,7 @@ import re
 import time
 import urllib.request
 from pathlib import Path
+
 from dew.data.recipes import load
 
 CORPUS = ("https://huggingface.co/datasets/roneneldan/TinyStories/resolve/"
@@ -61,6 +62,7 @@ SHAPES = {
 def corpus(cache: Path) -> Path:
     """The pinned text as a produced ArrayRecord token store."""
     from dew.data import ByteTokenizer, export
+    import numpy as np
 
     tokens = cache / "tokens"
     if (tokens / "_dew_manifest.json").is_file():
@@ -222,7 +224,8 @@ def main() -> None:
     target = shape["target"] if args.target is None else args.target
     tokens = corpus(args.cache)
     batch_size = shape["batch"] if args.batch is None else args.batch
-    data = load(Text(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory", validation_records=4 * (batch_size))
+    data = load(Text(source=str(tokens), seq_len=SEQ_LEN), batch=batch_size, read="memory",
+        validation_records=4 * (batch_size))
     model = CausalTransformer(**shape["model"], vocab_size=256, max_seq_len=SEQ_LEN + 1,
                               dtype=getattr(jnp, dtype), attention_impl="auto", scan_layers=args.scan_layers)
     mesh = MeshSpec(**mesh_of(shape["mesh"], jax.device_count()))

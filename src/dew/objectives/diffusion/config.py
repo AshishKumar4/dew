@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, ClassVar
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, Prepared, RunConfig
-from dew.data import Images, Video, load
+from dew.data import Augment, HoldOut, Images, Video, load
 from dew.data.steps.image import EncodeCaptions
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
@@ -177,7 +177,9 @@ class DiffusionRunConfig(RunConfig):
 
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("unet", dict(DEFAULT_MODEL_CONFIG)))
-    data: CaptionedSpec = dataclasses.field(default_factory=lambda: Images(source="tfds://oxford_flowers102"))
+    data: CaptionedSpec = dataclasses.field(default_factory=lambda: Images(
+        source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
+        caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
     preset: PresetSpec | None = dataclasses.field(default_factory=EDM)
     """The convention the model is trained and sampled with.
 
@@ -383,7 +385,7 @@ class DiffusionRunConfig(RunConfig):
 
         run = self.pinned()
         objective = run.build()
-        dataset = load(run.data, batch=run.trainer.batch_size, read=run.read, provision=run.provision,
+        dataset = load(run.data, batch=run.trainer.batch_size, read=run.data_read, provision=run.provision,
                        seed=run.data_seed, loading=run.loading,
                        validation_records=run.validation_records,
                        host=(EncodeCaptions(objective.inputs.tokenize),))

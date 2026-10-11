@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -141,7 +140,7 @@ class LMRunConfig(RunConfig):
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
-        loaded = load(tokens, batch=self.trainer.batch_size, read=self.read, provision=self.provision,
+        loaded = load(tokens, batch=self.trainer.batch_size, read=self.data_read, provision=self.provision,
                       seed=self.data_seed, loading=self.loading,
                       validation_records=self.validation_records, objective=objective.data())
         if not loaded.steps_per_epoch:
@@ -262,8 +261,10 @@ def token_vocabulary(tokens: Text) -> tuple[str, int]:
         metadata = source(leaf).metadata()
         if metadata.get("token_store"):
             if "tokenizer" not in metadata or "vocab_size" not in metadata:
-                raise FileNotFoundError(f"{source(leaf).describe()} needs producer metadata (tokenizer and vocab_size)")
-            recorded.add((text(metadata["tokenizer"], "tokenizer"), integer(metadata["vocab_size"], "vocab_size")))
+                raise FileNotFoundError(
+                    f"{source(leaf).describe()} needs producer metadata (tokenizer and vocab_size)")
+            recorded.add((text(metadata["tokenizer"], "tokenizer"), integer(metadata["vocab_size"],
+                "vocab_size")))
         else:
             recorded.add((tokens.tokenizer, tokenizer_for(tokens.tokenizer).vocab_size))
     if len(recorded) > 1:

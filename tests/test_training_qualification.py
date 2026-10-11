@@ -28,6 +28,7 @@ import numpy as np
 import pytest
 import qualification_worker as worker
 import torch
+from token_support import encoded_token_fixture
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -36,8 +37,6 @@ from transformers import (
     Qwen3MoeConfig,
     Qwen3MoeForCausalLM,
 )
-
-from token_support import encoded_token_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures"

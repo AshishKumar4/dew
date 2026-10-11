@@ -18,10 +18,12 @@ import numpy as np
 import pytest
 
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import DataPartition, HoldOut, Images, Loading, Preferences, TFDS, Text
+from dew.data import TFDS, DataPartition, HoldOut, Images, Loading, Preferences, Text
+from dew.data.recipes import load
 from dew.data.steps.image import EncodeCaptions
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout
+from dew.decision.data import Decisions
 from dew.diffusion.discrete import MDLM
 from dew.diffusion.presets import Flow, MeanFlow, Shortcut
 from dew.inputs import Field, InputSpec
@@ -45,8 +47,6 @@ from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.objectives.supervised import CrossEntropy, Supervised
 from dew.registry import objectives
 from dew.sampling.solvers import Euler
-from dew.data.recipes import load
-from dew.decision.data import Decisions
 
 IMAGES = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 SEQ_LEN = 15
@@ -149,7 +149,8 @@ def decision():
     objective = DecisionObjective(decoder(), tokenizer=ByteTokenizer(),
                                   specials=Specials(None, 10, 0, "\x00", 255),
                                   layout=StateFirstLayout(max_len=32, head_max_len=24, option_tokens=6))
-    return objective, next(load(Decisions(source=examples), batch=2, read="memory", objective=objective.data()).train(DataPartition()))
+    return objective, next(load(Decisions(source=examples), batch=2, read="memory",
+        objective=objective.data()).train(DataPartition()))
 
 
 def cases(windows):

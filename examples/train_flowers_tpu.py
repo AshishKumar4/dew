@@ -35,9 +35,9 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.data import DataPartition, HoldOut, Images, Loading, TFDS, load
+from dew.data import TFDS, DataPartition, HoldOut, Images, Loading, load
+from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions
-from dew.data.images import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
 from dew.eval import FID, CLIPScore
 from dew.nn.backbones import SimpleDiT
@@ -157,7 +157,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
 
 def held_out(run: DiffusionRunConfig) -> np.ndarray:
     """The uint8 images of the validation pass, which the run never trained on."""
-    data = load(run.data, batch=run.trainer.batch_size, read=run.read, loading=run.loading,
+    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
                 validation_records=run.validation_records)
     if data.val is None:
         raise ValueError("scoring FID needs an explicit validation source or HoldOut")
@@ -186,7 +186,7 @@ def main(config: Config) -> Path:
         run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))
 
     objective = run.build()
-    data = load(run.data, batch=run.trainer.batch_size, read=run.read, loading=run.loading,
+    data = load(run.data, batch=run.trainer.batch_size, read=run.data_read, loading=run.loading,
                 validation_records=run.validation_records, host=(EncodeCaptions(objective.inputs.tokenize),))
     name = "smoke" if config.smoke else f"flowers-{config.image_size}"
     run.train(objective, data, name=name, metrics=run.build_eval_metrics(),

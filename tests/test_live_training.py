@@ -2,10 +2,11 @@
 import importlib.util
 from pathlib import Path
 
+from token_support import encoded_token_fixture
+
 from dew import Trainer
 from dew.config import OptimConfig
 from dew.data import Loading, Text, load
-from token_support import encoded_token_fixture
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 
