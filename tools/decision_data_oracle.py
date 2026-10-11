@@ -28,8 +28,13 @@ def _worker(options):
     layout = JointLayout(max_len=3072, max_state_tokens=1024)
     specials = Specials.of(tokenizer)
     objective = DecisionObjective(
-        CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=8, num_layers=1, num_heads=1,
-                          mlp_features=16), tokenizer=tokenizer, layout=layout, specials=specials)
+        CausalTransformer(
+            vocab_size=tokenizer.vocab_size, emb_features=8, num_layers=1, num_heads=1, mlp_features=16
+        ),
+        tokenizer=tokenizer,
+        layout=layout,
+        specials=specials,
+    )
     reports = {}
     for split in ("train", "held"):
         path = options.work / f"{split}.jsonl"
@@ -44,8 +49,10 @@ def _worker(options):
                     from dew.decision.data import Weighted
 
                     try:
-                        weighted, _, _ = _fitting(objective, {options.corpus: Weighted(examples, 1.)}, [])
-                        kept = {id(example) for example in weighted[options.corpus].examples if example.labels()}
+                        weighted, _, _ = _fitting(objective, {options.corpus: Weighted(examples, 1.0)}, [])
+                        kept = {
+                            id(example) for example in weighted[options.corpus].examples if example.labels()
+                        }
                     except ValueError as error:
                         if "no row of" not in str(error):
                             raise
@@ -55,8 +62,11 @@ def _worker(options):
                     from dew.decision.objective import Fit
 
                     fitting = Fit(layout, tokenizer, specials)
-                    kept = {id(example) for example in examples
-                            if not isinstance(fitting.map({"example": example}), Rejected)}
+                    kept = {
+                        id(example)
+                        for example in examples
+                        if not isinstance(fitting.map({"example": example}), Rejected)
+                    }
                 for offset, example in enumerate(examples, start=attempted):
                     identity = f"{options.corpus}/{split}/{offset}\n".encode()
                     if id(example) in kept:
@@ -67,8 +77,13 @@ def _worker(options):
                     else:
                         dropped.append(offset)
                 attempted += len(examples)
-        reports[split] = {"attempted": attempted, "accepted": accepted, "dropped": dropped,
-                          "accepted_ids": kept_hash.hexdigest(), "scoring_ids": scoring_hash.hexdigest()}
+        reports[split] = {
+            "attempted": attempted,
+            "accepted": accepted,
+            "dropped": dropped,
+            "accepted_ids": kept_hash.hexdigest(),
+            "scoring_ids": scoring_hash.hexdigest(),
+        }
     options.output.write_text(json.dumps(reports, sort_keys=True) + "\n")
 
 
@@ -102,8 +117,11 @@ def _download(root, corpus, work):
 def _compare(options):
     from huggingface_hub import snapshot_download
 
-    tokenizer = Path(snapshot_download("Qwen/Qwen3.5-2B", revision=TOKENIZER,
-                     allow_patterns=["*.json", "*.jinja", "*.model", "*.txt"]))
+    tokenizer = Path(
+        snapshot_download(
+            "Qwen/Qwen3.5-2B", revision=TOKENIZER, allow_patterns=["*.json", "*.jinja", "*.model", "*.txt"]
+        )
+    )
     script = Path(__file__).resolve()
     checkout = Path.cwd()
     with tempfile.TemporaryDirectory(prefix="decision-oracle-", dir=checkout) as directory:
@@ -117,17 +135,43 @@ def _compare(options):
         reports = []
         for mode, root in (("legacy", baseline), ("pipeline", checkout)):
             report = work / f"{mode}.json"
-            subprocess.run([sys.executable, str(script), "--worker", mode, "--work", str(work),
-                            "--tokenizer", str(tokenizer), "--corpus", options.corpus, "--output", str(report)],
-                           cwd=root, check=True, env={**os.environ, "PYTHONPATH": str(root / "src"),
-                                                     "JAX_PLATFORMS": "cpu"})
+            subprocess.run(
+                [
+                    sys.executable,
+                    str(script),
+                    "--worker",
+                    mode,
+                    "--work",
+                    str(work),
+                    "--tokenizer",
+                    str(tokenizer),
+                    "--corpus",
+                    options.corpus,
+                    "--output",
+                    str(report),
+                ],
+                cwd=root,
+                check=True,
+                env={**os.environ, "PYTHONPATH": str(root / "src"), "JAX_PLATFORMS": "cpu"},
+            )
             reports.append(json.loads(report.read_text()))
         if reports[0] != reports[1]:
             raise ValueError(f"decision corpus {options.corpus} differs: {reports}")
-        options.output.write_text(json.dumps({"corpus": options.corpus, "weight": weight,
-                                              "manifest": manifest, "baseline": BASELINE,
-                                              "tokenizer": TOKENIZER, "equal": True, **reports[1]},
-                                             sort_keys=True) + "\n")
+        options.output.write_text(
+            json.dumps(
+                {
+                    "corpus": options.corpus,
+                    "weight": weight,
+                    "manifest": manifest,
+                    "baseline": BASELINE,
+                    "tokenizer": TOKENIZER,
+                    "equal": True,
+                    **reports[1],
+                },
+                sort_keys=True,
+            )
+            + "\n"
+        )
 
 
 def main():

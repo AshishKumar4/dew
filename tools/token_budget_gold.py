@@ -7,11 +7,11 @@ import argparse
 import collections
 import cProfile
 import hashlib
+import io
 import itertools
 import json
-import time
 import pstats
-import io
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,18 +36,32 @@ def main() -> None:
     parser.add_argument("--micro-tokens", type=int, default=24576)
     parser.add_argument("--profile-open", type=Path)
     args = parser.parse_args()
-    pinned = snapshot_download("Qwen/Qwen3.5-2B", revision="15852e8c16360a2fea060d615a32b45270f8a8fc",
-                               allow_patterns=["*.json", "*.jinja", "*.model", "*.txt"])
+    pinned = snapshot_download(
+        "Qwen/Qwen3.5-2B",
+        revision="15852e8c16360a2fea060d615a32b45270f8a8fc",
+        allow_patterns=["*.json", "*.jinja", "*.model", "*.txt"],
+    )
     tokenizer = HFTokenizer(pinned, local_files_only=True)
     objective = DecisionObjective(
-        CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=8, num_layers=1, num_heads=1,
-                          mlp_features=16), tokenizer=tokenizer, specials=Specials.of(tokenizer),
-        layout=JointLayout(max_len=3072, max_state_tokens=1024), shuffle_options=True)
+        CausalTransformer(
+            vocab_size=tokenizer.vocab_size, emb_features=8, num_layers=1, num_heads=1, mlp_features=16
+        ),
+        tokenizer=tokenizer,
+        specials=Specials.of(tokenizer),
+        layout=JointLayout(max_len=3072, max_state_tokens=1024),
+        shuffle_options=True,
+    )
     started = time.monotonic()
     profiler = cProfile.Profile()
     with profiler:
-        dataset = load(Decisions(args.root), tokens=args.micro_tokens, read="indexed", objective=objective.data(),
-                       seed=0, loading=Loading(workers=0, threads=4, read_buffer=16))
+        dataset = load(
+            Decisions(args.root),
+            tokens=args.micro_tokens,
+            read="indexed",
+            objective=objective.data(),
+            seed=0,
+            loading=Loading(workers=0, threads=4, read_buffer=16),
+        )
     if args.profile_open is not None:
         profiler.dump_stats(args.profile_open)
         report = io.StringIO()
@@ -83,12 +97,20 @@ def main() -> None:
         resumed.close()
     if not shapes or len(shapes) > 6:
         raise ValueError(f"the budget path emitted {len(shapes)} shapes, expected at most six")
-    result = {"root": args.root, "micro_tokens": args.micro_tokens, "rows": rows,
-              "batches": sum(shapes.values()), "real_tokens": real_tokens, "observed_shapes": dict(shapes),
-              "open_seconds": opened - started, "first_batch_seconds": first_seconds,
-              "elapsed_seconds": time.monotonic() - started, "resume_exact": True,
-              "position_sha256": hashlib.sha256(position).hexdigest(),
-              "plan": None if dataset.plan is None else dataset.plan.record()}
+    result = {
+        "root": args.root,
+        "micro_tokens": args.micro_tokens,
+        "rows": rows,
+        "batches": sum(shapes.values()),
+        "real_tokens": real_tokens,
+        "observed_shapes": dict(shapes),
+        "open_seconds": opened - started,
+        "first_batch_seconds": first_seconds,
+        "elapsed_seconds": time.monotonic() - started,
+        "resume_exact": True,
+        "position_sha256": hashlib.sha256(position).hexdigest(),
+        "plan": None if dataset.plan is None else dataset.plan.record(),
+    }
     args.output.write_text(json.dumps(result, sort_keys=True, indent=2) + "\n")
 
 

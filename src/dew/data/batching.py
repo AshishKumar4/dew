@@ -11,8 +11,8 @@ import numpy as np
 
 from dew.data.dataset import Batch, DataPartition
 from dew.data.pipeline import Geometry, TokenBudget, TokenField
-from dew.records import integer, integers, record
 from dew.objectives.base import VALID_ROWS
+from dew.records import integer, integers, record
 
 TOKEN_COUNTS = "_dew_token_counts"
 
@@ -24,14 +24,25 @@ def bucket_lengths(budget: TokenBudget, *, row_multiple: int = 1) -> tuple[int, 
     if budget.lengths:
         lengths = budget.lengths
     else:
-        divisors = {divisor for candidate in range(1, math.isqrt(budget.tokens) + 1)
-                    if budget.tokens % candidate == 0 for divisor in (candidate, budget.tokens // candidate)}
-        lengths = tuple(sorted(length for length in divisors
-                                if min(256, geometry.max_length) <= length <= geometry.max_length
-                                and (budget.tokens // length) % row_multiple == 0)[-6:])
+        divisors = {
+            divisor
+            for candidate in range(1, math.isqrt(budget.tokens) + 1)
+            if budget.tokens % candidate == 0
+            for divisor in (candidate, budget.tokens // candidate)
+        }
+        lengths = tuple(
+            sorted(
+                length
+                for length in divisors
+                if min(256, geometry.max_length) <= length <= geometry.max_length
+                and (budget.tokens // length) % row_multiple == 0
+            )[-6:]
+        )
     if not lengths or lengths[-1] != geometry.max_length:
-        raise ValueError(f"token budget {budget.tokens} needs a largest bucket equal to "
-                         f"max_length={geometry.max_length}, with rows divisible by {row_multiple}")
+        raise ValueError(
+            f"token budget {budget.tokens} needs a largest bucket equal to "
+            f"max_length={geometry.max_length}, with rows divisible by {row_multiple}"
+        )
     if any((budget.tokens // length) % row_multiple for length in lengths):
         raise ValueError(f"token budget bucket rows must divide across {row_multiple} row shards")
     return lengths
@@ -61,13 +72,19 @@ def _field(value: np.ndarray, size: int, field: TokenField) -> np.ndarray:
 
 def _batch(rows: Sequence[Batch], length: int, geometry: Geometry, size: int) -> Batch:
     fields = {field.name: field for field in geometry.token_fields}
-    cropped = [{name: _field(np.asarray(value), length, fields[name]) if name in fields else value
-                for name, value in row.items() if not name.startswith("_dew_")} for row in rows]
+    cropped = [
+        {
+            name: _field(np.asarray(value), length, fields[name]) if name in fields else value
+            for name, value in row.items()
+            if not name.startswith("_dew_")
+        }
+        for row in rows
+    ]
     batched = gx.batch_and_pad(cropped, batch_size=size)
     if not isinstance(batched, Mapping):
         raise TypeError("Grain token batching must preserve a record mapping")
     counts = np.zeros(size, np.int32)
-    counts[:len(rows)] = [_length(row, geometry) for row in rows]
+    counts[: len(rows)] = [_length(row, geometry) for row in rows]
     mask = {} if len(rows) == size else {VALID_ROWS: np.arange(size) < len(rows)}
     return {**batched, TOKEN_COUNTS: counts, **mask}
 
@@ -80,19 +97,23 @@ def _feasible(sizes: tuple[int, ...], count: int) -> tuple[bool, ...]:
 
 
 class _TokenBatches(grain.DatasetIterator[Batch]):
-    def __init__(self, parent: grain.DatasetIterator[Batch], budget: TokenBudget,
-                 partition: DataPartition, seed: int):
+    def __init__(
+        self, parent: grain.DatasetIterator[Batch], budget: TokenBudget, partition: DataPartition, seed: int
+    ):
         super().__init__(parent)
         if partition.count > 1:
-            raise ValueError("token-budget batching needs one share: independent per-share queues can choose different shapes")
+            raise ValueError(
+                "token-budget batching needs one share: independent per-share queues can choose different shapes"
+            )
         if budget.geometry is None:
             raise ValueError("token budget has no declared record geometry")
         self._read, self._budget, self._geometry = parent, budget, budget.geometry
         self._lengths = bucket_lengths(budget, row_multiple=partition.row_multiple)
         self._sizes = tuple(partition.rows(budget.tokens // length) for length in self._lengths)
         self._window_size = math.ceil(max(self._sizes) * budget.window / min(self._sizes)) * min(self._sizes)
-        self._possible = tuple(_feasible(self._sizes[index:], self._window_size)
-                               for index in range(len(self._sizes)))
+        self._possible = tuple(
+            _feasible(self._sizes[index:], self._window_size) for index in range(len(self._sizes))
+        )
         self._seed, self._window, self._emitted = seed, 0, 0
         self._before = parent.get_state()
         self._batches: list[Batch] = []
@@ -110,17 +131,27 @@ class _TokenBatches(grain.DatasetIterator[Batch]):
         formed: list[Batch] = []
         at = 0
         while at < len(rows):
-            first = next(index for index, length in enumerate(self._lengths)
-                         if length >= _length(rows[at], self._geometry))
+            first = next(
+                index
+                for index, length in enumerate(self._lengths)
+                if length >= _length(rows[at], self._geometry)
+            )
             remaining = len(rows) - at
-            choice = next((index for index in range(first, len(self._sizes)) if self._sizes[index] <= remaining
-                           and self._possible[first][remaining - self._sizes[index]]), None)
+            choice = next(
+                (
+                    index
+                    for index in range(first, len(self._sizes))
+                    if self._sizes[index] <= remaining
+                    and self._possible[first][remaining - self._sizes[index]]
+                ),
+                None,
+            )
             if choice is None:
                 if self._budget.drop_remainder:
                     break
                 choice = first
             size, length = self._sizes[choice], self._lengths[choice]
-            formed.append(_batch(rows[at:at + size], length, self._geometry, size))
+            formed.append(_batch(rows[at : at + size], length, self._geometry, size))
             self._shapes.add((size, length))
             at += size
         order = np.random.default_rng([self._seed, self._window]).permutation(len(formed))
@@ -139,8 +170,13 @@ class _TokenBatches(grain.DatasetIterator[Batch]):
         return batch
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._before, "window": self._window, "emitted": self._emitted,
-                "lengths": self._lengths, "shapes": sorted(self._shapes)}
+        return {
+            "parent": self._before,
+            "window": self._window,
+            "emitted": self._emitted,
+            "lengths": self._lengths,
+            "shapes": sorted(self._shapes),
+        }
 
     def set_state(self, state: Mapping[str, object]) -> None:
         if integers(state["lengths"], "token budget lengths") != self._lengths:
@@ -157,8 +193,9 @@ class _TokenBatches(grain.DatasetIterator[Batch]):
 
 
 class TokenBatches(grain.IterDataset[Batch]):
-    def __init__(self, parent: grain.IterDataset[Batch], budget: TokenBudget,
-                 partition: DataPartition, seed: int):
+    def __init__(
+        self, parent: grain.IterDataset[Batch], budget: TokenBudget, partition: DataPartition, seed: int
+    ):
         super().__init__(parent)
         self._records, self._budget, self._partition, self._seed = parent, budget, partition, seed
 

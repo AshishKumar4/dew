@@ -29,9 +29,15 @@ class BlockShuffle(grain.MapDataset[Batch]):
         if epoch in self._epochs:
             self._epochs.move_to_end(epoch)
             return self._epochs[epoch]
-        order = tuple(int(index) for index in np.random.default_rng([self._seed, epoch]).permutation(len(self._sizes)))
-        ends = np.cumsum([sum(self._sizes[index] for index in order[start:start + self._block])
-                          for start in range(0, len(order), self._block)])
+        order = tuple(
+            int(index) for index in np.random.default_rng([self._seed, epoch]).permutation(len(self._sizes))
+        )
+        ends = np.cumsum(
+            [
+                sum(self._sizes[index] for index in order[start : start + self._block])
+                for start in range(0, len(order), self._block)
+            ]
+        )
         self._epochs[epoch] = (order, ends)
         while len(self._epochs) > 2:
             self._epochs.popitem(last=False)
@@ -41,7 +47,7 @@ class BlockShuffle(grain.MapDataset[Batch]):
         epoch, position = divmod(index, self._total)
         order, ends = self._epoch(epoch)
         block = int(np.searchsorted(ends, position, side="right"))
-        members = order[block * self._block:(block + 1) * self._block]
+        members = order[block * self._block : (block + 1) * self._block]
         start = 0 if block == 0 else int(ends[block - 1])
         size = int(ends[block]) - start
         seed = int(np.random.SeedSequence([self._seed, epoch, block]).generate_state(1)[0])
@@ -56,9 +62,9 @@ class BlockShuffle(grain.MapDataset[Batch]):
         raise RuntimeError("physical shard block does not cover its record index")
 
     @overload
-    def __getitem__(self, index: int) -> Batch | None: ...
-    @overload
     def __getitem__(self, index: slice) -> grain.MapDataset[Batch]: ...
+    @overload
+    def __getitem__(self, index: int) -> Batch | None: ...
     def __getitem__(self, index: int | slice) -> Batch | grain.MapDataset[Batch] | None:
         return self.slice(index) if isinstance(index, slice) else self._rows[self.index(index)]
 
@@ -72,8 +78,8 @@ class PermutedLengths(grain.MapDataset[int]):
         return len(self._lengths)
 
     @overload
-    def __getitem__(self, index: int) -> int | None: ...
-    @overload
     def __getitem__(self, index: slice) -> grain.MapDataset[int]: ...
+    @overload
+    def __getitem__(self, index: int) -> int | None: ...
     def __getitem__(self, index: int | slice) -> int | grain.MapDataset[int] | None:
         return self.slice(index) if isinstance(index, slice) else self._lengths[self._index(index)]

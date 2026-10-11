@@ -14,6 +14,7 @@ from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected
 from dew.data.preferences import IDS_KEY, MASK_KEY, _ids, _mask
 from dew.data.prompts import (
+    FIELDS as PROMPT_FIELDS,
     INFO_KEY,
     LENGTH_KEY,
     PROMPT_KEY,
@@ -23,7 +24,6 @@ from dew.data.prompts import (
     _prompt_ids,
     _text,
     _utf8,
-    FIELDS as PROMPT_FIELDS,
 )
 from dew.data.text import load_tokenizer, tokenizer_snapshot
 from dew.records import integer, record
@@ -99,8 +99,14 @@ class ConfigurePrompt:
     thinking: bool | None
 
     def __call__(self, metadata: Mapping[str, object]) -> RenderPrompt:
-        return RenderPrompt(self.tokenizer, self.max_prompt_len, self.pad_id,
-                            integer(metadata["reward_bytes"], "reward_bytes"), self.long, self.thinking)
+        return RenderPrompt(
+            self.tokenizer,
+            self.max_prompt_len,
+            self.pad_id,
+            integer(metadata["reward_bytes"], "reward_bytes"),
+            self.long,
+            self.thinking,
+        )
 
 
 @dataclasses.dataclass(frozen=True)

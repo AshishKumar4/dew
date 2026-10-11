@@ -30,8 +30,12 @@ def main() -> None:
         baseline = root / f"dew-{BASELINE}"
         command = [sys.executable, str(script), "--output", str(options.output.resolve())]
         command.extend(argument for case in options.case for argument in ("--case", case))
-        subprocess.run(command, cwd=baseline, check=True,
-                       env={**os.environ, "PYTHONPATH": str(baseline / "src"), "JAX_PLATFORMS": "cpu"})
+        subprocess.run(
+            command,
+            cwd=baseline,
+            check=True,
+            env={**os.environ, "PYTHONPATH": str(baseline / "src"), "JAX_PLATFORMS": "cpu"},
+        )
 
 
 if __name__ == "__main__":

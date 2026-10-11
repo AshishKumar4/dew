@@ -69,7 +69,8 @@ class Chunks:
             {
                 key: value[start : start + self.length] if key in self.fields else value
                 for key, value in element.items()
-            } | {"_dew_length": min(self.length, count - start)}
+            }
+            | {"_dew_length": min(self.length, count - start)}
             for start in range(0, count, self.length)
         )
 
@@ -118,12 +119,16 @@ class FixedTokens(grain.MapTransform):
 
     @property
     def token_fields(self) -> tuple[TokenField, ...]:
-        return (TokenField(self.field, self.extra, pad=self.pad_id),
-                *(TokenField(name, self.extra) for name in (
-                    f"{self.field}_segment_ids", f"{self.field}_positions", f"{self.field}_roles")))
+        return (
+            TokenField(self.field, self.extra, pad=self.pad_id),
+            *(
+                TokenField(name, self.extra)
+                for name in (f"{self.field}_segment_ids", f"{self.field}_positions", f"{self.field}_roles")
+            ),
+        )
 
-    def map(self, row: Batch) -> Batch:
-        size = len(row[self.field])
+    def map(self, element: Batch) -> Batch:
+        size = len(element[self.field])
         if size != self.max_length + self.extra:
             raise ValueError(f"fixed tokens need {self.max_length + self.extra} values, got {size}")
-        return {**row, self.length_field: np.int32(self.max_length)}
+        return {**element, self.length_field: np.int32(self.max_length)}

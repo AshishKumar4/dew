@@ -29,8 +29,11 @@ def decode_image(encoded: bytes, *, at_least: int | None = None) -> np.ndarray:
     buffer = np.frombuffer(encoded, dtype=np.uint8)
     flags = cv2.IMREAD_UNCHANGED if transparent else cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION
     if at_least is not None and not transparent:
-        for factor, reduced in ((8, cv2.IMREAD_REDUCED_COLOR_8), (4, cv2.IMREAD_REDUCED_COLOR_4),
-                                (2, cv2.IMREAD_REDUCED_COLOR_2)):
+        for factor, reduced in (
+            (8, cv2.IMREAD_REDUCED_COLOR_8),
+            (4, cv2.IMREAD_REDUCED_COLOR_4),
+            (2, cv2.IMREAD_REDUCED_COLOR_2),
+        ):
             if min(height, width) // factor >= at_least:
                 flags = reduced | cv2.IMREAD_IGNORE_ORIENTATION
                 break

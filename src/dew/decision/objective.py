@@ -19,15 +19,7 @@ from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.data import Example
 from dew.decision.head import DecisionHead, Head
-from dew.decision.layout import (
-    OPTION_TILE,
-    DecisionInputs,
-    Layout,
-    MarkerLayout,
-    Specials,
-    StateFirstLayout,
-    compacted,
-)
+from dew.decision.layout import DecisionInputs, Layout, MarkerLayout, Specials, StateFirstLayout, compacted
 from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
@@ -206,7 +198,6 @@ def _padded(values: Sequence[int | bool], length: int, fill: int | bool = 0) -> 
     return row
 
 
-
 def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
     """The tokenizer a loaded model's text processor encodes with: a run's
     own, or a checkpoint's Hugging Face tokenizer, alone or inside a
@@ -225,7 +216,6 @@ def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return HFTokenizer(str(tokenizer.name_or_path), local_files_only=True)
         case _:
             return None
-
 
 
 @dataclass(frozen=True)
@@ -264,24 +254,44 @@ class Fit(pygrain.MapTransform):
             )
             for row in laid
         )
-        return ({"decision": fitted[0], "_dew_length": fitted[0].length,
-                 "_dew_truncated": fitted[0].truncated,
-                 "_dew_bounds": {"slots": {"questions": len(asked),
-                                             "options": max(len(question.options) for question in asked.values()),
-                                             "total_options": sum(len(question.options) for question in asked.values()),
-                                             "choice_questions": sum(isinstance(question, Choice) for question in asked.values())}}}
-                if self.layout.joint else {"decision_rows": fitted})
+        return (
+            {
+                "decision": fitted[0],
+                "_dew_length": fitted[0].length,
+                "_dew_truncated": fitted[0].truncated,
+                "_dew_bounds": {
+                    "slots": {
+                        "questions": len(asked),
+                        "options": max(len(question.options) for question in asked.values()),
+                        "total_options": sum(len(question.options) for question in asked.values()),
+                        "choice_questions": sum(isinstance(question, Choice) for question in asked.values()),
+                    }
+                },
+            }
+            if self.layout.joint
+            else {"decision_rows": fitted}
+        )
 
 
 @dataclass(frozen=True)
 class QuestionRows:
     def flat_map(self, element: Batch) -> Sequence[Batch]:
-        return tuple({"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
-                     | {"_dew_bounds": {"slots": {"questions": 1,
-                         "options": max(len(row.example.questions[name].options) for name in row.names),
-                         "total_options": sum(len(row.example.questions[name].options) for name in row.names),
-                         "choice_questions": sum(isinstance(row.example.questions[name], Choice) for name in row.names)}}}
-                     for row in element["decision_rows"])
+        return tuple(
+            {"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
+            | {
+                "_dew_bounds": {
+                    "slots": {
+                        "questions": 1,
+                        "options": max(len(row.example.questions[name].options) for name in row.names),
+                        "total_options": sum(len(row.example.questions[name].options) for name in row.names),
+                        "choice_questions": sum(
+                            isinstance(row.example.questions[name], Choice) for name in row.names
+                        ),
+                    }
+                }
+            }
+            for row in element["decision_rows"]
+        )
 
 
 def _fitted(element: Batch) -> FittedRow:
@@ -306,8 +316,10 @@ class LayoutRows(pygrain.RandomMapTransform):
 
     @property
     def token_fields(self) -> tuple[TokenField, ...]:
-        return tuple(TokenField(name, pad=self.encoding.specials.pad if name == "tokens" else 0)
-                     for name in _ALONG_THE_ROW)
+        return tuple(
+            TokenField(name, pad=self.encoding.specials.pad if name == "tokens" else 0)
+            for name in _ALONG_THE_ROW
+        )
 
     @property
     def length_field(self) -> str:
@@ -345,8 +357,9 @@ class ConfigureLayout:
         questions = integer(slots.get("questions"), "slots.questions") if self.layout.joint else 1
         if min(width, questions) < 1:
             raise ValueError("decision source slot maxima must be positive")
-        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, questions,
-                            self.shuffle, self.none_of_the_above)
+        encoding = Encoding(
+            self.layout, self.tokenizer, self.specials, width, questions, self.shuffle, self.none_of_the_above
+        )
         total = slots.get("total_options")
         if total is not None:
             count = integer(total, "slots.total_options")
@@ -524,7 +537,11 @@ class DecisionObjective(Objective[Ratio]):
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
         from dew.data.batching import TOKEN_COUNTS
 
-        weight = self.row_mean(batch[TOKEN_COUNTS], batch).total if TOKEN_COUNTS in batch else self.row_mean(scored, batch).total
+        weight = (
+            self.row_mean(batch[TOKEN_COUNTS], batch).total
+            if TOKEN_COUNTS in batch
+            else self.row_mean(scored, batch).total
+        )
         loss = Ratio(self.row_mean(charge * scored, batch).total, weight)
         return loss, Aux(metrics={"accuracy": accuracy})
 
@@ -561,13 +578,12 @@ class DecisionObjective(Objective[Ratio]):
     def _logits(self):
         return jax.jit(lambda variables, inputs: self.model.logits(variables, inputs))
 
-    def data(
-        self, tokenizer: Tokenizer | None = None
-    ) -> ObjectiveData:
+    def data(self, tokenizer: Tokenizer | None = None) -> ObjectiveData:
         """Fit rows before mixing, augment training layouts, and cut training batches."""
         vocabulary = self.tokenizer if tokenizer is None else tokenizer
-        training = ConfigureLayout(self.layout, vocabulary, self.specials, self.shuffle_options,
-                                    self.none_of_the_above, train=True)
+        training = ConfigureLayout(
+            self.layout, vocabulary, self.specials, self.shuffle_options, self.none_of_the_above, train=True
+        )
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, vocabulary, self.specials)
         expand = () if self.layout.joint else (QuestionRows(),)
@@ -577,7 +593,6 @@ class DecisionObjective(Objective[Ratio]):
             group=None if self.bucket is None else LengthGroups(StoredLength()),
             train_batch=() if self.bucket is None else (_Cut(self.bucket, self.layout.max_len),),
         )
-
 
     def inference_record(self):
         """Return what a saved run rebuilds its task from.

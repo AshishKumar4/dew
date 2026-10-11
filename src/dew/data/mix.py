@@ -5,12 +5,12 @@ from __future__ import annotations
 import dataclasses
 import logging
 import math
-import time
 import threading
-from typing import overload
+import time
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from fractions import Fraction
+from typing import overload
 
 import grain.python as pygrain
 
@@ -130,13 +130,19 @@ class _KeepAccepted:
 
     def _probe(self) -> None:
         if self.counts.attempted == 16:
-            _log.info("corpus %s: estimated rejection share over first 16 attempted records %.4f",
-                      self.counts.name, sum(self.counts.rejected.values()) / 16)
+            _log.info(
+                "corpus %s: estimated rejection share over first 16 attempted records %.4f",
+                self.counts.name,
+                sum(self.counts.rejected.values()) / 16,
+            )
 
 
 class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
-    def __init__(self, parent: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch],
-                 predicate: _KeepAccepted):
+    def __init__(
+        self,
+        parent: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch],
+        predicate: _KeepAccepted,
+    ):
         super().__init__(parent)
         self._read, self._predicate = parent, predicate
 
@@ -225,8 +231,10 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
             self._primed = True
         total = sum(self._delivered)
         scale = sum(self._weights)
-        chosen = max(range(len(self._reads)),
-                     key=lambda index: self._weights[index] * total - self._delivered[index] * scale)
+        chosen = max(
+            range(len(self._reads)),
+            key=lambda index: self._weights[index] * total - self._delivered[index] * scale,
+        )
         value = self._pending[chosen]
         if value is None:
             value = next(self._reads[chosen])
@@ -240,9 +248,15 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": [pending if value is not None and pending is not None else parent.get_state()
-                            for parent, value, pending in zip(self._reads, self._pending, self._pending_states, strict=True)],
-                "delivered": list(self._delivered)}
+        return {
+            "parents": [
+                pending if value is not None and pending is not None else parent.get_state()
+                for parent, value, pending in zip(
+                    self._reads, self._pending, self._pending_states, strict=True
+                )
+            ],
+            "delivered": list(self._delivered),
+        }
 
     def set_state(self, state: Mapping[str, object]) -> None:
         delivered = integers(state["delivered"], "delivered targets")
@@ -258,7 +272,9 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         for parent, saved in zip(self._reads, parents, strict=True):
             parent.set_state(record(saved, "corpus iterator"))
         self._delivered = list(delivered)
-        self._pending, self._pending_states, self._primed = [None] * len(self._reads), [None] * len(self._reads), False
+        self._pending = [None for _ in self._reads]
+        self._pending_states = [None for _ in self._reads]
+        self._primed = False
 
     def close(self) -> None:
         for parent in self._reads:
@@ -312,7 +328,9 @@ class _PrimeMap:
                     try:
                         row = dataset[0]
                     except (ValueError, TypeError, KeyError) as error:
-                        raise ValueError(f"corpus {self.names[corpus]} failed its first record: {error}") from error
+                        raise ValueError(
+                            f"corpus {self.names[corpus]} failed its first record: {error}"
+                        ) from error
                     if row is not None:
                         self.pending[corpus] = row
                 self.done = True
@@ -337,15 +355,16 @@ class PrimedMap(pygrain.MapDataset[Batch]):
         return len(self._records)
 
     @overload
-    def __getitem__(self, index: int) -> Batch | None: ...
-    @overload
     def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
+    @overload
+    def __getitem__(self, index: int) -> Batch | None: ...
     def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch] | None:
         return self.slice(index) if isinstance(index, slice) else self._group.read(self._index, index)
 
 
-def primed_maps(parents: Sequence[pygrain.MapDataset[Batch]], names: Sequence[str]
-                ) -> tuple[pygrain.MapDataset[Batch], ...]:
+def primed_maps(
+    parents: Sequence[pygrain.MapDataset[Batch]], names: Sequence[str]
+) -> tuple[pygrain.MapDataset[Batch], ...]:
     group = _PrimeMap(parents, names)
     return tuple(PrimedMap(parent, group, index) for index, parent in enumerate(parents))
 
@@ -364,7 +383,9 @@ class _PrimeReads:
                 try:
                     self.pending[corpus] = next(parent)
                 except (ValueError, TypeError, KeyError) as error:
-                    raise ValueError(f"corpus {self.names[corpus]} failed its first record: {error}") from error
+                    raise ValueError(
+                        f"corpus {self.names[corpus]} failed its first record: {error}"
+                    ) from error
             self.done = True
         if index in self.pending:
             self.before.pop(index, None)
@@ -403,7 +424,9 @@ class _ReadDataset(pygrain.IterDataset[Batch]):
 
 
 class PrimedMix(pygrain.IterDataset[Batch]):
-    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float], names: Sequence[str]):
+    def __init__(
+        self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float], names: Sequence[str]
+    ):
         super().__init__(parents)
         self._corpora, self._weights, self._names = tuple(parents), tuple(weights), tuple(names)
 
