@@ -32,6 +32,8 @@ from dew.nn.kernels import delta_chunks
 from dew.nn.linear import chunk_gated_delta_rule, chunk_states_kernel, l2norm, xla_chunk_states
 from dew.training import MeshSpec
 
+pytestmark = pytest.mark.kernel
+
 BOUND = 1e-5
 INTERPRETED = jax.default_backend() != "gpu"
 

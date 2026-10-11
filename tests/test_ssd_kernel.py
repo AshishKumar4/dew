@@ -48,6 +48,8 @@ from reference_error import assert_as_exact_as_the_reference, assert_computes_th
 from dew.nn.kernels.ssd import MIN_CHUNK, MIN_WIDTH, ssd_chunk_scan, ssd_kernel_platform, ssd_kernel_runs
 from dew.nn.mixers.mamba2 import RESET_DECAY, chunk_ssd, xla_chunk_scan
 
+pytestmark = pytest.mark.kernel
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 BOUND = 1e-5
 GRADIENT_BOUND = 2e-5
