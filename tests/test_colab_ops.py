@@ -954,7 +954,7 @@ def test_publish_retained_excludes_stale_files_outside_the_acknowledged_manifest
 
 @pytest.mark.parametrize("unpublished", [False, True])
 def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, monkeypatch, unpublished):
-    repo, _, sha = fixture_repository(tmp_path)
+    repo, origin, sha = fixture_repository(tmp_path)
     if unpublished:
         write(repo / "unpublished", b"new")
         subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
@@ -984,6 +984,8 @@ def test_vm_fetches_exact_shallow_sources_with_optional_delta_bundle(tmp_path, m
     for expected in (sha, plan["jobs"][0]["commit"]):
         subprocess.run(["git", "-C", str(worker.repo), "cat-file", "-e", expected + "^{commit}"], check=True)
     assert (worker.repo / ".git/shallow").is_file()
+    assert subprocess.check_output(["git", "-C", str(worker.repo), "remote", "get-url", "origin"],
+                                   text=True).strip() == str(origin)
 
 
 @pytest.mark.parametrize("expected,explicit", [(0.1, None), (0.7, None), (0.2, 0.08)])
@@ -1042,3 +1044,11 @@ def test_input_paths_preserve_plus_in_experiment_directories(tmp_path):
     source = write(tmp_path / "step+profile/entry.json", b"metrics")
     found = batch.input_paths({"inputs": f"{source} to /content/reference+metadata/", "command": "run"})
     assert found == [(source, "/content/reference+metadata/entry.json")]
+
+
+def test_artifact_exclusions_ignore_ancestors_above_archive_root(tmp_path):
+    tree = tmp_path / "dew-in-parent" / "tree"
+    write(tree / "out/train.log", b"retained")
+    assert set(sync.output_files(tree, ["out/"], "measurements", ["*dew*"])) == {"out/train.log"}
+    with pytest.raises(ValueError, match="archive-relative"):
+        sync.output_files(tree, ["out/"], "measurements", [str(tree / "out/*")])
