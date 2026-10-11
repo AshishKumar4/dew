@@ -387,7 +387,7 @@ class DecisionObjective(Objective[Ratio]):
     The loss is `loss`, a proper scoring rule or a sum of them, computed against
     each row's right option, with `label_smoothing` spread evenly over its
     options. `shuffle_options` and `none_of_the_above` augment the rows as
-    `Encoding` describes, and `dataset` builds them. With `bucket`, the
+    `Encoding` describes, and `data` supplies their pipeline steps. With `bucket`, the
     training stream batches rows of like length (`LengthGroups`) and cuts each
     batch after its longest row, rounded up to a multiple of `bucket`, so a
     step pays for little more than its tokens instead of `max_len` per row;
