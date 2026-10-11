@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
 
@@ -26,6 +26,9 @@ class Hub:
     config: str | None = None
     revision: str | None = None
     cache_dir: str | None = None
+
+    def with_split(self, name: str) -> Hub:
+        return replace(self, split=name)
 
     @cached_property
     def commit(self) -> str:

@@ -34,6 +34,14 @@
     "range_seconds_before": [156.00195605099998, 151.88854910700002, 152.02374131800002],
     "range_seconds_after": [143.909003752, 148.46507713099993, 135.9523451969999]
   },
+  "manifest_declared_index_open": {
+    "commit": "f1f0b8e0e",
+    "job": "20261011043831-a1777804",
+    "descriptor_sha256": "aa0e68216c5f003699efe87081edb525cb095b4ddaef64c9748ea579ee055627",
+    "seconds": 7.775772549997782,
+    "rss_delta_bytes": 516096,
+    "metadata_head_requests": 0
+  },
   "limitations": [
     "These measurements cover index opening and transport, not a full training pipeline.",
     "All six range-read runs returned the same byte digest.",

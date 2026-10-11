@@ -201,6 +201,9 @@ class TFDS:
         if self.shard_rows < 1:
             raise ValueError("TFDS shard_rows must be positive")
 
+    def with_split(self, name: str) -> TFDS:
+        return dataclasses.replace(self, split=name)
+
     @property
     def remote(self) -> bool:
         return self.path is not None and (
