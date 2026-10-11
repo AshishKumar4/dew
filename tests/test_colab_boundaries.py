@@ -221,17 +221,23 @@ def test_decision_accepted_before_deadline_is_honored_when_child_resumes_after_i
     directory.mkdir()
     child = tmp_path / "child.py"
     child.write_text("from tools.colab.boundary import checkpoint\ncheckpoint('E5')\n")
-    boundary.request(directory, "E5", 0, "accepted", decision_seconds=.5)
-    env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
-           "DEW_COLAB_BOUNDARY_DIR": str(directory), "DEW_COLAB_GENERATION": "0"}
+    boundary.request(directory, "E5", 0, "accepted", decision_seconds=0.5)
+    env = {
+        **os.environ,
+        "PYTHONPATH": str(Path(__file__).resolve().parents[1]),
+        "DEW_COLAB_BOUNDARY_DIR": str(directory),
+        "DEW_COLAB_GENERATION": "0",
+    }
     with (tmp_path / "run.log").open("w") as log:
         process = subprocess.Popen([sys.executable, str(child)], env=env, stdout=log, stderr=log)
         try:
             wait_file(directory / "ready.json")
             os.kill(process.pid, signal.SIGSTOP)
-            boundary.decide(directory, {"request_id": "accepted", "generation": 0,
-                                       "action": "stop", "snapshot_acknowledged": True})
-            time.sleep(.6)
+            boundary.decide(
+                directory,
+                {"request_id": "accepted", "generation": 0, "action": "stop", "snapshot_acknowledged": True},
+            )
+            time.sleep(0.6)
             os.kill(process.pid, signal.SIGCONT)
             assert process.wait(timeout=3) == boundary.REPLACED
         finally:
