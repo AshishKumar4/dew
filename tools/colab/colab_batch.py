@@ -9,8 +9,8 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from tools.colab import colab_sync, preflight
-from tools.colab.profile_analysis import TOOL_REF
 from tools.colab.common import HERE, PART, REPO, STATE, driver_sha, git, lock, name, read, save
+from tools.colab.profile_analysis import TOOL_REF
 
 QUEUE = STATE / "colab-queue.md"
 FIELD = re.compile(r"^(?:- |  )([a-z_]+):\s?(.*)$")
@@ -192,9 +192,7 @@ def identity(plan: dict) -> dict:
                 "wandb": job.get("wandb", False),
                 "raw_profiles": job.get("raw_profiles", False),
                 "profile_steps": job.get("profile_steps"),
-                "profile_analysis_ref": job.get(
-                    "profile_analysis_ref", TOOL_REF
-                ),
+                "profile_analysis_ref": job.get("profile_analysis_ref", TOOL_REF),
                 **{
                     key: job[key]
                     for key in ("commit", "command", "outputs", "artifact_policy", "ref", "compile_cache")
@@ -225,9 +223,7 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
             wandb=fields.get("wandb", "off") == "on",
             raw_profiles=fields.get("raw_profiles", "off") == "on",
             profile_steps=int(fields["profile_steps"]) if fields.get("profile_steps") else None,
-            profile_analysis_ref=fields.get(
-                "profile_analysis_ref", TOOL_REF
-            ),
+            profile_analysis_ref=fields.get("profile_analysis_ref", TOOL_REF),
             entry=entry,
             economics={
                 key: fields[key] for key in ("gpu_reason", "expected_cu", "decision", "memory_estimate")
