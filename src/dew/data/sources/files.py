@@ -21,7 +21,7 @@ import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 
 from dew.data.dataset import Batch, Records
-from dew.data.storage import Store
+from dew.data.storage import DewDataFileSystem, Store
 from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest
@@ -105,6 +105,28 @@ class Files:
     shard_bytes: int = 64 * 2**20
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
     spark: bool = False
+    file_info: Mapping[str, Mapping[str, object]] | None = None
+
+    @cached_property
+    def declared(self) -> Mapping[str, Mapping[str, object]]:
+        if self.file_info is not None:
+            return self.file_info
+        committed = self.committed
+        if committed is None:
+            return {}
+        entries = committed["files"]
+        if not isinstance(entries, list):
+            raise ValueError("export manifest files must be a list")
+        return {
+            Store(str(self.url), self.storage_options).child(entry["path"]).url: entry for entry in entries
+        }
+
+    def _header(self, url: str) -> Mapping[str, object]:
+        if url in self.declared:
+            stated = self.declared[url]
+            return {"name": url, "size": stated["bytes"], **stated}
+        fs, path = Store(url, self.storage_options).resolve()
+        return fs.info(path)
 
     @cached_property
     def kind(self) -> Format:
@@ -117,7 +139,7 @@ class Files:
 
     @cached_property
     def committed(self) -> Mapping[str, object] | None:
-        if not isinstance(self.url, str):
+        if self.file_info is not None or not isinstance(self.url, str):
             return None
         store = Store(self.url, self.storage_options).child("_dew_manifest.json")
         fs, path = store.resolve()
@@ -133,6 +155,12 @@ class Files:
 
     @cached_property
     def paths(self) -> tuple[str, ...]:
+        if self.file_info is not None:
+            urls = (self.url,) if isinstance(self.url, str) else self.url
+            missing = [url for url in urls if url not in self.file_info]
+            if missing:
+                raise ValueError(f"published source facts do not name {missing[0]}")
+            return urls
         if self.committed is not None:
             root = Store(str(self.url), self.storage_options)
             entries = self.committed["files"]
@@ -175,6 +203,10 @@ class Files:
         return f"files:{self.kind}:{self.url}"
 
     def snapshot(self) -> Mapping[str, object]:
+        return self._snapshot
+
+    @cached_property
+    def _snapshot(self) -> Mapping[str, object]:
         files = []
         indexes = (
             ()
@@ -185,10 +217,15 @@ class Files:
         )
         for url in (*self.paths, *indexes):
             fs, path = Store(url, self.storage_options).resolve()
-            if url in indexes and not fs.exists(path):
+            if url in indexes and url not in self.declared and not fs.exists(path):
                 continue
-            metadata = fs.info(path)
-            version = metadata.get("ETag") or metadata.get("etag") or metadata.get("generation")
+            metadata = self._header(url)
+            version = (
+                metadata.get("sha256")
+                or metadata.get("ETag")
+                or metadata.get("etag")
+                or metadata.get("generation")
+            )
             files.append(
                 {
                     "uri": url,
@@ -203,6 +240,11 @@ class Files:
             "filter": str(self.filter),
             "partitioning": self.partitioning,
             "shard_bytes": self.shard_bytes,
+            "manifest": None
+            if self.committed is None
+            else hashlib.sha256(
+                json.dumps(self.committed, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest(),
             "transport": Store(self.paths[0], self.storage_options).describe() if self.paths else {},
         }
 
@@ -225,11 +267,12 @@ class Files:
         if self.kind == "webdataset":
             return False
         indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
+        if "index_headers" in self.__dict__:
+            return True
         headers = {}
         for url in indexes:
-            fs, path = Store(url, self.storage_options).resolve()
             try:
-                headers[url] = fs.info(path)
+                headers[url] = self._header(url)
             except FileNotFoundError:
                 return False
         self.__dict__["index_headers"] = headers
@@ -277,6 +320,9 @@ class Files:
             )
             Store(self._index_url(url), self.storage_options).write(encoded.getvalue())
         self.__dict__.pop("paths", None)
+        self.__dict__.pop("_snapshot", None)
+        self.__dict__.pop("_metadata", None)
+        self.__dict__.pop("index_headers", None)
         return self
 
     def _provision_arrayrecord(self) -> Files:
@@ -320,6 +366,9 @@ class Files:
         }
         root.child("_dew_manifest.json").put_if_absent(json.dumps(manifest, sort_keys=True).encode())
         self.__dict__.pop("committed", None)
+        self.__dict__.pop("declared", None)
+        self.__dict__.pop("_snapshot", None)
+        self.__dict__.pop("_metadata", None)
         return self
 
     def records(self, read: Read) -> Records:
@@ -380,7 +429,7 @@ class Files:
             shards.extend(Shard(url, url) for url in self.paths)
         else:
             for url in self.paths:
-                size = Store(url, self.storage_options).size()
+                size = integer(self._header(url)["size"], "file bytes")
                 step = self.shard_bytes if self.kind in ("jsonl", "text") else max(size, 1)
                 if step < 1:
                     raise ValueError("file shard_bytes must be positive")
@@ -449,6 +498,10 @@ class Files:
         return {"row_index": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()}
 
     def metadata(self) -> Mapping[str, object]:
+        return self._metadata
+
+    @cached_property
+    def _metadata(self) -> Mapping[str, object]:
         if self.committed is not None:
             metadata = self.committed.get("metadata", {})
             if not isinstance(metadata, Mapping):
@@ -597,7 +650,11 @@ class _IndexedLines:
         fs, path = Store(self.source.paths[shard], self.source.storage_options).resolve()
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
         offset = int(entry["offset"])
-        payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
+        stated = self.source.declared.get(self.source.paths[shard], {})
+        options = (
+            {"version": stated["etag"]} if isinstance(fs, DewDataFileSystem) and "etag" in stated else {}
+        )
+        payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]), **options)
         if names is not None:
             return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
         return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}

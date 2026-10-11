@@ -224,7 +224,12 @@ class DewDataFileSystem(AbstractFileSystem):
         self._get_versioned(rpath, lpath)
 
     def _get_versioned(self, rpath: str, lpath: str, version: str | None = None) -> None:
-        with self._response("GET", rpath) as response, open(lpath, "wb") as target:
+        with (
+            self._response(
+                "GET", rpath, headers=None if version is None else {"If-Match": version}
+            ) as response,
+            open(lpath, "wb") as target,
+        ):
             if version is not None and response.headers.get("ETag") != version:
                 raise OSError(f"dew-data source changed before downloading {rpath}")
             shutil.copyfileobj(response, target, length=2**20)
@@ -286,6 +291,9 @@ class DewDataFileSystem(AbstractFileSystem):
 
     def cat_file(self, path: str, start: int | None = None, end: int | None = None, **kwargs) -> bytes:
         headers = {}
+        version = kwargs.get("version")
+        if version is not None:
+            headers["If-Match"] = version
         if start is not None or end is not None:
             if start is not None and start < 0:
                 headers["Range"] = f"bytes={start}"
@@ -293,7 +301,12 @@ class DewDataFileSystem(AbstractFileSystem):
                 headers["Range"] = f"bytes={start or 0}-{'' if end is None else end - 1}"
             if end is not None and end <= (start or 0):
                 return b""
-        body, _ = self._request("GET", path, headers=headers)
+        body, returned = self._request("GET", path, headers=headers)
+        if (
+            version is not None
+            and next(value for key, value in returned.items() if key.lower() == "etag") != version
+        ):
+            raise OSError(f"dew-data source changed before reading {path}")
         return body
 
     def pipe_file(self, path: str, value: bytes, mode: str = "overwrite", **kwargs) -> None:
@@ -412,7 +425,9 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                 for interrupted in directory.glob(".download-" + name + "-*"):
                     interrupted.unlink()
             size = None
-            if isinstance(self.fs, DewDataFileSystem):
+            if snapshot is not None and snapshot.get("sha256") is not None:
+                version, size = "sha256:" + snapshot["sha256"], int(snapshot["size"])
+            elif isinstance(self.fs, DewDataFileSystem):
                 metadata = self.fs.info(path) if snapshot is None else snapshot
                 version, size = str(metadata["etag"]), int(metadata["size"])
             else:
@@ -470,7 +485,11 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         os.close(descriptor)
         pending = Path(temporary)
         try:
-            if isinstance(self.fs, DewDataFileSystem):
+            if version.startswith("sha256:"):
+                self.fs.get_file(path, str(pending))
+                with pending.open("rb") as downloaded:
+                    unchanged = hashlib.file_digest(downloaded, "sha256").hexdigest() == version[7:]
+            elif isinstance(self.fs, DewDataFileSystem):
                 self.fs._get_versioned(path, str(pending), version)
                 unchanged = True
             else:

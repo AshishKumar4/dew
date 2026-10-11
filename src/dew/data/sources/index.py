@@ -9,7 +9,7 @@ from functools import cached_property
 
 import numpy as np
 
-from dew.data.storage import DewDataFileSystem, Store
+from dew.data.storage import Store
 
 
 @dataclass(frozen=True)
@@ -23,10 +23,10 @@ class ArrayIndex:
         store = Store(self.url, self.storage_options)
         fs, path = store.resolve()
         snapshot = None
-        if isinstance(fs, DewDataFileSystem) and self.metadata is not None:
+        if self.metadata is not None:
             snapshot = self.metadata
         protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
-        if "file" not in protocols:
+        if "file" not in protocols or self.metadata is not None:
             fs, path = store.cached().resolve()
         opened = fs.open(path, "rb", source_snapshot=snapshot)
         if not isinstance(opened.name, str):
