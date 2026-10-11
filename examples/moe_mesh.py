@@ -251,7 +251,7 @@ def main(config: Config) -> None:
             inputs = batch["text"][:, :-1]
             layers = routing_record(routing(selections, state.variables, inputs, trainer), np.asarray(inputs),
                                     where, config.experts, shards, config.dispatch)
-            state, loss, _, _, _ = step(state, batch)
+            state, loss, _, _, _, _ = step(state, batch)
             steps.append({"step": current, "loss": float(loss),
                           "sent": [layer["sent"] for layer in layers],
                           "rounds": [layer["rounds"] for layer in layers]})
