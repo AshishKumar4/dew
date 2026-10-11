@@ -38,7 +38,7 @@ from dew.nn.flops import (
 )
 from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
-from dew.nn.inputs import ModelInputs
+from dew.nn.inputs import AttentionMetadata, ModelInputs
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.linear import GatedDeltaNet, recurrent_delta_rule, recurrent_gated_delta_rule
 from dew.nn.mixers.attention import CausalSelfAttention
@@ -461,10 +461,18 @@ def test_recurrent_state_macs_are_algorithm_independent_and_scan_aware(kind):
     MultiHeadLatentAttention(8, 2, 16, 4, 3, 2, 2, 3, causal=False, attention_impl="reference"),
 ])
 def test_remaining_recurrent_and_latent_modules_match_token_paths(model):
-    """One-token recurrence avoids chunk prep and matches the model MAC convention."""
+    """One-token recurrence with validity uses the direct held conv path.
+
+    Whole-sequence Mamba-2 also computes throwaway convolution outputs over
+    its padded history before slicing; the held path has exactly one real
+    output and avoids charging that implementation padding to model work.
+    """
     x = jnp.ones((2, 1, 8))
-    variables = model.init(jax.random.key(202), x)
-    assert model.model_flops(np.array([1, 1])) == forward_products(model.apply, variables, x, state_mac=True)
+    metadata = AttentionMetadata(valid=jnp.ones((2, 1), bool))
+    variables = model.init(jax.random.key(202), x, attention_metadata=metadata)
+    def forward(variables, x):
+        return model.apply(variables, x, attention_metadata=metadata)
+    assert model.model_flops(np.array([1, 1])) == forward_products(forward, variables, x, state_mac=True)
 
 
 @pytest.mark.parametrize("kind", ["sparse", "gpt_oss", "gemma4"])
