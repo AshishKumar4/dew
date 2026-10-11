@@ -126,6 +126,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
     scopes = [e for e in events if e.get("ph") == "X"
               and e.get("name") in ("reference.forward", "reference.backward", "reference.optimizer")]
     kinds, parts, rows = defaultdict(float), defaultdict(lambda: defaultdict(float)), {}
+    part_kinds = defaultdict(lambda: defaultdict(float))
     gpu = [e for e in events if e.get("ph") == "X" and e.get("cat") in ("kernel", "gpu_memcpy", "gpu_memset")]
     for event in gpu:
         args = event.get("args", {})
@@ -154,6 +155,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
         ms = float(event["dur"]) / 1000 / steps
         kinds[kind] += ms
         parts[part][phase] += ms
+        part_kinds[part][kind] += ms
         key = (name, operator, kind, part, phase, json.dumps(shapes))
         row = rows.setdefault(key, {"name": name, "framework": operator, "kind": kind,
                                    "part": part, "direction": phase, "rule": rule,
@@ -172,6 +174,7 @@ def attribute(path: Path, steps: int, intermediate: int) -> dict:
             "device_window_ms_per_step": split["window"] * scale,
             "device_idle_ms_per_step": (split["idle_host"] + split["idle_input"]) * scale,
             "by_kind_ms": {kind: kinds[kind] for kind in KINDS}, "by_part_ms": dict(parts),
+            "by_part_kind_ms": dict(part_kinds),
             "top_ops": sorted(rows.values(), key=lambda row: -row["us"]),
             "accounting": "kernel sums by kind can overlap; device busy is interval union; idle is device window minus busy",
             "part_scope": "MLP GEMMs require observed input shapes; other GEMMs are projections. Unattributed is retained.",
