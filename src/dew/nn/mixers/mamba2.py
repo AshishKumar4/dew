@@ -54,7 +54,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.blocks import normal_kernel
-from dew.nn.flops import projection_flops, real_lengths, ssd_flops
+from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, document_conv1d, document_starts, held_scan
@@ -323,7 +323,8 @@ class Mamba2(nn.Module):
         """Projected SSD, conv and its recurrent state write/read, independent of chunk size."""
         projected = 3 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads
         return (projection_flops(lengths, self.emb_features, projected)
-                + 2 * self.conv_features * self.conv_kernel * float(real_lengths(lengths).sum())
+                + conv_flops(lengths, self.conv_features, self.conv_features,
+                             self.conv_kernel, groups=self.conv_features)
                 + ssd_flops(lengths, self.num_heads, self.state_size, self.head_dim))
 
     @property

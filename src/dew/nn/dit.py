@@ -114,6 +114,12 @@ class PatchEmbedding(nn.Module):
     precision: PrecisionLike = None
     bottleneck: int | None = None
 
+    @nn.nowrap
+    def model_flops(self, lengths, input_channels: int) -> float:
+        projected = self.bottleneck or self.embedding_dim
+        return (projection_flops(lengths, self.patch_size**2 * input_channels, projected)
+                + (projection_flops(lengths, projected, self.embedding_dim) if self.bottleneck else 0))
+
     @nn.compact
     def __call__(self, x):
         batch, height, width, _ = x.shape
@@ -175,6 +181,11 @@ class PatchSequenceEmbed(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     bottleneck: int | None = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_channels: int) -> float:
+        return PatchEmbedding(self.patch_size, self.emb_features, bottleneck=self.bottleneck,
+                               parent=None).model_flops(lengths, input_channels)
 
     def setup(self):
         assert self.scan_order in SCAN_ORDERS, f"Unknown scan order {self.scan_order}"
@@ -241,6 +252,14 @@ class ConditioningEmbed(nn.Module):
     interval: bool = False
     time_scale: float = 16
 
+    @nn.nowrap
+    def model_flops(self, lengths, text_features: int | None = None) -> float:
+        rows, width = np.ones(np.shape(lengths), np.int64), self.emb_features
+        expanded = self.mlp_ratio * width
+        time = TimeProjection(expanded, parent=None).model_flops(rows, width)
+        count = (1 + self.interval) * (time + projection_flops(rows, expanded, width))
+        return count + (projection_flops(rows, text_features, width) if text_features is not None else 0)
+
     def setup(self):
         def time_embedding(name: str) -> nn.Sequential:
             return nn.Sequential([
@@ -285,6 +304,14 @@ class PatchSequenceOutput(nn.Module):
     norm_epsilon: float = 1e-5
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths, input_features: int) -> float:
+        count = projection_flops(lengths, input_features, self.patch_size**2 * self.output_channels)
+        if self.modulated:
+            count += projection_flops(np.ones(np.shape(lengths), np.int64),
+                                       input_features, 2 * input_features)
+        return count
 
     @nn.compact
     def __call__(self, tokens, inv_idx, H, W, conditioning=None):
