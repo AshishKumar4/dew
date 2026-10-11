@@ -119,7 +119,14 @@ from dew.training.memory import (
     step_compiler_options,
     step_fits,
 )
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, model_batch, prepare_counts, step_counts
+from dew.training.model_flops import (
+    FORWARD_FLOPS,
+    TOKENS,
+    TRAINING_FLOPS,
+    model_batch,
+    prepare_counts,
+    step_counts,
+)
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.rungs import keep_rung, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice
@@ -494,11 +501,11 @@ class _Interval:
         if self.book is None:
             self.book = self.fresh = fresh_book(loss)
         aux = {} if aux is None else aux
-        self.model_counted |= FORWARD_FLOPS in aux
+        self.model_counted |= TRAINING_FLOPS in aux
         self.tokens_counted |= TOKENS in aux
         assert self.fresh is not None
         self.book = bookkeep(self.book, loss, finite,
-                             aux.get(FORWARD_FLOPS, self.fresh[3]), aux.get(TOKENS, self.fresh[4]))
+                             aux.get(TRAINING_FLOPS, self.fresh[3]), aux.get(TOKENS, self.fresh[4]))
 
     def check_finite(self, step: int, display: TrainingDisplay) -> None:
         """Raise RuntimeError once the loss has been non-finite for
@@ -1641,7 +1648,8 @@ class Trainer(Generic[Loss, Effects]):
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, steps, checkpoints = run.current, plan.steps, self.checkpoints
-        aux = {name: value for name, value in aux.items() if name not in (FORWARD_FLOPS, TOKENS)}
+        aux = {name: value for name, value in aux.items()
+               if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
@@ -2230,15 +2238,15 @@ class Trainer(Generic[Loss, Effects]):
             read = jax.device_get({
                 "loss": loss, "aux": aux, "accepted": accepted, "rate": learning_rate(state.opt_state),
                 "scale": None if state.scale is None else state.scale.scale,
-                "model_flops": (interval.book[3] if interval.model_counted and interval.book is not None
-                                else None),
+                "training_flops": (interval.book[3] if interval.model_counted and interval.book is not None
+                                   else None),
                 "tokens": interval.book[4] if interval.tokens_counted and interval.book is not None else None,
                 "rollout": {} if self.rollout is None else dict(_rollout_metrics(self.rollout))})
             scalars = {"train/loss": float(read["loss"]),
                        **{f"train/{k}": float(v) for k, v in read["aux"].items()},
                        **self._throughput(now - interval.last_log_time, interval.since_log,
                                           interval.samples, interval.flops, waited=interval.waited,
-                                          compiling=interval.compiling, model_flops=read["model_flops"],
+                                          compiling=interval.compiling, training_flops=read["training_flops"],
                                           tokens=read["tokens"])}
             scalars["train/accepted"] = float(read["accepted"])
             if read["rate"] is not None:
@@ -2404,13 +2412,14 @@ class Trainer(Generic[Loss, Effects]):
 
     def _throughput(self, elapsed: float, steps: int, samples: int, flops: StepFlops | None, *,
                     waited: float = 0.0, compiling: float = 0.0,
-                    model_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
+                    training_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
         """Compute the interval's rates from the records it read and its FLOPs.
 
         The FLOPs are the ones the compiler measured for each step's own
         shape; `flops` is None when a shape's measurement was unavailable.
-        train/mfu is three times the objective's analytical forward work on
-        real rows, over the whole mesh's peak. train/hfu keeps hardware HLO
+        train/mfu is the objective's analytical training work on real rows,
+        over the whole mesh's peak: 3*forward for full FT, explicit frozen/
+        trainable matrix work for PEFT. train/hfu keeps hardware HLO
         work including remat; train/hlo_flops_util is the former HLO model
         count with recomputation removed. No HLO count substitutes for MFU.
 
@@ -2436,8 +2445,8 @@ class Trainer(Generic[Loss, Effects]):
         if tokens is not None:
             scalars["train/tokens"] = float(tokens) / steps
             scalars["train/tokens_per_s"] = float(tokens) / stepping
-        if model_flops is not None:
-            per_device = 3 * float(model_flops) / self.device_mesh.devices.size
+        if training_flops is not None:
+            per_device = float(training_flops) / self.device_mesh.devices.size
             utilization = model_flops_utilization(per_device / steps, step_time)
             if utilization is not None:
                 scalars["train/mfu"] = utilization
