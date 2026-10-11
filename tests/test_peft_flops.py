@@ -16,6 +16,7 @@ from dew.decision.objective import DecisionObjective
 from dew.lora import LoRA
 from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.flops import MissingFlopsCount, dense_training_flops, projection_flops
+from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
 from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts
@@ -53,12 +54,12 @@ def test_frozen_dense_rank_factors_equal_the_actual_forward_and_gradient_dots():
 
     def forward_backward(params, frozen, x):
         def forward(params, x):
-            return adapted.model.apply({"params": params, "FROZEN": frozen}, x)
+            return adapted.model.apply({"params": params, FROZEN: frozen}, x)
         y, pullback = jax.vjp(forward, params, x)
         return y, *pullback(jnp.ones_like(y))
 
     assert expected == forward_products(forward_backward, adapted.variables["params"],
-                                        adapted.variables["FROZEN"], x)
+                                        adapted.variables[FROZEN], x)
 
 
 @pytest.mark.parametrize("loop", [None, Loop(3, layers=(0, 1))])
@@ -81,7 +82,7 @@ def test_objective_assembles_peft_training_work_without_three_times_forward():
     model = decoder()
     variables = model.init(jax.random.key(403), jnp.ones((2, 6), jnp.int32))
     adapted = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=503)
-    objective = LMObjective(adapted, seq_len=6, pad_id=0)
+    objective = LMObjective(adapted.model, variables=adapted.variables, seq_len=6, pad_id=0)
     batch = packed_batch()
     expected = (adapted.model.training_flops(np.array([2, 2, 3]))
                 + adapted.model.logits_training_flops(np.array([2, 2])))
@@ -128,7 +129,7 @@ def test_trainer_reads_training_work_once_from_the_existing_interval_record(monk
     model = decoder().clone(num_layers=1)
     variables = model.init(jax.random.key(406), jnp.ones((8, 6), jnp.int32))
     adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=506)
-    objective = LMObjective(adapted, seq_len=6, pad_id=0)
+    objective = LMObjective(adapted.model, variables=adapted.variables, seq_len=6, pad_id=0)
     tracker = RecordingTracker()
 
     class Batches:
