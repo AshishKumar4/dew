@@ -143,12 +143,12 @@ def test_wandb_tick_receives_memory_cache_and_existing_throughput(tmp_path, monk
     trainer._log_interval(3, loss, {}, accepted, state, interval)
     row = run.history[-1]
     names = {'train/loss', 'train/learning_rate', 'train/step_time_ms', 'train/data_wait_ms',
-             'train/compile_s', 'train/mfu', 'train/hfu', 'train/compiles', 'train/cache_hits',
+             'train/compile_s', 'train/hlo_flops_util', 'train/hfu', 'train/compiles', 'train/cache_hits',
              'train/cache_misses'}
     assert names <= row.keys()
     assert row['train/cache_hits'] == before['train/cache_hits'] + 1
     assert row['train/cache_misses'] == before['train/cache_misses'] + 2
-    assert row['train/hfu'] == pytest.approx(2 * row['train/mfu'])
+    assert row['train/hfu'] == pytest.approx(2 * row['train/hlo_flops_util'])
     assert row['train/compiles'] == 1
     if expected is None:
         assert 'train/peak_memory_gib' not in row
