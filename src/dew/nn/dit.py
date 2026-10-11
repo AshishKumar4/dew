@@ -457,15 +457,18 @@ class _TransformerOptions(nn.Module, kw_only=True):
                 'force_fp32_for_softmax': self.force_fp32_for_softmax,
                 'norm_epsilon': self.norm_epsilon, 'attention_impl': self.attention_impl}
 
+    @nn.nowrap
     def _embedding(self, patch_size: int, features: int, scan_order: str = 'raster',
                    *, bottleneck: int | None = None) -> PatchSequenceEmbed:
         return PatchSequenceEmbed(patch_size=patch_size, emb_features=features, scan_order=scan_order,
                                   dtype=self.dtype, precision=self.precision, bottleneck=bottleneck)
 
+    @nn.nowrap
     def _conditioning(self, features: int, **options: Unpack[_ConditioningOptions]) -> ConditioningEmbed:
         return ConditioningEmbed(emb_features=features, mlp_ratio=self.mlp_ratio,
                                  dtype=self.dtype, precision=self.precision, **options)
 
+    @nn.nowrap
     def _output(self, patch_size: int, channels: int, *, modulated: bool = False) -> PatchSequenceOutput:
         return PatchSequenceOutput(patch_size=patch_size, output_channels=channels, modulated=modulated,
                                    norm_epsilon=self.norm_epsilon, dtype=self.dtype, precision=self.precision)
