@@ -253,20 +253,31 @@ print(json.dumps(found))
 
 
 def resolve(python: str, chains: list[dict], bound: set, env: dict | None = None, cwd: Path | None = None):
-    if not chains:
-        return []
-    result = subprocess.run(
-        [python, "-c", RESOLVE],
-        input=json.dumps([chains, sorted(bound)]),
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=cwd,
-        timeout=1200,
-    )
-    if result.returncode:
-        raise RuntimeError(f"{python} could not resolve imports: {result.stderr[-2000:]}")
-    return json.loads(result.stdout.splitlines()[-1])
+    """Each chain's [kind, detail], importing one top-level package an interpreter, as one can kill it."""
+    groups: dict[str, list[int]] = {}
+    for index, chain in enumerate(chains):
+        groups.setdefault(top(chain), []).append(index)
+    found: list = [None] * len(chains)
+    for name, members in groups.items():
+        result = subprocess.run(
+            [python, "-c", RESOLVE],
+            input=json.dumps([[chains[index] for index in members], sorted(bound)]),
+            capture_output=True,
+            text=True,
+            env=env,
+            cwd=cwd,
+            timeout=1200,
+        )
+        try:
+            answers = json.loads(result.stdout.splitlines()[-1])
+        except (IndexError, json.JSONDecodeError):
+            lines = result.stderr.strip().splitlines() or ["no output"]
+            last = next((line for line in lines if line.startswith("Fatal Python error")), lines[-1])
+            answers = [["import", f"importing {name} ended the interpreter ({result.returncode}): {last}"]]
+            answers *= len(members)
+        for index, answer in zip(members, answers, strict=True):
+            found[index] = answer
+    return found
 
 
 class Sources:
