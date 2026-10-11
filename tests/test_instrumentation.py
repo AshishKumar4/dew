@@ -236,16 +236,22 @@ def test_throughput_metrics_ignore_a_zero_interval():
     assert make_trainer()._throughput(elapsed=0.0, steps=0, samples=0, flops=NO_FLOPS) == {}
 
 
-def test_mfu_reads_the_models_flops_and_hfu_the_hardwares(monkeypatch):
-    """train/mfu is over the model's FLOPs, a remat's recomputed forward once,
-    and train/hfu over the hardware's, which run it twice (PaLM's MFU and HFU)."""
+def test_mfu_reads_analytical_work_and_keeps_both_hlo_utilizations(monkeypatch):
+    """MFU is the real-token forward/backward estimate; the two HLO counts
+    remain separate and never stand in for a missing analytical count."""
     from dew.telemetry import peaks
     from dew.telemetry.instrumentation import StepFlops
 
     monkeypatch.setitem(peaks.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
-    metrics = make_trainer()._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0))
-    assert metrics["train/mfu"] == pytest.approx(0.05)
+    trainer = make_trainer()
+    metrics = trainer._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0),
+                                   model_flops=80.0, tokens=700)
+    assert metrics["train/mfu"] == pytest.approx(3 * 80 / (2 * 100 * trainer.device_mesh.devices.size))
+    assert metrics["train/tokens"] == 70
+    assert metrics["train/hlo_flops_util"] == pytest.approx(0.05)
     assert metrics["train/hfu"] == pytest.approx(0.075)
+    missing = trainer._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0))
+    assert "train/mfu" not in missing and "train/hlo_flops_util" in missing
 
 
 def test_throughput_metrics_report_compiles_and_waits_apart_from_steps():

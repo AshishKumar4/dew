@@ -44,6 +44,7 @@ from ..deepseek_v4 import DeepseekV4Mixer
 from ..dsa_kpool import KPoolSparseAttentionMixer
 from ..dspark import DSpark, DSparkStage, draft as dspark_draft
 from ..engram import Engram, EngramHashes, EngramLayer
+from ..flops import MissingFlopsCount, counted_flops, projection_flops
 from ..gemma3n import AltUp, rescale_to
 from ..gemma4_moe import Gemma4Experts
 from ..gpt_oss import GptOssMLP
@@ -893,6 +894,43 @@ class CausalTransformer(nn.Module):
                 dtype=self.dtype,
                 precision=self.precision)
         return gated_mlp, routed, parallel
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Hidden-state forward work: real rows, each loop pass, no embeddings or remat.
+
+        Factories are the same ones `setup` uses, so kind geometry, shared
+        K/V and dense/routed layer patterns cannot drift from the model.
+        The objective counts a vocabulary or decision head separately.
+        """
+        if self.altup is not None or self.hyper_connections is not None:
+            raise MissingFlopsCount("CausalTransformer needs its multi-stream expansion geometry")
+        types = self.per_layer_types
+        kinds = self.layer_kinds(types)
+        mixer = self.mixer if self.mixer is not None else AttentionMixer(
+            nope=self.position_embedding != 'rotary', alibi=self.position_embedding == 'alibi')
+        specs = self._layer_specs(types, kinds, mixer)
+        factories = self.feedforward_factories()
+        loop_start, loop_end = (0, self.num_layers) if self.loop is None or self.loop.layers is None else (
+            self.loop.layers)
+        total = 0.0
+        for index in range(self.num_layers):
+            block = self._block(specs, mixer, factories, BlockWiring(), index, f'layers_{index}')
+            passes = self.loop.steps if self.loop is not None and loop_start <= index < loop_end else 1
+            total += passes * counted_flops(block, lengths)
+        if self.per_layer_input_dim:
+            total += projection_flops(lengths, self.emb_features, self.num_layers * self.per_layer_input_dim)
+        if self.loop is not None and self.loop.exit_gate:
+            total += self.loop.steps * projection_flops(lengths, self.emb_features, 1)
+        return total
+
+    @nn.nowrap
+    def logits_flops(self, lengths) -> float:
+        """The vocabulary matrix and optional prediction transform, tied or untied."""
+        count = projection_flops(lengths, self.emb_features, self.vocab_size)
+        if self.head_transform is not None:
+            count += projection_flops(lengths, self.emb_features, self.emb_features)
+        return count
 
     def setup(self):
         """Build the embeddings, the layers, the prediction depths `mtp`, the final

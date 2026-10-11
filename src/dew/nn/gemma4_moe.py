@@ -18,6 +18,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
+from dew.nn.flops import projection_flops
 from dew.nn.moe import ExpertMLP, GatedActivation, Routes, chosen_experts
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
@@ -78,6 +79,15 @@ class Gemma4Experts(nn.Module):
     scale_after_cast: bool = False
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The routed branch beside the dense MLP, whose caller counts it separately."""
+        experts = ExpertMLP(num_experts=self.num_experts, hidden_features=self.hidden_features,
+                            out_features=self.out_features, activation=self.activation,
+                            capacity_factor=self.capacity_factor, parent=None)
+        return (projection_flops(lengths, self.out_features, self.num_experts)
+                + self.top_k * experts.model_flops(lengths))
 
     @nn.compact
     def __call__(self, x, mlp_out, routes: Routes | None = None):

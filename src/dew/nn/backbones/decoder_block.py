@@ -22,6 +22,7 @@ from ..activations import UNGATED, ungated_activation
 from ..attention import LayerNorm, RMSNorm
 from ..attention_residuals import DepthAttention, ResidualSite, sources
 from ..blocks import normal_kernel
+from ..flops import MissingFlopsCount, counted_flops, projection_flops
 from ..gemma3n import AltUp, AltUpLayer, LaurelBlock, gaussian_topk
 from ..hyper_connections import (
     Carried,
@@ -218,6 +219,12 @@ class GatedMLP(nn.Module):
     dropout_rate: float = 0.0
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """The residual-width MLP's two maps, or three with a learned gate."""
+        maps = 2 if self.activation in UNGATED else 3
+        return maps * projection_flops(lengths, self.out_features, self.hidden_features)
 
     def setup(self):
         dense = functools.partial(
@@ -532,6 +539,22 @@ class DecoderBlock(nn.Module):
     remat: RematPolicy | None = None
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Compose the declared mixer and MLPs, independent of remat and storage."""
+        if any(value is not None for value in (self.altup, self.hyper_connections,
+                                               self.residual_site, self.engram)):
+            raise MissingFlopsCount("DecoderBlock needs its multi-stream or memory-extension geometry")
+        count = counted_flops(self.mixer(parent=None), lengths)
+        for factory in (self.feedforward, self.parallel):
+            if factory is not None:
+                count += counted_flops(factory(parent=None), lengths)
+        if self.per_layer_input_dim:
+            count += 2 * projection_flops(lengths, self.emb_features, self.per_layer_input_dim)
+        if self.laurel_rank is not None:
+            count += 2 * projection_flops(lengths, self.emb_features, self.laurel_rank)
+        return count
 
     def setup(self):
         norm = decoder_norm(
