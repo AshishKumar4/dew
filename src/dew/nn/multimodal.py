@@ -18,6 +18,7 @@ from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
 
 if TYPE_CHECKING:
+    from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.hyper_connections import HyperConnections
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
@@ -454,6 +455,11 @@ class MultimodalTransformer(nn.Module):
         return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
 
     @nn.nowrap
+    def with_remat(self, policy: RematPolicy | None) -> Self:
+        """Choose the language model's layer policy, leaving the towers as they were."""
+        return self.clone(language_model=self.language_model.with_remat(policy))
+
+    @nn.nowrap
     def recompute_record(self) -> JSON:
         return self.language_model.recompute_record()
 
@@ -467,8 +473,10 @@ class MultimodalTransformer(nn.Module):
         return self.clone(language_model=self.language_model.restore_recompute(record))
 
     @nn.nowrap
-    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None) -> Self | None:
-        language_model = self.language_model.with_passes(steps, layers)
+    def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
+                    backprop_steps: int | None = None, remat: bool | None = None) -> Self | None:
+        language_model = self.language_model.with_passes(steps, layers, backprop_steps=backprop_steps,
+                                                         remat=remat)
         return None if language_model is None else self.clone(language_model=language_model)
 
     @nn.nowrap

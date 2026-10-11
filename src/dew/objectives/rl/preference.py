@@ -34,6 +34,8 @@ class DPOObjective(LMObjective):
     """
 
     _ema_is_reference = True
+    counts_tokens = False
+    """Preference pairs need their two-sequence geometry, not LM's text rows."""
 
     keeps_whole_logits = False
 

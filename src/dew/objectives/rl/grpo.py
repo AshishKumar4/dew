@@ -158,6 +158,9 @@ class GRPOObjective(LMObjective):
 
     _ema_is_reference = True
 
+    counts_tokens = False
+    """Rollout/packing geometry is supplied by its own objective count, not inherited LM rows."""
+
     keeps_whole_logits = False
 
     def __init__(self, model, seq_len: int, beta: float = 0.0,

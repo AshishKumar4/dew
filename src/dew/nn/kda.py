@@ -33,6 +33,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from .flops import delta_flops, projection_flops, real_lengths
 from .inputs import AttentionMetadata
 from .linear import (
     CHUNK_SIZE,
@@ -96,6 +97,21 @@ class KimiDeltaAttention(nn.Module):
     @property
     def qkv_features(self) -> int:
         return self.num_heads * self.head_dim
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Q/K/V/output, low-rank decay and gate, convs, and chunked delta work."""
+        inner = self.qkv_features
+        direct = 4 * inner + self.head_dim + self.num_heads
+        low_rank = self.head_dim * inner
+        if self.full_rank_gate:
+            direct += inner
+        else:
+            direct += self.head_dim
+            low_rank += self.head_dim * inner
+        return (projection_flops(lengths, self.emb_features, direct)
+                + float(real_lengths(lengths).sum()) * (2 * low_rank + 6 * inner * self.conv_kernel)
+                + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
         if self.conv_kernel < 2:

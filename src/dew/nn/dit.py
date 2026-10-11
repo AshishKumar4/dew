@@ -16,6 +16,7 @@ from typing import Literal, Self, TypedDict, Unpack
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
@@ -25,6 +26,7 @@ from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
 from .conv import Conv
+from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .precision import at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
@@ -544,6 +546,26 @@ class ModulatedBlock(nn.Module):
     bidirectional_ssm: bool = True
     use_2d_fusion: bool = False
     scan_order: str = 'raster'  # needed to un-permute for the 2D fusion conv
+
+    @nn.nowrap
+    def model_flops(self, lengths) -> float:
+        """Mixer, MLP and one modulation projection per real conditioning row."""
+        if self.mixer not in ('attention', 'ssm'):
+            raise MissingFlopsCount(f"ModulatedBlock has no declared FLOPs for mixer {self.mixer!r}")
+        if self.mixer == 'attention':
+            mixer = NormalAttention(self.features, self.num_heads,
+                                     self.features // self.num_heads, parent=None)
+        else:
+            scan = BidirectionalS5Layer if self.bidirectional_ssm else S5Layer
+            mixer = scan(self.features, self.ssm_state_dim, parent=None)
+        count = counted_flops(mixer, lengths)
+        if self.mixer == 'ssm' and self.use_2d_fusion:
+            count += SpatialFusionConv(self.features, parent=None).model_flops(lengths)
+        count += 2 * projection_flops(lengths, self.features, int(self.features * self.mlp_ratio))
+        if self.modulated:
+            rows = (real_lengths(lengths) > 0).astype(np.int64)
+            count += projection_flops(rows, self.features, 6 * self.features)
+        return count
 
     def setup(self):
         assert self.mixer in ('attention', 'ssm'), f"Unknown mixer {self.mixer}"
