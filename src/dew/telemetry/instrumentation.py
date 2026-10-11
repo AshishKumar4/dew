@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 
 import jax
 
-from dew.telemetry.peaks import peak_flops
+from dew.nn.kernels.generation import gpu_target
 
 _cache_counts = {'/jax/compilation_cache/cache_hits': 0, '/jax/compilation_cache/cache_misses': 0}
 _cache_lock = threading.Lock()
@@ -616,7 +616,7 @@ def model_flops_utilization(
     """
     if not flops_per_step or step_time <= 0:
         return None
-    peak = peak_flops(jax.devices()[0].device_kind)
+    peak = gpu_target(jax.devices()[0].device_kind).bf16_peak
     if peak is None:
         return None
     return flops_per_step / step_time / peak

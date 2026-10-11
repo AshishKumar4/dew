@@ -27,10 +27,14 @@ import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
+from dew.nn.kernels.generation import TARGETS
 from tools.colab.common import REPO, VENV_PYTHON, git
 from tools.python_uses import dotted, uses
 
-ARCH = {"gpu:T4": "7.5", "gpu:L4": "8.9", "gpu:A100": "8.0", "gpu:G4": "12.0"}
+# Each lab GPU's compute capability, from Dew's target table: sm89 is "8.9", sm120 "12.0".
+ARCH = {alias.upper().replace("GPU:", "gpu:"): f"{int(target.generation[2:-1])}.{target.generation[-1]}"
+        for target in TARGETS.values() if target.generation.startswith("sm")
+        for alias in target.aliases if alias.startswith("gpu:")}
 # The VM's interpreters: Colab's /usr/bin/python3 (c56's tracebacks, /usr/local/lib/python3.13), and
 # the job's venv, which `python` and `pip` name (colab_batch_vm).
 INTERPRETERS = {"system": "3.13", "venv": VENV_PYTHON}
@@ -738,8 +742,6 @@ def resolved(ref: str, origin: str) -> str:
     return git(REPO, "rev-parse", f"{ref}^{{commit}}") if known() else ref
 
 
-GENERATIONS = {"gpu:T4": "sm75", "gpu:L4": "sm89", "gpu:A100": "sm80", "gpu:G4": "sm120"}
-LAB_GPUS = {"gpu:A100": "a100", "gpu:G4": "g4", "gpu:L4": "l4", "gpu:T4": "t4"}
 STORE_CONFIG = Path.home() / ".config/dew/dew-data.json"
 
 
@@ -802,21 +804,26 @@ def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: Seque
     kernels, their callers and the pinned JAX byte for byte: CPU interpretation cannot catch a
     Triton lowering failure (c58, c57). None needed, none read."""
     if not (tree / "src/dew/nn/kernels/generation.py").exists():
+        from dew.nn.kernels.generation import gpu_target
         named = [f"explicit at {site}" for site in explicit]
-        return lab_record(tree, hardware, GENERATIONS[hardware], named, failures, config)
-    choices = subprocess.run(
-        [sys.executable, "-c", "import json; from dew.nn.kernels.generation import KERNELS; "
-         "print(json.dumps(KERNELS))"],
-        capture_output=True, text=True, env={**os.environ, "PYTHONPATH": str(tree / "src")}, cwd=tree,
-        timeout=300)
-    if choices.returncode:
-        failures.append(f"cannot read the ref's KERNELS: {choices.stderr[-300:]}")
-        return {}
-    from dew.nn.kernels.generation import PALLAS_CHOICES
+        return lab_record(tree, hardware, gpu_target(hardware).generation, named, failures, config)
+    from dew.nn.kernels.generation import PALLAS_CHOICES, gpu_target
 
-    generation = GENERATIONS[hardware]
-    named = sorted(f"{choice}={row[generation]}" for choice, row in json.loads(choices.stdout).items()
-                   if row.get(generation) in PALLAS_CHOICES)
+    # The ref's own kernel row for this tool's generation of `hardware`: a target table's, or an
+    # older ref's `KERNELS` mapping of choice to {generation: kernel}.
+    generation = gpu_target(hardware).generation
+    read = ("import json, dew.nn.kernels.generation as g\n"
+            f"rows = {{c: r.get({generation!r}) for c, r in g.KERNELS.items()}} if hasattr(g, 'KERNELS') "
+            f"else dict(g.gpu_target({generation!r}).kernels)\n"
+            "print(json.dumps({c: k for c, k in rows.items() if k}))")
+    choices = subprocess.run([sys.executable, "-c", read], capture_output=True, text=True,
+                             env={**os.environ, "PYTHONPATH": str(tree / "src")}, cwd=tree, timeout=300)
+    if choices.returncode:
+        failures.append(f"cannot read the ref's kernel row: {choices.stderr[-300:]}")
+        return {}
+    target = {"kernels": json.loads(choices.stdout)}
+    named = sorted(f"{choice}={kernel}" for choice, kernel in target['kernels'].items()
+                   if kernel in PALLAS_CHOICES)
     named += [f"explicit at {site}" for site in explicit]
     return lab_record(tree, hardware, generation, named, failures, config)
 
@@ -828,11 +835,12 @@ def lab_record(tree: Path, hardware: str, generation: str, named: list[str], fai
     if not named:
         return found
     found["digest"] = digest = kernel_digest(tree)
-    key = f"lab/verified/{LAB_GPUS[hardware]}/{digest}.json"
+    gpu = hardware.removeprefix('gpu:').lower()
+    key = f"lab/verified/{gpu}/{digest}.json"
     record, missing = store_read(key, config)
     if record is None or not record.get("ok"):
         failures.append(f"KERNELS on {generation} names Pallas kernels ({', '.join(named)}) whose code "
-                        f"the kernel lab has not verified on {LAB_GPUS[hardware]} ({key}: "
+                        f"the kernel lab has not verified on {gpu} ({key}: "
                         f"{missing or 'not ok'})")
         return found
     found["record"] = {k: record.get(k) for k in ("ref", "gpu", "versions", "at")}
@@ -962,7 +970,8 @@ def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: d
     torch reference, has nothing to lower."""
     if not sites:
         return {"skipped": "the request runs no Dew code"}
-    generation, script = GENERATIONS[hardware], tree / "tools" / "clef_step.py"
+    from dew.nn.kernels.generation import gpu_target
+    generation, script = gpu_target(hardware).generation, tree / "tools" / "clef_step.py"
     shape = shape or {}
     found: dict = {"generation": generation, "devices": 1, "env": env, "sites": list(sites),
                    "model": shape.get("like", "tiny"), "geometry": shape}
