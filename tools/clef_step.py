@@ -111,7 +111,8 @@ def lowered(work: Path, generation: str) -> dict:
     from dew.training.lowering import Lowered
 
     try:
-        run(work, 1, generation)
+        # Two steps: the schedule decays after its one warmup step.
+        run(work, 2, generation)
     except Lowered as done:
         return {"generation": done.generation, "kernels": done.kernels}
     raise RuntimeError(f"the run trained rather than lowering for {generation}")
