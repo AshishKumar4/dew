@@ -304,6 +304,9 @@ class Driver:
         except FileNotFoundError:
             self.record(boundary_waiting_job=job["index"])
             return
+        if ready.get("state") != "quiescent":
+            self.record(boundary_timeout=ready)
+            return
         acknowledgments = self.state.get("boundary_snapshots", {})
         if ready["request_id"] in acknowledgments:
             return
