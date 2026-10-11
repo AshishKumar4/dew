@@ -38,6 +38,7 @@ from dew.nn.attention import (
 from dew.nn.blocks import normal_kernel
 from dew.nn.flops import attention_flops, projection_flops
 from dew.nn.inputs import Admitted, AttentionMetadata
+from dew.nn.kernels.generation import backend
 from dew.nn.kv_cache import TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, scaled
@@ -945,7 +946,7 @@ class CausalSelfAttention(nn.Module):
         take the gathered rows, which the attention core widens."""
         if self.value_dim != self.head_dim:
             return False
-        if jax.default_backend() != 'gpu':
+        if backend() != 'gpu':
             return self.attention_impl in ('auto', 'tpu')
         return (self.attention_impl in ('auto', 'cudnn')
                 and cudnn_runs(query, self.attn_logit_softcap)
