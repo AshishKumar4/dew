@@ -24,7 +24,7 @@ class ArrayIndex:
         fs, path = store.resolve()
         snapshot = None
         if self.metadata is not None:
-            snapshot = self.metadata
+            snapshot = {"size": self.metadata.get("bytes", self.metadata.get("size")), **self.metadata}
         protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
         if "file" not in protocols or self.metadata is not None:
             fs, path = store.cached().resolve()
