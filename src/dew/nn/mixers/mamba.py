@@ -173,7 +173,8 @@ class Mamba(nn.Module):
         taps, bias = self.conv1d()
         out = held_scan(self, mixed.astype(wide), taps, bias, self._scan,
                         (self.intermediate_size, self.state_size),
-                        decode=decode, valid=valid, segments=segment_ids)
+                        decode=decode, valid=valid, segments=segment_ids,
+                        right_padded=attention_metadata is not None and attention_metadata.right_padded)
         if out is None:
             # Allocation only: init_cache's dummy token must not consume a
             # position or leave state behind.

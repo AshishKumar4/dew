@@ -44,6 +44,7 @@ from dew.nn.linear import (
     causal_conv1d,
     chunk_decay,
     chunk_gated_delta_rule,
+    held_conv1d,
     l2norm,
     recurrent_gated_delta_rule,
     strictly_lower_inverse,
@@ -502,6 +503,58 @@ def test_the_layer_reads_a_holed_row_as_the_row_without_its_holes(reference, geo
     assert largest(holed[:, kept], alone) < 1e-5
     assert jnp.array_equal(holed[:, jnp.asarray([2, 3, 6])],
                            jnp.zeros_like(holed[:, jnp.asarray([2, 3, 6])]))
+
+
+RIGHT_PADDED = {
+    "rows of five and three": [[1] * 5 + [0] * 3, [1] * 3 + [0] * 5],
+    "a full row beside an empty one": [[1] * 8, [0] * 8],
+    "fewer real tokens than the kernel's history": [[1] * 2 + [0] * 6, [1] + [0] * 7],
+}
+
+
+@pytest.mark.parametrize("case", list(RIGHT_PADDED))
+@pytest.mark.parametrize("history", [False, True])
+def test_a_right_padded_row_convolves_as_the_masked_conv(case, history):
+    """Declared right-padded, a row convolves as it stands, with no gather:
+    the masked conv's outputs, padding zeroed, the history it carries and
+    the gradients into the input, the taps and the incoming history."""
+    x, kernel, state, valid, cotangent = masked_operands(RIGHT_PADDED[case], 4, history=history, seed=3)
+
+    def scored(*, right_padded):
+        def inner(x, kernel, state):
+            out, carried = held_conv1d(x, kernel, valid, state, right_padded=right_padded)
+            return jnp.sum(out * cotangent) + jnp.sum(carried ** 2), (out, carried)
+        return jax.value_and_grad(inner, argnums=(0, 1, 2), has_aux=True)
+
+    (_, (out, carried)), grads = scored(right_padded=True)(x, kernel, state)
+    (_, (want_out, want_carried)), want_grads = scored(right_padded=False)(x, kernel, state)
+
+    assert largest(out, want_out) < 1e-6
+    assert largest(carried, want_carried) < 1e-6
+    for gradient, wanted in zip(grads, want_grads, strict=True):
+        if wanted is not None:
+            assert largest(gradient, wanted) < 1e-6
+
+
+def test_a_right_padded_layer_keeps_its_real_tokens_states(reference, geometry):
+    """The mixer told its rows are right-padded gives the masked call's
+    outputs, zero at the padding, by the conv without the gather."""
+    module = layer(geometry)
+    variables = layer_params(reference)
+    hidden = jnp.asarray(reference["layer.hidden"])[:, :9]
+    valid = jnp.arange(9)[None, :] < jnp.asarray([[6], [9]])
+
+    def call(metadata):
+        return jax.jit(lambda hidden: module.apply(variables, hidden, attention_metadata=metadata))
+
+    def gathers(metadata) -> int:
+        return call(metadata).lower(hidden).compile().as_text().count(" gather(")
+
+    masked, declared = AttentionMetadata(valid=valid), AttentionMetadata(valid=valid, right_padded=True)
+
+    assert largest(call(declared)(hidden), call(masked)(hidden)) < 1e-6
+    assert jnp.array_equal(call(declared)(hidden)[0, 6:], jnp.zeros_like(hidden[0, 6:]))
+    assert gathers(declared) < gathers(masked)
 
 
 @pytest.mark.parametrize("chunk", [4, 16, 64])

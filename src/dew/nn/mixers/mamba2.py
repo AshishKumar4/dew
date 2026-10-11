@@ -385,7 +385,8 @@ class Mamba2(nn.Module):
                     "state per row. Run them on a mesh with sequence=1.")
             out = held_scan(self, mixed, taps, bias, functools.partial(scan, dt=dt, heads=heads),
                             (self.num_heads, self.head_dim, self.state_size),
-                            decode=decode, valid=valid, segments=segment_ids)
+                            decode=decode, valid=valid, segments=segment_ids,
+                            right_padded=attention_metadata is not None and attention_metadata.right_padded)
             if out is None:
                 # Allocation only, as the delta net: init_cache's dummy token
                 # must not consume a position or leave state behind.

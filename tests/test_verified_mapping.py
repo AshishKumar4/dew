@@ -167,7 +167,7 @@ def test_the_probe_holds_its_bound_at_a_gpus_default_tf32_precision(tmp_path):
     import subprocess
 
     write_tiny(tmp_path, "cwm", sliding_window=4)
-    script = ("import sys\nfrom dew.interop import Pretrained.load\n"
+    script = ("import sys\nfrom dew.interop import Pretrained\n"
               "Pretrained.load(sys.argv[1], dtype='float32', attention_impl='reference')")
     env = {name: value for name, value in os.environ.items()
            if name not in ("JAX_DEFAULT_MATMUL_PRECISION", "XLA_FLAGS")}
