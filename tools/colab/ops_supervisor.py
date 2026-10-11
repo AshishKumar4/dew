@@ -85,8 +85,10 @@ def finalize(run_dir: Path, client: Colab, reason: str | None = None, code: int 
             if result["release"] == "already absent":
                 released_at = time.time()
         else:
-            if endpoint and (driver.get("progress", {}).get("phase") != "done"
-                             or any(job.get("collection_failed") for job in driver.get("results", []))):
+            if endpoint and (
+                driver.get("progress", {}).get("phase") != "done"
+                or any(job.get("collection_failed") for job in driver.get("results", []))
+            ):
                 emergency(run_dir, run, allocation, client, endpoint, result)
             result["release"] = client.release(run["session"], endpoint)
             released_at = time.time()
