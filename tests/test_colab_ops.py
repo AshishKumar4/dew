@@ -1175,10 +1175,16 @@ def test_snapshot_storage_error_records_attention_without_declaring_workload_dea
         def stop(self, **kwargs):
             return None
 
-    driver = Driver(tmp_path / "run", types.SimpleNamespace(kernel=lambda *args, **kwargs: Kernel()), "unused")
+    driver = Driver(
+        tmp_path / "run", types.SimpleNamespace(kernel=lambda *args, **kwargs: Kernel()), "unused"
+    )
     with pytest.raises(ops_driver.TransportError):
-        driver.control(allocation.Session("owned", "https://fake.invalid/", "token"), "snapshot", live_read=True)
-    assert driver.state["collection_needs_attention"] and driver.state["collection_error_names"] == ["PermissionError"]
+        driver.control(
+            allocation.Session("owned", "https://fake.invalid/", "token"), "snapshot", live_read=True
+        )
+    assert driver.state["collection_needs_attention"] and driver.state["collection_error_names"] == [
+        "PermissionError"
+    ]
     assert driver.state["results"] == []
 
 
