@@ -282,6 +282,27 @@ def test_dit_work_includes_the_native_conditioning_geometry(monkeypatch):
     assert work.training_flops_per_step == 3 * model.image_flops(np.array([4, 4]), 3)
 
 
+def test_qwen35_work_counts_the_shared_smoke_geometry(monkeypatch, tmp_path):
+    """The config-only count must see the convolution that HF builds by default."""
+    from dew.nn.flops import counted_flops
+    from dew.telemetry.records import WorkloadWork
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    writer = load("reference_runs/work")
+    args = writer.arguments(["qwen35", "--smoke", "--dtype", "float32",
+                             "--out", str(tmp_path / "work.json")])
+    work = args.count(args)
+    shared = load("reference_runs/qwen35")
+    from dew.interop import translate_config
+
+    model = translate_config(shared.config(smoke=True)).value
+    assert work.training_flops_per_step == 3 * counted_flops(model, np.array([16, 16]))
+    assert work.tokens_per_step == 32
+    assert work.batch_shape == (2, 16)
+    work.write(args.out)
+    assert WorkloadWork.read(args.out) == work
+
+
 @pytest.mark.parametrize("runner, argv", [
     ("torch_lm", ["--model", "model", "--data", "data", "--out", "out", "--batch", "2",
                   "--precision", "fp32"]),
