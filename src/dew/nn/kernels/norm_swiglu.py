@@ -55,10 +55,12 @@ def _selected(choice: str, implementation: str, refusal: str | None) -> str:
     return 'pallas' if reason is None else generation.ran_kernel(choice, 'xla', reason)
 
 
-def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool) -> str:
+def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
+                inverse_after_cast: bool = False) -> str:
     """Resolve RMSNorm without changing its arithmetic or collecting a split
     feature axis. Float64 and input-dtype statistics belong to XLA."""
     return _selected('rms_norm', implementation, first_refusal(
+        (not inverse_after_cast, "unweighted_rmsnorm rounds the inverse, not the normalized activation"),
         (fp32_statistics, "input-dtype statistics round each reduction step; the kernel reduces in fp32"),
         (x.dtype in DTYPES and jnp.dtype(dtype) in DTYPES,
          f"RMSNorm input {x.dtype} and output {dtype}; the kernel supports float32 and bfloat16"),
@@ -112,10 +114,11 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
     groups = pl.num_programs(0)
+    group = pl.program_id(0)
     weight = _weight(scale_ref, columns, width, offset) if scale_ref is not None else 1.0
 
     def block(i, accumulated):
-        row = (i * groups + pl.program_id(0)) * ROW_BLOCK + jnp.arange(ROW_BLOCK)
+        row = (i * groups + group) * ROW_BLOCK + jnp.arange(ROW_BLOCK)
         mask = (row[:, None] < rows) & (columns[None, :] < width)
         x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
         dy = plgpu.load(dy_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
@@ -137,7 +140,7 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
     partial = jax.lax.fori_loop(0, pl.cdiv(rows, groups * ROW_BLOCK), block,
                                 jnp.zeros(columns.shape, jnp.float32))
     if partial_ref is not None:
-        plgpu.store(partial_ref.at[pl.program_id(0), columns], partial, mask=columns < width)
+        plgpu.store(partial_ref.at[group, columns], partial, mask=columns < width)
 
 
 def _rms_with_inverse(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool,
