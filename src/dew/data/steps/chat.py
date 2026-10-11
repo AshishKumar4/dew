@@ -26,7 +26,7 @@ from dew.data.prompts import (
     FIELDS as PROMPT_FIELDS,
 )
 from dew.data.text import load_tokenizer, tokenizer_snapshot
-from dew.records import integer
+from dew.records import integer, record
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,6 +62,7 @@ class RenderPrompt(grain.MapTransform):
         return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
 
     def map(self, element: Batch) -> Batch | Rejected:
+        element = record(element, "prompt row")
         unknown = element.keys() - set(PROMPT_FIELDS)
         if unknown:
             raise ValueError(f"prompt unknown fields {sorted(unknown)}")
@@ -112,6 +113,7 @@ class PreferencePair(grain.MapTransform):
             raise ValueError("preference seq_len must be positive")
 
     def map(self, element: Batch) -> Batch:
+        element = record(element, "preference row")
         unknown = element.keys() - {"chosen", "rejected", "chosen_mask", "rejected_mask"}
         if unknown:
             raise ValueError(f"preference unknown fields {sorted(unknown)}")

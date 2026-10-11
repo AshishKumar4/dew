@@ -11,7 +11,7 @@ import numpy as np
 
 from dew import records
 from dew.data.pipeline import Configured, HostStep, Pipeline
-from dew.data.recipes import HoldOut, Split, Validation, _branches, source_argument
+from dew.data.recipes import HoldOut, Split, Validation, _branches, source_argument, SourceValue
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
@@ -225,8 +225,8 @@ class Decisions:
     """Decision rows and their corpus shares, with layout supplied by the objective."""
 
     source: Annotated[str | Source | Sequence[Example | Mapping[str, object]] | Mapping[
-        str, Sequence[Example | Mapping[str, object]]], source_argument()] = "tickets.csv"
-    validation: Annotated[Validation | Sequence[Example | Mapping[str, object]], source_argument()] = None
+        str, Sequence[Example | Mapping[str, object]]], source_argument(SourceValue)] = "tickets.csv"
+    validation: Annotated[Validation | Sequence[Example | Mapping[str, object]], source_argument(Validation)] = None
     weights: Mapping[str, float] = field(default_factory=dict)
     options: tuple[str, ...] = ()
     text: str = "text"
