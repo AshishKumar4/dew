@@ -10,7 +10,7 @@ import pytest
 
 from dew.data.cache import Cache
 from dew.data.compile import compile
-from dew.data.dataset import DataPartition, Loading, train_stream
+from dew.data.dataset import DataPartition, Loading
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
@@ -87,9 +87,9 @@ def take(reader, count):
 def test_pipeline_global_order_matches_the_existing_grain_order():
     stored = source()
     data = compile(Pipeline(stored).shuffle(7).repeat().random_map(Draw()).batch(4), loading=READ, seed=7)
-    old = train_stream(stored.values, [Draw()], batch=4, seed=7, loading=READ)
     reader = data.train(DataPartition())
-    oracle = old(DataPartition())
+    oracle = iter(grain.MapDataset.source(stored.values).seed(7).shuffle(7).repeat().random_map(Draw())
+                  .to_iter_dataset(grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)).batch(4))
     try:
         assert take(reader, 9) == take(oracle, 9)
     finally:
@@ -102,9 +102,9 @@ def test_memory_rejections_are_dense_before_global_order():
     data = compile(Pipeline(stored).map(Odd()).shuffle(3).repeat().batch(4),
                    read="memory", loading=READ, seed=3)
     rows = tuple(value for value in stored.values if int(value["id"]) % 2)
-    oracle = train_stream(rows, [], batch=4, seed=3, loading=READ)
     reader = data.train(DataPartition())
-    old = oracle(DataPartition())
+    old = iter(grain.MapDataset.source(rows).seed(3).shuffle(3).repeat()
+               .to_iter_dataset(grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)).batch(4))
     try:
         assert data.records == 12
         assert take(reader, 4) == take(old, 4)

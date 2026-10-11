@@ -296,7 +296,7 @@ A plain Python generator usually cannot report its position. To continue the dat
 
 A persistent checkpoint can restore into a different, compatible placement through the trainer's restore template. Whether the process count can change depends on the saved position:
 
-- A global record count can be read at any process count. Every record dataset built on `train_stream` saves this kind of position.
+- A global record count can be read at any process count. Every dataset compiled to a global record order saves this kind of position.
 - One share's own offset, which custom iterators like the one above report, can only be read by a reader of the same share (`DataPartition`), whichever processes those are. Restore refuses any other share and names the shares the checkpoint holds.
 - A checkpoint without a position can change the process count when the tensor layout is compatible.
 

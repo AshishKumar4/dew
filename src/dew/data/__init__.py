@@ -9,18 +9,7 @@ or streamed access for every source in the run.
 from .cache import Cache, Generation
 from .chat import Role
 from .compile import compile, iterate, publish, validation
-from .dataset import (
-    Batch,
-    Checkpointable,
-    Corpus,
-    DataPartition,
-    DataPhase,
-    Dataset,
-    Loading,
-    Ramp,
-    Reader,
-    Stage,
-)
+from .dataset import Batch, Checkpointable, DataPartition, DataPhase, Dataset, Loading, Ramp, Reader, Stage
 from .pipeline import Configured, ObjectiveData, Pipeline, Rejected
 from .preferences import IDS_KEY, MASK_KEY
 from .processors import AutoAudioProcessor
@@ -54,7 +43,6 @@ __all__ = [
     "Chat",
     "Checkpointable",
     "Configured",
-    "Corpus",
     "DataPartition",
     "DataPhase",
     "Dataset",
