@@ -333,6 +333,17 @@ class Pipeline:
     def map_with_index(
         self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None
     ) -> Pipeline:
+        """Map each row with its position in its source, as the read numbers it.
+
+        That is the index of an indexed source, the rows of the earlier shards
+        plus the row's place in its own for a streamed source, and a cache's
+        input index. A filter keeps it, so a rejected row leaves a gap, a
+        flat_map's outputs share their input's, and shuffles, repeats and
+        slices carry it with the row, so it is the same in every read, under
+        a cache, on resume and at any share or worker count. A row built from
+        several (after pack, windows, group or batch) or a mixture of corpora
+        has no single position, so the step is refused there.
+        """
         return self.then(MapWithIndex(step, identity, _rejects(step)))
 
     def filter(

@@ -3,13 +3,14 @@
 import dataclasses
 import itertools
 import json
+from uuid import uuid4
 
 import grain.python as grain
 import numpy as np
 import pytest
 
 from dew.data.cache import Cache
-from dew.data.compile import compile
+from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, Loading
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
@@ -326,3 +327,77 @@ def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
     with pytest.raises(ValueError, match=r"broken.*budget exhausted"):
         next(reader)
     reader.close()
+
+
+@dataclasses.dataclass(frozen=True)
+class Twice:
+    def flat_map(self, element):
+        return [element, {**element, "copy": np.int32(1)}]
+
+
+@dataclasses.dataclass(frozen=True)
+class Placed:
+    def __call__(self, index, element):
+        return {**element, "position": np.int64(index)}
+
+
+@pytest.mark.parametrize("expansion", [False, True])
+def test_map_with_index_reads_the_source_position_in_every_read(expansion):
+    """After a filter each row keeps its place in its source, so a rejected
+    row leaves a gap, and after a flat_map each output shares its input's.
+    Memory, indexed and streamed reads, and the same steps filled into a cache
+    under each read, agree on it across shard boundaries."""
+    stored = Memory(source(10).values, shard_rows=3)
+
+    def steps(pipeline):
+        pipeline = (pipeline.flat_map(Twice(), identity="twice@1") if expansion
+                    else pipeline.filter(lambda row: int(row["id"]) % 2 == 1, identity="odd@1"))
+        return pipeline.map_with_index(Placed(), identity="placed@1")
+
+    expected = ([(index, index) for index in range(10) for _ in range(2)] if expansion
+                else [(index, index) for index in range(1, 10, 2)])
+    for read in ("memory", "indexed", "streamed"):
+        cached = steps(Pipeline(stored)).cache(Cache(f"memory://{uuid4().hex}"))
+        for pipeline in (steps(Pipeline(stored)), cached):
+            rows = iterate(pipeline, read=read, loading=READ)
+            assert [(int(row["id"]), int(row["position"])) for row in rows] == expected, (read, pipeline)
+
+
+def test_map_with_index_is_refused_where_a_row_has_no_source_position():
+    mixed = Pipeline(source()).mix(Pipeline(source()), weights=(1, 1))
+    with pytest.raises(ValueError, match="map_with_index in mixture follows mix"):
+        compile(mixed.map_with_index(Placed()).batch(4), loading=READ)
+    windows = Pipeline(Memory([{"text": np.arange(9, dtype=np.int32)}])).windows(4)
+    with pytest.raises(ValueError, match="follows Windows"):
+        compile(windows.map_with_index(Placed()).batch(1), read="memory", loading=READ)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_token_split_after_a_shuffle_splits_the_shuffled_order(read):
+    """The held quarter is the first quarter of the shuffled order's tokens
+    and the trained branch the rest: disjoint, together the corpus, and
+    counted as the records an epoch trains on."""
+    documents = [{"text": np.arange(100 * index, 100 * index + size, dtype=np.int32)}
+                 for index, size in enumerate((5, 3, 8, 2, 6, 4, 7, 1))]
+    shuffled = [int(token) for document in grain.MapDataset.source(documents).seed(0).shuffle(0)
+                for token in document["text"]]
+
+    def branch(*, held):
+        return Pipeline(Memory(documents)).shuffle(0).token_split(0.25, held=held)
+
+    def rows(pipeline):
+        return [[int(token) for token in row["text"]] for row in iterate(pipeline, read=read, loading=READ)]
+
+    held, train = rows(branch(held=True)), rows(branch(held=False))
+    assert [token for row in held for token in row] == shuffled[:9]
+    assert [token for row in train for token in row] == shuffled[9:]
+    assert compile(branch(held=False).batch(1), read=read, loading=READ).records == len(train)
+
+
+def test_a_stage_without_a_lowering_is_refused_at_compile_time():
+    @dataclasses.dataclass(frozen=True)
+    class Foreign:
+        pass
+
+    with pytest.raises(ValueError, match=r"Foreign in .* is not a pipeline stage"):
+        compile(Pipeline(source()).then(Foreign()).batch(4), loading=READ)
