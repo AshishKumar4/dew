@@ -83,7 +83,7 @@ def test_a_tokenizer_that_does_not_match_the_token_files_is_rejected(tmp_path):
 
 def test_a_corpus_too_small_for_one_batch_is_refused(tmp_path):
     tokens = write_token_files(tmp_path / "tokens", 2 * SEQ, 2 * SEQ)
-    with pytest.raises(ValueError, match="do not fill one batch"):
+    with pytest.raises(ValueError, match="fewer than one batch of 8"):
         run_config(tokens, "--trainer.epochs", "1").run()
 
 

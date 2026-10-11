@@ -556,7 +556,7 @@ def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
 
     for processes in (1, 2):
         assert pooled(open_stream, processes, 5, state, rows=windows_of) == whole[2:]
-    with pytest.raises(ValueError, match="phase 0 reads something else"):
+    with pytest.raises(ValueError, match="saved data plan order changed"):
         load(phased_packed(first, second, (both, 4), (first, None)), batch=4, read="memory",
             loading=READ).train(DataPartition()).set_state(
             state
