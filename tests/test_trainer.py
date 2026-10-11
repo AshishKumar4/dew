@@ -55,6 +55,7 @@ from dew.training import (
 )
 from dew.training.optim import Cosine
 from dew.training.transaction import write_back
+from dew.data.recipes import load
 
 
 def endless():
@@ -436,7 +437,7 @@ def held_lm_trainer(**settings):
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
-    from dew.data import Loading, TokenWindows
+    from dew.data import Loading, Text
     from dew.data.dataset import Forwarding
 
     tokens = np.arange(29, dtype=np.uint16)
@@ -467,8 +468,7 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
             self._source.set_state(state)
 
     def dataset(seen):
-        data = TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
-                            loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=BATCH)
+        data = load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=BATCH, read="memory", seed=7, loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (BATCH))
         return dataclasses.replace(data, train=lambda partition: Observed(data.train(partition), seen))
 
     def trainer(directory):
@@ -523,13 +523,12 @@ def ladder_lm_trainer(directory, fits):
 
 
 def lm_windows(tmp_path):
-    from dew.data import Loading, TokenWindows
+    from dew.data import Loading, Text
 
     tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
     tokens.tofile(tmp_path / "train.bin")
     tokens.tofile(tmp_path / "val.bin")
-    return TokenWindows(path=str(tmp_path), seq_len=4, stride=1, seed=7,
-                        loading=Loading(workers=0, threads=1, read_buffer=1)).load(batch=8)
+    return load(Text(source=str(tmp_path), seq_len=4, stride=1), batch=8, read="memory", seed=7, loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (8))
 
 
 def test_a_resumed_run_compiles_the_rung_its_checkpoint_trained_on(tmp_path, monkeypatch):
@@ -581,7 +580,7 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     before the backend opens. Check every state leaf, not just parameters.
     bf16 at the default precision runs the head that rounds its logits and
     their gradient to bf16, and resumes bit-exactly too."""
-    from dew.data import Loading, TokenWindows
+    from dew.data import Loading, Text
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -592,8 +591,7 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
         "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
         "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
     }))
-    data = TokenWindows(path=str(tmp_path), seq_len=16,
-                        loading=Loading(workers=0)).load(batch=8)
+    data = load(Text(source=str(tmp_path), seq_len=16), batch=8, read="memory", loading=Loading(workers=0), validation_records=4 * (8))
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32, dtype=dtype)
     objective = LMObjective(model, seq_len=16, ema_decay=None)

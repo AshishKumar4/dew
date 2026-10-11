@@ -6,7 +6,7 @@ must match TRL 1.12's DPO path with the defaults (`sigmoid` loss,
 tools/parity_dpo.py writes by running TRL's own `DPOTrainer._compute_loss`
 on fixed logits. `DPOObjective` composes that term with the
 chunked head's per-token log-probabilities, reading the reference from the
-frozen `step.ema`, and `PreferencePairs` stacks the batches it trains on.
+frozen `step.ema`, and `Preferences` stacks the batches it trains on.
 """
 
 import json
@@ -19,11 +19,13 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 from rl_support import TinyHead
 
-from dew.data import DataPartition, Loading, PreferencePairs
-from dew.data.preferences import IDS_KEY, MASK_KEY, PreferenceSource
+from dew.data import DataPartition, Loading, Preferences
+from dew.data.compile import iterate
+from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 from dew.rl import preference_logsigmoid_terms
+from dew.data.recipes import load
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
 VOCAB = 8
@@ -226,12 +228,18 @@ def records(*rows):
     return tuple(json.dumps(row) for row in rows)
 
 
+def preference_rows(rows, pad_id, width):
+    recipe = Preferences(source=tuple(json.loads(row) for row in rows), seq_len=width, pad_id=pad_id)
+    pipeline, _, _ = recipe.pipelines()
+    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+
+
 PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
         "chosen_mask": [0, 0, 1, 1], "rejected_mask": [0, 0, 1]}
 
 
 def test_pairs_stack_chosen_over_rejected():
-    source = PreferenceSource.from_records(records(PAIR), 0, 4)
+    source = preference_rows(records(PAIR), 0, 4)
 
     batch = source[0]
 
@@ -241,7 +249,7 @@ def test_pairs_stack_chosen_over_rejected():
 
 def test_missing_masks_default_to_all_completion():
     row = {"chosen": [1, 2], "rejected": [3]}
-    source = PreferenceSource.from_records(records(row), 0, 4)
+    source = preference_rows(records(row), 0, 4)
 
     batch = source[0]
 
@@ -250,24 +258,24 @@ def test_missing_masks_default_to_all_completion():
 def test_a_ragged_pair_is_refused():
     row = dict(PAIR, chosen_mask=[0, 1, 1])
     with pytest.raises(ValueError, match="as long as its ids"):
-        PreferenceSource.from_records(records(row), 0, 4)[0]
+        preference_rows(records(row), 0, 4)[0]
     row = dict(PAIR, chosen=[1, "x"])
     with pytest.raises(ValueError, match="token ids"):
-        PreferenceSource.from_records(records(row), 0, 4)[0]
+        preference_rows(records(row), 0, 4)[0]
     row = dict(PAIR, rejected_mask=[0, 0, 2])
     with pytest.raises(ValueError, match="0/1"):
-        PreferenceSource.from_records(records(row), 0, 4)[0]
+        preference_rows(records(row), 0, 4)[0]
 
 
 def test_an_incomplete_row_is_refused():
     with pytest.raises(ValueError, match="both chosen and rejected"):
-        PreferenceSource.from_records(records({"chosen": [1]}), 0, 4)
+        preference_rows(records({"chosen": [1]}), 0, 4)
     with pytest.raises(ValueError, match="unknown fields"):
-        PreferenceSource.from_records(records(dict(PAIR, reward=1.0)), 0, 4)
+        preference_rows(records(dict(PAIR, reward=1.0)), 0, 4)
     with pytest.raises(ValueError, match="an object"):
-        PreferenceSource.from_records(records([1, 2]), 0, 4)[0]
-    with pytest.raises(ValueError, match="no pairs"):
-        PreferenceSource.from_records((), 0, 4)
+        preference_rows(records([1, 2]), 0, 4)[0]
+    with pytest.raises(ValueError, match="accepted|pairs|empty"):
+        load(Preferences(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
 
 
 def test_parquet_pairs_batch_in_pairs(tmp_path):
@@ -280,8 +288,7 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
         "chosen_mask": [[0, 0, 1, 1]], "rejected_mask": [[0, 0, 1]],
     }), path)
 
-    data = PreferencePairs(path=str(path), seq_len=4,
-                           loading=Loading(workers=0)).load(batch=1)
+    data = load(Preferences(source=str(path), seq_len=4), batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1))
 
     assert data.records == 1
     batch = next(data.train(DataPartition()))
@@ -297,8 +304,7 @@ def test_varied_rows_pad_to_one_window():
     rows = records(
         {"chosen": [1, 2, 3, 4], "rejected": [5]},
         {"chosen": [6], "rejected": [7, 8]})
-    data = PreferencePairs(records=rows, seq_len=4,
-                           loading=Loading(workers=0)).load(batch=2)
+    data = load(Preferences(source=tuple(json.loads(row) for row in rows), seq_len=4), batch=2, read="memory", loading=Loading(workers=0), validation_records=4 * (2))
 
     batch = next(data.train(DataPartition()))
 
@@ -312,9 +318,9 @@ def test_varied_rows_pad_to_one_window():
 def test_an_overlong_row_is_refused():
     row = {"chosen": [1, 2, 3, 4, 5], "rejected": [1]}
     with pytest.raises(ValueError, match="shorten the row"):
-        PreferenceSource.from_records(records(row), 0, 4)
+        preference_rows(records(row), 0, 4)
     with pytest.raises(ValueError, match="seq_len"):
-        PreferenceSource.from_records(records(PAIR), 0, 0)
+        preference_rows(records(PAIR), 0, 0)
 
 
 def test_parquet_without_sides_is_refused(tmp_path):
@@ -324,9 +330,9 @@ def test_parquet_without_sides_is_refused(tmp_path):
     path = tmp_path / "nopairs.parquet"
     pq.write_table(pa.table({"chosen": [[1]]}), path)
     with pytest.raises(ValueError, match="rejected column is required"):
-        PreferencePairs(path=str(path)).load(batch=1)
+        load(Preferences(source=str(path)), batch=1, read="memory", validation_records=4 * (1))
 
 
-def test_the_dataset_reads_one_source():
-    with pytest.raises(ValueError, match="one source"):
-        PreferencePairs().load(batch=2)
+def test_unknown_recipe_fields_are_refused_before_reading_pairs():
+    with pytest.raises(ValueError, match="unknown fields"):
+        load("preferences", source=(PAIR,), batch=2, read="memory", records=(PAIR,))

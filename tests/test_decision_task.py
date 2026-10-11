@@ -245,7 +245,12 @@ def passed(objective, variables, examples):
 
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     rows = []
-    for batch in objective.held_out(examples, batch=8)(DataPartition()):
+    from dew.data.compile import validation
+    from dew.decision.data import Decisions as DecisionRecipe
+
+    pipeline, _, _ = DecisionRecipe(source=examples).pipelines()
+    reader = validation(pipeline, batch=8, objective=objective.data(), read="memory")
+    for batch in reader(DataPartition()):
         probabilities = np.asarray(objective.evaluate(variables, batch, step).probabilities)
         logits = np.asarray(objective._logits(variables, laid_out(batch)))
         # A batch the pass filled with repeats marks its real rows.

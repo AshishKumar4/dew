@@ -7,7 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
-from dew.data import DataPartition, Loading, TokenWindows
+from dew.data import DataPartition, Loading, Text
+from dew.data.recipes import load
 
 NANOGPT = Path(__file__).resolve().parent / "fixtures" / "nanogpt"
 BATCHES = np.load(NANOGPT / "batch.npz")
@@ -28,8 +29,7 @@ def test_a_nanogpt_directory_reads_the_windows_get_batch_reads():
             np.testing.assert_array_equal(every[int(offset)][1:], y)
 
     # 16 rows a batch divides the epoch, so its batches are the epoch exactly.
-    data = TokenWindows(path=str(NANOGPT), seq_len=block, stride=1, val_batches=None,
-                        loading=Loading(workers=0)).load(batch=16)
+    data = load(Text(source=str(NANOGPT), seq_len=block, stride=1), batch=16, read="memory", loading=Loading(workers=0))
     assert data.records == len(every) and data.records % 16 == 0
     epoch = data.train(DataPartition())
     try:

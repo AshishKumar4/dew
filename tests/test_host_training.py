@@ -24,6 +24,7 @@ from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, freeze
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
+from dew.data import Records, load
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
@@ -464,7 +465,7 @@ def test_a_cpu_owned_lora_run_loads_through_the_pipeline_in_a_fresh_process(tmp_
     checkpoints = Checkpoints(str(tmp_path / "run"))
     rows = [{"text": np.arange(1, 10, dtype=np.int32)} for _ in range(8)]
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST, checkpoints=checkpoints)
-    data = Dataset.from_records(rows, batch=jax.device_count(), loading=Loading(workers=0))
+    data = load(Records(source=rows), batch=jax.device_count(), loading=Loading(workers=0), read="memory")
     state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     assert any(group_layers(name) and len(group_layers(name)) > 1 for name in state.variables[FROZEN])

@@ -26,7 +26,7 @@ block and compiles it again.
 from encoder import RULES
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
-from dew.decision import DecisionMixture
+from dew.decision import Decisions
 from dew.decision.config import DecisionRunConfig, JointShape
 from dew.lora import LoRA
 from dew.training.optim import Cosine
@@ -42,7 +42,7 @@ def run_config() -> DecisionRunConfig:
         pretrained="Qwen/Qwen3.5-4B", revision="851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a",
         model=ModelConfig("causal_transformer", {"dtype": "bfloat16"}),
         lora=LoRA(rank=64, modules=PROJECTIONS), head=JointShape(),
-        mixture=DecisionMixture("data/mixture"),
+        data=Decisions("data/mixture"),
         objective=ObjectiveConfig("decision", {"loss": RULES, "label_smoothing": 0.05}),
         optim=OptimConfig(learning_rate=1e-4, schedule=Cosine(peak=1e-4, warmup_steps=400)),
         trainer=TrainerConfig(batch_size=4, steps=12_000, eval_every=1_000, checkpoint_every=1_000),

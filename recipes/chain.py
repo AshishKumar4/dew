@@ -24,7 +24,7 @@ import jax
 import optax
 from flax import linen as nn
 
-from dew.data import ChatMessages, PreferencePairs, Prompts
+from dew.data import Chat, Loading, Preferences, Prompts, load
 from dew.data.chat import Role
 from dew.objectives.base import Variables
 from dew.objectives.lm import LMObjective
@@ -37,7 +37,7 @@ from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
 class Stage:
     """One link: `data` trained for `steps` gradient steps.
 
-    The data decides the loss: `ChatMessages` trains SFT, `PreferencePairs`
+    The data decides the loss: `Chat` trains SFT, `Preferences`
     DPO and `Prompts` GRPO. `beta` is the DPO or GRPO KL strength, 0.1 for
     DPO and 0.0 for GRPO when None; an SFT stage refuses one. A GRPO stage
     names its `reward` and sampling sizes, and refuses to run without a
@@ -45,18 +45,20 @@ class Stage:
     """
 
     name: str
-    data: ChatMessages | PreferencePairs | Prompts
+    data: Chat | Preferences | Prompts
     steps: int = 100
     beta: float | None = None
     reward: Reward | None = None
     groups: int = 4
     max_new_tokens: int = 32
     estimator: str = "group"
+    seed: int = 0
+    loading: Loading = dataclasses.field(default_factory=Loading)
 
     def __post_init__(self) -> None:
         if self.steps < 1:
             raise ValueError(f"stage {self.name!r} runs {self.steps} steps: at least one")
-        if isinstance(self.data, ChatMessages) and self.beta is not None:
+        if isinstance(self.data, Chat) and self.beta is not None:
             raise ValueError(
                 f"stage {self.name!r} sets beta on an SFT stage, which has no KL term")
         if isinstance(self.data, Prompts) and self.reward is None:
@@ -65,7 +67,7 @@ class Stage:
 
     @property
     def kind(self) -> str:
-        return {ChatMessages: "sft", PreferencePairs: "dpo", Prompts: "grpo"}[type(self.data)]
+        return {Chat: "sft", Preferences: "dpo", Prompts: "grpo"}[type(self.data)]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -106,7 +108,8 @@ class Recipe:
             print(f"Stage {index + 1}/{len(self.stages)}: {stage.name} "
                   f"({stage.kind}, {stage.steps} steps)")
             states.append(trainer.fit(
-                stage.data.load(batch=self.batch), steps=stage.steps))
+                load(stage.data, batch=self.batch, read="memory", seed=stage.seed, loading=stage.loading),
+                steps=stage.steps))
             variables = states[-1].variables
         return states
 
@@ -114,10 +117,10 @@ class Recipe:
                variables: Variables | None) -> tuple[LMObjective, Rollout | None]:
         """The stage's objective over the shared model, continuing `variables`
         past the first stage, with its rollout beside it for GRPO."""
-        if isinstance(stage.data, ChatMessages):
+        if isinstance(stage.data, Chat):
             return LMObjective(self.model, stage.data.seq_len, loss_role=Role.ASSISTANT,
                                variables=variables), None
-        if isinstance(stage.data, PreferencePairs):
+        if isinstance(stage.data, Preferences):
             beta = 0.1 if stage.beta is None else stage.beta
             return DPOObjective(self.model, stage.data.seq_len - 1, beta=beta,
                                 variables=variables), None
