@@ -3,8 +3,9 @@
 A batch pads every row to the most questions times the most options, and a
 row's real options are a few of them. The joint head computes each option on
 its own but for its weight in its question's summary, so over the compacted
-options it scores every real option as it does over the grid: to float32
-rounding against the grid, bit for bit at any number of option slots.
+options it scores every real option as it does over the grid, to float32
+rounding, whatever the number of option slots: XLA's products sum in an
+order that may follow how many rows they multiply.
 """
 
 import dataclasses
@@ -77,10 +78,12 @@ def test_a_rows_real_options_compact_in_order_and_a_row_over_the_cap_is_refused(
 
 def test_clefs_head_scores_compacted_options_as_it_scores_the_grid():
     """Clef's trained tiny head over the five cases: every real option's
-    logit as over the grid to float32 rounding, and bit for bit at two
-    numbers of option slots; a slot with no real option scores zero, which
-    the model's logits mask (`DecisionModel.logits`). The head's parameters
-    do not depend on the number of slots."""
+    logit as over the grid at two numbers of option slots, to float32
+    rounding (on armada's CPUs they moved by up to 6.6e-7 in logits of about 0.6
+    at two numbers of slots); a slot with no real option scores zero,
+    which the model's logits mask (`DecisionModel.logits`). The head's
+    parameters do not depend on the number of slots, so a checkpoint trained
+    at one serves at another."""
     loaded, table, inputs, states = clef_batch()
     most = int(np.max(np.sum(np.asarray(inputs.options).reshape(len(states), -1), axis=1)))
     assert most < inputs.options.shape[1] * inputs.options.shape[2]
@@ -91,9 +94,12 @@ def test_clefs_head_scores_compacted_options_as_it_scores_the_grid():
 
     grid, fewest, more = scores(None), scores(most), scores(most + 5)
     real = np.asarray(inputs.options)
-    np.testing.assert_allclose(fewest[real], grid[real], rtol=0, atol=1e-5 * np.abs(grid[real]).max())
-    np.testing.assert_array_equal(fewest[real], more[real])
-    assert not np.any(fewest[~real]) and not np.any(more[~real])
+    for compact in (fewest, more):
+        np.testing.assert_allclose(compact[real], grid[real], rtol=0, atol=1e-5 * np.abs(grid[real]).max())
+        assert not np.any(compact[~real])
+    drawn = [jax.eval_shape(loaded.head.init, jax.random.key(0), states, with_slots(inputs, slots), table)
+             for slots in (None, most, most + 5)]
+    assert drawn[0] == drawn[1] == drawn[2]
 
 
 def ragged() -> list[Example]:
