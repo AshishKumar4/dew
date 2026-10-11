@@ -700,6 +700,11 @@ class DevicePrefetchIterator:
     raises TypeError. After each batch the iterator returns, `source_state`
     holds the source's position after that batch.
 
+    `prepare`, when supplied, transforms the source's host batch before
+    placement, on the same worker and after its checkpoint position is read.
+    Analytical per-row telemetry therefore travels with its own batch and
+    never requires a synchronous device-to-host read in the step loop.
+
     If the worker thread cannot be created, the source is finalized on the
     caller's thread before the error is re-raised; no worker has touched it at
     that point. That path runs the source's close synchronously, so the close

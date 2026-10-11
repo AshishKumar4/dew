@@ -23,8 +23,10 @@ The forward work is analytical, not inferred from HLO: `Counted.model_flops(leng
 receives the real lengths of independent rows or packed segments. One multiply-add
 counts as two operations. A dense projection contributes `2 * in * out` per real
 token; QK and AV together contribute `2 * heads * head_dim * L²` for causal
-attention, twice that for non-causal attention. Lookup embeddings, padding and
-rematerialization are excluded. Every executed loop pass counts once.
+attention, twice that for non-causal attention. Lookups are excluded; every
+matmul is counted, including patch input projections and per-row timestep or
+conditioning MLPs. Padding and rematerialization are excluded. Every executed
+loop pass counts once.
 
 The chunked gated delta rule contributes
 `4 * Hv * Dk * Dv + 2 * Hv * C * (Dk + Dv)` per token, in addition to its learned

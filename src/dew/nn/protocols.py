@@ -55,7 +55,7 @@ if TYPE_CHECKING:
     from dew.nn.mla import MLAMixer
     from dew.records import JSON
 
-__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedLogits",
+__all__ = ["AffineHead", "BlockDenoiser", "CacheCapacity", "Counted", "CountedImages", "CountedLogits",
            "DecoderTraining", "DenoisingModel",
            "HiddenStates", "IntervalModel", "LayerScalars", "Logits", "LogitsFromHidden", "Looping",
            "ModelKwarg", "OutputTable", "ProjectionGroup", "Recomputing", "RematChoosing", "RequiresText",
@@ -113,6 +113,21 @@ class CountedLogits(Counted, Protocol):
     """
 
     def logits_flops(self, lengths: np.ndarray) -> float: ...
+
+
+@runtime_checkable
+class CountedImages(Protocol):
+    """A patch-token model's forward work with channel/conditioning geometry.
+
+    Models whose patch projection infers its channels at init cannot derive
+    that map's input width from token lengths alone. The objective supplies
+    `input_channels` and the pooled text width (None for no text).
+    """
+
+    def image_flops(self, lengths: np.ndarray, input_channels: int,
+                    text_features: int | None = None) -> float: ...
+
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray: ...
 
 
 @runtime_checkable
