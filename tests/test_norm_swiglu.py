@@ -1,13 +1,13 @@
 """The interpreted fused norms and SiLU products against XLA and float64.
 
 Every operand gradient is checked, including the fp32 weight's column sum
-and Dew's bf16 cotangent roundings. Ragged tiles and enough rows to make
+and Liger's fp32-intermediate VJP contract. Ragged tiles and enough rows to make
 each norm program accumulate multiple blocks exercise the masked paths.
-The variant fixtures hold every output and gradient to 1e-5 maximum
-relative error from XLA. The larger random bf16 stress explicitly permits
-one-ulp midpoint flips from different reduction grouping, and bounds its
-RMS error against float64 by XLA's own error instead. fp32 results, the
-weight gradient included, retain the 1e-5 maximum-relative check.
+The fp32 fixtures hold every output and gradient to 1e-5 maximum relative
+error from XLA. The bf16 VJPs keep wider intermediates than XLA's autodiff,
+so their contract is distance from float64, not bitwise XLA agreement.
+Forwards retain each model's cast sites. Small-shape c53 fixtures also hold
+the fused VJPs to Liger's measured float64 distances.
 """
 
 import functools
@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.ad_checkpoint import print_saved_residuals
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, distance
 
 from dew.nn import attention, kernels
 from dew.nn.attention import RMSNorm, forward_mode_attention, rms_normalized, unweighted_rmsnorm
@@ -51,7 +51,8 @@ def compare(functions, operands, seed, labels):
             assert theirs is None and want is None
             continue
         assert mine.dtype == theirs.dtype, label
-        assert relative(mine, theirs) < 1e-5, label
+        if mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
+            assert relative(mine, theirs) < 1e-5, label
         assert_as_exact_as_the_reference(mine, theirs, want, label)
 
 
@@ -98,13 +99,10 @@ def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"))
 
 
-def test_random_bf16_midpoint_flips_stay_as_exact_as_xla_against_float64():
-    """At Qwen3.5-0.8B's row count the fp32 reductions land on both sides of bf16
-    midpoints. A maximum-relative XLA tolerance of 1e-5 cannot describe a
-    one-ulp flip. Outputs stay within one ulp of XLA; gradients can lose
-    further ulps near cancellation, and every output and gradient is held
-    to XLA's float64 RMS error budget. The fp32 column sum still meets the
-    maximum-relative 1e-5 tolerance."""
+def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
+    """The real-row stress holds every output and gradient to XLA's float64
+    RMS budget, while fp32 columns retain the 1e-5 relative bound. BF16
+    gradients deliberately do not reproduce XLA's intermediate roundings."""
     operands, seed = norm_operands((24576, 17), jnp.bfloat16, jnp.float32)
     xla, pallas, exact = norm_functions(jnp.bfloat16, offset=True, after_cast=True)
     reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
@@ -117,12 +115,6 @@ def test_random_bf16_midpoint_flips_stay_as_exact_as_xla_against_float64():
         assert_as_exact_as_the_reference(mine, theirs, want, label)
         if mine.dtype == jnp.float32:
             assert relative(mine, theirs) < 1e-5, label
-        elif label == "y":
-            expected = np.asarray(theirs, np.float64)
-            above = np.asarray(jnp.nextafter(theirs, jnp.full_like(theirs, jnp.inf)), np.float64)
-            below = np.asarray(jnp.nextafter(theirs, jnp.full_like(theirs, -jnp.inf)), np.float64)
-            assert np.all(np.abs(np.asarray(mine, np.float64) - expected)
-                          <= np.maximum(above - expected, expected - below)), label
 
 
 @pytest.mark.parametrize("input_dtype,output_dtype", [(jnp.bfloat16, jnp.float32),
@@ -317,3 +309,58 @@ def test_norm_jvp_without_a_context_uses_xla():
     for mine, theirs in zip(jax.jvp(lambda x: pallas(x, None), (x,), (x,)),
                             jax.jvp(lambda x: xla(x, None), (x,), (x,)), strict=True):
         np.testing.assert_array_equal(mine, theirs)
+
+
+# Same-session c53, A100-SXM4-40GB, Liger 0.8.4 / torch 2.11.0+cu130:
+# dew-aux-c53-norm-swiglu-20261010-job-1, result.json, accuracy shape [257,127].
+LIGER_RMS_ERRORS = {
+    "rms_norm": (0.0017684225615251462, 0.0012577999558486422, 0.03934815194557525),
+    "swiglu": (0.0014667377536021014, 0.0010115300863026556, 0.0009935534908141895),
+}
+
+
+@pytest.mark.parametrize("operation", ["rms_norm", "swiglu"])
+def test_c53_gradients_are_as_close_to_float64_as_xla_and_measured_liger(operation):
+    """The measured operands and independent float64 equations from c53.
+
+    CPU and CUDA can differ by a few fp32 ulps inside a reduction or exp.
+    Four fp32 epsilons of the truth's RMS allow that backend floor, not an
+    extra bf16 rounding: the old rounded VJPs miss these bounds by ~40%.
+    """
+    shape = (257, 127)
+    x = jnp.asarray(np.random.default_rng(61).standard_normal(shape, dtype=np.float32), jnp.bfloat16)
+    seed = jnp.asarray(np.random.default_rng(62).standard_normal(shape, dtype=np.float32), jnp.bfloat16)
+    second = np.random.default_rng(63).standard_normal(
+        (shape[-1],) if operation == "rms_norm" else shape, dtype=np.float32)
+    if operation == "rms_norm":
+        scale = jnp.asarray(np.float32(0.7) + np.float32(0.2) * second)
+        operands = (x, scale)
+
+        def function(implementation):
+            return lambda x, scale: rms_normalized(
+                x, scale, 1e-6, jnp.bfloat16, scale_offset=False, scale_after_cast=True,
+                fp32_statistics=True, implementation=implementation)
+    else:
+        operands = (x, jnp.asarray(second, jnp.bfloat16))
+
+        def function(implementation):
+            return gated_product("swiglu", implementation=implementation)
+
+    reference = jax.jit(functools.partial(evaluated, function("xla")))(operands, seed)
+    actual = jax.jit(functools.partial(evaluated, function("pallas")))(operands, seed)
+    first, second = (np.asarray(value, np.float64) for value in operands)
+    dy = np.asarray(seed, np.float64)
+    if operation == "rms_norm":
+        inverse = 1 / np.sqrt(np.mean(first * first, axis=-1, keepdims=True) + 1e-6)
+        normalized, m = first * inverse, dy * second
+        truth = (normalized * second,
+                 inverse * (m - normalized * np.mean(m * normalized, axis=-1, keepdims=True)),
+                 np.sum(dy * normalized, axis=0))
+    else:
+        sigmoid = 1 / (1 + np.exp(-first))
+        activated = first * sigmoid
+        truth = (activated * second, dy * second * (sigmoid + activated * (1 - sigmoid)), dy * activated)
+    for index, (mine, theirs, want, measured) in enumerate(zip(
+            actual, reference, truth, LIGER_RMS_ERRORS[operation], strict=True)):
+        floor = 4 * np.finfo(np.float32).eps * np.sqrt(np.mean(np.square(want)))
+        assert distance(mine, want) <= min(distance(theirs, want), measured) + floor, (operation, index)

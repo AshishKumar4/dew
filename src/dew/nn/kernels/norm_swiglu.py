@@ -7,18 +7,21 @@ kernels follow linkedin/Liger-Kernel's ops/rms_norm.py and ops/swiglu.py:
 save only a row's inverse RMS, accumulate weight gradients per program,
 and recompute sigmoid from the two narrow SwiGLU inputs in reverse.
 
-Dew's rounded_to also rounds cotangents, unlike Liger's straight-through
-casts. Both passes reproduce those roundings; in particular SwiGLU's up
-gradient reads the rounded activation, not the unrounded SiLU. No hardware
-generation selects these kernels until c53 measures the complete VJPs.
+Dew's portable rounded_to also rounds cotangents. These fused VJPs instead
+use Liger's numerical contract: fp32 intermediate gradients and one cast at
+each gradient output. Forwards retain the model's cast sites, including
+cast-before-scale RMSNorm and SiLU rounded before the up product. RMSNorm's
+weight gradient reads that forward's rounded activation; SwiGLU's backward
+recomputes SiLU in fp32, as Liger does. At c53's [257,127] bf16 shape, Liger's
+norm dx was 1.26e-3 RMS from float64 against the rounded VJP's 1.78e-3;
+SwiGLU's gate gradient was 1.00e-3 against 1.45e-3 (A100). No generation
+selects these kernels until c53 measures their physical GPU kernel times.
 
 The fp32 tests hold maximum relative differences from XLA below 1e-5.
-At bf16 rounding midpoints, changing the reduction grouping can flip an
-output or input gradient by one bf16 ulp, despite the same arithmetic and
-rounding sites. The large random bf16 stress therefore also measures both
-implementations against float64, holding RMS error to the reference's
-budget (tests/reference_error.py), not promising 1e-5 maximum relative
-agreement after bf16 rounding. c53 reports the actual largest differences.
+The bf16 tests compare outputs and every gradient against float64, not
+bitwise against XLA's differently rounded autodiff. Forward midpoint flips
+can also differ by one ulp because reductions group differently. c53 keeps
+both distances and maximum-relative differences in its measurement report.
 """
 
 import functools
@@ -148,8 +151,6 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
         dy = plgpu.load(dy_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
         inverse = plgpu.load(inverse_ref.at[row], mask=row < rows, other=0)
         m = dy * weight
-        if scale_ref is not None and after_cast:
-            m = _round(m, dy_ref.dtype, interpret)
         # The two x contributions are kept separate, as XLA's square VJP is.
         correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) * (1.0 / width)
         dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
@@ -229,9 +230,8 @@ def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, interpret: boo
     up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     dy = plgpu.load(dy_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     sigmoid = jax.nn.sigmoid(gate)
-    activated = _round(gate * sigmoid, gate_ref.dtype, interpret)
-    dactivated = _round(dy * up, gate_ref.dtype, interpret)
-    dg = dactivated * sigmoid + (dactivated * gate) * (sigmoid * (1.0 - sigmoid))
+    activated = gate * sigmoid
+    dg = dy * (activated * (1.0 - sigmoid) + sigmoid) * up
     plgpu.store(dg_ref.at[index], dg.astype(gate_ref.dtype), mask=mask)
     plgpu.store(du_ref.at[index], (dy * activated).astype(up_ref.dtype), mask=mask)
 
