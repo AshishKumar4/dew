@@ -1,8 +1,4 @@
-"""PyTorch map-style datasets as a grain source.
-
-This module imports torch, so only `Dataset.from_torch` imports it, never
-`import dew.data`.
-"""
+"""Map-style torch datasets, imported on use and read through the shared pipeline."""
 
 from __future__ import annotations
 
