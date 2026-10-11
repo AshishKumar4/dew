@@ -105,8 +105,8 @@ class Counted(Protocol):
 
 
 @runtime_checkable
-class CountedLogits(Protocol):
-    """The vocabulary head's forward work, separately from hidden states.
+class CountedLogits(Counted, Protocol):
+    """A counted token backbone with separate vocabulary-head work.
 
     `lengths` counts predicted real tokens. A plain head contributes
     2*width*vocabulary per token, whether its matrix is tied or tiled.

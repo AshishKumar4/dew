@@ -18,7 +18,8 @@ FORWARD_FLOPS = "__dew_forward_flops"
 TOKENS = "__dew_real_tokens"
 
 
-def prepare_counts(objective: Objective, batch: Batch, *, count_model: bool) -> Batch:
+def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Batch, *,
+                                 count_model: bool) -> Batch:
     """Count the source's host rows, preserving its checkpoint and model inputs."""
     if not count_model and not objective.counts_tokens:
         return batch
