@@ -118,6 +118,9 @@ def device_generation() -> str:
 # The kernel each choice runs per generation, as measured (docs/performance.md, "Kernel choices per
 # generation"); a generation a row does not name runs the choice's portable path.
 KERNELS: dict[str, dict[str, str]] = {
+    # Candidate row reductions and SiLU products: no generation opts in before c53's GPU VJP timings.
+    'rms_norm': {},
+    'swiglu': {},
     # FlashAttention-2 (dew_flash_attn) beat cuDNN by 4-8% in Qwen3-0.6B's training step on the A100,
     # and the xla path 256-wide heads take by 17%; on the RTX 4080 by 1.9-2.5% in the decoder and DiT
     # steps, and on the L4 by under 3%.
