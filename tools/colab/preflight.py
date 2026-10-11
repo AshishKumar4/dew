@@ -644,7 +644,7 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     else:
         failures += unverified
     receipt["lowered"] = lowered(tree, args.hardware, args.dew_python, trains(texts, args.command),
-                                 lowering_env(texts, args.command), failures)
+                                 lowering_env(texts, args.command), failures, geometry(texts, args.command))
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
@@ -901,17 +901,45 @@ def lowering_env(texts: dict[str, str], command: str) -> dict[str, str]:
     return env
 
 
+# The request's flags the lowered step takes, by clef_step's own: the checkpoint whose layers it copies
+# and its commit, and the step's rows.
+GEOMETRY = {"like": r"pretrained", "revision": r"revision", "max-len": r"max[-_]len",
+            "batch": r"trainer\.batch[-_]size"}
+
+
+def geometry(texts: dict[str, str], command: str) -> dict[str, str]:
+    """The checkpoint, its commit, the row length and the batch the request's training names, as the
+    first flag in the command or a staged script gives each (`--pretrained Qwen/Qwen3.5-0.8B`, or
+    `"--pretrained", "Qwen/Qwen3.5-0.8B"` in a Python list): the step lowers with that checkpoint's
+    layer widths and those rows (`clef_step --like`). A local checkpoint, which this host lacks,
+    leaves the tiny model's widths, and says so."""
+    found: dict[str, str] = {}
+    for name, flag in GEOMETRY.items():
+        pattern = re.compile(rf"--{flag}[\"'\s,=]+([\w./-]+)")
+        for text in [command, *texts.values()]:
+            if name not in found and (match := pattern.search(text)) and match[1] != "None":
+                found[name] = match[1]
+    if found.get("like", "").startswith("/"):
+        found["local"] = found.pop("like")
+        found.pop("revision", None)
+    return found
+
+
 def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: dict[str, str],
-            failures: list[str]) -> dict:
+            failures: list[str], shape: dict[str, str] | None = None) -> dict:
     """For a request that trains (`sites`), the Clef recipe's step at the ref lowered on this CPU for
     `hardware`'s generation over one device, as Colab's GPU runs it, under the request's JAX and XLA
     settings (tools/clef_step.py, `TrainerConfig.lower_for`): every Pallas-Triton lowering the step
-    makes, which otherwise first runs in the GPU's own compile, where c58 and c57 died. A request
-    that trains nothing, such as a kernel bench, has no step to lower."""
+    makes, which otherwise first runs in the GPU's own compile, where c58 and c57 died. The step
+    takes the layer widths of the checkpoint the request trains, and its rows, where the request
+    names them (`geometry`), else the tiny model's (`model`). A request that trains nothing, such
+    as a kernel bench, has no step to lower."""
     if not sites:
         return {"skipped": "no training entry"}
     generation, script = GENERATIONS[hardware], tree / "tools" / "clef_step.py"
-    found: dict = {"generation": generation, "devices": 1, "env": env, "sites": list(sites)}
+    shape = shape or {}
+    found: dict = {"generation": generation, "devices": 1, "env": env, "sites": list(sites),
+                   "model": shape.get("like", "tiny"), "geometry": shape}
     if not script.is_file():
         failures.append(f"the request trains ({', '.join(sites[:3])}) at a ref that predates the lowering "
                         "dry run (tools/clef_step.py), the check c58's failure needs")
@@ -920,8 +948,9 @@ def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: d
     environment = {**os.environ, **env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(tree / "src")}
     with tempfile.TemporaryDirectory(prefix="dew-lowered-") as work:
         try:
-            done = subprocess.run([python, str(script), "--lower-for", generation, "--devices", "1", "--work",
-                                   work], capture_output=True, text=True, cwd=tree, env=environment,
+            flags = [f"--{name}={value}" for name, value in shape.items() if name != "local"]
+            done = subprocess.run([python, str(script), "--lower-for", generation, "--devices", "1", *flags,
+                                   "--work", work], capture_output=True, text=True, cwd=tree, env=environment,
                                   timeout=LOWERING_TIMEOUT)
         except subprocess.TimeoutExpired:
             failures.append(f"the Clef step's lowering for {generation} ran past {LOWERING_TIMEOUT} s")

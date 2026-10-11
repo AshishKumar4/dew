@@ -398,10 +398,15 @@ def test_a_training_request_lowers_the_refs_clef_step_under_its_own_jax_settings
     failures.clear()
     found = preflight.lowered(tree, "gpu:G4", sys.executable, ["run.sh:2"], env, failures)
     assert not failures
-    assert found == {"generation": "sm120", "devices": 1, "env": env, "sites": ["run.sh:2"],
-                     "script": hashlib.sha256(FAKE_STEP.encode()).hexdigest(),
+    assert found == {"generation": "sm120", "devices": 1, "env": env, "sites": ["run.sh:2"], "model": "tiny",
+                     "geometry": {}, "script": hashlib.sha256(FAKE_STEP.encode()).hexdigest(),
                      "kernels": {"args": "--lower-for sm120 --devices 1 --work", "platforms": "cpu",
                                  "flags": "--xla_a=1 --xla_b=2", "path": str(tree / "src")}}
+    shape = {"like": "Qwen/Qwen3.5-9B", "max-len": "3072"}
+    found = preflight.lowered(tree, "gpu:G4", sys.executable, ["run.sh:2"], env, failures, shape)
+    assert found["model"] == "Qwen/Qwen3.5-9B" and found["geometry"] == shape and not failures
+    assert found["kernels"]["args"] == ("--lower-for sm120 --devices 1 --like=Qwen/Qwen3.5-9B --max-len=3072 "
+                                        "--work")
     write(tree, {"tools/clef_step.py": "import sys\nsys.exit('ValueError: not enough values to unpack')\n"})
     found = preflight.lowered(tree, "gpu:A100", sys.executable, ["run.sh:2"], {}, failures)
     assert len(failures) == 1 and "does not lower for sm80" in failures[0]
@@ -470,3 +475,16 @@ def test_the_lab_gate_reads_what_the_preflight_reads(tmp_path, monkeypatch):
     records[f"lab/verified/a100/{found['digest']}.json"] = {"ok": True, "ref": "abc", "gpu": "a100"}
     assert lab_gate.gate(tree, "a100")[1] == []
     assert lab_gate.gate(tree, "g4") == ({"generation": "sm120", "pallas": []}, [])
+
+
+def test_the_lowered_step_takes_the_checkpoint_and_rows_the_request_trains():
+    """c58's profile script handed the recipe its checkpoint in a Python list and its command its batch:
+    the step lowers with that checkpoint's widths at those rows. A checkpoint on the VM's disk, which
+    this host lacks, leaves the tiny model's widths and is named."""
+    texts = {"c50_profile.py": 'flags = ["--pretrained", "Qwen/Qwen3.5-0.8B", "--revision", "abc123",\n'
+                               '         "--max-len", "3072"]\n',
+             "c58.sh": "python c50_profile.py --trainer.batch-size 8\n"}
+    assert preflight.geometry(texts, "bash c58.sh") == {"like": "Qwen/Qwen3.5-0.8B", "revision": "abc123",
+                                                        "max-len": "3072", "batch": "8"}
+    local = "python recipes/decision/clef.py --pretrained /content/ckpt --revision None"
+    assert preflight.geometry({}, local) == {"local": "/content/ckpt"}
