@@ -29,6 +29,7 @@ from huggingface_hub import HfFileSystem
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
+from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention
 from dew.records import JSON, json_value
 
@@ -307,6 +308,17 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         max_bytes = _byte_size(max_bytes)
         if max_bytes <= 0:
             raise ValueError("dewcache max_bytes must be positive")
+        if "cache_storage" not in kwargs:
+            remote = kwargs.get("fs")
+            namespace = kwargs.get("target_protocol")
+            if isinstance(remote, AbstractFileSystem):
+                namespace = remote.protocol
+                if isinstance(remote, S3FileSystem):
+                    namespace = (namespace, remote.endpoint_url or remote.client_kwargs.get("endpoint_url"))
+                elif isinstance(remote, DewDataFileSystem):
+                    namespace = (namespace, remote.endpoint)
+            digest = hashlib.sha256(json.dumps(namespace, sort_keys=True).encode()).hexdigest()[:16]
+            kwargs["cache_storage"] = os.path.join(dew_cache_dir(), "transport", digest)
         super().__init__(**{"check_files": True, **kwargs})
         if len(self.storage) != 1:
             raise ValueError("dewcache needs one writable cache_storage directory")

@@ -318,7 +318,27 @@ class Files:
         return _Lines(self, shard)
 
     def metadata(self) -> Mapping[str, object]:
-        return self.committed or {}
+        if self.committed is not None:
+            metadata = self.committed.get("metadata", {})
+            if not isinstance(metadata, Mapping):
+                raise ValueError("export metadata must be a mapping")
+            return {**metadata, "rows": self.committed["rows"], "format": self.committed["format"]}
+        if self.kind in ("parquet", "arrow"):
+            schema = self.arrow.schema.metadata or {}
+            details = json.loads(schema[b"huggingface"]) if b"huggingface" in schema else {}
+            features = details.get("info", {}).get("features", {})
+            names = {
+                name: tuple(feature["names"])
+                for name, feature in features.items()
+                if isinstance(feature, Mapping) and feature.get("_type") == "ClassLabel"
+            }
+            counts = (
+                {"rows": sum(_fragment_rows(fragment) for fragment in self.fragments)}
+                if self.filter is None
+                else {}
+            )
+            return {"class_names": names, **counts}
+        return {}
 
     def lengths(self) -> np.ndarray | None:
         if self.kind in ("parquet", "arrow") and "length" in self.arrow.schema.names:

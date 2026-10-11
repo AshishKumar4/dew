@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import hashlib
 import importlib
 import io
 import json
+import math
 import struct
 from collections.abc import Iterable, Mapping
+from decimal import Decimal
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -27,6 +30,11 @@ type Value = (
     | list[Value]
     | tuple[Value, ...]
     | Mapping[str, Value]
+    | datetime.datetime
+    | datetime.date
+    | datetime.time
+    | datetime.timedelta
+    | Decimal
 )
 
 
@@ -63,8 +71,17 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
 
 
 def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"float": value.hex()}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
+    for kind in (datetime.datetime, datetime.date, datetime.time):
+        if isinstance(value, kind):
+            return {kind.__name__: value.isoformat()}
+    if isinstance(value, datetime.timedelta):
+        return {"timedelta": [value.days, value.seconds, value.microseconds]}
+    if isinstance(value, Decimal):
+        return {"decimal": str(value)}
     if isinstance(value, np.generic):
         return _tree(value.item(), leaves)
     if isinstance(value, (np.ndarray, bytes)):
@@ -102,6 +119,15 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
         return node
     if not isinstance(node, dict):
         raise ValueError("artifact node is not a scalar or tagged object")
+    for kind in (datetime.datetime, datetime.date, datetime.time):
+        if kind.__name__ in node:
+            return kind.fromisoformat(node[kind.__name__])
+    if "timedelta" in node:
+        return datetime.timedelta(*node["timedelta"])
+    if "decimal" in node:
+        return Decimal(node["decimal"])
+    if "float" in node:
+        return float.fromhex(node["float"])
     if "bytes" in node:
         return leaves[str(node["bytes"])]
     if "array" in node:
