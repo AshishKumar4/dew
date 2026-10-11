@@ -170,16 +170,14 @@ class _DecisionSource:
                 names = record(stated, "class names").get(self.table.label)
                 first = records[0] if len(records) else None
                 if isinstance(names, (list, tuple)):
-                    self._classes.extend(str(name) for name in names)
+                    self._classes[:] = [str(name) for name in names]
                 elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
                     if self.table.label not in first:
                         raise ValueError(f"decision table needs column {self.table.label!r}")
-                    self._classes.extend(
-                        dict.fromkeys(
+                    self._classes[:] = sorted(set(
                             str(record(records[index], "decision row")[self.table.label])
                             for index in range(len(records))
-                        )
-                    )
+                    ))
             self._memory_slots(records)
         return records
 
