@@ -2,7 +2,6 @@
 that rebuilds from what it logged."""
 
 import dataclasses
-import itertools
 import json
 from collections.abc import Mapping
 from pathlib import Path
@@ -14,7 +13,7 @@ from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
 from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Memory, Text
-from dew.data.dataset import record_argument, tokenized
+from dew.data.dataset import record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig

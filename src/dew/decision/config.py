@@ -39,8 +39,8 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import LogLoss
 from dew.decision.task import Decide
-from dew.training.state import TrainState
 from dew.records import number, record
+from dew.training.state import TrainState
 
 if TYPE_CHECKING:
     from dew.interop import Pretrained

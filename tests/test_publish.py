@@ -89,7 +89,7 @@ def test_what_a_run_writes_after_training_is_published_with_its_checkpoint(tmp_p
     from test_instrumentation import Regression, batches
 
     from dew.config import RunConfig, TrainerConfig, Wandb
-    from dew.data import Dataset, Loading
+    from dew.data import Loading
 
     run = TrackedRun()
     wandb.init = lambda **_: run
@@ -248,7 +248,7 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     import optax
     import wandb as library
 
-    from dew.data import Dataset, Loading
+    from dew.data import Loading
     from dew.lora import Adapter, LoRA
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective

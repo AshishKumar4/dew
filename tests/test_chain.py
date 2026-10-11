@@ -16,7 +16,7 @@ import optax
 import pytest
 from rl_support import TinyHead
 
-from dew.data import Chat, Loading, Preferences, Prompts
+from dew.data import Chat, Preferences, Prompts
 from dew.training import Layout
 from recipes.chain import Recipe, Stage
 

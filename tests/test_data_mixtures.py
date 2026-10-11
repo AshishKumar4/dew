@@ -27,7 +27,6 @@ import pytest
 from flax import linen as nn
 from token_support import write_token_corpus
 
-import dew.data
 from dew.data import Corpus, DataPartition, DataPhase, Files, Loading, Memory, Pipeline, Ramp, Text, compile
 from dew.data.dataset import (
     CAPTION,
@@ -40,9 +39,9 @@ from dew.data.dataset import (
     tokenized,
     train_stream,
 )
+from dew.data.recipes import load
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.data.recipes import load
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
 

@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp

@@ -20,9 +20,9 @@ import numpy as np
 from process_support import prepare_worker
 
 from dew.data import Loading
+from dew.data.recipes import load
 from dew.telemetry.records import RECORD_TYPES
 from dew.training.evaluation import Evaluation
-from dew.data.recipes import load
 
 RES = 8
 BATCH = 8

@@ -14,6 +14,7 @@ import pytest
 from dew.artifacts import Decisions
 from dew.checkpoints import Checkpoints
 from dew.data import DataPartition
+from dew.data.recipes import load
 from dew.data.text import ByteTokenizer
 from dew.decision import (
     AURC,
@@ -35,12 +36,11 @@ from dew.decision import (
     StateFirstLayout,
     Weights,
 )
+from dew.decision.data import Decisions as DecisionRecipe
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import FROZEN, VALID_ROWS
 from dew.training.trainer import Trainer
-from dew.data.recipes import load
-from dew.decision.data import Decisions as DecisionRecipe
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
 RULES = [LogLoss(), Brier(), Spherical(), RankedProbability()]

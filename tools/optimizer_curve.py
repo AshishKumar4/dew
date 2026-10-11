@@ -32,11 +32,11 @@ import tyro
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew.config import OptimConfig
 from dew.data import DataPartition, Loading, Text
+from dew.data.recipes import load
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
-from dew.data.recipes import load
 
 Solver = Literal["adam", "adamw", "lamb", "muon", "muon-unsplit"]
 """The OPTIMIZER_MAP names, plus the unsplit Muon arm."""
@@ -117,7 +117,7 @@ def run(config: Comparison) -> Curve:
     with DevicePrefetchIterator(data.train(DataPartition.of(trainer.device_mesh)),
                                 trainer.device_mesh) as source:
         train_step = trainer.compile(state, next(source))
-        
+
         losses: list[float] = []
         start = time.perf_counter()
         for step in range(config.steps):

@@ -484,9 +484,10 @@ def test_jsonl_rows_pack_the_way_the_same_rows_do_in_parquet(tmp_path, tools_tok
 
 
 def test_a_prepared_hub_split_packs_the_same_conversations(tmp_path, monkeypatch, tools_tokenizer):
+    from types import SimpleNamespace
+
     import datasets as hf_datasets
     from huggingface_hub import HfApi
-    from types import SimpleNamespace
 
     from dew.data import Hub
 

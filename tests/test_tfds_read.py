@@ -15,9 +15,9 @@ import pytest
 
 tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.data import DataPartition, HoldOut, Images, Loading, TFDS, load
-from dew.data.steps.image import EncodeCaptions, ImageRecord
+from dew.data import TFDS, DataPartition, HoldOut, Images, Loading, load
 from dew.data.images import decode_image
+from dew.data.steps.image import ImageRecord
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 
@@ -52,7 +52,6 @@ def test_a_prepared_source_describes_the_directory_and_split_it_reads():
     """A saved position names the order it counts into by naming its source,
     and the builder's own source describes itself by its address in this
     process, which no resume can match."""
-    from dew.data.dataset import describe
 
     source = TFDS("dew_images", path=str(FIXTURE), split="all",
         decoders={"image": tfds.decode.SkipDecoding()})

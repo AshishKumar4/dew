@@ -15,6 +15,7 @@ from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
+from dew.data.recipes import load
 from dew.data.text import HFTokenizer
 from dew.decision import (
     Choice,
@@ -33,10 +34,9 @@ from dew.decision import (
 )
 from dew.decision.calibration import softmax
 from dew.decision.clef import ClefHead
+from dew.decision.data import Decisions
 from dew.decision.images import Images
 from dew.training.trainer import Trainer
-from dew.data.recipes import load
-from dew.decision.data import Decisions
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TINY = FIXTURES / "clef" / "tiny"

@@ -16,9 +16,9 @@ import numpy as np
 import pytest
 
 from dew.artifacts import ImageGrid
+from dew.data import Records, load
 from dew.eval import FID, PSNR, SSIM, CLIPDistance, CLIPScore
 from dew.registry import metrics as registry
-from dew.data import Records, load
 
 
 def test_mean_metric_counts_uneven_batches_and_weighted_totals():
@@ -61,7 +61,7 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
 
     from dew import Checkpoints, Mean, Trainer
     from dew.artifacts import TokenScores
-    from dew.data import Dataset, Loading
+    from dew.data import Loading
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
@@ -93,7 +93,7 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
     import optax
 
     from dew import Checkpoints, Mean, Trainer
-    from dew.data import Dataset, Loading
+    from dew.data import Loading
     from dew.objectives.base import Aux, Objective
 
     class Pixels(Objective):

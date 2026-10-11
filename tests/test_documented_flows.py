@@ -9,8 +9,8 @@ another one imported something fails. Every step runs offline against local
 fixtures, under a hard limit on open files lower than a workstation's.
 """
 
-import os
 import json
+import os
 import resource
 import subprocess
 import sys

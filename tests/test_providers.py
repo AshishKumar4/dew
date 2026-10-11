@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from dew.config import RunConfig, TrainerConfig
-from dew.data import DataPartition, Files, HoldOut, Loading, Memory, Pipeline, Records, TFDS, compile, load
+from dew.data import TFDS, DataPartition, Files, HoldOut, Loading, Memory, Pipeline, Records, compile, load
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=4, worker_buffer=1)

@@ -6,13 +6,12 @@ import importlib.util
 import json
 import math
 import sys
-import types
 from pathlib import Path
 
 import pytest
 
-from dew.data.text import HFTokenizer
 from dew.data import DataPartition, Loading, load
+from dew.data.text import HFTokenizer
 from dew.decision import Choice, Decide, DecisionObjective, Decisions, Example, JointLayout, Noul
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
