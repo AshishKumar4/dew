@@ -8,8 +8,10 @@ tokenizer on first use, so a host without the hub cache still imports
 
 from __future__ import annotations
 
+import hashlib
 import threading
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
@@ -21,6 +23,26 @@ _load_lock = threading.Lock()
 _loaded: dict[tuple[str, str | None, bool], PreTrainedTokenizerBase] = {}
 
 
+def tokenizer_snapshot(name: str) -> Mapping[str, object]:
+    """Pin the tokenizer and every local template file its loader can read."""
+    if name == "byte":
+        return {"name": "byte", "encoding": "utf-8", "eos": 255}
+    directory = Path(name)
+    resolved = None
+    if not directory.is_dir():
+        from huggingface_hub import HfApi, snapshot_download
+
+        repo, separator, revision = name.rpartition("@")
+        repo = repo if separator else name
+        resolved = HfApi().model_info(repo, revision=revision if separator else None).sha
+        directory = Path(snapshot_download(repo, revision=resolved,
+                         allow_patterns=["*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken"]))
+    files = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
+             for pattern in ("*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken")
+             for path in directory.rglob(pattern) if path.is_file()}
+    return {"name": name, "revision": resolved, "files": files, "directory": str(directory)}
+
+
 def load_tokenizer(name: str, *, revision: str | None = None,
                    local_files_only: bool = False) -> PreTrainedTokenizerBase:
     """The HF tokenizer of a hub repo or local directory, loaded once per process.
@@ -28,6 +50,11 @@ def load_tokenizer(name: str, *, revision: str | None = None,
     Every Dew path that needs an HF tokenizer loads it here, so one name at
     one revision is one object however many readers share it.
     """
+    repo, separator, pinned = name.rpartition("@")
+    if separator and not Path(name).exists():
+        if revision is not None and revision != pinned:
+            raise ValueError(f"tokenizer {name} and revision={revision!r} disagree")
+        name, revision = repo, pinned
     key = (name, revision, local_files_only)
     held = _loaded.get(key)
     if held is not None:
@@ -103,6 +130,9 @@ class ByteTokenizer:
         self.eos_id = 255
         self.bos_id = None
 
+    def dependencies(self) -> Mapping[str, object]:
+        return tokenizer_snapshot("byte")
+
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         """Return the text's utf-8 bytes as ids.
 
@@ -130,6 +160,9 @@ class HFTokenizer:
     def __init__(self, name: str, *, local_files_only: bool = False):
         self.name = name
         self.local_files_only = local_files_only
+
+    def dependencies(self) -> Mapping[str, object]:
+        return tokenizer_snapshot(self.name)
 
     @property
     def tokenizer(self) -> PreTrainedTokenizerBase:

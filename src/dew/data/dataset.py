@@ -1484,7 +1484,8 @@ class GlobalStream:
         self._records = 0
         self._reads: pygrain.DatasetIterator[Batch] | None = None
         self._loading = loading
-        self._plan, self._resume = plan, resume
+        self._plan = plan
+        self._resume: Literal["exact", "non-exact"] = resume
         self.manifest_changes: tuple[str, ...] = ()
         self.stop_seconds = loading.stop_seconds
 

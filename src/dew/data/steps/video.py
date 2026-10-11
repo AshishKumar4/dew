@@ -23,9 +23,13 @@ class DecodeClip(grain.RandomMapTransform):
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         from dew.data.sources.av_utils import read_av_random_clip
 
-        frames, audio = read_av_random_clip(element["video_path"], num_frames=self.frames,
-                                            audio_padding=self.audio_padding,
-                                            seed=int(rng.integers(0, 2**32 - 1)), sample_rate=self.sample_rate)
+        frames, audio = read_av_random_clip(
+            element["video_path"],
+            num_frames=self.frames,
+            audio_padding=self.audio_padding,
+            seed=int(rng.integers(0, 2**32 - 1)),
+            sample_rate=self.sample_rate,
+        )
         return {"video": fit_frames(frames, self.size), "caption": element.get("caption", ""), "audio": audio}
 
 
@@ -49,4 +53,7 @@ class Audio(grain.MapTransform):
     def map(self, element: Batch) -> Batch:
         audio = np.asarray(element["audio"])
         features = self.processor(audio.reshape(-1))
-        return {**element, "audio": {**{key: value[0] for key, value in features.items()}, "full_audio": audio}}
+        return {
+            **element,
+            "audio": {**{key: value[0] for key, value in features.items()}, "full_audio": audio},
+        }

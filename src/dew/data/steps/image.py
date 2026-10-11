@@ -64,13 +64,16 @@ class CenterCrop(grain.MapTransform):
     def map(self, element: Batch) -> Batch:
         image = np.asarray(element["image"])
         top, left = max(0, (image.shape[0] - self.size) // 2), max(0, (image.shape[1] - self.size) // 2)
-        return {**element, "image": resize_image(image[top:top + self.size, left:left + self.size], self.size)}
+        return {
+            **element,
+            "image": resize_image(image[top : top + self.size, left : left + self.size], self.size),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
 class RandomCrop(grain.RandomMapTransform):
     size: int
-    scale: tuple[float, float] = (.8, 1.)
+    scale: tuple[float, float] = (0.8, 1.0)
     flip: bool = False
     jitter: bool = False
 
@@ -86,7 +89,8 @@ class RandomCrop(grain.RandomMapTransform):
 @dataclasses.dataclass(frozen=True)
 class Flip(grain.RandomMapTransform):
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return {**element, "image": augment_image(Augment(True, False), np.asarray(element["image"]), rng)}
+        return {**element, "image": augment_image(Augment(flip=True, jitter=False),
+                                                  np.asarray(element["image"]), rng)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -94,7 +98,10 @@ class ColorJitter(grain.RandomMapTransform):
     flip: bool = False
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return {**element, "image": augment_image(Augment(self.flip, True), np.asarray(element["image"]), rng)}
+        return {
+            **element,
+            "image": augment_image(Augment(flip=self.flip, jitter=True), np.asarray(element["image"]), rng),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -116,7 +123,7 @@ class EncodeCaptions:
 @dataclasses.dataclass(frozen=True)
 class DeviceAugment:
     size: int
-    crop_scale: tuple[float, float] = (1., 1.)
+    crop_scale: tuple[float, float] = (1.0, 1.0)
     flip: bool = True
     jitter: bool = False
 
@@ -132,5 +139,8 @@ class DeviceAugment:
 
         from dew.data.image_augmentation import augment_batch
 
-        return jax.jit(functools.partial(augment_batch, size=self.size, crop_scale=self.crop_scale,
-                                        flip=self.flip, jitter=self.jitter))
+        return jax.jit(
+            functools.partial(
+                augment_batch, size=self.size, crop_scale=self.crop_scale, flip=self.flip, jitter=self.jitter
+            )
+        )

@@ -19,8 +19,10 @@ from dew.records import integers, record
 class WindowRecords:
     def __init__(self, rows: Sequence[Batch], windows: Windows):
         self.windows = windows
-        self.tokens = {name: np.concatenate([np.asarray(row[name]) for row in rows])
-                       if rows else np.zeros(0, np.int32) for name in windows.fields}
+        self.tokens = {
+            name: np.concatenate([np.asarray(row[name]) for row in rows]) if rows else np.zeros(0, np.int32)
+            for name in windows.fields
+        }
         sizes = {len(value) for value in self.tokens.values()}
         if len(sizes) != 1:
             raise ValueError("causal window fields have different token counts")
@@ -34,7 +36,9 @@ class WindowRecords:
         if not 0 <= index < len(self):
             raise IndexError(index)
         start = index * (self.windows.stride or self.windows.seq_len)
-        return {name: values[start:start + self.windows.seq_len + 1] for name, values in self.tokens.items()}
+        return {
+            name: values[start : start + self.windows.seq_len + 1] for name, values in self.tokens.items()
+        }
 
 
 class _WindowIterator(grain.DatasetIterator[Batch]):
@@ -51,10 +55,12 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
             counts = {len(row[name]) for name in self._windows.fields}
             if len(counts) != 1:
                 raise ValueError("causal window fields have different record lengths")
-            self._held = {name: np.concatenate([self._held[name], np.asarray(row[name])])
-                          for name in self._windows.fields}
+            self._held = {
+                name: np.concatenate([self._held[name], np.asarray(row[name])])
+                for name in self._windows.fields
+            }
         if self._skip:
-            self._held = {name: value[self._skip:] for name, value in self._held.items()}
+            self._held = {name: value[self._skip :] for name, value in self._held.items()}
         emitted = {name: value[:size] for name, value in self._held.items()}
         stride = self._windows.stride or self._windows.seq_len
         available = len(self._held[self._windows.fields[0]])
@@ -63,15 +69,24 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
         return emitted
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "skip": self._skip,
-                "held": {name: {"dtype": value.dtype.str, "tokens": value.tolist()}
-                         for name, value in self._held.items()}}
+        return {
+            "parent": self._read.get_state(),
+            "skip": self._skip,
+            "held": {
+                name: {"dtype": value.dtype.str, "tokens": value.tolist()}
+                for name, value in self._held.items()
+            },
+        }
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "window parent"))
         held = record(state["held"], "window carry")
-        self._held = {name: np.asarray(integers(record(tokens, name)["tokens"], name),
-                                      dtype=str(record(tokens, name)["dtype"])) for name, tokens in held.items()}
+        self._held = {
+            name: np.asarray(
+                integers(record(tokens, name)["tokens"], name), dtype=str(record(tokens, name)["dtype"])
+            )
+            for name, tokens in held.items()
+        }
         skip = state["skip"]
         if not isinstance(skip, int) or skip < 0:
             raise ValueError("saved causal window skip is invalid")
@@ -83,7 +98,7 @@ class _WindowIterator(grain.DatasetIterator[Batch]):
 
 class CausalWindows(grain.IterDataset[Batch]):
     def __init__(self, parent: grain.IterDataset[Batch], windows: Windows):
-        if windows.seq_len < 1 or windows.stride is not None and windows.stride < 1:
+        if windows.seq_len < 1 or (windows.stride is not None and windows.stride < 1):
             raise ValueError("causal window lengths and strides must be positive")
         super().__init__(parent)
         self._records, self._windows = parent, windows
