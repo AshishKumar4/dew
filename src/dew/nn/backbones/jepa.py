@@ -52,6 +52,7 @@ class TokenStack(_JepaStackOptions):
     def setup(self):
         self.blocks = self._blocks()
 
+    @nn.nowrap
     def _blocks(self) -> list[ModulatedBlock]:
         pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
         return [
