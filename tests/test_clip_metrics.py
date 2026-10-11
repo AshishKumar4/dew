@@ -130,7 +130,8 @@ def test_each_images_clip_score_is_a_term_of_the_sets():
 
     assert each.shape == (len(prompts),) and each.dtype == np.float64
     np.testing.assert_allclose(each, 100.0 * np.maximum(cosine, 0.0), atol=CLIP_SCORE_TOLERANCE)
-    np.testing.assert_array_equal(metric.scores(images, prompts, batch_size=3), each)
+    # A batch of another size compiles its own kernels, which round the last digit apart.
+    np.testing.assert_allclose(metric.scores(images, prompts, batch_size=3), each, rtol=1e-6)
     assert metric.score(images, prompts) == pytest.approx(each.mean(), abs=1e-9)
     assert metric.scores(images[::-1], prompts[::-1])[::-1] == pytest.approx(each, abs=1e-9)
 
