@@ -9,7 +9,7 @@ import io
 import json
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from functools import cached_property, lru_cache
 from pathlib import PurePosixPath
 from typing import BinaryIO, Literal
@@ -920,6 +920,13 @@ class TokenFiles:
     storage_options: Mapping[str, object] | None = None
     chunk_tokens: int = 65536
     field: str | None = None
+
+    def with_split(self, name: str) -> TokenFiles:
+        if name != self.split and Files(self.url, storage_options=self.storage_options).committed is not None:
+            raise ValueError(
+                f"token export {self.url!r} has one split; give an explicit TokenFiles URL for {name!r}"
+            )
+        return replace(self, split=name)
 
     def describe(self) -> str:
         return f"tokens:{self.url}:{self.split}:field={self.field}"
