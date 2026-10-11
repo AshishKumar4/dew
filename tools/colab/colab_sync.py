@@ -40,9 +40,12 @@ def missing_only(error):
 
 def raw_profile(file):
     """Keep raw captures VM-side; only explicit requests may transfer them."""
-    return (file.name.endswith((".xplane.pb", ".pt.trace.json", "trace.json", "trace.json.gz", "hlo.tgz"))
-            or "hlo" in file.parts or "plugins" in file.parts
-            or any(path.name == "reports" and (path.parent / "manifest.json").is_file() for path in file.parents))
+    return (
+        file.name.endswith((".xplane.pb", ".pt.trace.json", "trace.json", "trace.json.gz", "hlo.tgz"))
+        or "hlo" in file.parts
+        or "plugins" in file.parts
+        or any(path.name == "reports" and (path.parent / "manifest.json").is_file() for path in file.parents)
+    )
 
 
 def walk_files(root, policy, include_raw=True):
@@ -52,8 +55,12 @@ def walk_files(root, policy, include_raw=True):
     for directory, children, names in os.walk(root, followlinks=False, onerror=missing_only):
         current = Path(directory)
         # Prune checkpoint stores before descending, including named runs.
-        children[:] = [name for name in children if retained_path(current / name / "_probe", policy)
-                       and (include_raw or not raw_profile(current / name / "_probe"))]
+        children[:] = [
+            name
+            for name in children
+            if retained_path(current / name / "_probe", policy)
+            and (include_raw or not raw_profile(current / name / "_probe"))
+        ]
         yield from (current / name for name in names)
 
 

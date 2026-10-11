@@ -47,7 +47,9 @@ class Driver:
                     names = [item.get("ename", "unknown") for item in errors]
                     benign = all(name in ("FileNotFoundError", "NotADirectoryError") for name in names)
                     self.record(collection_error_names=names, collection_needs_attention=not benign)
-                    raise TransportError("live output collection failed; re-list on next cycle, not a workload exit")
+                    raise TransportError(
+                        "live output collection failed; re-list on next cycle, not a workload exit"
+                    )
                 raise RuntimeError(redact(str(errors)))
             return "".join(item.get("text", "") for item in outputs)
         finally:
