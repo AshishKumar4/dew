@@ -180,7 +180,7 @@ class KimiDeltaAttention(nn.Module):
         def scan(convolved, *, starts, valid, held):
             del starts, valid
             query, key, value = (part.reshape(B, S, self.num_heads, self.head_dim)
-                                 for part in jnp.split(jnp.moveaxis(convolved, 2, 1), 3, axis=-1))
+                                 for part in jnp.split(convolved, 3, axis=-1))
             rule = recurrent_delta_rule if S == 1 else functools.partial(
                 chunk_kimi_delta_rule, chunk_size=self.chunk_size)
             return rule(l2norm(query), l2norm(key), value, g, beta, held)
