@@ -559,6 +559,17 @@ class Objective(ABC, Generic[Loss, Effects]):
             raise MissingFlopsCount(f"{type(self).__name__} has no model to count for train/mfu")
         return counted_flops(model, self.real_lengths(batch))
 
+    def training_flops(self, model, batch: Batch) -> float:
+        """Full-FT forward/backward estimate, distinct from the forward count.
+
+        Parameter-efficient objectives override this assembly point with
+        frozen and trainable matrix work (4*N_frozen + 6*N_trainable), plus
+        their attention/state terms. They cannot reuse three times forward
+        work. Until their geometry is supplied, model_flops refuses the
+        adapter by name rather than reporting a full-FT MFU for PEFT.
+        """
+        return 3 * self.model_flops(model, batch)
+
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
 
