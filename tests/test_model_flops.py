@@ -17,7 +17,7 @@ from jax.extend import core as jaxpr_core
 
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
-from dew.decision.layout import Specials, StateFirstLayout
+from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
@@ -215,7 +215,8 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
     projected = 2 * 8 * 16 * (7 + 2 * 3 + 2 * 8 + 2)
     evidence = 4 * 16 * 16 * (7 + 8) + 4 * 16 * (2 * 2 + 5 * 6) + 4 * 16 * 32 * 8
     scorer = (8 * 16 * 16 + 2 * 16 + 6 * 16 + 2 * 8) * 8
-    assert clef.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer
+    pooling = 2 * 8 * (2 * (1 + 2 * 2) + 5 * (2 + 2 * 6))
+    assert clef.decision_flops(LENGTHS, questions, options) == projected + evidence + scorer + pooling
     with pytest.raises(MissingFlopsCount, match=r"JointSchemaHead.*decision_flops"):
         clef.model_flops(LENGTHS)
 
@@ -478,3 +479,33 @@ def test_s5_write_read_matches_the_native_scanned_path():
     def forward(x, operators):
         return _scanned_directions(x, (operators,), (False,), x.dtype)
     assert module.model_flops(np.array([7, 7])) == forward_products(forward, x, operators)
+
+
+@pytest.mark.parametrize("kind", ["laya", "clef"])
+def test_decision_heads_match_every_forward_product_including_pooling(kind):
+    states = jnp.ones((1, 4, 8))
+    inputs = DecisionInputs(tokens=jnp.ones((1, 4), jnp.int32), valid=jnp.ones((1, 4), bool),
+        kinds=jnp.zeros((1, 1), jnp.int32), questions=jnp.ones((1, 1), bool),
+        spans=jnp.array([[[0, 2]]]), option_spans=jnp.array([[[[2, 3], [3, 4]]]]),
+        options=jnp.ones((1, 1, 2), bool))
+    model = (DecisionHead(8, layers=1, attention_impl="reference") if kind == "laya" else
+             JointSchemaHead(8, width=8, heads=2, layers=1, routing_layers=1, feedforward=16,
+                              attention_impl="reference"))
+    table = jnp.ones((16, 8)) if kind == "clef" else None
+    variables = model.init(jax.random.key(205), states, inputs, table)
+    count = model.decision_flops(np.array([4]), np.array([1]), np.array([2]))
+    assert count == forward_products(model.apply, variables, states, inputs, table, state_mac=True)
+
+
+def test_chunked_ssm_dit_forward_equals_model_maps_plus_known_pole_products():
+    """S5's native chunk path has pole-prep and in-chunk products, outside model FLOPs.
+    Their independent shape count admits no tolerance for a missing learned map."""
+    model = HybridSSMAttentionDiT(emb_features=8, num_heads=2, num_layers=1, patch_size=2,
+                                   ssm_state_dim=3, ssm_attention_ratio="all-ssm")
+    image, time = jnp.ones((2, 4, 4, 3)), jnp.ones((2,))
+    variables = model.init(jax.random.key(206), image, time)
+    count = model.image_flops(np.array([4, 4]), 3)
+    # Two directions: 2 pole-picking products C*C*C*N and one 2C-wide
+    # real-state product B*2C*2C*N, each MAC two real FLOPs.
+    extra = 2 * (4 * 4**3 * 3 + 8 * 2 * 4**2 * 3)
+    assert count + extra == forward_products(model.apply, variables, image, time)
