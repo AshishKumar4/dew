@@ -13,6 +13,7 @@ inside functions. `colab_batch.plan_jobs` requires the receipt this writes.
 
 import argparse
 import ast
+import contextlib
 import hashlib
 import json
 import os
@@ -633,6 +634,8 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
     receipt.update(static={name: failed[name] for name in sorted(static.scope)}, guarded=static.guarded)
     failures += hazards(texts, args.command)
     receipt["kernel_lab"] = lab_verified(tree, args.hardware, failures, explicit_pallas(texts, args.command))
+    receipt["lowered"] = lowered(tree, args.hardware, args.dew_python, trains(texts, args.command),
+                                 lowering_env(texts, args.command), failures)
     receipt["accepted"], failures = accept(failures, args.accept)
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
@@ -816,6 +819,73 @@ def lab_record(tree: Path, hardware: str, generation: str, named: list[str], fai
                         f"{missing or 'not ok'})")
         return found
     found["record"] = {k: record.get(k) for k in ("ref", "gpu", "versions", "at")}
+    return found
+
+
+# A staged script or the command that names one of these trains: a recipe, Dew's training package or its
+# Trainer.
+TRAINING = re.compile(r"\brecipes/[\w.-]+/[\w.-]+\.py\b|\bdew\.training\b|\bTrainer\b")
+LOWERING_TIMEOUT = 900
+
+
+def trains(texts: dict[str, str], command: str) -> list[str]:
+    """Each site where the command or a staged script reaches a training entry, as `file:line`."""
+    return [f"{name}:{number}" for name, text in [("<command>", command), *texts.items()]
+            for number, line in enumerate(text.splitlines(), 1) if TRAINING.search(line)]
+
+
+def lowering_env(texts: dict[str, str], command: str) -> dict[str, str]:
+    """The JAX_ and XLA_ settings the command and its shell scripts assign, which the run's step
+    lowers under. A value read from another variable is unknown here, and left out."""
+    env = {}
+    for name, text in [("<command>", command), *texts.items()]:
+        if name != "<command>" and not name.endswith(SCRIPTS[1:]):
+            continue
+        for line in re.sub(r"\\\n", " ", text).splitlines():
+            try:
+                words = shlex.split(line, comments=True)
+            except ValueError:
+                continue  # `shell_facts` reports a line that does not parse.
+            for word in words:
+                key, equals, value = word.partition("=")
+                if equals and re.fullmatch(r"(?:JAX|XLA)_\w+", key) and "$" not in value:
+                    env[key] = value
+    return env
+
+
+def lowered(tree: Path, hardware: str, python: str, sites: Sequence[str], env: dict[str, str],
+            failures: list[str]) -> dict:
+    """For a request that trains (`sites`), the Clef recipe's step at the ref lowered on this CPU for
+    `hardware`'s generation over one device, as Colab's GPU runs it, under the request's JAX and XLA
+    settings (tools/clef_step.py, `TrainerConfig.lower_for`): every Pallas-Triton lowering the step
+    makes, which otherwise first runs in the GPU's own compile, where c58 and c57 died. A request
+    that trains nothing, such as a kernel bench, has no step to lower."""
+    if not sites:
+        return {"skipped": "no training entry"}
+    generation, script = GENERATIONS[hardware], tree / "tools" / "clef_step.py"
+    found: dict = {"generation": generation, "devices": 1, "env": env, "sites": list(sites)}
+    if not script.is_file():
+        failures.append(f"the request trains ({', '.join(sites[:3])}) at a ref that predates the lowering "
+                        "dry run (tools/clef_step.py), the check c58's failure needs")
+        return found
+    found["script"] = hashlib.sha256(script.read_bytes()).hexdigest()
+    environment = {**os.environ, **env, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(tree / "src")}
+    with tempfile.TemporaryDirectory(prefix="dew-lowered-") as work:
+        try:
+            done = subprocess.run([python, str(script), "--lower-for", generation, "--devices", "1", "--work",
+                                   work], capture_output=True, text=True, cwd=tree, env=environment,
+                                  timeout=LOWERING_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            failures.append(f"the Clef step's lowering for {generation} ran past {LOWERING_TIMEOUT} s")
+            return found
+    found["kernels"] = None
+    # A run that printed no record proved nothing.
+    with contextlib.suppress(IndexError, json.JSONDecodeError, KeyError, TypeError):
+        if done.returncode == 0:
+            found["kernels"] = json.loads(done.stdout.splitlines()[-1])["kernels"]
+    if found["kernels"] is None:
+        failures.append(f"the Clef step does not lower for {generation} at this ref (tools/clef_step.py "
+                        f"exited {done.returncode}): {done.stderr.strip()[-1500:]}")
     return found
 
 
