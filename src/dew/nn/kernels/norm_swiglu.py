@@ -85,7 +85,7 @@ def swiglu_kernel(implementation: str, gate, up) -> str:
 
 
 def _weight(scale_ref, columns, width: int, offset: bool):
-    scale = plgpu.load(scale_ref, (columns,), mask=columns < width, other=0)
+    scale = plgpu.load(scale_ref.at[columns], mask=columns < width, other=0)
     # The offset adds in the stored weight's dtype, including a bf16 weight.
     return (scale + 1.0 if offset else scale).astype(jnp.float32)
 
@@ -96,15 +96,15 @@ def _rms_forward(x_ref, scale_ref, y_ref, inverse_ref, *, epsilon: float,
     columns = jnp.arange(pl.next_power_of_2(width))
     row = pl.program_id(0) * ROW_BLOCK + jnp.arange(ROW_BLOCK)
     mask = (row[:, None] < rows) & (columns[None, :] < width)
-    x = plgpu.load(x_ref, (row[:, None], columns[None, :]), mask=mask, other=0).astype(jnp.float32)
+    x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
     inverse = jax.lax.rsqrt(jnp.sum(x * x, axis=1) / width + epsilon)
     y = x * inverse[:, None]
     if scale_ref is not None:
         if after_cast:
             y = _round(y, y_ref.dtype, interpret)
         y = y * _weight(scale_ref, columns, width, offset)[None, :]
-    plgpu.store(y_ref, (row[:, None], columns[None, :]), y.astype(y_ref.dtype), mask=mask)
-    plgpu.store(inverse_ref, (row,), inverse, mask=row < rows)
+    plgpu.store(y_ref.at[row[:, None], columns[None, :]], y.astype(y_ref.dtype), mask=mask)
+    plgpu.store(inverse_ref.at[row], inverse, mask=row < rows)
 
 
 def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
@@ -117,16 +117,16 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
     def block(i, accumulated):
         row = (i * groups + pl.program_id(0)) * ROW_BLOCK + jnp.arange(ROW_BLOCK)
         mask = (row[:, None] < rows) & (columns[None, :] < width)
-        x = plgpu.load(x_ref, (row[:, None], columns[None, :]), mask=mask, other=0).astype(jnp.float32)
-        dy = plgpu.load(dy_ref, (row[:, None], columns[None, :]), mask=mask, other=0).astype(jnp.float32)
-        inverse = plgpu.load(inverse_ref, (row,), mask=row < rows, other=0)
+        x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
+        dy = plgpu.load(dy_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
+        inverse = plgpu.load(inverse_ref.at[row], mask=row < rows, other=0)
         m = dy * weight
         if scale_ref is not None and after_cast:
             m = _round(m, dy_ref.dtype, interpret)
         # The two x contributions are kept separate, as XLA's square VJP is.
         correction = (-0.5 * jnp.sum(m * x, axis=1)) * (inverse * inverse * inverse) / width
         dx = m * inverse[:, None] + (2.0 * x) * correction[:, None]
-        plgpu.store(dx_ref, (row[:, None], columns[None, :]), dx.astype(dx_ref.dtype), mask=mask)
+        plgpu.store(dx_ref.at[row[:, None], columns[None, :]], dx.astype(dx_ref.dtype), mask=mask)
         if scale_ref is not None:
             normalized = x * inverse[:, None]
             if after_cast:
@@ -137,7 +137,7 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
     partial = jax.lax.fori_loop(0, pl.cdiv(rows, groups * ROW_BLOCK), block,
                                 jnp.zeros(columns.shape, jnp.float32))
     if partial_ref is not None:
-        plgpu.store(partial_ref, (pl.program_id(0), columns), partial, mask=columns < width)
+        plgpu.store(partial_ref.at[pl.program_id(0), columns], partial, mask=columns < width)
 
 
 def _rms_with_inverse(x, scale, epsilon: float, dtype, offset: bool, after_cast: bool,
@@ -189,24 +189,24 @@ rms_norm.defvjp(_rms_fwd, _rms_bwd)
 def _swiglu_forward(gate_ref, up_ref, y_ref, *, interpret: bool):
     index = pl.program_id(0) * ELEMENT_BLOCK + jnp.arange(ELEMENT_BLOCK)
     mask = index < gate_ref.shape[0]
-    gate = plgpu.load(gate_ref, (index,), mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref, (index,), mask=mask, other=0).astype(jnp.float32)
+    gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     activated = _round(gate * jax.nn.sigmoid(gate), gate_ref.dtype, interpret)
-    plgpu.store(y_ref, (index,), (activated * up).astype(y_ref.dtype), mask=mask)
+    plgpu.store(y_ref.at[index], (activated * up).astype(y_ref.dtype), mask=mask)
 
 
 def _swiglu_backward(gate_ref, up_ref, dy_ref, dg_ref, du_ref, *, interpret: bool):
     index = pl.program_id(0) * ELEMENT_BLOCK + jnp.arange(ELEMENT_BLOCK)
     mask = index < gate_ref.shape[0]
-    gate = plgpu.load(gate_ref, (index,), mask=mask, other=0).astype(jnp.float32)
-    up = plgpu.load(up_ref, (index,), mask=mask, other=0).astype(jnp.float32)
-    dy = plgpu.load(dy_ref, (index,), mask=mask, other=0).astype(jnp.float32)
+    gate = plgpu.load(gate_ref.at[index], mask=mask, other=0).astype(jnp.float32)
+    up = plgpu.load(up_ref.at[index], mask=mask, other=0).astype(jnp.float32)
+    dy = plgpu.load(dy_ref.at[index], mask=mask, other=0).astype(jnp.float32)
     sigmoid = jax.nn.sigmoid(gate)
     activated = _round(gate * sigmoid, gate_ref.dtype, interpret)
     dactivated = _round(dy * up, gate_ref.dtype, interpret)
     dg = dactivated * sigmoid + (dactivated * gate) * (sigmoid * (1.0 - sigmoid))
-    plgpu.store(dg_ref, (index,), dg.astype(gate_ref.dtype), mask=mask)
-    plgpu.store(du_ref, (index,), (dy * activated).astype(up_ref.dtype), mask=mask)
+    plgpu.store(dg_ref.at[index], dg.astype(gate_ref.dtype), mask=mask)
+    plgpu.store(du_ref.at[index], (dy * activated).astype(up_ref.dtype), mask=mask)
 
 
 def _swiglu(gate, up, interpret: bool):
