@@ -23,6 +23,12 @@ class Draw(grain.RandomMapTransform):
         return {**element, "draw": np.int32(rng.integers(1 << 20))}
 
 
+@dataclasses.dataclass(frozen=True)
+class WideDraw(grain.RandomMapTransform):
+    def random_map(self, element, rng):
+        return {**element, "draw": np.int64(rng.integers(0, 2**32))}
+
+
 def indices(iterator, count):
     return [[int(value) for value in batch["index"]] for batch in itertools.islice(iterator, count)]
 
@@ -35,7 +41,8 @@ def jsonl(tmp_path):
     return Files(str(path), format="jsonl", shard_bytes=96)
 
 
-@pytest.mark.parametrize("uri", ["tfds://dew_images", "hf://datasets/acme/pets", "data/rows.jsonl"])
+@pytest.mark.parametrize("uri", ["tfds://dew_images", "hf://datasets/acme/pets", "data/rows.jsonl",
+                                 "data/rows.parquet"])
 def test_load_requires_an_alias_or_a_typed_recipe(uri):
     with pytest.raises(ValueError, match="recipe or alias"):
         load(uri, batch=4)
@@ -157,12 +164,13 @@ def test_a_per_share_position_refuses_another_worker_topology(jsonl):
         other.close()
 
 
-def test_per_record_rng_draws_agree_with_plain_grain():
+@pytest.mark.parametrize("draw, seed", [(Draw(), 11), (WideDraw(), 7)])
+def test_per_record_rng_draws_agree_with_plain_grain(draw, seed):
     rows = [{"index": np.int32(index)} for index in range(24)]
-    data = compile(Pipeline(Memory(rows)).shuffle(11).repeat().random_map(Draw()).batch(4),
-                   seed=11, read="indexed", loading=READ)
-    oracle = iter(grain.MapDataset.source(rows).seed(11).shuffle(11).repeat().random_map(
-        Draw()).to_iter_dataset(
+    data = compile(Pipeline(Memory(rows)).shuffle(seed).repeat().random_map(draw).batch(4),
+                   seed=seed, read="indexed", loading=READ)
+    oracle = iter(grain.MapDataset.source(rows).seed(seed).shuffle(seed).repeat().random_map(
+        draw).to_iter_dataset(
         grain.ReadOptions(num_threads=1, prefetch_buffer_size=4)).batch(4))
     actual = data.train(DataPartition())
     try:

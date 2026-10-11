@@ -40,7 +40,7 @@ from dew.data import (
     load,
 )
 from dew.data.compile import validation
-from dew.data.dataset import Forwarding, GlobalStream, Records as IndexedRows, SourceSlice, describe
+from dew.data.dataset import Forwarding, GlobalStream, SourceSlice
 from dew.data.image_codec import decode_image
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
@@ -68,12 +68,6 @@ def test_an_unknown_dataset_is_refused():
 def test_an_unknown_recipe_field_is_refused_before_opening_data():
     with pytest.raises(ValueError, match=r"unknown fields \['image_scale'\]"):
         datasets.build("images", source=[], image_scale=64)
-
-
-@pytest.mark.parametrize("uri", ["tfds://dew_images", "hf://datasets/acme/pets", "data/rows.parquet"])
-def test_load_requires_a_recipe_instead_of_inferring_one_from_a_uri(uri):
-    with pytest.raises(ValueError, match="recipe or alias"):
-        load(uri, batch=4)
 
 
 def test_a_recipe_and_an_explicit_pipeline_read_the_same_records():
@@ -136,34 +130,8 @@ class Indexed:
         source = self.source()
         records = len(source) if self.count is None else self.count
         held = (self.val_batches or 0) * self.batch
-        val = Pipeline(_Synthetic(SourceSlice(source, 0, held))) if held else None
-        return Pipeline(_Synthetic(SourceSlice(source, held, records))), val, ()
-
-
-@dataclasses.dataclass(frozen=True)
-class _Synthetic:
-    values: IndexedRows
-
-    def describe(self):
-        return describe(self.values)
-
-    def snapshot(self):
-        return {"source": describe(self.values), "records": len(self.values)}
-
-    def supports(self, read):
-        return read != "streamed"
-
-    def records(self, read):
-        return self.values
-
-    def metadata(self):
-        return {"rows": len(self.values)}
-
-    def lengths(self):
-        return None
-
-    def manifest(self):
-        raise ValueError("synthetic source is indexed")
+        val = Pipeline(Memory(SourceSlice(source, 0, held))) if held else None
+        return Pipeline(Memory(SourceSlice(source, held, records))), val, ()
 
 
 def _indices(iterator, num_batches):
@@ -880,14 +848,14 @@ class Augmenting:
                 held = held[:self.val_batches * self.batch] if isinstance(held,
                     list) else [held[index] for index in
                         range(min(len(held), self.val_batches * self.batch))]
-        training = Pipeline(_Synthetic(train)).random_map(self.transform())
+        training = Pipeline(Memory(train)).random_map(self.transform())
         if self.augmentation_backend == "device":
             mode = self.augment
             training = training.map_batch(DeviceAugment(self.image_size,
                 self.crop_scale if mode else (1.0, 1.0),
                 False if mode is None else mode.flip, False if mode is None else mode.jitter))
         validation = (None if held is None else
-                      Pipeline(_Synthetic(held)).random_map(self.transform(training=False)))
+                      Pipeline(Memory(held)).random_map(self.transform(training=False)))
         return training, validation, (EncodeCaptions(),)
 
 

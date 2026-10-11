@@ -14,37 +14,10 @@ from dew.data.dataset import DataPartition, Loading
 from dew.data.mix import SearchBudget, TokenDeficit, token_weights
 from dew.data.pipeline import Artifact, Pipeline, Rejected
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
-from dew.data.sources.base import ShardManifest
+from dew.data.sources import Memory
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
-
-
-@dataclasses.dataclass(frozen=True)
-class Memory:
-    values: tuple[dict, ...]
-    name: str = "records"
-
-    def describe(self):
-        return self.name
-
-    def snapshot(self):
-        return {"name": self.name}
-
-    def supports(self, read):
-        return read != "streamed"
-
-    def records(self, read):
-        return self.values
-
-    def manifest(self) -> ShardManifest:
-        raise ValueError("no streamed test source")
-
-    def metadata(self):
-        return {}
-
-    def lengths(self):
-        return None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -82,19 +55,6 @@ def source(count=24):
 def take(reader, count):
     return [{name: np.asarray(value).tolist() for name, value in row.items()}
             for row in itertools.islice(reader, count)]
-
-
-def test_pipeline_global_order_matches_the_existing_grain_order():
-    stored = source()
-    data = compile(Pipeline(stored).shuffle(7).repeat().random_map(Draw()).batch(4), loading=READ, seed=7)
-    reader = data.train(DataPartition())
-    oracle = iter(grain.MapDataset.source(stored.values).seed(7).shuffle(7).repeat().random_map(Draw())
-                  .to_iter_dataset(grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)).batch(4))
-    try:
-        assert take(reader, 9) == take(oracle, 9)
-    finally:
-        reader.close()
-        oracle.close()
 
 
 def test_memory_rejections_are_dense_before_global_order():
@@ -318,10 +278,10 @@ def test_validation_takes_accepted_rows_before_the_share_cut():
 
 @dataclasses.dataclass(frozen=True)
 class PhysicalMemory(Memory):
-    shard_rows: tuple[int, ...] = (4, 6, 10)
+    physical: tuple[int, ...] = (4, 6, 10)
 
     def locality(self):
-        return self.shard_rows, False
+        return self.physical, False
 
 
 def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
@@ -341,11 +301,11 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     resumed.close()
     from dew.data.ordering import BlockShuffle
 
-    blocked = BlockShuffle(grain.MapDataset.source(stored.values), stored.shard_rows, 2, 11)
+    blocked = BlockShuffle(grain.MapDataset.source(stored.values), stored.physical, 2, 11)
     order, ends = blocked._epoch(0)
     assert len(order) == 3
     start = 0
-    original_ends = np.cumsum(stored.shard_rows)
+    original_ends = np.cumsum(stored.physical)
     for end in ends:
         selected = {int(np.searchsorted(original_ends, blocked.index(index), side="right"))
                     for index in range(start, int(end))}
