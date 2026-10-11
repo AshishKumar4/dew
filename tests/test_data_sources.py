@@ -201,3 +201,6 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     assert len(source.tokens) == 9
     assert source.tokens[2:8].tolist() == list(range(2, 8))
     assert source.metadata()["tokenizer"] == "byte"
+    from dew.data.sources import source as resolve
+
+    assert isinstance(resolve(root), TokenFiles)
