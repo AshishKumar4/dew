@@ -352,7 +352,7 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
         elif isinstance(stage, Pack):
             from dew.data.tokens import PackedWindows, first_fit
 
-            documents = tuple(record(value, "packing document") for _, value in rows)
+            documents = tuple(_Payload()(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             packed = PackedWindows(
                 pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe()
@@ -420,6 +420,7 @@ def _memory_order(pipeline: Pipeline, collected: Sequence[tuple[tuple[int, ...],
     if lengths is not None:
         derived["lengths"] = fingerprint(lengths)
     counter.accepted = len(rows)
+    counter.truncated = sum(bool(value.get("_dew_truncated", False)) for _, value in rows)
     facts: Batch = {}
     if any(isinstance(stage, (Pack, Windows)) for stage in pipeline.stages[:consumed]):
         from dew.data.steps.text import ValidTargets
@@ -773,7 +774,7 @@ class _Build:
         elif isinstance(stage, Limit):
             rows = gx.LimitIterDataset(_as_iter(rows, self.loading), stage.count)
         elif isinstance(stage, Pack):
-            parent = _as_iter(rows, self.loading)
+            parent = _as_iter(rows, self.loading).map(_Payload())
             sizes = dict.fromkeys(stage.fields, stage.seq_len)
             if stage.policy == "concat":
                 rows = gx.ConcatThenSplitIterDataset(parent, length_struct=sizes)
@@ -849,7 +850,7 @@ class _Build:
                 rows = rows[offset + partition.index :: partition.count]
             if self.loading.workers:
                 rows = _WorkerBatches(rows, size, self.loading.worker_count, remainder=not self.training)
-        stream = _as_iter(rows, self.loading).batch(
+        stream = _as_iter(rows, self.loading).map(_Payload()).batch(
             size,
             drop_remainder=batch_stage.drop_remainder if self.training else False,
             batch_fn=batch_stage.batch_fn,
@@ -1047,7 +1048,7 @@ def compile(
             )
         else:
             records = len(source.records(read))
-    return Dataset(training, held_reader, records, batch)
+    return Dataset(training, held_reader, records, batch, counts=counts, plan=plan)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1056,6 +1057,12 @@ class _ShareBatch:
 
     def __call__(self, batch: Batch) -> Batch:
         return {name: value[self.partition.index :: self.partition.count] for name, value in batch.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class _Payload:
+    def __call__(self, row: Batch) -> Batch:
+        return {name: value for name, value in row.items() if not name.startswith("_dew_")}
 
 
 @dataclasses.dataclass(frozen=True)

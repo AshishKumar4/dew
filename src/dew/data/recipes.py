@@ -17,6 +17,7 @@ from dew.data.pipeline import Artifact, HostStep, Mixture, ObjectiveData, Pipeli
 from dew.records import integer
 
 if TYPE_CHECKING:
+    from dew.data.cache import Cache, Generation
     from dew.data.sources.files import Format
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.chat import PreferencePair, RenderChat, RenderPrompt
@@ -220,6 +221,7 @@ class Text:
     source: SourceValue
     tokenizer: str = "byte"
     seq_len: int = 256
+    stride: int | None = None
     field: str = "text"
     eos: bool = False
     pack: Literal["first-fit", "best-fit", "concat"] | None = None
@@ -228,10 +230,15 @@ class Text:
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        prefix = Pipeline(_source(self.source)).map(Tokenize(self.tokenizer, self.field, self.eos)).stages
+        from dew.data.sources.files import TokenFiles
+
+        stored = _source(self.source, split=self.split)
+        if isinstance(stored, TokenFiles):
+            return self._token_pipelines(stored)
+        prefix = Pipeline(stored).map(Tokenize(self.tokenizer, self.field, self.eos)).stages
         train, held = _branches(self.source, self.validation, split=self.split, prefix=prefix)
         if self.pack is None:
-            train = train.windows(self.seq_len)
+            train = train.windows(self.seq_len, stride=self.stride)
             held = None if held is None else held.windows(self.seq_len)
         else:
             train = train.flat_map(Chunks(self.seq_len + 1)).pack(
@@ -245,6 +252,26 @@ class Text:
                 )
             )
         return train, held, ()
+
+
+    def _token_pipelines(self, stored) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
+        from dew.data.steps.windows import Documents, WindowSource
+
+        held = self.validation
+        if held is None and stored.metadata().get("val_tokens", 0):
+            held = dataclasses.replace(stored, split="val")
+        sources = (stored, None if held is None else _source(held))
+
+        def windows(source, stride):
+            if self.pack is None:
+                return Pipeline(WindowSource(source, source.tokens, self.seq_len, stride))
+            if source.tokens.eos_id is None:
+                raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
+            return Pipeline(source).flat_map(Documents(source.tokens.eos_id)).pack(
+                self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+
+        return (windows(sources[0], self.stride or self.seq_len),
+                None if sources[1] is None else windows(sources[1], self.seq_len), ())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -380,6 +407,7 @@ def load(
     batch: int,
     read: Read = "indexed",
     provision: bool = False,
+    cache: Cache | Generation | str | None = None,
     objective: ObjectiveData | Callable[[Mapping[str, object]], ObjectiveData] | None = None,
     seed: int = 0,
     loading: Loading = _DEFAULT_LOADING,
@@ -407,6 +435,9 @@ def load(
     if not isinstance(recipe, Recipe):
         raise TypeError("load expects a typed recipe with pipelines()")
     train, held, shared = recipe.pipelines()
+    if cache is not None:
+        train = _cached(train, cache)
+        held = None if held is None else _cached(held, cache)
     train = _batched(_ordered(train, read, seed), batch, train=True)
     held = None if held is None else _batched(held, batch, train=False)
     return compile(
@@ -451,4 +482,16 @@ def _batched(pipeline: Pipeline, batch: int, *, train: bool) -> Pipeline:
     at = next((index for index, stage in enumerate(pipeline.stages)
                if isinstance(stage, MapBatch)), len(pipeline.stages))
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).batch(batch, drop_remainder=train)
+    return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
+
+
+def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
+    from dew.data.pipeline import MapBatch, Pack, Windows
+
+    if isinstance(pipeline.source, Mixture):
+        children = tuple(_cached(child, cache) for child in pipeline.source.pipelines)
+        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+    at = next((index for index, stage in enumerate(pipeline.stages)
+               if isinstance(stage, (RandomMap, MapBatch, Pack, Windows))), len(pipeline.stages))
+    prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).cache(cache)
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
