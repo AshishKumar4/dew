@@ -198,11 +198,11 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
     columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info"]
+               "total_self_time", "source_info", "hbm_bw"]
     times = {"flash backward": 6000.0, "Pallas recurrence": 2000.0, "transposing fusion": 1000.0,
              "weight-gradient GEMM": 500.0}
     cells = [("15", found["category"], found["hlo_op_name"], found["hlo_op_expression"], found["tf_op_name"],
-              "1", time, "") for case, time in times.items() for found in [ROWS[case][0]]]
+              "1", time, "", 1500.0) for case, time in times.items() for found in [ROWS[case][0]]]
     rows = [{"c": [{"v": value} for value in values]} for values in cells]
     (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
                                                          "rows": rows}]))
@@ -216,6 +216,8 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     assert time["by_kind_ms"] == {"attention": 6.0, "pallas": 2.0, "layout": 1.0, "gemm": 0.5}
     assert time["by_part_kind_ms"]["attention"] == {"attention": 6.0}
     assert time["by_part_kind_ms"]["mlp"] == {"gemm": 0.5}
+    # 1,500 GiB/s over the transposing fusion's millisecond is 1.5 GiB a step.
+    assert {record["us"]: record["hbm_mib"] for record in time["top_ops"]}[1000.0] == 1536.0
 
 
 def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
@@ -260,7 +262,7 @@ def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
     columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info", "normalized_flop_rate"]
+               "total_self_time", "source_info", "model_flop_rate"]
     cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = bf16[8,8]{1,0} custom-call('
               'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
               "jit(step)/dot_general", "1", 1000.0, "", 1.0e5),
@@ -285,6 +287,40 @@ def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
     assert attribute.main(command) == 0
     # 1e11 / 5e14 + 1e11 / 1e15 over 2 ms.
     assert json.loads(out.read_text())["time"]["mfu_mixed_of_device_time"] == 0.15
+def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(tmp_path):
+    """XProf's normalized rate scales a GEMM's FLOPs by bf16's peak over its precision's, so an fp32
+    dot it takes for non-tensor-core arithmetic reads above any peak (the later Qwen3.5-0.8B step's GEMMs at 1.127 of
+    the A100's). The compiler's FLOPs over the measured time are the work done, and each GEMM's
+    fraction is of its own precision's peak in Dew's table, as mfu_mixed counts it."""
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+               "total_self_time", "source_info", "normalized_flop_rate", "model_flop_rate"]
+    cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = f32[8,8]{1,0} custom-call('
+              'f32[8,8]{1,0} %a, f32[8,8]{1,0} %b), custom_call_target="__cublas$gemm"',
+              "jit(step)/dot_general", "1", 1000.0, "", 8.0e6, 2.5e5),
+             ("15", "custom-call", "custom-call.2", '%custom-call.2 = bf16[8,8]{1,0} custom-call('
+              'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
+              "jit(step)/dot_general", "1", 1000.0, "", 4.0e5, 8.0e5)]
+    rows = [{"c": [{"v": v} for v in row]} for row in cells]
+    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
+                                                         "rows": rows}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
+    entry = tmp_path / "entry.json"
+    entry.write_text(json.dumps({"model_flops_per_step": 1.05e12, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
+    out = tmp_path / "attribution.json"
+    command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    assert attribute.main(command) == 0
+    time = json.loads(out.read_text())["time"]
+    # 2.5e5 of the 5e5 GFLOP/s bf16 peak and 8e5 of the 1e6 FP8 peak, a millisecond each.
+    assert {record["hlo"]: record["fraction_of_peak"] for record in time["gemms_by_lost_time"]} == {
+        "custom-call.1": 0.5, "custom-call.2": 0.8}
+    assert time["gemm_fraction_of_peak"] == 0.65 and time["gemm_lost_ms"] == 0.7
+    assert time["fp8_gemm_flops_per_step"] == 8e11
+    # All the step is GEMM time, so mfu_mixed is the GEMMs' own fraction.
+    assert time["mfu_mixed_of_device_time"] == 0.65
+
+
 def test_a_module_read_as_it_streams_is_the_module_read_whole():
     """Line by line, with the metadata kept only as traced names: the same instructions, kinds and
     traced names as the whole text, braces inside a quoted op_name included."""

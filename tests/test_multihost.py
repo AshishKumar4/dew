@@ -178,22 +178,23 @@ def gang_run(command: list[str], *, devices: int, timeout: float = 1800) -> str:
 
 
 @pytest.mark.distributed
-def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device():
-    """The parity tool's dense decoder and mixture of experts over one device on each of four hosts:
+@pytest.mark.parametrize("model", ["dense", "moe"])
+def test_layouts_across_hosts_split_only_data_and_fsdp_and_match_one_device(model):
+    """The parity tool's dense decoder or mixture of experts over one device on each of four hosts:
     the data, fsdp and replica layouts, whose sums cross the relay between containers, match one
     device, and an axis inside a model replica (tensor, stage) is refused across hosts, since each
-    container is its own slice and only fsdp may cross slices."""
+    container is its own slice and only fsdp may cross slices. One model a test, so CI's gangs run
+    them side by side."""
     if WORLD != 4:
         pytest.skip("one device on each of four hosts")
-    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", "dense", "moe", "--layouts",
+    output = gang_run([sys.executable, "tools/layout_parity.py", "--models", model, "--layouts",
                        "data4", "fsdp4", "replicas4", "replicas2_fsdp2", "tensor4", "stage4"], devices=1)
     if RANK == 0:
         summary = next(line for line in output.splitlines() if re.fullmatch(r"\w+ \d+(, \w+ \d+)*", line))
         counts = {status: int(count) for status, count in re.findall(r"(\w+) (\d+)", summary)}
         refusals = re.findall(r"^refused (\S+): (.*)$", output, re.M)
-        assert counts == {"works": 8, "refused": 4}, output[-4000:]
-        assert sorted(name for name, _ in refusals) == ["dense/stage4", "dense/tensor4", "moe/stage4",
-                                                        "moe/tensor4"]
+        assert counts == {"works": 4, "refused": 2}, output[-4000:]
+        assert sorted(name for name, _ in refusals) == [f"{model}/stage4", f"{model}/tensor4"]
         assert all("granules" in reason for _, reason in refusals), refusals
 
 
