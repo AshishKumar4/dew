@@ -583,9 +583,8 @@ class Trainer(Generic[Loss, Effects]):
         it. `step` replaces the built-in transaction. A custom step then owns the clocks, the
         scaler, the EMA and the mutable writes, and the compiled wrapper owns only the
         attempted-step counter. `rollout` runs once per batch read, before the step and outside
-        replay. `layout` and `mesh` say where the state lives. `lower_for` names a CUDA generation
-        ('sm80') to lower the first step for in place of compiling it, and `fit` then raises
-        `Lowered` (`dew.training.lowering`).
+        replay. `layout` and `mesh` say where the state lives. `lower_for`, a CUDA generation, lowers
+        the first step for it in place of compiling it (`dew.training.lowering.Lowered`).
         """
         if accumulation < 1:
             raise ValueError(f"accumulation must be at least 1, got {accumulation}")
@@ -1190,7 +1189,7 @@ class Trainer(Generic[Loss, Effects]):
             refusals: list[RuntimeError] = []
             consulted, record_path, key = False, None, {}
             while True:
-                jitted = self._jitted(self._step_body(shapes, copies), shardings, placement, replicated)
+                jitted = self._jitted(shapes, copies, shardings, placement, replicated)
                 self.program = jitted.lower(prepared, batch)
                 if not consulted:
                     consulted, before = True, self._rung()
@@ -1259,14 +1258,12 @@ class Trainer(Generic[Loss, Effects]):
                 lambda variables: narrowed(variables, copies), prepared.variables))
         return shapes, copies, prepared
 
-    def _step_body(self, shapes, copies: dict):
-        """The transaction's step, or the custom step's."""
-        if self.step is not None:
-            return self.step(self.objective, self.optimizer)
-        return Transaction(self.objective, self.optimizer, self.accumulation, shapes, copies).step()
+    def _jitted(self, shapes, copies: dict, shardings: Placement[TrainState], placement,
+                replicated: NamedSharding):
+        """The transaction's step, or the custom one, which donates the state it is handed."""
+        body = (self.step(self.objective, self.optimizer) if self.step is not None else
+                Transaction(self.objective, self.optimizer, self.accumulation, shapes, copies).step())
 
-    def _jitted(self, body, shardings: Placement[TrainState], placement, replicated: NamedSharding):
-        """The step over `body`, which donates the state it is handed."""
         def step(current, batch):
             # The body sees every field on the device; the out shardings
             # return the host-resident ones to pinned host memory.
@@ -1283,12 +1280,9 @@ class Trainer(Generic[Loss, Effects]):
         """The step `compile` builds first, traced as on a GPU of the CUDA `generation` and lowered
         for one (`dew.training.lowering`), on whatever devices this process has.
 
-        The step traces on an abstract mesh of that GPU's devices, the device
-        mesh's axes over them, so JAX's Pallas lowering reads the GPU from each
-        kernel's trace and lowers it to Triton. Only shapes cross over: the
-        state and the batch on this process's devices sit on another mesh. A
-        CPU-owned state's step realizes its parameters on the host as it runs,
-        and is not lowered whole."""
+        The step traces on an abstract mesh of that GPU's devices, from which JAX's Pallas lowering
+        reads the GPU, so only shapes cross over. A CPU-owned state's step realizes its parameters on
+        the host as it runs, and is not lowered whole."""
         if self.host_master:
             raise ValueError("lower_for lowers a step whose state the devices hold; this layout keeps "
                              "the variables on the host")
@@ -1300,8 +1294,7 @@ class Trainer(Generic[Loss, Effects]):
             shardings = jax.tree.map(lambda s: NamedSharding(mesh, s.spec, memory_kind=s.memory_kind),
                                      self.shardings(prepared))
             placement = batch_shardings(mesh, batch)
-            jitted = self._jitted(self._step_body(shapes, copies), shardings, placement,
-                                  NamedSharding(mesh, P()))
+            jitted = self._jitted(shapes, copies, shardings, placement, NamedSharding(mesh, P()))
             placed = [jax.tree.map(lambda x, s: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=s), tree, at)
                       for tree, at in ((prepared, shardings), (batch, placement))]
             return jitted.trace(*placed).lower(lowering_platforms=('cuda',))
