@@ -62,7 +62,7 @@ class IndexedWindows:
         if not 0 <= index < len(self):
             raise IndexError(index)
         start = index * self.stride
-        return {"text": np.asarray(self.tokens[start:start + self.length + 1], np.int32)}
+        return {"text": np.asarray(self.tokens[start : start + self.length + 1], np.int32)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,12 +95,22 @@ class WindowSource:
 
     def manifest(self) -> ShardManifest:
         count = len(self.records("indexed"))
-        return ShardManifest(tuple(Shard(f"{self.describe()}:{start}", self.describe(), start,
-                                         min(start + 1024, count), min(1024, count - start))
-                                   for start in range(0, count, 1024)), self._reader)
+        return ShardManifest(
+            tuple(
+                Shard(
+                    f"{self.describe()}:{start}",
+                    self.describe(),
+                    start,
+                    min(start + 1024, count),
+                    min(1024, count - start),
+                )
+                for start in range(0, count, 1024)
+            ),
+            self._reader,
+        )
 
     def _reader(self, shard: Shard) -> grain.IterDataset[Batch]:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
+        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()
 
 
 @dataclasses.dataclass(frozen=True)

@@ -83,9 +83,14 @@ class TokenBudget:
     def __post_init__(self) -> None:
         if self.tokens <= 0 or self.window <= 0:
             raise ValueError("token budget and grouping window must be positive")
-        if self.lengths and (len(self.lengths) > 6 or tuple(sorted(set(self.lengths))) != self.lengths
-                             or any(length <= 0 or self.tokens % length for length in self.lengths)):
-            raise ValueError("token budget lengths need at most six increasing positive divisors of the budget")
+        if self.lengths and (
+            len(self.lengths) > 6
+            or tuple(sorted(set(self.lengths))) != self.lengths
+            or any(length <= 0 or self.tokens % length for length in self.lengths)
+        ):
+            raise ValueError(
+                "token budget lengths need at most six increasing positive divisors of the budget"
+            )
 
 
 @runtime_checkable
@@ -283,7 +288,11 @@ class Phases:
     until_steps: tuple[int | None, ...]
 
     def __post_init__(self) -> None:
-        if not self.pipelines or len(self.pipelines) != len(self.until_steps) or self.until_steps[-1] is not None:
+        if (
+            not self.pipelines
+            or len(self.pipelines) != len(self.until_steps)
+            or self.until_steps[-1] is not None
+        ):
             raise ValueError("phases need one boundary per pipeline; the last boundary is None")
         previous = 0
         for boundary in self.until_steps[:-1]:
@@ -301,14 +310,19 @@ class Pipeline:
     def then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
 
-    def map(self, *steps: RecordStep | Configured, identity: str | None = None,
-            rejects: bool | None = None) -> Pipeline:
+    def map(
+        self, *steps: RecordStep | Configured, identity: str | None = None, rejects: bool | None = None
+    ) -> Pipeline:
         for step in steps:
             if isinstance(step, pygrain.RandomMapTransform):
-                raise ValueError(f"stochastic step {type(step).__name__} needs random_map after the cache prefix")
+                raise ValueError(
+                    f"stochastic step {type(step).__name__} needs random_map after the cache prefix"
+                )
         return self.then(
             *(
-                step if isinstance(step, Configured) else Map(step, identity, _rejects(step) if rejects is None else rejects)
+                step
+                if isinstance(step, Configured)
+                else Map(step, identity, _rejects(step) if rejects is None else rejects)
                 for step in steps
             )
         )
@@ -329,8 +343,9 @@ class Pipeline:
     def flat_map(self, step: Expansion, *, identity: str | None = None) -> Pipeline:
         return self.then(FlatMap(step, identity))
 
-    def shuffle(self, seed: int = 0, *, window: int | None = None,
-                block_shards: int | None = None) -> Pipeline:
+    def shuffle(
+        self, seed: int = 0, *, window: int | None = None, block_shards: int | None = None
+    ) -> Pipeline:
         if window is not None and block_shards is not None:
             raise ValueError("shuffle uses a window or physical shard blocks, not both")
         if block_shards is not None and block_shards < 1:
@@ -394,8 +409,7 @@ class Pipeline:
     ) -> Pipeline:
         return self.then(Windows(seq_len, stride, fields))
 
-    def token_split(self, fraction: float, *, held: bool,
-                    fields: tuple[str, ...] = ("text",)) -> Pipeline:
+    def token_split(self, fraction: float, *, held: bool, fields: tuple[str, ...] = ("text",)) -> Pipeline:
         return self.then(TokenSplit(fraction, held, fields))
 
     def rebatch(self, size: int) -> Pipeline:
@@ -445,4 +459,5 @@ def _rejects(step: RecordStep | RandomStep | Callable[[int, Batch], Batch | Reje
         method = step
     returned = inspect.signature(method).return_annotation
     return "Rejected" in str(returned) or (
-        returned is inspect.Signature.empty and not isinstance(step, pygrain.RandomMapTransform))
+        returned is inspect.Signature.empty and not isinstance(step, pygrain.RandomMapTransform)
+    )

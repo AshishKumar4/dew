@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-import inspect
 import importlib.metadata
+import inspect
 import json
 import logging
 import platform
 import re
 import subprocess
-import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -68,16 +67,22 @@ class StepIdentity:
             not exact or (external and declared is None) or (inspect.isfunction(step) and declared is None)
         ):
             raise ValueError(f"cache prefix step {name} needs identity='name@version'")
-        path = None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
+        path = (
+            None if inspect.isbuiltin(step) or kind.__module__ == "builtins" else inspect.getsourcefile(kind)
+        )
         module_hash = (
             hashlib.sha256(Path(path).read_bytes()).hexdigest()
             if external and path is not None and Path(path).is_file()
             else None
         )
         config = re.sub(r" at 0x[0-9a-fA-F]+", "", config)
-        dependencies = (step.dependencies() if isinstance(step, _Dependencies)
-                        else _dependencies(step) if dataclasses.is_dataclass(step) and not isinstance(step, type)
-                        else {})
+        dependencies = (
+            step.dependencies()
+            if isinstance(step, _Dependencies)
+            else _dependencies(step)
+            if dataclasses.is_dataclass(step) and not isinstance(step, type)
+            else {}
+        )
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps(_configuration(step), sort_keys=True)
         return cls(name, config, exact, module_hash, declared, dependencies)
@@ -153,25 +158,47 @@ class Manifest:
                 ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
             ).stdout.strip()
             dirty = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=no"], cwd=root,
-                check=True, capture_output=True, text=True).stdout.strip()
+                ["git", "status", "--porcelain", "--untracked-files=no"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             added_code = subprocess.run(
-                ["git", "ls-files", "--others", "--exclude-standard", "src/dew"], cwd=root,
-                check=True, capture_output=True, text=True).stdout.strip()
+                ["git", "ls-files", "--others", "--exclude-standard", "src/dew"],
+                cwd=root,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip()
             clean = not dirty and not added_code
         locked = [root / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
-        dependencies = {distribution.metadata["Name"]: distribution.version
-                        for distribution in importlib.metadata.distributions() if distribution.metadata["Name"]}
-        lock = fingerprint({"files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                                      for path in locked if path.is_file()}, "installed": dependencies})
+        dependencies = {
+            distribution.metadata["Name"]: distribution.version
+            for distribution in importlib.metadata.distributions()
+            if distribution.metadata["Name"]
+        }
+        lock = fingerprint(
+            {
+                "files": {
+                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+                    for path in locked
+                    if path.is_file()
+                },
+                "installed": dependencies,
+            }
+        )
         return cls(
             source,
             tuple(steps),
             revision=revision,
             lock=lock,
             fill={} if fill is None else fill,
-            tokenizer={f"{index}/{step.name}": step.dependencies
-                       for index, step in enumerate(steps) if step.dependencies},
+            tokenizer={
+                f"{index}/{step.name}": step.dependencies
+                for index, step in enumerate(steps)
+                if step.dependencies
+            },
             clean=clean,
         )
 

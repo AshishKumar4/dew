@@ -12,7 +12,7 @@ import numpy as np
 
 from dew import records
 from dew.data.pipeline import Configured, HostStep, Pipeline
-from dew.data.recipes import HoldOut, Split, Validation, _branches, source_argument, SourceValue
+from dew.data.recipes import HoldOut, SourceValue, Split, Validation, _branches, source_argument
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
@@ -94,7 +94,6 @@ class Example:
         return np.eye(len(self.questions[name].options))[self.labels()[name]]
 
 
-
 def _distribution(question: Question, target: JSON, name: str) -> tuple[float, ...]:
     """A target distribution from a row: probabilities in the question's option order, or keyed by option."""
     match target:
@@ -106,7 +105,6 @@ def _distribution(question: Question, target: JSON, name: str) -> tuple[float, .
             return tuple(records.number(target[option], f"{name}.{option}") for option in question.options)
         case _:
             raise ValueError(f"{name} is a list of probabilities or a mapping of options to them")
-
 
 
 def _label(value: str | int | float | bool) -> str | int:
@@ -176,8 +174,12 @@ class _DecisionSource:
                 elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
                     if self.table.label not in first:
                         raise ValueError(f"decision table needs column {self.table.label!r}")
-                    self._classes.extend(dict.fromkeys(str(record(records[index], "decision row")[self.table.label])
-                                                      for index in range(len(records))))
+                    self._classes.extend(
+                        dict.fromkeys(
+                            str(record(records[index], "decision row")[self.table.label])
+                            for index in range(len(records))
+                        )
+                    )
             self._memory_slots(records)
         return records
 
@@ -208,9 +210,14 @@ class _DecisionSource:
     def metadata(self) -> Mapping[str, object]:
         stated = self.source.metadata()
         if self.table is not None:
-            names = (self.table.options or tuple(self._classes) or
-                     records.strings(record(stated.get("class_names", {}), "class names").get(
-                         self.table.label, ()), "class names"))
+            names = (
+                self.table.options
+                or tuple(self._classes)
+                or records.strings(
+                    record(stated.get("class_names", {}), "class names").get(self.table.label, ()),
+                    "class names",
+                )
+            )
             if names:
                 return {**stated, "slots": {"questions": 1, "options": len(names)}, "decision_options": names}
         return {**stated, "slots": self._facts} if self._facts else stated
@@ -226,9 +233,16 @@ class _DecisionSource:
 class Decisions:
     """Decision rows and their corpus shares, with layout supplied by the objective."""
 
-    source: Annotated[str | Source | Sequence[Example | Mapping[str, object]] | Mapping[
-        str, Sequence[Example | Mapping[str, object]]], source_argument(SourceValue)] = "tickets.csv"
-    validation: Annotated[Validation | Sequence[Example | Mapping[str, object]], source_argument(Validation)] = None
+    source: Annotated[
+        str
+        | Source
+        | Sequence[Example | Mapping[str, object]]
+        | Mapping[str, Sequence[Example | Mapping[str, object]]],
+        source_argument(SourceValue),
+    ] = "tickets.csv"
+    validation: Annotated[
+        Validation | Sequence[Example | Mapping[str, object]], source_argument(Validation)
+    ] = None
     weights: Mapping[str, float] = field(default_factory=dict)
     options: tuple[str, ...] = ()
     text: str = "text"
@@ -245,13 +259,20 @@ class Decisions:
 
         table = ParseTable(self.options, self.text, self.label, self.question, self.instructions)
         if isinstance(self.source, Mapping):
-            branches = [dataclasses.replace(
-                dataclasses.replace(self, source=rows, validation=None, weights={}).pipelines()[0], name=name)
-                        for name, rows in sorted(self.source.items())]
-            weights = [self.weights.get(name, 1.) for name in sorted(self.source)]
+            branches = [
+                dataclasses.replace(
+                    dataclasses.replace(self, source=rows, validation=None, weights={}).pipelines()[0],
+                    name=name,
+                )
+                for name, rows in sorted(self.source.items())
+            ]
+            weights = [self.weights.get(name, 1.0) for name in sorted(self.source)]
             train = branches[0] if len(branches) == 1 else branches[0].mix(*branches[1:], weights=weights)
-            held = None if self.validation is None else dataclasses.replace(
-                self, source=(), weights={}).pipelines()[1]
+            held = (
+                None
+                if self.validation is None
+                else dataclasses.replace(self, source=(), weights={}).pipelines()[1]
+            )
             return train, held, ()
         if isinstance(self.source, str):
             root = Store(self.source)
@@ -267,12 +288,16 @@ class Decisions:
                     provenance = record(replaced.get("provenance"), "descriptor provenance")
                     root_manifest = root.child("manifest.sha256").read().decode().strip()
                     if provenance.get("original_manifest_sha") != root_manifest:
-                        raise ValueError("decision descriptor refers to a different canonical source manifest")
+                        raise ValueError(
+                            "decision descriptor refers to a different canonical source manifest"
+                        )
                     original_files = record(stated.get("files", {}), "original files")
                     for name, value in record(replaced.get("files", {}), "descriptor files").items():
                         old = record(original_files.get(name), f"original files.{name}")
                         for partition, entry in record(value, name).items():
-                            if record(entry, partition).get("sha256") != record(old.get(partition), partition).get("sha256"):
+                            if record(entry, partition).get("sha256") != record(
+                                old.get(partition), partition
+                            ).get("sha256"):
                                 raise ValueError(f"decision descriptor changes raw corpus {name}/{partition}")
                     stated = replaced
                     pinned = {"url": self.descriptor, "sha256": hashlib.sha256(payload).hexdigest()}
@@ -313,15 +338,25 @@ class Decisions:
                                 if index is None
                                 else self.source.rstrip("/") + "/" + records.text(index, "index.path")
                             )
-                            declared = {
-                                self.source.rstrip("/") + "/" + records.text(record(shard, "shard")["path"], "shard.path"):
-                                record(shard, "shard") for shard in shards if isinstance(shards, list)
-                            } if isinstance(shards, list) else None
+                            declared = (
+                                {
+                                    self.source.rstrip("/")
+                                    + "/"
+                                    + records.text(record(shard, "shard")["path"], "shard.path"): record(
+                                        shard, "shard"
+                                    )
+                                    for shard in shards
+                                    if isinstance(shards, list)
+                                }
+                                if isinstance(shards, list)
+                                else None
+                            )
                             if declared is not None and source_index is not None:
                                 declared[source_index] = record(entry["index"], "index")
                             dataset = _DecisionSource(
                                 Files(paths, format="jsonl", index=source_index, file_info=declared),
-                                slots or None, descriptor=pinned
+                                slots or None,
+                                descriptor=pinned,
                             )
                             destination.append(Pipeline(dataset, name=name).map(ParseExample()))
                     weights.append(weight)
@@ -336,7 +371,8 @@ class Decisions:
                             Concatenate(
                                 tuple(child.source for child in held if isinstance(child.source, Source))
                             ),
-                            slots or None, descriptor=pinned,
+                            slots or None,
+                            descriptor=pinned,
                         )
                     ).map(ParseExample())
                 )
@@ -373,7 +409,8 @@ class Decisions:
             evaluated = Pipeline(held_source, name="held out")
         else:
             evaluated = Pipeline(_DecisionSource(source(self.validation), table=table)).map(
-                Configured(_ParseConfigured(table), needs=()))
+                Configured(_ParseConfigured(table), needs=())
+            )
         return train, evaluated, ()
 
 

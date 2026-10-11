@@ -7,38 +7,36 @@ import functools
 import hashlib
 import json
 import random
+from collections.abc import Mapping, Sequence
 from types import UnionType
-from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, runtime_checkable
 
 import numpy as np
 import tyro
 
 from dew.data.compile import compile
-from dew.data.dataset import Batch, DataPhase, Dataset, Loading, record_argument
-from dew.data.dataset import Records as IndexedRecords
-from dew.data.pipeline import Artifact, Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, RandomMap, Rejected, Stage
+from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
+from dew.data.pipeline import (
+    Artifact,
+    Configured,
+    HostStep,
+    Mixture,
+    ObjectiveData,
+    Phases,
+    Pipeline,
+    RandomMap,
+    Rejected,
+    Stage,
+)
 from dew.records import integer
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache, Generation
     from dew.data.sources.files import Format
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
-from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat, RenderPrompt
+from dew.data.steps.chat import ConfigurePrompt, PreferencePair, RenderChat
 from dew.data.steps.generic import Formatting
-from dew.data.steps.image import (
-    AugmentationKey,
-    Caption,
-    ColorJitter,
-    ConfigureImage,
-    DecodeImage,
-    DeviceAugment,
-    EncodeCaptions,
-    Flip,
-    ImageRecord,
-    RandomCrop,
-    Resize,
-)
+from dew.data.steps.image import ConfigureImage, DeviceAugment, EncodeCaptions, ImageRecord
 from dew.data.steps.text import Chunks, LengthPolicy, Tokenize, ValidTargets
 from dew.data.steps.video import Audio, DecodeClip, VideoPath
 
@@ -56,18 +54,33 @@ def source_argument(annotation: type | UnionType | TypeAliasType):
             return None
         if word.startswith(("{", "[")):
             value = json.loads(word)
-            return from_record(annotation, value, dtypes=False) if isinstance(value, Mapping) and "class" in value else value
+            return (
+                from_record(annotation, value, dtypes=False)
+                if isinstance(value, Mapping) and "class" in value
+                else value
+            )
         return word
 
     def write(value):
         from dew.registry import to_record
 
-        return [value if isinstance(value, str) else "None" if value is None else json.dumps(to_record(value, None))]
+        return [
+            value
+            if isinstance(value, str)
+            else "None"
+            if value is None
+            else json.dumps(to_record(value, None))
+        ]
 
-    return tyro.constructors.PrimitiveConstructorSpec(nargs=1, metavar="URL|JSON", instance_from_str=read,
-        is_instance=lambda value: value is None or isinstance(value, (str, Source, Mapping, Sequence))
-                                  or dataclasses.is_dataclass(value),
-        str_from_instance=write)
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1,
+        metavar="URL|JSON",
+        instance_from_str=read,
+        is_instance=lambda value: value is None
+        or isinstance(value, (str, Source, Mapping, Sequence))
+        or dataclasses.is_dataclass(value),
+        str_from_instance=write,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -159,9 +172,15 @@ class _HashSource:
         import grain.python as grain
 
         rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows)) if (
-            int.from_bytes(hashlib.sha256(f"index:{index}".encode()).digest()[:8], "big")
-            < int(self.fraction * 2**64)) == self.held)
+        keys = tuple(
+            index
+            for index in range(len(rows))
+            if (
+                int.from_bytes(hashlib.sha256(f"index:{index}".encode()).digest()[:8], "big")
+                < int(self.fraction * 2**64)
+            )
+            == self.held
+        )
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
 
     def metadata(self) -> Mapping[str, object]:
@@ -177,8 +196,10 @@ class _HashSource:
     def _reader(self, manifest: ShardManifest, shard: Shard):
         from dew.data.mix import Accepted
 
-        return Accepted(manifest.reader(shard).map_with_index(_HashRows(self.fraction, self.held, shard.id)),
-                        self.describe())
+        return Accepted(
+            manifest.reader(shard).map_with_index(_HashRows(self.fraction, self.held, shard.id)),
+            self.describe(),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -205,7 +226,11 @@ class _RandomSource:
         return read != "streamed" and self.source.supports(read)
 
     def _indices(self, count: int) -> tuple[int, ...]:
-        size = self.split.records if self.split.records is not None else int(count * (self.split.fraction or 0.))
+        size = (
+            self.split.records
+            if self.split.records is not None
+            else int(count * (self.split.fraction or 0.0))
+        )
         size = min(size, self.split.most) if self.split.most is not None else size
         order = list(range(count))
         random.Random(self.split.seed).shuffle(order)
@@ -229,8 +254,9 @@ class _RandomSource:
         raise ValueError("random-index HoldOut needs indexed records; use by='hash' for streams")
 
 
-def _source(value: SourceValue | Mapping[str, float], *, split: str = "train",
-            format: Format | None = None) -> Source:
+def _source(
+    value: SourceValue | Mapping[str, float], *, split: str = "train", format: Format | None = None
+) -> Source:
     from dew.data.sources import source
 
     return source(value, split=split, format=format)
@@ -285,15 +311,20 @@ class Recipe(Protocol):
 @runtime_checkable
 class _HostBinding(Protocol):
     binding: str
+
     def __call__(self, batch: Batch) -> Batch: ...
 
 
 def _host_stages(defaults: tuple[HostStep, ...], explicit: tuple[HostStep, ...]) -> tuple[HostStep, ...]:
     bindings = {stage.binding: stage for stage in explicit if isinstance(stage, _HostBinding)}
-    configured = tuple(bindings.pop(stage.binding, stage) if isinstance(stage, _HostBinding) else stage
-                       for stage in defaults)
-    return (*configured, *(stage for stage in explicit if not isinstance(stage, _HostBinding)),
-            *bindings.values())
+    configured = tuple(
+        bindings.pop(stage.binding, stage) if isinstance(stage, _HostBinding) else stage for stage in defaults
+    )
+    return (
+        *configured,
+        *(stage for stage in explicit if not isinstance(stage, _HostBinding)),
+        *bindings.values(),
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -324,7 +355,7 @@ class Text:
     token_holdout: HoldOut | None = None
 
     def __post_init__(self) -> None:
-        if self.seq_len < 1 or self.stride is not None and self.stride < 1:
+        if self.seq_len < 1 or (self.stride is not None and self.stride < 1):
             raise ValueError("text seq_len and stride must be positive")
         if self.packing_bins < 1:
             raise ValueError("packing_bins must be positive")
@@ -335,24 +366,46 @@ class Text:
         if self.phases:
             if self.source:
                 raise ValueError("Text takes source or phases, not both")
-            branches = [dataclasses.replace(self, source=phase.path, phases=()).pipelines()
-                        for phase in self.phases]
-            return Pipeline(Phases(tuple(branch[0] for branch in branches),
-                                   tuple(phase.until_step for phase in self.phases))), branches[0][1], ()
-        if isinstance(self.source, Mapping) and all(isinstance(weight, (int, float))
-                                                   for weight in self.source.values()):
+            branches = [
+                dataclasses.replace(self, source=phase.path, phases=()).pipelines() for phase in self.phases
+            ]
+            return (
+                Pipeline(
+                    Phases(
+                        tuple(branch[0] for branch in branches),
+                        tuple(phase.until_step for phase in self.phases),
+                    )
+                ),
+                branches[0][1],
+                (),
+            )
+        if isinstance(self.source, Mapping) and all(
+            isinstance(weight, (int, float)) for weight in self.source.values()
+        ):
             branches = [dataclasses.replace(self, source=path).pipelines() for path in sorted(self.source)]
             if not branches:
                 raise ValueError("Text mixture has no corpora")
-            weighted = {path: float(weight) for path, weight in self.source.items()
-                        if isinstance(weight, (int, float))}
+            weighted = {
+                path: float(weight)
+                for path, weight in self.source.items()
+                if isinstance(weight, (int, float))
+            }
             weights = [weighted[path] for path in sorted(weighted)]
             trains = [branch[0] for branch in branches]
             held = [branch[1] for branch in branches]
-            train = trains[0] if len(trains) == 1 else trains[0].mix(*trains[1:], weights=weights, tokens=ValidTargets())
+            train = (
+                trains[0]
+                if len(trains) == 1
+                else trains[0].mix(*trains[1:], weights=weights, tokens=ValidTargets())
+            )
             scored = [branch for branch in held if branch is not None]
-            validation = (None if not scored else scored[0] if len(scored) == 1
-                          else scored[0].mix(*scored[1:], weights=weights))
+            validation = (
+                None
+                if not scored
+                else scored[0]
+                if len(scored) == 1
+                else scored[0].mix(*scored[1:], weights=weights)
+            )
             return train, validation, ()
         stored = _source(self.source, split=self.split)
         if isinstance(stored, TokenFiles):
@@ -366,20 +419,29 @@ class Text:
             train = train.token_split(self.token_holdout.fraction, held=False)
         if self.pack is None:
             train = train.windows(self.seq_len, stride=self.stride)
-            held = None if held is None else held if isinstance(self.validation, Pipeline) else held.windows(self.seq_len)
+            held = (
+                None
+                if held is None
+                else held
+                if isinstance(self.validation, Pipeline)
+                else held.windows(self.seq_len)
+            )
         else:
             train = train.flat_map(Chunks(self.seq_len + 1)).pack(
                 self.seq_len + 1, bins=self.packing_bins, policy=self.pack
             )
-            held = self.validation if isinstance(self.validation, Pipeline) else (
-                None
-                if held is None
-                else held.flat_map(Chunks(self.seq_len + 1)).pack(
-                    self.seq_len + 1, bins=self.packing_bins, policy=self.pack
+            held = (
+                self.validation
+                if isinstance(self.validation, Pipeline)
+                else (
+                    None
+                    if held is None
+                    else held.flat_map(Chunks(self.seq_len + 1)).pack(
+                        self.seq_len + 1, bins=self.packing_bins, policy=self.pack
+                    )
                 )
             )
         return train, held, ()
-
 
     def _token_pipelines(self, stored) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         from dew.data.steps.windows import Documents, WindowSource
@@ -388,7 +450,9 @@ class Text:
         if isinstance(held, Split):
             held = dataclasses.replace(stored, split=held.name)
         elif isinstance(held, HoldOut):
-            raise ValueError("token-store validation uses its named split; slice a windows Pipeline for HoldOut")
+            raise ValueError(
+                "token-store validation uses its named split; slice a windows Pipeline for HoldOut"
+            )
         if held is None and stored.metadata().get("val_tokens", 0):
             held = dataclasses.replace(stored, split="val")
         sources = (stored, None if held is None or isinstance(held, Pipeline) else _source(held))
@@ -397,12 +461,24 @@ class Text:
             if self.pack is None:
                 return Pipeline(WindowSource(source, source.tokens, self.seq_len, stride))
             if source.tokens.eos_id is None:
-                raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
-            return Pipeline(source).flat_map(Documents(source.tokens.eos_id)).pack(
-                self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+                raise ValueError(
+                    f"packed text needs producer document boundaries or EOS: {source.describe()}"
+                )
+            return (
+                Pipeline(source)
+                .flat_map(Documents(source.tokens.eos_id))
+                .pack(self.seq_len + 1, bins=self.packing_bins, policy=self.pack)
+            )
 
-        return (windows(sources[0], self.seq_len if self.stride is None else self.stride),
-                held if isinstance(held, Pipeline) else None if sources[1] is None else windows(sources[1], self.seq_len), ())
+        return (
+            windows(sources[0], self.seq_len if self.stride is None else self.stride),
+            held
+            if isinstance(held, Pipeline)
+            else None
+            if sources[1] is None
+            else windows(sources[1], self.seq_len),
+            (),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -429,7 +505,11 @@ class Chat:
                 )
             return pipeline.pack(self.seq_len + 1, fields=("text", "text_roles"), bins=self.packing_bins)
 
-        return policy(train), None if held is None else held if isinstance(self.validation, Pipeline) else policy(held), ()
+        return (
+            policy(train),
+            None if held is None else held if isinstance(self.validation, Pipeline) else policy(held),
+            (),
+        )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -446,8 +526,10 @@ class Prompts:
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
         source = _PromptFacts(_source(self.source, split=self.split), self.reward_bytes)
-        step = Configured(ConfigurePrompt(self.tokenizer, self.max_prompt_len, self.pad_id,
-                                         self.long, self.thinking), needs=("reward_bytes",))
+        step = Configured(
+            ConfigurePrompt(self.tokenizer, self.max_prompt_len, self.pad_id, self.long, self.thinking),
+            needs=("reward_bytes",),
+        )
         prefix = Pipeline(source).map(step).stages
         validation = self.validation
         if validation is not None and not isinstance(validation, (HoldOut, Split, Pipeline)):
@@ -479,15 +561,31 @@ class _PromptFacts:
 
         rows = self.source.records(read)
         if read == "memory" and self.width is None and "reward_bytes" not in self._measured:
-            self._measured["reward_bytes"] = max(1, max((len(text.encode("utf-8"))
-                for index in range(len(rows)) for row in (rows[index],) if isinstance(row, Mapping)
-                for text in (_text(row.get("data_source")), _ground_truth(row, "prompt"),
-                             _text(row.get("extra_info")))), default=1))
+            self._measured["reward_bytes"] = max(
+                1,
+                max(
+                    (
+                        len(text.encode("utf-8"))
+                        for index in range(len(rows))
+                        for row in (rows[index],)
+                        if isinstance(row, Mapping)
+                        for text in (
+                            _text(row.get("data_source")),
+                            _ground_truth(row, "prompt"),
+                            _text(row.get("extra_info")),
+                        )
+                    ),
+                    default=1,
+                ),
+            )
         return rows
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self.source.metadata(), **self._measured,
-                **({} if self.width is None else {"reward_bytes": self.width})}
+        return {
+            **self.source.metadata(),
+            **self._measured,
+            **({} if self.width is None else {"reward_bytes": self.width}),
+        }
 
     def lengths(self) -> np.ndarray | None:
         return self.source.lengths()
@@ -541,7 +639,7 @@ class Images:
     split: str = "train"
 
     def __post_init__(self) -> None:
-        if self.image_size < 1 or self.staging_size is not None and self.staging_size < self.image_size:
+        if self.image_size < 1 or (self.staging_size is not None and self.staging_size < self.image_size):
             raise ValueError("image_size must be positive and staging_size must be at least image_size")
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -560,19 +658,36 @@ class Images:
             from dew.data.storage import Store
 
             classes = tuple(Store(self.labels).read().decode().splitlines())
-        transform = ImageRecord(self.image_size, size, self.field, self.caption, self.caption_templates,
-                                self.caption_columns, classes, flip=augment is not None and augment.flip,
-                                jitter=augment is not None and augment.jitter,
-                                crop_scale=(1., 1.) if augment is None else augment.crop_scale,
-                                backend="host" if augment is None else augment.backend)
+        transform = ImageRecord(
+            self.image_size,
+            size,
+            self.field,
+            self.caption,
+            self.caption_templates,
+            self.caption_columns,
+            classes,
+            flip=augment is not None and augment.flip,
+            jitter=augment is not None and augment.jitter,
+            crop_scale=(1.0, 1.0) if augment is None else augment.crop_scale,
+            backend="host" if augment is None else augment.backend,
+        )
         train = train.map(Configured(ConfigureImage(transform), needs=(), random=True))
         if augment is not None and augment.backend == "device":
-            train = train.map_batch(DeviceAugment(self.image_size, augment.crop_scale, augment.flip, augment.jitter))
+            train = train.map_batch(
+                DeviceAugment(self.image_size, augment.crop_scale, augment.flip, augment.jitter)
+            )
         if held is not None:
-            evaluated = dataclasses.replace(transform, staging_size=self.image_size, backend="host",
-                                            flip=False, jitter=False, crop_scale=(1., 1.))
+            evaluated = dataclasses.replace(
+                transform,
+                staging_size=self.image_size,
+                backend="host",
+                flip=False,
+                jitter=False,
+                crop_scale=(1.0, 1.0),
+            )
             held = held.map(Configured(ConfigureImage(evaluated), needs=(), random=True))
         return train, held, (EncodeCaptions(),)
+
 
 @dataclasses.dataclass(frozen=True)
 class Video:
@@ -599,10 +714,14 @@ class Video:
 
         source = _source(self.source, split=self.split, format="files")
         if isinstance(source, Files):
-            extensions = tuple(extension.lower() if extension.startswith(".") else "." + extension.lower()
-                               for extension in self.extensions)
-            source = dataclasses.replace(source, url=tuple(path for path in source.paths
-                                                          if PurePosixPath(path).suffix.lower() in extensions))
+            extensions = tuple(
+                extension.lower() if extension.startswith(".") else "." + extension.lower()
+                for extension in self.extensions
+            )
+            source = dataclasses.replace(
+                source,
+                url=tuple(path for path in source.paths if PurePosixPath(path).suffix.lower() in extensions),
+            )
         prefix = Pipeline(source).map(VideoPath(self.caption)).stages
         train, held = _branches(source, self.validation, split=self.split, prefix=prefix)
         audio = Audio(self.audio_model)
@@ -679,8 +798,11 @@ def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     if read == "memory":
         at = next(
-            (index for index, stage in enumerate(pipeline.stages)
-             if isinstance(stage, RandomMap) or isinstance(stage, Configured) and stage.random),
+            (
+                index
+                for index, stage in enumerate(pipeline.stages)
+                if isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
+            ),
             len(pipeline.stages),
         )
         order = Pipeline(pipeline.source).shuffle(seed).repeat().stages
@@ -698,8 +820,14 @@ def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *order, *pipeline.stages[at:]))
 
 
-def _batched(pipeline: Pipeline, batch: int | None, *, train: bool, tokens: int | None = None,
-             lengths: tuple[int, ...] = ()) -> Pipeline:
+def _batched(
+    pipeline: Pipeline,
+    batch: int | None,
+    *,
+    train: bool,
+    tokens: int | None = None,
+    lengths: tuple[int, ...] = (),
+) -> Pipeline:
     from dew.data.pipeline import BatchStage, MapBatch
 
     stated = [stage.size for stage in pipeline.stages if isinstance(stage, BatchStage)]
@@ -708,10 +836,13 @@ def _batched(pipeline: Pipeline, batch: int | None, *, train: bool, tokens: int 
             raise ValueError(f"pipeline batches {stated}, but load requested batch={batch}")
         return pipeline
 
-    at = next((index for index, stage in enumerate(pipeline.stages)
-               if isinstance(stage, MapBatch)), len(pipeline.stages))
+    at = next(
+        (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, MapBatch)),
+        len(pipeline.stages),
+    )
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).batch(
-        batch, tokens=tokens, lengths=lengths, drop_remainder=train)
+        batch, tokens=tokens, lengths=lengths, drop_remainder=train
+    )
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
 
 
@@ -721,8 +852,14 @@ def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
     if isinstance(pipeline.source, (Mixture, Phases)):
         children = tuple(_cached(child, cache) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
-    at = next((index for index, stage in enumerate(pipeline.stages)
-               if isinstance(stage, (RandomMap, MapBatch, Pack, Windows))
-               or isinstance(stage, Configured) and stage.random), len(pipeline.stages))
+    at = next(
+        (
+            index
+            for index, stage in enumerate(pipeline.stages)
+            if isinstance(stage, (RandomMap, MapBatch, Pack, Windows))
+            or (isinstance(stage, Configured) and stage.random)
+        ),
+        len(pipeline.stages),
+    )
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).cache(cache)
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))

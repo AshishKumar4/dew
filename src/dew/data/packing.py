@@ -37,13 +37,27 @@ class PackingPlan:
         first = np.repeat(np.cumsum(counts) - counts, counts)
         offsets = (np.arange(len(documents)) - first) * self.pack.seq_len
         order, starts = first_fit(chunk_sizes, self.pack.seq_len, self.pack.bins)
-        targets = np.asarray([sum(max(0, int(chunk_sizes[index]) - 1)
-                                   for index in order[starts[window]:starts[window + 1]])
-                              for window in range(len(starts) - 1)], np.int64)
+        targets = np.asarray(
+            [
+                sum(
+                    max(0, int(chunk_sizes[index]) - 1)
+                    for index in order[starts[window] : starts[window + 1]]
+                )
+                for window in range(len(starts) - 1)
+            ],
+            np.int64,
+        )
         kept = np.flatnonzero(targets > 0)
-        arrays = {"documents": documents, "offsets": offsets, "sizes": chunk_sizes,
-                  "order": order, "starts": starts, "targets": targets, "accepted": kept,
-                  "totals": np.asarray([targets[kept].sum(), np.count_nonzero(targets == 0)], np.int64)}
+        arrays = {
+            "documents": documents,
+            "offsets": offsets,
+            "sizes": chunk_sizes,
+            "order": order,
+            "starts": starts,
+            "targets": targets,
+            "accepted": kept,
+            "totals": np.asarray([targets[kept].sum(), np.count_nonzero(targets == 0)], np.int64),
+        }
         return {plan_name(self.pack, field): value for field, value in arrays.items()}
 
 
@@ -67,19 +81,25 @@ class _PackedRows:
             chunk = self._at("order", position)
             document = record(self._documents[self._at("documents", chunk)], "packed document")
             offset, size = self._at("offsets", chunk), self._at("sizes", chunk)
-            chunks.append({name: np.asarray(document[name])[offset:offset + size] for name in self._pack.fields})
+            chunks.append(
+                {name: np.asarray(document[name])[offset : offset + size] for name in self._pack.fields}
+            )
         fields = {name: np.zeros(self._pack.seq_len, chunks[0][name].dtype) for name in self._pack.fields}
         segments, positions = np.zeros(self._pack.seq_len, np.int32), np.zeros(self._pack.seq_len, np.int32)
         at = 0
         for segment, chunk in enumerate(chunks, start=1):
             size = len(chunk[self._pack.fields[0]])
             for name, value in chunk.items():
-                fields[name][at:at + size] = value
-            segments[at:at + size], positions[at:at + size] = segment, np.arange(size, dtype=np.int32)
+                fields[name][at : at + size] = value
+            segments[at : at + size], positions[at : at + size] = segment, np.arange(size, dtype=np.int32)
             at += size
         first = self._pack.fields[0]
-        return {**fields, f"{first}_segment_ids": segments, f"{first}_positions": positions,
-                "_dew_valid_targets": self._at("targets", window)}
+        return {
+            **fields,
+            f"{first}_segment_ids": segments,
+            f"{first}_positions": positions,
+            "_dew_valid_targets": self._at("targets", window),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,8 +115,10 @@ class PackedSource:
         return {"source": self.source.snapshot(), "packing": self.order_fingerprints()}
 
     def order_fingerprints(self) -> Mapping[str, str]:
-        return {field: self.generation.plan_hash(plan_name(self.pack, field))
-                for field in ("documents", "offsets", "sizes", "order", "starts", "targets", "accepted")}
+        return {
+            field: self.generation.plan_hash(plan_name(self.pack, field))
+            for field in ("documents", "offsets", "sizes", "order", "starts", "targets", "accepted")
+        }
 
     def supports(self, read: Read) -> bool:
         return read in ("memory", "indexed", "streamed")
@@ -106,18 +128,32 @@ class PackedSource:
 
     def metadata(self) -> Mapping[str, object]:
         total = self.generation.plan_at(plan_name(self.pack, "totals"), 0)
-        return {**self.source.metadata(), "windows": len(self.records("indexed")),
-                "rows": len(self.records("indexed")), "valid_targets": int(total.item()),
-                "zero_target_windows": 0}
+        return {
+            **self.source.metadata(),
+            "windows": len(self.records("indexed")),
+            "rows": len(self.records("indexed")),
+            "valid_targets": int(total.item()),
+            "zero_target_windows": 0,
+        }
 
     def lengths(self) -> np.ndarray | None:
         return None
 
     def manifest(self) -> ShardManifest:
         size = len(self.records("indexed"))
-        return ShardManifest(tuple(Shard(f"{self.generation.url}:{start}", self.generation.url, start,
-                                         min(start + 1024, size), min(1024, size - start))
-                                   for start in range(0, size, 1024)), self._reader)
+        return ShardManifest(
+            tuple(
+                Shard(
+                    f"{self.generation.url}:{start}",
+                    self.generation.url,
+                    start,
+                    min(start + 1024, size),
+                    min(1024, size - start),
+                )
+                for start in range(0, size, 1024)
+            ),
+            self._reader,
+        )
 
     def _reader(self, shard: Shard) -> grain.IterDataset[Batch]:
-        return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
+        return grain.MapDataset.source(self.records("indexed"))[shard.start : shard.stop].to_iter_dataset()

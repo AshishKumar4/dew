@@ -44,8 +44,12 @@ class DecodeClip(grain.RandomMapTransform):
                 held = pins.enter_context(fs.open(target, "rb"))
                 path = held.name
             frames, audio = read_av_random_clip(
-                path.removeprefix("file://"), num_frames=self.frames, audio_padding=self.audio_padding,
-                seed=int(rng.integers(0, 2**32 - 1)), sample_rate=self.sample_rate)
+                path.removeprefix("file://"),
+                num_frames=self.frames,
+                audio_padding=self.audio_padding,
+                seed=int(rng.integers(0, 2**32 - 1)),
+                sample_rate=self.sample_rate,
+            )
         return {"video": fit_frames(frames, self.size), "caption": element.get("caption", ""), "audio": audio}
 
 

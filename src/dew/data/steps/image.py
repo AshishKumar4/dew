@@ -101,8 +101,10 @@ class RandomCrop(grain.RandomMapTransform):
 @dataclasses.dataclass(frozen=True)
 class Flip(grain.RandomMapTransform):
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        return {**element, "image": augment_image(Augment(flip=True, jitter=False),
-                                                  np.asarray(element["image"]), rng)}
+        return {
+            **element,
+            "image": augment_image(Augment(flip=True, jitter=False), np.asarray(element["image"]), rng),
+        }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -178,7 +180,7 @@ class ImageRecord(grain.RandomMapTransform):
     classes: tuple[str, ...] = ()
     flip: bool = False
     jitter: bool = False
-    crop_scale: tuple[float, float] = (1., 1.)
+    crop_scale: tuple[float, float] = (1.0, 1.0)
     backend: Literal["host", "device"] = "host"
 
     def __post_init__(self) -> None:
@@ -236,9 +238,12 @@ class ImageRecord(grain.RandomMapTransform):
             image = as_rgb(np.asarray(image))
         image = resize_image(image, self.staging_size)
         if self.backend == "host":
-            if (self.flip or self.jitter) and (self.crop_scale != (1., 1.) or self.staging_size != self.size):
+            if (self.flip or self.jitter) and (
+                self.crop_scale != (1.0, 1.0) or self.staging_size != self.size
+            ):
                 image = RandomCrop(self.size, self.crop_scale, self.flip, self.jitter).random_map(
-                    {"image": image}, rng)["image"]
+                    {"image": image}, rng
+                )["image"]
             else:
                 image = augment_image(Augment(self.flip, self.jitter), image, rng)
         held: Batch = {"image": image, "caption": caption}
@@ -257,5 +262,8 @@ class ConfigureImage:
         from dew.records import record, strings
 
         labels = record(metadata.get("class_names", {}), "class names").get("label")
-        return self.image if self.image.classes or labels is None else dataclasses.replace(
-            self.image, classes=strings(labels, "class_names.label"))
+        return (
+            self.image
+            if self.image.classes or labels is None
+            else dataclasses.replace(self.image, classes=strings(labels, "class_names.label"))
+        )
