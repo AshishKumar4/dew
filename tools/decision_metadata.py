@@ -91,7 +91,12 @@ def main() -> None:
                     maximum[key] = max(maximum[key], value)
             proofs.append({"path": proof_path, "sha256": hashlib.sha256(payload).hexdigest()})
         mixture["slots"] = maximum
-        mixture["provenance"] = {"source_manifest_sha256": original_sha, "slot_proofs": proofs}
+        physical = json.loads(original)
+        mixture["provenance"] = {
+            "original_manifest_sha": original_sha,
+            "slot_proofs": proofs,
+            "raw_shards": [entry for entry in physical["files"] if entry["path"].endswith(".jsonl")],
+        }
         descriptor = mixture
         payload = (json.dumps(descriptor, sort_keys=True, separators=(",", ":")) + "\n").encode()
         path = f"descriptors/{hashlib.sha256(payload).hexdigest()}.json"
