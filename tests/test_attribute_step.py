@@ -198,11 +198,11 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
     columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info"]
+               "total_self_time", "source_info", "hbm_bw"]
     times = {"flash backward": 6000.0, "Pallas recurrence": 2000.0, "transposing fusion": 1000.0,
              "weight-gradient GEMM": 500.0}
     cells = [("15", found["category"], found["hlo_op_name"], found["hlo_op_expression"], found["tf_op_name"],
-              "1", time, "") for case, time in times.items() for found in [ROWS[case][0]]]
+              "1", time, "", 1500.0) for case, time in times.items() for found in [ROWS[case][0]]]
     rows = [{"c": [{"v": value} for value in values]} for values in cells]
     (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
                                                          "rows": rows}]))
@@ -216,6 +216,8 @@ def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     assert time["by_kind_ms"] == {"attention": 6.0, "pallas": 2.0, "layout": 1.0, "gemm": 0.5}
     assert time["by_part_kind_ms"]["attention"] == {"attention": 6.0}
     assert time["by_part_kind_ms"]["mlp"] == {"gemm": 0.5}
+    # 1,500 GiB/s over the transposing fusion's millisecond is 1.5 GiB a step.
+    assert {record["us"]: record["hbm_mib"] for record in time["top_ops"]}[1000.0] == 1536.0
 
 
 def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):

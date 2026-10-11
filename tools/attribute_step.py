@@ -18,7 +18,8 @@ and loss, embedding, norm, optimizer, other) and direction (forward, backward, n
 read from the op itself (`kind_of`): GEMM, attention, Pallas/Triton, layout (transposes and
 copies), slicing, gathers and scatters, reductions, elementwise, collectives; both together; GEMMs
 by the time they lose against the device's peak (time - flops / peak); the costliest layout
-moves and ops with framework name and source line; the device's idle time; with `--entry`, the
+moves and ops with framework name and source line, each with its HBM traffic a step (XProf's
+measured HBM bandwidth over the op's time); the device's idle time; with `--entry`, the
 step's model FLOPs over its device time against the peak. Without `--hlo`, a custom call or a
 fusion is kinded from its name alone, which cannot tell FlashAttention's call from any other.
 
@@ -209,9 +210,12 @@ def attribute_time(trace: Path, steps: int, model_flops: float | None,
         # (an fp32 dot as non-tensor-core arithmetic, though it runs as TF32), which put the later Qwen3.5-0.8B step's
         # GEMMs at 1.127 of the A100's peak.
         gflops = float(row.get("model_flop_rate") or 0)
+        # XProf's HBM bandwidth is GiB/s over the op's own time, so the op moves that much a step.
+        hbm_mib = float(row.get("hbm_bw") or 0) * us * 1e-6 * 1024
         record = {"us": round(us, 1), "part": part, "direction": direction, "kind": kind,
                   "hlo": row.get("hlo_op_name"), "framework": name[:200], "count": row.get("occurrences"),
-                  "gflops": round(gflops, 1), "bound_by": row.get("bound_by"), "source": source}
+                  "gflops": round(gflops, 1), "hbm_mib": round(hbm_mib, 1), "bound_by": row.get("bound_by"),
+                  "source": source}
         everything.append(record)
         if kind == "gemm":
             record["precision"] = gemm_precision(row, known)
