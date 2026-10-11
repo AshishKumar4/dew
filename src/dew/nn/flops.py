@@ -48,6 +48,24 @@ def projection_flops(lengths: np.ndarray, inputs: int, outputs: int) -> float:
     return float(2 * inputs * outputs * np.sum(real_lengths(lengths)))
 
 
+def dense_training_flops(lengths: np.ndarray, inputs: int, outputs: int, *,
+                          trainable: bool = True, adapter_rank: int = 0) -> float:
+    """Forward/backward work of a dense layer, separate from forward FLOPs.
+
+    A frozen base matrix has forward and input-gradient products, 4*in*out
+    per token. A trained matrix also has its weight-gradient product,
+    6*in*out. Trainable rank-r adapter factors add 6*r*(in+out), so a frozen
+    dense layer with LoRA costs exactly 4*in*out + 6*r*(in+out). Remat is
+    excluded. The caller supplies actual frozen/trainable geometry; this
+    helper never infers it from a parameter name or folds it into a forward
+    model count that the trainer would incorrectly multiply by three.
+    """
+    if inputs < 0 or outputs < 0 or adapter_rank < 0:
+        raise ValueError("dense training FLOPs need nonnegative matrix widths and adapter rank")
+    per_token = (6 if trainable else 4) * inputs * outputs + 6 * adapter_rank * (inputs + outputs)
+    return float(np.sum(real_lengths(lengths)) * per_token)
+
+
 def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, causal: bool,
                     window: int | None = None, chunk: int | None = None) -> float:
     """QK and AV, two FLOPs per multiply-add, causal attention halved.

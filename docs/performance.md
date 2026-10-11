@@ -71,6 +71,16 @@ MFU previously used the HLO model count. It now uses analytical real-token
 model work: old `train/mfu` and new `train/mfu` values are not directly comparable.
 The previous count remains available as `train/hlo_flops_util` for that comparison.
 
+For parameter-efficient runs, forward/backward work is assembled separately:
+`4 * N_frozen + 6 * N_trainable` per real token, plus the row-length attention and
+state terms. Frozen weights still perform a forward and an input-gradient
+product; trainable weights additionally perform their weight-gradient product.
+A frozen `in * out` dense layer with trainable rank-r LoRA factors therefore costs
+`4 * in * out + 6 * r * (in + out)` per token (`nn.flops.dense_training_flops`).
+`Objective.training_flops` is the named training-work assembly point; it is not
+`Objective.model_flops`, which counts only the forward. Core currently refuses
+adapter geometry by name, and never reports three-times-forward MFU for PEFT.
+
 ## A CPU cluster against one GPU, 2026-10-08
 
 Could a gang of Cloudflare containers train faster or more cheaply than one A100? `tools/cluster_vs_gpu.py` trains

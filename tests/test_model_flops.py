@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from jax.extend import core as jaxpr_core
+from recording import RecordingTracker
 
 from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
@@ -27,7 +28,14 @@ from dew.nn.backbones.decoder_stack import Loop
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.jepa import FactorizedTokenStack, JepaEncoder, JepaPredictor, TokenStack
 from dew.nn.backbones.ssm_dit import HybridSSMAttentionDiT
-from dew.nn.flops import MissingFlopsCount, attention_flops, counted_flops, delta_flops, projection_flops
+from dew.nn.flops import (
+    MissingFlopsCount,
+    attention_flops,
+    counted_flops,
+    delta_flops,
+    dense_training_flops,
+    projection_flops,
+)
 from dew.nn.gemma4_moe import Gemma4Experts
 from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
@@ -498,6 +506,29 @@ def test_microbatches_two_sum_real_tokens_before_interval_throughput():
     assert metrics["train/tokens_per_s"] == 4
 
 
+def test_accumulation_two_logs_the_real_tokens_of_both_microbatches():
+    import optax
+
+    from dew.training import Trainer
+
+    class Batches:
+        batch, records, val, steps_per_epoch = 8, 16, None, 2
+
+        def train(self, partition):
+            for length in (3, 5):
+                row = np.arange(7) < length
+                yield {"text": np.broadcast_to(row.astype(np.int32), (self.batch, 7))}
+
+    tracker = RecordingTracker()
+    objective = LMObjective(decoder().clone(num_layers=1), seq_len=6, pad_id=0)
+    trainer = Trainer(objective, optax.sgd(0.01), key=0, accumulation=2, tracker=tracker)
+    trainer.fit(Batches(), steps=2, log_every=2)
+    ticks = [scalars for _, scalars in tracker.scalars if "train/tokens" in scalars]
+    assert len(ticks) == 1
+    assert ticks[0]["train/tokens"] * 2 == 8 * (3 + 5)
+    assert ticks[0]["train/tokens_per_s"] > 0
+
+
 def test_s5_write_read_matches_the_native_scanned_path():
     """CPU/GPU chunked S5 executes extra pole-power GEMMs, which belong to HFU.
     The native TPU scan implements the recurrent function directly and its
@@ -541,3 +572,17 @@ def test_chunked_ssm_dit_forward_equals_model_maps_plus_known_pole_products():
     # real-state product B*2C*2C*N, each MAC two real FLOPs.
     extra = 2 * (4 * 4**3 * 3 + 8 * 2 * 4**2 * 3)
     assert count + extra == forward_products(model.apply, variables, image, time)
+
+
+@pytest.mark.parametrize("inputs,outputs,rank", [(8, 16, 2), (4096, 14336, 16)])
+def test_peft_training_work_does_not_charge_a_frozen_weight_gradient(inputs, outputs, rank):
+    lengths = np.array([3, 5], np.int64)
+    expected = (4 * inputs * outputs + 6 * rank * (inputs + outputs)) * 8
+    assert dense_training_flops(lengths, inputs, outputs, trainable=False, adapter_rank=rank) == expected
+    assert dense_training_flops(lengths, inputs, outputs) == 3 * projection_flops(lengths, inputs, outputs)
+
+
+def test_training_work_assembly_is_distinct_from_forward_model_count():
+    objective = LMObjective(decoder(), seq_len=6, pad_id=0)
+    batch = packed_batch()
+    assert objective.training_flops(None, batch) == 3 * objective.model_flops(None, batch)
