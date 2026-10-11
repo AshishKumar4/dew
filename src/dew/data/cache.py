@@ -25,13 +25,14 @@ import grain.python as grain
 import numpy as np
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from dew.data.dataset import _QUIET_STOP_SECONDS, Batch
+from dew.data.dataset import _QUIET_STOP_SECONDS, Batch, Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import Shard, ShardManifest, Source
+from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.sources.codec import decode, encode
+from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
-from dew.data.storage import PreconditionFailed, Store, _byte_size
+from dew.data.storage import PreconditionFailed, Store, Versioned, _byte_size
 from dew.records import JSON
 
 _log = logging.getLogger(__name__)
@@ -261,6 +262,8 @@ class Cache:
         except FileNotFoundError:
             current = None
         completions, shards = _sealed(root, pins)
+        if current is not None:
+            _retain_committed(root, current, completions, shards, pins)
         expected = tuple(_source_ids(source, streamed=any(row.startswith("[") for row in completions)))
         expected_keys = {_row_key(row) for row in expected}
         missing, extra = expected_keys - completions.keys(), completions.keys() - expected_keys
@@ -374,6 +377,29 @@ def _write_plan(root: Store, name: str, array: np.ndarray) -> Mapping[str, objec
     }
 
 
+def _retain_committed(
+    root: Store, current: Versioned, completions: dict, shards: dict, pins: ExitStack
+) -> None:
+    reference = json.loads(current.data)
+    manifest_path = f"generations/{reference['generation']}/manifest.json"
+    _checked(root, {"path": manifest_path, "bytes": reference["bytes"], "sha256": reference["sha256"]})
+    prior = Generation(root.child(f"generations/{reference['generation']}").url, root.storage_options)
+    if prior.pin is not None:
+        pins.enter_context(prior.pin)
+    for page in prior.manifest["pages"].values():
+        retained = json.loads(_checked(Store(prior.url, prior.storage_options), page))
+        for row_id, entry in retained.items():
+            candidate = completions.get(row_id)
+            if candidate is not None and candidate["payload_sha256"] != entry["payload_sha256"]:
+                if not candidate["volatile"]:
+                    raise ValueError(f"conflicting committed cache row {row_id}")
+                _log.warning(
+                    "volatile cache conflict for committed row %s; retaining its generation copy", row_id
+                )
+            completions[row_id] = entry
+    shards.update(prior.manifest["shards"])
+
+
 def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
     fs, path = root.child("segments").resolve()
     segment_paths = sorted(fs.find(path)) if fs.exists(path) else []
@@ -401,7 +427,7 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
                     )
                 for entry in record["completions"]:
                     _completion(entry, rows[entry["record"]])
-                    candidate = {**entry, "shard": record["shard"]["path"]}
+                    candidate = {**entry, "shard": record["shard"]["path"], "volatile": record["volatile"]}
                     existing = completions.get(entry["id"])
                     if existing is not None and existing["payload_sha256"] != entry["payload_sha256"]:
                         if not record["volatile"]:
@@ -531,8 +557,13 @@ class _Writer:
             existing = self.pending.get(row_key)
             if existing is not None:
                 if existing != payload:
-                    raise ValueError(f"conflicting cache duplicate for row {row_key}")
-                return outputs if transform is not None else outputs[0]
+                    if not self.volatile:
+                        raise ValueError(f"conflicting cache duplicate for row {row_key}")
+                    _log.warning(
+                        "volatile cache conflict for pending row %s; keeping the first copy", row_key
+                    )
+                cached = _decode_outputs(existing)
+                return cached if transform is not None else cached[0]
             completed = self.index.execute(
                 "SELECT shard, offset, digest FROM inputs WHERE id=?", (row_key,)
             ).fetchone()
@@ -543,37 +574,37 @@ class _Writer:
                     _log.warning("volatile cache conflict for row %s; keeping the first copy", row_key)
                 return outputs if transform is not None else outputs[0]
             if not transient and self.admitting:
-                pages = self.index.execute("PRAGMA page_count").fetchone()[0]
-                page_size = self.index.execute("PRAGMA page_size").fetchone()[0]
-                if (pages + 2) * page_size > self.cache.local_limit:
-                    self.admitting = False
-                    _log.warning("cache %s stopped admission at its local index budget", self.root.url)
-                if len(payload) > self.cache.spool_limit:
-                    if self.cache.on_full == "block":
-                        raise ValueError(f"cache row {row_key} exceeds spool_bytes={self.cache.spool_bytes}")
-                    self.admitting = False
-                while self.admitting and self.spool_bytes + len(payload) > self.cache.spool_limit:
-                    self._flush()
-                    if self.cache.on_full == "stop":
-                        self.admitting = False
-                        break
-                    self.lock.wait(0.1)
-                    for future in self.futures:
-                        if future.done():
-                            future.result()
-                if self.admitting:
-                    self.pending[row_key] = payload
-                    self.pending_bytes += len(payload)
-                    self.spool_bytes += len(payload)
-                    if self.pending_bytes >= self.cache.shard_limit:
-                        self._flush()
-                    if (
-                        self.expected is not None
-                        and self.index.total_changes + len(self.pending) == self.expected
-                    ):
-                        self._flush()
-                        self.seal_future = self.pool.submit(self.seal)
+                self._admit(row_key, payload)
         return outputs if transform is not None else outputs[0]
+
+    def _admit(self, row_key: str, payload: bytes) -> None:
+        pages = self.index.execute("PRAGMA page_count").fetchone()[0]
+        page_size = self.index.execute("PRAGMA page_size").fetchone()[0]
+        if (pages + 2) * page_size > self.cache.local_limit:
+            self.admitting = False
+            _log.warning("cache %s stopped admission at its local index budget", self.root.url)
+        if len(payload) > self.cache.spool_limit:
+            if self.cache.on_full == "block":
+                raise ValueError(f"cache row {row_key} exceeds spool_bytes={self.cache.spool_bytes}")
+            self.admitting = False
+        while self.admitting and self.spool_bytes + len(payload) > self.cache.spool_limit:
+            self._flush()
+            if self.cache.on_full == "stop":
+                self.admitting = False
+                break
+            self.lock.wait(0.1)
+            for future in self.futures:
+                if future.done():
+                    future.result()
+        if self.admitting:
+            self.pending[row_key] = payload
+            self.pending_bytes += len(payload)
+            self.spool_bytes += len(payload)
+            if self.pending_bytes >= self.cache.shard_limit:
+                self._flush()
+            if self.expected is not None and self.index.total_changes + len(self.pending) == self.expected:
+                self._flush()
+                self.seal_future = self.pool.submit(self.seal)
 
     def _flush(self) -> None:
         if not self.pending:
@@ -1148,10 +1179,10 @@ class _GenerationSource:
             "manifest": _hash(_json(self.generation.manifest)),
         }
 
-    def supports(self, read) -> bool:
+    def supports(self, read: Read) -> bool:
         return True
 
-    def records(self, read):
+    def records(self, read: Read) -> Records:
         return self.generation
 
     def manifest(self) -> ShardManifest:
@@ -1199,5 +1230,13 @@ class _GenerationSource:
         entry = self.generation.manifest["metadata"].get("lengths")
         if entry is None:
             return None
-        encoded = _checked(Store(self.generation.url, self.generation.storage_options), entry)
-        return np.load(io.BytesIO(encoded), allow_pickle=False)
+        return self._length_index.values
+
+    @cached_property
+    def _length_index(self) -> ArrayIndex:
+        entry = self.generation.manifest["metadata"]["lengths"]
+        index = ArrayIndex(
+            self.generation.url.rstrip("/") + "/" + entry["path"], self.generation.storage_options
+        )
+        index.verify(entry)
+        return index

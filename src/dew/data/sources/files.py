@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import bisect
 import csv
+import hashlib
 import io
 import json
 import threading
@@ -23,6 +24,7 @@ from dew.data.dataset import Batch, Records
 from dew.data.storage import Store
 
 from .base import Read, Shard, ShardManifest
+from .index import ArrayIndex
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
 
@@ -192,7 +194,16 @@ class Files:
         }
 
     def supports(self, read: Read) -> bool:
-        if read != "indexed" or self.kind in ("files", "array_record"):
+        if read != "indexed" or self.kind == "files":
+            return True
+        if self.kind == "array_record":
+            if self.committed is not None:
+                return True
+            for url in self.paths:
+                fs, _ = Store(url, self.storage_options).resolve()
+                protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+                if not {"file", "gs", "gcs"}.intersection(protocols):
+                    return False
             return True
         if self.filter is not None:
             return False
@@ -213,6 +224,8 @@ class Files:
         return url.rsplit(".", 1)[0] + ".index.npy"
 
     def provision(self) -> Files:
+        if self.kind == "array_record":
+            return self._provision_arrayrecord()
         if self.kind not in ("jsonl", "text", "csv"):
             raise ValueError(f"{self.describe()} has no provisionable offset index")
         for url in self.paths:
@@ -250,6 +263,46 @@ class Files:
         self.__dict__.pop("paths", None)
         return self
 
+    def _provision_arrayrecord(self) -> Files:
+        from .records import ArrayRecords
+
+        if not isinstance(self.url, str) or any(mark in self.url for mark in "*?["):
+            raise ValueError("ArrayRecord provisioning needs one directory URL")
+        root = Store(self.url, self.storage_options)
+        fs, directory = root.resolve()
+        if not fs.isdir(directory):
+            raise ValueError("ArrayRecord provisioning needs its containing directory URL")
+        files = []
+        for url in self.paths:
+            filesystem, path = Store(url, self.storage_options).resolve()
+            opened = ArrayRecords((url,), self.storage_options)
+            try:
+                count = len(opened)
+                mirror, mirrored_path = Store(url, self.storage_options).cached().resolve()
+                with mirror.open(mirrored_path, "rb") as reader:
+                    digest = hashlib.file_digest(reader, "sha256").hexdigest()
+            finally:
+                opened.close()
+            files.append(
+                {
+                    "path": path[len(directory) :].lstrip("/"),
+                    "rows": count,
+                    "bytes": filesystem.size(path),
+                    "sha256": digest,
+                }
+            )
+        manifest = {
+            "schema": 1,
+            "format": "array_record",
+            "codec": None,
+            "rows": sum(entry["rows"] for entry in files),
+            "files": files,
+            "metadata": {},
+        }
+        root.child("_dew_manifest.json").put_if_absent(json.dumps(manifest, sort_keys=True).encode())
+        self.__dict__.pop("committed", None)
+        return self
+
     def records(self, read: Read) -> Records:
         if not self.supports(read):
             raise FileNotFoundError(
@@ -263,7 +316,14 @@ class Files:
         elif self.kind == "array_record":
             from .records import ArrayRecords
 
-            rows = ArrayRecords(self.paths, self.storage_options, record_codec=self.committed is not None)
+            committed = self.committed
+            counts = None if committed is None else tuple(entry["rows"] for entry in committed["files"])
+            rows = ArrayRecords(
+                self.paths,
+                self.storage_options,
+                record_codec=committed is not None and committed.get("codec") == 1,
+                counts=counts,
+            )
         elif read == "memory":
             return tuple(row for shard in self.manifest().shards for row in self._read_shard(shard))
         else:
@@ -318,7 +378,11 @@ class Files:
             from .records import ArrayRecords
 
             return grain.MapDataset.source(
-                ArrayRecords((shard.uri,), self.storage_options, record_codec=self.committed is not None)
+                ArrayRecords(
+                    (shard.uri,),
+                    self.storage_options,
+                    record_codec=self.committed is not None and self.committed.get("codec") == 1,
+                )
             ).to_iter_dataset()
         if self.kind == "webdataset":
             from .webdataset import TarRows
@@ -336,6 +400,8 @@ class Files:
             remote |= "file" not in protocols and "memory" not in protocols
         if self.kind in ("parquet", "arrow") and self.filter is None:
             return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
+        if self.kind == "array_record" and self.committed is not None:
+            return tuple(entry["rows"] for entry in self.committed["files"]), remote
         if self.kind == "files":
             return tuple(1 for _ in self.paths), remote
         return (), remote
@@ -448,11 +514,18 @@ class _IndexedLines:
         self.indexes = (
             (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
         )
-        self.tables = tuple(
-            np.load(io.BytesIO(Store(url, source.storage_options).read()), allow_pickle=False)
-            for url in self.indexes
-        )
+        self.index_files = tuple(ArrayIndex(url, source.storage_options) for url in self.indexes)
+        self.tables = tuple(index.values for index in self.index_files)
         self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
+
+    def __getstate__(self) -> Mapping[str, object]:
+        return {"source": self.source}
+
+    def __setstate__(self, state: Mapping[str, object]) -> None:
+        source = state["source"]
+        if not isinstance(source, Files):
+            raise ValueError("invalid indexed file source state")
+        self.__init__(source)
 
     @cached_property
     def fieldnames(self) -> tuple[tuple[str, ...], ...]:
