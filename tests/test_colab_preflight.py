@@ -293,7 +293,7 @@ def test_pallas_kernel_choices_need_the_labs_record_of_their_exact_code(tmp_path
     none, and a G4 with no row runs no Pallas kernel."""
     tree = kernel_tree(tmp_path)
     records = {}
-    monkeypatch.setattr(preflight, "store_read", lambda key: (records.get(key), "absent"))
+    monkeypatch.setattr(preflight, "store_read", lambda key, config=None: (records.get(key), "absent"))
     failures: list[str] = []
     found = preflight.lab_verified(tree, "gpu:A100", failures)
     assert found["pallas"] == ["gated_delta_rule=fla"]
@@ -433,8 +433,9 @@ def test_the_kernel_labs_own_session_needs_no_record_it_exists_to_write(tmp_path
     monkeypatch.setattr(preflight, "store_read", lambda key, config=None: (None, "absent"))
     script = tmp_path / "kernel-lab.sh"
     script.write_text(LAB_SCRIPT)
-    args = argparse.Namespace(ref=commit, hardware="gpu:A100", command=command, inputs=[str(script)], pin=[],
-                              origin="origin", accept=[], also=[], dew_python=sys.executable)
+    args = argparse.Namespace(ref=commit, hardware="gpu:A100", command=f"LAB_REF={commit} {command}",
+                              inputs=[str(script)], pin=[], origin="origin", accept=[], also=[],
+                              dew_python=sys.executable)
     receipt = preflight.preflight(args, tmp_path / "work")
     assert receipt["ok"], receipt["failures"]
     assert receipt["kernel_lab"]["bootstrap"] == "this session produces the record"
