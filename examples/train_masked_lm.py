@@ -108,7 +108,7 @@ def main(config: Config) -> Path:
         model=ModelConfig("causal_transformer", {
             **config.model, "causal": False, "mask_token_id": tokenizer.vocab_size,
             "dtype": "float32" if config.smoke else "bfloat16"}),
-        data=data, tokenizer=config.tokenizer, provision=not config.smoke,
+        data=data, data_read="memory", tokenizer=config.tokenizer, provision=not config.smoke,
         validation_records=None if config.val_batches is None else config.val_batches * config.batch_size,
         loading=Loading(workers=0, threads=4),
         objective=ObjectiveConfig("masked_diffusion", {
