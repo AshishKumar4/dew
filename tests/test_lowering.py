@@ -14,15 +14,15 @@ from jax.experimental import pallas as pl
 from jax.sharding import Mesh
 
 from dew.nn.kernels.generation import (
-    DEVICE_KINDS,
-    KERNELS,
     PALLAS_CHOICES,
+    TARGETS,
     UNLOWERABLE,
     assumed,
     backend,
     bf16_dot_runs,
     device_generation,
     gpu_mesh,
+    gpu_target,
     measured_kernel,
     triton_runs,
 )
@@ -41,7 +41,7 @@ def test_an_assumed_generation_answers_for_the_device(generation, triton, bf16):
     with assumed(generation):
         assert (device_generation(), triton_runs(), bf16_dot_runs()) == (generation, triton, bf16)
         rule = measured_kernel('gated_delta_rule', 'xla')
-        assert rule == KERNELS['gated_delta_rule'].get(generation, 'xla')
+        assert rule == gpu_target(generation).kernels.get('gated_delta_rule', 'xla')
         with assumed(None):
             assert (device_generation(), triton_runs(), bf16_dot_runs()) == own
     assert (device_generation(), triton_runs(), bf16_dot_runs()) == own
@@ -79,10 +79,36 @@ def test_the_gpu_mesh_keeps_the_axes_over_the_generations_devices():
     target = gpu_mesh(mesh, 'sm120')
     assert (target.axis_names, target.axis_sizes, target.axis_types) == (
         mesh.axis_names, mesh.axis_sizes, mesh.axis_types)
-    assert target.abstract_device.device_kind == DEVICE_KINDS['sm120']
+    assert target.abstract_device.device_kind == gpu_target('sm120').device_kind
     assert target.abstract_device.platform == 'cuda'
     with pytest.raises(ValueError, match="'sm81'"):
         gpu_mesh(mesh, 'sm81')
+
+
+@pytest.mark.parametrize('identifier,generation,bf16,fp8,shared', [
+    ('gpu:A100', 'sm80', 312e12, None, 163 * 1024),
+    ('g4', 'sm120', 500e12, 1000e12, 99 * 1024),
+    ('NVIDIA H100 PCIe', 'sm90', 756e12, 1513e12, 227 * 1024),
+    ('NVIDIA H200 NVL', 'sm90', 835e12, 1670.5e12, 227 * 1024),
+    ('NVIDIA GeForce RTX 4080', 'sm89', 97.5e12, None, 99 * 1024),
+    ('TPU v5 lite', 'v5e', 197e12, None, None),
+    ('unknown accelerator', 'unknown accelerator', None, None, None),
+])
+def test_one_target_resolves_generation_precision_peaks_and_block_memory(identifier, generation, bf16,
+                                                                        fp8, shared):
+    target = gpu_target(identifier)
+    assert (target.generation, target.bf16_peak, target.fp8_peak, target.shared_limit) == (
+        generation, bf16, fp8, shared)
+
+
+def test_reference_target_reader_imports_with_the_standard_library_only():
+    source = ROOT / 'src/dew/nn/kernels/generation.py'
+    script = ('import importlib.util,sys; '
+              f's=importlib.util.spec_from_file_location("gpu_targets", {str(source)!r}); '
+              'm=importlib.util.module_from_spec(s); sys.modules[s.name]=m; s.loader.exec_module(m); '
+              'assert m.gpu_target("NVIDIA L4").fp8_peak==242.5e12; assert "jax" not in sys.modules')
+    done = subprocess.run([sys.executable, '-I', '-S', '-c', script], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
 
 
 def _doubled(x):
@@ -118,21 +144,22 @@ FAMILIES = {
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
 }
 
-GPUS = sorted({generation for row in KERNELS.values() for generation in row if generation.startswith('sm')}
+GPUS = sorted({generation for generation, target in TARGETS.items()
+               if generation.startswith('sm') and target.kernels}
               | {'sm80', 'sm120'}, key=lambda generation: int(generation[2:]))
 """Every CUDA generation a KERNELS row names, and the A100's and the G4's, which Dew's sessions take."""
 
 
 def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
     """The Pallas choices `generation`'s rows name whose kernels `probe` runs."""
-    return {(choice, row[generation]) for choice, row in KERNELS.items()
-            if (choice, row.get(generation)) in FAMILIES and FAMILIES[choice, row[generation]][0] == probe}
+    return {(choice, kernel) for choice, kernel in gpu_target(generation).kernels.items()
+            if (choice, kernel) in FAMILIES and FAMILIES[choice, kernel][0] == probe}
 
 
 def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
     """A Pallas kernel KERNELS chooses for some GPU is one this file lowers for that GPU on a CPU: a new
     row needs its kernels in FAMILIES, so no Triton lowering first runs in a GPU session's compile."""
-    named = {(choice, kernel) for choice, row in KERNELS.items() for kernel in row.values()
+    named = {(choice, kernel) for target in TARGETS.values() for choice, kernel in target.kernels.items()
              if kernel in PALLAS_CHOICES}
     assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
     assert {key for key, (_, names) in FAMILIES.items() if names is None} == set(UNLOWERABLE)

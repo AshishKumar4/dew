@@ -60,7 +60,7 @@ from .sharding import (
 # where a sigmoid saturates.
 SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
-# 'auto' resolves per hardware generation through `KERNELS['grouped_matmul']`.
+# 'auto' resolves per hardware generation through `gpu_target().kernels['grouped_matmul']`.
 GROUPED_MATMULS = ('auto', 'xla', 'pallas', 'tokamax')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
@@ -341,7 +341,7 @@ def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[D
                           precision: PrecisionLike) -> str:
     """The one choice of grouped matmul: 'xla', 'pallas' or 'tokamax'.
 
-    'auto' takes the generation's measured one (`KERNELS['grouped_matmul']`).
+    'auto' takes the generation's measured one (`gpu_target().kernels['grouped_matmul']`).
     'pallas' needs a GPU the kernels compile for and a product they compute
     exactly (`ragged_dot_refusal`), else 'xla', which `ran_kernel` logs where
     'pallas' was measured fastest. `operands` are the input and kernel dtypes

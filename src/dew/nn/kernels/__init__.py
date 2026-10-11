@@ -8,16 +8,17 @@ shape and backend takes.
 """
 
 from .generation import (
-    DEVICE_KINDS,
-    KERNELS,
     PALLAS_CHOICES,
+    TARGETS,
     UNLOWERABLE,
+    GpuTarget,
     assumed,
     backend,
     bf16_dot_runs,
     device_generation,
     first_refusal,
     gpu_mesh,
+    gpu_target,
     measured_kernel,
     ran_kernel,
     triton_runs,
@@ -25,7 +26,8 @@ from .generation import (
 from .grouped_matmul import grouped_projection, ragged_dot_refusal
 from .ssd import ssd_chunk_scan, ssd_kernel_platform, ssd_kernel_runs
 
-__all__ = ["DEVICE_KINDS", "KERNELS", "PALLAS_CHOICES", "UNLOWERABLE", "assumed", "backend", "bf16_dot_runs",
-           "device_generation", "first_refusal", "gpu_mesh", "grouped_projection", "measured_kernel",
+__all__ = ["PALLAS_CHOICES", "TARGETS", "UNLOWERABLE", "GpuTarget", "assumed", "backend", "bf16_dot_runs",
+           "device_generation", "first_refusal", "gpu_mesh", "gpu_target",
+           "grouped_projection", "measured_kernel",
            "ragged_dot_refusal", "ran_kernel", "ssd_chunk_scan", "ssd_kernel_platform", "ssd_kernel_runs",
            "triton_runs"]

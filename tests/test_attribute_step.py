@@ -238,7 +238,8 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
-    assert time["peak_gflops"] == 500e3 and time["peak_source"].startswith("dew.telemetry.peaks")
+    assert time["peak_gflops"] == 500e3
+    assert time["peak_source"].startswith("dew.nn.kernels.generation.gpu_target")
     assert time["mfu_bf16_of_device_time"] == time["mfu_mixed_of_device_time"] == 0.5
     assert time["bf16_equiv_throughput_tflops"] == 250.0
     entry.write_text(json.dumps({"model_flops_per_step": 2.5e11}))
@@ -253,7 +254,8 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
 def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
     """With an FP8 GEMM in the step, mfu_bf16 is a bf16-equivalent throughput, and mfu_mixed takes
     that GEMM's FLOPs over the FP8 peak; with no FP8 peak for the device, mfu_mixed is unknown."""
-    from dew.telemetry import peaks
+    from dew.nn.kernels.generation import gpu_target
+    peaks = gpu_target('sm120').dense_peaks['NVIDIA RTX PRO 6000 Blackwell']
 
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
@@ -273,12 +275,13 @@ def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
     entry.write_text(json.dumps({"model_flops_per_step": 2e11, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
     out = tmp_path / "attribution.json"
     command = ["--trace", str(tmp_path / "profile"), "--out", str(out), "--entry", str(entry)]
+    monkeypatch.delitem(peaks, 'fp8')
     assert attribute.main(command) == 0
     time = json.loads(out.read_text())["time"]
     # 1e5 GFLOP/s for 1 ms is 1e11 FLOPs on FP8 of the 2e11 the model does, over 2 ms.
     assert time["fp8_gemm_flops_per_step"] == 1e11 and time["mfu_mixed_of_device_time"] is None
     assert time["mfu_bf16_of_device_time"] == 0.2 and time["bf16_equiv_throughput_tflops"] == 100.0
-    monkeypatch.setitem(peaks.PEAK_FP8_FLOPS_PER_DEVICE, "NVIDIA RTX PRO 6000 Blackwell", 1000e12)
+    monkeypatch.setitem(peaks, 'fp8', 1000e12)
     assert attribute.main(command) == 0
     # 1e11 / 5e14 + 1e11 / 1e15 over 2 ms.
     assert json.loads(out.read_text())["time"]["mfu_mixed_of_device_time"] == 0.15

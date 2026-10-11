@@ -7,13 +7,17 @@ and sends every other one to its portable path. The measurements are in
 docs/performance.md, "Kernel choices per generation".
 """
 
+from __future__ import annotations
+
 import contextlib
 import contextvars
+import dataclasses
 import logging
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
+from typing import TYPE_CHECKING
 
-import jax
-from jax.sharding import AbstractDevice, AbstractMesh, Mesh
+if TYPE_CHECKING:
+    from jax.sharding import AbstractMesh, Mesh
 
 _log = logging.getLogger(__name__)
 
@@ -48,31 +52,139 @@ UNLOWERABLE = {
 """The Pallas choices a `KERNELS` row can name whose Triton lowering no CPU reaches, and why."""
 
 
-DEVICE_KINDS = {
-    'sm75': "Tesla T4",
-    'sm80': "NVIDIA A100-SXM4-80GB",
-    'sm86': "NVIDIA A10",
-    'sm89': "NVIDIA L4",
-    'sm90': "NVIDIA H100 80GB HBM3",
-    'sm120': "NVIDIA RTX PRO 6000 Blackwell Server Edition",
-}
-"""A `device_kind` of each CUDA generation a program lowers for, as the device reports it: JAX's
-Pallas lowering reads the compute capability it targets from the kind (`get_gpu_info`)."""
+@dataclasses.dataclass(frozen=True)
+class GpuTarget:
+    """One generation's device prefixes, dense peaks, block memory and measured kernel row.
+
+    `dense_peaks` maps reported device-kind prefixes to precision rates, so
+    PCIe/SXM and GeForce/data-center variants retain their own peaks. `device_kind`
+    is the canonical device for a generation, or the reported SKU a reader asked
+    for. Empty resources remain unknown. The standard-library-only table can
+    also be read by a Torch reference's environment without importing JAX.
+    """
+
+    generation: str
+    device_kind: str
+    shared_limit: int | None = None
+    kernels: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    dense_peaks: Mapping[str, Mapping[str, float]] = dataclasses.field(default_factory=dict)
+    aliases: tuple[str, ...] = ()
+
+    @property
+    def device_kind_prefixes(self) -> tuple[str, ...]:
+        return tuple(self.dense_peaks)
+
+    @property
+    def peaks(self) -> Mapping[str, float]:
+        keys = [prefix for prefix in self.dense_peaks if self.device_kind.startswith(prefix)]
+        return self.dense_peaks[max(keys, key=len)] if keys else {}
+
+    @property
+    def bf16_peak(self) -> float | None:
+        return self.peaks.get('bf16')
+
+    @property
+    def fp8_peak(self) -> float | None:
+        return self.peaks.get('fp8')
+
+
+# CUDA datasheets give sparse tensor peaks; the dense figures below are half.
+# A100 bf16 624; H100 SXM bf16/FP8 1979/3958, PCIe 1513/3026, NVL 1671/3341;
+# H200 SXM 1979/3958, NVL 1671/3341; L4 242/485; RTX PRO 6000 Blackwell Server 1000/2000 TF/s.
+# Existing rounded bf16 rates remain the baseline; FP8 uses the stated dense half.
+# https://i.dell.com/sites/csdocuments/App-Merchandizing_Documents/en/us/h100-gpu.pdf
+# https://www.nvidia.com/en-us/data-center/h100/
+# https://www.megware.com/fileadmin/user_upload/LandingPage%20NVIDIA/NVIDIA_H200_Datasheet.pdf (Jul24)
+# https://www.nvidia.com/en-us/data-center/l4/
+# https://www.nvidia.com/en-us/data-center/rtx-pro-6000-blackwell-server-edition/
+# GeForce bf16 is dense fp32-accumulate throughput: RTX4080 97.5 (Ada whitepaper),
+# RTX3090 71 (GA102 whitepaper), half the fp16-accumulator rate.
+# TPU per-chip bf16: v2/v3 45/123 (two JAX devices/chip, halved); v4 275;
+# v5e 197, v5p459, v6e918 from Google's architecture and generation pages.
+# Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
+# Blackwell99, Hopper227. The SM reservation is already excluded:
+# https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
+# https://docs.nvidia.com/cuda/hopper-tuning-guide/index.html
+# https://docs.nvidia.com/cuda/blackwell-tuning-guide/index.html
+TARGETS = {target.generation: target for target in (
+    GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
+              aliases=('gpu:t4', 't4')),
+    GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
+              {'attention': 'flash', 'grouped_matmul': 'pallas', 'tokamax_grouped_matmul': 'triton',
+               'xla_triton_gemm': 'off', 'gated_delta_rule': 'pallas', 'narrow_copies': 'on'},
+              {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100')),
+    GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'grouped_matmul': 'pallas'},
+              {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}),
+    GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
+              {'attention': 'flash', 'grouped_matmul': 'pallas', 'tokamax_grouped_matmul': 'triton',
+               'xla_triton_gemm': 'off', 'gated_delta_rule': 'pallas', 'narrow_copies': 'on'},
+              {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
+               'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4')),
+    GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024, dense_peaks={
+        'NVIDIA H100': {'bf16': 989e12, 'fp8': 1979e12},
+        'NVIDIA H100 PCIe': {'bf16': 756e12, 'fp8': 1513e12},
+        'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
+        'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
+        'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}),
+    GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
+              dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
+              aliases=('gpu:g4', 'g4')),
+    GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
+    GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
+    GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
+    GpuTarget('v5e', 'TPU v5 lite',
+              kernels={'grouped_matmul': 'xla', 'tokamax_grouped_matmul': 'mosaic_tpu_v2'},
+              dense_peaks={'TPU v5 lite': {'bf16': 197e12}}),
+    GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
+    GpuTarget('v6e', 'TPU v6 lite',
+              kernels={'grouped_matmul': 'xla', 'tokamax_grouped_matmul': 'mosaic_tpu_v2'},
+              dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
+)}
+
+
+def gpu_target(identifier: str | None = None) -> GpuTarget:
+    """The target for a generation, reported device kind or case-insensitive lab alias.
+
+    None is the default device's: its generation is `device_generation`'s, the
+    one seam that `assumed` and tests set, and its device kind only picks the
+    SKU's peaks within that generation; a real GPU the table names no SKU of
+    keeps its own kind, so its peaks stay unknown, while an assumed or patched
+    generation takes the generation's canonical device. SKU queries retain
+    that SKU's peaks. Unknown kinds have empty resources.
+    """
+    if identifier is None:
+        import jax
+        device = jax.devices()[0]
+        generation, kind = device_generation(), device.device_kind
+        target = gpu_target(kind)
+        if target.generation == generation:
+            return target
+        canonical = TARGETS.get(generation, GpuTarget(generation, kind))
+        real = device.platform == 'gpu' and ASSUMED.get() is None
+        return dataclasses.replace(canonical, device_kind=kind) if real else canonical
+    if identifier in TARGETS:
+        return TARGETS[identifier]
+    for target in TARGETS.values():
+        if identifier.lower() in target.aliases:
+            return target
+    matches = [(len(prefix), target) for target in TARGETS.values()
+               for prefix in target.device_kind_prefixes if identifier.startswith(prefix)]
+    if matches:
+        return dataclasses.replace(max(matches, key=lambda entry: entry[0])[1], device_kind=identifier)
+    return GpuTarget(identifier, identifier)
 
 
 def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton
     for that GPU on any host (`TrainerConfig.lower_for`; the kernel lab's oracle)."""
-    if generation not in DEVICE_KINDS:
-        raise ValueError(f"no device kind for {generation!r}; one of {', '.join(DEVICE_KINDS)}")
-    device = AbstractDevice(device_kind=DEVICE_KINDS[generation], num_cores=None, platform='cuda')
+    from jax.sharding import AbstractDevice, AbstractMesh
+    target = gpu_target(generation)
+    if not target.generation.startswith('sm') or target.shared_limit is None:
+        raise ValueError(f"no CUDA target for {generation!r}")
+    device = AbstractDevice(device_kind=target.device_kind, num_cores=None, platform='cuda')
     return AbstractMesh(mesh.axis_sizes, mesh.axis_names, axis_types=mesh.axis_types, abstract_device=device)
 
-
-# `device_kind` of the TPU generations Dew names.
-TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v5p': 'v5p',
-                   'TPU v6 lite': 'v6e'}
 
 # The first GPU generation with bf16 tensor cores (Ampere). Below it XLA
 # rejects the BF16_BF16_F32 dot algorithm at run time ("UNIMPLEMENTED:
@@ -82,17 +194,11 @@ TPU_GENERATIONS = {'TPU v4': 'v4', 'TPU v5 lite': 'v5e', 'TPU v5': 'v5p', 'TPU v
 BF16_GPU = 80
 
 
-def _compute_capability() -> str | None:
-    """The first device's compute capability, '8.9' for an sm89 card. jax's
-    Device declares no such field, and a CUDA device carries it, so it is
-    read at this boundary; a device without one gives None."""
-    return getattr(jax.devices()[0], 'compute_capability', None)
-
-
-SMALL_SHARED = ('sm86', 'sm89', 'sm120')
-"""Generations whose blocks hold 99 KB of shared memory, against 163 KB and
-more on an A100 or an H100: a kernel that buffers more in a block compiles
-fewer pipeline stages there, or refuses (`delta_chunks.stages`)."""
+def _compute_capability(device) -> str | None:
+    """`device`'s compute capability, '8.9' for an sm89 card. jax's Device
+    declares no such field, and a CUDA device carries it, so it is read at
+    this boundary; a device without one gives None."""
+    return getattr(device, 'compute_capability', None)
 
 
 def device_generation() -> str:
@@ -102,58 +208,23 @@ def device_generation() -> str:
     TPU v6e, and the platform's name otherwise; within `assumed`, the one it
     names.
     """
+    import jax
     generation = ASSUMED.get()
     if generation is not None:
         return generation
     device = jax.devices()[0]
-    capability = _compute_capability() if device.platform == 'gpu' else None
+    capability = _compute_capability(device) if device.platform == 'gpu' else None
     if capability:
         return 'sm' + capability.replace('.', '')
     if device.platform == 'tpu':
         kind = device.device_kind or 'tpu'
-        return TPU_GENERATIONS.get(kind, kind)
+        return gpu_target(kind).generation
     return device.platform
-
-
-# The kernel each choice runs per generation, as measured (docs/performance.md, "Kernel choices per
-# generation"); a generation a row does not name runs the choice's portable path.
-KERNELS: dict[str, dict[str, str]] = {
-    # Candidate row reductions and SiLU products: no generation opts in before c53's GPU VJP timings.
-    'rms_norm': {},
-    'swiglu': {},
-    # FlashAttention-2 (dew_flash_attn) beat cuDNN by 4-8% in Qwen3-0.6B's training step on the A100,
-    # and the xla path 256-wide heads take by 17%; on the RTX 4080 by 1.9-2.5% in the decoder and DiT
-    # steps, and on the L4 by under 3%.
-    'attention': {'sm80': 'flash', 'sm89': 'flash'},
-    # JAX's Pallas grouped matmul runs 5x-61x faster than XLA's ragged_dot on sm80-sm89; on TPU XLA
-    # wins except tokamax's mosaic_tpu_v2 (1.11x-1.38x at 8 experts), not a dependency.
-    'grouped_matmul': {'sm80': 'pallas', 'sm86': 'pallas', 'sm89': 'pallas', 'v5e': 'xla', 'v6e': 'xla'},
-    # The kernel 'tokamax' names. Its own dispatch tries Mosaic first, 4x-13x slower than XLA on a TPU
-    # and over shared memory on sm89; its Triton backward faults on sm80 and sm89, so only the forward
-    # runs on it.
-    'tokamax_grouped_matmul': {'sm80': 'triton', 'sm89': 'triton', 'v5e': 'mosaic_tpu_v2',
-                               'v6e': 'mosaic_tpu_v2'},
-    # XLA's Triton GEMM fusions off, every dot on cuBLAS: on sm80 compiles take half as long and
-    # decoder, MoE and DiT steps run 0-6% faster; on sm89 decoder steps run 3-10% faster, 3x where the
-    # fusions hit a whole-logits head at 4096 tokens. A Mamba-2 mixer loses 7.7% and keeps them.
-    'xla_triton_gemm': {'sm80': 'off', 'sm89': 'off'},
-    # The chunked gated delta rule's memory across chunks (delta_chunks) and in-chunk correction
-    # (delta_prep). At Qwen3.5-9B's widths on an A100, fused prep cut the rule's forward and backward
-    # from 9.09 to 8.17 ms and a GatedDeltaNet layer's from 15.15 to 13.70. The output stays XLA;
-    # its fused backward lost at every tile. Whole-rule float64 RMS ratios at most 1.324 (c46).
-    # On an RTX 4080, the recurrence at one pipeline stage (delta_chunks.stages) and the prep at its
-    # two, which fit there: the rule's 24.62 against 15.73 ms and the layer's 41.35 against 33.80.
-    'gated_delta_rule': {'sm80': 'pallas', 'sm89': 'pallas'},
-    # The forward reads bf16 copies of the fp32 weights (dew.training.narrow): Qwen3-0.6B at 1 x 1024
-    # runs 96.1 against 90.8 ms on an RTX 4080, and at 4 x 1024 128.4 against 125.9 on an A100. A
-    # TPU fuses the cast into the matmul.
-    'narrow_copies': {'sm80': 'on', 'sm89': 'on'},
-}
 
 
 def measured_kernel(choice: str, default: str) -> str:
     """The kernel `KERNELS` names for `choice` on the default device's generation, else `default`."""
-    return KERNELS[choice].get(device_generation(), default)
+    return gpu_target(device_generation()).kernels.get(choice, default)
 
 
 # Each (choice, kernel, refusal) `ran_kernel` has logged in this process.
@@ -167,7 +238,7 @@ def ran_kernel(choice: str, kernel: str, refusal: str) -> str:
     shows in a run's log, not only in its step time. A generation without a measurement, or a call
     that runs the measured kernel, logs nothing."""
     generation = device_generation()
-    measured = KERNELS[choice].get(generation)
+    measured = gpu_target(generation).kernels.get(choice)
     if measured not in (None, kernel) and (choice, kernel, refusal) not in _logged:
         _logged.add((choice, kernel, refusal))
         _log.warning("%s runs %r, not %r, the kernel measured fastest on %s: %s",
@@ -195,12 +266,15 @@ def backend() -> str:
     """The platform a call's code is chosen for: `jax.default_backend()`, or within `assumed` the
     assumed generation's, 'gpu' for an `smXY` and 'tpu' for a TPU's, so a choice keyed on the
     platform acts as on that device while a step traces for it on another."""
+    import jax
     generation = ASSUMED.get()
     if generation is None:
         return jax.default_backend()
     if generation.startswith('sm'):
         return 'gpu'
-    return 'tpu' if generation in TPU_GENERATIONS.values() else generation
+    if generation in TARGETS and TARGETS[generation].device_kind.startswith('TPU '):
+        return 'tpu'
+    return generation
 
 
 def triton_runs() -> bool:
