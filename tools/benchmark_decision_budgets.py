@@ -208,7 +208,7 @@ class Measurement:
             "loss_normalization": (
                 "per real token" if self.config.trainer.batch_tokens else "per scored question"),
             "analytic_mfu_scope": "Counted recurrent trunk work at real lengths; head and remat excluded",
-            "hfu_scope": "compiled HLO including padded work, head and recomputation; separate from model MFU",
+            "hfu_scope": "compiled HLO includes padding, head and recomputation; separate from model MFU",
             "model_flops_per_step": statistics.mean(row["model_flops"] for row in measured),
             "whole_run_compile_seconds": sum(float(row["seconds"]) for row in self.compiles),
             "compile_count": len(self.compiles), "compiles": self.compiles,
