@@ -23,6 +23,7 @@ import sys
 import tempfile
 import urllib.error
 import urllib.request
+from collections.abc import Sequence
 from pathlib import Path
 
 from tools.colab.common import REPO, VENV_PYTHON, git
@@ -778,7 +779,7 @@ def hazards(texts: dict[str, str], command: str) -> list[str]:
             for pattern, why in HAZARDS.items() if (match := pattern.search(line))]
 
 
-def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: list[str] = ()) -> dict:
+def lab_verified(tree: Path, hardware: str, failures: list[str], explicit: Sequence[str] = ()) -> dict:
     """Where the ref's measured kernel choices on `hardware` name Pallas kernels, or a script asks for
     one by name (`explicit`), the kernel lab's record that it compiled and ran them on that GPU,
     kernels, their callers and the pinned JAX byte for byte: CPU interpretation cannot catch a
