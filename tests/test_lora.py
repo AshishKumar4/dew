@@ -1022,13 +1022,13 @@ def _recipe_run(tmp_path, image_size, *args):
         "data:images", "--data.source", json.dumps({"class": "dew.data.sources.tfds:TFDS", "fields": {
             "name": "dew_images", "path": str(IMAGES), "split": "all"}}), "--data.image-size",
                 str(image_size),
-        "--data.augment", "None", "--data.validation", "null", "--objective.solver",
+        "--data.validation", "null", "--objective.solver",
         '{"class": "euler"}', "--objective.guidance", "None", "--objective.steps", "2",
         "--objective.ema-decay", "None", "--val-metrics",
         "--trainer.checkpoint-dir", str(tmp_path), "--trainer.batch-size", str(jax.device_count()),
         "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
-        *args])
+        *args, "data.augment:none"])
     return config, config.run()
 
 
