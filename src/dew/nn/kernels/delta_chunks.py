@@ -52,10 +52,11 @@ two (`stages`). Each stage buffers a chunk's fp32 `[C, Dk]` operands."""
 
 def stages() -> int:
     """The pipeline depth the kernels compile with on this generation: one
-    where a block holds 99 KB (`generation.SMALL_SHARED`), since two stages
+    where the target cannot hold the two-stage working set, since two stages
     of a 64-token chunk of 128-wide keys ask 112 KB (RESOURCE_EXHAUSTED on an
     RTX 4080), and wider chunks or keys are refused there."""
-    return 1 if generation.device_generation() in generation.SMALL_SHARED else STAGES
+    limit = generation.gpu_target().shared_limit
+    return 1 if limit is not None and limit < 112 * 1024 else STAGES
 MIN_WIDTH = 16
 """The narrowest side of a product Triton's `dot` takes."""
 
@@ -68,13 +69,13 @@ def refusal(key: jax.Array, out_vals: jax.Array) -> str | None:
     multiple of `BLOCK` wide, and operands no mesh axis splits
     (`seen_whole`)."""
     chunk, width = key.shape[-2:]
-    columns, device = out_vals.shape[-1], generation.device_generation()
+    columns, target = out_vals.shape[-1], generation.gpu_target()
     return first_refusal(
         (key.dtype == jnp.float32, f"the rule runs in {key.dtype}, and the kernels in float32"),
         (all(side >= MIN_WIDTH and side & (side - 1) == 0 for side in (chunk, width)),
          f"chunks of {chunk} and keys {width} wide; Triton multiplies powers of two from {MIN_WIDTH}"),
-        (device not in generation.SMALL_SHARED or chunk * width <= 64 * 128,
-         f"chunks of {chunk} and keys {width} wide outgrow {device}'s 99 KB of shared memory a block"),
+        (target.shared_limit is None or target.shared_limit >= 112 * 1024 or chunk * width <= 64 * 128,
+         f"chunks of {chunk} and keys {width} wide outgrow {target.generation}'s block shared memory"),
         (columns % BLOCK == 0, f"values {columns} wide, not a multiple of the {BLOCK}-column block"),
         (seen_whole(key), "a mesh axis splits the rule's operands, and the kernels see whole arrays"),
     )

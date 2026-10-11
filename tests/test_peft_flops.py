@@ -152,11 +152,10 @@ def test_unknown_media_work_can_count_tokens_without_claiming_a_model_flop_count
 
 
 def test_trainer_reads_training_work_once_from_the_existing_interval_record(monkeypatch):
-    import dew.telemetry.instrumentation as instrumentation
-    import dew.training.trainer as trainer_module
+    from dew.nn.kernels import TARGETS, GpuTarget
 
-    monkeypatch.setattr(instrumentation, "peak_flops", lambda device: 1e12)
-    monkeypatch.setattr(trainer_module, "peak_flops", lambda device: 1e12)
+    kind = jax.devices()[0].device_kind
+    monkeypatch.setitem(TARGETS, kind, GpuTarget(kind, kind, dense_peaks={kind: {'bf16': 1e12}}))
     model = decoder().clone(num_layers=1)
     variables = model.init(jax.random.key(406), jnp.ones((8, 6), jnp.int32))
     adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=506)

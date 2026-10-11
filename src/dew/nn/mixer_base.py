@@ -115,7 +115,7 @@ class MixerBase:
 
     keeps_triton_gemm = False
     """Whether a step with this mixer keeps XLA's Triton GEMM fusions where
-    `dew.nn.kernels.KERNELS['xla_triton_gemm']` turns them off."""
+    `gpu_target().kernels['xla_triton_gemm']` turns them off."""
 
     mixed_step = False
     """Whether the mixer this kind builds runs a server's mixed call

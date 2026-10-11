@@ -175,7 +175,9 @@ def test_the_kernels_are_as_exact_as_the_xla_scan():
 def test_auto_takes_the_kernels_where_they_were_measured(monkeypatch, generation, gpu, chosen):
     """'auto' runs the kernels on a generation `KERNELS` names them for and
     they compile on, and the scan everywhere else."""
-    monkeypatch.setitem(kernels.KERNELS, "gated_delta_rule", {"sm80": "pallas"})
+    for target in kernels.TARGETS.values():
+        monkeypatch.delitem(target.kernels, 'gated_delta_rule', raising=False)
+    monkeypatch.setitem(kernels.gpu_target('sm80').kernels, 'gated_delta_rule', 'pallas')
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: generation)
     monkeypatch.setattr(linear, "triton_runs", lambda: gpu)
     key, _, u, gc, _ = recurrence_operands((1, 1, 2, 64, 128, 128))
@@ -195,7 +197,7 @@ def test_a_call_the_kernels_cannot_take_runs_the_scan_and_says_why(monkeypatch, 
     """Where the kernels were measured fastest, a call they cannot take runs
     the scan, and the first such call logs the reason by name."""
     shape, dtype, reason = REFUSED[case]
-    monkeypatch.setitem(kernels.KERNELS, "gated_delta_rule", {"sm80": "pallas"})
+    monkeypatch.setitem(kernels.gpu_target('sm80').kernels, 'gated_delta_rule', 'pallas')
     monkeypatch.setattr(kernels.generation, "device_generation", lambda: "sm80")
     monkeypatch.setattr(kernels.generation, "_logged", set())
     monkeypatch.setattr(linear, "triton_runs", lambda: True)

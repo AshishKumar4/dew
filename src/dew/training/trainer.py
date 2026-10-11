@@ -48,7 +48,7 @@ from dew.data.dataset import (
     stream_endless,
     stream_identity,
 )
-from dew.nn.kernels.generation import assumed, gpu_mesh, measured_kernel
+from dew.nn.kernels.generation import assumed, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
     BATCH_AXES,
     SEQUENCE_AXIS,
@@ -80,7 +80,7 @@ from dew.objectives.base import (
 )
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization, peak_flops, step_flops
+from dew.telemetry.instrumentation import NO_FLOPS, StepFlops, model_flops_utilization, step_flops
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     AxisLink,
@@ -1121,7 +1121,7 @@ class Trainer(Generic[Loss, Effects]):
         mesh or for a device the peak table does not name, where it decides
         nothing."""
         devices = list(mesh.devices.flat)
-        peaks = [peak for device in devices if (peak := peak_flops(device.device_kind)) is not None]
+        peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
         platform = devices[0].platform
         links = {}
@@ -2162,7 +2162,7 @@ class Trainer(Generic[Loss, Effects]):
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it."""
         return prepare_counts(self.objective, batch,
-                              count_model=peak_flops(jax.devices()[0].device_kind) is not None)
+                              count_model=gpu_target(jax.devices()[0].device_kind).bf16_peak is not None)
 
     def _rolled_out(self, state: TrainState, batch: Batch) -> tuple[Batch, float]:
         """Sample one batch through the rollout, with the seconds it took.

@@ -239,10 +239,11 @@ def test_throughput_metrics_ignore_a_zero_interval():
 def test_mfu_reads_analytical_work_and_keeps_both_hlo_utilizations(monkeypatch):
     """MFU is the real-token forward/backward estimate; the two HLO counts
     remain separate and never stand in for a missing analytical count."""
-    from dew.telemetry import peaks
+    from dew.nn.kernels import TARGETS, GpuTarget
     from dew.telemetry.instrumentation import StepFlops
 
-    monkeypatch.setitem(peaks.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
+    kind = jax.devices()[0].device_kind
+    monkeypatch.setitem(TARGETS, kind, GpuTarget(kind, kind, dense_peaks={kind: {'bf16': 100.0}}))
     trainer = make_trainer()
     metrics = trainer._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0),
                                    training_flops=240.0, tokens=700)
@@ -274,8 +275,10 @@ def test_mfu_is_skipped_on_unknown_hardware():
 
 
 def test_mfu_uses_the_per_device_flop_count(monkeypatch):
-    from dew.telemetry import instrumentation, peaks
-    monkeypatch.setitem(peaks.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
+    from dew.nn.kernels import TARGETS, GpuTarget
+    from dew.telemetry import instrumentation
+    kind = jax.devices()[0].device_kind
+    monkeypatch.setitem(TARGETS, kind, GpuTarget(kind, kind, dense_peaks={kind: {'bf16': 100.0}}))
     assert instrumentation.model_flops_utilization(50.0, 1.0) == pytest.approx(0.5)
     assert instrumentation.model_flops_utilization(50.0, 2.0) == pytest.approx(0.25)
 
@@ -297,8 +300,8 @@ def test_the_peak_table_resolves_the_names_devices_report(device_kind, peak):
     the PCIe H100 has to resolve to its own figure, not the SXM's, whose
     name it also starts with. Hardware the table does not name is None, and
     the run then logs no utilisation."""
-    from dew.telemetry.instrumentation import peak_flops
-    assert peak_flops(device_kind) == peak
+    from dew.nn.kernels import gpu_target
+    assert gpu_target(device_kind).bf16_peak == peak
 
 
 def test_compiled_flops_is_per_device_under_spmd():
