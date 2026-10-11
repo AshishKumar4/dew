@@ -87,8 +87,14 @@ def test_cache_keeps_active_file_pinned_and_evicts_lru(tmp_path):
     assert not cache._check_file(f"{root}/b")
     assert cache._check_file(f"{root}/c")
     active.close()
-    assert sum(path.stat().st_size for path in tmp_path.iterdir()
-               if path.name not in ("cache", ".dew-lock") and not path.name.endswith(".pin")) <= 8
+    assert (
+        sum(
+            path.stat().st_size
+            for path in tmp_path.iterdir()
+            if path.name not in ("cache", ".dew-lock") and not path.name.endswith(".pin")
+        )
+        <= 8
+    )
 
 
 def test_oversized_file_bypasses_transport_cache(tmp_path):
@@ -125,8 +131,10 @@ def test_concurrent_misses_download_once(tmp_path, monkeypatch):
 
 
 def test_url_chain_reads_and_writes_memory(tmp_path):
-    store = Store(f"dewcache::memory://chain-{uuid4().hex}/object", {
-        "dewcache": {"cache_storage": str(tmp_path), "max_bytes": 1024}})
+    store = Store(
+        f"dewcache::memory://chain-{uuid4().hex}/object",
+        {"dewcache": {"cache_storage": str(tmp_path), "max_bytes": 1024}},
+    )
     store.put_if_absent(b"through the chain")
     assert store.read() == b"through the chain"
     old = store.get_versioned()
@@ -149,8 +157,9 @@ def test_real_r2_conditional_publication_and_bounded_read(tmp_path):
         store.put_if_match(first, previous.version)
     with pytest.raises(PreconditionFailed):
         store.put_if_absent(b'{"generation":"two"}')
-    cached = Store("dewcache::" + store.url, {"dewcache": {
-        "cache_storage": str(tmp_path), "max_bytes": 1024}})
+    cached = Store(
+        "dewcache::" + store.url, {"dewcache": {"cache_storage": str(tmp_path), "max_bytes": 1024}}
+    )
     assert cached.read() == first
     fs, path = store.resolve()
     fs.rm(path)

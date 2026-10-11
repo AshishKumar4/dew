@@ -18,7 +18,16 @@ from dew.records import JSON
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
-type Value = JSON | bytes | np.ndarray | np.generic | DataclassInstance | tuple[Value, ...] | Mapping[str, Value]
+type Value = (
+    JSON
+    | bytes
+    | np.ndarray
+    | np.generic
+    | DataclassInstance
+    | list[Value]
+    | tuple[Value, ...]
+    | Mapping[str, Value]
+)
 
 
 def pack_dict_of_byte_arrays(values: Mapping[str, bytes]) -> bytes:
@@ -40,7 +49,7 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
             raise ValueError("truncated ArrayRecord key length")
         length = struct.unpack_from("<I", payload, offset)[0]
         offset += 4
-        key = payload[offset:offset + length].decode()
+        key = payload[offset : offset + length].decode()
         offset += length
         if offset + 4 > len(payload):
             raise ValueError(f"truncated ArrayRecord value length for {key!r}")
@@ -48,7 +57,7 @@ def unpack_dict_of_byte_arrays(payload: bytes) -> dict[str, bytes]:
         offset += 4
         if offset + length > len(payload) or key in values:
             raise ValueError(f"invalid ArrayRecord value for {key!r}")
-        values[key] = payload[offset:offset + length]
+        values[key] = payload[offset : offset + length]
         offset += length
     return values
 
@@ -77,9 +86,14 @@ def _tree(value: Value, leaves: dict[str, bytes]) -> JSON:
         cls = type(value)
         if not cls.__module__.startswith("dew."):
             raise TypeError(f"artifact codec has no schema for {cls.__module__}.{cls.__qualname__}")
-        return {"dataclass": [cls.__module__, cls.__qualname__],
-                "fields": {field.name: _tree(getattr(value, field.name), leaves)
-                           for field in dataclasses.fields(value) if field.init}}
+        return {
+            "dataclass": [cls.__module__, cls.__qualname__],
+            "fields": {
+                field.name: _tree(getattr(value, field.name), leaves)
+                for field in dataclasses.fields(value)
+                if field.init
+            },
+        }
     raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
 
 

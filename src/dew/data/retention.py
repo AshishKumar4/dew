@@ -39,8 +39,11 @@ class LocalRetention:
                 yield True
 
     def _keys(self) -> list[Path]:
-        return [path for path in self.directory.iterdir()
-                if path.is_dir() and re.fullmatch(r"[a-f0-9]{64}", path.name)]
+        return [
+            path
+            for path in self.directory.iterdir()
+            if path.is_dir() and re.fullmatch(r"[a-f0-9]{64}", path.name)
+        ]
 
     def _size(self) -> int:
         return sum(path.stat().st_size for key in self._keys() for path in key.rglob("*") if path.is_file())
@@ -69,9 +72,12 @@ class LocalRetention:
         with FileLock(str(self.directory / ".retention.lock")):
             replaced = target.stat().st_size if target.is_file() else 0
             needed = max(0, byte_count - replaced)
-            candidates = sorted((manifest.stat().st_atime_ns, manifest.parent)
-                                for key in self._keys() for manifest in (key / "generations").glob("*/manifest.json")
-                                if re.fullmatch(r"[a-f0-9]{32}", manifest.parent.name))
+            candidates = sorted(
+                (manifest.stat().st_atime_ns, manifest.parent)
+                for key in self._keys()
+                for manifest in (key / "generations").glob("*/manifest.json")
+                if re.fullmatch(r"[a-f0-9]{32}", manifest.parent.name)
+            )
             for _, generation in candidates:
                 if self._size() + needed <= self.max_bytes:
                     break
@@ -82,14 +88,19 @@ class LocalRetention:
                         continue
                     key = generation.parent.parent
                     current = key / "CURRENT"
-                    if current.is_file() and json.loads(current.read_bytes())["generation"] == generation.name:
+                    if (
+                        current.is_file()
+                        and json.loads(current.read_bytes())["generation"] == generation.name
+                    ):
                         with FileLock(str(current) + ".cas.lock"):
                             current.unlink()
                     shutil.rmtree(generation)
                     self._reclaim(key)
             if self._size() + needed > self.max_bytes:
-                raise OSError(f"local cache {self.directory} cannot admit {needed} bytes within "
-                              f"keep_local_bytes={self.max_bytes}; its remaining generations or writers are pinned")
+                raise OSError(
+                    f"local cache {self.directory} cannot admit {needed} bytes within "
+                    f"keep_local_bytes={self.max_bytes}; its remaining generations or writers are pinned"
+                )
             yield
 
     @staticmethod

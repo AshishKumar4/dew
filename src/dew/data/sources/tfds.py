@@ -351,7 +351,13 @@ class TFDS:
         return grain.MapDataset.source(self.records("indexed"))[shard.start:shard.stop].to_iter_dataset()
 
     def metadata(self) -> Mapping[str, object]:
-        return {"name": self.builder.info.name, "version": str(self.builder.info.version)}
+        import tensorflow_datasets as tfds
+
+        features = self.builder.info.features
+        class_names = ({name: tuple(feature.names) for name, feature in features.items()
+                        if isinstance(feature, tfds.features.ClassLabel)} if isinstance(features, Mapping) else {})
+        return {"name": self.builder.info.name, "version": str(self.builder.info.version),
+                "rows": len(self.builder.as_data_source(self.split)), "class_names": class_names}
 
     def lengths(self):
         return None
