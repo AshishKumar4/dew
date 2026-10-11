@@ -262,6 +262,7 @@ markers = [
     "distributed: tests that need real processes with jax.distributed",
     "mesh(devices=8): tests that need that many devices; tests/conftest.py skips them, naming both device counts, on a run with fewer",
     "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
+    "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands",
 ]
 # A warning is a failure waiting to be reported, so the ones dew is
 # responsible for are errors. The module field is matched against the module
