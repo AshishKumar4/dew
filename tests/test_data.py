@@ -40,7 +40,7 @@ from dew.data import (
     load,
 )
 from dew.data.compile import validation
-from dew.data.dataset import Forwarding, GlobalStream, SourceSlice
+from dew.data.dataset import Forwarding, GlobalStream, Records as IndexedRows, SourceSlice, describe
 from dew.data.image_codec import decode_image
 from dew.data.sinks import export
 from dew.data.sources import Torch, av_utils, source as stored_source
@@ -1195,11 +1195,43 @@ class _Raising:
 
 
 @dataclasses.dataclass(frozen=True)
+class _Lazy:
+    """A source whose records are read only as the stream reads them.
+
+    `Memory` fingerprints every record when a pipeline compiles, so a record
+    that cannot be read would fail there and never reach the stream.
+    """
+
+    values: IndexedRows
+
+    def describe(self):
+        return describe(self.values)
+
+    def snapshot(self):
+        return {"source": describe(self.values), "records": len(self.values)}
+
+    def supports(self, read):
+        return read != "streamed"
+
+    def records(self, read):
+        return self.values
+
+    def metadata(self):
+        return {"rows": len(self.values)}
+
+    def lengths(self):
+        return None
+
+    def manifest(self):
+        raise ValueError("a lazy source is indexed")
+
+
+@dataclasses.dataclass(frozen=True)
 class Raising(Indexed):
     bad: int | None = None
 
-    def source(self):
-        return _Raising(self.length, self.bad)
+    def pipelines(self):
+        return Pipeline(_Lazy(_Raising(self.length, self.bad))), None, ()
 
 
 @pytest.mark.parametrize("worker_count", [0, pytest.param(2, marks=pytest.mark.slow)])
