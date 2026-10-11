@@ -8,7 +8,7 @@ import tarfile
 from pathlib import Path
 from urllib.parse import urlparse
 
-from tools.colab import colab_sync
+from tools.colab import colab_sync, preflight
 from tools.colab.common import HERE, PART, REPO, STATE, driver_sha, git, lock, name, read, save
 
 QUEUE = STATE / "colab-queue.md"
@@ -151,7 +151,8 @@ def select(device: str, selector: str, hardware: str, order: list[str]) -> list[
         fields = entry["fields"]
         if fields.get("hardware", hardware) != hardware:
             raise ValueError("selected job requests different hardware")
-        for field in ("ref", "gpu_reason", "expected_cu", "decision", "memory_estimate", "outputs"):
+        required = ("ref", "gpu_reason", "expected_cu", "decision", "memory_estimate", "outputs", "preflight")
+        for field in required:
             if not fields.get(field):
                 raise ValueError(f"GPU request lacks {field}: {entry['text'].splitlines()[0]}")
         estimate = float(fields["expected_cu"])
@@ -221,6 +222,9 @@ def plan_jobs(chosen: list[dict], device: str, hardware: str, base: str, repo: P
         for source, target in input_paths(fields):
             with source.open("rb") as stream:
                 inputs.append((target, hashlib.file_digest(stream, "sha256").hexdigest()))
+        if fields.get("preflight"):
+            receipt = Path(fields["preflight"]).expanduser()
+            job["preflight"] = preflight.verify(receipt, job["commit"], hardware, job["command"], inputs)
         job.update(data_inputs(fields))
         job["resume_key"] = colab_sync.retained_key(
             job["commit"],
