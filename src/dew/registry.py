@@ -37,6 +37,7 @@ from typing import (
     Literal,
     Protocol,
     TypedDict,
+    TypeAliasType,
     Union,
     overload,
     runtime_checkable,
@@ -342,11 +343,11 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
 
 
 @overload
-def from_record(annotation: types.UnionType | types.TypeAliasType, value: Configured, *,
+def from_record(annotation: types.UnionType | TypeAliasType, value: Configured, *,
                 dtypes: bool = True) -> object: ...
 
 
-def from_record(annotation: type | types.UnionType | types.TypeAliasType, value: Configured, *,
+def from_record(annotation: type | types.UnionType | TypeAliasType, value: Configured, *,
                 dtypes: bool = True) -> object:
     """Return `value` as the class `annotation` names, from a record or already one.
 
@@ -361,7 +362,7 @@ def from_record(annotation: type | types.UnionType | types.TypeAliasType, value:
     """
     with _reading(value):
         built = _rebuilt(annotation, value, dtypes=dtypes)
-    if isinstance(annotation, (types.UnionType, types.TypeAliasType)):
+    if isinstance(annotation, (types.UnionType, TypeAliasType)):
         return built
     witness = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
