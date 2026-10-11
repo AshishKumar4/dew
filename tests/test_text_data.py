@@ -203,7 +203,7 @@ def test_an_epoch_reads_every_complete_window_stride_apart(tmp_path, seq_len, st
 def test_a_window_needs_a_positive_stride_and_length_and_a_long_enough_split(tmp_path):
     _stream_dir(tmp_path, np.zeros(4))
     for fields, refusal in (({"seq_len": 2, "stride": 0}, "stride"), ({"seq_len": 2, "stride": -1}, "stride"),
-                            ({"seq_len": 0}, "seq_len"), ({"seq_len": 4}, "too few for even one window")):
+                            ({"seq_len": 0}, "seq_len"), ({"seq_len": 4}, "has no accepted rows")):
         with pytest.raises(ValueError, match=refusal):
             load(Text(source=str(tmp_path)), batch=1, read="memory", loading=Loading(workers=0,
                 threads=1, read_buffer=1, worker_buffer=1), **fields)
@@ -1076,6 +1076,11 @@ def test_windows_read_only_their_span_and_memory_packing_never_rereads_the_store
     finally:
         stream.close()
     assert spans and max(spans) <= 8
+    stream = packed.train(DataPartition())
+    try:
+        next(stream)
+    finally:
+        stream.close()
     before = len(spans)
     stream = packed.train(DataPartition())
     try:
