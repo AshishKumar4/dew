@@ -102,7 +102,7 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     prefix_scale = float(prefix.scale.scale)
     prefix_params = jax.tree.map(np.asarray, prefix.variables)
     prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
-    rejected, _, _, finite, accepted = run(prefix, data[1])
+    rejected, _, _, finite, accepted, _ = run(prefix, data[1])
     assert bool(finite) and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1
     assert float(rejected.scale.scale) == prefix_scale / 2
@@ -112,7 +112,7 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     for before, after in zip(jax.tree.leaves(prefix_accumulation),
                              jax.tree.leaves(rejected.accumulation), strict=True):
         np.testing.assert_array_equal(before, after)
-    final, _, _, _, accepted = run(rejected, data[2])
+    final, _, _, _, accepted, _ = run(rejected, data[2])
     assert bool(accepted) and int(final.updates) == 1
     assert float(final.variables["stats"]["seen"]) == 2
     assert float(start["stats"]["seen"]) == 0
@@ -237,7 +237,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     partial, *_ = run(initial, data[0])
     for before, after in zip(jax.tree.leaves(start), jax.tree.leaves(partial.variables), strict=True):
         np.testing.assert_array_equal(before, after)
-    actual, actual_loss, _, _, accepted = run(partial, data[1])
+    actual, actual_loss, _, _, accepted, _ = run(partial, data[1])
     assert bool(accepted) and int(actual.updates) == 1
     combined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), *data)
     info = Step(jnp.array(0), jax.random.fold_in(key, 0), start)

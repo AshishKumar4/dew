@@ -375,7 +375,7 @@ def _resident_memory_step():
     memory = device.memory_stats()
     assert memory is not None
     assert additional_bytes() <= memory["bytes_limit"] - memory["bytes_in_use"]
-    _, loss, _, finite, _ = jax.block_until_ready(step(state, batch))
+    _, loss, _, finite, _, _ = jax.block_until_ready(step(state, batch))
     assert bool(finite), float(loss)
     jax.block_until_ready(held)
 

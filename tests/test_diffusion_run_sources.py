@@ -79,7 +79,7 @@ def test_a_run_fine_tunes_a_published_pipeline_and_rebinds_it_without_weights(
     trainer = Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3))
     initial = trainer.initial_state()
     before = value(objective, initial.variables, batch)
-    state, _, _, _, accepted = trainer.compile(initial, batch)(initial, batch)
+    state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
     trained = value(objective, state.variables, batch)
     assert trained < before
@@ -327,7 +327,7 @@ def test_a_published_family_trains_from_scratch_on_its_pipelines_text_towers(pip
     before = value(objective, initial.variables, batch)
     step, state = trainer.compile(initial, batch), initial
     for _ in range(10):
-        state, _, _, _, accepted = step(state, batch)
+        state, _, _, _, accepted, _ = step(state, batch)
         assert bool(accepted)
     assert value(objective, state.variables, batch) < before
 
@@ -351,7 +351,7 @@ def grpo_step(objective, rollout, **trainer):
     initial = trainer.initial_state()
     prepared = rollout(initial, batch_for(objective, 4), jax.random.PRNGKey(2))
     started = [np.asarray(leaf) for leaf in jax.tree.leaves(initial.variables["params"])]
-    state, _, _, _, accepted = trainer.compile(initial, prepared)(initial, prepared)
+    state, _, _, _, accepted, _ = trainer.compile(initial, prepared)(initial, prepared)
     assert bool(accepted)
     return prepared, started, state
 

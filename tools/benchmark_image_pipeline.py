@@ -172,12 +172,12 @@ def training_timing(config, backend):
     with DevicePrefetchIterator(source, trainer.device_mesh) as batches:
         step = trainer.compile(state, next(batches))
         for _ in range(config.warmup):
-            state, loss, _, _, _ = step(state, next(batches))
+            state, loss, _, _, _, _ = step(state, next(batches))
         jax.block_until_ready(state)
         for _ in range(config.repeats):
             started = time.perf_counter()
             for _ in range(config.steps):
-                state, loss, _, _, _ = step(state, next(batches))
+                state, loss, _, _, _, _ = step(state, next(batches))
             jax.block_until_ready(state)
             durations.append(time.perf_counter() - started)
     if not np.isfinite(float(loss)):

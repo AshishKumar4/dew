@@ -642,7 +642,12 @@ class TrainerConfig:
     None compiles from scratch every run.
     """
     wandb: Wandb | None = None
-    """An optional W&B sink, in addition to the local tracking journal."""
+    """An optional W&B telemetry sink, in addition to the local tracking journal.
+
+    Scalars, records and objective previews are tracked; checkpoints are not uploaded.
+    """
+    publish: bool = False
+    """Publish the final checkpoint to the W&B model registry; requires `wandb`."""
     multi_host: bool | None = None
     """Whether to join the JAX process pool.
 
@@ -675,6 +680,8 @@ class TrainerConfig:
     """
 
     def __post_init__(self):
+        if self.publish and self.wandb is None:
+            raise ValueError("trainer.publish requires trainer.wandb to name the publishing run")
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
@@ -1110,10 +1117,10 @@ class RunConfig:
         The run lives under `name` in `trainer.checkpoint_dir`, and process zero writes
         the record there before training starts. A `trainer.wandb` opens a tracker
         under the same name, with the record, `summary` (the recipe's own view of the
-        run) and the step count as its config. The final checkpoint is published to
-        the W&B registry under the name with slashes and spaces replaced, because an
-        artifact name allows neither. Local tracking journals live in a separate
-        tracking directory.
+        run) and the step count as its config. Only `trainer.publish` publishes the
+        final checkpoint to the W&B registry, under the name with slashes and spaces
+        replaced because an artifact name allows neither. Local tracking journals
+        live in a separate tracking directory.
 
         `dataset` must be the one the recipe loaded at `trainer.batch_size`; a dataset
         at any other batch size is refused here. The record, the ramp and the reported
@@ -1166,7 +1173,9 @@ class RunConfig:
                     display.note(f"Local tracking: {local.directory}")
                     self.save(checkpoints.directory)
                     tracker.artifact(RunRecord(name, json_value(self.to_dict()),
-                        json_value(summary or {}), steps, packages_installed()), 0)
+                        json_value(summary or {}), steps, packages_installed(),
+                        device_kind=jax.devices()[0].device_kind, devices=jax.device_count(),
+                        processes=jax.process_count()), 0)
 
             agreed("run metadata", record_run)
             # The trainer holds mesh, layout, accumulation, dynamic_scale and
@@ -1189,7 +1198,7 @@ class RunConfig:
                 after(state, checkpoints.directory)
             def publish_checkpoint() -> None:
                 """Upload the checkpoint the run ended on, where a tracker takes one."""
-                if wandb_tracker is not None:
+                if trainer.publish and wandb_tracker is not None:
                     # fit wrote the step it ended on, so that checkpoint is the run's.
                     dew.io.publish(checkpoints.path(int(state.step)), _artifact_name(name),
                                    tracker=wandb_tracker)

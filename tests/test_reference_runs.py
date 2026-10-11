@@ -70,7 +70,7 @@ def test_lm_fine_tune_steps_are_as_exact_as_torch():
     step = trainer.compile(state, {TEXT_KEY: tokens[0]})
     losses, norms = [], []
     for rows in tokens:
-        state, loss, _, _, _ = step(state, {TEXT_KEY: rows})
+        state, loss, _, _, _, _ = step(state, {TEXT_KEY: rows})
         losses.append(float(loss))
         norms.append(float(state.opt_state[0].norm))
 
