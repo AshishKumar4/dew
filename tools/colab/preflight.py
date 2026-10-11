@@ -142,13 +142,36 @@ def pins(words: list[str], found: dict) -> None:
             found["failures"].append(f"pip installs {word!r} without an exact version")
 
 
-def uses(source: str, label: str) -> tuple[list[dict], set[tuple[str, str]]]:
-    """Every module attribute chain a Python source reads, and the attributes it assigns on modules."""
-    tree = ast.parse(source, label)
-    chains: list[dict] = []
-    bound: set[tuple[str, str]] = set()
+def uses(source: str, label: str) -> tuple[list[dict], set[tuple[str, str]], set[str]]:
+    """Every module attribute chain a Python source reads, the attributes it assigns on modules, and
+    the directories, relative to the Dew tree it runs in, it puts on sys.path."""
+    found = Uses(ast.parse(source, label), label)
+    return found.chains, found.bound, found.paths
 
-    def scope(node: ast.AST, inherited: dict[str, tuple[str, tuple[str, ...]]]) -> None:
+
+class Uses:
+    def __init__(self, tree: ast.Module, label: str):
+        self.label = label
+        self.chains: list[dict] = []
+        self.bound: set[tuple[str, str]] = set()
+        self.paths: set[str] = set()
+        self.constants: dict[str, str] = {}
+        for node in tree.body:
+            if (
+                isinstance(node, ast.Assign)
+                and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+            ):
+                value = directory(node.value, self.constants)
+                if value is not None:
+                    self.constants[node.targets[0].id] = value
+        self.scope(tree, {})
+
+    def chain(self, module: str, attrs: list[str], node: ast.AST) -> None:
+        where = f"{self.label}:{getattr(node, 'lineno', 0)}"
+        self.chains.append({"module": module, "attrs": list(attrs), "where": where})
+
+    def scope(self, node: ast.AST, inherited: dict[str, tuple[str, tuple[str, ...]]]) -> None:
         aliases = dict(inherited)
         own, nested = [], []
         pending = list(ast.iter_child_nodes(node))
@@ -165,46 +188,73 @@ def uses(source: str, label: str) -> tuple[list[dict], set[tuple[str, str]]]:
                 aliases.pop(argument.arg, None)
         imported = set()
         for child in own:
-            where = f"{label}:{getattr(child, 'lineno', 0)}"
-            if isinstance(child, ast.Import):
-                for alias in child.names:
-                    chains.append({"module": alias.name, "attrs": [], "where": where})
-                    bind = alias.asname or alias.name.split(".")[0]
-                    aliases[bind] = (alias.name if alias.asname else bind, ())
-                    imported.add(bind)
-            elif isinstance(child, ast.ImportFrom) and not child.level and child.module:
-                for alias in child.names:
-                    attrs = [] if alias.name == "*" else [alias.name]
-                    chains.append({"module": child.module, "attrs": attrs, "where": where})
-                    if attrs:
-                        aliases[alias.asname or alias.name] = (child.module, (alias.name,))
-                        imported.add(alias.asname or alias.name)
-            elif isinstance(child, ast.Call) and dotted(child.func).endswith("import_module"):
-                named = child.args[0] if child.args else None
-                if isinstance(named, ast.Constant) and isinstance(named.value, str):
-                    chains.append({"module": named.value, "attrs": [], "where": where})
+            imported |= self.record(child, aliases)
         for child in own:
             if isinstance(child, ast.Name) and isinstance(child.ctx, ast.Store) and child.id not in imported:
                 aliases.pop(child.id, None)
         for child in own:
-            if not isinstance(child, ast.Attribute):
-                continue
-            path = dotted(child)
-            root, *attrs = path.split(".") if path else [""]
-            if root not in aliases:
-                continue
-            module, prefix = aliases[root]
-            attrs = [*prefix, *attrs]
-            if isinstance(child.ctx, ast.Load):
-                chains.append({"module": module, "attrs": attrs, "where": f"{label}:{child.lineno}"})
-            else:
-                bound.add((".".join([module, *attrs[:-1]]), attrs[-1]))
-                chains.append({"module": module, "attrs": attrs[:-1], "where": f"{label}:{child.lineno}"})
+            if isinstance(child, ast.Attribute):
+                self.attribute(child, aliases)
         for child in nested:
-            scope(child, aliases)
+            self.scope(child, aliases)
 
-    scope(tree, {})
-    return chains, bound
+    def record(self, node: ast.AST, aliases: dict) -> set[str]:
+        """An import, sys.path addition or import_module call; the names an import binds."""
+        names = set()
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                self.chain(alias.name, [], node)
+                bind = alias.asname or alias.name.split(".")[0]
+                aliases[bind] = (alias.name if alias.asname else bind, ())
+                names.add(bind)
+        elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+            for alias in node.names:
+                attrs = [] if alias.name == "*" else [alias.name]
+                self.chain(node.module, attrs, node)
+                if attrs:
+                    aliases[alias.asname or alias.name] = (node.module, (alias.name,))
+                    names.add(alias.asname or alias.name)
+        elif isinstance(node, ast.Call) and node.args:
+            name, argument = dotted(node.func), node.args[-1]
+            if name in ("sys.path.insert", "sys.path.append"):
+                value = directory(argument, self.constants)
+                if value is not None:
+                    self.paths.add(value)
+            elif name.endswith("import_module") and isinstance(node.args[0], ast.Constant):
+                if isinstance(node.args[0].value, str):
+                    self.chain(node.args[0].value, [], node)
+        return names
+
+    def attribute(self, node: ast.Attribute, aliases: dict) -> None:
+        root, *attrs = (dotted(node) or ".").split(".")
+        if root not in aliases:
+            return
+        module, prefix = aliases[root]
+        attrs = [*prefix, *attrs]
+        if isinstance(node.ctx, ast.Load):
+            self.chain(module, attrs, node)
+        else:
+            self.bound.add((".".join([module, *attrs[:-1]]), attrs[-1]))
+            self.chain(module, attrs[:-1], node)
+
+
+def directory(node: ast.AST, constants: dict[str, str]) -> str | None:
+    """A path expression's value relative to the working directory, where it is a literal one."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return os.path.normpath(node.value)
+    if isinstance(node, ast.Name):
+        return constants.get(node.id)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div):
+        left, right = directory(node.left, constants), directory(node.right, constants)
+        return None if left is None or right is None else os.path.normpath(os.path.join(left, right))
+    if isinstance(node, ast.Call):
+        name = dotted(node.func)
+        if name in ("Path.cwd", "pathlib.Path.cwd", "os.getcwd") or (name.endswith("Path") and not node.args):
+            return "."
+        if name in ("Path", "pathlib.Path", "str", "os.fspath", "os.path.join") and node.args:
+            parts = [directory(argument, constants) for argument in node.args]
+            return None if None in parts else os.path.normpath(os.path.join(*parts))
+    return None
 
 
 def dotted(node: ast.AST) -> str:
@@ -639,14 +689,16 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
             sources.append((path, (tree / path).read_text()))
     chains = [{"module": module, "attrs": [], "where": "<shell>"} for module in found["modules"]]
     bound: set = set()
+    paths: set[Path] = set()
     for name, text in sources:
         try:
-            more, assigned = uses(text, name)
+            more, assigned, added = uses(text, name)
         except SyntaxError as error:
             failures.append(f"{name} does not parse: {error}")
             continue
         chains += more
         bound |= assigned
+        paths |= {tree / path for path in added if not os.path.isabs(path) and (tree / path).is_dir()}
     unique = {(chain["module"], tuple(chain["attrs"])): chain for chain in chains}
     chains = [chain for chain in unique.values() if top(chain) not in sys.stdlib_module_names]
     # A script imports its sibling inputs by name, from the directory it runs in.
@@ -656,9 +708,11 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
         if name.endswith(".py"):
             (siblings / name).write_text(text)
     ours = {*LOCAL, *(Path(name).stem for name in texts if name.endswith(".py"))}
+    for folder in paths:
+        ours |= {item.stem for item in folder.iterdir() if item.suffix == ".py" or item.is_dir()}
     local = [chain for chain in chains if top(chain) in ours]
     other = [chain for chain in chains if top(chain) not in ours]
-    path = [str(siblings), str(tree / "src"), str(tree)]
+    path = [str(siblings), *map(str, sorted(paths)), str(tree / "src"), str(tree)]
     environment = {**os.environ, "PYTHONPATH": os.pathsep.join(path)}
     found_local = resolve(args.dew_python, local, bound, environment, tree)
     for chain, (kind, detail) in zip(local, found_local, strict=True):
@@ -688,7 +742,8 @@ def preflight(args: argparse.Namespace, work: Path) -> dict:
         elif kind != "ok":
             failures.append(f"{label(chain)}: {detail}")
     failures += static.closure({chain["module"] for chain in other if top(chain) in static.scope}, bound)
-    receipt.update(static=sorted(static.scope))
+    reasons = {top(chain): why for chain, (kind, why) in zip(other, results, strict=True) if kind == "import"}
+    receipt.update(static={name: reasons[name] for name in sorted(static.scope)})
     receipt.update(checked=len(chains), failures=failures, ok=not failures)
     return receipt
 

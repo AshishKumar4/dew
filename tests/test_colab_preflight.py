@@ -55,8 +55,12 @@ def test_a_script_is_read_with_the_variables_its_command_sets():
     assert "runs $C56_PROFILE, which the command does not set" in unset["failures"]
 
 
-def test_chains_follow_aliases_scopes_and_module_assignments():
+def test_chains_follow_aliases_scopes_module_assignments_and_path_additions():
     source = (
+        "import sys\n"
+        "from pathlib import Path\n"
+        "RECIPES = Path('recipes/decision')\n"
+        "sys.path.insert(0, str(RECIPES))\n"
         "import torch\n"
         "import jax.numpy as jnp\n"
         "def jax_rules():\n"
@@ -67,13 +71,17 @@ def test_chains_follow_aliases_scopes_and_module_assignments():
         "def shim():\n"
         "    import flash_qla.ops.gated_delta_rule.chunk as chunk\n"
         "    chunk.aggregate_card_state = None\n"
+        "def trace():\n"
+        "    sys.path.insert(0, str(Path.cwd() / 'tools'))\n"
+        "    sys.path.append(__file__)\n"
     )
-    chains, bound = preflight.uses(source, "rules.py")
+    chains, bound, paths = preflight.uses(source, "rules.py")
     found = {(chain["module"], tuple(chain["attrs"])) for chain in chains}
     assert ("dew.nn.kernels", ("fla_gdn", "chunk_gated_delta_rule")) in found
     assert ("jax.numpy", ("zeros",)) in found
     assert not any("not_a_module_attribute" in attrs for _, attrs in found)
     assert bound == {("flash_qla.ops.gated_delta_rule.chunk", "aggregate_card_state")}
+    assert paths == {"recipes/decision", "tools"}
 
 
 # FlashQLA 0.1.3's shape: the chunk package binds aggregate_card_state on sm90 only, and a function
