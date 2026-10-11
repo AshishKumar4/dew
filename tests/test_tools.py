@@ -696,7 +696,7 @@ def parameter_movement(tool, case, steps: int = 2):
     before = jax.tree.map(np.asarray, named(state.variables))  # the step consumes the state
     compiled = trainer.compile(state, next(source))
     for _ in range(steps):
-        state, loss, _, finite, _ = compiled(state, next(source))
+        state, loss, _, finite, _, _ = compiled(state, next(source))
     after = named(state.variables)
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))

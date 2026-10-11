@@ -179,7 +179,7 @@ def exercise_updates_and_resume(
                 return value.astype(old.dtype)
             expected_ema = jax.tree.map(average, expected_ema, {"params": expected_params})
         for micro in range(k):
-            state, loss, _, finite, accepted = step(state, batch)
+            state, loss, _, finite, accepted, _ = step(state, batch)
             assert bool(finite) and bool(accepted)
             if window == 0 and micro == 0:
                 checkpoints.save(1, state, None, {"loss": float(loss)})
@@ -285,13 +285,13 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     initial = dataclasses.replace(initial, scale=dataclasses.replace(initial.scale, scale=jnp.array(1.)))
     batch = {"first": jnp.ones((), dtype=bool)}
     step = trainer.compile(initial, batch)
-    prefix, _, _, _, accepted = step(initial, batch)
+    prefix, _, _, _, accepted, _ = step(initial, batch)
     assert bool(accepted)
     # The step consumes the state, so the prefix is read before the rejected step.
     prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     prefix_params = jax.tree.map(np.asarray, prefix.variables)
     # Each finalized contribution fits fp16; their fp32 sum does not.
-    rejected, loss, _, finite, accepted = step(prefix, {"first": jnp.zeros((), dtype=bool)})
+    rejected, loss, _, finite, accepted, _ = step(prefix, {"first": jnp.zeros((), dtype=bool)})
     assert bool(finite) and float(loss) == 0 and not bool(accepted)
     assert int(rejected.step) == 2 and int(rejected.microstep) == 1 and int(rejected.updates) == 0
     assert float(rejected.scale.scale) == .5
