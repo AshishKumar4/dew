@@ -39,6 +39,8 @@ from dew.nn.kernels import bf16_dot_runs
 from dew.telemetry.devices import apply_xla_flags, deterministic_ops_requested, xla_flag
 from dew.training import MeshSpec
 
+pytestmark = pytest.mark.kernel
+
 
 def on_gpu(test):
     """Mark `test` for a cuda device of sm80 or later, cuDNN's bf16 floor."""
