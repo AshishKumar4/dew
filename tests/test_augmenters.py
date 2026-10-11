@@ -86,7 +86,8 @@ def _spec(kind, labels_file, augmentation="flip_jitter"):
     augment = images.image_augmentations(augmentation)
     return ImageRecord(SCALE, SCALE, templates=CAPTION_TEMPLATES if kind == "tfds" else (),
                        classes=LABELS if kind == "tfds" else (),
-                       flip=augment is not None and augment.flip, jitter=augment is not None and augment.jitter)
+                       flip=augment is not None and augment.flip,
+                           jitter=augment is not None and augment.jitter)
 
 
 def _resized(kind, element):

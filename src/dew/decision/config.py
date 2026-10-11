@@ -166,7 +166,8 @@ class DecisionRunConfig(RunConfig):
                        objective=objective.data())
         summary["records"] = dataset.records
         unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
-        unfit["held out"] = sum(counter.rejected.get("unfit", 0) for counter in dataset.validation_counts.values())
+        unfit["held out"] = sum(counter.rejected.get("unfit",
+            0) for counter in dataset.validation_counts.values())
         if any(unfit.values()):
             summary["unfit"] = unfit
 

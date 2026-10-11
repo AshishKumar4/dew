@@ -46,8 +46,10 @@ def pair_records():
 
 def stages(tmp_path):
     return (
-        Stage(name="sft", data=Chat(source=chat_parquet(tmp_path), tokenizer=str(TOKENIZER), seq_len=31, long="chunk"), steps=1),
-        Stage(name="dpo", data=Preferences(source=tuple(json.loads(row) for row in pair_records()), seq_len=4),
+        Stage(name="sft", data=Chat(source=chat_parquet(tmp_path), tokenizer=str(TOKENIZER), seq_len=31,
+            long="chunk"), steps=1),
+        Stage(name="dpo", data=Preferences(source=tuple(json.loads(row) for row in pair_records()),
+            seq_len=4),
             steps=1),
     )
 
@@ -75,7 +77,8 @@ def test_each_stage_continues_the_last(tmp_path):
 def test_a_mislinked_chain_is_refused(tmp_path):
     model, optim, key = TinyHead(vocab_size=8), optax.sgd(0.1), jax.random.key(0)
     chat = Chat(source=chat_parquet(tmp_path), tokenizer=str(TOKENIZER), long="chunk")
-    prompts = Prompts(source=tuple(json.loads(row) for row in ("{}",)), tokenizer=str(TOKENIZER), long="truncate")
+    prompts = Prompts(source=tuple(json.loads(row) for row in ("{}",)), tokenizer=str(TOKENIZER),
+        long="truncate")
 
     with pytest.raises(ValueError, match="at least one stage"):
         Recipe(model, optim, key, (), str(tmp_path))

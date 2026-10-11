@@ -610,7 +610,9 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     (tmp_path / "val.bin").write_bytes(documents.tobytes())
     (tmp_path / "meta.json").write_text(json.dumps(
         {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2), batch=jax.device_count(), read="memory", seed=0, loading=Loading(workers=0), validation_records=4 * (jax.device_count()))
+    data = load(Text(source=str(tmp_path), pack="first-fit", seq_len=8, packing_bins=2),
+        batch=jax.device_count(), read="memory", seed=0, loading=Loading(workers=0),
+            validation_records=4 * (jax.device_count()))
 
     mesh = MeshSpec().build()
     with DevicePrefetchIterator(data.train(DataPartition()), mesh, depth=2) as it:

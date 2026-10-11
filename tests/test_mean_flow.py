@@ -181,7 +181,8 @@ def test_a_meanflow_run_config_builds_a_smooth_time_embedding_unless_it_names_on
     from dew.objectives.diffusion import DiffusionRunConfig
 
     def built(config):
-        return DiffusionRunConfig(model=ModelConfig("simple_dit", config), data=Images(source="tfds://oxford_flowers102", image_size=8),
+        return DiffusionRunConfig(model=ModelConfig("simple_dit", config),
+            data=Images(source="tfds://oxford_flowers102", image_size=8),
                                   preset=presets.MeanFlow(), text=None,
                                   val_metrics=(),
                                   objective=ObjectiveConfig("mean_flow", {"solver": Euler()})).build().model

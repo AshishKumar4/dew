@@ -210,7 +210,8 @@ def main(config: Config) -> Path:
         raise ValueError("the staged Parquet must record its label names")
     info = read_record(read_record(json.loads(metadata[b"huggingface"]), "HF schema")["info"], "info")
     features = read_record(info["features"], "features")
-    labels = tuple(name.strip() for name in strings(read_record(features["label"], "label")["names"], "label names"))
+    labels = tuple(name.strip() for name in strings(read_record(features["label"], "label")["names"],
+        "label names"))
     record = model_config(config)
     model = build(record, dtype="float32" if config.smoke else "bfloat16")
     run = RunConfig(
