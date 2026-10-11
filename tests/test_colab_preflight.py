@@ -406,3 +406,66 @@ def test_a_training_request_lowers_the_refs_clef_step_under_its_own_jax_settings
     found = preflight.lowered(tree, "gpu:A100", sys.executable, ["run.sh:2"], {}, failures)
     assert len(failures) == 1 and "does not lower for sm80" in failures[0]
     assert "not enough values to unpack" in failures[0] and found["kernels"] is None
+
+
+LAB_SCRIPT = 'git checkout -q "$LAB_REF"\npython -m tools.kernel_lab.server --gpu a100 --work /content/lab\n'
+
+
+def test_the_kernel_labs_own_session_needs_no_record_it_exists_to_write(tmp_path, monkeypatch):
+    """A session that runs the kernel lab alone, its server, client and gate, produces the lab's
+    record, so its preflight records the bootstrap; a session that also runs a script of its own or
+    trains is no lab session, and still needs the record."""
+    command = "bash /content/kernel-lab/kernel-lab.sh"
+    texts = {"kernel-lab.sh": LAB_SCRIPT}
+    assert preflight.lab_session(preflight.shell(command, texts), texts, command)
+    bench = {**texts, "c54.py": "from dew.nn.kernels import fla_gdn\n"}
+    benched = command + " && python /content/c54/c54.py"
+    assert not preflight.lab_session(preflight.shell(benched, bench), bench, benched)
+    training = {"kernel-lab.sh": LAB_SCRIPT + "python -m tools.kernel_lab.submit --verify --ref X\n"
+                                              "python -m dew.training.launch recipes/decision/clef.py\n"}
+    assert not preflight.lab_session(preflight.shell(command, training), training, command)
+    tree = kernel_tree(tmp_path / "dew")
+    write(tree, {"tools/__init__.py": "", "tools/kernel_lab/__init__.py": "",
+                 "tools/kernel_lab/server.py": ""})
+    commit = repository(tree, {})
+    monkeypatch.setattr(preflight, "REPO", tree)
+    monkeypatch.setattr(preflight, "VENV_PYTHON", "{}.{}".format(*sys.version_info[:2]))
+    monkeypatch.setattr(preflight, "store_read", lambda key, config=None: (None, "absent"))
+    script = tmp_path / "kernel-lab.sh"
+    script.write_text(LAB_SCRIPT)
+    args = argparse.Namespace(ref=commit, hardware="gpu:A100", command=command, inputs=[str(script)], pin=[],
+                              origin="origin", accept=[], also=[], dew_python=sys.executable)
+    receipt = preflight.preflight(args, tmp_path / "work")
+    assert receipt["ok"], receipt["failures"]
+    assert receipt["kernel_lab"]["bootstrap"] == "this session produces the record"
+    assert receipt["lowered"] == {"skipped": "no training entry"}
+
+
+def test_a_session_that_trains_only_after_the_lab_gate_stops_it_is_gated_at_runtime():
+    """The gate must stop the session where it fails, by `set -e` before it or `|| exit` on its line,
+    and stand before everything that trains, here a staged driver that runs the Clef recipe."""
+    driver = {"train.py": "subprocess.run([python, 'recipes/decision/clef.py'])\n"}
+    verified = "set -eu\npython -m tools.kernel_lab.verify --gpu a100 --ref X\n"
+    gated = {"run.sh": verified + "python -m tools.colab.lab_gate --gpu a100\npython train.py\n", **driver}
+    assert preflight.runtime_gate(gated, "bash run.sh") == "run.sh:3"
+    stopped = {"run.sh": "python -m tools.colab.lab_gate --gpu a100 || exit 1\npython train.py\n", **driver}
+    assert preflight.runtime_gate(stopped, "bash run.sh") == "run.sh:1"
+    for unsafe in ("python -m tools.colab.lab_gate --gpu a100\npython train.py\n",
+                   "python train.py\npython -m tools.colab.lab_gate --gpu a100 || exit 1\n",
+                   "python -m tools.colab.lab_gate --gpu a100 || exit 1\necho done\n"):
+        assert preflight.runtime_gate({"run.sh": unsafe, **driver}, "bash run.sh") is None, unsafe
+
+
+def test_the_lab_gate_reads_what_the_preflight_reads(tmp_path, monkeypatch):
+    """The gate fails a ref whose KERNELS row names Pallas kernels on the GPU and whose digest has no
+    ok record, passes one that has it, and passes a GPU whose row names none."""
+    from tools.colab import lab_gate
+
+    tree = kernel_tree(tmp_path)
+    records: dict = {}
+    monkeypatch.setattr(preflight, "store_read", lambda key, config=None: (records.get(key), "absent"))
+    found, failures = lab_gate.gate(tree, "a100")
+    assert failures and "not verified on a100" in failures[0]
+    records[f"lab/verified/a100/{found['digest']}.json"] = {"ok": True, "ref": "abc", "gpu": "a100"}
+    assert lab_gate.gate(tree, "a100")[1] == []
+    assert lab_gate.gate(tree, "g4") == ({"generation": "sm120", "pallas": []}, [])
