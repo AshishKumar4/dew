@@ -23,9 +23,13 @@ class DecodeClip(grain.RandomMapTransform):
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         from dew.data.sources.av_utils import read_av_random_clip
 
-        frames, audio = read_av_random_clip(element["video_path"], num_frames=self.frames,
-                                            audio_padding=self.audio_padding,
-                                            seed=int(rng.integers(0, 2**32 - 1)), sample_rate=self.sample_rate)
+        frames, audio = read_av_random_clip(
+            element["video_path"],
+            num_frames=self.frames,
+            audio_padding=self.audio_padding,
+            seed=int(rng.integers(0, 2**32 - 1)),
+            sample_rate=self.sample_rate,
+        )
         return {"video": fit_frames(frames, self.size), "caption": element.get("caption", ""), "audio": audio}
 
 
@@ -42,11 +46,14 @@ class FixedClip(grain.MapTransform):
 class Audio(grain.MapTransform):
     model: str = "facebook/wav2vec2-base-960h"
 
-    @functools.cache
-    def _processor(self) -> AutoAudioProcessor:
+    @functools.cached_property
+    def processor(self) -> AutoAudioProcessor:
         return AutoAudioProcessor(tensor_type="np", modelname=self.model)
 
     def map(self, element: Batch) -> Batch:
         audio = np.asarray(element["audio"])
-        features = self._processor()(audio.reshape(-1))
-        return {**element, "audio": {**{key: value[0] for key, value in features.items()}, "full_audio": audio}}
+        features = self.processor(audio.reshape(-1))
+        return {
+            **element,
+            "audio": {**{key: value[0] for key, value in features.items()}, "full_audio": audio},
+        }

@@ -29,32 +29,40 @@ class CorpusCounts:
 
     def metrics(self) -> dict[str, float]:
         total = max(1, self.attempted)
-        return {f"data/attempted/{self.name}": float(self.attempted),
-                f"data/accepted/{self.name}": float(self.accepted),
-                f"data/truncated/{self.name}": self.truncated / total,
-                f"data/chunks_per_record/{self.name}": self.chunks / total,
-                **{f"data/rejected/{self.name}/{reason}": float(count)
-                   for reason, count in self.rejected.items()}}
+        return {
+            f"data/attempted/{self.name}": float(self.attempted),
+            f"data/accepted/{self.name}": float(self.accepted),
+            f"data/truncated/{self.name}": self.truncated / total,
+            f"data/chunks_per_record/{self.name}": self.chunks / total,
+            **{
+                f"data/rejected/{self.name}/{reason}": float(count) for reason, count in self.rejected.items()
+            },
+        }
 
     def state(self) -> Mapping[str, object]:
-        return {"attempted": self.attempted, "accepted": self.accepted,
-                "truncated": self.truncated, "chunks": self.chunks,
-                "rejected": dict(self.rejected)}
+        return {
+            "attempted": self.attempted,
+            "accepted": self.accepted,
+            "truncated": self.truncated,
+            "chunks": self.chunks,
+            "rejected": dict(self.rejected),
+        }
 
     def restore(self, state: Mapping[str, object]) -> None:
         self.attempted = integer(state["attempted"], "attempted")
         self.accepted = integer(state["accepted"], "accepted")
         self.truncated = integer(state["truncated"], "truncated")
         self.chunks = integer(state["chunks"], "chunks")
-        self.rejected = Counter({name: integer(value, name)
-                                 for name, value in record(state["rejected"], "rejected").items()})
+        self.rejected = Counter(
+            {name: integer(value, name) for name, value in record(state["rejected"], "rejected").items()}
+        )
 
 
 @dataclasses.dataclass(frozen=True)
 class SearchBudget:
     consecutive: int = 10_000
-    seconds: float | None = 60.
-    warn_over: float = .01
+    seconds: float | None = 60.0
+    warn_over: float = 0.01
 
     def __post_init__(self) -> None:
         if self.consecutive < 1 or (self.seconds is not None and self.seconds <= 0):
@@ -63,9 +71,11 @@ class SearchBudget:
             raise ValueError("warn_over is a share between zero and one")
 
 
+_DEFAULT_BUDGET = SearchBudget()
+
+
 class _KeepAccepted:
-    def __init__(self, counts: CorpusCounts, budget: SearchBudget,
-                 tokens: Callable[[Batch], int] | None):
+    def __init__(self, counts: CorpusCounts, budget: SearchBudget, tokens: Callable[[Batch], int] | None):
         self.counts, self.budget, self.tokens = counts, budget, tokens
         self.consecutive = 0
         self.started: float | None = None
@@ -82,6 +92,9 @@ class _KeepAccepted:
                 reason = "zero_targets"
         if reason is None:
             self.counts.accepted += 1
+            if not isinstance(element, Rejected):
+                self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
+                self.counts.chunks += int(element.get("_dew_chunks", 0))
             self.consecutive, self.started = 0, None
             return True
         self.counts.rejected[reason] += 1
@@ -89,20 +102,31 @@ class _KeepAccepted:
         now = time.monotonic()
         if self.started is None:
             self.started = now
-        if not self.warned and sum(self.counts.rejected.values()) / self.counts.attempted > self.budget.warn_over:
-            _log.warning("corpus %s rejected more than %.1f%% of attempted records (%s)",
-                         self.counts.name, self.budget.warn_over * 100, reason)
+        if (
+            not self.warned
+            and sum(self.counts.rejected.values()) / self.counts.attempted > self.budget.warn_over
+        ):
+            _log.warning(
+                "corpus %s rejected more than %.1f%% of attempted records (%s)",
+                self.counts.name,
+                self.budget.warn_over * 100,
+                reason,
+            )
             self.warned = True
-        if (self.consecutive >= self.budget.consecutive
-                or self.budget.seconds is not None and now - self.started >= self.budget.seconds):
-            raise ValueError(f"corpus {self.counts.name}: rejection search budget exhausted after "
-                             f"{self.consecutive} consecutive rejections ({reason}); "
-                             "this is not a proof that the corpus is empty")
+        if self.consecutive >= self.budget.consecutive or (
+            self.budget.seconds is not None and now - self.started >= self.budget.seconds
+        ):
+            raise ValueError(
+                f"corpus {self.counts.name}: rejection search budget exhausted after "
+                f"{self.consecutive} consecutive rejections ({reason}); "
+                "this is not a proof that the corpus is empty"
+            )
         return False
 
 
 class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
-    def __init__(self, parent: pygrain.DatasetIterator[Batch | Rejected], predicate: _KeepAccepted):
+    def __init__(self, parent: pygrain.DatasetIterator[Batch | Rejected] | pygrain.DatasetIterator[Batch],
+                 predicate: _KeepAccepted):
         super().__init__(parent)
         self._read, self._predicate = parent, predicate
 
@@ -113,8 +137,13 @@ class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parent": self._read.get_state(), "counts": self._predicate.counts.state(),
-                "consecutive": self._predicate.consecutive, "warned": self._predicate.warned}
+        return {
+            "parent": self._read.get_state(),
+            "corpus": self._predicate.counts.name,
+            "counts": self._predicate.counts.state(),
+            "consecutive": self._predicate.consecutive,
+            "warned": self._predicate.warned,
+        }
 
     def set_state(self, state: Mapping[str, object]) -> None:
         self._read.set_state(record(state["parent"], "accepted parent"))
@@ -130,8 +159,14 @@ class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
 class Accepted(pygrain.IterDataset[Batch]):
     """Grain's filter, with a named search budget and checkpointed counts."""
 
-    def __init__(self, parent: pygrain.IterDataset[Batch | Rejected], name: str, *,
-                 budget: SearchBudget = SearchBudget(), tokens: Callable[[Batch], int] | None = None):
+    def __init__(
+        self,
+        parent: pygrain.IterDataset[Batch | Rejected] | pygrain.IterDataset[Batch],
+        name: str,
+        *,
+        budget: SearchBudget = _DEFAULT_BUDGET,
+        tokens: Callable[[Batch], int] | None = None,
+    ):
         super().__init__(parent)
         self._records, self._name, self._budget, self._tokens = parent, name, budget, tokens
 
@@ -140,14 +175,18 @@ class Accepted(pygrain.IterDataset[Batch]):
         return _AcceptedIterator(iter(self._records.filter(predicate)), predicate)
 
 
-def token_weights(names: Sequence[str], weights: Sequence[float], windows: Sequence[int],
-                  targets: Sequence[int]) -> tuple[float, ...]:
+def token_weights(
+    names: Sequence[str], weights: Sequence[float], windows: Sequence[int], targets: Sequence[int]
+) -> tuple[float, ...]:
     """Window shares for authoritative per-corpus valid-target counts."""
     adjusted = []
     for name, weight, rows, tokens in zip(names, weights, windows, targets, strict=True):
         if tokens <= 0:
-            raise ValueError(f"corpus {name} has zero valid target tokens" if tokens == 0 else
-                             f"corpus {name} has a negative valid-target count")
+            raise ValueError(
+                f"corpus {name} has zero valid target tokens"
+                if tokens == 0
+                else f"corpus {name} has a negative valid-target count"
+            )
         if rows <= 0:
             raise ValueError(f"corpus {name} has no accepted windows")
         adjusted.append(weight * rows / tokens)
@@ -155,30 +194,41 @@ def token_weights(names: Sequence[str], weights: Sequence[float], windows: Seque
 
 
 class _DeficitIterator(pygrain.DatasetIterator[Batch]):
-    def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]], weights: tuple[float, ...],
-                 tokens: Callable[[Batch], int]):
+    def __init__(
+        self,
+        parents: Sequence[pygrain.DatasetIterator[Batch]],
+        weights: tuple[float, ...],
+        tokens: Callable[[Batch], int],
+    ):
         super().__init__(parents)
         self._reads, self._weights, self._tokens = tuple(parents), weights, tokens
         self._delivered = [0] * len(parents)
 
     def __next__(self) -> Batch:
         total = sum(self._delivered)
-        chosen = max(range(len(self._reads)), key=lambda index: self._weights[index] * total - self._delivered[index])
+        chosen = max(
+            range(len(self._reads)), key=lambda index: self._weights[index] * total - self._delivered[index]
+        )
         value = next(self._reads[chosen])
         tokens = self._tokens(value)
         if tokens <= 0:
-            raise RuntimeError("token deficit mix received a window without valid targets; filter it before mixing")
+            raise RuntimeError(
+                "token deficit mix received a window without valid targets; filter it before mixing"
+            )
         self._delivered[chosen] += tokens
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": [parent.get_state() for parent in self._reads],
-                "delivered": list(self._delivered)}
+        return {"parents": [parent.get_state() for parent in self._reads], "delivered": list(self._delivered)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         delivered = integers(state["delivered"], "delivered targets")
         parents = state["parents"]
-        if not isinstance(parents, (list, tuple)) or len(parents) != len(self._reads) or len(delivered) != len(self._reads):
+        if (
+            not isinstance(parents, (list, tuple))
+            or len(parents) != len(self._reads)
+            or len(delivered) != len(self._reads)
+        ):
             raise ValueError("token deficit state has a different corpus count")
         if min(delivered) < 0:
             raise ValueError("token deficit state has negative delivered targets")
@@ -194,17 +244,30 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
 class TokenDeficit(pygrain.IterDataset[Batch]):
     """Pick the corpus furthest below its token share, with index-order ties."""
 
-    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float], *,
-                 tokens: Callable[[Batch], int], names: Sequence[str], budget: SearchBudget = SearchBudget()):
+    def __init__(
+        self,
+        parents: Sequence[pygrain.IterDataset[Batch]],
+        weights: Sequence[float],
+        *,
+        tokens: Callable[[Batch], int],
+        names: Sequence[str],
+        budget: SearchBudget = _DEFAULT_BUDGET,
+    ):
         if not parents or len(parents) != len(weights) or len(names) != len(parents):
             raise ValueError("token deficit mix needs one weight and name per corpus")
         if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
             raise ValueError("token deficit weights must be finite and positive")
-        filtered = tuple(Accepted(parent, name, budget=budget, tokens=tokens)
-                         for parent, name in zip(parents, names, strict=True))
+        filtered = tuple(
+            Accepted(parent, name, budget=budget, tokens=tokens)
+            for parent, name in zip(parents, names, strict=True)
+        )
         super().__init__(filtered)
         total = sum(weights)
-        self._corpora, self._weights, self._tokens = filtered, tuple(weight / total for weight in weights), tokens
+        self._corpora, self._weights, self._tokens = (
+            filtered,
+            tuple(weight / total for weight in weights),
+            tokens,
+        )
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         return _DeficitIterator([iter(parent) for parent in self._corpora], self._weights, self._tokens)
