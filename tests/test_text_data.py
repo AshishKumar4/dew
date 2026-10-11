@@ -229,19 +229,6 @@ def test_the_ids_are_read_at_the_width_meta_json_records(tmp_path):
 # Text
 # ---------------------------------------------------------------------------------
 
-def _windows(tmp_path, **fields):
-    """The fixed-window spec over `tmp_path`, read in this process."""
-    fields = {"val_batches": None,
-              "loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1),
-              **fields}
-    return Text(source=str(tmp_path))
-
-
-def _packed_tokens(tmp_path, **fields):
-    """The packed spec over `tmp_path`, read in this process."""
-    fields = {"val_batches": None, "loading": Loading(workers=0, worker_buffer=1), **fields}
-    return Text(source=str(tmp_path), pack="first-fit")
-
 def test_token_loader_yields_int32_batches_with_one_overlap_token(tmp_path):
     """Window k is tokens [k seq_len, k seq_len + seq_len], so consecutive
     windows share one token: the last of one is the first of the next, the
@@ -1254,7 +1241,7 @@ def _as_records(directory, split, tokens, sizes, field=None):
     """`tokens` as arrayrecord shards, cut into records of `sizes`."""
     from array_record.python.array_record_module import ArrayRecordWriter
 
-    from dew.data.images import pack_dict_of_byte_arrays
+    from dew.data.sources.codec import pack_dict_of_byte_arrays
 
     paths = []
     for shard, piece in enumerate(_chunks(tokens, sizes)):
@@ -1306,7 +1293,7 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
         return [{key: value.tolist() for key, value in row.items()} for row in rows]
 
     windows = {name: validation(name, seq_len=4) for name in fields}
-    packed = {name: validation(name, seq_len=5, pack=True, packing_bins=2) for name in fields}
+    packed = {name: validation(name, seq_len=5, pack="first-fit", packing_bins=2) for name in fields}
     assert [row["text"] for row in windows["bin"]] == [
         CORPUS[start:start + 5].tolist() for start in range(0, len(CORPUS) - 4, 4)]
     lengths = [count for row in packed["bin"]

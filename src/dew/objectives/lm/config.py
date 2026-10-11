@@ -141,7 +141,7 @@ class LMRunConfig(RunConfig):
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
-        loaded = load(tokens, batch=self.trainer.batch_size, read=self.read, provision=self.provision,
+        loaded = load(tokens, batch=self.trainer.batch_size, read=self.data_read, provision=self.provision,
                       seed=self.data_seed, loading=self.loading,
                       validation_records=self.validation_records, objective=objective.data())
         if not loaded.steps_per_epoch:

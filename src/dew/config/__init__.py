@@ -851,7 +851,7 @@ class RunConfig:
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
     data: DataSpec = dataclasses.field(default_factory=lambda: Images(source="tfds://oxford_flowers102"))
-    read: Read = "memory"
+    data_read: Read = "memory"
     provision: bool = False
     data_seed: int = 0
     loading: Loading = dataclasses.field(default_factory=Loading)
@@ -1049,7 +1049,7 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        dataset = load(self.data, batch=self.trainer.batch_size, read=self.read,
+        dataset = load(self.data, batch=self.trainer.batch_size, read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
                        validation_records=self.validation_records, objective=objective.data())
         return Prepared(self, lambda name: self.train(objective, dataset, name=name))

@@ -31,6 +31,7 @@ if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
 from dew.data import DataPartition, Images, Loading, images, load
+from dew.data.sources.codec import unpack_dict_of_byte_arrays
 from dew.data.steps.image import EncodeCaptions, ImageRecord
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -94,7 +95,7 @@ def _resized(kind, element):
     if kind == "tfds":
         image = element["image"]
     else:
-        records = images.unpack_dict_of_byte_arrays(element)
+        records = unpack_dict_of_byte_arrays(element)
         decoded = cv2.imdecode(
             np.frombuffer(records["jpg"], dtype=np.uint8), cv2.IMREAD_UNCHANGED
         )
@@ -347,14 +348,13 @@ def test_the_caption_template_comes_from_the_record_rng(tmp_path):
 @pytest.mark.parametrize("column", ["caption", "text"])
 def test_a_record_caption_is_taken_as_it_is(column):
     """Hub datasets carry their own text, under either of two column names."""
-    assert images.record_caption({column: "a yellow tulip"}) == "a yellow tulip"
+    row = {column: "a yellow tulip", "image": _synthetic_image()}
+    assert ImageRecord(SCALE, SCALE).random_map(row, _record_rng(0))["caption"] == "a yellow tulip"
 
 
-def test_a_record_with_no_caption_column_says_what_it_has():
-    with pytest.raises(
-        KeyError, match=r"one of the columns \['caption', 'text'\], this one has \['image', 'url'\]"
-    ):
-        images.record_caption({"image": None, "url": "x"})
+def test_a_record_with_no_caption_keeps_an_empty_host_caption():
+    row = {"image": _synthetic_image(), "url": "x"}
+    assert ImageRecord(SCALE, SCALE).random_map(row, _record_rng(0))["caption"] == ""
 
 
 def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():
