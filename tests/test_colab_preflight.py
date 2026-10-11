@@ -364,19 +364,28 @@ def test_a_setting_known_to_break_gpu_runs_fails_the_preflight():
 
 
 
-def test_only_a_request_that_trains_has_a_step_to_lower(tmp_path):
-    """c58's command reached the Clef recipe through the profile script it staged; c54's bench runs the
-    port's kernels and trains nothing, so it has no step to lower and fails nothing for it."""
+def test_every_request_that_runs_dews_code_has_a_step_to_lower(tmp_path):
+    """c58's command reached the Clef recipe through the profile script it staged. A kernel bench and
+    the lab's verify run Dew's kernels without training and lower as much: two short verifies once
+    launched on a kernel whose inline assembly did not lower. Only a request running no Dew code,
+    a torch reference, has nothing to lower."""
     texts = {"c58.sh": 'bash -c "$C58_PROFILE"\n',
              "c50_profile.py": "import subprocess\nsubprocess.run(['python', 'recipes/decision/clef.py'])\n"}
     assert preflight.trains(texts, "C58_PROFILE='python c50_profile.py' bash c58.sh") == ["c50_profile.py:2"]
     assert preflight.trains({"run.py": "from dew.training import Trainer\n"}, "python run.py") == ["run.py:1"]
-    bench = {"c54_fla_port.py": "from dew.nn.kernels import fla_gdn\n"}
-    assert preflight.trains(bench, "python c54_fla_port.py") == []
+    bench, _, _, _ = preflight.uses("from dew.nn.kernels import fla_gdn\n", "c54_fla_port.py")
+    assert preflight.trains({"c54_fla_port.py": ""}, "python c54_fla_port.py") == []
+    assert preflight.runs_dew(bench) == ["c54_fla_port.py:1"]
+    verify = [{"module": "tools.kernel_lab.verify", "attrs": [], "where": "<shell>"}]
+    assert preflight.runs_dew(verify) == ["<shell>"]
+    torch, _, _, _ = preflight.uses("import torch\n", "reference.py")
+    assert preflight.runs_dew(torch) == []
     failures: list[str] = []
     assert preflight.lowered(tmp_path, "gpu:A100", sys.executable, [], {}, failures) == {
-        "skipped": "no training entry"}
+        "skipped": "the request runs no Dew code"}
     assert not failures
+    preflight.lowered(tmp_path, "gpu:A100", sys.executable, ["<shell>"], {}, failures)
+    assert len(failures) == 1 and "runs Dew's code (<shell>)" in failures[0]
 
 
 FAKE_STEP = """import json, os, sys
@@ -438,7 +447,8 @@ def test_the_kernel_labs_own_session_needs_no_record_it_exists_to_write(tmp_path
     assert not preflight.lab_session(preflight.shell(command, training), training, command)
     tree = kernel_tree(tmp_path / "dew")
     write(tree, {"tools/__init__.py": "", "tools/kernel_lab/__init__.py": "",
-                 "tools/kernel_lab/server.py": ""})
+                 "tools/kernel_lab/server.py": "",
+                 "tools/clef_step.py": "import json\nprint(json.dumps({'kernels': {'rms_norm': 'xla'}}))\n"})
     commit = repository(tree, {})
     monkeypatch.setattr(preflight, "REPO", tree)
     monkeypatch.setattr(preflight, "VENV_PYTHON", "{}.{}".format(*sys.version_info[:2]))
@@ -451,7 +461,8 @@ def test_the_kernel_labs_own_session_needs_no_record_it_exists_to_write(tmp_path
     receipt = preflight.preflight(args, tmp_path / "work")
     assert receipt["ok"], receipt["failures"]
     assert receipt["kernel_lab"]["bootstrap"] == "this session produces the record"
-    assert receipt["lowered"] == {"skipped": "no training entry"}
+    # The lab's server compiles Dew's kernels on the GPU, so its step lowers here first.
+    assert receipt["lowered"]["generation"] == "sm80" and receipt["lowered"]["kernels"]
 
 
 def test_a_session_that_trains_only_after_the_lab_gate_stops_it_is_gated_at_runtime():
