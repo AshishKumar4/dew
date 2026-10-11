@@ -612,6 +612,12 @@ class GatedDeltaNet(nn.Module):
                 + 2 * self.conv_features * self.conv_kernel * float(real_lengths(lengths).sum())
                 + delta_flops(lengths, self.num_v_heads, self.head_k_dim, self.head_v_dim))
 
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Frozen learned maps/conv, excluding the nonparameter state contractions."""
+        return self.model_flops(lengths) - delta_flops(
+            lengths, self.num_v_heads, self.head_k_dim, self.head_v_dim)
+
     def setup(self):
         if self.num_v_heads % self.num_k_heads:
             raise ValueError(

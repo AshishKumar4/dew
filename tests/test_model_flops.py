@@ -58,7 +58,7 @@ from dew.objectives.rl.preference import DPOObjective
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
-from dew.training.model_flops import FORWARD_FLOPS, TOKENS, prepare_counts, step_counts
+from dew.training.model_flops import FORWARD_FLOPS, TOKENS, TRAINING_FLOPS, prepare_counts, step_counts
 from dew.training.trainer import _Interval
 
 LENGTHS = np.asarray([2, 5], np.int64)
@@ -290,10 +290,11 @@ def test_interval_accumulates_work_with_its_loss_and_resets_only_at_logs():
     for forward, tokens in ((100, 4), (200, 3)):
         interval.count({"rows": np.ones((2, 1))}, StepFlops(10, 20), loss,
                         jnp.asarray(a=True), {FORWARD_FLOPS: jnp.asarray(forward),
+                                             TRAINING_FLOPS: jnp.asarray(3 * forward),
                                              TOKENS: jnp.asarray(tokens)})
-    np.testing.assert_array_equal(np.asarray(interval.book[3:]), [300, 7])
+    np.testing.assert_array_equal(np.asarray(interval.book[3:]), [900, 7])
     interval.saved(2)
-    np.testing.assert_array_equal(np.asarray(interval.book[3:]), [300, 7])
+    np.testing.assert_array_equal(np.asarray(interval.book[3:]), [900, 7])
     interval.logged(3.0)
     np.testing.assert_array_equal(np.asarray(interval.book[3:]), [0, 0])
     assert not interval.model_counted and not interval.tokens_counted
@@ -512,7 +513,7 @@ def test_microbatches_two_sum_real_tokens_before_interval_throughput():
     totals = np.asarray(interval.book[3:])
     assert totals[1] == 8
     metrics = trainer._throughput(2, 2, 2, interval.flops,
-                                  model_flops=float(totals[0]), tokens=float(totals[1]))
+                                  training_flops=float(totals[0]), tokens=float(totals[1]))
     assert metrics["train/tokens"] * 2 == 8
     assert metrics["train/tokens_per_s"] == 4
 

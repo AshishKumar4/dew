@@ -53,6 +53,8 @@ from flax.nnx import bridge
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
+from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
+from dew.nn.protocols import CountedLogits, CountedMatrixUsage
 from dew.objectives.base import Path, Variables, freeze, merge as overlay, select, thaw
 from dew.registry import wrapper_layers
 
@@ -424,6 +426,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     if isinstance(base, AdaptedClass):
         raise ValueError("The model is already adapted")
     factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
+    bindings = {layout.paths[0][:-1]: layout for layout in layouts.values() if len(layout.paths) == 1}
 
     class Adapted(base):
         # Staticmethods, or Flax would wrap the callables as module methods.
@@ -433,6 +436,52 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
         @staticmethod
         def _dew_wrapper() -> AdapterRecord:
             return _record(branch.targets, branch.rslora, branch.dropout, layouts)
+
+        @nn.nowrap
+        def _adapter_forward(self, lengths, *, logits: bool = False) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedMatrixUsage):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared adapter matrix usage")
+            total = 0.0
+            for path, target in branch.targets.items():
+                layout = bindings.get(path)
+                if layout is None or len(layout.shape) != 2:
+                    raise MissingFlopsCount(f"adapter {'/'.join(path)} needs bound two-axis matrix geometry")
+                shape = layout.shape
+                if layout.transpose is not None:
+                    if len(layout.transpose) != 2:
+                        raise MissingFlopsCount(f"adapter {'/'.join(path)} has nonmatrix native axes")
+                    shape = tuple(shape[layout.transpose.index(axis)] for axis in range(2))
+                usage = original.matrix_usage(path, lengths, logits=logits)
+                total += projection_flops(usage, shape[0] + shape[1], target.rank)
+            return total
+
+        @nn.nowrap
+        def model_flops(self, lengths) -> float:
+            """Actual forward work, including factors, distinct from training work."""
+            return counted_flops(unadapted(self), lengths) + self._adapter_forward(lengths)
+
+        @nn.nowrap
+        def logits_flops(self, lengths) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedLogits):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
+            return original.logits_flops(lengths) + self._adapter_forward(lengths, logits=True)
+
+        @nn.nowrap
+        def training_flops(self, lengths) -> float:
+            """Frozen base maps get 4N, factors 6N; state/attention retain 3*forward."""
+            original = unadapted(self)
+            forward = counted_flops(original, lengths)
+            learned = parameter_flops(original, lengths)
+            return 3 * forward - learned + 3 * self._adapter_forward(lengths)
+
+        @nn.nowrap
+        def logits_training_flops(self, lengths) -> float:
+            original = unadapted(self)
+            if not isinstance(original, CountedLogits):
+                raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
+            return 2 * original.logits_flops(lengths) + 3 * self._adapter_forward(lengths, logits=True)
 
         def apply(self, variables, *args, **kwargs):
             with nn.intercept_methods(self._dew_lora_interceptor):

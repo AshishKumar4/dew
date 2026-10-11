@@ -47,7 +47,7 @@ from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import CountedLogits, DecoderTraining, Logits, TokenModel
+from dew.nn.protocols import CountedLogits, CountedTraining, DecoderTraining, Logits, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     OMITTED,
@@ -621,6 +621,8 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         """Host token geometry, with the same padding/packing fields as the loss."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
+        if prepared.conditioning:
+            raise MissingFlopsCount("LMObjective needs its conditioning tower's multi-sequence geometry")
         tokens = np.asarray(prepared.tokens)
         fields = prepared.token_fields
         documents = batch.get("text_segment_ids", fields.get("segment_ids"))
@@ -662,6 +664,20 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
             predicted &= documents[:, :-1] == documents[:, 1:]
         lengths = np.sum(predicted, axis=-1, dtype=np.int64)
         return counted_flops(model, self.real_lengths(batch)) + model.logits_flops(lengths)
+
+    def training_flops(self, model, batch: Batch) -> float:
+        """The adapted trunk and prediction head on actual token geometry."""
+        model = self.model if model is None else model
+        if not isinstance(model, CountedTraining):
+            return super().training_flops(model, batch)
+        if self.mtp_weight:
+            raise MissingFlopsCount("adapted LMObjective needs prediction-depth parameter geometry")
+        valid, documents = self._counted_tokens(batch)
+        predicted = valid[:, :-1] & valid[:, 1:]
+        if documents is not None:
+            predicted &= documents[:, :-1] == documents[:, 1:]
+        targets = np.sum(predicted, axis=-1, dtype=np.int64)
+        return model.training_flops(self.real_lengths(batch)) + model.logits_training_flops(targets)
 
     def __init__(
         self,
