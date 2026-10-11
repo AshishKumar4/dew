@@ -12,7 +12,7 @@ import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Memory, Text
+from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Text, export
 from dew.data.dataset import record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -139,6 +139,8 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     batch = 8
     samples = next(_Batches(5 * batch))
     rows = [{"image": image, "caption": "a flower"} for image in samples["image"]]
+    inputs = tmp_path / "inputs"
+    export(rows, str(inputs), format="array_record")
     config = parse(DiffusionRunConfig, [
         "--text.encoder", STUB_TEXT, "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
@@ -151,7 +153,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     # A validation pass needs a consumer; psnr scores samples against the
     # batch and downloads nothing, unlike the default clip metric.
     config = dataclasses.replace(config, val_metrics=("psnr",), loading=Loading(workers=0),
-                                 data=Images(source=Memory(rows), validation=HoldOut(records=batch),
+                                 data=Images(source=str(inputs), validation=HoldOut(records=batch),
                                              image_size=RES, augment=None))
 
     state = config.run()
@@ -197,6 +199,8 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
     samples = next(_Images())
     rows = [{"image": image, "label": label} for _ in range(5)
             for image, label in zip(samples["image"], samples["label"], strict=True)]
+    inputs = tmp_path / "inputs"
+    export(rows, str(inputs), format="array_record")
     config = parse(
         JepaRunConfig,
         [
@@ -228,7 +232,7 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
     )
 
     config = dataclasses.replace(config, loading=Loading(workers=0),
-                                 data=Images(source=Memory(rows), image_size=size, augment=None))
+                                 data=Images(source=str(inputs), image_size=size, augment=None))
 
     state = config.run()
 
