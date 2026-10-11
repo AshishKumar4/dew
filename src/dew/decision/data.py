@@ -7,13 +7,14 @@ import random
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Annotated
 
 import numpy as np
 
 from dew import records
 from dew.data.dataset import Dataset, DatasetSpec, Tokenize
 from dew.data.pipeline import Configured, HostStep, Pipeline
-from dew.data.recipes import HoldOut, Split, Validation, _branches
+from dew.data.recipes import HoldOut, Split, Validation, _branches, source_argument
 from dew.data.sources.base import Read, ShardManifest, Source
 from dew.data.sources.hf import HFDatasetSource, HFOptions
 from dew.decision.questions import Choice, Question
@@ -382,8 +383,9 @@ class _DecisionSource:
 class Decisions:
     """Decision rows and their corpus shares, with layout supplied by the objective."""
 
-    source: str | Source | Sequence[Example | Mapping[str, object]] | Mapping[str, Sequence[Example | Mapping[str, object]]] = "tickets.csv"
-    validation: Validation | Sequence[Example | Mapping[str, object]] = None
+    source: Annotated[str | Source | Sequence[Example | Mapping[str, object]] | Mapping[
+        str, Sequence[Example | Mapping[str, object]]], source_argument()] = "tickets.csv"
+    validation: Annotated[Validation | Sequence[Example | Mapping[str, object]], source_argument()] = None
     weights: Mapping[str, float] = field(default_factory=dict)
     options: tuple[str, ...] = ()
     text: str = "text"

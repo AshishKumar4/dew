@@ -5,14 +5,16 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import json
 import random
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Annotated, Literal, Protocol, runtime_checkable
 
 import numpy as np
+import tyro
 
 from dew.data.compile import compile
-from dew.data.dataset import Batch, DataPhase, Dataset, Loading
+from dew.data.dataset import Batch, DataPhase, Dataset, Loading, record_argument
 from dew.data.dataset import Records as IndexedRecords
 from dew.data.pipeline import Artifact, Configured, HostStep, Mixture, ObjectiveData, Phases, Pipeline, RandomMap, Rejected, Stage
 from dew.records import integer
@@ -42,6 +44,29 @@ from dew.data.steps.video import Audio, DecodeClip, VideoPath
 type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
 type Validation = HoldOut | Split | Pipeline | SourceValue | None
 _DEFAULT_LOADING = Loading(workers="auto")
+
+
+def source_argument():
+    def read(words):
+        from dew.registry import from_record
+
+        word = words[0]
+        if word == "None":
+            return None
+        if word.startswith(("{", "[")):
+            value = json.loads(word)
+            return from_record(Source, value, dtypes=False) if isinstance(value, Mapping) and "class" in value else value
+        return word
+
+    def write(value):
+        from dew.registry import to_record
+
+        return [value if isinstance(value, str) else "None" if value is None else json.dumps(to_record(value, None))]
+
+    return tyro.constructors.PrimitiveConstructorSpec(nargs=1, metavar="URL|JSON", instance_from_str=read,
+        is_instance=lambda value: value is None or isinstance(value, (str, Source, Mapping, Sequence))
+                                  or dataclasses.is_dataclass(value),
+        str_from_instance=write)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -270,8 +295,8 @@ def _host_stages(defaults: tuple[HostStep, ...], explicit: tuple[HostStep, ...])
 
 @dataclasses.dataclass(frozen=True)
 class Records:
-    source: SourceValue
-    validation: Validation = None
+    source: Annotated[SourceValue, source_argument()]
+    validation: Annotated[Validation, source_argument()] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -282,7 +307,7 @@ class Records:
 
 @dataclasses.dataclass(frozen=True)
 class Text:
-    source: SourceValue | Mapping[str, float] = ""
+    source: Annotated[SourceValue | Mapping[str, float], source_argument()] = ""
     tokenizer: str = "byte"
     seq_len: int = 256
     stride: int | None = None
@@ -290,9 +315,9 @@ class Text:
     eos: bool = False
     pack: Literal["first-fit", "best-fit", "concat"] | None = None
     packing_bins: int = 8
-    validation: Validation = None
+    validation: Annotated[Validation, source_argument()] = None
     split: str = "train"
-    phases: tuple[DataPhase, ...] = ()
+    phases: Annotated[tuple[DataPhase, ...], record_argument(tuple[DataPhase, ...])] = ()
     token_holdout: HoldOut | None = None
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -371,13 +396,13 @@ class Text:
 
 @dataclasses.dataclass(frozen=True)
 class Chat:
-    source: SourceValue
+    source: Annotated[SourceValue, source_argument()]
     tokenizer: str
     seq_len: int = 256
     column: str = "messages"
     long: Literal["truncate", "drop", "chunk"] = "truncate"
     packing_bins: int = 8
-    validation: Validation = None
+    validation: Annotated[Validation, source_argument()] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -398,14 +423,14 @@ class Chat:
 
 @dataclasses.dataclass(frozen=True)
 class Prompts:
-    source: SourceValue
+    source: Annotated[SourceValue, source_argument()]
     tokenizer: str
     max_prompt_len: int = 256
     pad_id: int = 0
     reward_bytes: int | None = None
     long: Literal["drop", "truncate"] = "drop"
     thinking: bool | None = None
-    validation: Validation = None
+    validation: Annotated[Validation, source_argument()] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -462,10 +487,10 @@ class _PromptFacts:
 
 @dataclasses.dataclass(frozen=True)
 class Preferences:
-    source: SourceValue
+    source: Annotated[SourceValue, source_argument()]
     seq_len: int = 256
     pad_id: int = 0
-    validation: Validation = None
+    validation: Annotated[Validation, source_argument()] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -485,7 +510,7 @@ class Augment:
 
 @dataclasses.dataclass(frozen=True)
 class Images:
-    source: SourceValue
+    source: Annotated[SourceValue, source_argument()]
     image_size: int = 128
     staging_size: int | None = None
     field: str = "image"
@@ -495,7 +520,7 @@ class Images:
     classes: tuple[str, ...] = ()
     labels: str | None = None
     augment: Augment | None = dataclasses.field(default_factory=Augment)
-    validation: Validation = None
+    validation: Annotated[Validation, source_argument()] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -530,14 +555,14 @@ class Images:
 
 @dataclasses.dataclass(frozen=True)
 class Video:
-    source: SourceValue
+    source: Annotated[SourceValue, source_argument()]
     frames: int = 16
     frame_size: int = 256
     audio_padding: int = 3
     audio_model: str = "facebook/wav2vec2-base-960h"
     caption: str = ""
     extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm")
-    validation: Validation = None
+    validation: Annotated[Validation, source_argument()] = None
     split: str = "train"
 
     @property
