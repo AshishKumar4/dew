@@ -2,6 +2,7 @@
 
 import itertools
 import json
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -364,13 +365,16 @@ def test_a_held_out_row_fewer_than_a_batch_counts_once_in_the_loss_and_the_metri
     assert result.scores["val/accuracy"] == float(right)
 
 
-def test_a_saved_vision_run_answers_image_rows(tmp_path):
+@pytest.mark.parametrize("separate_tokenizer", [False, True], ids=["shared-source", "separate-tokenizer"])
+def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     """A shared decision record restores the backbone's image processor.
 
     A local multimodal source under Dew's own head trains and checkpoints
     without a released decision format. Its reloaded task answers an image
     row with the live task's probabilities, and those differ from the text
     row's, so the saved processor and vision tower both reach the answer.
+    The task's tokenizer may live in a different, tokenizer-only directory;
+    that directory is not the identity of its image processor.
     """
     from PIL import Image
 
@@ -380,26 +384,73 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path):
 
     directory = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
     source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
-    tokenizer = HFTokenizer(str(directory), local_files_only=True)
+    tokenizer_directory = directory
+    if separate_tokenizer:
+        tokenizer_directory = tmp_path / "tokenizer"
+        tokenizer_directory.mkdir()
+        for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+            shutil.copyfile(directory / name, tokenizer_directory / name)
+    tokenizer = HFTokenizer(str(tokenizer_directory), local_files_only=True)
     layout = JointLayout(max_len=1024)
     base = DecisionObjective(source, tokenizer=tokenizer, layout=layout)
     task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
                   processor=source.processor)
     objective = DecisionObjective(task)
     data = objective.dataset(EXAMPLES, batch=8)
-    checkpoints = Checkpoints(str(tmp_path), keep=1)
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
     state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
         data, steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
-    live, reloaded = objective.pipeline(state), Decide.from_run(str(tmp_path))
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
     images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
     asked = {"team": INTENT}
     first = live("charged twice!", asked, images=images)["team"].probabilities
     second = reloaded("charged twice!", asked, images=images)["team"].probabilities
 
     assert reloaded.processor is not None
+    assert reloaded.processor.source == str(directory)
+    assert objective.inference_record()["processor"] == str(directory)
     np.testing.assert_array_equal(second, first)
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
+
+
+def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_path):
+    """A text task records its own byte vocabulary, not its source's tokenizer.
+
+    The pretrained decoder brings a tokenizer-backed processor, but the
+    decision task lays out text with ByteTokenizer. Saving that task keeps
+    no media processor to reload, and never treats `byte` as a Hub repo.
+    """
+    from dew.interop import Pretrained
+
+    fixtures = Path(__file__).parent / "fixtures" / "hf"
+    directory = tmp_path / "source"
+    directory.mkdir()
+    for name in ("config.json", "model.safetensors"):
+        shutil.copyfile(fixtures / "qwen3-tiny" / name, directory / name)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, directory / name)
+    source = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=128)
+    base = DecisionObjective(source, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
+    task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
+                  processor=source.processor)
+    objective = DecisionObjective(task)
+    data = objective.dataset(EXAMPLES, batch=8)
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        data, steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+
+    assert source.processor is not None and source.processor.source is None
+    assert objective.inference_record()["processor"] is None
+    assert isinstance(reloaded.tokenizer, ByteTokenizer)
+    assert reloaded.processor is None
+    asked = {"team": INTENT}
+    np.testing.assert_array_equal(reloaded("charged twice!", asked)["team"].probabilities,
+                                  live("charged twice!", asked)["team"].probabilities)
 
 
 def test_calibration_counts_33_validation_rows_once_at_batch_32():
