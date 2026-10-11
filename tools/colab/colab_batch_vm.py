@@ -306,7 +306,9 @@ class Batch:
 
         env = {**environment(venv), **compilation_cache(job, tree, venv), **private_environment(job)}
         # One venv per commit, but every job imports its own checked-out tree.
-        env["PYTHONPATH"] = str(tree / "src") + os.pathsep + str(self.root)
+        env["PYTHONPATH"] = str(tree / "src")
+        if job.get("boundary_control"):
+            env["PYTHONPATH"] += os.pathsep + str(self.root)
         began = time.time()
         status.update(command_started_at=began)
         self.save_job(job, status)
