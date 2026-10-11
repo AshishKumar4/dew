@@ -47,6 +47,47 @@ class SingleReader(Protocol):
     single_reader: bool
 
 
+@dataclasses.dataclass(frozen=True)
+class TokenField:
+    name: str
+    extra: int = 0
+    side: Literal["left", "right"] = "right"
+    pad: int | bool = 0
+
+
+@runtime_checkable
+class TokenGeometry(Protocol):
+    @property
+    def max_length(self) -> int: ...
+    @property
+    def token_fields(self) -> tuple[TokenField, ...]: ...
+    @property
+    def length_field(self) -> str: ...
+
+
+@dataclasses.dataclass(frozen=True)
+class Geometry:
+    max_length: int
+    token_fields: tuple[TokenField, ...]
+    length_field: str
+
+
+@dataclasses.dataclass(frozen=True)
+class TokenBudget:
+    tokens: int
+    lengths: tuple[int, ...] = ()
+    window: int = 8
+    geometry: Geometry | None = None
+    drop_remainder: bool = True
+
+    def __post_init__(self) -> None:
+        if self.tokens <= 0 or self.window <= 0:
+            raise ValueError("token budget and grouping window must be positive")
+        if self.lengths and (len(self.lengths) > 6 or tuple(sorted(set(self.lengths))) != self.lengths
+                             or any(length <= 0 or self.tokens % length for length in self.lengths)):
+            raise ValueError("token budget lengths need at most six increasing positive divisors of the budget")
+
+
 @runtime_checkable
 class Expansion(Protocol):
     def flat_map(self, element: Batch, /) -> Sequence[Batch | Rejected]: ...
@@ -218,6 +259,7 @@ type Stage = (
     | Windows
     | Configured
     | TokenSplit
+    | TokenBudget
 )
 
 
@@ -314,12 +356,20 @@ class Pipeline:
 
     def batch(
         self,
-        size: int,
+        size: int | None = None,
         *,
+        tokens: int | None = None,
+        lengths: tuple[int, ...] = (),
         drop_remainder: bool = True,
         batch_fn: Callable[[Sequence[Batch]], Batch] | None = None,
     ) -> Pipeline:
-        if size < 1:
+        if (size is None) == (tokens is None):
+            raise ValueError("batch needs exactly one of row size or tokens")
+        if tokens is not None:
+            if batch_fn is not None:
+                raise ValueError("token batching owns its variable-size stack; batch_fn needs row batching")
+            return self.then(TokenBudget(tokens, lengths, drop_remainder=drop_remainder))
+        if size is None or size < 1:
             raise ValueError("batch size must be positive")
         return self.then(BatchStage(size, drop_remainder, batch_fn))
 

@@ -100,6 +100,8 @@ class DataPartition:
     """
     reader: int = 0
     """This process's place among the share's readers, in process order (0 for the first)."""
+    row_multiple: int = 1
+    """Number of distinct row shards this reader feeds within its host."""
 
     def __post_init__(self):
         if not 0 <= self.index < self.count or not 0 <= self.reader < self.readers:
@@ -139,7 +141,10 @@ class DataPartition:
             raise ValueError(
                 f"batch {batch} does not split into {self.count} equal shares, "
                 f"one for each group of processes that reads its own rows")
-        return batch // self.count
+        rows = batch // self.count
+        if rows % self.row_multiple:
+            raise ValueError(f"batch {batch} must divide across {self.count * self.row_multiple} row shards")
+        return rows
 
 
 @functools.cache
@@ -160,7 +165,7 @@ def _partition(mesh: Mesh) -> DataPartition:
     mine = frozenset(held[jax.process_index()])
     readers = sorted(process for process, rows in held.items() if frozenset(rows) == mine)
     return DataPartition(index=groups.index(mine), count=len(groups), readers=len(readers),
-                         reader=readers.index(jax.process_index()))
+                         reader=readers.index(jax.process_index()), row_multiple=len(mine))
 
 
 type Reader = Callable[[DataPartition], Iterator[Batch]]
@@ -513,6 +518,10 @@ class Loading:
 _DEFAULT_LOADING = Loading()
 
 
+def _data_statistics() -> Mapping[str, float]:
+    return {}
+
+
 @dataclasses.dataclass(frozen=True)
 class Stage:
     """One stage of a batch ramp: the global batch a step reads in it, and the record it starts at."""
@@ -640,6 +649,8 @@ class Dataset:
     counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     validation_counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     plan: Plan | None = None
+    statistics: Callable[[], Mapping[str, float]] = dataclasses.field(default=_data_statistics, repr=False)
+    batch_tokens: int | None = None
 
 
     @property

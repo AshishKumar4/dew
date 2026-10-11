@@ -14,7 +14,7 @@ from flax import linen as nn
 
 from dew.artifacts import Decisions
 from dew.data.dataset import LengthGroups
-from dew.data.pipeline import Configured, ObjectiveData, Rejected
+from dew.data.pipeline import Configured, ObjectiveData, Rejected, TokenField
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
 from dew.decision.data import Example
@@ -252,7 +252,9 @@ class Fit(pygrain.MapTransform):
             for row in laid
         )
         return ({"decision": fitted[0], "_dew_length": fitted[0].length,
-                 "_dew_truncated": fitted[0].truncated}
+                 "_dew_truncated": fitted[0].truncated,
+                 "_dew_bounds": {"slots": {"questions": len(asked),
+                                             "options": max(len(question.options) for question in asked.values())}}}
                 if self.layout.joint else {"decision_rows": fitted})
 
 
@@ -260,6 +262,8 @@ class Fit(pygrain.MapTransform):
 class QuestionRows:
     def flat_map(self, element: Batch) -> Sequence[Batch]:
         return tuple({"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
+                     | {"_dew_bounds": {"slots": {"questions": 1,
+                         "options": max(len(row.example.questions[name].options) for name in row.names)}}}
                      for row in element["decision_rows"])
 
 
@@ -276,7 +280,21 @@ class LayoutRows(pygrain.RandomMapTransform):
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, rng)
+        encoded = self.encoding(fitted.example, fitted.names, rng)
+        return {**encoded, self.length_field: np.int32(np.sum(encoded["valid"]))}
+
+    @property
+    def max_length(self) -> int:
+        return self.encoding.layout.max_len
+
+    @property
+    def token_fields(self) -> tuple[TokenField, ...]:
+        return tuple(TokenField(name, pad=self.encoding.specials.pad if name == "tokens" else 0)
+                     for name in _ALONG_THE_ROW)
+
+    @property
+    def length_field(self) -> str:
+        return "_dew_length"
 
 
 @dataclass(frozen=True)
@@ -285,7 +303,8 @@ class EvaluateRows(pygrain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, None)
+        encoded = self.encoding(fitted.example, fitted.names, None)
+        return {**encoded, "_dew_length": np.int32(np.sum(encoded["valid"]))}
 
 
 @dataclass(frozen=True)
@@ -413,8 +432,7 @@ class DecisionObjective(Objective[Ratio]):
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
         self.bucket = bucket
-        # A cut batch is as long as its longest row, so only an uncut stream declares its length.
-        self.inputs = None if bucket else InputSpec(sample=Field("tokens", (self.layout.max_len,)))
+        self.inputs = InputSpec(sample=Field("tokens", (self.layout.max_len,), variable_axes=(0,)))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The backbone, then the head, both trained."""
@@ -479,7 +497,10 @@ class DecisionObjective(Objective[Ratio]):
         charge = self.loss_rule.charge(logits, target, options, inputs.kinds == _SCORE)
         correct = (jnp.argmax(logits, axis=-1) == batch["labels"]).astype(jnp.float32)
         accuracy, _ = self.accuracy(correct, batch, scored).mean()
-        loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
+        from dew.data.batching import TOKEN_COUNTS
+
+        weight = self.row_mean(batch[TOKEN_COUNTS], batch).total if TOKEN_COUNTS in batch else self.row_mean(scored, batch).total
+        loss = Ratio(self.row_mean(charge * scored, batch).total, weight)
         return loss, Aux(metrics={"accuracy": accuracy})
 
     def evaluate(self, params: Variables, batch: Batch, step: Step) -> Decisions:

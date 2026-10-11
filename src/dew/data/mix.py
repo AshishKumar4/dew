@@ -273,3 +273,30 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         return _DeficitIterator([iter(parent) for parent in self._corpora], self._weights, self._tokens)
+
+
+def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:
+    """Read per-corpus counters through Grain's nested iterator checkpoints."""
+    counted: dict[str, CorpusCounts] = {}
+
+    def visit(branch):
+        if isinstance(branch, Mapping):
+            corpus, stored = branch.get("corpus"), branch.get("counts")
+            if isinstance(corpus, str) and isinstance(stored, Mapping):
+                parsed = CorpusCounts(corpus)
+                parsed.restore(stored)
+                combined = counted.setdefault(corpus, CorpusCounts(corpus))
+                combined.accepted = max(combined.accepted, parsed.accepted)
+                combined.truncated = max(combined.truncated, parsed.truncated)
+                combined.chunks = max(combined.chunks, parsed.chunks)
+                combined.rejected.update(parsed.rejected)
+            for child in branch.values():
+                visit(child)
+        elif isinstance(branch, (tuple, list)):
+            for child in branch:
+                visit(child)
+
+    visit(state)
+    for counts in counted.values():
+        counts.attempted = counts.accepted + sum(counts.rejected.values())
+    return counted
