@@ -128,6 +128,25 @@ CUDNN_ATTENTION_CROSS = attention_module(
     '__cudnn$fmhaSoftmax', '[3,128,8,64]{3,2,1,0}', '[3,64,8,64]{3,2,1,0}',
     'bf16[3,8,128,64]{3,1,2,0}, f32[3,8,128]{2,1,0}, u8[0]{0}')
 
+# FlashAttention-2's calls with the operands and results dew_flash_attn's
+# `_forward` and `_backward` give them (kernels/flash_attn/dew_flash_attn):
+# grouped keys, and the backward's output gradient ahead of its query.
+FLASH_FORWARD = attention_module(
+    'dew_flash_mha_fwd', '[3,128,8,64]{3,2,1,0}', '[3,128,2,64]{3,2,1,0}',
+    'bf16[3,128,8,64]{3,2,1,0}, f32[3,8,128]{2,1,0}, f32[2,3,128,8,64]{4,3,2,1,0}, f32[2,3,8,128]{3,2,1,0}')
+FLASH_BACKWARD = hlo_module(
+    '%gradient = bf16[3,128,8,64]{3,2,1,0} parameter(0)',
+    '%query = bf16[3,128,8,64]{3,2,1,0} parameter(1)',
+    '%key = bf16[3,128,2,64]{3,2,1,0} parameter(2)',
+    '%value = bf16[3,128,2,64]{3,2,1,0} parameter(3)',
+    '%output = bf16[3,128,8,64]{3,2,1,0} parameter(4)',
+    '%lse = f32[3,8,128]{2,1,0} parameter(5)',
+    'ROOT %attention = (bf16[3,128,8,64]{3,2,1,0}, bf16[3,128,8,64]{3,2,1,0}, bf16[3,128,8,64]{3,2,1,0}, '
+    'f32[3,8,128]{2,1,0}, f32[3,128,8,64]{3,2,1,0}) '
+    'custom-call(%gradient, %query, %key, %value, %output, %lse), custom_call_target="dew_flash_mha_bwd", '
+    'api_version=API_VERSION_TYPED_FFI',
+)
+
 # A loop XLA states no trip count for: the body holds a matmul, so counting it
 # once would be a number that belongs to no run.
 UNBOUNDED_LOOP = """HloModule unbounded
@@ -457,6 +476,9 @@ def test_gpu_matmul_custom_calls_are_counted_from_their_shapes():
     # Cross attention counts its own key length.
     assert hlo_flops(CUDNN_ATTENTION_CROSS) == pytest.approx(
         4 * batch * heads * seq * (seq // 2) * head_dim)
+    # FlashAttention-2's calls are the same work, its backward's query second.
+    assert hlo_flops(FLASH_FORWARD) == pytest.approx(4 * scores)
+    assert hlo_flops(FLASH_BACKWARD) == pytest.approx(8 * scores)
 
 
 def test_fit_reports_throughput_to_the_tracker():

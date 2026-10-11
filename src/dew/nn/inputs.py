@@ -253,6 +253,14 @@ class AttentionMetadata:
     (`Admitted`). `position_bias` is added to every attention logit,
     `[B or 1, heads, S, keys]`: T5's relative position table, which its
     encoder computes once for its layers.
+
+    `right_padded` says each row's `valid` slots are its first, its padding
+    after them, as a training batch pads its rows. A real token then reads no
+    padding through a causal layer, so those layers skip what would keep it
+    out: causal attention takes no key mask and stays on its fused kernel, and
+    a conv reads the row as it stands (`dew.nn.linear.held_conv1d`). A padding
+    slot's output is then unspecified. A mask with padding before or between
+    real slots must not set it.
     """
 
     valid: jax.Array | None = None
@@ -265,6 +273,7 @@ class AttentionMetadata:
     media: jax.Array | None = None
     admitted: Admitted | None = None
     position_bias: jax.Array | None = None
+    right_padded: bool = struct.field(pytree_node=False, default=False)
 
 
 @struct.dataclass

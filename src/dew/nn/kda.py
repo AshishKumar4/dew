@@ -172,7 +172,8 @@ class KimiDeltaAttention(nn.Module):
         # allocation-only call returns before any state is written.
         out = held_scan(self, projected.astype(wide), taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, valid=valid,
-                        state='recurrent_state')
+                        state='recurrent_state',
+                        right_padded=attention_metadata is not None and attention_metadata.right_padded)
         if out is None:
             return self.o_proj(jnp.zeros((B, S, self.qkv_features), self.dtype))
         gate = self.g_proj(x) if self.full_rank_gate else self.g_b_proj(self.g_a_proj(x))

@@ -198,27 +198,37 @@ def _cudnn_convolution_flops(target: str, instruction: _Instruction,
     return _MAC * macs / (int(groups.group(1)) if groups else 1)
 
 
-def _fused_attention_flops(target: str, instruction: _Instruction,
-                           shapes: dict[str, tuple[int, ...]]) -> float:
-    """A cuDNN fused-attention call, from the query and key it is given.
+_FLASH = {'dew_flash_mha_fwd': (0, False), 'dew_flash_mha_bwd': (1, True)}
+"""FlashAttention-2's calls (dew_flash_attn): where the query sits among
+each one's operands (the backward's first is the output's gradient), and
+whether it is the backward."""
+
+
+def _fused_attention_flops(instruction: _Instruction, shapes: dict[str, tuple[int, ...]], *,
+                           query: int, backward: bool) -> float:
+    """A fused-attention call (cuDNN's or FlashAttention-2's), from the query
+    and key it is given, the operands at `query` and the one after it.
 
     The kernel keeps the scores off memory, so nothing in the module states
     its arithmetic; the operands do. They are `[batch, sequence, heads, width]`
     (checked against the calls XLA emits for `jax.nn.dot_product_attention`,
     including grouped-query and cross attention, where the key carries its own
-    head count and sequence). Both products of the forward pass, `Q K^T` and
-    `P V`, cost one multiply-add per query, key, head and width; the backward
-    pass runs four such products, for dV, dP, dQ and dK.
+    head count and sequence, and against dew_flash_attn's). Both products of
+    the forward pass, `Q K^T` and `P V`, cost one multiply-add per query, key,
+    head and width; the backward pass runs four such products, for dV, dP, dQ
+    and dK. That is the whole square: under a causal mask the kernels skip
+    about half of it, so the count keeps MFU's convention and train/hfu reads
+    up to twice their hardware's work there.
     """
-    if len(instruction.operands) < 2:
+    if len(instruction.operands) < query + 2:
         return 0.0
-    query = shapes.get(instruction.operands[0])
-    key = shapes.get(instruction.operands[1])
-    if query is None or key is None or len(query) != 4 or len(key) != 4:
+    queries = shapes.get(instruction.operands[query])
+    key = shapes.get(instruction.operands[query + 1])
+    if queries is None or key is None or len(queries) != 4 or len(key) != 4:
         return 0.0
-    batch, queries, heads, width = query
-    products = 4 if target.endswith('Backward') else 2
-    return products * _MAC * batch * heads * queries * key[1] * width
+    batch, length, heads, width = queries
+    products = 4 if backward else 2
+    return products * _MAC * batch * heads * length * key[1] * width
 
 
 def _instruction_flops(instruction: _Instruction,
@@ -251,7 +261,10 @@ def _instruction_flops(instruction: _Instruction,
     if target.startswith('__cudnn$conv'):
         return _cudnn_convolution_flops(target, instruction, shapes)
     if target.startswith('__cudnn$fmha'):
-        return _fused_attention_flops(target, instruction, shapes)
+        return _fused_attention_flops(instruction, shapes, query=0, backward=target.endswith('Backward'))
+    if target in _FLASH:
+        query, backward = _FLASH[target]
+        return _fused_attention_flops(instruction, shapes, query=query, backward=backward)
     return 0.0
 
 

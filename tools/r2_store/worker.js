@@ -3,12 +3,14 @@
 // /<key> in the bucket bound as CACHE, and GET /?list=<prefix> for the keys
 // under a prefix (the whole bucket for an empty one), a page at a time, with
 // `&detail=1` each one's size and ETag beside them, for a bearer of the
-// store's CACHE_TOKEN secret, who may also DELETE /<key>. A bearer of its
-// READ_TOKEN secret, where one is set, reads the same way and is refused a PUT or a DELETE with a 403.
-// A miss is a 404. A GET with a Range header answers 206 with that
-// slice and its Content-Range. A PUT honours If-None-Match and If-Match
-// (`If-None-Match: *` writes a key only if it is absent) and answers 412
-// where the condition fails; every answer about an object carries its ETag.
+// store's CACHE_TOKEN secret, who may also DELETE /<key>. A GET or HEAD
+// honours If-Match (412 where the object's ETag differs) and If-None-Match
+// (304). A bearer of its READ_TOKEN secret, where one is set, reads the same
+// way and is refused a PUT or a DELETE with a 403. A miss is a 404. A GET
+// with a Range header answers 206 with that slice and its Content-Range. A PUT
+// honours If-None-Match and If-Match (`If-None-Match: *` writes a key only if
+// it is absent) and answers 412 where the condition fails; every answer about
+// an object carries its ETag.
 // How long an object lives is its bucket's lifecycle, which provision.sh sets.
 // The largest request body Cloudflare's edge hands a Worker on this account's
 // plan (100 MB); a larger PUT would fail there before the Worker answers.
@@ -20,6 +22,28 @@ async function authorized(request, token) {
   const given = new TextEncoder().encode(request.headers.get('authorization') ?? '');
   const wanted = new TextEncoder().encode(`Bearer ${token}`);
   return given.byteLength === wanted.byteLength && crypto.subtle.timingSafeEqual(given, wanted);
+}
+
+/** The ETags a precondition header lists, unquoted, weak marks dropped; `*` for any. */
+function tags(header) {
+  return header.split(',').map((tag) => tag.trim().replace(/^W\//, '').replace(/^"|"$/g, '')).filter(Boolean);
+}
+
+/** Whether an If-Match is given that `object`'s ETag does not meet. */
+function failsMatch(request, object) {
+  const match = request.headers.get('if-match');
+  return match !== null && !tags(match).some((tag) => tag === '*' || tag === object.etag);
+}
+
+/** Whether an If-None-Match is given that `object`'s ETag meets. */
+function matchesNone(request, object) {
+  const none = request.headers.get('if-none-match');
+  return none !== null && tags(none).some((tag) => tag === '*' || tag === object.etag);
+}
+
+/** The answer to an unmet precondition, with the object's ETag: 412 for If-Match, else 304. */
+function unmet(request, object) {
+  return new Response(null, { status: failsMatch(request, object) ? 412 : 304, headers: { etag: object.httpEtag } });
 }
 
 export default {
@@ -47,11 +71,15 @@ export default {
     }
     const key = decodeURIComponent(url.pathname.slice(1));
     if (key.length > 512 || !KEY.test(key) || key.split('/').includes('..')) return new Response(null, { status: 400 });
+    const conditional = request.headers.has('if-match') || request.headers.has('if-none-match');
     if (request.method === 'GET') {
       const ranged = request.headers.has('range');
       let object;
       try {
-        object = await env.CACHE.get(key, ranged ? { range: request.headers } : {});
+        // R2 checks If-Match and If-None-Match against the object it reads, so a reader that pins an
+        // ETag gets 412 for a changed object rather than bytes of another one, with no separate HEAD.
+        object = await env.CACHE.get(key, { ...(ranged ? { range: request.headers } : {}),
+          ...(conditional ? { onlyIf: request.headers } : {}) });
       } catch (error) {
         // R2 throws on a range the object cannot satisfy, one starting past its
         // end; any other failure is the request's 500.
@@ -61,6 +89,9 @@ export default {
         return new Response(null, { status: 416, headers: { 'content-range': `bytes */${head.size}` } });
       }
       if (object === null) return new Response(null, { status: 404 });
+      // A failed precondition gives the object's metadata without its body. R2 applies If-Match to a
+      // ranged read but not If-None-Match, which is checked here against the object it read.
+      if (!('body' in object) || matchesNone(request, object)) return unmet(request, object);
       if (!ranged || object.range === undefined) {
         return new Response(object.body, { headers: { 'content-length': String(object.size), etag: object.httpEtag } });
       }
@@ -72,8 +103,9 @@ export default {
     }
     if (request.method === 'HEAD') {
       const object = await env.CACHE.head(key);
-      return new Response(null, object === null ? { status: 404 }
-        : { status: 200, headers: { 'content-length': String(object.size), etag: object.httpEtag } });
+      if (object === null) return new Response(null, { status: 404 });
+      if (conditional && (failsMatch(request, object) || matchesNone(request, object))) return unmet(request, object);
+      return new Response(null, { status: 200, headers: { 'content-length': String(object.size), etag: object.httpEtag } });
     }
     if (request.method === 'DELETE') {
       if (!writes) return new Response(null, { status: 403 });
