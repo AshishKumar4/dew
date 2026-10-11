@@ -14,13 +14,16 @@ import subprocess
 import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import numpy as np
 
 from dew.records import JSON, json_value, record
 
 _log = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
@@ -72,7 +75,9 @@ class StepIdentity:
             else None
         )
         config = re.sub(r" at 0x[0-9a-fA-F]+", "", config)
-        dependencies = _dependencies(step)
+        dependencies = (step.dependencies() if isinstance(step, _Dependencies)
+                        else _dependencies(step) if dataclasses.is_dataclass(step) and not isinstance(step, type)
+                        else {})
         if dependencies and dataclasses.is_dataclass(step) and not isinstance(step, type):
             config = json.dumps({field.name: dependencies[field.name] if field.name in dependencies
                                   else repr(getattr(step, field.name)) for field in dataclasses.fields(step)
@@ -90,15 +95,17 @@ class _Dependencies(Protocol):
     def dependencies(self) -> Mapping[str, object]: ...
 
 
-def _dependencies(step: object) -> Mapping[str, object]:
-    if step is None or isinstance(step, (str, int, float, bool, bytes, np.ndarray)):
-        return {}
-    if isinstance(step, _Dependencies):
-        return step.dependencies()
-    if dataclasses.is_dataclass(step) and not isinstance(step, type):
-        return {field.name: dependencies for field in dataclasses.fields(step)
-                if (dependencies := _dependencies(getattr(step, field.name)))}
-    return {}
+def _dependencies(step: DataclassInstance) -> Mapping[str, object]:
+    dependencies: dict[str, Mapping[str, object]] = {}
+    for field in dataclasses.fields(step):
+        value = getattr(step, field.name)
+        if isinstance(value, _Dependencies):
+            dependencies[field.name] = value.dependencies()
+        elif dataclasses.is_dataclass(value) and not isinstance(value, type):
+            nested = _dependencies(value)
+            if nested:
+                dependencies[field.name] = nested
+    return dependencies
 
 
 @dataclasses.dataclass(frozen=True)

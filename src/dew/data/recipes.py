@@ -42,11 +42,11 @@ from dew.data.steps.text import Chunks, LengthPolicy, Tokenize, ValidTargets
 from dew.data.steps.video import Audio, DecodeClip, VideoPath
 
 type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
-type Validation = HoldOut | Split | Pipeline | SourceValue | None
+type Validation = HoldOut | Split | Pipeline | Source | str | Sequence[Batch] | Mapping[str, Sequence] | None
 _DEFAULT_LOADING = Loading(workers="auto")
 
 
-def source_argument():
+def source_argument[Value](annotation: type[Value]):
     def read(words):
         from dew.registry import from_record
 
@@ -55,7 +55,7 @@ def source_argument():
             return None
         if word.startswith(("{", "[")):
             value = json.loads(word)
-            return from_record(Source, value, dtypes=False) if isinstance(value, Mapping) and "class" in value else value
+            return from_record(annotation, value, dtypes=False) if isinstance(value, Mapping) and "class" in value else value
         return word
 
     def write(value):
@@ -228,14 +228,15 @@ class _RandomSource:
         raise ValueError("random-index HoldOut needs indexed records; use by='hash' for streams")
 
 
-def _source(value: SourceValue, *, split: str = "train", format: Format | None = None) -> Source:
+def _source(value: SourceValue | Mapping[str, float], *, split: str = "train",
+            format: Format | None = None) -> Source:
     from dew.data.sources import source
 
     return source(value, split=split, format=format)
 
 
 def _branches(
-    value: SourceValue,
+    value: SourceValue | Mapping[str, float],
     validation: Validation,
     *,
     split: str,
@@ -283,6 +284,7 @@ class Recipe(Protocol):
 @runtime_checkable
 class _HostBinding(Protocol):
     binding: str
+    def __call__(self, batch: Batch) -> Batch: ...
 
 
 def _host_stages(defaults: tuple[HostStep, ...], explicit: tuple[HostStep, ...]) -> tuple[HostStep, ...]:
@@ -295,8 +297,8 @@ def _host_stages(defaults: tuple[HostStep, ...], explicit: tuple[HostStep, ...])
 
 @dataclasses.dataclass(frozen=True)
 class Records:
-    source: Annotated[SourceValue, source_argument()]
-    validation: Annotated[Validation, source_argument()] = None
+    source: Annotated[SourceValue, source_argument(SourceValue)]
+    validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -307,7 +309,7 @@ class Records:
 
 @dataclasses.dataclass(frozen=True)
 class Text:
-    source: Annotated[SourceValue | Mapping[str, float], source_argument()] = ""
+    source: Annotated[SourceValue | Mapping[str, float], source_argument(SourceValue)] = ""
     tokenizer: str = "byte"
     seq_len: int = 256
     stride: int | None = None
@@ -315,7 +317,7 @@ class Text:
     eos: bool = False
     pack: Literal["first-fit", "best-fit", "concat"] | None = None
     packing_bins: int = 8
-    validation: Annotated[Validation, source_argument()] = None
+    validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
     phases: Annotated[tuple[DataPhase, ...], record_argument(tuple[DataPhase, ...])] = ()
     token_holdout: HoldOut | None = None
@@ -335,7 +337,9 @@ class Text:
             branches = [dataclasses.replace(self, source=path).pipelines() for path in sorted(self.source)]
             if not branches:
                 raise ValueError("Text mixture has no corpora")
-            weights = [float(self.source[path]) for path in sorted(self.source)]
+            weighted = {path: float(weight) for path, weight in self.source.items()
+                        if isinstance(weight, (int, float))}
+            weights = [weighted[path] for path in sorted(weighted)]
             trains = [branch[0] for branch in branches]
             held = [branch[1] for branch in branches]
             train = trains[0] if len(trains) == 1 else trains[0].mix(*trains[1:], weights=weights, tokens=ValidTargets())
@@ -396,13 +400,13 @@ class Text:
 
 @dataclasses.dataclass(frozen=True)
 class Chat:
-    source: Annotated[SourceValue, source_argument()]
+    source: Annotated[SourceValue, source_argument(SourceValue)]
     tokenizer: str
     seq_len: int = 256
     column: str = "messages"
     long: Literal["truncate", "drop", "chunk"] = "truncate"
     packing_bins: int = 8
-    validation: Annotated[Validation, source_argument()] = None
+    validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -423,14 +427,14 @@ class Chat:
 
 @dataclasses.dataclass(frozen=True)
 class Prompts:
-    source: Annotated[SourceValue, source_argument()]
+    source: Annotated[SourceValue, source_argument(SourceValue)]
     tokenizer: str
     max_prompt_len: int = 256
     pad_id: int = 0
     reward_bytes: int | None = None
     long: Literal["drop", "truncate"] = "drop"
     thinking: bool | None = None
-    validation: Annotated[Validation, source_argument()] = None
+    validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -487,10 +491,10 @@ class _PromptFacts:
 
 @dataclasses.dataclass(frozen=True)
 class Preferences:
-    source: Annotated[SourceValue, source_argument()]
+    source: Annotated[SourceValue, source_argument(SourceValue)]
     seq_len: int = 256
     pad_id: int = 0
-    validation: Annotated[Validation, source_argument()] = None
+    validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -510,7 +514,7 @@ class Augment:
 
 @dataclasses.dataclass(frozen=True)
 class Images:
-    source: Annotated[SourceValue, source_argument()]
+    source: Annotated[SourceValue, source_argument(SourceValue)]
     image_size: int = 128
     staging_size: int | None = None
     field: str = "image"
@@ -520,7 +524,7 @@ class Images:
     classes: tuple[str, ...] = ()
     labels: str | None = None
     augment: Augment | None = dataclasses.field(default_factory=Augment)
-    validation: Annotated[Validation, source_argument()] = None
+    validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
@@ -555,14 +559,14 @@ class Images:
 
 @dataclasses.dataclass(frozen=True)
 class Video:
-    source: Annotated[SourceValue, source_argument()]
+    source: Annotated[SourceValue, source_argument(SourceValue)]
     frames: int = 16
     frame_size: int = 256
     audio_padding: int = 3
     audio_model: str = "facebook/wav2vec2-base-960h"
     caption: str = ""
     extensions: tuple[str, ...] = (".mp4", ".avi", ".mov", ".webm")
-    validation: Annotated[Validation, source_argument()] = None
+    validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
 
     @property
@@ -594,7 +598,9 @@ class Video:
 def load(
     recipe: Recipe | str,
     *,
-    batch: int,
+    batch: int | None = None,
+    tokens: int | None = None,
+    lengths: tuple[int, ...] = (),
     read: Read = "indexed",
     provision: bool = False,
     cache: Cache | Generation | str | None = None,
@@ -606,6 +612,8 @@ def load(
     **fields,
 ) -> Dataset:
     """Resolve a recipe alias and compile its training and evaluation pipelines."""
+    if (batch is None) == (tokens is None):
+        raise ValueError("load needs exactly one of batch rows or tokens")
     if isinstance(recipe, str):
         if "://" in recipe or "/" in recipe:
             raise ValueError("load needs a recipe or alias; a bare URI names a source")
@@ -631,8 +639,8 @@ def load(
     if cache is not None:
         train = _cached(train, cache)
         held = None if held is None else _cached(held, cache)
-    train = _batched(_ordered(train, read, seed), batch, train=True)
-    held = None if held is None else _batched(held, batch, train=False)
+    train = _batched(_ordered(train, read, seed), batch, train=True, tokens=tokens, lengths=lengths)
+    held = None if held is None else _batched(held, batch, train=False, tokens=tokens, lengths=lengths)
     return compile(
         train,
         validation=held,
@@ -673,7 +681,8 @@ def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *order, *pipeline.stages[at:]))
 
 
-def _batched(pipeline: Pipeline, batch: int, *, train: bool) -> Pipeline:
+def _batched(pipeline: Pipeline, batch: int | None, *, train: bool, tokens: int | None = None,
+             lengths: tuple[int, ...] = ()) -> Pipeline:
     from dew.data.pipeline import BatchStage, MapBatch
 
     stated = [stage.size for stage in pipeline.stages if isinstance(stage, BatchStage)]
@@ -684,7 +693,8 @@ def _batched(pipeline: Pipeline, batch: int, *, train: bool) -> Pipeline:
 
     at = next((index for index, stage in enumerate(pipeline.stages)
                if isinstance(stage, MapBatch)), len(pipeline.stages))
-    prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).batch(batch, drop_remainder=train)
+    prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).batch(
+        batch, tokens=tokens, lengths=lengths, drop_remainder=train)
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
 
 

@@ -81,3 +81,6 @@ class PerformanceConfig:
 def pick_performance_config(ds: IterDataset[Any], *, ram_budget_mb: int | None,
                             max_workers: int | None, max_buffer_size: int | None,
                             samples_to_check: int = ...) -> PerformanceConfig: ...
+
+
+def batch_and_pad(values: Sequence[T], batch_size: int | None = ...) -> T: ...
