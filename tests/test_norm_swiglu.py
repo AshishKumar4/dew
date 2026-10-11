@@ -3,8 +3,10 @@
 Every operand gradient is checked, including the fp32 weight's column sum
 and Liger's fp32-intermediate VJP contract. Ragged tiles and enough rows to make
 each norm program accumulate multiple blocks exercise the masked paths.
-The fp32 fixtures hold every output and gradient to 1e-5 maximum relative
-error from XLA. The bf16 VJPs keep wider intermediates than XLA's autodiff,
+The fp32 activation/input-gradient fixtures hold a 1e-5 maximum relative
+bound from XLA. For dscale, float64 is the judge: its RMS error must be no
+greater than XLA's, whose GPU column sum is itself inexact. The bf16 VJPs
+keep wider intermediates than XLA's autodiff,
 so their contract is distance from float64, not bitwise XLA agreement.
 Forwards retain each model's cast sites. Small-shape c53 fixtures also hold
 the fused VJPs to Liger's measured float64 distances.
@@ -77,7 +79,9 @@ def compare(functions, operands, seed, labels):
                 assert theirs is None and want is None
                 continue
             assert mine.dtype == theirs.dtype, label
-            if mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
+            if label == "scale":
+                assert distance(mine, want) <= distance(theirs, want), label
+            elif mine.dtype == jnp.float32 and reference[0].dtype == jnp.float32:
                 assert relative(mine, theirs) < 1e-5, label
             assert_as_exact_as_the_reference(mine, theirs, want, label)
     except AssertionError as error:
@@ -132,7 +136,7 @@ def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
 
 def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
     """The real-row stress holds every output and gradient to XLA's float64
-    RMS budget, while fp32 columns retain the 1e-5 relative bound. BF16
+    RMS budget. dscale must be at least as close to float64 as XLA. BF16
     gradients deliberately do not reproduce XLA's intermediate roundings."""
     operands, seed = norm_operands((24576, 17), jnp.bfloat16, jnp.float32)
     xla, pallas, exact = norm_functions(jnp.bfloat16, offset=True, after_cast=True)
@@ -145,8 +149,8 @@ def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():
     try:
         for label, mine, theirs, want in zip(("y", "x", "scale"), actual, reference, truth, strict=True):
             assert_as_exact_as_the_reference(mine, theirs, want, label)
-            if mine.dtype == jnp.float32:
-                assert relative(mine, theirs) < 1e-5, label
+            if label == "scale":
+                assert distance(mine, want) <= distance(theirs, want), label
     except AssertionError as error:
         report = rounding_report(("y", "x", "scale"), actual, reference, truth)
         print(report, flush=True)
