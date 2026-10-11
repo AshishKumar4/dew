@@ -54,18 +54,18 @@ def test_an_assumed_generation_names_its_platform(generation, platform):
 
 def test_a_platform_keyed_choice_takes_the_assumed_gpus_path():
     """On this CPU, jax.nn's xla attention sums a long fp32 value product in one chain, so 'auto' takes
-    the reference path, and an explicit Pallas RMSNorm interprets. Under an assumed T4 both act as
-    on the GPU: the xla path, and XLA's RMSNorm, as a T4 compiles no Triton kernel."""
+    the reference path, and an explicit Pallas grouped matmul interprets. Under an assumed T4 both
+    act as on the GPU: the xla path, and XLA's ragged dot, as a T4 compiles no Triton kernel."""
     from dew.nn.attention import VALUE_BLOCK, _xla_kernel_chains
-    from dew.nn.kernels import norm_swiglu
+    from dew.nn.moe import grouped_matmul_kernel
 
     query, key = jnp.zeros((1, 8, 2, 64)), jnp.zeros((1, VALUE_BLOCK + 1, 2, 64))
-    x = jnp.zeros((4, 64))
+    operands = (jnp.bfloat16, jnp.bfloat16)
     assert _xla_kernel_chains(query, key)
-    assert norm_swiglu.rms_kernel('pallas', x, None, jnp.float32, fp32_statistics=True) == 'pallas'
+    assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'pallas'
     with assumed('sm75'):
         assert not _xla_kernel_chains(query, key)
-        assert norm_swiglu.rms_kernel('pallas', x, None, jnp.float32, fp32_statistics=True) == 'xla'
+        assert grouped_matmul_kernel('pallas', jnp.bfloat16, operands, None) == 'xla'
 
 
 def test_the_gpu_mesh_keeps_the_axes_over_the_generations_devices():
@@ -101,26 +101,88 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
     assert triton_kernels(jax.jit(_doubled).lower(x)) == {}
 
 
-# The kernels of each Pallas choice a generation's KERNELS row names, as the step calls them.
+# The Triton kernels each Pallas choice a KERNELS row can name lowers to, by their `pallas_call` names,
+# and the probe that runs them: the Clef recipe's step (tools/clef_step.py), or an expert layer's
+# forward and backward (`_experts_lowered`). None for a kernel whose Triton lowering this host cannot
+# reach (`_experts_lowered`'s tokamax).
 FAMILIES = {
-    ('rms_norm', 'pallas'): {"rms_norm_forward", "rms_norm_backward"},
-    ('swiglu', 'pallas'): {"swiglu_forward", "swiglu_backward"},
-    ('gated_delta_rule', 'fla'): {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u",
-                                  "fla_chunk_fwd_h", "fla_chunk_fwd_o", "fla_chunk_bwd_dhu",
-                                  "fla_chunk_bwd_dv_local", "fla_chunk_bwd_dqkwg", "fla_prepare_wy_repr_bwd"},
+    ('gated_delta_rule', 'pallas'): ("step", {"gated_delta_states", "gated_delta_states_backward",
+                                              "gated_delta_prep", "gated_delta_prep_backward"}),
+    ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
+    ('tokamax_grouped_matmul', 'triton'): ("experts", None),
 }
+
+GPUS = sorted({generation for row in KERNELS.values() for generation in row if generation.startswith('sm')}
+              | {'sm80', 'sm120'}, key=lambda generation: int(generation[2:]))
+"""Every CUDA generation a KERNELS row names, and the A100's and the G4's, which Dew's sessions take."""
+
+
+def chosen(generation: str, probe: str) -> set[tuple[str, str]]:
+    """The Pallas choices `generation`'s rows name whose kernels `probe` runs."""
+    return {(choice, row[generation]) for choice, row in KERNELS.items()
+            if (choice, row.get(generation)) in FAMILIES and FAMILIES[choice, row[generation]][0] == probe}
+
+
+def test_every_pallas_choice_a_row_names_has_a_lowering_probe():
+    """A Pallas kernel KERNELS chooses for some GPU is one this file lowers for that GPU on a CPU: a new
+    row needs its kernels in FAMILIES, so no Triton lowering first runs in a GPU session's compile."""
+    from tools.colab.preflight import PALLAS_CHOICES
+
+    named = {(choice, kernel) for choice, row in KERNELS.items() for kernel in row.values()
+             if kernel in PALLAS_CHOICES}
+    assert named <= set(FAMILIES), sorted(named - set(FAMILIES))
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm120"])
 def test_the_clef_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation, tmp_path):
     """c58's and c57's step, the Clef recipe's decision step over a Qwen 3.5 hybrid, lowered on this CPU
     for their GPUs, an A100 and a G4 (tools/clef_step.py): it lowers, and it calls the Triton kernels
-    of every Pallas choice the generation's KERNELS row names, so none was interpreted or refused."""
+    of every Pallas choice the generation's KERNELS row names for its layers, so none was
+    interpreted or refused."""
     done = subprocess.run([sys.executable, str(ROOT / "tools" / "clef_step.py"), "--lower-for", generation,
                            "--work", str(tmp_path)], capture_output=True, text=True, cwd=ROOT, timeout=1500,
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     kernels = json.loads(done.stdout.splitlines()[-1])["kernels"]
-    chosen = {(choice, row[generation]) for choice, row in KERNELS.items() if generation in row}
-    expected = set().union(*(names for key, names in FAMILIES.items() if key in chosen))
-    assert set(kernels) == expected
+    assert set(kernels) == set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
+
+
+def _experts_lowered(generation: str, implementation: str):
+    """An expert layer's bf16 forward and backward, as a MoE step runs them, lowered for `generation`."""
+    from dew.nn.moe import ExpertMLP
+
+    experts = ExpertMLP(num_experts=8, hidden_features=128, out_features=64, implementation=implementation,
+                        dtype=jnp.bfloat16)
+    x = jax.ShapeDtypeStruct((256, 64), jnp.bfloat16)
+    indices = jnp.asarray(np.arange(512).reshape(256, 2) % 8, jnp.int32)
+    weights = jnp.full((256, 2), 0.5, jnp.float32)
+    variables = jax.eval_shape(lambda: experts.init(jax.random.key(1), jnp.zeros(x.shape, x.dtype), weights,
+                                                    indices))
+
+    def loss(variables, x):
+        return experts.apply(variables, x, weights, indices).astype(jnp.float32).sum()
+
+    mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
+    with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
+        return jax.jit(jax.value_and_grad(loss)).trace(variables, x).lower(lowering_platforms=('cuda',))
+
+
+@pytest.mark.parametrize("generation", GPUS)
+def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
+    """'auto' takes the generation's grouped matmul: its forward and both backward products lower to
+    the Pallas kernels where the row names them, and to none where it does not."""
+    expected = set().union(*(FAMILIES[key][1] for key in chosen(generation, "experts")
+                             if key[0] == 'grouped_matmul'))
+    assert set(triton_kernels(_experts_lowered(generation, 'auto'))) == expected
+
+
+@pytest.mark.parametrize("generation", [generation for generation in GPUS
+                                        if 'tokamax_grouped_matmul' in dict(chosen(generation, "experts"))])
+def test_tokamax_lowers_for_the_gpu_its_row_names(generation):
+    """'tokamax', an opt-in implementation 'auto' never takes, names its Triton kernel per generation;
+    tokamax registers that kernel only on a host with a GPU, so a CPU's dry run skips it, and the
+    kernel lab's verify on the GPU runs it (tests/test_moe.py)."""
+    api = pytest.importorskip("tokamax._src.ops.ragged_dot.api")
+    if 'triton' not in api.IMPLEMENTATIONS:
+        pytest.skip("tokamax registers its Triton ragged dot only where a GPU is present")
+    assert triton_kernels(_experts_lowered(generation, 'tokamax'))

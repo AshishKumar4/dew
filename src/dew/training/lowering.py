@@ -18,10 +18,11 @@ generation's platform, and takes the GPU's path here. Three still read
 attention's cuDNN (`cudnn_runs`) and FlashAttention (`flash_refusal`) calls,
 CUDA kernels and not Pallas ones, whose trace asks the CUDA plugin for
 versions and libraries a CPU host lacks, so attention traces its XLA path;
-and the gated delta rule's explicit 'pallas' on a CPU
-(dew.nn.linear's `chunk_states_kernel` and `fla_refusal`), which places the
-kernel interpreted where a GPU below sm80 would refuse it. `auto` never asks
-for that.
+and the gated delta rule's explicit 'pallas' on a CPU (dew.nn.linear's
+`chunk_states_kernel`), which places the kernel interpreted where a GPU
+below sm80 would refuse it. `auto` never asks for that. Nor can it lower
+tokamax's Triton ragged dot, the opt-in 'tokamax' grouped matmul's, which
+tokamax registers only on a host with a GPU.
 """
 
 from __future__ import annotations

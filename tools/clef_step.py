@@ -1,5 +1,5 @@
-"""The Clef recipe's training step on a tiny Qwen 3.5 hybrid that fla's port runs, lowered for a
-CUDA generation on any host or trained for a few steps on this one's devices.
+"""The Clef recipe's training step on a tiny Qwen 3.5 hybrid, lowered for a CUDA generation on any
+host or trained for a few steps on this one's devices.
 
     python tools/clef_step.py --lower-for sm80    # a CPU will do: every Pallas-Triton kernel lowers
     python tools/clef_step.py --steps 3           # on the GPU: the step compiles and runs
@@ -13,9 +13,9 @@ the run's real step for one (`dew.training.lowering`). The step is
 recipes/decision/clef.py's own run at its defaults, bfloat16 compute, LoRA
 on every projection and Clef's joint head. The backbone is the size of a
 test fixture: the tiny Qwen 3.5's three Gated DeltaNet layers and one
-full-attention layer, with 64-wide key and value heads, the narrowest the
-port takes (`dew.nn.linear.fla_refusal`), so `KERNELS` chooses on it as on
-the 0.8B. `--like` gives its four layers another checkpoint's widths instead
+full-attention layer, with 64-wide key and value heads, which the gated
+delta rule's kernels take (`dew.nn.kernels.delta_chunks.refusal`), so
+`KERNELS` chooses on it as on the 0.8B. `--like` gives its four layers another checkpoint's widths instead
 (`GEOMETRY`, from that checkpoint's config alone), the heads and widths a
 kernel's choices and refusals read, and `--max-len` and `--batch` its rows.
 
