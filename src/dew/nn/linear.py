@@ -613,8 +613,7 @@ class GatedDeltaNet(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Learned maps, conv and algorithm-independent recurrent rule (`delta_flops`)."""
-        projected = 2 * self.key_features + 3 * self.value_features + 2 * self.num_v_heads
-        return (projection_flops(lengths, self.emb_features, projected)
+        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
                 + conv_flops(lengths, self.conv_features, self.conv_features,
                              self.conv_kernel, groups=self.conv_features)
                 + delta_flops(lengths, self.num_v_heads, self.head_k_dim, self.head_v_dim))
@@ -624,6 +623,22 @@ class GatedDeltaNet(nn.Module):
         """Frozen learned maps/conv, excluding the nonparameter state contractions."""
         return self.model_flops(lengths) - delta_flops(
             lengths, self.num_v_heads, self.head_k_dim, self.head_v_dim)
+
+    @nn.nowrap
+    def projections(self) -> dict[str, tuple[int, int]]:
+        """The delta net's maps as `{name: (inputs, outputs)}`: the
+        reference's four input projections or Qwen3-Next's two fused ones,
+        and the map back to the residual. Setup builds them and the count
+        reads them."""
+        if self.fused_in_proj:
+            widths = {'in_proj_qkvz': 2 * self.key_features + 2 * self.value_features,
+                      'in_proj_ba': 2 * self.num_v_heads}
+        else:
+            widths = {'in_proj_qkv': 2 * self.key_features + self.value_features,
+                      'in_proj_z': self.value_features, 'in_proj_b': self.num_v_heads,
+                      'in_proj_a': self.num_v_heads}
+        return {**{name: (self.emb_features, width) for name, width in widths.items()},
+                'out_proj': (self.value_features, self.emb_features)}
 
     def setup(self):
         if self.num_v_heads % self.num_k_heads:
@@ -640,23 +655,14 @@ class GatedDeltaNet(nn.Module):
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
             nn.Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
-        if self.fused_in_proj:
-            self.in_proj_qkvz = dense(2 * self.key_features + 2 * self.value_features,
-                                      name='in_proj_qkvz')
-            self.in_proj_ba = dense(2 * self.num_v_heads, name='in_proj_ba')
-        else:
-            self.in_proj_qkv = dense(self.key_features * 2 + self.value_features,
-                                     name='in_proj_qkv')
-            self.in_proj_z = dense(self.value_features, name='in_proj_z')
-            self.in_proj_b = dense(self.num_v_heads, name='in_proj_b')
-            self.in_proj_a = dense(self.num_v_heads, name='in_proj_a')
+        for name, (_, outputs) in self.projections().items():
+            setattr(self, name, dense(outputs, name=name))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,
                                        kernel=self.conv_kernel, name='conv1d')
         self.A_log = self.param('A_log', nn.initializers.constant(0.0),
                                 (self.num_v_heads,), jnp.float32)
         self.dt_bias = self.param('dt_bias', nn.initializers.ones,
                                   (self.num_v_heads,), jnp.float32)
-        self.out_proj = dense(self.emb_features, name='out_proj')
         self.norm = RMSNormGated(epsilon=self.norm_eps, activation=self.gate_activation,
                                  dtype=self.dtype, name='norm')
 

@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from flax.traverse_util import flatten_dict
 from jax.extend import core as jaxpr_core
 from recording import RecordingTracker
 
@@ -709,3 +710,96 @@ def test_qwen35_reference_uses_the_counted_real_token_backbone_convention(monkey
     assert record.training_flops_per_step == 3 * counted_flops(model, np.full((8,), 3072, np.int64))
     assert record.training_flops_per_step == objective.training_flops(None, batch)
     assert record.tokens_per_step == 8 * 3072
+
+
+def _kernels(variables) -> dict[tuple[str, ...], tuple[int, ...]]:
+    """Every Dense kernel's shape a module's init builds, by its path."""
+    return {path[:-1]: value.shape for path, value in flatten_dict(variables["params"]).items()
+            if path[-1] == "kernel"}
+
+
+@pytest.mark.parametrize("fused", [False, True])
+def test_delta_net_builds_exactly_the_projections_it_counts(fused):
+    model = GatedDeltaNet(32, 2, 4, 8, 8, fused_in_proj=fused)
+    variables = jax.eval_shape(model.init, jax.random.key(82), jnp.ones((1, 1, 32)))
+    assert _kernels(variables) == {(name,): shape for name, shape in model.projections().items()}
+
+
+@pytest.mark.parametrize("activation,packed", [("swiglu", False), ("swiglu", True), ("gelu", False)])
+def test_mlp_builds_its_projections_and_packs_its_group_from_them(activation, packed):
+    model = GatedMLP(48, 32, activation=activation, packed=packed)
+    variables = jax.eval_shape(model.init, jax.random.key(83), jnp.ones((1, 1, 32)))
+    declared = {(name,): shape for name, shape in model.projections().items()}
+    groups = model.apply(variables, method="projection_groups")
+    if activation == "gelu":
+        assert groups == ()
+    else:
+        (group,) = groups
+        assert group.widths == tuple(model.projections()[name][1] for name in group.members)
+        if packed:
+            del declared[("gate_proj",)], declared[("up_proj",)]
+            declared[(group.packed,)] = (32, sum(group.widths))
+    assert _kernels(variables) == declared
+
+
+@pytest.mark.parametrize("packed,k_eq_v,kv_shared,output_gate,value_dim", [
+    (False, False, False, False, 8), (True, False, False, True, 8), (False, False, False, False, 4),
+    (False, True, False, False, 8), (False, False, True, False, 8)])
+def test_attention_builds_only_the_projections_it_declares(packed, k_eq_v, kv_shared, output_gate, value_dim):
+    model = CausalSelfAttention(32, 4, 2, 8, 8, packed=packed, k_eq_v=k_eq_v, kv_shared=kv_shared,
+                                kv_store_key="provider", output_gate=output_gate, value_head_dim=value_dim,
+                                attention_impl="reference")
+    keys, values = jnp.ones((1, 1, 2, 8)), jnp.ones((1, 1, 2, value_dim))
+    store = {"provider": (keys, values, jnp.zeros((1, 1), jnp.int32))}
+    variables = jax.eval_shape(lambda: model.init(jax.random.key(84), jnp.ones((1, 1, 32)), kv_store=store))
+    declared = {(name,): shape for name, shape in model.projections().items()}
+    groups = model.apply(variables, method="projection_groups")
+    if kv_shared or k_eq_v:
+        assert groups == ()
+    else:
+        (group,) = groups
+        assert group.widths == (64 if output_gate else 32, 16, 2 * value_dim)
+        if packed:
+            for name in group.members:
+                del declared[(name,)]
+            declared[(group.packed,)] = (32, sum(group.widths))
+    assert _kernels(variables) == declared
+
+
+def test_packed_attention_refuses_a_layer_without_its_own_values():
+    model = CausalSelfAttention(32, 4, 2, 8, 8, packed=True, k_eq_v=True, attention_impl="reference")
+    with pytest.raises(ValueError, match="packed qkv_proj"):
+        jax.eval_shape(model.init, jax.random.key(85), jnp.ones((1, 1, 32)))
+
+
+@pytest.mark.parametrize("size,layers,mlp,linear,attention", [
+    ("0.8B", 24,
+     {"gate_proj": (1024, 3584), "up_proj": (1024, 3584), "down_proj": (3584, 1024)},
+     {"in_proj_qkv": (1024, 6144), "in_proj_z": (1024, 2048), "in_proj_b": (1024, 16),
+      "in_proj_a": (1024, 16), "out_proj": (2048, 1024)},
+     {"q_proj": (1024, 4096), "k_proj": (1024, 512), "v_proj": (1024, 512), "o_proj": (2048, 1024)}),
+    ("9B", 32,
+     {"gate_proj": (4096, 12288), "up_proj": (4096, 12288), "down_proj": (12288, 4096)},
+     {"in_proj_qkv": (4096, 8192), "in_proj_z": (4096, 4096), "in_proj_b": (4096, 32),
+      "in_proj_a": (4096, 32), "out_proj": (4096, 4096)},
+     {"q_proj": (4096, 8192), "k_proj": (4096, 1024), "v_proj": (4096, 1024), "o_proj": (4096, 4096)}),
+], ids=["qwen35-0.8b", "qwen35-9b"])
+def test_qwen35_layers_build_the_projections_the_frozen_base_was_measured_on(size, layers, mlp, linear,
+                                                                              attention):
+    """The FP8 frozen base's A/B at 316cce053 covered these layer projections
+    (`dense_matrices` there, its packed alternatives aside); built from the
+    one declaration they are unchanged, so that measurement still applies."""
+    path = Path(__file__).parent / "fixtures" / "hf" / "qwen35-0.8b" / "config.json"
+    config = json.loads(path.read_text())["text_config"]
+    if size == "9B":
+        config.update(hidden_size=4096, intermediate_size=12288, num_hidden_layers=32, num_attention_heads=16,
+                      num_key_value_heads=4, linear_num_value_heads=32, tie_word_embeddings=False,
+                      layer_types=["linear_attention"] * 3 + ["full_attention"] * 1)
+        config["layer_types"] *= 8
+    model = translate_config(config).value
+    variables = jax.eval_shape(model.init, jax.random.key(86), jnp.ones((1, 8), jnp.int32))
+    built = {path: shape for path, shape in _kernels(variables).items() if path[0].startswith("layers_")}
+    expected = {(f"layers_{index}", owner, name): shape for index in range(layers)
+                for owner, sites in (("mlp", mlp), ("self_attn", attention if index % 4 == 3 else linear))
+                for name, shape in sites.items()}
+    assert built == expected
