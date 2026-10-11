@@ -8,12 +8,14 @@
 #
 # EXPIRE_DAYS deletes an object that many days after it is written; without
 # it the bucket keeps every object until it is deleted, except under _smoke/,
-# where a remote smoke's objects expire after a day. Two tokens are made
-# once: the write token at ~/.config/dew/NAME.token, which also reads, and a
+# where a remote smoke's objects expire after a day. Three tokens are made
+# once: the write token at ~/.config/dew/NAME.token, which also reads, a
 # read token at ~/.config/dew/NAME.read.token, refused a PUT, for readers
-# such as a restore-only VM (both mode 600). The Worker's URL is written to
-# ~/.config/dew/NAME.json. Run again, it deploys the Worker and sets the same
-# tokens. WRANGLER names the wrangler to run (default `bunx wrangler@4`).
+# such as a restore-only VM, and a lab token at ~/.config/dew/NAME.lab.token
+# that reaches only the keys under lab/, for the kernel lab's VM (all mode
+# 600). The Worker's URL is written to ~/.config/dew/NAME.json. Run again, it
+# deploys the Worker and sets the same tokens. WRANGLER names the wrangler to
+# run (default `bunx wrangler@4`).
 set -eu
 name=$1
 days=${2:-}
@@ -34,7 +36,8 @@ fi
 mkdir -p "$HOME/.config/dew"
 token="$HOME/.config/dew/$name.token"
 reader="$HOME/.config/dew/$name.read.token"
-for file in "$token" "$reader"; do
+lab="$HOME/.config/dew/$name.lab.token"
+for file in "$token" "$reader" "$lab"; do
   if [ ! -s "$file" ]; then
     (umask 077 && head -c 48 /dev/urandom | base64 | tr -d '/+=\n' > "$file")
   fi
@@ -46,6 +49,7 @@ url=$(echo "$deployed" | grep -o "https://$name\.[A-Za-z0-9.-]*workers\.dev" | h
 [ -n "$url" ] || { echo "$deployed" >&2; echo "the deploy named no URL" >&2; exit 1; }
 tr -d '\n' < "$token" | $wrangler secret put CACHE_TOKEN -c "$config" >/dev/null
 tr -d '\n' < "$reader" | $wrangler secret put READ_TOKEN -c "$config" >/dev/null
-printf '{"url": "%s", "token_file": "%s", "read_token_file": "%s"}\n' "$url" "$token" "$reader" \
-  > "$HOME/.config/dew/$name.json"
-echo "$name: $url (tokens in $token and $reader)"
+tr -d '\n' < "$lab" | $wrangler secret put LAB_TOKEN -c "$config" >/dev/null
+printf '{"url": "%s", "token_file": "%s", "read_token_file": "%s", "lab_token_file": "%s"}\n' \
+  "$url" "$token" "$reader" "$lab" > "$HOME/.config/dew/$name.json"
+echo "$name: $url (tokens in $token, $reader and $lab)"

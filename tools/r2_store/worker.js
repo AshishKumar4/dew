@@ -6,7 +6,11 @@
 // store's CACHE_TOKEN secret, who may also DELETE /<key>. A GET or HEAD
 // honours If-Match (412 where the object's ETag differs) and If-None-Match
 // (304). A bearer of its READ_TOKEN secret, where one is set, reads the same
-// way and is refused a PUT or a DELETE with a 403. A miss is a 404. A GET
+// way and is refused a PUT or a DELETE with a 403. A bearer of its LAB_TOKEN
+// secret, where one is set, reads, writes and deletes the keys under lab/ and
+// lists prefixes there, the kernel lab's jobs, results and boards
+// (tools/kernel_lab), and is refused anything else with a 403: a VM that runs
+// the lab holds that token, never the bucket's. A miss is a 404. A GET
 // with a Range header answers 206 with that slice and its Content-Range. A PUT
 // honours If-None-Match and If-Match (`If-None-Match: *` writes a key only if
 // it is absent) and answers 412 where the condition fails; every answer about
@@ -17,6 +21,8 @@
 const MAX_BYTES = 100 * 1000 * 1000;
 // '=' for Hive partition directories (split=train), as pyarrow.dataset writes them.
 const KEY = /^[A-Za-z0-9._=-]+(\/[A-Za-z0-9._=-]+)*$/;
+// The keys a LAB_TOKEN reaches.
+const LAB = 'lab/';
 
 async function authorized(request, token) {
   const given = new TextEncoder().encode(request.headers.get('authorization') ?? '');
@@ -48,9 +54,11 @@ function unmet(request, object) {
 
 export default {
   async fetch(request, env) {
-    const writes = Boolean(env.CACHE_TOKEN) && (await authorized(request, env.CACHE_TOKEN));
-    const reads = writes || (Boolean(env.READ_TOKEN) && (await authorized(request, env.READ_TOKEN)));
-    if (!reads) return new Response(null, { status: 401 });
+    const owner = Boolean(env.CACHE_TOKEN) && (await authorized(request, env.CACHE_TOKEN));
+    const reader = owner || (Boolean(env.READ_TOKEN) && (await authorized(request, env.READ_TOKEN)));
+    const lab = !reader && Boolean(env.LAB_TOKEN) && (await authorized(request, env.LAB_TOKEN));
+    if (!reader && !lab) return new Response(null, { status: 401 });
+    const writes = owner || lab;
     const url = new URL(request.url);
     const listed = url.searchParams.get('list');
     if (listed !== null && request.method === 'GET') {
@@ -58,6 +66,7 @@ export default {
       if (listed.length > 512 || (listed !== '' && !KEY.test(listed.replace(/\/$/, '')))) {
         return new Response(null, { status: 400 });
       }
+      if (lab && !listed.startsWith(LAB)) return new Response(null, { status: 403 });
       const page = await env.CACHE.list({ prefix: listed, limit: 1000, cursor: url.searchParams.get('cursor') ?? undefined });
       const keys = page.objects.map((object) => object.key.slice(listed.length));
       const answer = { keys, cursor: page.truncated ? page.cursor : null };
@@ -71,6 +80,7 @@ export default {
     }
     const key = decodeURIComponent(url.pathname.slice(1));
     if (key.length > 512 || !KEY.test(key) || key.split('/').includes('..')) return new Response(null, { status: 400 });
+    if (lab && !key.startsWith(LAB)) return new Response(null, { status: 403 });
     const conditional = request.headers.has('if-match') || request.headers.has('if-none-match');
     if (request.method === 'GET') {
       const ranged = request.headers.has('range');
