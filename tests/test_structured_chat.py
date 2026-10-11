@@ -141,7 +141,7 @@ def test_prompt_media_is_refused_before_truncation():
         {"type": "text", "text": "Weather in Paris?"}]}]}
     spec = Prompts(source=tuple(json.loads(row) for row in (json.dumps(row),)),
         tokenizer=str(TOOLS_TOKENIZER), max_prompt_len=4)
-    with pytest.raises(ValueError, match=r"row 0 message 0.*image.*processor"):
+    with pytest.raises(ValueError, match=r"prompt message 0.*image.*processor"):
         next(load(spec, batch=1, read="memory", loading=Loading(workers=0),
             validation_records=4 * (1)).train(DataPartition()))
 
