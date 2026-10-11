@@ -28,9 +28,16 @@ from .generation import first_refusal
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
 DTYPES = (jnp.dtype(jnp.float32), jnp.dtype(jnp.bfloat16))
-ROW_BLOCK = 4
+ROW_ELEMENTS = 4096
 MAX_PROGRAMS = 128
 ELEMENT_BLOCK = 1024
+
+
+def _row_block(width: int) -> int:
+    """At most four rows, with the live register tile bounded at 4096
+    elements except when a single row is wider. A 4096-wide norm takes one
+    row rather than spilling four copies of every backward intermediate."""
+    return min(4, max(1, ROW_ELEMENTS // pl.next_power_of_2(width)))
 
 
 def _round(x, dtype, interpret: bool):
@@ -96,7 +103,8 @@ def _rms_forward(x_ref, scale_ref, y_ref, inverse_ref, *, epsilon: float,
                  offset: bool, after_cast: bool, interpret: bool):
     rows, width = x_ref.shape
     columns = jnp.arange(pl.next_power_of_2(width))
-    row = pl.program_id(0) * ROW_BLOCK + jnp.arange(ROW_BLOCK)
+    row_block = _row_block(width)
+    row = pl.program_id(0) * row_block + jnp.arange(row_block)
     mask = (row[:, None] < rows) & (columns[None, :] < width)
     x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
     inverse = jax.lax.rsqrt(jnp.sum(x * x, axis=1) / width + epsilon)
@@ -115,10 +123,11 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
     columns = jnp.arange(pl.next_power_of_2(width))
     groups = pl.num_programs(0)
     group = pl.program_id(0)
+    row_block = _row_block(width)
     weight = _weight(scale_ref, columns, width, offset) if scale_ref is not None else 1.0
 
     def block(i, accumulated):
-        row = (i * groups + group) * ROW_BLOCK + jnp.arange(ROW_BLOCK)
+        row = (i * groups + group) * row_block + jnp.arange(row_block)
         mask = (row[:, None] < rows) & (columns[None, :] < width)
         x = plgpu.load(x_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
         dy = plgpu.load(dy_ref.at[row[:, None], columns[None, :]], mask=mask, other=0).astype(jnp.float32)
@@ -137,7 +146,7 @@ def _rms_backward(x_ref, scale_ref, inverse_ref, dy_ref, dx_ref, partial_ref, *,
             accumulated = accumulated + jnp.sum(dy * normalized, axis=0)
         return accumulated
 
-    partial = jax.lax.fori_loop(0, pl.cdiv(rows, groups * ROW_BLOCK), block,
+    partial = jax.lax.fori_loop(0, pl.cdiv(rows, groups * row_block), block,
                                 jnp.zeros(columns.shape, jnp.float32))
     if partial_ref is not None:
         plgpu.store(partial_ref.at[group, columns], partial, mask=columns < width)
@@ -149,7 +158,7 @@ def _rms_with_inverse(x, scale, epsilon: float, dtype, offset: bool, after_cast:
     y, inverse = pl.pallas_call(
         functools.partial(_rms_forward, epsilon=epsilon, offset=offset, after_cast=after_cast,
                           interpret=interpret),
-        grid=(pl.cdiv(rows, ROW_BLOCK),),
+        grid=(pl.cdiv(rows, _row_block(width)),),
         out_shape=(jax.ShapeDtypeStruct((rows, width), dtype),
                    jax.ShapeDtypeStruct((rows,), jnp.float32)),
         compiler_params=plgpu.CompilerParams(num_warps=4, num_stages=1),
@@ -171,7 +180,7 @@ def _rms_bwd(epsilon: float, dtype, offset: bool, after_cast: bool, interpret: b
     del epsilon, dtype
     x, scale, inverse = residual
     rows, width = math.prod(x.shape[:-1]), x.shape[-1]
-    groups = min(MAX_PROGRAMS, pl.cdiv(rows, ROW_BLOCK))
+    groups = min(MAX_PROGRAMS, pl.cdiv(rows, _row_block(width)))
     dx, partial = pl.pallas_call(
         functools.partial(_rms_backward, offset=offset, after_cast=after_cast, interpret=interpret),
         grid=(groups,),

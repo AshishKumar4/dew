@@ -11,11 +11,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.ad_checkpoint import print_saved_residuals
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn import attention, kernels
 from dew.nn.attention import RMSNorm, forward_mode_attention, rms_normalized, unweighted_rmsnorm
-from dew.nn.kernels import norm_swiglu
 from dew.nn.moe import gated_product
 
 
@@ -75,7 +75,7 @@ def test_rms_variants_and_every_gradient(dtype, scale_dtype, offset, after_cast)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17)])
+@pytest.mark.parametrize("shape", [(7, 1000), (3, 4096), (3, 257, 17), (24576, 17)])
 def test_rms_ragged_widths_and_many_rows(dtype, shape):
     operands, seed = norm_operands(shape, dtype, jnp.float32)
     compare(norm_functions(dtype, offset=True, after_cast=True), operands, seed, ("y", "x", "scale"))
@@ -133,6 +133,8 @@ def test_rms_module_uses_the_same_fused_vjp(offset, after_cast, with_scale):
 ])
 def test_rms_refusals_fall_back_and_log_once(monkeypatch, caplog, statistics, dtype,
                                            scale_shape, width, reason):
+    from dew.nn.kernels import norm_swiglu
+
     monkeypatch.setitem(kernels.KERNELS, "rms_norm", {"cpu": "pallas"})
     monkeypatch.setattr(kernels.generation, "_logged", set())
     with jax.enable_x64(new_val=True):
@@ -149,6 +151,8 @@ def test_rms_refusals_fall_back_and_log_once(monkeypatch, caplog, statistics, dt
 
 
 def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
+    from dew.nn.kernels import norm_swiglu
+
     with jax.enable_x64(new_val=True):
         for gate, up in ((jnp.ones((2, 17)), jnp.ones((17,))),
                          (jnp.ones((2, 17)), jnp.ones((2, 17), jnp.bfloat16)),
@@ -159,6 +163,8 @@ def test_swiglu_refuses_broadcast_mixed_and_wide_dtypes():
 
 
 def test_cpu_auto_and_forward_mode_are_portable():
+    from dew.nn.kernels import norm_swiglu
+
     x = jnp.ones((2, 17), jnp.float32)
     assert norm_swiglu.rms_kernel("auto", x, None, x.dtype, fp32_statistics=True) == "xla"
     assert norm_swiglu.swiglu_kernel("auto", x, x) == "xla"
@@ -210,3 +216,16 @@ def test_inverse_cast_variant_refuses_the_normalized_activation_kernel(monkeypat
             np.testing.assert_array_equal(mine, theirs)
     logged = [record.getMessage() for record in caplog.records if record.name == kernels.generation.__name__]
     assert len(logged) == 1 and "rounds the inverse" in logged[0]
+
+
+@pytest.mark.parametrize("operation", ["rms_norm", "swiglu"])
+def test_fused_residuals_keep_no_full_width_fp32_activation(operation, capsys):
+    x = jnp.ones((2, 3, 31), jnp.bfloat16)
+    if operation == "rms_norm":
+        function = norm_functions(jnp.bfloat16, offset=False, after_cast=True)[1]
+        operands = (x, jnp.ones((31,), jnp.float32))
+    else:
+        function, operands = gated_product("swiglu", implementation="pallas"), (x, x)
+    print_saved_residuals(function, *operands)
+    saved = capsys.readouterr().out
+    assert "bf16[2,3,31]" in saved and "f32[2,3,31]" not in saved, saved
