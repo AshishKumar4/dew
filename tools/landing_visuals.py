@@ -223,7 +223,7 @@ def provenance(experiment, pipe, directory):
         "loaded_with": f"dew.sampling.TextToImage.from_run(pull_from_hub({experiment.model!r}, "
         "revision=...)), the run from_pretrained loads",
         "checkpoint_step": experiment.checkpoint_step,
-        "parameters": int(sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(pipe.params["params"]))),
+        "parameters": int(sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(pipe.variables["params"]))),
         "dew_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=REPO, text=True).strip(),
         "device": jax.devices()[0].device_kind,
         "jax": jax.__version__,
@@ -449,6 +449,8 @@ def summary(args):
 
 
 def sheets(args):
+    args.experiment.check("prompts", args.prompts or [], args.experiment.prompts)
+    args.experiment.check("settings", args.config or [], args.experiment.configs)
     rows = rank([row for row in records(args.out) if row["framing"] in ("square", "wide")])
     rows = [row for row in rows if not args.config or row["config"] in args.config]
     save_json(args.out / "ranked.json", rows)
@@ -504,6 +506,8 @@ def trajectory(pipe, prompt, seed, config):
     import jax.numpy as jnp
     from jax import lax
 
+    from dew.sampling.guidance import Walk
+
     solver, guidance, negative = call_settings(config)
     steps = config["steps"]
     prepared = pipe.prepare([prompt], key=seed, steps=steps, unconditional=negative)
@@ -515,29 +519,30 @@ def trajectory(pipe, prompt, seed, config):
     @jax.jit
     def run(params, given, null, x_T):
         variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
-        walk = guidance.walk(process.denoiser(pipe.model, variables, given, null))
         with jax.ensure_compile_time_eval():
             times = process.times(steps)
             initial = solver.init(x_T, times, process, key=key)
+        count = times.shape[0] - 1
+        walk = Walk.over(process.denoiser(pipe.model, variables, given, null), guidance, count)
         batch = x_T.shape[0]
 
         def body(carry, inputs):
             x, state, guided = carry
             t, t_next, index = inputs
             t, t_next = jnp.full((batch,), t), jnp.full((batch,), t_next)
-            (denoised, eps), guided = walk.step(x, t, guided)
-            x, state = solver.step(
-                x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index), process, walk.at(guided)
-            )
+            (denoised, eps), guided = walk.step(x, t, index, guided)
+            step_key = jax.random.fold_in(key, index)
+            guide = walk.at(guided, index)
+            x, state = solver.step(x, t, t_next, denoised, eps, state, step_key, process, guide)
             return (x, state, guided), denoised
 
         (x, _, guided), x0s = lax.scan(
             body, (x_T, initial, walk.init(x_T)), (times[:-1], times[1:], jnp.arange(times.shape[0] - 1))
         )
-        final = walk.at(guided)(x, jnp.full((batch,), times[-1]))[0]
+        final = walk.at(guided, count)(x, jnp.full((batch,), times[-1]))[0]
         return jnp.concatenate([x0s, final[None]])
 
-    walked = run(pipe.params, prepared.conditions, prepared.unconditional, prepared.noise)
+    walked = run(pipe.variables, prepared.conditions, prepared.unconditional, prepared.noise)
     reference = single(pipe, prompt, seed, config, decode=False).latents
     gap = float(jnp.max(jnp.abs(reference.astype(jnp.float32) - walked[-1].astype(jnp.float32))))
     return walked[:, 0], gap
@@ -598,7 +603,7 @@ def finals(args):
             replay.mkdir(parents=True, exist_ok=True)
             frames = []
             for start in range(0, walked.shape[0], 8):
-                frames.extend(uint8_pixels(decode(pipe.params["autoencoder"], walked[start : start + 8])))
+                frames.extend(uint8_pixels(decode(pipe.variables["autoencoder"], walked[start : start + 8])))
             for step, frame in enumerate(frames):
                 Image.fromarray(frame).save(replay / f"x0_{step:03d}.png")
             pixel_gap = int(np.abs(frames[-1].astype(np.int16) - pixels.astype(np.int16)).max())
