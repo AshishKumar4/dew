@@ -90,6 +90,23 @@ def capture(factory: Callable, workers: int, shares: int):
     return {"records": data.records, "held_out": data.held_out, "shares": rows}
 
 
+def _videos(root: Path):
+    from imageio_ffmpeg import get_ffmpeg_exe
+    from transformers import Wav2Vec2FeatureExtractor
+
+    clips = root / "clips"
+    clips.mkdir()
+    video = clips / "00.mp4"
+    subprocess.run([get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
+                    "testsrc=size=16x16:rate=25", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=16000",
+                    "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)], check=True)
+    for index in range(1, 12):
+        shutil.copyfile(video, clips / f"{index:02}.mp4")
+    audio = root / "audio"
+    Wav2Vec2FeatureExtractor(sampling_rate=16000).save_pretrained(audio)
+    return clips, audio
+
+
 def fixtures(root: Path):
     from dew.data import (
         ArrayRecordImages,
@@ -164,19 +181,7 @@ def fixtures(root: Path):
         for row in pixels]).cast_column("image", HFImage())
     image_table = root / "image.parquet"
     arrow_images.to_parquet(str(image_table))
-    from imageio_ffmpeg import get_ffmpeg_exe
-    from transformers import Wav2Vec2FeatureExtractor
-
-    clips = root / "clips"
-    clips.mkdir()
-    video = clips / "00.mp4"
-    subprocess.run([get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i",
-                    "testsrc=size=16x16:rate=25", "-f", "lavfi", "-i", "sine=frequency=1000:sample_rate=16000",
-                    "-t", "2", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", str(video)], check=True)
-    for index in range(1, 12):
-        shutil.copyfile(video, clips / f"{index:02}.mp4")
-    audio = root / "audio"
-    Wav2Vec2FeatureExtractor(sampling_rate=16000).save_pretrained(audio)
+    clips, audio = _videos(root)
     backbone = CausalTransformer(vocab_size=256, emb_features=8, num_layers=1, num_heads=2, mlp_features=16)
     objective = DecisionObjective(backbone, tokenizer=ByteTokenizer(), specials=Specials(0, 1, 2, "<mark>", 3),
                                   layout=StateFirstLayout(max_len=128), shuffle_options=True)

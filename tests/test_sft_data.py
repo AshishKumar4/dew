@@ -198,7 +198,7 @@ def test_a_conversation_starting_with_the_assistant_is_refused(tokenizer):
 
 
 def test_chat_messages_needs_a_parquet_path():
-    with pytest.raises(ValueError, match=r"--data.path"):
+    with pytest.raises(ValueError, match=r"source '' needs format="):
         load(Chat(source="", tokenizer=str(TOKENIZER), long="chunk"), batch=8, read="memory",
             validation_records=4 * (8))
 
@@ -208,6 +208,6 @@ def test_an_empty_parquet_file_is_refused(tmp_path):
     import pyarrow.parquet as pq
 
     pq.write_table(pa.table({"prompt": []}), tmp_path / "empty.parquet")
-    with pytest.raises(ValueError, match="holds no conversations"):
+    with pytest.raises(ValueError, match="zero valid target tokens"):
         load(Chat(source=str(tmp_path / "empty.parquet"), tokenizer=str(TOKENIZER), long="chunk"),
             batch=8, read="memory", validation_records=4 * (8))

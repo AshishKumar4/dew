@@ -33,7 +33,8 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         writer.writerows(tickets)
     # The command line `laya-train --data tickets.csv` is, with this run's sizes.
     config = DecisionRunConfig.cli([
-        "--data.source", str(table), "--data.validation.fraction", "0.5", "--data.question", "team",
+        "--data.source", str(table), "--data.validation", json.dumps({"class": "dew.data.recipes:HoldOut",
+            "fields": {"fraction": 0.5, "by": "random", "most": 400}}), "--data.question", "team",
         "--loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
             {"class": "dew.decision.scoring:Combined",
              "fields": {"terms": [[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}),
@@ -171,7 +172,7 @@ def test_the_encoder_recipe_trains_a_fresh_head_on_a_decontaminated_mixture(tmp_
 
 def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
     objective = DecisionObjective(Decide.from_pretrained(TINY),
-                                  layout=JointLayout(max_len=128, max_state_tokens=32))
+                                  layout=JointLayout(max_len=512, max_state_tokens=32))
     short = [Example.of(row) for row in _requests(4, joint=True)]
     too_many = Choice("Which?", [f"option {index}" for index in range(200)])
     long = [Example(f"long {index}", {"team": too_many}, {"team": 0}) for index in range(3)]
@@ -270,7 +271,7 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
     assert jax.tree.structure(changed) == jax.tree.structure(unbroken)
     for ours, theirs in zip(leaves(changed), leaves(unbroken), strict=True):
         np.testing.assert_allclose(ours, theirs, rtol=1e-4, atol=1e-6)
-    with pytest.raises(ValueError, match="record count"):
+    with pytest.raises(ValueError, match="saved data plan order changed"):
         run(tmp_path / "changed", 6, "--data-seed", "1")
 
 

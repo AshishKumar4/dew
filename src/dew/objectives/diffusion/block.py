@@ -204,6 +204,13 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.ema = EMASpec.constant(ema_decay)
         self.head_chunks = head_chunks
 
+    def data(self, tokenizer=None):
+        from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.text import FixedTokens
+
+        geometry = FixedTokens(self.sequence_length, pad_id=self.pad_token_id)
+        return ObjectiveData(train=(geometry,), evaluate=(geometry,))
+
     def task_record(self) -> Mapping[str, JSON]:
         """The sequence length, canvas budget, tokenizer and block process."""
         from dew.diffusion.block import BlockProcess

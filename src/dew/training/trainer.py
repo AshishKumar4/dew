@@ -2144,6 +2144,7 @@ class Trainer(Generic[Loss, Effects]):
             if self.rollout is not None:
                 scalars["train/rollout_seconds"] = interval.rollout_seconds
                 scalars.update({f"rollout/{name}": float(value) for name, value in read["rollout"].items()})
+            scalars.update(self.dataset.statistics())
             self._display.interval(step, scalars)
             if self.tracker is not None:
                 self.tracker.log(scalars, step)

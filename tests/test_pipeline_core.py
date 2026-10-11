@@ -232,7 +232,7 @@ def test_lambda_identity_requires_explicit_non_exact_resume():
 
 def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     stored = source(8)
-    cache = Cache(str(tmp_path / "cache"), shard_bytes=2048, spool_bytes=65536)
+    cache = Cache(str(tmp_path / "cache"), shard_bytes=2048, spool_bytes=2 * 1024**2)
     prefix = Pipeline(stored).cache(cache)
 
     def build(prefix):
@@ -286,5 +286,58 @@ def test_validation_takes_accepted_rows_before_the_share_cut():
         held = data.val(DataPartition(share, 2))
         rows = list(held)
         assert len(rows) == 1
-        assert rows[0]["id"][rows[0][VALID_ROWS]].tolist() == ([1, 5] if share == 0 else [3])
+        valid = rows[0].get(VALID_ROWS, np.ones(len(rows[0]["id"]), bool))
+        assert rows[0]["id"][valid].tolist() == ([1, 5] if share == 0 else [3])
         held.close()
+
+
+@dataclasses.dataclass(frozen=True)
+class PhysicalMemory(Memory):
+    shard_rows: tuple[int, ...] = (4, 6, 10)
+
+    def locality(self):
+        return self.shard_rows, False
+
+
+def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
+    stored = PhysicalMemory(source(20).values)
+    configured = Pipeline(stored).shuffle(11, block_shards=2).repeat().batch(4)
+    data = compile(configured, read="memory", loading=READ)
+    reader = data.train(DataPartition())
+    first = take(reader, 5)
+    ids = [value for batch in first for value in batch["id"]]
+    assert sorted(ids) == list(range(20))
+    state = reader.get_state()
+    rest = take(reader, 4)
+    reader.close()
+    resumed = data.train(DataPartition())
+    resumed.set_state(state)
+    assert take(resumed, 4) == rest
+    resumed.close()
+    from dew.data.ordering import BlockShuffle
+
+    blocked = BlockShuffle(grain.MapDataset.source(stored.values), stored.shard_rows, 2, 11)
+    order, ends = blocked._epoch(0)
+    assert len(order) == 3
+    start = 0
+    original_ends = np.cumsum(stored.shard_rows)
+    for end in ends:
+        selected = {int(np.searchsorted(original_ends, blocked.index(index), side="right"))
+                    for index in range(start, int(end))}
+        assert len(selected) <= 2
+        start = int(end)
+    changed = compile(Pipeline(stored).shuffle(11, block_shards=3).repeat().batch(4),
+                      read="memory", loading=READ).train(DataPartition())
+    with pytest.raises(ValueError, match="block_shards"):
+        changed.set_state(state)
+    changed.close()
+
+
+def test_token_mixer_probes_an_unselected_tiny_share_before_emitting_a_row():
+    parents = [grain.MapDataset.source([{"targets": 3}]).repeat().to_iter_dataset(),
+               grain.MapDataset.source([{"targets": 0}]).repeat().to_iter_dataset()]
+    reader = iter(TokenDeficit(parents, [1, 1e-9], tokens=Targets(), names=["normal", "broken"],
+                              budget=SearchBudget(consecutive=3, seconds=None)))
+    with pytest.raises(ValueError, match="broken.*budget exhausted"):
+        next(reader)
+    reader.close()

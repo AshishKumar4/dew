@@ -48,7 +48,7 @@ from dew.cache import default_compilation_cache_dir, dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
 from dew.coordination import agree_process_phase, agreed
-from dew.data import Dataset, Images, Loading, Ramp, Read, Recipe, load
+from dew.data import Augment, Dataset, HoldOut, Images, Loading, Ramp, Read, Recipe, load
 from dew.data.dataset import Reader, ramped, record_argument
 from dew.files import write_atomically
 from dew.lora import AdapterRecord, LoRA
@@ -596,8 +596,12 @@ class TrainerConfig:
     """The number of latest checkpoints kept, besides the best one."""
     best: Annotated[str | Best | tuple[Best, ...] | None, _best_argument()] = None
     """The metric name and ranking policy; None selects validation loss or training loss."""
-    batch_size: int = 32
-    """The global batch size, over every process."""
+    batch_size: int | None = 32
+    """The global row batch; None selects token-budget batching."""
+    batch_tokens: int | None = None
+    """The micro-batch's token budget; set batch_size=None to select it."""
+    update_tokens: int | None = None
+    """The optimizer update's token budget, a whole number of micro-batches."""
     key: int = 0
     """The seed of the run key, which sets parameter init and every per-step draw."""
     steps: int | None = None
@@ -664,6 +668,20 @@ class TrainerConfig:
     """
 
     def __post_init__(self):
+        if (self.batch_tokens is None) != (self.update_tokens is None):
+            raise ValueError("--trainer.batch-tokens and --trainer.update-tokens must be set together")
+        if self.batch_tokens is not None:
+            if self.batch_size is not None:
+                raise ValueError("token budgets require --trainer.batch-size None together with "
+                                 "--trainer.batch-tokens and --trainer.update-tokens")
+            if self.batch_tokens < 1 or self.update_tokens is None or self.update_tokens < 1:
+                raise ValueError("trainer token budgets must be positive")
+            if self.update_tokens % self.batch_tokens:
+                raise ValueError("--trainer.update-tokens must be a multiple of --trainer.batch-tokens")
+            if self.batch_ramp is not None:
+                raise ValueError("--trainer.batch-ramp grows row batches and cannot use token budgets")
+        elif self.batch_size is None or self.batch_size < 1:
+            raise ValueError("--trainer.batch-size must be positive without token budgets")
         if self.steps is not None and self.epochs is not None:
             raise ValueError("steps and epochs both name the run length; set one")
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
@@ -686,6 +704,18 @@ class TrainerConfig:
             object.__setattr__(
                 self, "best", tuple(rebuilt) if isinstance(self.best, (tuple, list)) else rebuilt[0]
             )
+
+    def derived(self) -> Self:
+        """The trainer settings with token-budget accumulation recorded explicitly."""
+        if self.batch_tokens is None:
+            return self
+        if self.update_tokens is None:
+            raise ValueError("token-budget accumulation requires --trainer.update-tokens")
+        accumulation = self.update_tokens // self.batch_tokens
+        if self.accumulation not in (1, accumulation):
+            raise ValueError("token budgets determine --trainer.accumulation; omit it or match "
+                             f"the derived value {accumulation}")
+        return dataclasses.replace(self, accumulation=accumulation)
 
     def best_policies(self):
         if self.best is None:
@@ -850,7 +880,9 @@ class RunConfig:
     subcommand its flags imply."""
 
     model: ModelConfig = dataclasses.field(default_factory=ModelConfig)
-    data: DataSpec = dataclasses.field(default_factory=lambda: Images(source="tfds://oxford_flowers102"))
+    data: DataSpec = dataclasses.field(default_factory=lambda: Images(
+        source="tfds://oxford_flowers102", split="all", augment=Augment(flip=True, jitter=True),
+        caption_templates=("a photo of a {}",), validation=HoldOut(records=128)))
     data_read: Read = "memory"
     provision: bool = False
     data_seed: int = 0
@@ -1045,11 +1077,13 @@ class RunConfig:
         """Build what this run trains: the objective its record names around
         its model, on its data. A kind of run with settings of its own builds
         from them in its own `prepare`."""
+        self = dataclasses.replace(self, trainer=self.trainer.derived())
         if self.objective is None or self.lora is not None:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        dataset = load(self.data, batch=self.trainer.batch_size, read=self.data_read,
+        dataset = load(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+                       read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
                        validation_records=self.validation_records, objective=objective.data())
         return Prepared(self, lambda name: self.train(objective, dataset, name=name))
@@ -1129,11 +1163,14 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
-        if dataset.batch != self.trainer.batch_size:
+        if self.trainer.batch_size is not None and dataset.batch != self.trainer.batch_size:
             raise ValueError(
                 f"--trainer.batch-size is {self.trainer.batch_size} and this dataset "
                 f"reads {dataset.batch} records a step; load it with "
                 f"load(batch={self.trainer.batch_size})")
+        if dataset.batch_tokens != self.trainer.batch_tokens:
+            raise ValueError(f"dataset.batch_tokens is {dataset.batch_tokens}, but trainer.batch_tokens is "
+                             f"{self.trainer.batch_tokens}; compile data with the trainer's token budget")
         if self.trainer.quantization is not None:
             quantize_trunk(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
@@ -1143,7 +1180,8 @@ class RunConfig:
         # Before the run length, since a ramp reads fewer records a step early
         # and a pass over the data is that many steps longer.
         dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
-        summary = {**(summary or {}), **({} if dataset.plan is None else {"data_plan": dataset.plan.record()})}
+        if dataset.plan is not None:
+            summary = {**(summary or {}), "data_plan": dataset.plan.record()}
         steps = trainer.total_steps(dataset)
         tracker = None
         try:

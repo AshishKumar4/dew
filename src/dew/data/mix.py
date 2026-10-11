@@ -6,6 +6,8 @@ import dataclasses
 import logging
 import math
 import time
+import threading
+from typing import overload
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from fractions import Fraction
@@ -96,10 +98,12 @@ class _KeepAccepted:
             if not isinstance(element, Rejected):
                 self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
                 self.counts.chunks += int(element.get("_dew_chunks", 0))
+            self._probe()
             self.consecutive, self.started = 0, None
             return True
         self.counts.rejected[reason] += 1
         self.consecutive += 1
+        self._probe()
         now = time.monotonic()
         if self.started is None:
             self.started = now
@@ -123,6 +127,11 @@ class _KeepAccepted:
                 "this is not a proof that the corpus is empty"
             )
         return False
+
+    def _probe(self) -> None:
+        if self.counts.attempted == 16:
+            _log.info("corpus %s: estimated rejection share over first 16 attempted records %.4f",
+                      self.counts.name, sum(self.counts.rejected.values()) / 16)
 
 
 class _AcceptedIterator(pygrain.DatasetIterator[Batch]):
@@ -204,13 +213,24 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         super().__init__(parents)
         self._reads, self._weights, self._tokens = tuple(parents), weights, tokens
         self._delivered = [0] * len(parents)
+        self._pending: list[Batch | None] = [None] * len(parents)
+        self._pending_states: list[Mapping[str, object] | None] = [None] * len(parents)
+        self._primed = False
 
     def __next__(self) -> Batch:
+        if not self._primed:
+            for index, parent in enumerate(self._reads):
+                self._pending_states[index] = parent.get_state()
+                self._pending[index] = next(parent)
+            self._primed = True
         total = sum(self._delivered)
         scale = sum(self._weights)
         chosen = max(range(len(self._reads)),
                      key=lambda index: self._weights[index] * total - self._delivered[index] * scale)
-        value = next(self._reads[chosen])
+        value = self._pending[chosen]
+        if value is None:
+            value = next(self._reads[chosen])
+        self._pending[chosen], self._pending_states[chosen] = None, None
         tokens = self._tokens(value)
         if tokens <= 0:
             raise RuntimeError(
@@ -220,7 +240,9 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         return value
 
     def get_state(self) -> Mapping[str, object]:
-        return {"parents": [parent.get_state() for parent in self._reads], "delivered": list(self._delivered)}
+        return {"parents": [pending if value is not None and pending is not None else parent.get_state()
+                            for parent, value, pending in zip(self._reads, self._pending, self._pending_states, strict=True)],
+                "delivered": list(self._delivered)}
 
     def set_state(self, state: Mapping[str, object]) -> None:
         delivered = integers(state["delivered"], "delivered targets")
@@ -236,6 +258,7 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
         for parent, saved in zip(self._reads, parents, strict=True):
             parent.set_state(record(saved, "corpus iterator"))
         self._delivered = list(delivered)
+        self._pending, self._pending_states, self._primed = [None] * len(self._reads), [None] * len(self._reads), False
 
     def close(self) -> None:
         for parent in self._reads:
@@ -273,6 +296,121 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         return _DeficitIterator([iter(parent) for parent in self._corpora], self._weights, self._tokens)
+
+
+class _PrimeMap:
+    def __init__(self, parents: Sequence[pygrain.MapDataset[Batch]], names: Sequence[str]):
+        self.parents, self.names = tuple(parents), tuple(names)
+        self.lock = threading.Lock()
+        self.done = False
+        self.pending: dict[int, Batch] = {}
+
+    def read(self, parent: int, index: int) -> Batch | None:
+        with self.lock:
+            if not self.done:
+                for corpus, dataset in enumerate(self.parents):
+                    try:
+                        row = dataset[0]
+                    except (ValueError, TypeError, KeyError) as error:
+                        raise ValueError(f"corpus {self.names[corpus]} failed its first record: {error}") from error
+                    if row is not None:
+                        self.pending[corpus] = row
+                self.done = True
+            if index == 0 and parent in self.pending:
+                return self.pending.pop(parent)
+        return self.parents[parent][index]
+
+    def __getstate__(self):
+        return {name: value for name, value in self.__dict__.items() if name != "lock"}
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self.lock = threading.Lock()
+
+
+class PrimedMap(pygrain.MapDataset[Batch]):
+    def __init__(self, parent: pygrain.MapDataset[Batch], group: _PrimeMap, index: int):
+        super().__init__(parent)
+        self._records, self._group, self._index = parent, group, index
+
+    def __len__(self) -> int:
+        return len(self._records)
+
+    @overload
+    def __getitem__(self, index: int) -> Batch | None: ...
+    @overload
+    def __getitem__(self, index: slice) -> pygrain.MapDataset[Batch]: ...
+    def __getitem__(self, index: int | slice) -> Batch | pygrain.MapDataset[Batch] | None:
+        return self.slice(index) if isinstance(index, slice) else self._group.read(self._index, index)
+
+
+def primed_maps(parents: Sequence[pygrain.MapDataset[Batch]], names: Sequence[str]
+                ) -> tuple[pygrain.MapDataset[Batch], ...]:
+    group = _PrimeMap(parents, names)
+    return tuple(PrimedMap(parent, group, index) for index, parent in enumerate(parents))
+
+
+class _PrimeReads:
+    def __init__(self, parents: Sequence[pygrain.DatasetIterator[Batch]], names: Sequence[str]):
+        self.parents, self.names = tuple(parents), tuple(names)
+        self.pending: dict[int, Batch] = {}
+        self.before: dict[int, Mapping[str, object]] = {}
+        self.done = False
+
+    def read(self, index: int) -> Batch:
+        if not self.done:
+            for corpus, parent in enumerate(self.parents):
+                self.before[corpus] = parent.get_state()
+                try:
+                    self.pending[corpus] = next(parent)
+                except (ValueError, TypeError, KeyError) as error:
+                    raise ValueError(f"corpus {self.names[corpus]} failed its first record: {error}") from error
+            self.done = True
+        if index in self.pending:
+            self.before.pop(index, None)
+            return self.pending.pop(index)
+        return next(self.parents[index])
+
+
+class _PrimedRead(pygrain.DatasetIterator[Batch]):
+    def __init__(self, group: _PrimeReads, index: int):
+        super().__init__(group.parents[index])
+        self._group, self._index = group, index
+
+    def __next__(self) -> Batch:
+        return self._group.read(self._index)
+
+    def get_state(self) -> Mapping[str, object]:
+        return self._group.before.get(self._index, self._group.parents[self._index].get_state())
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._group.parents[self._index].set_state(state)
+        self._group.pending.pop(self._index, None)
+        self._group.before.pop(self._index, None)
+        self._group.done = False
+
+    def close(self) -> None:
+        self._group.parents[self._index].close()
+
+
+class _ReadDataset(pygrain.IterDataset[Batch]):
+    def __init__(self, parent: pygrain.IterDataset[Batch], group: _PrimeReads, index: int):
+        super().__init__(parent)
+        self._group, self._index = group, index
+
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        return _PrimedRead(self._group, self._index)
+
+
+class PrimedMix(pygrain.IterDataset[Batch]):
+    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float], names: Sequence[str]):
+        super().__init__(parents)
+        self._corpora, self._weights, self._names = tuple(parents), tuple(weights), tuple(names)
+
+    def __iter__(self) -> pygrain.DatasetIterator[Batch]:
+        group = _PrimeReads([iter(parent) for parent in self._corpora], self._names)
+        parents = [_ReadDataset(parent, group, index) for index, parent in enumerate(self._corpora)]
+        return iter(pygrain.IterDataset.mix(parents, self._weights))
 
 
 def state_counts(state: Mapping[str, object]) -> dict[str, CorpusCounts]:

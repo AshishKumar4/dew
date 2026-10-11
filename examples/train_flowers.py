@@ -32,8 +32,9 @@ class Config:
 
 def main(config: Config):
     data = load(Images(
-        source=TFDS("oxford_flowers102", path=str(config.data.expanduser())),
+        source=TFDS("oxford_flowers102", split="train", path=str(config.data.expanduser())),
         image_size=64,
+        caption_templates=("a photo of a {}",),
         augment=Augment(flip=True, jitter=True),
     ), batch=config.batch, read="memory",
         loading=Loading(workers=2, threads=2, read_buffer=16, worker_buffer=2))

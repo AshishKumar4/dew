@@ -296,6 +296,13 @@ def resolve_alias(annotation: Annotation) -> Annotation:
     return annotation
 
 
+def _union_members(annotation: Annotation) -> tuple[Annotation, ...]:
+    annotation = resolve_alias(annotation)
+    if typing.get_origin(annotation) in (Union, types.UnionType):
+        return tuple(inner for member in typing.get_args(annotation) for inner in _union_members(member))
+    return (annotation,)
+
+
 def _unwrapped(annotation: Annotation) -> Annotation:
     """Return `annotation` with an Optional looked through. A union of several
     members says nothing about its entries and answers None."""
@@ -330,7 +337,17 @@ def wants_tuple(annotation: Annotation) -> bool:
             or typing.get_origin(annotation) in (tuple, Sequence))
 
 
-def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT:
+@overload
+def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: bool = True) -> ValueT: ...
+
+
+@overload
+def from_record(annotation: types.UnionType | types.TypeAliasType, value: Configured, *,
+                dtypes: bool = True) -> object: ...
+
+
+def from_record(annotation: type | types.UnionType | types.TypeAliasType, value: Configured, *,
+                dtypes: bool = True) -> object:
     """Return `value` as the class `annotation` names, from a record or already one.
 
     The class is the witness: what comes back is an instance of it or a
@@ -344,7 +361,9 @@ def from_record[ValueT](annotation: type[ValueT], value: Configured, *, dtypes: 
     """
     with _reading(value):
         built = _rebuilt(annotation, value, dtypes=dtypes)
-    witness: type[ValueT] = typing.get_origin(annotation) or annotation
+    if isinstance(annotation, (types.UnionType, types.TypeAliasType)):
+        return built
+    witness = typing.get_origin(annotation) or annotation
     if not isinstance(built, witness):
         raise ValueError(f"{value!r} builds {type(built).__name__}, "
                          f"not the {witness.__name__} the field declares")
@@ -493,7 +512,7 @@ def _rebuilt(annotation: Annotation, value: object, *, dtypes: bool, name: str =
     if typing.get_origin(annotation) in (Union, types.UnionType):
         if value is None:
             return value
-        inner = [member for member in typing.get_args(annotation) if member is not type(None)]
+        inner = [member for member in _union_members(annotation) if member is not type(None)]
         if len(inner) == 1:
             return _rebuilt(inner[0], value, dtypes=dtypes)
         classes = tuple(member for member in inner if isinstance(member, type))

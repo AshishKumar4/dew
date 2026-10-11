@@ -19,7 +19,7 @@ from affine_run import TimingRegression as Regression, batches
 
 from dew.artifacts import Representations
 from dew.data import DataPartition, Dataset
-from dew.data.dataset import tokenized
+from dew.data.dataset import mapped
 from dew.data.tokens import bounded
 from dew.training import Checkpoints, MeshSpec, ProfileWindow, Trainer
 from dew.training.distributed import DevicePrefetchIterator
@@ -179,7 +179,7 @@ def test_tokenized_stop_interrupts_next_then_finalizes_on_its_owner():
             owners.append(threading.get_ident())
             closed.set()
 
-    wrapped = tokenized(lambda partition: Blocking(), None)(DataPartition())
+    wrapped = mapped(lambda partition: Blocking(), dict)(DataPartition())
     with DevicePrefetchIterator(wrapped, MeshSpec().build()) as stream:
         consumer = threading.Thread(target=lambda: list(stream))
         consumer.start()
@@ -434,7 +434,7 @@ def test_wrapped_cancellation_reaches_source_during_finalization(limited):
     def opened(partition):
         return Finalizing()
 
-    wrapped = (bounded(opened, 1) if limited else tokenized(opened, None))(DataPartition())
+    wrapped = (bounded(opened, 1) if limited else mapped(opened, dict))(DataPartition())
     stream = DevicePrefetchIterator(wrapped, MeshSpec().build())
     consumer = threading.Thread(target=lambda: list(stream))
     consumer.start()

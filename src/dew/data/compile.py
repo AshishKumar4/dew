@@ -30,12 +30,13 @@ from dew.data.dataset import (
     Loading,
     Position,
     Reader,
+    Records,
     _Grouped,
     _WorkerBatches,
     weight_counts,
     rows_of,
 )
-from dew.data.mix import Accepted, CorpusCounts, SearchBudget, TokenDeficit, state_counts, token_weights
+from dew.data.mix import Accepted, CorpusCounts, PrimedMix, SearchBudget, TokenDeficit, primed_maps, state_counts, token_weights
 from dew.data.pipeline import (
     Artifact,
     BatchStage,
@@ -77,7 +78,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
 from dew.data.sources.base import Read, ShardManifest, Source
-from dew.records import integer, record
+from dew.records import JSON, integer, json_value, record
 
 type Rows = pygrain.MapDataset | pygrain.IterDataset
 _log = logging.getLogger(__name__)
@@ -93,6 +94,16 @@ class _Provisionable(Protocol):
 @runtime_checkable
 class _Finishable(Protocol):
     def finish(self) -> None: ...
+
+
+@runtime_checkable
+class _Locality(Protocol):
+    def locality(self) -> tuple[tuple[int, ...], bool]: ...
+
+
+@runtime_checkable
+class _OrderFacts(Protocol):
+    def order_fingerprints(self) -> Mapping[str, str]: ...
 
 
 def _leaves(pipeline: Pipeline) -> Iterator[Pipeline]:
@@ -159,7 +170,17 @@ def _promoted(pipeline: Pipeline) -> tuple[Pipeline, tuple[str, ...]]:
         references = tuple(reference for _, held in branches for reference in held)
     for index, stage in enumerate(pipeline.stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            return (dataclasses.replace(pipeline, source=stage.cache.source(), stages=pipeline.stages[index + 1:]),
+            from dew.data.packing import PackedSource, plan_name
+
+            suffix = pipeline.stages[index + 1:]
+            promoted: Source = stage.cache.source()
+            if suffix and isinstance(suffix[0], Pack):
+                pack = suffix[0]
+                plans = record(stage.cache.manifest.get("plan", {}), "published plans")
+                if plan_name(pack, "accepted") in plans:
+                    promoted = PackedSource(promoted, stage.cache, pack)
+                    suffix = suffix[1:]
+            return (dataclasses.replace(pipeline, source=promoted, stages=suffix),
                     (*references, f"generation {stage.cache.url}"))
     return dataclasses.replace(pipeline, source=source), references
 
@@ -424,6 +445,16 @@ class _Memory:
     def lengths(self) -> np.ndarray | None:
         return self.measured
 
+    def locality(self) -> tuple[tuple[int, ...], bool]:
+        if not isinstance(self.original, _Locality) or any(len(identifier) != 1
+                                                          for identifier in self.identifiers):
+            raise ValueError("block shuffle needs an unchanged physical shard index")
+        sizes, remote = self.original.locality()
+        ends = np.cumsum(sizes)
+        selected = np.bincount([int(np.searchsorted(ends, identifier[0], side="right"))
+                               for identifier in self.identifiers], minlength=len(sizes))
+        return tuple(int(size) for size in selected), remote
+
     def manifest(self) -> ShardManifest:
         raise ValueError("materialized records are read by index")
 
@@ -437,10 +468,16 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
         return _memory_mixture(pipeline, pipeline.source, counts, groups, training=training)
     source = pipeline.source
     stored = source.records("memory")
-    rows: list[tuple[tuple[int, ...], Record]] = []
     counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline)))
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
+    rows, consumed = _memory_inputs(pipeline, source, stored, counter)
+    return _memory_stages(pipeline, source, stored, rows, consumed, counter, groups, training=training)
+
+
+def _memory_inputs(pipeline: Pipeline, source: Source, stored: Records, counter: CorpusCounts
+                    ) -> tuple[list[tuple[tuple[int, ...], Record]], int]:
+    rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
     artifact_at = next(
         (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Artifact)), None
@@ -480,6 +517,12 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
             else:
                 identifier = source.identifiers[index] if isinstance(source, _Memory) else (index,)
                 rows.append((identifier, value))
+    return rows, consumed
+
+
+def _memory_stages(pipeline: Pipeline, source: Source, stored: Records,
+                    rows: list[tuple[tuple[int, ...], Record]], consumed: int,
+                    counter: CorpusCounts, groups: LengthGroups | None, *, training: bool) -> Pipeline:
     derived: dict[str, str] = {}
     for stage in pipeline.stages[consumed:]:
         if not isinstance(stage, (Map, MapWithIndex, Filter, FlatMap, Pack, Windows, TokenSplit)):
@@ -624,12 +667,13 @@ def _memory_order(pipeline: Pipeline, collected: Sequence[tuple[tuple[int, ...],
 
 
 def _measured_bounds(rows: Sequence[Batch]) -> Mapping[str, object]:
-    bounds: Batch = {}
+    bounds: dict[str, JSON] = {}
 
-    def merge(target: Batch, given: Mapping[str, object]) -> None:
+    def merge(target: dict[str, JSON], given: Mapping[str, object]) -> None:
         for key, value in given.items():
             if isinstance(value, Mapping):
-                previous = dict(record(target.get(key, {}), key))
+                previous = {name: json_value(datum, name)
+                            for name, datum in record(target.get(key, {}), key).items()}
                 merge(previous, value)
                 target[key] = previous
             else:
@@ -914,7 +958,8 @@ class _Build:
                         [integer(stated["valid_targets"], "valid_targets") for stated in metadata],
                     )
                 measured = [length for length in lengths if length is not None]
-                return pygrain.MapDataset.mix(mapped, weights).seed(self.seed), (
+                checked = primed_maps(mapped, [_name(child) for child in source.pipelines])
+                return pygrain.MapDataset.mix(checked, weights).seed(self.seed), (
                     pygrain.MapDataset.mix(measured, weights) if len(measured) == len(parents) else None
                 )
             streams = [
@@ -929,7 +974,7 @@ class _Build:
                     names=[_name(child) for child in source.pipelines],
                     budget=self.budget,
                 ), None
-            return pygrain.IterDataset.mix(streams, source.weights), None
+            return PrimedMix(streams, source.weights, [_name(child) for child in source.pipelines]).seed(self.seed), None
         if self.read == "streamed":
             from dew.data.shards import streamed
 
@@ -1031,6 +1076,8 @@ class _Build:
         if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
             return self.record_stage(rows, lengths, stage, pipeline)
         if isinstance(stage, Shuffle):
+            if stage.block_shards is not None:
+                return self.block_shuffle(rows, lengths, stage, pipeline, partition)
             if isinstance(rows, pygrain.MapDataset):
                 rows = (
                     rows.shuffle(stage.seed)
@@ -1106,6 +1153,24 @@ class _Build:
             if self.read != "streamed":
                 raise ValueError("interleave needs a shard-manifest source")
         return rows, lengths
+
+    def block_shuffle(self, rows: Rows, lengths: pygrain.MapDataset | None, stage: Shuffle,
+                      pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
+        from dew.data.ordering import BlockShuffle, PermutedLengths
+
+        if not isinstance(rows, pygrain.MapDataset) or not isinstance(pipeline.source, _Locality):
+            raise ValueError(f"block shuffle of {_name(pipeline)} needs an indexed source with physical shard counts")
+        if stage.block_shards is None:
+            raise ValueError("block shuffle needs a block_shards size")
+        sizes, _ = pipeline.source.locality()
+        if not self.global_order and self.training:
+            starts = np.cumsum((0, *sizes[:-1]))
+            sizes = tuple(max(0, math.ceil((int(start) + size - partition.index) / partition.count)
+                                 - math.ceil((int(start) - partition.index) / partition.count))
+                          for start, size in zip(starts, sizes, strict=True))
+        blocked = BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
+        lengths = None if lengths is None else PermutedLengths(lengths, blocked.index)
+        return blocked, lengths
 
     def record_stage(self, rows: Rows, lengths: pygrain.MapDataset | None,
                      stage: Map | RandomMap | MapWithIndex | Filter | FlatMap,
@@ -1281,8 +1346,15 @@ def _derived(pipeline: Pipeline, seed: int, read: Read) -> Mapping[str, str]:
         if isinstance(source, _Memory):
             arrays.update({f"{index}/{key}": value for key, value in source.derived.items()})
         lengths = source.lengths()
-        if lengths is not None:
+        if isinstance(source, _OrderFacts):
+            arrays.update({f"{index}/{key}": value for key, value in source.order_fingerprints().items()})
+        if lengths is not None and f"{index}/lengths" not in arrays:
             arrays[f"{index}/lengths"] = fingerprint(lengths)
+        if any(isinstance(stage, Shuffle) and stage.block_shards is not None for stage in leaf.stages):
+            if not isinstance(source, _Locality):
+                raise ValueError(f"source {_name(leaf)} does not state physical shard locality")
+            sizes, _ = source.locality()
+            arrays[f"{index}/physical_shards"] = fingerprint(list(sizes))
         if read != "streamed":
             arrays[f"{index}/index"] = fingerprint([len(source.records(read)), seed])
         metadata = source.metadata()
@@ -1766,6 +1838,19 @@ def publish(pipeline: Pipeline, cache, *, read: Read = "streamed", provision: bo
         raise TypeError("publish needs a Cache destination")
     if isinstance(pipeline.source, (Mixture, Phases)):
         raise ValueError("publish each source prefix before mixing")
+    _capabilities((pipeline,), read, provision)
+    if any(isinstance(stage, Configured) for stage in pipeline.stages):
+        pipeline = _configured(pipeline, _metadata((pipeline,), read), read)
+    planned = next((index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Pack)), None)
+    builder = None
+    if planned is not None:
+        from dew.data.packing import PackingPlan
+
+        packing = pipeline.stages[planned]
+        if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
+            raise ValueError("publication accepts one terminal packing stage after the cached prefix")
+        builder = PackingPlan(packing)
+        pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:planned])
     cached = pipeline.cache(cache)
     _check(cached, read)
     manifest = _cache_manifest(pipeline.source, pipeline.stages, read)
@@ -1775,4 +1860,4 @@ def publish(pipeline: Pipeline, cache, *, read: Read = "streamed", provision: bo
             pass
     finally:
         iterator.close()
-    return cache.publish(manifest, pipeline.source)
+    return cache.publish(manifest, pipeline.source, plan=builder)
