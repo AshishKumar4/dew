@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import math
 from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -42,6 +43,11 @@ class Volatile(Protocol):
 
 
 @runtime_checkable
+class SingleReader(Protocol):
+    single_reader: bool
+
+
+@runtime_checkable
 class Expansion(Protocol):
     def flat_map(self, element: Batch) -> Sequence[Batch | Rejected]: ...
 
@@ -57,12 +63,14 @@ class Map:
 class RandomMap:
     step: RandomStep
     identity: str | None = None
+    rejects: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
 class MapWithIndex:
     step: Callable[[int, Batch], Batch | Rejected]
     identity: str | None = None
+    rejects: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -209,21 +217,24 @@ class Pipeline:
     def then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
 
-    def map(self, *steps: RecordStep, identity: str | None = None, rejects: bool = False) -> Pipeline:
+    def map(self, *steps: RecordStep, identity: str | None = None, rejects: bool | None = None) -> Pipeline:
+        for step in steps:
+            if isinstance(step, pygrain.RandomMapTransform):
+                raise ValueError(f"stochastic step {type(step).__name__} needs random_map after the cache prefix")
         return self.then(
             *(
-                Map(step, identity, rejects or (isinstance(step, Rejecting) and step.rejects))
+                Map(step, identity, _rejects(step) if rejects is None else rejects)
                 for step in steps
             )
         )
 
     def random_map(self, *steps: RandomStep, identity: str | None = None) -> Pipeline:
-        return self.then(*(RandomMap(step, identity) for step in steps))
+        return self.then(*(RandomMap(step, identity, _rejects(step)) for step in steps))
 
     def map_with_index(
         self, step: Callable[[int, Batch], Batch | Rejected], *, identity: str | None = None
     ) -> Pipeline:
-        return self.then(MapWithIndex(step, identity))
+        return self.then(MapWithIndex(step, identity, _rejects(step)))
 
     def filter(
         self, predicate: Callable[[Batch], bool], *, reason: str = "filtered", identity: str | None = None
@@ -319,3 +330,17 @@ class ObjectiveData:
     group: LengthGroups | None = None
     train_batch: tuple[HostStep, ...] = ()
     evaluate_batch: tuple[HostStep, ...] = ()
+
+
+def _rejects(step: RecordStep | RandomStep | Callable[[int, Batch], Batch | Rejected]) -> bool:
+    if isinstance(step, Rejecting):
+        return step.rejects
+    if isinstance(step, pygrain.MapTransform):
+        method = step.map
+    elif isinstance(step, pygrain.RandomMapTransform):
+        method = step.random_map
+    else:
+        method = step
+    returned = inspect.signature(method).return_annotation
+    return "Rejected" in str(returned) or (
+        returned is inspect.Signature.empty and not isinstance(step, pygrain.RandomMapTransform))

@@ -56,6 +56,7 @@ from dew.data.pipeline import (
     Repeat,
     ShardByHost,
     Shuffle,
+    SingleReader,
     Slice,
     Stage,
     Volatile,
@@ -139,7 +140,7 @@ def _check(pipeline: Pipeline, read: Read, *, validation: bool = False) -> None:
             isinstance(stage, (Filter, FlatMap, Pack, Windows)) and (read != "memory" or random is not None)
         ):
             indexed = False
-        if isinstance(stage, Map) and stage.rejects and read != "memory":
+        if isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects and read != "memory":
             indexed = False
         if isinstance(stage, BatchStage):
             if batched:
@@ -224,7 +225,10 @@ class _Expand:
     stage: FlatMap
 
     def flat_map(self, element: Record) -> Sequence[Record]:
-        return (element,) if isinstance(element, Rejected) else self.stage.step.flat_map(record(element, "flat_map input"))
+        if isinstance(element, Rejected):
+            return (element,)
+        outputs = self.stage.step.flat_map(record(element, "flat_map input"))
+        return outputs or (Rejected("empty_expansion"),)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -252,7 +256,7 @@ class _Prefix:
                 elif isinstance(stage, Filter):
                     emitted.append(_Predicate(stage).map(value))
                 elif isinstance(stage, FlatMap):
-                    emitted.extend(_Expand(stage).flat_map(value))
+                    emitted.extend(stage.step.flat_map(record(value, "cached expansion input")))
                 else:
                     raise ValueError(f"cache prefix contains non-record stage {type(stage).__name__}")
             held = tuple(emitted)
@@ -262,7 +266,7 @@ class _Prefix:
 @dataclasses.dataclass(frozen=True)
 class _CachedOutputs:
     def flat_map(self, outputs: Sequence[Batch | Rejected]) -> Sequence[Batch | Rejected]:
-        return outputs
+        return outputs or (Rejected("empty_expansion"),)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -346,18 +350,20 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
         if isinstance(stage, Windows):
             from dew.data.steps.windows import WindowRecords
 
+            derived[f"accepted_before_windows_{consumed}"] = fingerprint([list(identifier) for identifier, _ in rows])
             windows = WindowRecords(tuple(record(value, "window document") for _, value in rows), stage)
             derived["windows"] = fingerprint([windows.size, stage.seq_len, stage.stride])
             rows = [((index,), windows[index]) for index in range(len(windows))]
         elif isinstance(stage, Pack):
-            from dew.data.tokens import PackedWindows, first_fit
+            from dew.data.tokens import PackedWindows, chunk_lengths, first_fit
 
+            derived[f"accepted_before_pack_{consumed}"] = fingerprint([list(identifier) for identifier, _ in rows])
             documents = tuple(_Payload()(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             packed = PackedWindows(
                 pygrain.MapDataset.source(documents), sizes, stage.seq_len, stage.bins, source.describe()
             )
-            plan, starts = first_fit(sizes, stage.seq_len, stage.bins)
+            plan, starts = first_fit(chunk_lengths(sizes, stage.seq_len), stage.seq_len, stage.bins)
             derived["packing"] = fingerprint([plan.tolist(), starts.tolist()])
             rows = [((index,), packed[index]) for index in range(len(packed))]
         else:
@@ -365,6 +371,8 @@ def _materialize(pipeline: Pipeline, counts: dict[str, CorpusCounts],
             for index, (identifier, value) in enumerate(rows):
                 if isinstance(stage, FlatMap):
                     outputs = stage.step.flat_map(record(value, "expansion input"))
+                    if not outputs:
+                        counter.rejected["empty_expansion"] += 1
                 elif isinstance(stage, MapWithIndex):
                     outputs = (stage.step(index, record(value, "indexed map input")),)
                 else:
@@ -531,19 +539,56 @@ class _Host(Forwarding):
         self._source.set_state(state)
 
 
+class _CanonicalPass:
+    def __init__(self, reader: Reader, partition: DataPartition):
+        import jax
+
+        self._partition = partition
+        self._source = reader(DataPartition()) if jax.process_index() == 0 else None
+
+    def __iter__(self) -> Iterator[Batch]:
+        return self
+
+    def __next__(self) -> Batch:
+        import jax
+        from jax.experimental import multihost_utils
+
+        from dew.coordination import agreed, broadcast_from_process_zero
+        from dew.data.sources.codec import decode, encode
+
+        root = jax.process_index() == 0
+        held = agreed("canonical validation read", lambda: next(self._source, None) if self._source is not None else None)
+        payload = b"" if held is None else encode(held)
+        size = broadcast_from_process_zero(len(payload))
+        if not size:
+            raise StopIteration
+        if jax.process_count() > 1:
+            buffer = np.frombuffer(payload, np.uint8).copy() if root else np.zeros(size, np.uint8)
+            payload = np.asarray(multihost_utils.broadcast_one_to_all(buffer, is_source=root)).tobytes()
+        whole = record(decode(payload), "canonical validation batch")
+        return _ShareBatch(self._partition)(whole)
+
+    def close(self) -> None:
+        if isinstance(self._source, Closeable):
+            self._source.close()
+        self._source = None
+
+
 class _PerShare(Forwarding):
     @property
     def endless(self) -> bool:
-        return True
+        return self._endless
 
     def __init__(
         self,
         open_reader: Callable[[], pygrain.DatasetIterator[Batch]],
         plan: Plan,
         resume: Literal["exact", "non-exact"],
+        *, endless: bool = True,
     ):
         self._open, self._plan = open_reader, plan
         self._resume: Literal["exact", "non-exact"] = resume
+        self._endless = endless
         self._read: pygrain.DatasetIterator[Batch] | None = None
         self._saved: Mapping[str, object] | None = None
 
@@ -592,8 +637,8 @@ def _per_share(pipeline: Pipeline, read: Read) -> bool:
         if any(_per_share(child, read) for child in pipeline.source.pipelines):
             return True
     return any(
-        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact))
-        or (isinstance(stage, Map) and stage.rejects)
+        isinstance(stage, (Filter, FlatMap, Pack, Windows, Interleave, Artifact, Limit, Rebatch))
+        or (isinstance(stage, (Map, MapWithIndex, RandomMap)) and stage.rejects)
         for stage in pipeline.stages
     )
 
@@ -662,7 +707,8 @@ class _Build:
                 seed=self.seed if self.training else None,
                 cycle_length=1,
                 loading=self.loading,
-            ), None
+                epochs=_epochs(pipeline) if self.training else 1,
+            ).seed(self.seed), None
         stored = source.records(self.read)
         rows = pygrain.MapDataset.source(stored).seed(self.seed)
         lengths = source.lengths()
@@ -670,6 +716,8 @@ class _Build:
         if not self.global_order and self.training:
             rows = rows[partition.index :: partition.count]
             measured = None if measured is None else measured[partition.index :: partition.count]
+            if not any(isinstance(stage, Repeat) for stage in pipeline.stages):
+                rows = rows.repeat(None)
         return rows, measured
 
     def records(self, pipeline: Pipeline, partition: DataPartition) -> tuple[Rows, pygrain.MapDataset | None]:
@@ -704,7 +752,8 @@ class _Build:
                     seed=self.seed if self.training else None,
                     cycle_length=cycle,
                     loading=self.loading,
-                )
+                    epochs=_epochs(pipeline) if self.training else 1,
+                ).seed(self.seed)
             else:
                 rows = artifact.cache.mapped(
                     pygrain.MapDataset.source(source.records(self.read)).seed(self.seed),
@@ -720,6 +769,8 @@ class _Build:
         for stage in pipeline.stages[consumed:]:
             if isinstance(stage, (BatchStage, Workers, MapBatch, Rebatch)):
                 break
+            if self.read == "streamed" and isinstance(stage, Repeat) and _root_repeat(pipeline):
+                continue
             rows, lengths = self.stage(rows, lengths, stage, pipeline, partition)
         if not self.global_order:
             rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
@@ -824,8 +875,14 @@ class _Build:
                 lengths = None
         elif isinstance(stage, RandomMap):
             rows = rows.random_map(_Random(stage))
+            if stage.rejects:
+                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
+                lengths = None
         elif isinstance(stage, MapWithIndex):
             rows = rows.map_with_index(stage.step)
+            if stage.rejects:
+                rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
+                lengths = None
         elif isinstance(stage, Filter):
             rows = Accepted(_as_iter(rows, self.loading).map(_Predicate(stage)),
                             _name(pipeline), budget=self.budget)
@@ -843,20 +900,28 @@ class _Build:
         batch_stage = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage))
         shared_size = partition.rows(batch_stage.size)
         size = batch_stage.size if canonical else shared_size
+        workers = _workers(pipeline, self.loading)
+        empty = False
         if isinstance(rows, pygrain.MapDataset):
             if self.training and not any(isinstance(stage, Repeat) for stage in _steps(pipeline)):
                 rows = rows.repeat(None)
+            elif self.training and self.global_order and not _endless(pipeline):
+                rows = rows[:len(rows) // batch_stage.size * batch_stage.size]
             if self.global_order or not self.training:
+                whole = rows
                 rows = rows[offset + partition.index :: partition.count]
-            if self.loading.workers:
-                rows = _WorkerBatches(rows, size, self.loading.worker_count, remainder=not self.training)
+                empty = not self.training and not len(rows) and bool(len(whole))
+                if empty:
+                    rows = whole[:1]
+            if workers:
+                rows = _WorkerBatches(rows, size, workers, remainder=not self.training)
         stream = _as_iter(rows, self.loading).map(_Payload()).batch(
             size,
             drop_remainder=batch_stage.drop_remainder if self.training else False,
             batch_fn=batch_stage.batch_fn,
         )
         if not self.training:
-            stream = stream.map(FilledBatch(size))
+            stream = stream.map(FilledBatch(size, real=not empty))
             if canonical and partition.count > 1:
                 stream = stream.map(_ShareBatch(partition))
         explicit_workers = False
@@ -910,7 +975,7 @@ def _order(pipeline: Pipeline) -> Mapping[str, object]:
     }
 
 
-def _derived(pipeline: Pipeline, seed: int) -> Mapping[str, str]:
+def _derived(pipeline: Pipeline, seed: int, read: Read) -> Mapping[str, str]:
     arrays: dict[str, str] = {}
     for index, leaf in enumerate(_leaves(pipeline)):
         source = leaf.source
@@ -921,8 +986,8 @@ def _derived(pipeline: Pipeline, seed: int) -> Mapping[str, str]:
         lengths = source.lengths()
         if lengths is not None:
             arrays[f"{index}/lengths"] = fingerprint(lengths)
-        if source.supports("indexed"):
-            arrays[f"{index}/index"] = fingerprint([len(source.records("indexed")), seed])
+        if read != "streamed":
+            arrays[f"{index}/index"] = fingerprint([len(source.records(read)), seed])
         metadata = source.metadata()
         if "valid_targets" in metadata:
             arrays[f"{index}/valid_targets"] = fingerprint(
@@ -958,8 +1023,8 @@ def compile(
     _capabilities(pipelines, read, provision)
     if objective is not None:
         shaped = objective if isinstance(objective, ObjectiveData) else objective(_metadata(pipelines, read))
-        train = _objective_branch(train, shaped, train=True)
-        validation = None if validation is None else _objective_branch(validation, shaped, train=False)
+        train = _objective_branch(train, shaped, train=True, read=read)
+        validation = None if validation is None else _objective_branch(validation, shaped, train=False, read=read)
         _check(train, read)
         if validation is not None:
             _check(validation, read, validation=True)
@@ -985,7 +1050,7 @@ def compile(
         "global" if global_order else "per-share",
         manifest,
         _order(train),
-        _derived(train, seed),
+        _derived(train, seed, read),
         cache=tuple(stage.cache.url for stage in _steps(original) if isinstance(stage, Artifact)),
         volatile=any(
             isinstance(stage.step, Volatile) and stage.step.volatile
@@ -1003,6 +1068,9 @@ def compile(
     def training(partition: DataPartition) -> Iterator[Batch]:
         if plan.volatile and partition.readers > 1:
             raise ValueError("volatile pipeline requires one reader per share until its bytes are persisted")
+        for step in train_host:
+            if partition.count > 1 and isinstance(step, SingleReader) and step.single_reader:
+                raise ValueError(f"host stage {type(step).__name__} requires one reader for its batch shape")
         opened: Iterator[Batch]
         if global_order:
             opened = GlobalStream(
@@ -1012,13 +1080,15 @@ def compile(
                 loading,
                 plan=plan,
                 resume=resume,
+                endless=_endless(train),
             )
         else:
             own_plan = dataclasses.replace(
                 plan,
-                topology={"shares": partition.count, "share": partition.index, "workers": loading.workers},
+                topology={"shares": partition.count, "share": partition.index, "workers": _workers(train, loading)},
             )
-            opened = _PerShare(functools.partial(build.batches, train, partition), own_plan, resume)
+            opened = _PerShare(functools.partial(build.batches, train, partition), own_plan, resume,
+                               endless=_endless(train))
         return _Host(opened, train_host) if train_host else opened
 
     held_reader: Reader | None = None
@@ -1027,7 +1097,8 @@ def compile(
         held_host = tuple(stage.step for stage in validation.stages if isinstance(stage, MapBatch)) + host
 
         def validating(partition: DataPartition) -> Iterator[Batch]:
-            held = held_build.batches(validation, partition)
+            held = (_CanonicalPass(functools.partial(held_build.batches, validation), partition)
+                    if read == "streamed" else held_build.batches(validation, partition))
             return _Host(held, held_host) if held_host else held
 
         held_reader = validating
@@ -1048,6 +1119,8 @@ def compile(
             )
         else:
             records = len(source.records(read))
+        if records == 0:
+            raise ValueError(f"corpus {_name(train)} has no accepted rows")
     return Dataset(training, held_reader, records, batch, counts=counts, plan=plan)
 
 
@@ -1057,6 +1130,31 @@ class _ShareBatch:
 
     def __call__(self, batch: Batch) -> Batch:
         return {name: value[self.partition.index :: self.partition.count] for name, value in batch.items()}
+
+
+def _workers(pipeline: Pipeline, loading: Loading) -> int:
+    return next((stage.count for stage in pipeline.stages if isinstance(stage, Workers)), loading.worker_count)
+
+
+def _endless(pipeline: Pipeline) -> bool:
+    stages = tuple(_steps(pipeline))
+    if any(isinstance(stage, Limit) for stage in stages):
+        return False
+    repeats = [stage.epochs for stage in stages if isinstance(stage, Repeat)]
+    return not repeats or any(epochs is None for epochs in repeats)
+
+
+def _root_repeat(pipeline: Pipeline) -> bool:
+    for stage in pipeline.stages:
+        if isinstance(stage, RandomMap):
+            return False
+        if isinstance(stage, Repeat):
+            return True
+    return True
+
+
+def _epochs(pipeline: Pipeline) -> int | None:
+    return next((stage.epochs for stage in pipeline.stages if isinstance(stage, Repeat)), None) if _root_repeat(pipeline) else 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1076,21 +1174,15 @@ class _LengthAt:
         return measured
 
 
-def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool) -> Pipeline:
+def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
     """Put objective record steps on each corpus before its mixture."""
     if isinstance(pipeline.source, Mixture):
-        children = tuple(
-            objective_steps(child, objective, train=train) for child in pipeline.source.pipelines
-        )
+        children = tuple(objective_steps(child, objective, train=train, read=read)
+                         for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
-    at = next(
-        (
-            index
-            for index, stage in enumerate(pipeline.stages)
-            if isinstance(stage, (Shuffle, Repeat, Group, BatchStage))
-        ),
-        len(pipeline.stages),
-    )
+    boundary = (Shuffle, Repeat, Group, BatchStage) if read == "memory" else (Group, BatchStage)
+    at = next((index for index, stage in enumerate(pipeline.stages) if isinstance(stage, boundary)),
+              len(pipeline.stages))
     suffix = pipeline.stages[at:]
     pipeline = dataclasses.replace(pipeline, stages=pipeline.stages[:at])
     for step in objective.train if train else objective.evaluate:
@@ -1103,17 +1195,12 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     return dataclasses.replace(pipeline, stages=(*pipeline.stages, *suffix))
 
 
-def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool) -> Pipeline:
-    before = next(
-        (
-            index
-            for index, stage in enumerate(pipeline.stages)
-            if isinstance(stage, (Shuffle, Repeat, Group, BatchStage))
-        ),
-        len(pipeline.stages),
-    )
+def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:
+    boundary = (Shuffle, Repeat, Group, BatchStage) if read == "memory" else (Group, BatchStage)
+    before = next((index for index, stage in enumerate(pipeline.stages) if isinstance(stage, boundary)),
+                  len(pipeline.stages))
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:before])
-    prefix = objective_steps(prefix, objective, train=train)
+    prefix = objective_steps(prefix, objective, train=train, read=read)
     branch = dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[before:]))
     if isinstance(branch.source, Mixture):
         children = branch.source.pipelines
@@ -1133,7 +1220,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
                 stages=(*suffixes[0], *branch.stages),
             )
     ordering = tuple(stage for stage in branch.stages if isinstance(stage, (Shuffle, Repeat)))
-    if ordering:
+    if ordering and read == "memory":
         first_random = next(
             (index for index, stage in enumerate(branch.stages) if isinstance(stage, RandomMap)), None
         )
