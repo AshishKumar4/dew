@@ -87,7 +87,8 @@ class Gemma4Experts(nn.Module):
                             out_features=self.out_features, activation=self.activation,
                             capacity_factor=self.capacity_factor, parent=None)
         return (projection_flops(lengths, self.out_features, self.num_experts)
-                + self.top_k * experts.model_flops(lengths))
+                + self.top_k * experts.model_flops(lengths)
+                + projection_flops(lengths, self.top_k, self.out_features))
 
     @nn.compact
     def __call__(self, x, mlp_out, routes: Routes | None = None):
