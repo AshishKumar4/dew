@@ -355,3 +355,54 @@ def test_a_setting_known_to_break_gpu_runs_fails_the_preflight():
     assert len(found) == 1 and found[0].startswith("drive.py:1 sets JAX_EXPLAIN_CACHE_MISSES")
     assert preflight.hazards({"drive.py": "print(1)\n"}, "python drive.py") == []
 
+
+
+def test_only_a_request_that_trains_has_a_step_to_lower(tmp_path):
+    """c58's command reached the Clef recipe through the profile script it staged; c54's bench runs the
+    port's kernels and trains nothing, so it has no step to lower and fails nothing for it."""
+    texts = {"c58.sh": 'bash -c "$C58_PROFILE"\n',
+             "c50_profile.py": "import subprocess\nsubprocess.run(['python', 'recipes/decision/clef.py'])\n"}
+    assert preflight.trains(texts, "C58_PROFILE='python c50_profile.py' bash c58.sh") == ["c50_profile.py:2"]
+    assert preflight.trains({"run.py": "from dew.training import Trainer\n"}, "python run.py") == ["run.py:1"]
+    bench = {"c54_fla_port.py": "from dew.nn.kernels import fla_gdn\n"}
+    assert preflight.trains(bench, "python c54_fla_port.py") == []
+    failures: list[str] = []
+    assert preflight.lowered(tmp_path, "gpu:A100", sys.executable, [], {}, failures) == {
+        "skipped": "no training entry"}
+    assert not failures
+
+
+FAKE_STEP = """import json, os, sys
+print("lowering", file=sys.stderr)
+print(json.dumps({"kernels": {"args": " ".join(sys.argv[1:-1]), "platforms": os.environ["JAX_PLATFORMS"],
+                              "flags": os.environ["XLA_FLAGS"], "path": os.environ["PYTHONPATH"]}}))
+"""
+
+
+def test_a_training_request_lowers_the_refs_clef_step_under_its_own_jax_settings(tmp_path):
+    """The ref's tools/clef_step.py lowers its Clef step for the GPU's generation over one device, on
+    this CPU whatever platform the request names, under the JAX and XLA settings the request's
+    command and shell scripts assign; the receipt keeps the generation, the device count, the
+    settings, the script's digest and the kernels it lowered. A ref without the script, or one
+    whose step does not lower, fails."""
+    tree = tmp_path / "dew"
+    failures: list[str] = []
+    found = preflight.lowered(tree, "gpu:A100", sys.executable, ["<command>:1"], {}, failures)
+    assert len(failures) == 1 and "predates the lowering dry run" in failures[0] and "kernels" not in found
+    write(tree, {"tools/clef_step.py": FAKE_STEP})
+    shell = {"run.sh": "export XLA_FLAGS='--xla_a=1 --xla_b=2'\nJAX_PLATFORMS=cuda python recipes/d/clef.py\n"
+                       "JAX_Z=$W true\n"}
+    env = preflight.lowering_env(shell, "JAX_TRACEBACK_FILTERING=off bash run.sh")
+    assert env == {"JAX_TRACEBACK_FILTERING": "off", "XLA_FLAGS": "--xla_a=1 --xla_b=2",
+                   "JAX_PLATFORMS": "cuda"}
+    failures.clear()
+    found = preflight.lowered(tree, "gpu:G4", sys.executable, ["run.sh:2"], env, failures)
+    assert not failures
+    assert found == {"generation": "sm120", "devices": 1, "env": env, "sites": ["run.sh:2"],
+                     "script": hashlib.sha256(FAKE_STEP.encode()).hexdigest(),
+                     "kernels": {"args": "--lower-for sm120 --devices 1 --work", "platforms": "cpu",
+                                 "flags": "--xla_a=1 --xla_b=2", "path": str(tree / "src")}}
+    write(tree, {"tools/clef_step.py": "import sys\nsys.exit('ValueError: not enough values to unpack')\n"})
+    found = preflight.lowered(tree, "gpu:A100", sys.executable, ["run.sh:2"], {}, failures)
+    assert len(failures) == 1 and "does not lower for sm80" in failures[0]
+    assert "not enough values to unpack" in failures[0] and found["kernels"] is None
