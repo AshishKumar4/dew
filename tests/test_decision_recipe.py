@@ -246,6 +246,8 @@ def test_the_clef_recipe_trains_a_joint_head_under_lora_on_a_frozen_decoder(tmp_
     clef = _module("clef")
     storage = [] if param_dtype == "float32" else ["--param-dtype", param_dtype]
     config = DecisionRunConfig.cli([*_flags(mixture, tmp_path / "runs"), "--pretrained", str(QWEN),
+                                    "--trainer.batch-size", "None", "--trainer.batch-tokens", "8192",
+                                    "--trainer.update-tokens", "8192",
                                     "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                                     "--head.feedforward", "40", "--head.layers", "1",
                                     "--head.routing-layers", "1", "--max-len", "1024", *storage],
@@ -284,9 +286,11 @@ def test_a_bucketed_decision_run_resumes_bitwise_and_after_a_change_that_keeps_i
     mixture = _mixture(tmp_path, _requests(24, joint=True), ["nothing these rows share at all"], held=8)
     clef = _module("clef")
 
-    def run(directory: Path, steps: int, *changed: str):
+    def run(directory: Path, steps: int, *changed):
         flags = _flags(mixture, directory)
         flags[flags.index("--trainer.steps") + 1] = str(steps)
+        flags[flags.index("--trainer.batch-size") + 1] = "None"
+        flags += ["--trainer.batch-tokens", "8192", "--trainer.update-tokens", "8192"]
         flags += ["--pretrained", str(QWEN), "--lora.rank", "4", "--head.width", "24", "--head.heads", "2",
                   "--head.feedforward", "40", "--head.layers", "1", "--head.routing-layers", "1",
                   "--max-len", "1024", "--objective.bucket", "64", "--no-calibrate", *changed]
