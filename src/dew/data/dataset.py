@@ -332,6 +332,11 @@ class Closeable(Protocol):
 
 
 @runtime_checkable
+class Statistical(Protocol):
+    def statistics(self) -> Mapping[str, float]: ...
+
+
+@runtime_checkable
 class Stoppable(Protocol):
     """A stream that can be asked to stop before it is drained."""
 

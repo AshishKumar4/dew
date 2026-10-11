@@ -38,6 +38,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 from dew.checkpoints import Checkpoints, Ranking
 from dew.coordination import agree_process_phase, agreed, agreed_same
 from dew.data.dataset import (
+    Statistical,
     Checkpointable,
     Closeable,
     DataPartition,
@@ -1609,7 +1610,8 @@ class Trainer(Generic[Loss, Effects]):
         if current % plan.log_every == 0:
             interval.check_finite(current, self._display)
             self._log_interval(current, loss, aux, accepted, state, interval,
-                               statistics=plan.dataset.statistics)
+                               statistics=plan.dataset.statistics if isinstance(plan.dataset, Statistical)
+                               else lambda: {})
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already
