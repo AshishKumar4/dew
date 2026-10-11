@@ -29,6 +29,7 @@ def test_memory_columns_snapshot_changes_with_content():
     with pytest.raises(ValueError, match="different row counts"):
         len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
     assert Memory([{"x": np.int16(4)}]).snapshot() != Memory([{"x": np.int32(4)}]).snapshot()
+    assert Memory([{"x": 1}], shard_rows=1).snapshot() != Memory([{"x": 1}], shard_rows=2).snapshot()
 
 
 def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monkeypatch):

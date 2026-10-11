@@ -195,6 +195,11 @@ class TFDS:
     config: str | None = None
     version: str | None = None
     decoders: DecoderTree | None = None
+    shard_rows: int = 1024
+
+    def __post_init__(self) -> None:
+        if self.shard_rows < 1:
+            raise ValueError("TFDS shard_rows must be positive")
 
     @property
     def remote(self) -> bool:
@@ -265,6 +270,7 @@ class TFDS:
             "store": "tfds",
             "name": self.name,
             "split": self.split,
+            "shard_rows": self.shard_rows,
             "directory": self.path if self.remote else directory,
             "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
             "definitions": definitions,
@@ -377,10 +383,10 @@ class TFDS:
                 f"{self.describe()}:{start}",
                 str(self.builder.data_path),
                 start,
-                min(start + 1024, len(rows)),
-                min(1024, len(rows) - start),
+                min(start + self.shard_rows, len(rows)),
+                min(self.shard_rows, len(rows) - start),
             )
-            for start in range(0, len(rows), 1024)
+            for start in range(0, len(rows), self.shard_rows)
         )
         return ShardManifest(shards, self._read_shard)
 

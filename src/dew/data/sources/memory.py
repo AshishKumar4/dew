@@ -76,6 +76,7 @@ class Memory:
             "store": "memory",
             "identity": self.identity,
             "rows": len(rows),
+            "shard_rows": self.shard_rows,
             "sha256": fingerprint(rows[index] for index in range(len(rows))),
         }
 

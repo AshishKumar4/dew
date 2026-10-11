@@ -202,6 +202,7 @@ class Files:
             "columns": self.columns,
             "filter": str(self.filter),
             "partitioning": self.partitioning,
+            "shard_bytes": self.shard_bytes,
             "transport": Store(self.paths[0], self.storage_options).describe() if self.paths else {},
         }
 
@@ -972,6 +973,8 @@ class TokenFiles:
                 "url": self.url,
                 "split": self.split,
                 "metadata": self.meta,
+                "field": self.field,
+                "chunk_tokens": self.chunk_tokens,
                 "shards": Files(
                     self.tokens.paths, format="array_record", storage_options=self.storage_options
                 ).snapshot(),
@@ -985,6 +988,8 @@ class TokenFiles:
             "url": self.url,
             "split": self.split,
             "metadata": self.meta,
+            "field": self.field,
+            "chunk_tokens": self.chunk_tokens,
             "bytes": fs.size(path),
             "version": fs.ukey(path),
         }
