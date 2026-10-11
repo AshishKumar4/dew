@@ -743,7 +743,7 @@ def test_a_packed_validation_pass_covers_the_split_once(tmp_path):
 
 
 def test_only_the_packed_spec_carries_segment_ids_and_positions(tmp_path):
-    _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23], [30, 31]])
+    _document_dir(tmp_path, [[10, 11, 12], [20, 21, 22, 23], [30, 31]] * 2)
 
     packed = next(load(Text(source=str(tmp_path), pack="first-fit", seq_len=8), batch=2, read="memory",
         loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)).train(DataPartition()))
