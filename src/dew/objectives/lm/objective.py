@@ -47,7 +47,7 @@ from dew.nn.flops import MissingFlopsCount, counted_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_losses
-from dew.nn.protocols import CountedLogits, CountedTraining, DecoderTraining, Logits, TokenModel
+from dew.nn.protocols import CountedLogits, CountedLogitsTraining, DecoderTraining, Logits, TokenModel
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
     OMITTED,
@@ -679,7 +679,7 @@ class LMObjective(Objective[Ratio | LMStatistics, Variables]):
         if missing is not None:
             raise MissingFlopsCount(missing)
         self._check_flop_geometry(batch)
-        if not isinstance(model, CountedTraining):
+        if not isinstance(model, CountedLogitsTraining):
             return super().training_flops(model, batch)
         targets = self._prediction_lengths(batch)
         return model.training_flops(self.real_lengths(batch)) + model.logits_training_flops(targets)
