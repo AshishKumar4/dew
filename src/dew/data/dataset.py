@@ -640,6 +640,7 @@ class Dataset:
     ramp: Ramp | None = None
     held_out: int = 0
     counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
+    validation_counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=dict)
     plan: Plan | None = None
 
     @classmethod

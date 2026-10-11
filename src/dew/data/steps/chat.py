@@ -35,7 +35,7 @@ class RenderChat(grain.MapTransform):
     column: str = "messages"
 
     def dependencies(self) -> Mapping[str, object]:
-        return tokenizer_snapshot(self.tokenizer)
+        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
 
     def map(self, element: Batch) -> Batch:
         messages = element.get(self.column, element.get("prompt"))
@@ -59,7 +59,7 @@ class RenderPrompt(grain.MapTransform):
             raise ValueError("prompt max_prompt_len and reward_bytes must be positive")
 
     def dependencies(self) -> Mapping[str, object]:
-        return tokenizer_snapshot(self.tokenizer)
+        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
 
     def map(self, element: Batch) -> Batch | Rejected:
         unknown = element.keys() - set(PROMPT_FIELDS)

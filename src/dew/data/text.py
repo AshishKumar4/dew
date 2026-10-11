@@ -40,7 +40,7 @@ def tokenizer_snapshot(name: str) -> Mapping[str, object]:
     files = {str(path.relative_to(directory)): hashlib.sha256(path.read_bytes()).hexdigest()
              for pattern in ("*.json", "*.jinja", "*.model", "*.txt", "*.tiktoken")
              for path in directory.rglob(pattern) if path.is_file()}
-    return {"name": name, "revision": resolved, "files": files, "directory": str(directory)}
+    return {"name": None if resolved is None else repo, "revision": resolved, "files": files}
 
 
 def load_tokenizer(name: str, *, revision: str | None = None,
