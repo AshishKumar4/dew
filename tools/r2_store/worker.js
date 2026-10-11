@@ -5,11 +5,12 @@
 // `&detail=1` each one's size and ETag beside them, for a bearer of the
 // store's CACHE_TOKEN secret, who may also DELETE /<key>. A GET or HEAD
 // honours If-Match (412 where the object's ETag differs) and If-None-Match
-// (304). A bearer of its READ_TOKEN secret, where one is set, reads the same way and is refused a PUT or a DELETE with a 403.
-// A miss is a 404. A GET with a Range header answers 206 with that
-// slice and its Content-Range. A PUT honours If-None-Match and If-Match
-// (`If-None-Match: *` writes a key only if it is absent) and answers 412
-// where the condition fails; every answer about an object carries its ETag.
+// (304). A bearer of its READ_TOKEN secret, where one is set, reads the same
+// way and is refused a PUT or a DELETE with a 403. A miss is a 404. A GET
+// with a Range header answers 206 with that slice and its Content-Range. A PUT
+// honours If-None-Match and If-Match (`If-None-Match: *` writes a key only if
+// it is absent) and answers 412 where the condition fails; every answer about
+// an object carries its ETag.
 // How long an object lives is its bucket's lifecycle, which provision.sh sets.
 // The largest request body Cloudflare's edge hands a Worker on this account's
 // plan (100 MB); a larger PUT would fail there before the Worker answers.
