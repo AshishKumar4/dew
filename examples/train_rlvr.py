@@ -578,7 +578,7 @@ def main(config: Config) -> dict:
         )
     data = load(Prompts(tokenizer=tokenizer,
         source=tuple(json.loads(row) for row in records(config.tasks, config.seed)),
-                        thinking=config.thinking, max_prompt_len=config.prompt_tokens,
+                        thinking=config.thinking, max_prompt_len=config.prompt_tokens, long="truncate",
                         pad_id=sampling.pad_token_id), batch=config.prompts, read="memory",
                 loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1), seed=config.seed)
     # Every session packs as one chain within the width.

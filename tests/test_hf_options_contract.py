@@ -11,12 +11,15 @@ import pytest
 from dew.data.sources.hub import Hub
 
 
-def test_hub_builder_uses_the_resolved_commit_and_named_configuration(monkeypatch):
+def test_hub_builder_uses_the_resolved_commit_and_named_configuration(tmp_path, monkeypatch):
     import datasets
     from huggingface_hub import HfApi
 
     requested = []
-    expected = object()
+    marker = tmp_path / "dataset_info.json"
+    marker.write_text("{}")
+    expected = SimpleNamespace(cache_dir=str(tmp_path),
+                               as_dataset=lambda **kwargs: SimpleNamespace(cache_files=[]))
     monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo_id, **kwargs: SimpleNamespace(sha="frozen"))
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda repo, **kwargs:
                         requested.append((repo, kwargs)) or expected)
@@ -24,7 +27,7 @@ def test_hub_builder_uses_the_resolved_commit_and_named_configuration(monkeypatc
     assert source.builder is expected
     assert requested == [("acme/records", {"name": "named", "revision": "frozen", "cache_dir": "arrow"})]
     assert source.snapshot() == {"store": "hf", "repo": "acme/records", "revision": "frozen",
-                                 "config": "named", "split": "validation"}
+                                 "config": "named", "split": "validation", "shards": []}
 
 
 def test_hub_bindings_are_frozen():
@@ -64,7 +67,8 @@ source.__dict__['commit'] = 'frozen'
 try:
     source.builder
 except ImportError as error:
-    assert 'datasets is absent' in str(error)
+    assert "pip install 'dewml[streaming]'" in str(error)
+    assert isinstance(error.__cause__, ModuleNotFoundError)
 else:
     raise AssertionError('opening Arrow without datasets succeeded')
 """

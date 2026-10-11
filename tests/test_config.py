@@ -63,6 +63,33 @@ def test_a_field_a_record_lacks_takes_its_default():
     assert RunConfig.from_dict({**record, "trainer": trainer}).trainer.steps == TrainerConfig().steps
 
 
+@pytest.mark.parametrize("fields, message", [
+    ({"batch_tokens": 24}, "must be set together"),
+    ({"update_tokens": 96}, "must be set together"),
+    ({"batch_tokens": 24, "update_tokens": 96}, "--trainer.batch-size None"),
+    ({"batch_size": None, "batch_tokens": 0, "update_tokens": 96}, "must be positive"),
+    ({"batch_size": None, "batch_tokens": 24, "update_tokens": 95}, "must be a multiple"),
+    ({"batch_size": None}, "must be positive without token budgets"),
+])
+def test_token_budget_flags_refuse_an_ambiguous_or_fractional_batch(fields, message):
+    with pytest.raises(ValueError, match=message):
+        TrainerConfig(**fields)
+
+
+def test_token_budgets_derive_the_recorded_accumulation_without_changing_the_requested_config():
+    requested = TrainerConfig(batch_size=None, batch_tokens=24576, update_tokens=98304, steps=1)
+    derived = requested.derived()
+    assert requested.accumulation == 1 and derived.accumulation == 4
+    config = RunConfig(trainer=derived)
+    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
+    assert loaded.trainer.batch_size is None
+    assert loaded.trainer.batch_tokens == 24576 and loaded.trainer.update_tokens == 98304
+    assert loaded.trainer.accumulation == 4
+    conflicting = dataclasses.replace(requested, accumulation=3)
+    with pytest.raises(ValueError, match="derived value 4"):
+        conflicting.derived()
+
+
 def test_a_registered_arrayrecord_spec_round_trips(tmp_path):
     """A registered recipe records its concrete type and source, so the
     fields that from_dict could not rebuild. Registered, it records as

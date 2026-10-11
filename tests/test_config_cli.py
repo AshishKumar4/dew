@@ -12,7 +12,7 @@ import pytest
 from diffusion_stubs import RES, STUB_TEXT
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Memory, Text
+from dew.data import Augment, Dataset, Files, HoldOut, Images, Loading, Text, export
 from dew.data.dataset import record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
@@ -39,8 +39,8 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
         "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model", "simple_dit", "--model.scan_order", "hilbert"])
 
-    assert config.data == Images(source="tfds://oxford_flowers102", image_size=64,
-        augment=Augment(crop_scale=(0.8, 1.0)))
+    assert config.data == dataclasses.replace(DiffusionRunConfig().data, image_size=64,
+                                               augment=Augment(jitter=True, crop_scale=(0.8, 1.0)))
     assert config.preset == Flow(shift=3.0)
     assert config.objective.fields["solver"]["class"] == import_path(Heun)
     assert config.objective.fields["guidance"]["fields"]["scale"] == 2.5
@@ -50,8 +50,7 @@ def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
 
 def test_the_default_dataset_takes_flags_without_naming_its_subcommand():
     config = parse(RunConfig, ["--data.image-size", "96", "--trainer.epochs", "3"])
-    assert config.data == Images(source="tfds://oxford_flowers102",
-        image_size=96) and config.trainer.epochs == 3
+    assert config.data == dataclasses.replace(RunConfig().data, image_size=96) and config.trainer.epochs == 3
 
 
 def test_another_dataset_is_its_subcommand():
@@ -106,6 +105,14 @@ def test_steps_and_epochs_are_one_choice():
         )
 
 
+def test_the_cli_selects_a_token_budget_without_selecting_a_row_batch():
+    config = parse(RunConfig, ["--trainer.batch-size", "None", "--trainer.batch-tokens", "24576",
+                              "--trainer.update-tokens", "98304", "--trainer.steps", "1"])
+    assert config.trainer.batch_size is None
+    assert config.trainer.derived().accumulation == 4
+    assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
+
+
 class _Batches:
     """Endless captioned noise batches that report a position, like grain's.
 
@@ -140,6 +147,8 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     batch = 8
     samples = next(_Batches(5 * batch))
     rows = [{"image": image, "caption": "a flower"} for image in samples["image"]]
+    inputs = tmp_path / "inputs"
+    export(rows, str(inputs), format="array_record")
     config = parse(DiffusionRunConfig, [
         "--text.encoder", STUB_TEXT, "--text.checkpoint", "stub",
         "--data.image-size", str(RES), "--trainer.batch-size", str(batch), "--trainer.steps", "2",
@@ -152,7 +161,7 @@ def test_the_diffusion_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(
     # A validation pass needs a consumer; psnr scores samples against the
     # batch and downloads nothing, unlike the default clip metric.
     config = dataclasses.replace(config, val_metrics=("psnr",), loading=Loading(workers=0),
-                                 data=Images(source=Memory(rows), validation=HoldOut(records=batch),
+                                 data=Images(source=str(inputs), validation=HoldOut(records=batch),
                                              image_size=RES, augment=None))
 
     state = config.run()
@@ -198,6 +207,8 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
     samples = next(_Images())
     rows = [{"image": image, "label": label} for _ in range(5)
             for image, label in zip(samples["image"], samples["label"], strict=True)]
+    inputs = tmp_path / "inputs"
+    export(rows, str(inputs), format="array_record")
     config = parse(
         JepaRunConfig,
         [
@@ -229,7 +240,7 @@ def test_the_jepa_entrypoint_runs_without_a_tracker_and_saves_its_run_spec(tmp_p
     )
 
     config = dataclasses.replace(config, loading=Loading(workers=0),
-                                 data=Images(source=Memory(rows), image_size=size, augment=None))
+                                 data=Images(source=str(inputs), image_size=size, augment=None))
 
     state = config.run()
 

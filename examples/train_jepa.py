@@ -44,9 +44,10 @@ class Config:
 
 def main(config: Config, data=None):
     data = data or load(Images(
-        source=TFDS("oxford_flowers102",
+        source=TFDS("oxford_flowers102", split="all",
                     path=None if config.data_path is None else str(config.data_path.expanduser())),
         image_size=config.image_size,
+        caption_templates=("a photo of a {}",),
         augment=Augment(flip=True, jitter=True), validation=HoldOut(records=4 * config.batch_size),
     ), batch=config.batch_size, provision=config.data_path is None, read="memory")
     steps = config.steps or data.epoch_steps(config.epochs)
