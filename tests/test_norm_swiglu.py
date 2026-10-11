@@ -3,6 +3,11 @@
 Every operand gradient is checked, including the fp32 weight's column sum
 and Dew's bf16 cotangent roundings. Ragged tiles and enough rows to make
 each norm program accumulate multiple blocks exercise the masked paths.
+The variant fixtures hold every output and gradient to 1e-5 maximum
+relative error from XLA. The larger random bf16 stress explicitly permits
+one-ulp midpoint flips from different reduction grouping, and bounds its
+RMS error against float64 by XLA's own error instead. fp32 results, the
+weight gradient included, retain the 1e-5 maximum-relative check.
 """
 
 import functools
@@ -91,6 +96,32 @@ def test_rms_weight_gradient_accumulates_a_full_step_of_rows(dtype):
     x = jnp.broadcast_to(row, (24576, 1000))
     seed = jnp.broadcast_to(seed, x.shape)
     compare(norm_functions(dtype, offset=True, after_cast=True), (x, scale), seed, ("y", "x", "scale"))
+
+
+def test_random_bf16_midpoint_flips_stay_as_exact_as_xla_against_float64():
+    """At Qwen3.5-0.8B's row count the fp32 reductions land on both sides of bf16
+    midpoints. A maximum-relative XLA tolerance of 1e-5 cannot describe a
+    one-ulp flip; every bf16 value is held within one ulp of XLA and every
+    output and gradient to its float64 RMS error budget. The fp32 column
+    sum still meets the maximum-relative 1e-5 tolerance."""
+    operands, seed = norm_operands((24576, 17), jnp.bfloat16, jnp.float32)
+    xla, pallas, exact = norm_functions(jnp.bfloat16, offset=True, after_cast=True)
+    reference = jax.jit(functools.partial(evaluated, xla))(operands, seed)
+    actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
+    cpu = jax.devices("cpu")[0]
+    with jax.enable_x64(new_val=True), jax.default_device(cpu):
+        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), operands)
+        truth = evaluated(exact, wide, jnp.asarray(np.asarray(seed, np.float64)))
+    for label, mine, theirs, want in zip(("y", "x", "scale"), actual, reference, truth, strict=True):
+        assert_as_exact_as_the_reference(mine, theirs, want, label)
+        if mine.dtype == jnp.float32:
+            assert relative(mine, theirs) < 1e-5, label
+        else:
+            expected = np.asarray(theirs, np.float64)
+            above = np.asarray(jnp.nextafter(theirs, jnp.full_like(theirs, jnp.inf)), np.float64)
+            below = np.asarray(jnp.nextafter(theirs, jnp.full_like(theirs, -jnp.inf)), np.float64)
+            assert np.all(np.abs(np.asarray(mine, np.float64) - expected)
+                          <= np.maximum(above - expected, expected - below)), label
 
 
 @pytest.mark.parametrize("input_dtype,output_dtype", [(jnp.bfloat16, jnp.float32),
