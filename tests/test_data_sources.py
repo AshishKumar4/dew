@@ -47,7 +47,7 @@ def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monke
     monkeypatch.setattr(HfApi, "dataset_info", metadata)
     monkeypatch.setattr(HfApi, "list_repo_files", listing)
     with pytest.raises(FileNotFoundError, match=r"original.*converted branch.*provision=True"):
-        Hub("owner/data", revision="original").files
+        _ = Hub("owner/data", revision="original").files
     latest = Hub("owner/data").files
     assert latest.url == ("hf://datasets/owner/data@converted/data/train-00000.parquet",)
 
@@ -244,6 +244,15 @@ def test_corrupt_export_manifest_names_the_object_and_never_falls_back_to_raw_sh
     root.child("_dew_manifest.json").write(b"not-json")
     with pytest.raises(ValueError, match=r"corrupt-export.*_dew_manifest.json"):
         Files(root.url, format="parquet").records("indexed")
+
+
+def test_export_manifest_cannot_reference_an_object_outside_its_root():
+    root = Store(f"memory://escaping-export-{uuid4().hex}/dataset")
+    root.child("_dew_manifest.json").write(
+        json.dumps({"schema": 1, "format": "jsonl", "files": [{"path": "../outside.jsonl"}]}).encode()
+    )
+    with pytest.raises(ValueError, match="stay inside its root"):
+        Files(root.url).manifest()
 
 
 def test_webdataset_groups_members_and_restores_inside_shard():

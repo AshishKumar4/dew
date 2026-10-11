@@ -59,8 +59,10 @@ class Hub:
         if not paths:
             if self.revision is not None:
                 raise FileNotFoundError(
-                    f"HF {self.repo!r}@{revision} split {self.split!r} has no native Parquet, Arrow or JSONL files; "
-                    "pin the converted branch's own commit explicitly, or provision=True for Arrow at this revision"
+                    f"HF {self.repo!r}@{revision} split {self.split!r} "
+                    "has no native Parquet, Arrow or JSONL files; "
+                    "pin the converted branch's own commit explicitly, "
+                    "or provision=True for Arrow at this revision"
                 )
             revision = HfApi().dataset_info(self.repo, revision="refs/convert/parquet").sha
             if revision is None:

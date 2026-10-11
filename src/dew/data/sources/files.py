@@ -432,6 +432,21 @@ class Files:
             raise ValueError("export manifest files must be a list")
         return tuple(integer(record(entry, "export file")["rows"], "export shard rows") for entry in entries)
 
+    def order_fingerprints(self) -> Mapping[str, str]:
+        if self.kind not in ("jsonl", "text", "csv"):
+            return {}
+        if "index_headers" not in self.__dict__ and not self.supports("indexed"):
+            return {}
+        indexes = (self.index,) if self.index else tuple(self._index_url(path) for path in self.paths)
+        known = self.__dict__["index_headers"]
+        headers = []
+        for url in indexes:
+            fs, path = Store(url, self.storage_options).resolve()
+            metadata = known[url]
+            version = metadata.get("sha256") or metadata.get("etag") or metadata.get("ETag")
+            headers.append({"url": url, "version": fs.ukey(path) if version is None else version})
+        return {"row_index": hashlib.sha256(json.dumps(headers, sort_keys=True).encode()).hexdigest()}
+
     def metadata(self) -> Mapping[str, object]:
         if self.committed is not None:
             metadata = self.committed.get("metadata", {})

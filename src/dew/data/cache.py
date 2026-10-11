@@ -1230,6 +1230,16 @@ class _GenerationSource:
             ),
         }
 
+    def order_fingerprints(self) -> Mapping[str, str]:
+        manifest = self.generation.manifest
+        metadata = manifest["metadata"]
+        facts = {"accepted_ids": _hash(_json([entry["sha256"] for entry in manifest["row_pages"]]))}
+        if "lengths" in metadata:
+            facts["lengths"] = metadata["lengths"]["sha256"]
+        if "valid_targets" in metadata:
+            facts["valid_targets"] = _hash(_json(metadata["valid_targets"]))
+        return facts
+
     def lengths(self) -> np.ndarray | None:
         entry = self.generation.manifest["metadata"].get("lengths")
         if entry is None:

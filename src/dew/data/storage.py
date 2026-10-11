@@ -14,7 +14,6 @@ import tempfile
 import threading
 import time
 import tomllib
-
 import urllib.parse
 from collections.abc import Buffer, Iterator, Mapping
 from dataclasses import dataclass, field
@@ -585,6 +584,14 @@ class Store:
         return Store("dewcache::" + self.url, {scheme: {**backend, **options}, "dewcache": transport})
 
     def child(self, path: str) -> Store:
+        path = path.rstrip("/")
+        if (
+            not path
+            or path.startswith("/")
+            or "://" in path
+            or any(part in ("", ".", "..") for part in path.split("/"))
+        ):
+            raise ValueError(f"storage child must stay inside its root: {path!r}")
         return Store(self.url.rstrip("/") + "/" + path, self.storage_options, self.retention)
 
     def describe(self) -> Mapping[str, object]:
