@@ -118,6 +118,23 @@ def test_clip_score_batches_a_set_into_the_score_of_the_whole_set():
         CLIPScore(str(CLIP_TINY)).score(images, prompts[:2])
 
 
+def test_each_images_clip_score_is_a_term_of_the_sets():
+    """`scores` gives each image's own score, in order and whatever the batch,
+    and `score` is their mean: one image paired with another's prompt would
+    move both."""
+    prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
+    images = np.load(CLIP_TINY / "reference.npz")["images"]
+    metric = CLIPScore(str(CLIP_TINY))
+    each = metric.scores(images, prompts)
+    _, _, cosine = clip_fixture()
+
+    assert each.shape == (len(prompts),) and each.dtype == np.float64
+    np.testing.assert_allclose(each, 100.0 * np.maximum(cosine, 0.0), atol=CLIP_SCORE_TOLERANCE)
+    np.testing.assert_array_equal(metric.scores(images, prompts, batch_size=3), each)
+    assert metric.score(images, prompts) == pytest.approx(each.mean(), abs=1e-9)
+    assert metric.scores(images[::-1], prompts[::-1])[::-1] == pytest.approx(each, abs=1e-9)
+
+
 def test_clip_score_truncates_an_overlong_caption_to_the_text_context():
     """A caption past CLIP's context is cut to it, so 500 words and 600 score
     alike instead of overrunning the position table."""
