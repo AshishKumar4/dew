@@ -15,7 +15,7 @@ import tyro
 
 from dew.config import OptimConfig
 from dew.data import ByteTokenizer, Loading, Text, load
-from dew.data.sources import source
+from dew.data.sources.files import TokenFiles
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
@@ -41,7 +41,7 @@ class Config:
 
 
 def main(config: Config):
-    stored = source(str(config.tokens))
+    stored = TokenFiles(str(config.tokens))
     vocabulary = integer(stored.metadata()["vocab_size"], "vocab_size")
     tokenizer = ByteTokenizer()
     data = load(Text(source=stored, seq_len=config.sequence_length), batch=config.batch_size,
