@@ -29,8 +29,8 @@ from huggingface_hub import HfFileSystem
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
-from dew.records import JSON, json_value
 from dew.data.retention import LocalRetention
+from dew.records import JSON, json_value
 
 
 class PreconditionFailed(FileExistsError):
@@ -387,7 +387,10 @@ class BoundedFileCache(WholeFileCacheFileSystem):
             if start is not None:
                 file.seek(start, 2 if start < 0 else 0)
             size = -1 if end is None else max(0, end - file.tell())
-            return file.read(size)
+            payload = file.read(size)
+            if not isinstance(payload, bytes):
+                raise TypeError("dewcache binary read returned non-bytes")
+            return payload
 
 
 _MEMORY_LOCK = threading.RLock()

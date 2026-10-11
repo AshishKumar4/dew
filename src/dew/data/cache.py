@@ -72,7 +72,11 @@ def _checked(root: Store, entry: Mapping[str, object]) -> bytes:
         raise ValueError("artifact object path is not a string")
     payload = root.child(path).read()
     if len(payload) != entry["bytes"] or _hash(payload) != entry["sha256"]:
-        raise OSError(f"committed object is corrupt: {root.child(path).url}")
+        raise OSError(
+            f"committed object is corrupt: {root.child(path).url}; "
+            f"bytes={len(payload)}, sha256={_hash(payload)}, "
+            f"expected bytes={entry['bytes']}, sha256={entry['sha256']}"
+        )
     return payload
 
 

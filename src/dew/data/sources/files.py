@@ -652,7 +652,12 @@ class TokenFiles:
         )
 
     def metadata(self) -> Mapping[str, object]:
-        return {**self.meta, "tokens": len(self.tokens), "token_store": True}
+        return {
+            **self.meta,
+            "tokens": len(self.tokens),
+            "token_store": True,
+            f"{self.split}_tokens": len(self.tokens),
+        }
 
     def snapshot(self) -> Mapping[str, object]:
         if isinstance(self.tokens, TokenRecords):

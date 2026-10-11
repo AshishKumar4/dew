@@ -20,8 +20,9 @@ class _ArrowRows(Protocol):
     def to_pylist(self) -> list[Batch]: ...
 
 
-def source(value: object, *, format: Format | None = None, split: str | None = None,
-           provision: bool = False) -> Source:
+def source(
+    value: object, *, format: Format | None = None, split: str | None = None, provision: bool = False
+) -> Source:
     if isinstance(value, Source):
         resolved = value
     elif isinstance(value, (str, PathLike)):
@@ -29,7 +30,9 @@ def source(value: object, *, format: Format | None = None, split: str | None = N
         if url.startswith("tfds://"):
             name, _, version = url[7:].partition(":")
             resolved = TFDS(name=name, version=version or None, split=split or "train")
-        elif url.startswith("hf://") and not any(character in url for character in ("*", ".parquet", ".arrow")):
+        elif url.startswith("hf://") and not any(
+            character in url for character in ("*", ".parquet", ".arrow")
+        ):
             repo, _, revision = url.removeprefix("hf://").removeprefix("datasets/").partition("@")
             resolved = Hub(repo=repo, revision=revision or None, split=split or "train")
         else:
@@ -37,7 +40,15 @@ def source(value: object, *, format: Format | None = None, split: str | None = N
 
             fs, path = Store(url).resolve()
             token_file = path.rstrip("/") + f"/{split or 'train'}.bin"
-            resolved = TokenFiles(url, split or "train") if format is None and fs.exists(token_file) else Files(url, format=format)
+            files = Files(url, format=format)
+            committed = files.committed
+            metadata = None if committed is None else committed.get("metadata")
+            native_tokens = isinstance(metadata, Mapping) and metadata.get("token_store") is True
+            resolved = (
+                TokenFiles(url, split or "train")
+                if format is None and (native_tokens or fs.exists(token_file))
+                else files
+            )
     elif isinstance(value, _ArrowRows):
         resolved = Memory(value.to_pylist())
     elif isinstance(value, (Mapping, Sequence)):
