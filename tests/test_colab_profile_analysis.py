@@ -1,14 +1,31 @@
 """Profile parsing executes on the fake VM; the controller receives small JSON."""
 
+import contextlib
 import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from tools.colab import colab_sync, profile_analysis
 from tools.colab.colab_batch_vm import run_logged
-from tools.colab.common import read
+from tools.colab.colab_batch_vm import Batch
+from tools.colab.common import read, save
+
+
+@pytest.fixture(autouse=True)
+def fake_memory_scope(tmp_path, monkeypatch):
+    @contextlib.contextmanager
+    def scope(limit):
+        group = tmp_path / "memory-group"
+        group.mkdir(exist_ok=True)
+        (group / "memory.max").write_text(str(limit))
+        (group / "memory.events").write_text("oom_kill 0\n")
+        yield group
+    monkeypatch.setattr(profile_analysis, "memory_scope", scope)
+    monkeypatch.setattr(profile_analysis, "memory_bound", lambda: 512 * 1024 * 1024)
 
 
 def file(path, body=b"fixture"):
@@ -34,7 +51,7 @@ def fixture_tool(tree, failed=False):
     script = (
         "import argparse,json,pathlib,os\np=argparse.ArgumentParser()\n"
         "p.add_argument('--trace');p.add_argument('--hlo');p.add_argument('--out');"
-        "p.add_argument('--steps',type=int,default=1);p.add_argument('--entry')\na=p.parse_args()\n"
+        "p.add_argument('--steps',type=int,default=1);p.add_argument('--entry');p.add_argument('--module')\na=p.parse_args()\n"
         "assert os.environ['JAX_PLATFORMS']=='cpu' and os.environ['CUDA_VISIBLE_DEVICES']==''\n"
         "pathlib.Path(a.out).write_text(json.dumps({'time':{'by_part_ms':{'gemm':4,'layout':2},"
         "'device_idle_ms_per_step':1},'memory':{'peak_gib':20},'steps':a.steps}))\n"
@@ -112,3 +129,61 @@ def test_non_profile_job_does_not_fetch_analysis_tool(tmp_path):
     assert profile_analysis.analyze(
         {"outputs": ["out/"]}, tree, tmp_path / "venv", tree, tmp_path, "unused", {}, run_logged
     ) == {"attempted": False, "reason": "no native device profile"}
+
+
+def test_memory_bound_failure_is_recorded_without_a_parser_fallback(tmp_path, monkeypatch):
+    tree, _ = fixture_profile(tmp_path)
+    fixture_tool(tree)
+
+    def unavailable(limit):
+        raise PermissionError("cgroup unavailable")
+
+    monkeypatch.setattr(profile_analysis, "memory_scope", unavailable)
+    result = profile_analysis.analyze({"outputs": ["out/"]}, tree, tmp_path / "venv", tree,
+                                      tmp_path, "unused", {}, run_logged)
+    assert not result["complete"]
+    assert result["captures"][0]["state"] == "bounded analysis unavailable or failed"
+    assert result["captures"][0]["memory_limit_bytes"] == 512 * 1024 * 1024
+
+
+def test_memory_controller_oom_is_a_named_receipt_state(tmp_path):
+    tree, _ = fixture_profile(tmp_path)
+    fixture_tool(tree)
+
+    def oom(args, log, **kwargs):
+        (kwargs["memory_group"] / "memory.events").write_text("oom_kill 1\n")
+        log.write_text("analysis killed by cgroup\n")
+        return -9
+
+    result = profile_analysis.analyze({"outputs": ["out/"]}, tree, tmp_path / "venv", tree,
+                                      tmp_path, "unused", {}, oom)
+    assert not result["complete"]
+    assert result["captures"][0]["state"] == "analysis exceeded its memory bound"
+
+
+def test_measurement_pack_exists_before_analysis_and_failure_does_not_change_training_exit(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    file(repo / "job.py", b"from pathlib import Path\nPath('out').mkdir();Path('out/result.json').write_text('{}')\n")
+    for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                  "commit", "-qm", "fake-job")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True)
+    commit = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+    venv = tmp_path / "venvs" / commit
+    (venv / "bin").mkdir(parents=True)
+    (venv / "bin/python").symlink_to(sys.executable)
+    (venv / ".ready").touch()
+    save(tmp_path / "plan.json", {"driver_sha": "driver"})
+    worker = Batch(tmp_path)
+
+    def failed(*args):
+        home = tmp_path / "job-1"
+        assert (home / "outputs.tar.gz").is_file()
+        assert read(home / "outputs.tar.gz.manifest.json")
+        assert read(home / "status.json")["pre_analysis_manifest"]
+        return {"attempted": True, "complete": False, "captures": [], "error": "memory bound"}
+
+    monkeypatch.setattr(profile_analysis, "analyze", failed)
+    status = worker.run_job({"index": 1, "commit": commit, "command": "python job.py", "minutes": 1,
+                            "compile_cache": "off", "outputs": ["out/"], "artifact_policy": "measurements"})
+    assert status["exit"] == 0 and not status["profile_analysis"]["complete"]
+    assert (tmp_path / "job-1/analysis.tar.gz").is_file()

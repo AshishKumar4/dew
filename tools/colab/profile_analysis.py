@@ -1,14 +1,40 @@
 """Shared VM-side profile finalization; return small breakdowns, not raw dumps."""
 
+import contextlib
 import os
 import subprocess
 import time
+import uuid
 from pathlib import Path
 
 from tools.colab import colab_sync
 from tools.colab.common import command, read, save
 
 TOOL_REF = "b420100f20856822ae19d7f314a9a22ba24e26df"
+
+
+def memory_bound() -> int:
+    total = next(int(line.split()[1]) * 1024 for line in Path("/proc/meminfo").read_text().splitlines()
+                 if line.startswith("MemTotal:"))
+    for file in (Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory/memory.limit_in_bytes")):
+        if file.is_file():
+            value = file.read_text().strip()
+            if value.isdigit() and int(value) > 0:
+                total = min(total, int(value))
+    return max(1, total // 4)
+
+
+@contextlib.contextmanager
+def memory_scope(limit: int):
+    group = Path("/sys/fs/cgroup") / ("dew-profile-" + uuid.uuid4().hex)
+    group.mkdir()
+    try:
+        (group / "memory.max").write_text(str(limit))
+        (group / "memory.swap.max").write_text("0")
+        (group / "memory.oom.group").write_text("1")
+        yield group
+    finally:
+        group.rmdir()
 
 
 def profile_settings(value):
@@ -39,8 +65,11 @@ def discover(job: dict, tree: Path) -> list[dict]:
             captures.add(candidate)
     settings = []
     for file in files.values():
-        if file.name == "run.json" and file.stat().st_size < 2 * 1024 * 1024:
-            settings.extend(profile_settings(read(file)))
+        try:
+            if file.name == "run.json" and file.stat().st_size < 2 * 1024 * 1024:
+                settings.extend(profile_settings(read(file)))
+        except (FileNotFoundError, ValueError):
+            continue
     found = []
     for capture in sorted(captures):
         entries = [
@@ -54,12 +83,9 @@ def discover(job: dict, tree: Path) -> list[dict]:
         ]
         hlo = max(archives, key=lambda file: len(file.parts), default=None)
         if hlo is None:
-            candidates = [
-                file.parent for file in files.values() if file.name.endswith("after_optimizations.txt")
-            ]
-            hlo = max(
-                candidates, key=lambda path: len(os.path.commonpath([str(path), str(capture)])), default=None
-            )
+            candidates = {file.parent for file in files.values() if file.name.endswith("after_optimizations.txt")}
+            matching = [path for path in candidates if capture.is_relative_to(path.parent.parent)]
+            hlo = matching[0] if len(matching) == 1 else None
         matched = [
             profile
             for profile in settings
@@ -88,7 +114,10 @@ def tool_tree(tree: Path, repo: Path, root: Path, origin: str, ref: str) -> Path
 def analyze(
     job: dict, tree: Path, venv: Path, repo: Path, root: Path, origin: str, env: dict, run_logged
 ) -> dict:
-    captures = discover(job, tree)
+    try:
+        captures = discover(job, tree)
+    except (OSError, ValueError) as error:
+        return {"attempted": True, "complete": False, "error": type(error).__name__, "captures": []}
     if not captures:
         return {"attempted": False, "reason": "no native device profile"}
     result = {
@@ -97,10 +126,13 @@ def analyze(
         "captures": [],
         "analysis_scope": "on original VM; no raw capture transferred",
     }
+    limit = memory_bound()
     for index, capture in enumerate(captures):
         output = capture["capture"].parent / "analysis" / f"capture-{index}"
         output.mkdir(parents=True, exist_ok=True)
         receipt = {"capture": str(capture["capture"]), "output": str(output), "steps": capture["steps"]}
+        receipt["hlo"] = str(capture["hlo"]) if capture["hlo"] else None
+        receipt.update(memory_limit_bytes=limit, memory_policy="cgroup resident memory, 25% of VM bound", module="jit_step")
         result["captures"].append(receipt)
         try:
             tools = tool_tree(tree, repo, root, origin, job.get("profile_analysis_ref", TOOL_REF))
@@ -126,15 +158,21 @@ def analyze(
                 "CUDA_VISIBLE_DEVICES": "",
                 "PYTHONPATH": str(tools / "src"),
             }
-            receipt["exit"] = run_logged(
-                args, output / "analysis.log", timeout=180, cwd=tools, env=analysis_env
-            )
+            args.extend(["--module", receipt["module"]])
+            with memory_scope(limit) as group:
+                receipt["exit"] = run_logged(args, output / "analysis.log", timeout=180, cwd=tools,
+                                             env=analysis_env, memory_group=group)
+                events = dict(line.split() for line in (group / "memory.events").read_text().splitlines())
+                if int(events.get("oom_kill", "0")) or int(events.get("oom_group_kill", "0")):
+                    receipt["state"] = "analysis exceeded its memory bound"
             receipt["tool_commit"] = command(
                 ["git", "-C", str(tools), "rev-parse", "HEAD"], timeout=30
             ).stdout.strip()
             receipt["complete"] = receipt["exit"] == 0 and (output / "attribution.json").is_file()
+            if receipt["complete"]:
+                receipt["module_number"] = read(output / "attribution.json").get("memory", {}).get("module_number")
         except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as error:
-            receipt.update(exit=type(error).__name__, complete=False)
+            receipt.update(exit=type(error).__name__, complete=False, state="bounded analysis unavailable or failed")
         save(output / "receipt.json", receipt)
     result.update(
         seconds=time.time() - result["started_at"],
