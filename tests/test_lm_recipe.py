@@ -134,7 +134,7 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     first = write_token_files(tmp_path / "first", 40 * SEQ, 8 * SEQ, eos_id=0)
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
     config = LMRunConfig.cli([
-        "--data.pack", "first-fit", "--data.source", str(first), "0.7", str(second), "0.3",
+        "--data.pack", "first-fit", "--data.source", json.dumps({str(first): 0.7, str(second): 0.3}),
         "--data.seq-len", str(SEQ), "--data.packing-bins", "2", "--loading.workers", "0",
         "--trainer.batch-size", "8", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
