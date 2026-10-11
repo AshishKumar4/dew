@@ -13,7 +13,14 @@ import pytest
 from jax.experimental import pallas as pl
 from jax.sharding import Mesh
 
-from dew.nn.kernels.generation import KERNELS, assumed, bf16_dot_runs, device_generation, measured_kernel, triton_runs
+from dew.nn.kernels.generation import (
+    KERNELS,
+    assumed,
+    bf16_dot_runs,
+    device_generation,
+    measured_kernel,
+    triton_runs,
+)
 from dew.training.lowering import DEVICE_KINDS, gpu_mesh, triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -28,7 +35,8 @@ def test_an_assumed_generation_answers_for_the_device(generation, triton, bf16):
     own = device_generation(), triton_runs(), bf16_dot_runs()
     with assumed(generation):
         assert (device_generation(), triton_runs(), bf16_dot_runs()) == (generation, triton, bf16)
-        assert measured_kernel('gated_delta_rule', 'xla') == KERNELS['gated_delta_rule'].get(generation, 'xla')
+        rule = measured_kernel('gated_delta_rule', 'xla')
+        assert rule == KERNELS['gated_delta_rule'].get(generation, 'xla')
         with assumed(None):
             assert (device_generation(), triton_runs(), bf16_dot_runs()) == own
     assert (device_generation(), triton_runs(), bf16_dot_runs()) == own
@@ -52,8 +60,8 @@ def _doubled(x):
     def kernel(x_ref, o_ref):
         o_ref[...] = x_ref[...] * 2
 
-    return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype), interpret=not triton_runs(),
-                          name="doubled")(x)
+    return pl.pallas_call(kernel, out_shape=jax.ShapeDtypeStruct(x.shape, x.dtype),
+                          interpret=not triton_runs(), name="doubled")(x)
 
 
 def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
@@ -70,6 +78,7 @@ def test_a_kernel_traced_for_an_assumed_gpu_lowers_to_a_named_triton_call():
 # The kernels of each Pallas choice a generation's KERNELS row names, as the step calls them.
 FAMILIES = {
     ('rms_norm', 'pallas'): {"rms_norm_forward", "rms_norm_backward"},
+    ('swiglu', 'pallas'): {"swiglu_forward", "swiglu_backward"},
     ('gated_delta_rule', 'fla'): {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u",
                                   "fla_chunk_fwd_h", "fla_chunk_fwd_o", "fla_chunk_bwd_dhu",
                                   "fla_chunk_bwd_dv_local", "fla_chunk_bwd_dqkwg", "fla_prepare_wy_repr_bwd"},
