@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, TypeAliasType, r
 import numpy as np
 import tyro
 
-from dew.data.compile import _preferred_read, _promoted, compile
+from dew.data.compile import _at, _preferred_read, _promoted, _random, _until, compile
 from dew.data.dataset import Batch, DataPhase, Dataset, Loading, Records as IndexedRecords, record_argument
 from dew.data.pipeline import (
     Artifact,
@@ -24,7 +24,6 @@ from dew.data.pipeline import (
     ObjectiveData,
     Phases,
     Pipeline,
-    RandomMap,
     Rejected,
     Stage,
 )
@@ -809,33 +808,18 @@ def load(
 
 
 def _ordered(pipeline: Pipeline, read: Read, seed: int) -> Pipeline:
-    if isinstance(pipeline.source, Phases):
-        children = tuple(_ordered(child, read, seed) for child in pipeline.source.pipelines)
-        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
-    if isinstance(pipeline.source, Mixture):
+    if isinstance(pipeline.source, (Mixture, Phases)):
         children = tuple(_ordered(child, read, seed) for child in pipeline.source.pipelines)
         return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
     if read == "memory":
-        at = next(
-            (
-                index
-                for index, stage in enumerate(pipeline.stages)
-                if isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
-            ),
-            len(pipeline.stages),
-        )
+        stages = pipeline.stages
+        at = next((index for index, stage in enumerate(stages) if _random(stage)), len(stages))
         order = Pipeline(pipeline.source).shuffle(seed).repeat().stages
     else:
-        cache = next(
-            (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, Artifact)), -1
-        )
-        at = cache + 1
-        order = (
-            Pipeline(pipeline.source)
-            .shuffle(seed, window=64 if read == "streamed" or cache >= 0 else None)
-            .repeat()
-            .stages
-        )
+        cache = _at(pipeline.stages, Artifact)
+        at = 0 if cache is None else cache + 1
+        window = 64 if read == "streamed" or cache is not None else None
+        order = Pipeline(pipeline.source).shuffle(seed, window=window).repeat().stages
     return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *order, *pipeline.stages[at:]))
 
 
@@ -855,10 +839,7 @@ def _batched(
             raise ValueError(f"pipeline batches {stated}, but load requested batch={batch}")
         return pipeline
 
-    at = next(
-        (index for index, stage in enumerate(pipeline.stages) if isinstance(stage, MapBatch)),
-        len(pipeline.stages),
-    )
+    at = _until(pipeline.stages, MapBatch)
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).batch(
         batch, tokens=tokens, lengths=lengths, drop_remainder=train
     )
@@ -875,8 +856,7 @@ def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
         (
             index
             for index, stage in enumerate(pipeline.stages)
-            if isinstance(stage, (RandomMap, MapBatch, Pack, Windows))
-            or (isinstance(stage, Configured) and stage.random)
+            if isinstance(stage, (MapBatch, Pack, Windows)) or _random(stage)
         ),
         len(pipeline.stages),
     )
