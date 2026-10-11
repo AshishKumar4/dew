@@ -75,25 +75,27 @@ def _compensated_add(total, correction, value, *, interpret: bool) -> tuple[jax.
     Triton uses round-to-nearest instructions, not a compiler-only option.
     """
     if not interpret:
-        high, low = plgpu.elementwise_inline_asm(
+        shape = jax.ShapeDtypeStruct(total.shape, jnp.float32)
+        high = plgpu.elementwise_inline_asm(
+            "add.rn.f32 $0, $1, $2;", constraints="=f,f,f", args=(total, value),
+            result_shape_dtypes=(shape,), pack=1)[0]
+        low = plgpu.elementwise_inline_asm(
             """{
             .reg .f32 a, b, e, f, s, c;
             .reg .pred p;
-            add.rn.f32 s, $2, $4;
-            abs.f32 a, $2;
-            abs.f32 b, $4;
+            add.rn.f32 s, $1, $3;
+            abs.f32 a, $1;
+            abs.f32 b, $3;
             setp.ge.f32 p, a, b;
-            sub.rn.f32 e, $2, s;
-            add.rn.f32 e, e, $4;
-            sub.rn.f32 f, $4, s;
-            add.rn.f32 f, f, $2;
+            sub.rn.f32 e, $1, s;
+            add.rn.f32 e, e, $3;
+            sub.rn.f32 f, $3, s;
+            add.rn.f32 f, f, $1;
             selp.f32 e, e, f, p;
-            add.rn.f32 c, $3, e;
-            mov.f32 $0, s;
-            mov.f32 $1, c;
-            }""", constraints="=f,=f,f,f,f", args=(total, correction, value),
-            result_shape_dtypes=(jax.ShapeDtypeStruct(total.shape, jnp.float32),
-                                 jax.ShapeDtypeStruct(total.shape, jnp.float32)), pack=1)
+            add.rn.f32 c, $2, e;
+            mov.f32 $0, c;
+            }""", constraints="=f,f,f,f", args=(total, correction, value),
+            result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
     value = jax.lax.optimization_barrier(value)
     merged = jax.lax.optimization_barrier(total + value)
@@ -105,17 +107,18 @@ def _compensated_add(total, correction, value, *, interpret: bool) -> tuple[jax.
 def _product_parts(left, right, *, interpret: bool) -> tuple[jax.Array, jax.Array]:
     """The rounded fp32 product and its lost bits, without a float64 dtype."""
     if not interpret:
-        high, low = plgpu.elementwise_inline_asm(
+        shape = jax.ShapeDtypeStruct(left.shape, jnp.float32)
+        high = plgpu.elementwise_inline_asm(
+            "mul.rn.f32 $0, $1, $2;", constraints="=f,f,f", args=(left, right),
+            result_shape_dtypes=(shape,), pack=1)[0]
+        low = plgpu.elementwise_inline_asm(
             """{
-            .reg .f32 p, e;
-            mul.rn.f32 p, $2, $3;
-            neg.f32 e, p;
-            fma.rn.f32 e, $2, $3, e;
-            mov.f32 $0, p;
-            mov.f32 $1, e;
-            }""", constraints="=f,=f,f,f", args=(left, right),
-            result_shape_dtypes=(jax.ShapeDtypeStruct(left.shape, jnp.float32),
-                                 jax.ShapeDtypeStruct(left.shape, jnp.float32)), pack=1)
+            .reg .f32 e;
+            neg.f32 e, $3;
+            fma.rn.f32 e, $1, $2, e;
+            mov.f32 $0, e;
+            }""", constraints="=f,f,f,f", args=(left, right, high),
+            result_shape_dtypes=(shape,), pack=1)[0]
         return high, low
     barrier = jax.lax.optimization_barrier
     # Split significands in half by bits, avoiding splitter*value overflow.
