@@ -17,15 +17,12 @@ when the row lacks them.
 
 from __future__ import annotations
 
-import dataclasses
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 
 import numpy as np
 
 from .chat import Conversation, render_prompt
-from .dataset import Batch, Dataset, DatasetSpec, Tokenize
-from .rows import json_records, known_row, parquet_names, parquet_rows, row_dataset
 from .text import load_tokenizer, tokenizer_for
 
 PROMPT_KEY = "prompt"
@@ -53,16 +50,6 @@ keeps `tools_kwargs` inside `extra_info`. `ability` and `agent_name` (which
 of verl's agent loops runs the row, a choice a Dew rollout source makes) are
 read and dropped."""
 
-
-@dataclasses.dataclass(frozen=True)
-class _Row:
-    """One row's raw prompt, tool schemas and three reward strings."""
-
-    prompt: object
-    tools: object
-    data_source: str
-    ground_truth: str
-    extra_info: str
 
 
 def _text(value: object) -> str:
@@ -140,132 +127,3 @@ def _utf8(text: str, width: int) -> np.ndarray:
     return out
 
 
-class PromptSource:
-    """Reads normalized prompt rows by index, encoding each on read.
-
-    A row comes back as the prompt left-padded to the window and the reward
-    columns as UTF-8 bytes of the scanned width. Workers unpickle the rows
-    and the tokenizer path and render their own copies. The repr names the
-    origin file, or the record count for in-memory rows, which is what a
-    saved position compares against (`describe`).
-    """
-
-    def __init__(self, rows: Sequence[object], origin: str,
-                 tokenizer: str, max_prompt_len: int, pad_id: int,
-                 thinking: bool | None = None):
-        if max_prompt_len < 1:
-            raise ValueError(
-                f"max_prompt_len is {max_prompt_len}: prompts need at least one token")
-        normalized: list[_Row] = []
-        for index, held in enumerate(rows):
-            where = f"{origin} row {index}"
-            row = known_row(held, FIELDS, where)
-            if row.get("prompt") is None:
-                raise ValueError(
-                    f"{where}: a row without a prompt has nothing to sample from")
-            normalized.append(_Row(
-                prompt=row["prompt"],
-                tools=row.get("tools"),
-                data_source=_text(row.get("data_source")),
-                ground_truth=_ground_truth(row, where),
-                extra_info=_text(row.get("extra_info"))))
-        if not normalized:
-            raise ValueError(f"{origin} holds no prompts")
-        self._rows = normalized
-        self._origin = origin
-        self._tokenizer = tokenizer
-        self._thinking = thinking
-        self._window = max_prompt_len
-        self._pad_id = pad_id
-        self._info_width = max(
-            1,
-            max(len(text.encode("utf-8")) for row in normalized
-                for text in (row.data_source, row.ground_truth, row.extra_info)))
-
-    @classmethod
-    def from_parquet(cls, path: str, tokenizer: str, max_prompt_len: int,
-                     pad_id: int, thinking: bool | None = None) -> PromptSource:
-        """The parquet file's rows.
-
-        `prompt` is required; the reward columns ride along when present.
-        """
-        names = parquet_names(path, "prompt")
-        if "prompt" not in names:
-            raise ValueError(
-                f"{path}: the prompt column is required, the file has {names}")
-        return cls(parquet_rows(path, FIELDS, names), path, tokenizer, max_prompt_len, pad_id, thinking)
-
-    @classmethod
-    def from_records(cls, records: tuple[str, ...], tokenizer: str,
-                     max_prompt_len: int, pad_id: int,
-                     thinking: bool | None = None) -> PromptSource:
-        """In-memory rows as JSON, for tests and small sweeps."""
-        rows = json_records(records)
-        return cls(rows, f"{len(rows)} in-memory records", tokenizer,
-                   max_prompt_len, pad_id, thinking)
-
-    def __repr__(self) -> str:
-        # A saved position compares this; the switch renders other ids, so it counts when set.
-        thinking = "" if self._thinking is None else f", thinking={self._thinking!r}"
-        return (f"{self.__class__.__name__}(origin={self._origin!r}, "
-                f"tokenizer={self._tokenizer!r}{thinking})")
-
-    def __len__(self) -> int:
-        return len(self._rows)
-
-    def __getitem__(self, index: int) -> Batch:
-        row = self._rows[index]
-        ids = _prompt_ids(self._tokenizer, row.prompt, row.tools,
-                          f"{self._origin} row {index}", self._thinking)[-self._window:]
-        prompt = np.full(self._window, self._pad_id, np.int32)
-        prompt[self._window - len(ids):] = ids
-        return {
-            PROMPT_KEY: prompt,
-            LENGTH_KEY: np.int32(len(ids)),
-            SOURCE_KEY: _utf8(row.data_source, self._info_width),
-            TRUTH_KEY: _utf8(row.ground_truth, self._info_width),
-            INFO_KEY: _utf8(row.extra_info, self._info_width),
-        }
-
-
-@dataclasses.dataclass(frozen=True)
-class Prompts(DatasetSpec):
-    """Reads prompts with their reward context, in fixed-width batches.
-
-    `path` is a parquet file in the verl layout, and `records` is JSON rows
-    for tests and small sweeps; set exactly one of the two. Each batch holds
-    `prompt` left-padded to `max_prompt_len` with `pad_id`, `prompt_length`,
-    and the reward columns (`data_source`, `ground_truth`, `extra_info`) as
-    UTF-8 bytes. A prompt longer than `max_prompt_len` keeps its last tokens.
-
-    A row's prompt is chat messages, a string or token ids. Messages are
-    rendered with the tokenizer's chat template and generation prompt, and
-    token ids are used as they are. A string is encoded with `tokenizer_for`
-    and no special tokens, so `tokenizer="byte"` encodes UTF-8 locally and a
-    Hub name loads its own vocabulary. An optional `tools` column holds tool
-    schemas for chat prompts, as a list or a JSON string. The schemas are
-    rendered into the prompt tokens and are not copied into the device batch.
-
-    `val_path` is a second parquet file scored as one pass; None trains
-    without validation. `thinking` sets a reasoning template's
-    `enable_thinking` (Qwen3's switch); None keeps the template's default.
-    """
-
-    tokenizer: str
-    path: str | None = None
-    records: tuple[str, ...] = ()
-    val_path: str | None = None
-    max_prompt_len: int = 128
-    pad_id: int = 0
-    val_batches: int | None = 4
-    thinking: bool | None = None
-
-    def load(self, *, batch: int, tokenize: Tokenize | None = None) -> Dataset:
-        self.uncaptioned(tokenize)
-        return row_dataset(
-            self, batch=batch, path=self.path, records=self.records,
-            val_path=self.val_path, val_batches=self.val_batches,
-            from_parquet=lambda path: PromptSource.from_parquet(
-                path, self.tokenizer, self.max_prompt_len, self.pad_id, self.thinking),
-            from_records=lambda records: PromptSource.from_records(
-                tuple(records), self.tokenizer, self.max_prompt_len, self.pad_id, self.thinking))
