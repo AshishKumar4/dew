@@ -34,10 +34,10 @@ ELEMENT_BLOCK = 1024
 
 
 def _row_block(width: int) -> int:
-    """At most four rows, with the live register tile bounded at 4096
+    """At most sixteen rows, with the live register tile bounded at 4096
     elements except when a single row is wider. A 4096-wide norm takes one
     row rather than spilling four copies of every backward intermediate."""
-    return min(4, max(1, ROW_ELEMENTS // pl.next_power_of_2(width)))
+    return min(16, max(1, ROW_ELEMENTS // pl.next_power_of_2(width)))
 
 
 def _round(x, dtype, interpret: bool):
