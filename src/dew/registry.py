@@ -54,7 +54,7 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-    from dew.data.dataset import DatasetSpec
+    from dew.data.recipes import Recipe
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
     from dew.nn.mixers import MixerBase
@@ -1118,21 +1118,16 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "unipc": "dew.sampling.solvers.unipc:UniPC",
     "unmask": "dew.diffusion.discrete:Unmask",
 })
-datasets: Aliases[type[DatasetSpec], DatasetSpec] = Aliases("dataset", {
-    "array_record_images": "dew.data.images:ArrayRecordImages",
-    "chat_messages": "dew.data.chat:ChatMessages",
-    "decision_table": "dew.decision.data:DecisionTable",
-    "hf": "dew.data.providers:HubDataset",
-    "hf_images": "dew.data.images:HFImages",
-    "local_videos": "dew.data.video:LocalVideos",
-    "online_images": "dew.data.streaming:OnlineImages",
-    "online_videos": "dew.data.streaming:OnlineVideos",
-    "preference_pairs": "dew.data.preferences:PreferencePairs",
-    "prompts": "dew.data.prompts:Prompts",
-    "tfds": "dew.data.providers:PreparedTFDS",
-    "tfds_images": "dew.data.images:TFDSImages",
-    "token_windows": "dew.data.tokens:TokenWindows",
-}, base="dew.data.dataset:DatasetSpec")
+datasets: Aliases[type[Recipe], Recipe] = Aliases("dataset", {
+    "chat": "dew.data.recipes:Chat",
+    "decisions": "dew.decision.data:Decisions",
+    "images": "dew.data.recipes:Images",
+    "preferences": "dew.data.recipes:Preferences",
+    "prompts": "dew.data.recipes:Prompts",
+    "records": "dew.data.recipes:Records",
+    "text": "dew.data.recipes:Text",
+    "video": "dew.data.recipes:Video",
+}, base="dew.data.recipes:Recipe")
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",

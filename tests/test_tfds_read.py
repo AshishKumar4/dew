@@ -15,7 +15,8 @@ import pytest
 
 pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
-from dew.data import DataPartition, Loading, TFDSImages
+from dew.data import DataPartition, HoldOut, Images, Loading, TFDS, load
+from dew.data.steps.image import EncodeCaptions, ImageRecord
 from dew.data.images import decode_image
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
@@ -24,17 +25,18 @@ FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
     """The source hands out the bytes on disk; `record` decodes them, so a
     worker pays one decode at the resolution it needs and no more."""
-    spec = TFDSImages(path=str(FIXTURE))
-    source = spec.source()
+    spec = Images(source=TFDS("dew_images", path=str(FIXTURE), split="all"), caption_templates=("a photo of a {}",))
+    source = spec.source.records("indexed")
     assert len(source) == 20
     for index in range(len(source)):
         record = source[index]
         assert isinstance(record["image"], bytes)
         np.testing.assert_array_equal(decode_image(record["image"]), np.full((8, 8, 3), index + 10, np.uint8))
         assert record["label"] == index % 2
-        _, caption, label = spec.record(record, np.random.default_rng(0))
+        result = ImageRecord(8, 8, templates=spec.caption_templates, classes=("red", "blue")).random_map(record, np.random.default_rng(0))
+        caption, label = result["caption"], result["label"]
         assert ("red" if label == 0 else "blue") in caption.split()
-    test_split = TFDSImages(path=str(FIXTURE), split="test").source()
+    test_split = TFDS("dew_images", path=str(FIXTURE), split="test").records("indexed")
     assert [int(decode_image(test_split[i]["image"])[0, 0, 0]) for i in range(len(test_split))] == [
         26,
         27,
@@ -49,19 +51,19 @@ def test_a_prepared_source_describes_the_directory_and_split_it_reads():
     process, which no resume can match."""
     from dew.data.dataset import describe
 
-    source = TFDSImages(path=str(FIXTURE)).source()
-    other = TFDSImages(path=str(FIXTURE), split="test").source()
+    source = TFDS("dew_images", path=str(FIXTURE), split="all")
+    other = TFDS("dew_images", path=str(FIXTURE), split="test")
 
-    assert describe(source) == f"Prepared(directory={str(FIXTURE)!r}, split='all')"
-    assert describe(other) != describe(source)
+    assert str(FIXTURE) in source.describe() and ":all:" in source.describe()
+    assert other.snapshot() != source.snapshot()
 
 
 @pytest.mark.parametrize("workers", [0, 2])
 def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
-    data = TFDSImages(
-        path=str(FIXTURE), image_size=8, augmentation="none", val_batches=1,
-        loading=Loading(workers=workers, threads=1, read_buffer=8, worker_buffer=2),
-    ).load(batch=4)
+    data = load(Images(source=TFDS("dew_images", path=str(FIXTURE), split="all"),
+                       image_size=8, augment=None, validation=HoldOut(records=4),
+                       caption_templates=("a photo of a {}",)), batch=4, read="memory",
+                loading=Loading(workers=workers, threads=1, read_buffer=8, worker_buffer=2))
     source = data.train(DataPartition())
     train = list(itertools.islice(source, 4))
     validation = list(data.val(DataPartition()))
@@ -80,17 +82,16 @@ def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
 def test_explicit_caption_names_override_the_prepared_metadata(tmp_path):
     labels = tmp_path / "names.txt"
     labels.write_text("fern\nrose\n")
-    spec = TFDSImages(path=str(FIXTURE), labels=str(labels))
-    source = spec.source()
-    _, caption, label = spec.record(source[1], np.random.default_rng(0))
+    spec = Images(source=TFDS("dew_images", path=str(FIXTURE), split="all"), labels=str(labels), caption_templates=("a photo of a {}",))
+    source = spec.source.records("indexed")
+    result = ImageRecord(8, 8, templates=spec.caption_templates, classes=tuple(labels.read_text().splitlines())).random_map(source[1], np.random.default_rng(0))
+    caption, label = result["caption"], result["label"]
     assert label == 1 and "rose" in caption.split()
 
 
 def test_an_unprepared_directory_requests_external_preparation(tmp_path):
-    with pytest.raises(ValueError, match="prepared TFDS ArrayRecords"):
-        TFDSImages().source()
     with pytest.raises(FileNotFoundError, match="separate environment"):
-        TFDSImages(path=str(tmp_path)).source()
+        TFDS("dew_images", path=str(tmp_path), split="all").records("indexed")
     assert list(tmp_path.iterdir()) == []
 
 
@@ -102,7 +103,7 @@ def test_a_tfrecord_preparation_is_refused_before_reading(tmp_path):
     metadata["fileFormat"] = "tfrecord"
     metadata_path.write_text(json.dumps(metadata))
     with pytest.raises(ValueError, match="dew reads ArrayRecords"):
-        TFDSImages(path=str(directory)).source()
+        TFDS("dew_images", path=str(directory), split="all").records("indexed")
 
 
 def test_missing_records_request_preparation_only_for_the_selected_split(tmp_path):
@@ -111,7 +112,7 @@ def test_missing_records_request_preparation_only_for_the_selected_split(tmp_pat
     directory = tmp_path / "prepared"
     shutil.copytree(FIXTURE, directory)
     (directory / "dew_images-train.array_record-00000-of-00001").unlink()
-    available = TFDSImages(path=str(directory), split="test").source()
+    available = TFDS("dew_images", path=str(directory), split="test").records("indexed")
     assert int(decode_image(available[0]["image"])[0, 0, 0]) == 26
     with pytest.raises(FileNotFoundError, match="Missing prepared ArrayRecord shard"):
-        TFDSImages(path=str(directory), split="train").source()
+        TFDS("dew_images", path=str(directory), split="train").records("indexed")

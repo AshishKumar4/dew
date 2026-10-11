@@ -30,8 +30,8 @@ from absl import flags
 if not flags.FLAGS.is_parsed():
     flags.FLAGS.mark_as_parsed()
 
-from dew.data import ArrayRecordImages, DataPartition, Loading, TFDSImages, images
-from dew.data.images import ImageTransform
+from dew.data import DataPartition, Images, Loading, images, load
+from dew.data.steps.image import EncodeCaptions, ImageRecord
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -82,11 +82,10 @@ def _element_for(kind, seed=0):
 def _spec(kind, labels_file, augmentation="flip_jitter"):
     """A prepared TFDS spec, or an arrayrecord one: `record` is what differs.
     Both augment on the host, the per-record path these tests read."""
-    if kind == "tfds":
-        return TFDSImages(image_size=SCALE, augmentation=augmentation, augmentation_backend="host",
-                          labels=str(labels_file), caption_templates=CAPTION_TEMPLATES)
-    return ArrayRecordImages(image_size=SCALE, augmentation=augmentation, augmentation_backend="host",
-                             shards=("cc12m",))
+    augment = images.image_augmentations(augmentation)
+    return ImageRecord(SCALE, SCALE, templates=CAPTION_TEMPLATES if kind == "tfds" else (),
+                       classes=LABELS if kind == "tfds" else (),
+                       flip=augment is not None and augment.flip, jitter=augment is not None and augment.jitter)
 
 
 def _resized(kind, element):
@@ -122,15 +121,15 @@ def test_module_imports_and_constructs_without_torchvision(tmp_path):
             "sys.modules['transformers'] = None",
             "",
             "import numpy as np",
-            "from dew.data import ArrayRecordImages, TFDSImages",
-            "from dew.data.images import ImageTransform, augment_image, image_augmentations",
+            "from dew.data import Images",
+            "from dew.data.images import augment_image, image_augmentations",
+            "from dew.data.steps.image import ImageRecord",
             "",
             "labels = sys.argv[1]",
             "image = np.zeros((9, 11, 3), dtype=np.uint8)",
             "for mode in ('none', 'flip_only', 'flip_jitter'):",
-            "    for spec in (TFDSImages(labels=labels, augmentation=mode), "
-            "ArrayRecordImages(augmentation=mode)):",
-            "        ImageTransform(spec)",
+            "    Images(source=(), labels=labels)",
+            "    ImageRecord(16, 16)",
             "    out = augment_image(image_augmentations(mode), image, np.random.default_rng(0))",
             "    assert out.dtype == np.uint8 and out.shape == image.shape",
             "print('ok')",
@@ -177,22 +176,13 @@ _READERS = "\n".join([
     "import dataclasses, io, sys",
     "import numpy as np",
     "from PIL import Image",
-    "from dew.data import DataPartition, Loading",
-    "from dew.data.images import ImageDataset",
+    "from dew.data import DataPartition, Images, Loading, load",
     "buffer = io.BytesIO()",
     "Image.fromarray(np.arange(40 * 40 * 3, dtype=np.uint8).reshape(40, 40, 3)).save(",
     "    buffer, format='PNG')",
     "PNG = buffer.getvalue()",
     "",
-    "@dataclasses.dataclass(frozen=True)",
-    "class Pngs(ImageDataset):",
-    "    def source(self, split=None):",
-    "        return [PNG] * 64",
-    "    def record(self, element, rng):",
-    "        return element, 'a picture', None",
-    "",
-    "SPEC = Pngs(image_size=16, val_batches=0, augmentation='none',",
-    "            loading=Loading(workers=0, threads=32, read_buffer=64))",
+    "SPEC = Images(source=[{'image': PNG, 'caption': 'a picture'}] * 64, image_size=16, augment=None)",
 ])
 
 
@@ -200,7 +190,7 @@ def test_opening_an_image_loader_imports_opencv_before_its_readers_start():
     _fresh_process("\n".join([
         _READERS,
         "assert 'cv2' not in sys.modules",
-        "data = SPEC.load(batch=32)",
+        "data = load(SPEC, batch=32, read='indexed', loading=Loading(workers=0, threads=32, read_buffer=64))",
         "assert 'cv2' in sys.modules",
         "batch = next(iter(data.train(DataPartition())))",
         "assert batch['image'].shape == (32, 16, 16, 3)",
@@ -215,9 +205,9 @@ def test_a_spawned_worker_imports_opencv_before_its_readers_start(tmp_path):
     _fresh_process("\n".join([
         _READERS,
         "import pickle",
-        "from dew.data.images import ImageTransform",
+        "from dew.data.steps.image import ImageRecord",
         "with open(sys.argv[1], 'wb') as handle:",
-        "    pickle.dump(ImageTransform(SPEC), handle)",
+        "    pickle.dump(ImageRecord(16, 16), handle)",
         "print('ok')",
     ]), pickled)
     _fresh_process("\n".join([
@@ -229,7 +219,7 @@ def test_a_spawned_worker_imports_opencv_before_its_readers_start(tmp_path):
         "    transform = pickle.load(handle)",
         "assert 'cv2' in sys.modules",
         "with ThreadPoolExecutor(32) as pool:",
-        "    records = list(pool.map(lambda seed: transform.random_map(PNG, np.random.default_rng(seed)),",
+        "    records = list(pool.map(lambda seed: transform.random_map({'image': PNG}, np.random.default_rng(seed)),",
         "                            range(64)))",
         "assert all(record['image'].shape == (16, 16, 3) for record in records)",
         "print('ok')",
@@ -244,7 +234,7 @@ def test_a_spawned_worker_imports_opencv_before_its_readers_start(tmp_path):
 def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = ImageTransform(_spec(kind, labels_file, "none"))
+    transform = _spec(kind, labels_file, "none")
 
     out = transform.random_map(element, _record_rng(0))
 
@@ -260,7 +250,7 @@ def test_none_mode_returns_the_resized_image_bit_identical(kind, tmp_path):
 def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = ImageTransform(_spec(kind, labels_file, "flip_only"))
+    transform = _spec(kind, labels_file, "flip_only")
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -279,7 +269,7 @@ def test_flip_only_mode_returns_only_the_image_or_its_mirror(kind, tmp_path):
 def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    transform = ImageTransform(_spec(kind, labels_file, "flip_jitter"))
+    transform = _spec(kind, labels_file, "flip_jitter")
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -303,8 +293,8 @@ def test_flip_jitter_mode_keeps_shape_and_dtype_and_changes_statistics(kind, tmp
 def test_the_default_augmentation_is_flip_jitter(kind, tmp_path):
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    spec = dataclasses.replace(_spec(kind, labels_file), augmentation=TFDSImages().augmentation)
-    transform = ImageTransform(spec)
+    spec = _spec(kind, labels_file)
+    transform = spec
 
     base = _resized(kind, element)
     mirror = base[:, ::-1, :]
@@ -324,8 +314,8 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path
     whatever the worker or process count, and neither global RNG may move."""
     labels_file = _write_labels(tmp_path)
     element = _element_for(kind)
-    first = ImageTransform(_spec(kind, labels_file))
-    other = ImageTransform(_spec(kind, labels_file))
+    first = _spec(kind, labels_file)
+    other = _spec(kind, labels_file)
 
     numpy_state = np.random.get_state()[1]
     python_state = random.getstate()
@@ -343,15 +333,15 @@ def test_augmentation_and_caption_repeat_from_the_same_record_rng(kind, tmp_path
 def test_the_caption_template_comes_from_the_record_rng(tmp_path):
     """A module-global random.choice picked the template, so a record's caption
     moved with the worker and process count while its image did not."""
-    spec = TFDSImages(labels=str(_write_labels(tmp_path)), caption_templates=CAPTION_TEMPLATES)
+    spec = _spec("tfds", _write_labels(tmp_path), "none")
     element = {"image": _synthetic_image(), "label": 1}
 
-    captions = [spec.record(element, _record_rng(draw))[1] for draw in range(DRAWS)]
+    captions = [spec.random_map(element, _record_rng(draw))["caption"] for draw in range(DRAWS)]
 
     assert len(set(captions)) > 1  # the rng really does pick the template
     assert set(captions) <= {t.format(LABELS[1]) for t in CAPTION_TEMPLATES}
-    assert spec.record(element, _record_rng(3))[1] == captions[3]
-    assert spec.record(element, _record_rng(3))[2] == 1
+    assert spec.random_map(element, _record_rng(3))["caption"] == captions[3]
+    assert spec.random_map(element, _record_rng(3))["label"] == 1
 
 
 @pytest.mark.parametrize("column", ["caption", "text"])
@@ -370,8 +360,7 @@ def test_a_record_with_no_caption_column_says_what_it_has():
 def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():
     """The same image transform serves a hub dataset: what changes is where the
     caption comes from, and that a caption dataset has no class index."""
-    transform = ImageTransform(images.HFImages(name="acme/pets", image_size=SCALE,
-                                               augmentation="none"))
+    transform = ImageRecord(SCALE, SCALE)
 
     element = {"image": _synthetic_image(0), "caption": "a yellow tulip"}
     out = transform.random_map(element, _record_rng(0))
@@ -387,17 +376,6 @@ def test_a_hub_record_captions_from_the_record_and_reads_no_label_file():
 # Loader level: a record does not depend on how many workers produced it
 # ---------------------------------------------------------------------------------
 
-@dataclasses.dataclass(frozen=True)
-class Flowers(TFDSImages):
-    """A prepared TFDS spec over synthetic records, one label per record so a
-    batch says which records it carries."""
-
-    caption_templates: tuple[str, ...] = ("a photo of a {}", "a photo of a {} flower")
-
-    def source(self):
-        return [{"image": _synthetic_image(i), "label": i} for i in range(RECORDS)]
-
-
 def _by_record(spec, worker_count):
     """label -> (image, caption) for every record of one epoch.
 
@@ -405,9 +383,9 @@ def _by_record(spec, worker_count):
     own slice of the index stream, so batch composition follows worker_count
     while record content must not.
     """
-    data = dataclasses.replace(spec, loading=Loading(workers=worker_count, threads=1,
-                                                    read_buffer=1, worker_buffer=1)).load(
-        batch=4, tokenize=keep_captions)
+    data = load(spec, batch=4, read="memory", seed=7,
+                loading=Loading(workers=worker_count, threads=1, read_buffer=1, worker_buffer=1),
+                host=(EncodeCaptions(keep_captions),))
     records = {}
     for batch in itertools.islice(data.train(DataPartition()), data.steps_per_epoch):
         for position, label in enumerate(batch["label"]):
@@ -419,8 +397,12 @@ def _by_record(spec, worker_count):
 def test_a_record_comes_out_the_same_with_and_without_worker_processes(tmp_path):
     labels_file = tmp_path / "indexed_labels.txt"
     labels_file.write_text("\n".join(f"flower{i:02d}" for i in range(RECORDS)) + "\n")
-    spec = Flowers(image_size=SCALE, labels=str(labels_file), val_batches=None, seed=7,
-                   loading=Loading(threads=1, read_buffer=1, worker_buffer=1))
+    from dew.data import Augment
+
+    spec = Images(source=[{"image": _synthetic_image(index), "label": index} for index in range(RECORDS)],
+                  image_size=SCALE, labels=str(labels_file),
+                  caption_templates=("a photo of a {}", "a photo of a {} flower"),
+                  augment=Augment(flip=True, jitter=True, backend="host"))
 
     serial = _by_record(spec, worker_count=0)
     parallel = _by_record(spec, worker_count=2)

@@ -14,7 +14,9 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.data import ByteTokenizer, Loading, TokenCorpus, TokenWindows
+from dew.data import ByteTokenizer, Loading, Text, load
+from dew.data.sources import source
+from dew.records import integer
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
@@ -39,14 +41,15 @@ class Config:
 
 
 def main(config: Config):
-    corpus = TokenCorpus.read(config.tokens)
+    stored = source(str(config.tokens))
+    vocabulary = integer(stored.metadata()["vocab_size"], "vocab_size")
     tokenizer = ByteTokenizer()
-    data = TokenWindows(path=str(config.tokens), seq_len=config.sequence_length,
-                        loading=Loading(workers=4)).load(batch=config.batch_size)
+    data = load(Text(source=stored, seq_len=config.sequence_length), batch=config.batch_size,
+                read="memory", validation_records=4 * config.batch_size, loading=Loading(workers=4))
     steps = config.steps or data.epoch_steps(config.epochs)
 
     prompt = tokenizer.encode(config.prompt)
-    model = CausalTransformer(**config.model, vocab_size=corpus.vocab_size,
+    model = CausalTransformer(**config.model, vocab_size=vocabulary,
                               max_seq_len=max(config.sequence_length, len(prompt) + config.max_new_tokens),
                               dtype=jnp.bfloat16)
     objective = LMObjective(

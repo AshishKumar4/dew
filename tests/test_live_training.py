@@ -4,7 +4,8 @@ from pathlib import Path
 
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import HubText, TokenCorpus, load
+from dew.data import Loading, Text, load
+from token_support import encoded_token_fixture
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 
@@ -14,13 +15,14 @@ ROOT = Path(__file__).resolve().parents[1] / "site/live/container"
 def test_the_caps_print_what_they_changed_before_the_run(tmp_path, monkeypatch, capsys):
     monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
     text = "ROMEO: I love the moon.\nJULIET: The moon shines tonight.\n" * 200
-    TokenCorpus.write([text], HubText("winglian/tiny-shakespeare").directory, val_fraction=0.5, pack=True)
+    tokens = encoded_token_fixture(tmp_path / "tokens", [text], val_fraction=0.5, eos=True)
     spec = importlib.util.spec_from_file_location("live_training", ROOT / "live_training.py")
     live_training = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(live_training)
     capped_load, capped_fit = live_training.capped_load(load), live_training.capped_fit(Trainer.fit)
 
-    data = capped_load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=16)
+    data = capped_load(Text(source=str(tokens), tokenizer="byte", seq_len=16), batch=64,
+                       read="memory", loading=Loading(workers=0))
     model = CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=2,
                               mlp_features=32, max_seq_len=32)
     trainer = Trainer(LMObjective(model, seq_len=16), OptimConfig(learning_rate=1e-3), key=0)
