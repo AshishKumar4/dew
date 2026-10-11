@@ -25,8 +25,16 @@ def checkpoint(name: str) -> None:
     if request.get("after") != name or request.get("generation") != generation:
         return
     if request.get("expires_at", 0) <= time.time():
-        save(directory / "ready.json", {"name": name, "generation": generation,
-             "request_id": request["request_id"], "state": "expired before boundary; continued", "at": time.time()})
+        save(
+            directory / "ready.json",
+            {
+                "name": name,
+                "generation": generation,
+                "request_id": request["request_id"],
+                "state": "expired before boundary; continued",
+                "at": time.time(),
+            },
+        )
         return
     ready = {
         "name": name,
@@ -35,7 +43,9 @@ def checkpoint(name: str) -> None:
         "pid": os.getpid(),
         "ready_at": time.time(),
         "state": "quiescent",
-        "decision_deadline": min(request["expires_at"], time.time() + min(180, request.get("decision_seconds", 180))),
+        "decision_deadline": min(
+            request["expires_at"], time.time() + min(180, request.get("decision_seconds", 180))
+        ),
     }
     save(directory / "ready.json", ready)
     while True:
@@ -131,20 +141,37 @@ def run(job: dict, home: Path, tree: Path, env: dict, timeout: float, run_logged
         (directory / "decision.json").unlink()
 
 
-def request(directory: Path, name: str, generation: int, request_id: str, *,
-            expires_at: float | None = None, decision_seconds: float = 180) -> None:
+def request(
+    directory: Path,
+    name: str,
+    generation: int,
+    request_id: str,
+    *,
+    expires_at: float | None = None,
+    decision_seconds: float = 180,
+) -> None:
     current = read(directory / "request.json")
     if current and current.get("generation") == generation and current.get("expires_at", 0) > time.time():
         raise ValueError("this generation already has a boundary request")
-    save(directory / "request.json", {"after": name, "generation": generation, "request_id": request_id,
-                                      "expires_at": expires_at if expires_at is not None else time.time() + 1200,
-                                      "decision_seconds": min(180, max(0.1, decision_seconds))})
+    save(
+        directory / "request.json",
+        {
+            "after": name,
+            "generation": generation,
+            "request_id": request_id,
+            "expires_at": expires_at if expires_at is not None else time.time() + 1200,
+            "decision_seconds": min(180, max(0.1, decision_seconds)),
+        },
+    )
 
 
 def decide(directory: Path, decision: dict) -> None:
     ready, requested = read(directory / "ready.json"), read(directory / "request.json")
-    if (ready.get("request_id") != decision.get("request_id")
-            or ready.get("generation") != decision.get("generation") or ready.get("state") != "quiescent"):
+    if (
+        ready.get("request_id") != decision.get("request_id")
+        or ready.get("generation") != decision.get("generation")
+        or ready.get("state") != "quiescent"
+    ):
         raise ValueError("decision is not owned by the current quiescent boundary")
     if time.time() >= min(ready["decision_deadline"], requested["expires_at"]):
         raise ValueError("boundary request expired; refusing a late decision")

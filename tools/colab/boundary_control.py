@@ -100,7 +100,9 @@ def control(
             raise ValueError("session ended while awaiting boundary; no relaunch")
         session = client.session(driver["endpoint"])
         try:
-            ready = json.loads(colab_io.content_bytes(colab_io.contents(session, directory + "/ready.json", content=True)))
+            ready = json.loads(
+                colab_io.content_bytes(colab_io.contents(session, directory + "/ready.json", content=True))
+            )
             if ready.get("request_id") == request_id and "continued" in ready.get("state", ""):
                 raise TimeoutError("boundary decision expired; original child continued")
             ack = json.loads(
@@ -113,8 +115,12 @@ def control(
         except FileNotFoundError:
             save(
                 run_dir / "boundary-requests" / (request_id + ".json"),
-                {"request_id": request_id, "generation": generation,
-                 "status": "waiting for acknowledged boundary", "at": time.time()},
+                {
+                    "request_id": request_id,
+                    "generation": generation,
+                    "status": "waiting for acknowledged boundary",
+                    "at": time.time(),
+                },
             )
         time.sleep(1)
     else:
