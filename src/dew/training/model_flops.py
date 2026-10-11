@@ -15,6 +15,7 @@ from dew.data.dataset import rows_of
 from dew.objectives.base import Batch, Objective
 
 FORWARD_FLOPS = "__dew_forward_flops"
+TRAINING_FLOPS = "__dew_training_flops"
 TOKENS = "__dew_real_tokens"
 
 
@@ -23,33 +24,37 @@ def prepare_counts[Loss, Effects](objective: Objective[Loss, Effects], batch: Ba
     """Count the source's host rows, preserving its checkpoint and model inputs."""
     if not count_model and not objective.counts_tokens:
         return batch
-    if FORWARD_FLOPS in batch or TOKENS in batch:
+    if any(name in batch for name in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)):
         raise ValueError("the input batch contains reserved model-work telemetry columns")
     rows = rows_of(batch)
-    forward, tokens = [], []
+    tokens = []
     for index in range(rows):
         row = jax.tree.map(lambda leaf, index=index: leaf[index:index + 1]
                            if np.ndim(leaf) and np.shape(leaf)[0] == rows else leaf, batch)
         if objective.counts_tokens:
             tokens.append(float(np.sum(objective.real_lengths(row), dtype=np.float64)))
-        if count_model:
-            forward.append(objective.model_flops(None, row))
     # The step's scalar telemetry accumulates in fp32, just like its loss;
     # widening before counting kept large integer products from overflowing.
     counted = dict(batch)
     if objective.counts_tokens:
         counted[TOKENS] = np.asarray(tokens, np.float32)
     if count_model:
-        counted[FORWARD_FLOPS] = np.asarray(forward, np.float32)
+        # Partition each assembled scalar over the batch's row shards. A
+        # shared conditioning row is counted once, not once per example.
+        forward = objective.model_flops(None, batch)
+        training = objective.training_flops(None, batch)
+        counted[FORWARD_FLOPS] = np.full((rows,), forward / rows if rows else 0, np.float32)
+        counted[TRAINING_FLOPS] = np.full((rows,), training / rows if rows else 0, np.float32)
     return counted
 
 
 def step_counts(batch: Batch) -> dict[str, jax.Array]:
     """Global device-side sums, returned with the step's other scalar metrics."""
     return {name: jnp.sum(batch[name], dtype=jnp.float32)
-            for name in (FORWARD_FLOPS, TOKENS) if name in batch}
+            for name in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS) if name in batch}
 
 
 def model_batch(batch: Batch) -> Batch:
     """The objective sees only its own inputs, not the trainer's accounting columns."""
-    return {name: value for name, value in batch.items() if name not in (FORWARD_FLOPS, TOKENS)}
+    return {name: value for name, value in batch.items()
+            if name not in (FORWARD_FLOPS, TRAINING_FLOPS, TOKENS)}

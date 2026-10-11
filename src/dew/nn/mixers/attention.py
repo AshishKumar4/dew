@@ -299,6 +299,14 @@ class CausalSelfAttention(nn.Module):
                 + attention_flops(lengths, self.num_heads, self.head_dim, self.value_dim, causal=self.causal,
                                   window=window, chunk=self.attention_chunk))
 
+    @nn.nowrap
+    def parameter_flops(self, lengths) -> float:
+        """Learned QKV/output/gate maps, excluding data-dependent attention products."""
+        window = self.sliding_window if self.causal or self.bidirectional_window else None
+        products = attention_flops(lengths, self.num_heads, self.head_dim, self.value_dim,
+                                   causal=self.causal, window=window, chunk=self.attention_chunk)
+        return self.model_flops(lengths) - products
+
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """Its query, key and value projections packed as `qkv_proj`
         (`ProjectionSites`), which `setup` reads in their place, where it

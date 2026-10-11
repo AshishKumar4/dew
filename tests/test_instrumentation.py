@@ -245,7 +245,7 @@ def test_mfu_reads_analytical_work_and_keeps_both_hlo_utilizations(monkeypatch):
     monkeypatch.setitem(peaks.PEAK_FLOPS_PER_DEVICE, jax.devices()[0].device_kind, 100.0)
     trainer = make_trainer()
     metrics = trainer._throughput(elapsed=2.0, steps=10, samples=640, flops=StepFlops(10.0, 15.0),
-                                   model_flops=80.0, tokens=700)
+                                   training_flops=240.0, tokens=700)
     assert metrics["train/mfu"] == pytest.approx(3 * 80 / (2 * 100 * trainer.device_mesh.devices.size))
     assert metrics["train/tokens"] == 70
     assert metrics["train/tokens_per_s"] == 350
