@@ -90,7 +90,8 @@ def control(
         files.append({"staged": staged, "target": target, "sha256": decision["script_hashes"][target]})
     script = (
         f"import sys\nsys.path.insert(0,{root!r})\nfrom tools.colab.boundary import request\n"
-        f"from pathlib import Path\nrequest(Path({directory!r}),{after!r},{generation!r},{request_id!r})\n"
+        f"from pathlib import Path\nrequest(Path({directory!r}),{after!r},{generation!r},{request_id!r},"
+        f"expires_at={time.time() + timeout!r})\n"
     )
     rpc(client, session, root, script)
     deadline = time.monotonic() + timeout
@@ -99,6 +100,9 @@ def control(
             raise ValueError("session ended while awaiting boundary; no relaunch")
         session = client.session(driver["endpoint"])
         try:
+            ready = json.loads(colab_io.content_bytes(colab_io.contents(session, directory + "/ready.json", content=True)))
+            if ready.get("request_id") == request_id and "continued" in ready.get("state", ""):
+                raise TimeoutError("boundary decision expired; original child continued")
             ack = json.loads(
                 colab_io.content_bytes(
                     colab_io.contents(session, directory + "/snapshot-ack.json", content=True)
@@ -119,8 +123,8 @@ def control(
         request_id=request_id, generation=generation, action=action, snapshot_acknowledged=True, files=files
     )
     script = (
-        f"import sys\nsys.path.insert(0,{root!r})\nfrom tools.colab.common import save\n"
-        f"from pathlib import Path\nsave(Path({directory + '/decision.json'!r}),{decision!r})\n"
+        f"import sys\nsys.path.insert(0,{root!r})\nfrom tools.colab.boundary import decide\n"
+        f"from pathlib import Path\ndecide(Path({directory!r}),{decision!r})\n"
     )
     rpc(client, session, root, script)
     return {
