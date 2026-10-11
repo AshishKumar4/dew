@@ -103,7 +103,13 @@ class Colab:
             return None
         if request.get("endpoint"):
             return request["endpoint"]
-        assigned = self.state.client._get_assignment(uuid.UUID(request["notebook"]), **self._options(request))
+        options = self._options(request)
+        if request["accelerator"] == "G4" and request.get("shape") == "HIGH_RAM":
+            # Legacy requests can contain this unsupported shape. Lookup is a
+            # read-only GET of the owned UUID, not a new allocation; retain the
+            # original journal and omit only the invalid selector from the query.
+            options["shape"] = None
+        assigned = self.state.client._get_assignment(uuid.UUID(request["notebook"]), **options)
         return getattr(assigned, "endpoint", None)
 
     def _store(self, session_name, response, variant, accelerator, shape):
