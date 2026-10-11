@@ -291,6 +291,7 @@ test('the MoE controls render the recorded frame and router counts, not syntheti
 		input.value = String(last);
 		input.dispatchEvent(new Event('input', { bubbles: true }));
 	}, last);
+	assert.deepEqual(await view.locator('.moe-edge title').allTextContents(), edges(last, 0));
 	await view.locator('[data-moe-layer]').selectOption('1');
 	assert.deepEqual(await view.locator('.moe-edge title').allTextContents(), edges(last, 1));
 	assert.match(await view.locator('[data-moe-label]').textContent(), /after training/);
