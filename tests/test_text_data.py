@@ -14,7 +14,6 @@ import threading
 from collections import Counter
 from pathlib import Path
 
-import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -23,7 +22,7 @@ import pytest
 from absl import flags
 from token_support import write_token_corpus
 
-from dew.data import ByteTokenizer, DataPartition, Loading, Text
+from dew.data import ByteTokenizer, DataPartition, Loading, Memory, Pipeline, Text, compile
 from dew.data.recipes import load
 from dew.data.sources.files import TokenFiles
 from dew.nn import attention
@@ -33,7 +32,6 @@ from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.position import ENVELOPE
 from dew.training import Step
-from dew.data import Memory, Pipeline, compile
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
@@ -1342,7 +1340,8 @@ def test_the_same_corpus_gives_the_same_windows_and_packing_in_every_store(store
     root, fields = stores
 
     def validation(name, **spec):
-        data = load(Text(source=TokenFiles(str(root / name), field=fields[name]["field"])), batch=1, read="memory",
+        data = load(Text(source=TokenFiles(str(root / name), field=fields[name]["field"])), batch=1,
+            read="memory",
             loading=Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1), **spec)
         rows = _read(data.val(DataPartition()))
         return [{key: value.tolist() for key, value in row.items()} for row in rows]

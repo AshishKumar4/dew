@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 
 from dew.data import TFDS, DataPartition, HoldOut, Images, Loading, load
-from dew.data.images import decode_image
+from dew.data.image_codec import decode_image
 from dew.data.steps.image import ImageRecord
 
 tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")

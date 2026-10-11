@@ -7,12 +7,11 @@ import pytest
 from recording import RecordingTracker
 
 from dew.artifacts import Representations
-from dew.data import DataPartition, Dataset
+from dew.data import DataPartition, Memory, Pipeline, compile
 from dew.eval.common import Mean
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, Objective, Ratio, Step
 from dew.training import Trainer
-from dew.data import Memory, Pipeline, compile
 
 
 class ScalarRegression(Objective):
