@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping
 from typing import Literal
 
@@ -25,7 +26,7 @@ from dew.data.prompts import (
     _text,
     _utf8,
 )
-from dew.data.text import load_tokenizer, tokenizer_snapshot
+from dew.data.text import PinnedTokenizer, pin_tokenizer
 from dew.records import integer, record
 
 
@@ -34,13 +35,18 @@ class RenderChat(grain.MapTransform):
     tokenizer: str
     column: str = "messages"
 
+    @functools.cached_property
+    def pinned(self) -> PinnedTokenizer:
+        """The tokenizer and template resolved once, as `Tokenize.pinned`."""
+        return pin_tokenizer(self.tokenizer)
+
     def dependencies(self) -> Mapping[str, object]:
-        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
+        return {"tokenizer": self.pinned.snapshot}
 
     def map(self, element: Batch) -> Batch:
         messages = element.get(self.column, element.get("prompt"))
         conversation = Conversation.parse(messages, element.get("tools"), self.tokenizer)
-        ids, roles = render_conversation(load_tokenizer(self.tokenizer), conversation, self.tokenizer)
+        ids, roles = render_conversation(self.pinned.transformers(), conversation, self.tokenizer)
         return {"text": ids, "text_roles": roles}
 
 
@@ -58,8 +64,13 @@ class RenderPrompt(grain.MapTransform):
         if self.max_prompt_len < 1 or self.reward_bytes < 1:
             raise ValueError("prompt max_prompt_len and reward_bytes must be positive")
 
+    @functools.cached_property
+    def pinned(self) -> PinnedTokenizer:
+        """The tokenizer and template resolved once, as `Tokenize.pinned`."""
+        return pin_tokenizer(self.tokenizer)
+
     def dependencies(self) -> Mapping[str, object]:
-        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
+        return {"tokenizer": self.pinned.snapshot}
 
     def map(self, element: Batch) -> Batch | Rejected:
         element = record(element, "prompt row")
@@ -68,7 +79,7 @@ class RenderPrompt(grain.MapTransform):
             raise ValueError(f"prompt unknown fields {sorted(unknown)}")
         if "prompt" not in element:
             raise ValueError("RenderPrompt needs a prompt column")
-        ids = _prompt_ids(self.tokenizer, element["prompt"], element.get("tools"), "prompt", self.thinking)
+        ids = _prompt_ids(self.pinned, element["prompt"], element.get("tools"), "prompt", self.thinking)
         if len(ids) > self.max_prompt_len:
             if self.long == "drop":
                 return Rejected("over_length")

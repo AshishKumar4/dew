@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 from collections.abc import Mapping, Sequence
 from typing import Literal
 
@@ -11,7 +12,7 @@ import numpy as np
 
 from dew.data.dataset import Batch
 from dew.data.pipeline import Rejected, TokenField
-from dew.data.text import tokenizer_for, tokenizer_snapshot
+from dew.data.text import PinnedTokenizer, pin_tokenizer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -20,14 +21,20 @@ class Tokenize(grain.MapTransform):
     field: str = "text"
     eos: bool = False
 
+    @functools.cached_property
+    def pinned(self) -> PinnedTokenizer:
+        """The tokenizer resolved once, which the step's identity and its
+        encoding both read, in this process and in any worker it is sent to."""
+        return pin_tokenizer(self.tokenizer)
+
     def dependencies(self) -> Mapping[str, object]:
-        return {"tokenizer": tokenizer_snapshot(self.tokenizer)}
+        return {"tokenizer": self.pinned.snapshot}
 
     def map(self, element: Batch) -> Batch:
         value = element[self.field]
         if not isinstance(value, str):
             raise ValueError(f"Tokenize field {self.field!r} must contain text")
-        tokenizer = tokenizer_for(self.tokenizer)
+        tokenizer = self.pinned.load()
         ids = tokenizer.encode(value)
         if self.eos and ids:
             if tokenizer.eos_id is None:
