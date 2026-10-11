@@ -106,6 +106,18 @@ class DecisionRunConfig(RunConfig):
     (a hundred options, or a document's many hypotheses) fits under a `max_len`
     set for it without lengthening every other row's state. None lets the
     state fill the row."""
+    bucket_lengths: tuple[int, ...] = ()
+    """Allowed token-budget row lengths; empty derives at most six lengths from the budget."""
+
+    def __post_init__(self) -> None:
+        lengths = self.bucket_lengths
+        if len(lengths) > 6 or any(length < 1 for length in lengths):
+            raise ValueError("--bucket-lengths needs at most six positive lengths")
+        if any(before >= after for before, after in zip(lengths, lengths[1:])):
+            raise ValueError("--bucket-lengths must increase without duplicates")
+        if lengths and self.trainer.batch_tokens is None:
+            raise ValueError("--bucket-lengths selects token-budget batches; set --trainer.batch-tokens "
+                             "and --trainer.update-tokens with --trainer.batch-size None")
 
     def prepare(self) -> Prepared:
         """The objective over the backbone `pretrained` names, on the table's
@@ -115,6 +127,7 @@ class DecisionRunConfig(RunConfig):
         `param_dtype` chooses the loaded checkpoint's storage dtype."""
         from dew.interop import Pretrained, sources
 
+        self = dataclasses.replace(self, trainer=self.trainer.derived())
         decided = sorted(set(self.model.fields) - {"dtype", "attention_impl"})
         if decided:
             raise ValueError(f"--model sets {decided}, which {self.pretrained} decides; only dtype and "
@@ -160,7 +173,8 @@ class DecisionRunConfig(RunConfig):
                            record(made.get("weights", {}), "weights").items()} | dict(self.data.weights)
                 summary["mixture"] = {name: value for name, value in weights.items() if value > 0}
                 summary["made"] = made
-        dataset = load(self.data, batch=self.trainer.batch_size, read=self.data_read,
+        dataset = load(self.data, batch=self.trainer.batch_size, tokens=self.trainer.batch_tokens,
+                       lengths=self.bucket_lengths, read=self.data_read,
                        provision=self.provision, seed=self.data_seed, loading=self.loading,
                        validation_records=self.validation_records,
                        objective=objective.data())
