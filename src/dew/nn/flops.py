@@ -28,6 +28,11 @@ def real_lengths(lengths: np.ndarray) -> np.ndarray:
 
 def counted_flops(module: nn.Module | Counted, lengths: np.ndarray) -> float:
     """Read a module's declaration, or refuse by name; never read its HLO."""
+    from dew.lora import AdaptedClass
+
+    if isinstance(module, AdaptedClass):
+        raise MissingFlopsCount(f"{type(module).__name__} needs its adapter projection geometry "
+                                "for train/mfu")
     if not isinstance(module, Counted):
         raise MissingFlopsCount(f"{type(module).__name__} has no model_flops(lengths); "
                                 "cannot report train/mfu")

@@ -39,6 +39,7 @@ from dew.nn.protocols import Counted, CountedLogits
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
+from dew.objectives.rl.preference import DPOObjective
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
 from dew.training.distributed import DevicePrefetchIterator
@@ -190,6 +191,14 @@ def test_lm_packing_counts_independent_attention_squares_and_real_predictions():
     expected = model.model_flops(np.array([2, 2, 3])) + model.logits_flops(np.array([2, 2]))
     assert objective.model_flops(model, batch) == expected
     assert objective.model_flops(None, batch) == expected
+
+
+def test_preference_geometry_is_not_mistaken_for_a_single_lm_sequence():
+    objective = DPOObjective(decoder(), seq_len=6)
+    batch = {"input_ids": np.ones((2, 2, 7), np.int32)}
+    assert prepare_counts(objective, batch, count_model=False) is batch
+    with pytest.raises(MissingFlopsCount, match=r"DPOObjective.*auxiliary"):
+        objective.model_flops(None, batch)
 
 
 def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
