@@ -147,9 +147,24 @@ class JepaEncoder(_JepaStackOptions):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """The selected patch tokens' stack; the embedding is excluded."""
+        raise MissingFlopsCount("JepaEncoder requires image_flops(lengths, input_channels)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        """Image patch lengths; a video needs its frame/patch geometry separately."""
+        if len(sample_shape) != 3 or any(side % self.patch_size for side in sample_shape[:2]):
+            raise MissingFlopsCount("JepaEncoder needs a divisible [height, width, channels] sample shape")
+        height, width, _ = sample_shape
+        return np.full((rows,), (height // self.patch_size) * (width // self.patch_size), np.int64)
+
+    @nn.nowrap
+    def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:
+        """The patch projection plus selected tokens' transformer stack."""
+        if text_features is not None:
+            raise MissingFlopsCount("JepaEncoder has no text conditioning projection")
         stack = self.stack_type(self.emb_features, self.num_layers, **self._stack_options(), parent=None)
-        return counted_flops(stack, lengths)
+        return (projection_flops(lengths, self.patch_size**2 * input_channels, self.emb_features)
+                + counted_flops(stack, lengths))
 
     def setup(self):
         self.embed = self._embedding(self.patch_size, self.emb_features, self.scan_order)
@@ -181,10 +196,12 @@ class JepaVideoEncoder(JepaEncoder):
     stack_type = FactorizedTokenStack
 
     @nn.nowrap
-    def spatiotemporal_flops(self, frames, patches) -> float:
-        """Frame and patch geometry supplied by the objective, not flattened into L."""
+    def spatiotemporal_flops(self, frames, patches, input_channels: int) -> float:
+        """Patch maps and factorized work, not flattened into one attention square."""
         stack = FactorizedTokenStack(self.emb_features, self.num_layers, **self._stack_options(), parent=None)
-        return stack.spatiotemporal_flops(frames, patches)
+        lengths = (real_lengths(frames) * real_lengths(patches)).astype(np.int64)
+        return (projection_flops(lengths, self.patch_size**2 * input_channels, self.emb_features)
+                + stack.spatiotemporal_flops(frames, patches))
 
     def __call__(self, x, token_idx=None, train: bool = False):
         B, T, H, W, C = x.shape

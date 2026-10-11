@@ -26,7 +26,7 @@ from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention
 from .blocks import FourierEmbedding, TimeProjection
 from .conv import Conv
-from .flops import counted_flops, projection_flops, real_lengths
+from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .precision import at_least_fp32, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
@@ -550,6 +550,8 @@ class ModulatedBlock(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Mixer, MLP and one modulation projection per real conditioning row."""
+        if self.mixer not in ('attention', 'ssm'):
+            raise MissingFlopsCount(f"ModulatedBlock has no declared FLOPs for mixer {self.mixer!r}")
         if self.mixer == 'attention':
             mixer = NormalAttention(self.features, self.num_heads,
                                      self.features // self.num_heads, parent=None)

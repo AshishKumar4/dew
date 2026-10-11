@@ -7,7 +7,7 @@ import numpy as np
 from flax import linen as nn
 
 from ..dit import ROPE_THETA, ModulatedBlock, _DiTStackOptions, remat_block, rope_for_scan
-from ..flops import counted_flops, projection_flops, real_lengths
+from ..flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from ..precision import at_least_fp32
 from ..rope import rotary_freqs
 
@@ -57,9 +57,31 @@ class SimpleDiT(_DiTStackOptions):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Real patch-token blocks and output map; embeddings and remat excluded."""
+        """Input channels and conditioning width belong to the objective's geometry."""
+        raise MissingFlopsCount("SimpleDiT requires image_flops(lengths, input_channels, text_features)")
+
+    @nn.nowrap
+    def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
+        """Patch-token lengths from the actual latent/image shape, never a guessed channel count."""
+        if len(sample_shape) != 3 or any(side % self.patch_size for side in sample_shape[:2]):
+            raise MissingFlopsCount("SimpleDiT needs a divisible [height, width, channels] sample shape")
+        height, width, _ = sample_shape
+        return np.full((rows,), (height // self.patch_size) * (width // self.patch_size), np.int64)
+
+    @nn.nowrap
+    def image_flops(self, lengths, input_channels: int, text_features: int | None = None) -> float:
+        """Every matmul, including patch/time/text input maps; only lookups excluded."""
         real_lengths(lengths)
-        total = 0.0
+        channels, hidden = self.patch_size**2 * input_channels, self.emb_features
+        bottleneck = self.patch_bottleneck
+        total = projection_flops(lengths, channels, bottleneck or hidden)
+        if bottleneck is not None:
+            total += projection_flops(lengths, bottleneck, hidden)
+        rows = np.ones(np.shape(lengths), np.int64)
+        # Fourier signals have no matmul. Both time maps are width -> r*width -> width.
+        total += (1 + self.interval) * 2 * projection_flops(rows, hidden, self.mlp_ratio * hidden)
+        if text_features is not None:
+            total += projection_flops(rows, text_features, hidden)
         for index, block in enumerate(self.counted_blocks()):
             active = np.asarray(lengths)
             for ratio, start, end in self.checked_routes():

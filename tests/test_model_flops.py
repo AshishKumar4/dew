@@ -18,6 +18,7 @@ from dew.data.text import ByteTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
+from dew.inputs import Field, InputSpec
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import GatedMLP, RematPolicy
 from dew.nn.backbones.decoder_stack import Loop
@@ -35,6 +36,7 @@ from dew.nn.mixers.mamba2 import Mamba2
 from dew.nn.moe import SparseMLP
 from dew.nn.protocols import Counted, CountedLogits
 from dew.nn.ssm import BidirectionalS5Layer, S5Layer
+from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
@@ -107,21 +109,22 @@ def test_dit_counts_routed_tokens_modulation_and_output_but_not_remat():
     model = SimpleDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2)
     block = 24 * 8 * 8 * 7 + 4 * 8 * 29 + 12 * 8 * 8 * 2
     output = 2 * 8 * 4 * 3 * 7
-    assert model.model_flops(LENGTHS) == 2 * block + output
-    assert model.clone(remat='full').model_flops(LENGTHS) == model.model_flops(LENGTHS)
+    inputs = 2 * 12 * 8 * 7 + 4 * 4 * 8 * 8 * 2
+    assert model.image_flops(LENGTHS, 3) == 2 * block + output + inputs
+    assert model.clone(remat='full').image_flops(LENGTHS, 3) == model.image_flops(LENGTHS, 3)
     routed = model.clone(routes=((0.5, 0, 0),))
     shortened = 24 * 8 * 8 * 4 + 4 * 8 * (1 + 9) + 12 * 8 * 8 * 2
-    assert routed.model_flops(LENGTHS) == shortened + block + output
+    assert routed.image_flops(LENGTHS, 3) == shortened + block + output + inputs
     hybrid = HybridSSMAttentionDiT(emb_features=8, num_heads=2, num_layers=2, patch_size=2,
                                    ssm_state_dim=4, ssm_attention_ratio="all-ssm")
     ssm = BidirectionalS5Layer(8, 4).model_flops(LENGTHS)
-    assert hybrid.model_flops(LENGTHS) == 2 * (ssm + 16 * 8 * 8 * 7 + 12 * 8 * 8 * 2) + output
+    assert hybrid.image_flops(LENGTHS, 3) == 2 * (ssm + 16 * 8 * 8 * 7 + 12 * 8 * 8 * 2) + output + inputs
 
 
 def test_jepa_supplies_context_target_and_factorized_geometry_explicitly():
     stack = TokenStack(8, 2, num_heads=2)
     encoder = JepaEncoder(emb_features=8, num_layers=2, num_heads=2)
-    assert encoder.model_flops(LENGTHS) == stack.model_flops(LENGTHS)
+    assert encoder.image_flops(LENGTHS, 3) == stack.model_flops(LENGTHS) + 2 * 16**2 * 3 * 8 * 7
     factorized = FactorizedTokenStack(8, 2, num_heads=2)
     with pytest.raises(MissingFlopsCount, match="spatiotemporal_flops"):
         factorized.model_flops(np.array([10]))
@@ -130,6 +133,15 @@ def test_jepa_supplies_context_target_and_factorized_geometry_explicitly():
     predictor = JepaPredictor(emb_features=16, predictor_features=8, num_layers=2, num_heads=2)
     assert predictor.multisequence_flops(np.array([3]), np.array([2])) == (
         stack.model_flops(np.array([5])) + 2 * 16 * 8 * 5)
+
+
+def test_diffusion_supplies_patch_channels_and_refuses_missing_auxiliary_work():
+    model = SimpleDiT(emb_features=8, num_layers=2, num_heads=2, patch_size=2)
+    objective = DiffusionObjective(model, inputs=InputSpec(sample=Field("images", (4, 8, 3))),
+                                   autoencoder=None, ema_decay=None)
+    batch = {"images": np.zeros((2, 4, 8, 3), np.float32)}
+    np.testing.assert_array_equal(objective.real_lengths(batch), [8, 8])
+    assert objective.model_flops(None, batch) == model.image_flops(np.array([8, 8]), 3)
 
 
 def test_dense_mlp_gate_and_active_experts_are_counted():
