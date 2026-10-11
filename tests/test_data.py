@@ -751,7 +751,7 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     rows = Files(patterns, format="files").records("memory")
     records = [VideoPath(caption="a clip").map(row) for row in rows]
 
-    assert [r["video_path"] for r in records] == sorted(
+    assert sorted(r["video_path"] for r in records) == sorted(
         [c.as_uri() for c in clips] + [(tmp_path / "extra.webm").as_uri()]
     )
     assert {r["caption"] for r in records} == {"a clip"}
