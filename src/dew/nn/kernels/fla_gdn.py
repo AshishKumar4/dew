@@ -47,18 +47,19 @@ _SM80_BF16 = {
     "chunk_bwd_dqkwg": {"bk": 64, "bv": 64, "warps": 4, "stages": 1},
     "prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 4, "stages": 2},
 }
-_SM80_FP32 = {**_SM80_BF16,
+# Eight warps for fp32's WY backward on every GPU: at TF32x3 four took ptxas 40 s on sm80 and 66 s on
+# sm89, eight 17 s.
+_FP32_WY = {"prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 8, "stages": 2}}
+_SM80_FP32 = {**_SM80_BF16, **_FP32_WY,
               "chunk_fwd_h": {"bv": 64, "warps": 4, "stages": 2},
               # One stage: three took 254,984 bytes of an A100's 166,912 (c58).
-              "chunk_bwd_dhu": {"bv": 64, "warps": 4, "stages": 1},
-              # Eight warps: four took ptxas 40 s to compile at TF32x3 on sm80, eight 17 s.
-              "prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 8, "stages": 2}}
+              "chunk_bwd_dhu": {"bv": 64, "warps": 4, "stages": 1}}
 # fla's stage and block lists for devices under an A100's shared memory (chunk_delta_h.py:43-44,
 # 352-353), with two warps for the forward h.
 _SMALL_BF16 = {**_SM80_BF16,
                "chunk_fwd_h": {"bv": 32, "warps": 2, "stages": 2},
                "chunk_bwd_dhu": {"bv": 64, "warps": 4, "stages": 1}}
-_SMALL_FP32 = {**_SMALL_BF16,
+_SMALL_FP32 = {**_SMALL_BF16, **_FP32_WY,
                "chunk_fwd_h": {"bv": 64, "warps": 2, "stages": 1},
                "chunk_bwd_dhu": {"bv": 32, "warps": 4, "stages": 1}}
 # Blackwell's two-warp, four-stage WY backward, the one config fla validated there (wy_fast.py:18-22,
@@ -66,7 +67,7 @@ _SMALL_FP32 = {**_SMALL_BF16,
 _BLACKWELL = {"prepare_wy_repr_bwd": {"bk": 64, "bv": 64, "warps": 2, "stages": 4}}
 
 
-def _table(name: str, target: generation.GpuTarget, dtype: str) -> dict:
+def _declared(name: str, target: generation.GpuTarget, dtype: str) -> dict:
     wide = (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
     table = {("bfloat16", True): _SM80_BF16, ("float32", True): _SM80_FP32,
              ("bfloat16", False): _SMALL_BF16, ("float32", False): _SMALL_FP32}[dtype, wide]
@@ -74,7 +75,7 @@ def _table(name: str, target: generation.GpuTarget, dtype: str) -> dict:
     return {**table, **_BLACKWELL} if int(name[2:]) >= 100 else table
 
 
-CONFIGS = {(name, dtype): _table(name, target, dtype)
+CONFIGS = {(name, dtype): _declared(name, target, dtype)
            for name, target in generation.TARGETS.items()
            if name.startswith("sm") and int(name[2:]) >= generation.BF16_GPU
            for dtype in ("bfloat16", "float32")}
@@ -94,20 +95,19 @@ def _rule_shape(key, value, chunk):
     return {"width": key.shape[-1], "columns": value.shape[-1], "chunk": chunk}
 
 
-def _table(dtype, target: str | None = None) -> dict | None:
-    """The configs a call reads: its GPU's for its activation dtype (fp16 takes bf16's, whose itemsize
-    it shares), an A100's where the kernels interpret off a GPU, or None where none are declared."""
+def _config_key(dtype, target: str | None = None) -> tuple[str, str]:
+    """The CONFIGS key a call reads: its GPU, or an A100 where the kernels interpret off a GPU, and its
+    activation dtype, fp16 taking bf16's, whose itemsize it shares."""
     target = generation.device_generation() if target is None else target
     name = jnp.dtype(dtype).name
-    name = "bfloat16" if name == "float16" else name
-    return CONFIGS.get((target if target.startswith("sm") else "sm80", name))
+    return target if target.startswith("sm") else "sm80", "bfloat16" if name == "float16" else name
 
 
 def kernel_config(kernel: str, shape: Mapping[str, int], dtype, *, target: str | None = None,
                   **overrides: int | None) -> dict[str, int]:
-    """`kernel`'s config for `dtype` on `target` (`_table`); overrides (the lab's) replace its fields.
-    Blocks are clipped to the keys' `width` and values' `columns`."""
-    config = {**_table(dtype, target)[kernel],
+    """`kernel`'s config for `dtype` on `target` (`_config_key`); overrides (the lab's) replace its
+    fields. Blocks are clipped to the keys' `width` and values' `columns`."""
+    config = {**CONFIGS[_config_key(dtype, target)][kernel],
               **{key: value for key, value in overrides.items() if value is not None}}
     return {key: min(value, shape["width"] if key == "bk" else shape["columns"]) if key in ("bk", "bv")
             else value for key, value in config.items()}
@@ -119,7 +119,7 @@ def rule_refusal(key, value, chunk):
     heads no Triton block holds."""
     if key.dtype != value.dtype:
         return f"the port needs matching key/value dtypes, got {key.dtype} and {value.dtype}"
-    if _table(key.dtype) is None:
+    if _config_key(key.dtype) not in CONFIGS:
         return f"the port has no {jnp.dtype(key.dtype).name} configs for {generation.device_generation()}"
     widest = max(shape["width"] for shape in CONFIG_SHAPES.values())
     if key.shape[-1] > widest or value.shape[-1] > widest:
