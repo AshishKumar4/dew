@@ -282,3 +282,44 @@ def test_an_fp8_gemm_counts_against_its_own_peak(tmp_path, monkeypatch):
     assert attribute.main(command) == 0
     # 1e11 / 5e14 + 1e11 / 1e15 over 2 ms.
     assert json.loads(out.read_text())["time"]["mfu_mixed_of_device_time"] == 0.15
+def test_a_module_read_as_it_streams_is_the_module_read_whole():
+    """Line by line, with the metadata kept only as traced names: the same instructions, kinds and
+    traced names as the whole text, braces inside a quoted op_name included."""
+    quoted = MODULE.replace('kind=kInput, calls=%fused_reduce.89',
+                            'kind=kInput, calls=%fused_reduce.89, metadata={op_name="jit(step)/a{b}" '
+                            'source_file="x.py" source_line=3}, backend_config={"k":1}')
+    whole, streamed = hlo_instructions(quoted), hlo_instructions(iter(quoted.splitlines()))
+    assert whole == streamed
+    assert streamed["input_reduce_fusion.89"].traced == {"jit(step)/a{b} x.py:3"}
+    assert streamed["input_reduce_fusion.89"].fused == {"parameter", "constant", "reduce"}
+
+
+def test_the_dump_reads_only_its_newest_module_from_an_archive(tmp_path):
+    """A dump holds every compile of the step; only the newest one's four files are extracted,
+    and the memory breakdown reads them a line at a time."""
+    import tarfile
+
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    for number, peak in (("0003", 1 << 30), ("0015", 2 << 30)):
+        stem = f"module_{number}.jit_step.sm_8.0_gpu_after_optimizations"
+        (dump / f"{stem}.txt").write_text(MODULE)
+        (dump / f"{stem}-live-range.txt").write_text(
+            f"Stack trace breakdown for peak usage: {peak} bytes\n"
+            f"  main ({100.0:.1f}%, total: {peak} bytes, current: 0 bytes)\n"
+            f"    p/params/kernel (50.0%, total: {peak // 2} bytes, current: {peak // 2} bytes)\n")
+        (dump / f"{stem}-buffer-assignment.txt").write_text(f"allocation 0: size {peak}, parameter 0\n")
+        (dump / f"{stem}-memory-usage-report.txt").write_text(f"Total bytes: {peak}\n")
+    (dump / "module_0016.jit_other.sm_8.0_gpu_after_optimizations.txt").write_text(MODULE)
+    archive = tmp_path / "hlo.tgz"
+    with tarfile.open(archive, "w:gz") as writer:
+        writer.add(dump, arcname="hlo")
+    for source in (archive, dump):
+        with attribute.dump_files(source, "jit_step") as files:
+            assert files["module_number"] == "15"
+            assert set(files) == {"module_number", ".txt", "-live-range.txt", "-buffer-assignment.txt",
+                                  "-memory-usage-report.txt"}
+            memory = attribute.attribute_memory(files)
+        assert (memory["peak_gib"], memory["total_bytes_gib"], memory["allocations_gib"]) == (
+            2.0, 2.0, {"parameter": 2.0})
+        assert memory["peak_by_role_and_part_gib"][0]["role"] == "argument: parameters"
