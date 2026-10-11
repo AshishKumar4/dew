@@ -1,5 +1,6 @@
 """Conditional publication, transport bounds and URL credentials."""
 
+import json
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -130,6 +131,31 @@ def test_concurrent_misses_download_once(tmp_path, monkeypatch):
     assert len(calls) == 1
 
 
+def test_distinct_transport_misses_download_concurrently_within_the_shared_budget(tmp_path, monkeypatch):
+    remote = fsspec.filesystem("memory")
+    prefix = f"parallel-cache-{uuid4().hex}"
+    paths = [prefix + "/a", prefix + "/b"]
+    for path in paths:
+        remote.pipe_file(path, path.encode())
+    waiting = threading.Barrier(2)
+    download = remote.get_file
+
+    def synchronize(*args, **kwargs):
+        waiting.wait(timeout=5)
+        return download(*args, **kwargs)
+
+    monkeypatch.setattr(remote, "get_file", synchronize)
+    cache = BoundedFileCache(fs=remote, cache_storage=str(tmp_path), max_bytes=1024)
+
+    def read(path):
+        with cache.open(path, "rb") as file:
+            return file.read()
+
+    with ThreadPoolExecutor(2) as pool:
+        assert list(pool.map(read, paths)) == [path.encode() for path in paths]
+    assert cache.metrics()["downloaded_bytes"] == sum(len(path) for path in paths)
+
+
 def test_url_chain_reads_and_writes_memory(tmp_path):
     store = Store(
         f"dewcache::memory://chain-{uuid4().hex}/object",
@@ -140,6 +166,86 @@ def test_url_chain_reads_and_writes_memory(tmp_path):
     old = store.get_versioned()
     store.put_if_match(b"changed", old.version)
     assert store.read() == b"changed"
+
+
+def test_gcs_generation_preconditions_are_sent_to_the_json_api():
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs, unquote, urlsplit
+
+    versions = {}
+    lock = threading.Lock()
+
+    def metadata(key):
+        generation, payload = versions[key][-1]
+        return {
+            "bucket": "bucket",
+            "name": key,
+            "size": str(len(payload)),
+            "generation": str(generation),
+            "updated": "2026-01-01T00:00:00.000Z",
+        }
+
+    class GCS(BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            return
+
+        def reply(self, status, payload):
+            self.send_response(status)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            query = parse_qs(urlsplit(self.path).query)
+            key = query["name"][0]
+            payload = self.rfile.read(int(self.headers["Content-Length"]))
+            with lock:
+                expected = str(versions[key][-1][0]) if key in versions else "0"
+                if query.get("ifGenerationMatch") != [expected]:
+                    self.reply(412, b'{"error":{"code":412,"message":"precondition failed"}}')
+                    return
+                versions.setdefault(key, []).append((int(expected) + 1, payload))
+                self.reply(200, json.dumps(metadata(key)).encode())
+
+        def do_GET(self):
+            url = urlsplit(self.path)
+            query = parse_qs(url.query)
+            key = unquote(url.path.split("/o/", 1)[1]) if "/o/" in url.path else None
+            with lock:
+                if key is None:
+                    prefix = query.get("prefix", [""])[0]
+                    payload = json.dumps(
+                        {"items": [metadata(name) for name in versions if name.startswith(prefix)]}
+                    ).encode()
+                elif key not in versions:
+                    self.reply(404, b"missing")
+                    return
+                elif query.get("alt") == ["media"]:
+                    wanted = int(query.get("generation", [versions[key][-1][0]])[0])
+                    payload = next(payload for generation, payload in versions[key] if generation == wanted)
+                else:
+                    payload = json.dumps(metadata(key)).encode()
+                self.reply(200, payload)
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), GCS) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        store = Store(
+            "gs://bucket/value", {"token": "anon", "endpoint_url": f"http://127.0.0.1:{server.server_port}"}
+        )
+        try:
+            first = store.put_if_absent(b"first")
+            assert store.get_versioned().data == b"first"
+            with pytest.raises(PreconditionFailed):
+                store.put_if_absent(b"duplicate")
+            second = store.put_if_match(b"second", first)
+            with pytest.raises(PreconditionFailed):
+                store.put_if_match(b"stale", first)
+            assert store.get_versioned().version == second
+            assert store.read() == b"second"
+        finally:
+            server.shutdown()
+            thread.join()
 
 
 @pytest.mark.network

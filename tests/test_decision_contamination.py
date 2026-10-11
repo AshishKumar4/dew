@@ -37,7 +37,8 @@ def _table(path: Path, texts: list[tuple[str, str]]) -> list[Example]:
         writer.writerows(texts)
     pipeline, _, _ = Decisions(source=str(path), question="team", instructions=INSTRUCTIONS,
                                 options=("billing", "technical", "sales")).pipelines()
-    return [Example.of(row["example"]) for row in iterate(pipeline, read="memory", loading=Loading(workers=0))]
+    return [Example.of(row["example"]) for row in iterate(pipeline, read="memory",
+        loading=Loading(workers=0))]
 
 
 def test_a_shared_question_is_not_a_repeat_but_a_shared_decision_is(contamination, tmp_path):

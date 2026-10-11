@@ -3,6 +3,7 @@
 import io
 import json
 import tarfile
+from pathlib import Path
 from uuid import uuid4
 
 import numpy as np
@@ -27,6 +28,53 @@ def test_memory_columns_snapshot_changes_with_content():
     assert [row["x"] for row in rows] == list(range(5))
     with pytest.raises(ValueError, match="different row counts"):
         len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
+    assert Memory([{"x": np.int16(4)}]).snapshot() != Memory([{"x": np.int32(4)}]).snapshot()
+
+
+def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
+    import tensorflow_datasets as tfds
+
+    from dew.data.sources import TFDS
+
+    root = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    decoded = TFDS("dew_images", path=str(root))
+    raw = TFDS("dew_images", path=str(root), decoders={"image": tfds.decode.SkipDecoding()})
+    assert decoded.metadata()["rows"] == 16
+    assert decoded.metadata()["class_names"]["label"] == tuple(
+        (root / "label.labels.txt").read_text().splitlines()
+    )
+    assert decoded.snapshot() != raw.snapshot()
+    assert isinstance(raw.records("indexed")[0]["image"], bytes)
+
+
+def test_remote_tfds_requires_explicit_provisioning_before_native_reads():
+    from dew.data.sources import TFDS
+
+    fixture = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    root = Store(f"memory://tfds-{uuid4().hex}/1.0.0")
+    for path in fixture.iterdir():
+        root.child(path.name).write(path.read_bytes())
+    source = TFDS("dew_images", path=root.url)
+    assert not source.supports("indexed")
+    with pytest.raises(FileNotFoundError, match=r"provision=True.*gs://"):
+        source.records("indexed")
+    source.provision()
+    assert source.supports("indexed")
+    assert len(source.records("indexed")) == 16
+    assert not Path(source.directory, "dew_images-test.array_record-00000-of-00001").exists()
+
+
+def test_tfds_label_definitions_participate_in_source_identity(tmp_path):
+    import shutil
+
+    from dew.data.sources import TFDS
+
+    fixture = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
+    shutil.copytree(fixture, tmp_path, dirs_exist_ok=True)
+    before = TFDS("dew_images", path=str(tmp_path)).snapshot()
+    (tmp_path / "label.labels.txt").write_text("rouge\nbleu\n")
+    after = TFDS("dew_images", path=str(tmp_path)).snapshot()
+    assert before != after
 
 
 def test_jsonl_ranges_cover_rows_once_even_at_line_boundaries():
@@ -204,6 +252,41 @@ def test_exported_token_lengths_support_indexed_spans_without_record_scan():
     from dew.data.sources import source as resolve
 
     assert isinstance(resolve(root), TokenFiles)
+
+
+def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
+    root = Store(f"memory://lazy-records-{uuid4().hex}")
+    manifest = export(
+        [{"id": index} for index in range(12)], root.url, format="array_record", rows_per_shard=4
+    )
+    filesystem, _ = root.resolve()
+    downloaded = []
+    get_file = filesystem.get_file
+
+    def download(remote, local, **kwargs):
+        downloaded.append(remote)
+        return get_file(remote, local, **kwargs)
+
+    monkeypatch.setattr(filesystem, "get_file", download)
+    rows = Files(root.url, format="array_record").records("indexed")
+    assert len(rows) == 12
+    assert downloaded == []
+    assert rows[9] == {"id": 9}
+    assert len(downloaded) == 1
+    assert downloaded[0].endswith(manifest["files"][2]["path"])
+
+
+def test_jsonl_offset_index_is_mapped_and_reopened_instead_of_pickled_as_rows():
+    import pickle
+
+    root = Store(f"memory://mapped-index-{uuid4().hex}/rows.jsonl")
+    root.write(b'{"id":0}\n{"id":1}\n')
+    source = Files(root.url).provision()
+    indexed = source.records("indexed")
+    assert isinstance(indexed.tables[0], np.memmap)
+    resumed = pickle.loads(pickle.dumps(indexed))
+    assert resumed[1] == {"id": 1}
+    assert isinstance(resumed.tables[0], np.memmap)
 
 
 def test_torch_source_refuses_streaming_and_cache_without_content_identity():

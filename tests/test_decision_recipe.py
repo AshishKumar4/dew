@@ -6,13 +6,12 @@ import importlib.util
 import json
 import math
 import sys
-import types
 from pathlib import Path
 
 import pytest
 
-from dew.data.text import HFTokenizer
 from dew.data import DataPartition, Loading, load
+from dew.data.text import HFTokenizer
 from dew.decision import Choice, Decide, DecisionObjective, Decisions, Example, JointLayout, Noul
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
@@ -185,7 +184,7 @@ def test_the_fit_check_leaves_out_a_set_none_of_whose_rows_fit():
         assert next(stream)["tokens"].shape[0] == 2
     finally:
         stream.close()
-    with pytest.raises(ValueError, match="fit|accepted|empty"):
+    with pytest.raises(ValueError, match=r"fit|accepted|empty"):
         refused = load(Decisions(source={"long": long}, weights={"long": 1.0}), batch=2,
                        read="memory", objective=objective.data(), loading=Loading(workers=0))
         next(refused.train(DataPartition()))

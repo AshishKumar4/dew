@@ -98,8 +98,9 @@ def _length_index(root: Store, writer: str, number: int, batch, field: str | Non
             raise ValueError(f"export row is missing length_field={field!r}")
         lengths.append(len(row[field]))
     encoded = io.BytesIO()
-    np.save(encoded, np.asarray(lengths, np.int64), allow_pickle=False)
-    path = f"shards/{writer}/part-{number:06d}.lengths.npy"
+    sizes = np.asarray(lengths, np.int64)
+    np.save(encoded, np.column_stack((sizes, np.cumsum(sizes))), allow_pickle=False)
+    path = f"_dew_indexes/{writer}/part-{number:06d}.lengths.npy"
     return {"path": path, **root.child(path).verified(encoded.getvalue())}
 
 

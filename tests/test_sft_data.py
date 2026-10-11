@@ -95,7 +95,9 @@ def test_a_packed_sft_batch_carries_four_aligned_fields(tmp_path, tokenizer):
         "the fixture tokenizer changed; re-derive the bins below")
     (a_ids, a_roles), (b_ids, b_roles), (c_ids, c_roles) = rendered
 
-    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=2, validation=path, long="chunk"), batch=2, read="memory", loading=Loading(workers=0), validation_records=4 * (2))
+    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=2,
+        validation=path, long="chunk"), batch=2, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (2))
     assert data.val is not None
     batches = list(data.val(DataPartition()))
     assert len(batches) == 1
@@ -130,7 +132,9 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer):
     assert len(ids) > window
     chunks = -(-len(ids) // window)
 
-    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=1, validation=path, long="chunk"), batch=1, read="memory", loading=Loading(workers=0), validation_records=4 * (1))
+    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=1,
+        validation=path, long="chunk"), batch=1, read="memory", loading=Loading(workers=0),
+            validation_records=4 * (1))
     assert data.records == chunks, "one bin puts every chunk in a window of its own"
     assert data.val is not None
     batches = list(data.val(DataPartition()))
@@ -150,7 +154,8 @@ def test_the_train_stream_runs_end_to_end(tmp_path, tokenizer):
     rendered = {tuple(render(tokenizer, conversation)[0].tolist())
                 for conversation in (SHORT, MEDIUM, LONG)}
     columns = ("text", ROLES_KEY, "text_segment_ids", "text_positions")
-    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=95, packing_bins=2, long="chunk"), batch=2, read="memory", loading=Loading(workers=2), validation_records=4 * (2))
+    data = load(Chat(source=path, tokenizer=str(TOKENIZER), seq_len=95, packing_bins=2, long="chunk"),
+        batch=2, read="memory", loading=Loading(workers=2), validation_records=4 * (2))
 
     batch = next(data.train(DataPartition()))
 
@@ -194,7 +199,8 @@ def test_a_conversation_starting_with_the_assistant_is_refused(tokenizer):
 
 def test_chat_messages_needs_a_parquet_path():
     with pytest.raises(ValueError, match=r"--data.path"):
-        load(Chat(source="", tokenizer=str(TOKENIZER), long="chunk"), batch=8, read="memory", validation_records=4 * (8))
+        load(Chat(source="", tokenizer=str(TOKENIZER), long="chunk"), batch=8, read="memory",
+            validation_records=4 * (8))
 
 
 def test_an_empty_parquet_file_is_refused(tmp_path):
@@ -203,4 +209,5 @@ def test_an_empty_parquet_file_is_refused(tmp_path):
 
     pq.write_table(pa.table({"prompt": []}), tmp_path / "empty.parquet")
     with pytest.raises(ValueError, match="holds no conversations"):
-        load(Chat(source=str(tmp_path / "empty.parquet"), tokenizer=str(TOKENIZER), long="chunk"), batch=8, read="memory", validation_records=4 * (8))
+        load(Chat(source=str(tmp_path / "empty.parquet"), tokenizer=str(TOKENIZER), long="chunk"),
+            batch=8, read="memory", validation_records=4 * (8))

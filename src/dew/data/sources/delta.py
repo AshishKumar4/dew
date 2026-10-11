@@ -31,6 +31,10 @@ class Delta(Files):
     def arrow(self):
         return self.table.to_pyarrow_dataset()
 
+    @cached_property
+    def paths(self) -> tuple[str, ...]:
+        return tuple(self.table.file_uris())
+
     def snapshot(self) -> Mapping[str, object]:
         return {
             "store": "delta",

@@ -14,7 +14,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
-from dew.data import DataPartition, Dataset, Loading
+from dew.data import DataPartition, Loading, Records, load
 from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -24,7 +24,6 @@ from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, freeze
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
-from dew.data import Records, load
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)

@@ -1,36 +1,27 @@
-"""Prepared TFDS ArrayRecords as a grain source.
-
-Preparation downloads, generates and writes the shards, and needs
-TensorFlow. Reading them needs neither: TFDS's read-only builder opens what
-preparation left behind. `prepared` alone prepares, into dew's own TFDS
-directory, in a separate process.
-
-`read_only_builder` resolves the version directory, the directory itself
-when it holds the metadata and otherwise through TFDS's own
-`builder_from_files` from the names a caller gave, then compares the builder,
-config and version asked for with what the metadata reports and refuses a
-file format other than ArrayRecord.
-`prepared_source` is the builder's own data source behind those checks and a
-check that every shard of the split is present.
-"""
+"""Prepared TFDS data sources, with explicit preparation and remote mirrors."""
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import importlib.util
+import json
 import os
+import shutil
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+import tempfile
+from collections.abc import Mapping
 from functools import cached_property
-from typing import TYPE_CHECKING, Annotated
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from etils import epath
 from filelock import FileLock
 
 from dew.cache import dew_cache_dir
 
-from ..dataset import Batch, Records, json_argument
+from ..dataset import Records
 from .base import Read, Shard, ShardManifest
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
@@ -194,131 +185,6 @@ def read_only_builder(path: str, *, name: str | None, config: str | None, versio
     return reader
 
 
-def check_shards(builder, split: str, directory: epath.Path) -> None:
-    """Raise unless every prepared shard the split reads is present.
-
-    A plain name that is not a prepared split is named here, where the
-    alternatives can be listed. An expression -- a union, a slice, or TFDS's
-    own "all" -- is left to TFDS, and every prepared split's shards are
-    checked instead, since any of them may be read.
-
-    The check runs before the run rather than in a grain worker on the first
-    record that needed a missing shard, steps into training.
-    """
-    splits = builder.info.splits
-    plain = not any(character in split for character in "+[")
-    if plain and split != "all" and split not in splits:
-        raise ValueError(f"{directory} holds no split {split!r}; it holds {sorted(splits)}")
-    wanted = [split] if plain and split in splits else sorted(splits)
-    for name in wanted:
-        for instruction in splits[name].file_instructions:
-            if not epath.Path(instruction.filename).is_file():
-                raise FileNotFoundError(
-                    f"Missing prepared ArrayRecord shard {instruction.filename!r}. "
-                    f"Copy the complete prepared dataset or prepare it again."
-                )
-
-
-def prepared_source(
-    path: str,
-    split: str,
-    *,
-    name: str | None = None,
-    config: str | None = None,
-    version: str | None = None,
-    decoders: DecoderTree | None = None,
-) -> Records:
-    """Reads one split of a prepared TFDS dataset by index.
-
-    The builder's own `as_data_source` is already grain's protocol. What this
-    adds is the resolution of the directory, the checks against its metadata,
-    and the refusals a half-prepared or wrongly formatted directory earns.
-
-    `split` takes TFDS's own syntax, slicing included, and `decoders` reaches
-    the builder unchanged, so a caller can hand it `SkipDecoding()` for a
-    feature it wants as the bytes on disk. A record is whatever the prepared
-    features and those decoders make it: a mapping for a features dict, a
-    bare array for a single feature. The run's own `preprocess` is where it
-    becomes batch fields.
-    """
-    reader = read_only_builder(path, name=name, config=config, version=version)
-    check_shards(reader, split, epath.Path(reader.data_path))
-    return Prepared(reader.as_data_source(split, decoders=decoders), str(reader.data_path), split)
-
-
-class Prepared:
-    """Reads one prepared split by index.
-
-    TFDS's features and the caller's decoders decide what a record is: a
-    mapping of features, or the bytes of a single feature a decoder skipped.
-    A record is narrowed here, on the way out, so one that is neither is
-    named where the split is known rather than inside a grain worker.
-
-    The repr is the directory and the split, which is what a saved position
-    compares against (`describe`). The builder's own source describes itself
-    by its address in this process, and two addresses refuse every resume.
-    """
-
-    def __init__(self, records: Sequence[object], directory: str, split: str):
-        self.directory = directory
-        self.split = split
-        self._records = records
-
-    def __repr__(self) -> str:
-        return f"Prepared(directory={self.directory!r}, split={self.split!r})"
-
-    def __len__(self) -> int:
-        return len(self._records)
-
-    def __getitem__(self, index: int) -> Batch | bytes | None:
-        held = self._records[index]
-        if isinstance(held, bytes):
-            return held
-        if isinstance(held, Mapping):
-            return dict(held)
-        raise TypeError(
-            f"record {index} of {self.directory} split {self.split!r} is "
-            f"{type(held).__name__}; a prepared record is its features or the "
-            f"bytes of the one feature a decoder skipped"
-        )
-
-
-@dataclasses.dataclass(frozen=True)
-class TFDSOptions:
-    """Where a prepared TFDS dataset is, and which part of it to read.
-
-    `path` is what a preparation run wrote, either the version directory or
-    the `data_dir` above it, and is only read. None reads dew's own TFDS
-    directory instead, where a missing builder is prepared first
-    (`prepared`). `config` and `version` pick the directory inside a
-    data_dir, and both are checked against the prepared metadata.
-    `decoders` is TFDS's own decoder tree, passed to the builder unchanged,
-    so a caller can ask for the bytes on disk with `SkipDecoding()`.
-
-    The builder's name and the split expression are not options here,
-    because a mixture reads several builders through one set of these
-    options.
-    """
-
-    path: str | None = None
-    config: str | None = None
-    version: str | None = None
-    decoders: DecoderTree | None = None
-
-    def source(self, name: str, split: str) -> Records:
-        """Open `split` of the prepared builder `name` for reading by index."""
-        path = self.path or prepared(name, config=self.config, version=self.version)
-        return prepared_source(
-            path, split, name=name, config=self.config, version=self.version, decoders=self.decoders
-        )
-
-
-PreparedOptions = Annotated[TFDSOptions, json_argument(TFDSOptions)]
-"""`TFDSOptions` as a dataset spec declares it: one JSON object on the
-command line, because a decoder tree is a tree of TFDS objects with no
-command-line spelling."""
-
-
 @dataclasses.dataclass(frozen=True)
 class TFDS:
     """A prepared TFDS split, read with TFDS's native ArrayRecord data source."""
@@ -330,10 +196,29 @@ class TFDS:
     version: str | None = None
     decoders: DecoderTree | None = None
 
+    @property
+    def remote(self) -> bool:
+        return self.path is not None and (
+            "::" in self.path or ("://" in self.path and not self.path.startswith(("file://", "gs://")))
+        )
+
+    @property
+    def directory(self) -> str:
+        if not self.remote:
+            return self.path or os.path.join(dew_cache_dir(), "tfds")
+        named = (self.path, self.name, self.config, self.version, self.split)
+        digest = hashlib.sha256(json.dumps(named).encode()).hexdigest()
+        return os.path.join(dew_cache_dir(), "tfds-mirrors", digest)
+
     @cached_property
     def builder(self):
+        if self.remote and not Path(self.directory, "READY").is_file():
+            raise FileNotFoundError(
+                f"TFDS cannot read {self.path!r} natively; set provision=True to mirror the "
+                "prepared split locally once, or use a gs:// prepared directory"
+            )
         return read_only_builder(
-            self.path or os.path.join(dew_cache_dir(), "tfds"),
+            self.directory,
             name=self.name,
             config=self.config,
             version=self.version,
@@ -343,12 +228,15 @@ class TFDS:
         return f"tfds:{self.name}/{self.config}:{self.version}:{self.split}:{self.path}"
 
     def snapshot(self) -> Mapping[str, object]:
-        import hashlib
-
         from dew.data.storage import Store
 
         directory = str(self.builder.data_path)
         metadata = Store(directory.rstrip("/") + "/dataset_info.json").read()
+        fs, prefix = Store(directory).resolve()
+        definitions = {}
+        for path in fs.find(prefix):
+            if path.endswith((".json", ".labels.txt")):
+                definitions[path[len(prefix) :].lstrip("/")] = hashlib.sha256(fs.cat_file(path)).hexdigest()
         splits = self.builder.info.splits
         names = (
             tuple(splits)
@@ -362,26 +250,40 @@ class TFDS:
             for instruction in splits[name].file_instructions:
                 store = Store(instruction.filename)
                 fs, path = store.resolve()
-                header = fs.info(path)
+                try:
+                    header = fs.info(path)
+                except FileNotFoundError as error:
+                    raise FileNotFoundError(
+                        f"Missing prepared ArrayRecord shard {instruction.filename!r}; "
+                        "copy the complete split or provision it again"
+                    ) from error
                 files.append({"uri": store.url, "bytes": header["size"], "version": fs.ukey(path)})
+        if self.remote:
+            mirrored = json.loads(Path(self.directory, "READY").read_text())
+            files = mirrored["files"]
         return {
             "store": "tfds",
             "name": self.name,
             "split": self.split,
-            "directory": directory,
+            "directory": self.path if self.remote else directory,
             "metadata_sha256": hashlib.sha256(metadata).hexdigest(),
+            "definitions": definitions,
             "files": files,
             "decoders": _decoder_record(self.decoders),
+            "original": self.path,
         }
 
     def supports(self, read: Read) -> bool:
         try:
-            self.snapshot()
+            _ = self.builder
         except FileNotFoundError:
             return False
         return True
 
     def provision(self) -> TFDS:
+        if self.remote:
+            self._mirror()
+            return self
         if self.path is not None:
             raise ValueError(
                 f"TFDS {self.name!r} path={self.path!r} is read-only; prepare that directory "
@@ -390,12 +292,76 @@ class TFDS:
         prepared(self.name, config=self.config, version=self.version)
         return self
 
+    def _mirror(self) -> None:
+        from dew.data.storage import Store
+
+        destination = Path(self.directory)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        with FileLock(str(destination) + ".lock"):
+            if (destination / "READY").is_file():
+                return
+            root = Store(str(self.path))
+            fs, path = root.resolve()
+            if not fs.exists(path.rstrip("/") + "/dataset_info.json"):
+                raise FileNotFoundError(
+                    f"remote TFDS path {self.path!r} must name one prepared version directory"
+                )
+            with tempfile.TemporaryDirectory(dir=destination.parent, prefix="tfds-") as temporary:
+                staged = Path(temporary) / "dataset"
+                staged.mkdir()
+                copied = []
+
+                def download(key: str, target: Path) -> None:
+                    version = fs.ukey(key)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    fs.get_file(key, str(target))
+                    if fs.ukey(key) != version or fs.size(key) != target.stat().st_size:
+                        raise OSError(f"TFDS shard changed while provisioning {key}")
+                    copied.append(
+                        {
+                            "uri": root.child(key[len(path) :].lstrip("/")).url,
+                            "bytes": target.stat().st_size,
+                            "version": version,
+                        }
+                    )
+
+                for key in fs.find(path):
+                    if "array_record" in key:
+                        continue
+                    relative = key[len(path) :].lstrip("/")
+                    target = staged / relative
+                    download(key, target)
+                builder = read_only_builder(
+                    str(staged), name=self.name, config=self.config, version=self.version
+                )
+                selected = (
+                    tuple(builder.info.splits)
+                    if self.split == "all"
+                    else tuple(part.split("[", 1)[0] for part in self.split.split("+"))
+                )
+                for name in selected:
+                    if name not in builder.info.splits:
+                        raise ValueError(f"TFDS {self.name!r} has no split {name!r}")
+                    for instruction in builder.info.splits[name].file_instructions:
+                        filename = Path(instruction.filename).name
+                        download(path.rstrip("/") + "/" + filename, staged / filename)
+                (staged / "READY").write_text(
+                    json.dumps({"source": self.path, "split": self.split, "files": copied})
+                )
+                shutil.move(staged, destination)
+
     def records(self, read: Read) -> Records:
         if not self.supports(read):
+            if self.remote:
+                raise FileNotFoundError(
+                    f"TFDS cannot read {self.path!r} natively; set provision=True to mirror "
+                    "the prepared split locally once, or use gs://"
+                )
             raise FileNotFoundError(
                 f"{self.describe()} has no prepared ArrayRecord data; "
                 "run dew data provision or set provision=True"
             )
+        self.snapshot()
         rows = self.builder.as_data_source(self.split, decoders=self.decoders)
         import grain.python as grain
 
@@ -433,7 +399,7 @@ class TFDS:
                 for name, feature in features.items()
                 if isinstance(feature, tfds.features.ClassLabel)
             }
-            if isinstance(features, Mapping)
+            if isinstance(features, tfds.features.FeaturesDict)
             else {}
         )
         return {
