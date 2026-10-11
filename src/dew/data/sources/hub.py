@@ -13,7 +13,7 @@ import numpy as np
 from dew.data.dataset import Records
 
 from .base import Read, ShardManifest
-from .files import Files
+from .files import Files, Format
 from .memory import _record
 
 
@@ -48,34 +48,51 @@ class Hub:
         )
 
     @cached_property
-    def parquet(self) -> Files:
-        from huggingface_hub import HfApi, HfFileSystem
+    def files(self) -> Files:
+        from huggingface_hub import HfApi
 
-        fs = HfFileSystem()
         revision = self.commit
 
-        def selected(paths: list[str]) -> list[str]:
-            return [
-                path
-                for path in paths
-                if path.endswith(".parquet")
-                and (f"/{self.split}/" in "/" + path or Path(path).name.startswith(self.split + "-"))
-                and (self.config is None or f"/{self.config}/" in "/" + path)
-            ]
-
-        paths = selected(HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision))
+        paths, format = self._selected(
+            HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision)
+        )
         if not paths:
+            if self.revision is not None:
+                raise FileNotFoundError(
+                    f"HF {self.repo!r}@{revision} split {self.split!r} has no native Parquet, Arrow or JSONL files; "
+                    "pin the converted branch's own commit explicitly, or provision=True for Arrow at this revision"
+                )
             revision = HfApi().dataset_info(self.repo, revision="refs/convert/parquet").sha
-            paths = selected(HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision))
+            if revision is None:
+                raise ValueError(f"HF {self.repo!r} conversion did not resolve to a commit")
+            paths, format = self._selected(
+                HfApi().list_repo_files(self.repo, repo_type="dataset", revision=revision)
+            )
         if not paths:
             raise FileNotFoundError(
-                f"HF {self.repo!r} split {self.split!r} has no physical Parquet shards; "
+                f"HF {self.repo!r} split {self.split!r} has no physical readable shards; "
                 "name an hf:// Parquet URL or explicitly provision Arrow"
             )
         urls = tuple(f"hf://datasets/{self.repo}@{revision}/{path}" for path in sorted(paths))
-        for url in urls:
-            fs.info(url)
-        return Files(urls, format="parquet")
+        return Files(urls, format=format)
+
+    def _selected(self, paths: list[str]) -> tuple[list[str], Format]:
+        formats: tuple[Format, ...] = ("parquet", "arrow", "jsonl")
+        for format in formats:
+            matches = [
+                path
+                for path in paths
+                if path.endswith("." + format)
+                and (
+                    f"/{self.split}/" in "/" + path
+                    or Path(path).name.startswith(self.split + "-")
+                    or Path(path).stem == self.split
+                )
+                and (self.config is None or f"/{self.config}/" in "/" + path)
+            ]
+            if matches:
+                return matches, format
+        return [], "parquet"
 
     def describe(self) -> str:
         return f"hf:{self.repo}@{self.commit}:{self.config}:{self.split}"
@@ -101,7 +118,7 @@ class Hub:
                 for entry in dataset.cache_files
             ]
         else:
-            identity["shards"] = self.parquet.snapshot()
+            identity["shards"] = self.files.snapshot()
         return identity
 
     def supports(self, read: Read) -> bool:
@@ -127,7 +144,7 @@ class Hub:
         return grain.MapDataset.source(dataset).map(_record)
 
     def manifest(self) -> ShardManifest:
-        return self.parquet.manifest()
+        return self.files.manifest()
 
     def metadata(self) -> Mapping[str, object]:
         from datasets import ClassLabel
