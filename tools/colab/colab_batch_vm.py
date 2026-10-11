@@ -47,7 +47,9 @@ def run_logged(
 
 
 def public_environment() -> dict[str, str]:
-    private = {"MPLBACKEND", "WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT"}
+    # JAX 0.11.2's cache-miss explainer crashes Pallas/Triton lowerings.
+    # Explicit script usage is refused by preflight; don't inherit it either.
+    private = {"MPLBACKEND", "WANDB_API_KEY", "WANDB_ENTITY", "WANDB_PROJECT", "JAX_EXPLAIN_CACHE_MISSES"}
     return {key: value for key, value in os.environ.items() if key not in private}
 
 
