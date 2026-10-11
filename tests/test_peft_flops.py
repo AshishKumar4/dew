@@ -46,7 +46,7 @@ def test_frozen_dense_rank_factors_equal_the_actual_forward_and_gradient_dots():
     model = DenseCount(8, 16)
     x = jnp.ones((2, 3, 8))
     variables = model.init(jax.random.key(401), x)
-    adapted = LoRA(rank=2, alpha=2, modules=("layer",)).apply(model, variables)
+    adapted = LoRA(rank=2, alpha=2, modules=("layer",)).apply(model, variables, key=501)
     lengths = np.array([3, 3])
     expected = dense_training_flops(lengths, 8, 16, trainable=False, adapter_rank=2)
     assert adapted.model.training_flops(lengths) == expected
@@ -66,7 +66,7 @@ def test_decoder_frozen_matrices_and_repeated_adapter_scopes_are_separate(loop):
     model = decoder(loop=loop)
     tokens = jnp.ones((2, 6), jnp.int32)
     variables = model.init(jax.random.key(402), tokens)
-    adapted = LoRA(rank=2, alpha=4, modules=("q_proj", "down_proj")).apply(model, variables)
+    adapted = LoRA(rank=2, alpha=4, modules=("q_proj", "down_proj")).apply(model, variables, key=502)
     lengths = np.array([3, 5])
     layer_passes = 5 if loop is not None else 3
     extra = 2 * 2 * ((8 + 8) + (16 + 8)) * 8 * layer_passes
@@ -80,7 +80,7 @@ def test_decoder_frozen_matrices_and_repeated_adapter_scopes_are_separate(loop):
 def test_objective_assembles_peft_training_work_without_three_times_forward():
     model = decoder()
     variables = model.init(jax.random.key(403), jnp.ones((2, 6), jnp.int32))
-    adapted = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables)
+    adapted = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(model, variables, key=503)
     objective = LMObjective(adapted, seq_len=6, pad_id=0)
     batch = packed_batch()
     expected = (adapted.model.training_flops(np.array([2, 2, 3]))
@@ -96,7 +96,7 @@ def test_objective_assembles_peft_training_work_without_three_times_forward():
 def test_clef_head_remains_trainable_while_backbone_is_adapted():
     model = decoder()
     variables = model.init(jax.random.key(404), jnp.ones((2, 6), jnp.int32))
-    adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables)
+    adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=504)
     head = JointSchemaHead(8, width=8, heads=2, routing_layers=1, layers=1, feedforward=16)
     objective = DecisionObjective(adapted, head=head, tokenizer=ByteTokenizer(),
                                   specials=Specials(begin=None, separator=10, marker=0,
@@ -116,7 +116,7 @@ def test_unknown_adapted_family_is_refused_instead_of_being_counted_as_full_ft()
             return nn.Dense(8, name="layer")(x)
     model = Unknown()
     variables = model.init(jax.random.key(405), jnp.ones((2, 8)))
-    adapted = LoRA(rank=2, modules=("layer",)).apply(model, variables)
+    adapted = LoRA(rank=2, modules=("layer",)).apply(model, variables, key=505)
     with pytest.raises(MissingFlopsCount, match="Unknown"):
         adapted.model.training_flops(np.array([1, 1]))
 
@@ -127,7 +127,7 @@ def test_trainer_reads_training_work_once_from_the_existing_interval_record(monk
     monkeypatch.setattr(trainer_module, "peak_flops", lambda device: 1e12)
     model = decoder().clone(num_layers=1)
     variables = model.init(jax.random.key(406), jnp.ones((8, 6), jnp.int32))
-    adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables)
+    adapted = LoRA(rank=2, modules=("q_proj",)).apply(model, variables, key=506)
     objective = LMObjective(adapted, seq_len=6, pad_id=0)
     tracker = RecordingTracker()
 
